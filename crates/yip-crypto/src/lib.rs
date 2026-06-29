@@ -96,6 +96,72 @@ pub enum CryptoError {
     Handshake,
 }
 
+/// An in-progress Noise-IK handshake. Drive it by exchanging the two messages
+/// (`write_message`/`read_message`), then convert into a [`Session`].
+pub struct Handshake {
+    inner: snow::HandshakeState,
+}
+
+impl Handshake {
+    /// Begin as the initiator, which must already know the responder's static public key.
+    pub fn initiator(
+        local_private: &[u8; 32],
+        peer_public: &[u8; 32],
+    ) -> Result<Handshake, CryptoError> {
+        let inner = snow::Builder::new(NOISE_PARAMS.parse().map_err(|_| CryptoError::Handshake)?)
+            .local_private_key(local_private)
+            .map_err(|_| CryptoError::Handshake)?
+            .remote_public_key(peer_public)
+            .map_err(|_| CryptoError::Handshake)?
+            .build_initiator()
+            .map_err(|_| CryptoError::Handshake)?;
+        Ok(Handshake { inner })
+    }
+
+    /// Begin as the responder; learns the initiator's static key during the handshake.
+    pub fn responder(local_private: &[u8; 32]) -> Result<Handshake, CryptoError> {
+        let inner = snow::Builder::new(NOISE_PARAMS.parse().map_err(|_| CryptoError::Handshake)?)
+            .local_private_key(local_private)
+            .map_err(|_| CryptoError::Handshake)?
+            .build_responder()
+            .map_err(|_| CryptoError::Handshake)?;
+        Ok(Handshake { inner })
+    }
+
+    /// Produce the next (empty-payload) handshake message to send to the peer.
+    pub fn write_message(&mut self) -> Result<Vec<u8>, CryptoError> {
+        let mut buf = [0u8; 1024];
+        let n = self
+            .inner
+            .write_message(&[], &mut buf)
+            .map_err(|_| CryptoError::Handshake)?;
+        Ok(buf[..n].to_vec())
+    }
+
+    /// Consume a handshake message received from the peer.
+    pub fn read_message(&mut self, msg: &[u8]) -> Result<(), CryptoError> {
+        let mut buf = [0u8; 1024];
+        self.inner
+            .read_message(msg, &mut buf)
+            .map_err(|_| CryptoError::Handshake)?;
+        Ok(())
+    }
+
+    /// Whether the handshake has completed and a session can be derived.
+    pub fn is_finished(&self) -> bool {
+        self.inner.is_handshake_finished()
+    }
+
+    /// The peer's authenticated static public key, if learned yet.
+    pub fn remote_static(&self) -> Option<[u8; 32]> {
+        self.inner.get_remote_static().map(|k| {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(k);
+            out
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +190,23 @@ mod tests {
             !w.check_and_set(5),
             "counter now far below window rejected as too old"
         );
+    }
+
+    #[test]
+    fn ik_handshake_completes_and_authenticates_initiator() {
+        let resp_kp = generate_keypair();
+        let init_kp = generate_keypair();
+
+        let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
+        let mut res = Handshake::responder(&resp_kp.private).unwrap();
+
+        let msg1 = ini.write_message().unwrap();
+        res.read_message(&msg1).unwrap();
+        let msg2 = res.write_message().unwrap();
+        ini.read_message(&msg2).unwrap();
+
+        assert!(ini.is_finished() && res.is_finished());
+        // IK: the responder learns the initiator's static public key.
+        assert_eq!(res.remote_static(), Some(init_kp.public));
     }
 }
