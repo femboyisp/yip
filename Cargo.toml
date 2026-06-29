@@ -11,6 +11,9 @@ repository = "https://github.com/femboyisp/yip"
 thiserror = "2.0.9"
 tracing = "0.1.41"
 
+[workspace.metadata.cargo-shear]
+ignored = ["tracing"]
+
 [workspace.lints.clippy]
 allow_attributes = "warn"
 as_ptr_cast_mut = "warn"

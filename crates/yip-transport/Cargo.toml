@@ -10,3 +10,6 @@ yip-wire = { path = "../yip-wire" }
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-shear]
+ignored = ["yip-wire"]

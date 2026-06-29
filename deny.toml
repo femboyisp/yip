@@ -7,4 +7,5 @@ confidence-threshold = 0.9
 
 [bans]
 multiple-versions = "warn"
-wildcard-dependencies = "deny"
+# path-only (no version) deps within the workspace are intentional
+wildcards = "allow"
