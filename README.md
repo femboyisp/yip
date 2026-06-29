@@ -84,6 +84,13 @@ workspace lint set with `-D warnings`, no `as` casts for numeric conversion (`Fr
 `#![forbid(unsafe_code)]` on every crate except `yip-io`, pinned dependency versions, and a
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) `CHANGELOG.md`.
 
+Install the pre-commit hooks so fmt, clippy, tests, and file hygiene run before every commit:
+
+```sh
+pre-commit install        # one-time, after cloning
+pre-commit run --all-files  # optional: run against the whole tree
+```
+
 ## License
 
 [MPL-2.0](LICENSE).

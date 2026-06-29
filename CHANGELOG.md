@@ -10,3 +10,5 @@ All notable changes to this project are documented here, following
   `yip-device`, and `yipd` crate stubs.
 - CI quality gates: build, test, clippy, rustfmt, cargo-shear, cargo-deny,
   coverage, and mutation testing.
+- Pre-commit hooks (file hygiene, cargo fmt, clippy, and test).
+- Public `README.md` and `docs/architecture.md`.
