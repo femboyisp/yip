@@ -201,18 +201,46 @@ reply; never unbounded state.
 broadcast) end-to-end; each backend-fallback path forced and verified; rekey under load with no
 stall/drop spike.
 
-**Benchmark harness (headline deliverable, nyxpsi-proofed):**
+**Benchmark harness (headline deliverable, nyxpsi-proofed) — `yip-bench` crate:**
 - Real impairment via `tc netem` (loss, latency, jitter, reorder, dup) on veth — never loopback +
   sleep.
-- Apples-to-apples: identical transfer patterns and netem profiles for yip vs kernel WireGuard vs
-  plain UDP.
+- Apples-to-apples: identical transfer patterns and netem profiles across every contender; pinned
+  versions and documented configs for each, automated so runs are reproducible.
+- **Comparison matrix — compared like-for-like by layer** (a tool is only benched on the data plane
+  it actually provides):
+
+  | Contender | Layer | Role in comparison |
+  |---|---|---|
+  | **yip** (io_uring + AF_XDP backends) | L2 + L3 | subject |
+  | **WireGuard (kernel)** | L3 | the latency floor to approach |
+  | **WireGuard-go / boringtun** | L3 | userspace baseline we must beat |
+  | **AmneziaWG** | L3 | obfuscated-WG latency cost reference |
+  | **OpenVPN** | L3 | legacy baseline |
+  | **n2n** | L2 | primary L2 mesh comparison |
+  | **ZeroTier** | L2 | L2 overlay comparison |
+  | **plain UDP / plain kernel routing** | — | absolute floor (no tunnel) |
+
 - Metrics across a netem sweep: added one-way latency + p99 (target within ~50–80 µs of kernel WG on
-  io_uring); **p99-under-loss** (the thesis: yip stays ~flat through 1–10 % loss while WG/UDP spike);
-  repair-overhead % vs measured loss; throughput single/multi-core per backend.
+  io_uring); **p99-under-loss** (the thesis: yip stays ~flat through 1–10 % loss while the others
+  spike); repair-overhead % vs measured loss; throughput single/multi-core per backend; CPU per Gbps.
 - Latency-floor validation on real hardware: confirm ~0.42–0.5 ms io_uring and ~6.5–13 µs AF_XDP
   wire path; record as project baseline.
-- CI: unit + netns integration every commit; netem bench nightly/on-demand (needs `CAP_NET_ADMIN`),
-  tracked over time for regressions.
+- In-process micro-benches (Criterion) for the hot logic (AEAD seal/open, RaptorQ encode/decode,
+  classify, header-protect) kept separate from the network benches.
+- CI: unit + netns integration every commit; netem comparison bench nightly/on-demand (needs
+  `CAP_NET_ADMIN` and the contenders installed), tracked over time for regressions.
+
+### Coverage & correctness bar
+
+- **≥ 90 % line coverage on every crate**, measured with `cargo-llvm-cov`, enforced in CI.
+- Coverage alone is gameable, so it is backed by: **`cargo-mutants`** (mutation testing) on the
+  protocol/logic crates (`yip-wire`, `yip-transport`, `yip-crypto`) so the 90 % is *meaningful*, and
+  **`cargo-fuzz`** on every parser (`yip-wire` deframe, RaptorQ packet deserialize, feedback parse).
+- **Honest exclusion:** the AF_XDP **zero-copy** path and io_uring SQPOLL paths cannot be covered
+  hermetically (need specific NICs / kernel caps not present in CI runners). These are covered by the
+  netns integration suite in *copy/fallback* mode and a separately-documented, hardware-gated suite;
+  the un-CI-able lines are explicitly annotated and excluded from the 90 % denominator with a
+  rationale comment, **not** silently. No other exclusions.
 
 ---
 
@@ -238,7 +266,36 @@ DPI-friendly); classical crypto only, PQ-ready (PQ in a later sub-project).
 
 ---
 
-## 7. Future-reuse earmark
+## 7. Coding standards & guidelines compliance
+
+Follows `~/projects/femboy/coding-guidelines` (the Mullvad guidelines) — same lint set already used
+by `blackwall`, so the two repos stay consistent.
+
+- **Lints:** adopt the guideline `[workspace.lints]` set verbatim; CI builds with `--deny warnings`.
+  rustfmt with the Mullvad reference config. `cargo clippy` clean.
+- **Integer conversions — `as` is banned for numeric casts.** Use `From` / `TryFrom`. This is
+  load-bearing here: the packet/symbol code is full of width conversions (`symbol_size: u16`, ESI,
+  lengths, counters) and **nyxpsi's fatal bug was literally `let packet_symbol_size = size as u16`**.
+  The guideline that forbids `as` would have caught it at compile time — so this rule is a primary
+  defense, not a style nicety.
+- **Unsafe:** `yip-io` (io_uring/AF_XDP) is the only crate with significant `unsafe`. Every `unsafe`
+  block gets a `// SAFETY:` comment; every `unsafe fn` a `# Safety` doc section; blocks kept minimal.
+  `undocumented_unsafe_blocks` lint enforces it. Goal: confine `unsafe` to `yip-io`; the protocol
+  crates stay `#![forbid(unsafe_code)]`.
+- **Borrowed types:** `&[u8]` / `&str` / `&Path`, never `&Vec` / `&String` / `&PathBuf` in signatures.
+- **Dependencies:** pin full versions (`x.y.z`, not `x`); prefer crates.io; any git dep is forked to
+  our org and pinned by `rev`. `cargo-shear` (unused deps) and `cargo-deny` (licenses + RUSTSEC
+  advisories) in CI; verify against `-Z minimal-versions`.
+- **API design:** follow the Rust API guidelines; avoid premature generality (a concrete
+  `Tap`/`Tun` over an over-abstracted device factory) per the "don't over-genericize" rule.
+- **Docs:** document what the signature does *not* already say (invariants, drop behavior, units),
+  not restatements. Public items documented; keep the documentation ratio up.
+- **Changelog:** keep-a-changelog `CHANGELOG.md` from the first commit (Added/Changed/Fixed/…).
+- **Git:** imperative, capitalized, ≤72-char subjects; kebab-case branches; clean history (no
+  intra-branch "fix typo" commits).
+- **Files:** UTF-8, LF, final newline, no trailing whitespace, space indent.
+
+## 8. Future-reuse earmark
 
 A fast-path AF_XDP/eBPF packet-I/O layer is wanted by both this project (`yip-io`'s AF_XDP backend)
 and `blackwall` (DDoS fast-drop). Earmark a shared `xdp-io` crate, factored out once #1's AF_XDP
