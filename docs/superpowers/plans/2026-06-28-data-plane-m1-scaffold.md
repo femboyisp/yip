@@ -65,7 +65,11 @@ bin/
 ```toml
 [workspace]
 resolver = "2"
-members = ["crates/*", "bin/*"]
+# NOTE: `bin/*` is intentionally omitted until Task 7 creates `bin/yipd`.
+# Cargo errors on a member glob that matches zero directories, so it is added
+# back in Task 7. `crates/*` is likewise empty until Task 2 — but Task 1's
+# verification step only runs `cargo metadata`, which is expected to fail here.
+members = ["crates/*"]
 
 [workspace.package]
 edition = "2021"
@@ -655,6 +659,19 @@ mod tests {
     }
 }
 ```
+
+- [ ] **Step 1b: Re-add `bin/*` to the workspace members**
+
+Now that `bin/yipd` exists, restore the binary glob. In root `Cargo.toml`, change:
+
+```toml
+members = ["crates/*"]
+```
+to:
+```toml
+members = ["crates/*", "bin/*"]
+```
+(and remove the explanatory NOTE comment above it). Run `cargo metadata --no-deps >/dev/null` after Step 2 to confirm the workspace resolves with `yipd` included.
 
 - [ ] **Step 2: Write `bin/yipd/Cargo.toml`**
 
