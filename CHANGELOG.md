@@ -18,3 +18,5 @@ All notable changes to this project are documented here, following
   per-frame nonces and a sliding anti-replay window.
 - `yip-device` TUN (L3) and TAP (L2) tunnel devices, and `yip-io` io_uring
   DataPlaneIo backend with a portable plain-socket fallback.
+- `yip-transport` adaptive RaptorQ FEC: per-flow classifier, object encoder,
+  pipelined erasure-tolerant reassembler, and a repair-ratio controller.
