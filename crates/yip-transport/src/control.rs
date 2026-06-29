@@ -26,9 +26,11 @@ impl AdaptiveController {
         self.ratio
     }
 
-    /// Update from an observed loss fraction (0.0..=1.0). Additive increase when
-    /// loss exceeds what the current redundancy can mask; multiplicative decrease
-    /// toward the class minimum when the link is clean.
+    /// Update from an observed loss fraction (0.0..=1.0). When loss exceeds
+    /// what the current redundancy can mask, the ratio is immediately set to
+    /// `loss + 0.05` (jump to just above the observed loss rate with a small
+    /// headroom margin), rather than incrementing gradually.  When the link is
+    /// clean the ratio decays 10% per observation toward the class minimum.
     pub fn observe_loss(&mut self, loss_fraction: f32) {
         let loss = loss_fraction.clamp(0.0, 1.0);
         if loss > self.target_residual + self.ratio {
