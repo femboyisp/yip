@@ -1,0 +1,20 @@
+---
+name: Mutation testing
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  mutants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-mutants
+      - name: Mutation test (logic crates)
+        run: >
+          cargo mutants --package yip-wire --package yip-transport
+          --package yip-crypto -- --all-targets

@@ -1,0 +1,23 @@
+[package]
+name = "yip-wire-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.7"
+
+[dependencies.yip-wire]
+path = ".."
+
+[[bin]]
+name = "deframe"
+path = "fuzz_targets/deframe.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

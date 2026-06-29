@@ -1,0 +1,19 @@
+[package]
+name = "yipd"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+yip-io = { path = "../../crates/yip-io" }
+yip-wire = { path = "../../crates/yip-wire" }
+yip-crypto = { path = "../../crates/yip-crypto" }
+yip-transport = { path = "../../crates/yip-transport" }
+yip-device = { path = "../../crates/yip-device" }
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-shear]
+ignored = ["yip-io", "yip-wire", "yip-crypto", "yip-transport", "yip-device"]
