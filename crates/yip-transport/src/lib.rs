@@ -6,6 +6,9 @@
 pub mod classify;
 pub use classify::{Classifier, PolicyRule};
 
+pub mod control;
+pub use control::AdaptiveController;
+
 pub mod fec;
 pub use fec::{FecEncoder, FecReassembler, Symbol};
 
