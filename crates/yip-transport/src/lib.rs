@@ -6,6 +6,9 @@
 pub mod classify;
 pub use classify::{Classifier, PolicyRule};
 
+pub mod flow;
+pub use flow::FlowTable;
+
 pub mod control;
 pub use control::AdaptiveController;
 
