@@ -28,7 +28,9 @@ pub struct FlowKey {
 pub struct PolicyRule {
     /// IP protocol number to match (None = any).
     pub proto: Option<u8>,
-    /// Destination L4 port to match (None = any).
+    /// Destination L4 port to match (None = any). Note: non-TCP/UDP packets
+    /// report port 0, so `Some(0)` also matches ICMP/ESP/etc.; discriminate
+    /// non-port protocols with `proto`, not `dst_port`.
     pub dst_port: Option<u16>,
     /// Class assigned to matching flows.
     pub class: FlowClass,
