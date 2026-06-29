@@ -37,7 +37,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-shear
       - name: Unused dependencies
-        run: cargo shear --expand
+        run: cargo shear
 
   deny:
     runs-on: ubuntu-latest
