@@ -5,6 +5,7 @@
 
 use siphasher::sip::SipHasher24;
 use std::hash::Hasher;
+use subtle::ConstantTimeEq;
 
 /// A single on-wire frame carrying one FEC symbol.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,10 +30,6 @@ pub const TAG_LEN: usize = 8;
 pub const MIN_FRAME: usize = HEADER_LEN + TAG_LEN;
 
 /// Serialize the logical header (big-endian, fixed layout).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used in M2 codec implementation")
-)]
 fn write_header(frame: &Frame) -> [u8; HEADER_LEN] {
     let mut out = [0u8; HEADER_LEN];
     out[0..8].copy_from_slice(&frame.conn_tag.to_be_bytes());
@@ -43,10 +40,6 @@ fn write_header(frame: &Frame) -> [u8; HEADER_LEN] {
 }
 
 /// Parse the logical header fields back out.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used in M2 codec implementation")
-)]
 fn read_header(bytes: &[u8; HEADER_LEN]) -> (u64, u16, [u8; 4], u8) {
     let conn_tag = u64::from_be_bytes(bytes[0..8].try_into().expect("8 bytes"));
     let object_id = u16::from_be_bytes(bytes[8..10].try_into().expect("2 bytes"));
@@ -56,10 +49,6 @@ fn read_header(bytes: &[u8; HEADER_LEN]) -> (u64, u16, [u8; 4], u8) {
 }
 
 /// Compute the 8-byte coverage-auth tag over `covered` under `auth_key`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the Codec in M2 Task 4")
-)]
 fn auth_tag(auth_key: &[u8; 16], covered: &[u8]) -> [u8; TAG_LEN] {
     let mut hasher = SipHasher24::new_with_key(auth_key);
     hasher.write(covered);
@@ -68,10 +57,6 @@ fn auth_tag(auth_key: &[u8; 16], covered: &[u8]) -> [u8; TAG_LEN] {
 
 /// Generate `n` mask bytes as a SipHash-CTR keystream under `hp_key`,
 /// seeded by `sample`. Block i = SipHash24(hp_key, sample ‖ i_be_u32).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the Codec in M2 Task 4")
-)]
 fn keystream(hp_key: &[u8; 16], sample: &[u8], n: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(n);
     let mut counter: u32 = 0;
@@ -87,10 +72,6 @@ fn keystream(hp_key: &[u8; 16], sample: &[u8], n: usize) -> Vec<u8> {
 }
 
 /// XOR `mask` into `buf` byte-for-byte (`buf.len()` must be `<= mask.len()`).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the Codec in M2 Task 4")
-)]
 fn xor_in_place(buf: &mut [u8], mask: &[u8]) {
     for (b, m) in buf.iter_mut().zip(mask.iter()) {
         *b ^= *m;
@@ -108,12 +89,71 @@ pub enum WireError {
     Malformed,
 }
 
+/// Wire codec: frames `Frame`s with a SipHash coverage-auth tag and keyed
+/// header protection. Keys are injected (real session keys arrive in M3).
+pub struct Codec {
+    auth_key: [u8; 16],
+    hp_key: [u8; 16],
+}
+
+impl Codec {
+    /// Construct a codec from a 16-byte auth key and a 16-byte header-protection key.
+    pub fn new(auth_key: [u8; 16], hp_key: [u8; 16]) -> Self {
+        Self { auth_key, hp_key }
+    }
+}
+
 /// Encodes [`Frame`]s to datagrams and back. Implemented in M2.
 pub trait WireCodec {
     /// Serialize and header-protect a frame into a wire datagram.
     fn frame(&self, frame: &Frame) -> Vec<u8>;
     /// Authenticate, deprotect, and parse a datagram into a [`Frame`].
     fn deframe(&self, datagram: &[u8]) -> Result<Frame, WireError>;
+}
+
+impl WireCodec for Codec {
+    fn frame(&self, frame: &Frame) -> Vec<u8> {
+        let header = write_header(frame);
+        let mut out = Vec::with_capacity(HEADER_LEN + frame.payload.len() + TAG_LEN);
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&frame.payload);
+        // Authenticate header‖payload, then append the tag.
+        let tag = auth_tag(&self.auth_key, &out);
+        out.extend_from_slice(&tag);
+        // Header-protect: XOR a keyed mask (seeded by the tag) over the header.
+        let mask = keystream(&self.hp_key, &tag, HEADER_LEN);
+        xor_in_place(&mut out[..HEADER_LEN], &mask);
+        out
+    }
+
+    fn deframe(&self, datagram: &[u8]) -> Result<Frame, WireError> {
+        if datagram.len() < MIN_FRAME {
+            return Err(WireError::Malformed);
+        }
+        let tag = &datagram[datagram.len() - TAG_LEN..];
+        // Recover the header by removing the keyed mask (seeded by the tag).
+        let mask = keystream(&self.hp_key, tag, HEADER_LEN);
+        let mut header = [0u8; HEADER_LEN];
+        header.copy_from_slice(&datagram[..HEADER_LEN]);
+        xor_in_place(&mut header, &mask);
+        let payload = &datagram[HEADER_LEN..datagram.len() - TAG_LEN];
+        // Recompute the tag over recovered-header‖payload and compare in constant time.
+        let mut authed = Vec::with_capacity(HEADER_LEN + payload.len());
+        authed.extend_from_slice(&header);
+        authed.extend_from_slice(payload);
+        let expected = auth_tag(&self.auth_key, &authed);
+        if expected.ct_eq(tag).unwrap_u8() != 1 {
+            return Err(WireError::AuthFailed);
+        }
+        let (conn_tag, object_id, payload_id, flags) = read_header(&header);
+        Ok(Frame {
+            conn_tag,
+            object_id,
+            payload_id,
+            flags,
+            payload: payload.to_vec(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -163,6 +203,63 @@ mod tests {
         // a different sample yields a different stream
         let mask2 = keystream(&hp, &[0xBBu8; TAG_LEN], HEADER_LEN);
         assert_ne!(mask, mask2);
+    }
+
+    #[test]
+    fn codec_roundtrips_a_frame() {
+        let codec = Codec::new([4u8; 16], [5u8; 16]);
+        let frame = Frame {
+            conn_tag: 0xDEAD_BEEF_0000_0001,
+            object_id: 7,
+            payload_id: [1, 2, 3, 4],
+            flags: 0b0000_0011,
+            payload: b"the quick brown fox".to_vec(),
+        };
+        let wire = codec.frame(&frame);
+        assert!(wire.len() >= MIN_FRAME);
+        assert_eq!(codec.deframe(&wire).unwrap(), frame);
+    }
+
+    #[test]
+    fn codec_rejects_tampered_frame() {
+        let codec = Codec::new([4u8; 16], [5u8; 16]);
+        let frame = Frame {
+            conn_tag: 1,
+            object_id: 1,
+            payload_id: [0; 4],
+            flags: 0,
+            payload: b"payload".to_vec(),
+        };
+        let mut wire = codec.frame(&frame);
+        let last = wire.len() - 1;
+        wire[last] ^= 0x01; // flip a payload/tag bit
+        assert_eq!(codec.deframe(&wire), Err(WireError::AuthFailed));
+    }
+
+    #[test]
+    fn codec_rejects_short_datagram() {
+        let codec = Codec::new([4u8; 16], [5u8; 16]);
+        assert_eq!(
+            codec.deframe(&[0u8; MIN_FRAME - 1]),
+            Err(WireError::Malformed)
+        );
+    }
+
+    #[test]
+    fn codec_has_no_constant_header_bytes() {
+        // Two frames identical except conn_tag must not share a plaintext-looking
+        // header prefix on the wire (header is protected).
+        let codec = Codec::new([4u8; 16], [5u8; 16]);
+        let base = Frame {
+            conn_tag: 0,
+            object_id: 0,
+            payload_id: [0; 4],
+            flags: 0,
+            payload: vec![],
+        };
+        let wire = codec.frame(&base);
+        // The first 15 wire bytes are the protected all-zero header; they must not be all zero.
+        assert_ne!(&wire[..HEADER_LEN], &[0u8; HEADER_LEN]);
     }
 
     #[test]
