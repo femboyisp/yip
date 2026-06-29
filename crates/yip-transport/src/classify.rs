@@ -1,11 +1,7 @@
 //! Per-flow classification: map an inner packet to a [`FlowClass`] via the
-//! precedence policy rule -> DSCP/ToS -> default.
-//!
-//! A heuristic layer (between DSCP and default) is deferred: a correct one needs
-//! per-5-tuple rate/burstiness state, since a lone small unmarked packet is
-//! indistinguishable from a realtime packet on a single-packet basis. It lands
-//! when the flow table arrives in a later milestone.
+//! precedence policy rule -> DSCP/ToS -> flow-table heuristic -> default.
 
+use crate::flow::FlowTable;
 use crate::FlowClass;
 
 /// The 5-tuple that uniquely identifies a flow.
@@ -37,9 +33,9 @@ pub struct PolicyRule {
 }
 
 /// Classifies inner packets into flow classes.
-#[derive(Debug, Clone)]
 pub struct Classifier {
     rules: Vec<PolicyRule>,
+    flows: FlowTable,
 }
 
 struct Parsed {
@@ -50,12 +46,17 @@ struct Parsed {
 impl Classifier {
     /// Build a classifier from an ordered list of policy rules.
     pub fn new(rules: Vec<PolicyRule>) -> Self {
-        Self { rules }
+        Self {
+            rules,
+            flows: FlowTable::new(4096, 30_000),
+        }
     }
 
     /// Classify an inner frame. `l2` = true when the frame is an Ethernet (TAP)
     /// frame (skip the 14-byte Ethernet header), false for an L3 (TUN) IP packet.
-    pub fn classify(&self, inner: &[u8], l2: bool) -> FlowClass {
+    /// `now_ms` is the current wall-clock time in milliseconds, used by the flow
+    /// heuristic.
+    pub fn classify(&mut self, inner: &[u8], l2: bool, now_ms: u64) -> FlowClass {
         let Some(p) = parse_ip(inner, l2) else {
             return FlowClass::Default;
         };
@@ -73,7 +74,12 @@ impl Classifier {
             8 | 10 | 12 | 14 => return FlowClass::Bulk,      // CS1, AF11..AF13 (bulk-ish)
             _ => {}
         }
-        // 3. default
+        // 3. heuristic: observe this packet, then consult flow history
+        self.flows.observe(&p.key, inner.len(), now_ms);
+        if let Some(class) = self.flows.classify(&p.key) {
+            return class;
+        }
+        // 4. default
         FlowClass::Default
     }
 }
@@ -159,28 +165,31 @@ mod tests {
 
     #[test]
     fn dscp_ef_maps_to_realtime() {
-        let c = Classifier::new(vec![]);
+        let mut c = Classifier::new(vec![]);
         // DSCP 46 (EF) -> Realtime
-        assert_eq!(c.classify(&ipv4(46, 17, 5000), false), FlowClass::Realtime);
+        assert_eq!(
+            c.classify(&ipv4(46, 17, 5000), false, 0),
+            FlowClass::Realtime
+        );
         // DSCP 0 default -> Default
-        assert_eq!(c.classify(&ipv4(0, 17, 5000), false), FlowClass::Default);
+        assert_eq!(c.classify(&ipv4(0, 17, 5000), false, 0), FlowClass::Default);
     }
 
     #[test]
     fn policy_rule_overrides_dscp() {
-        let c = Classifier::new(vec![PolicyRule {
+        let mut c = Classifier::new(vec![PolicyRule {
             proto: Some(17),
             dst_port: Some(5000),
             class: FlowClass::Bulk,
         }]);
         // policy wins even though DSCP says realtime
-        assert_eq!(c.classify(&ipv4(46, 17, 5000), false), FlowClass::Bulk);
+        assert_eq!(c.classify(&ipv4(46, 17, 5000), false, 0), FlowClass::Bulk);
     }
 
     #[test]
     fn malformed_packet_is_default() {
-        let c = Classifier::new(vec![]);
-        assert_eq!(c.classify(&[0u8; 3], false), FlowClass::Default);
+        let mut c = Classifier::new(vec![]);
+        assert_eq!(c.classify(&[0u8; 3], false, 0), FlowClass::Default);
     }
 
     #[test]
@@ -199,5 +208,20 @@ mod tests {
         assert_eq!(parsed.key.src_port, 1111);
         assert_eq!(parsed.key.dst_port, 2222);
         assert_eq!(parsed.key.proto, 17);
+    }
+
+    #[test]
+    fn heuristic_classifies_unmarked_small_flow_after_warmup() {
+        let mut c = Classifier::new(vec![]);
+        // unmarked (DSCP 0) small UDP packets on one flow
+        let pkt = ipv4(0, 17, 5000); // 24 bytes, DSCP 0
+                                     // first few packets: cold -> Default
+        assert_eq!(c.classify(&pkt, false, 0), FlowClass::Default);
+        // warm the flow up with several small packets
+        for i in 1..6 {
+            c.classify(&pkt, false, i * 5);
+        }
+        // now the heuristic should kick in -> Realtime
+        assert_eq!(c.classify(&pkt, false, 30), FlowClass::Realtime);
     }
 }
