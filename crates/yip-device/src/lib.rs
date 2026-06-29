@@ -80,6 +80,8 @@ fn bring_up(ifname: &[u8; libc::IFNAMSIZ]) -> Result<(), DeviceError> {
         }
         let rc_get = libc::ioctl(sock_fd, libc::SIOCGIFFLAGS, &raw mut req);
         if rc_get == 0 {
+            // FFI: libc exposes IFF_UP/IFF_RUNNING as c_int, but `ifreq.ifr_flags`
+            // is c_short; the combined value (0x41) fits trivially.
             req.flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
             let rc_set = libc::ioctl(sock_fd, libc::SIOCSIFFLAGS, &raw mut req);
             libc::close(sock_fd);
