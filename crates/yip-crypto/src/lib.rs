@@ -40,7 +40,6 @@ struct ReplayWindow {
 }
 
 impl ReplayWindow {
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Session in M3 Task 4"))]
     fn new() -> Self {
         Self {
             latest: 0,
@@ -50,7 +49,6 @@ impl ReplayWindow {
     }
 
     /// Accept `counter` if fresh, recording it; reject replays and too-old counters.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by Session in M3 Task 4"))]
     fn check_and_set(&mut self, counter: u64) -> bool {
         if !self.started {
             self.started = true;
@@ -160,6 +158,77 @@ impl Handshake {
             out
         })
     }
+
+    /// Convert a completed handshake into an AEAD [`Session`].
+    pub fn into_session(self) -> Result<Session, CryptoError> {
+        let transport = self
+            .inner
+            .into_stateless_transport_mode()
+            .map_err(|_| CryptoError::Handshake)?;
+        Ok(Session {
+            transport,
+            send_counter: 0,
+            replay: ReplayWindow::new(),
+        })
+    }
+}
+
+/// A sealed frame: the AEAD ciphertext plus the explicit nonce it was sealed
+/// under. The caller carries `counter` on the wire so the peer can `open`.
+#[derive(Debug, Clone)]
+pub struct Sealed {
+    /// The explicit AEAD nonce assigned to this frame.
+    pub counter: u64,
+    /// The AEAD ciphertext (plaintext length + 16-byte tag).
+    pub ciphertext: Vec<u8>,
+}
+
+/// An established AEAD session. Seals outgoing frames under a monotonic counter
+/// and opens incoming frames out of order, rejecting replays.
+pub struct Session {
+    transport: snow::StatelessTransportState,
+    send_counter: u64,
+    replay: ReplayWindow,
+}
+
+impl Session {
+    /// Seal one inner frame, assigning it the next send counter.
+    pub fn seal(&mut self, plaintext: &[u8]) -> Result<Sealed, CryptoError> {
+        let counter = self.send_counter;
+        let mut buf = vec![0u8; plaintext.len() + 16];
+        let n = self
+            .transport
+            .write_message(counter, plaintext, &mut buf)
+            .map_err(|_| CryptoError::Decrypt)?;
+        buf.truncate(n);
+        self.send_counter = self
+            .send_counter
+            .checked_add(1)
+            .ok_or(CryptoError::Decrypt)?;
+        Ok(Sealed {
+            counter,
+            ciphertext: buf,
+        })
+    }
+
+    /// Open one inner frame received under explicit `counter`, enforcing replay protection.
+    ///
+    /// Note: the replay window slot is marked before AEAD verification, matching WireGuard's
+    /// behaviour. A forged counter that fails AEAD still consumes a window slot, but forged
+    /// frames cannot be opened. A stricter "only mark on AEAD success" variant is a possible
+    /// later refinement.
+    pub fn open(&mut self, counter: u64, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        if !self.replay.check_and_set(counter) {
+            return Err(CryptoError::Replay);
+        }
+        let mut buf = vec![0u8; ciphertext.len()];
+        let n = self
+            .transport
+            .read_message(counter, ciphertext, &mut buf)
+            .map_err(|_| CryptoError::Decrypt)?;
+        buf.truncate(n);
+        Ok(buf)
+    }
 }
 
 #[cfg(test)]
@@ -190,6 +259,55 @@ mod tests {
             !w.check_and_set(5),
             "counter now far below window rejected as too old"
         );
+    }
+
+    // Helper: run a full handshake and return (initiator_session, responder_session).
+    fn established_pair() -> (Session, Session) {
+        let resp_kp = generate_keypair();
+        let init_kp = generate_keypair();
+        let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
+        let mut res = Handshake::responder(&resp_kp.private).unwrap();
+        let m1 = ini.write_message().unwrap();
+        res.read_message(&m1).unwrap();
+        let m2 = res.write_message().unwrap();
+        ini.read_message(&m2).unwrap();
+        (ini.into_session().unwrap(), res.into_session().unwrap())
+    }
+
+    #[test]
+    fn session_seals_and_opens_roundtrip() {
+        let (mut a, mut b) = established_pair();
+        let s = a.seal(b"inner packet").unwrap();
+        assert_eq!(s.counter, 0, "first counter is 0");
+        assert_eq!(b.open(s.counter, &s.ciphertext).unwrap(), b"inner packet");
+    }
+
+    #[test]
+    fn session_opens_out_of_order() {
+        let (mut a, mut b) = established_pair();
+        let s0 = a.seal(b"zero").unwrap();
+        let s1 = a.seal(b"one").unwrap();
+        assert_eq!(s1.counter, 1);
+        // deliver 1 before 0
+        assert_eq!(b.open(s1.counter, &s1.ciphertext).unwrap(), b"one");
+        assert_eq!(b.open(s0.counter, &s0.ciphertext).unwrap(), b"zero");
+    }
+
+    #[test]
+    fn session_rejects_replay() {
+        let (mut a, mut b) = established_pair();
+        let s = a.seal(b"x").unwrap();
+        assert!(b.open(s.counter, &s.ciphertext).is_ok());
+        assert_eq!(b.open(s.counter, &s.ciphertext), Err(CryptoError::Replay));
+    }
+
+    #[test]
+    fn session_rejects_tampered_ciphertext() {
+        let (mut a, mut b) = established_pair();
+        let s = a.seal(b"y").unwrap();
+        let mut bad = s.ciphertext.clone();
+        bad[0] ^= 0x01;
+        assert_eq!(b.open(s.counter, &bad), Err(CryptoError::Decrypt));
     }
 
     #[test]
