@@ -259,6 +259,13 @@ WireGuard-class latency and materially flatter under loss**.
   clean links); bulk classes tolerate ~15–20 %+.
 - Throughput ~1–5 Gbps/core (io_uring) → 10 Gbps+/core (AF_XDP).
 
+### Backend build order
+
+Both backends ship in #1, but built in this order: **(1) io_uring** (portable, any kernel 6.x, no
+special NIC) to get the tunnel end-to-end and the bench harness producing numbers; **(2) AF_XDP
+zero-copy** as the bare-metal accelerant once the protocol is proven. The plain
+`recvmmsg`/`sendmmsg` path exists only as the fallback rung, not a build milestone.
+
 ### Explicitly NOT in #1
 
 No discovery / NAT traversal / relay (#2); no anti-DPI obfuscation (#3, though `yip-wire` is built
