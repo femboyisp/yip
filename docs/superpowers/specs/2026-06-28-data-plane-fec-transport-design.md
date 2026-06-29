@@ -8,7 +8,7 @@
 
 ## 0. Context & decomposition
 
-The overall project (see root `README.md` and `docs/research/00-overview.md`) is a low-latency,
+The overall project (see `projectref.md` and `docs/research/00-overview.md`) is a low-latency,
 high-performance P2P mesh-network VPN tunnel in Rust. That is a *platform*, not one project. It is
 decomposed into five sub-projects, each with its own spec → plan → build cycle:
 

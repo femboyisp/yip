@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repository is
 
-This is a **design/research-stage** project (not yet a codebase) to build a new networking application:
-a **low-latency, high-performance, P2P mesh-network VPN tunnel written in Rust**. The full goal is in
-the root `README.md`. Key required properties:
+This project builds **yip**, a **low-latency, high-performance, P2P mesh-network VPN tunnel written
+in Rust**. The original full brief lives in `projectref.md` (local, git-ignored). Key required
+properties:
 
 - NAT hole-punching (rendezvous + UDP hole-punching; relay fallback)
 - RaptorQ forward error correction (rateless FEC) for lossy links
@@ -14,13 +14,18 @@ the root `README.md`. Key required properties:
 - Post-quantum encryption at high performance / low latency, with key rotation
 - Elimination of DPI-detectable network signatures (anti-DPI / censorship resistance)
 
-There is **no Rust code yet.** The current contents are research and (forthcoming) design docs.
+**Status:** past research; the design is approved and implementation has begun. Sub-project #1 (core
+data plane + FEC transport) is specced, and milestone **M1 (workspace scaffold + quality gates) is
+merged** — six crate stubs (`yip-io`, `yip-wire`, `yip-crypto`, `yip-transport`, `yip-device`) plus
+the `yipd` binary, all gates green. See `README.md` for the public overview and `docs/` for design.
 
 ## Layout
 
-- `README.md` — the vision: goal + an annotated list of ~35 reference projects with links.
+- `README.md` — public repository overview: goals, status, architecture, build.
+- `projectref.md` — the original vision brief + annotated list of ~35 reference projects
+  (**local, git-ignored** — not committed).
 - `refrences/` — local clones of those reference projects (note the spelling: `refrences`, not
-  `references`). **Read-only reference material — do not modify these clones.**
+  `references`; **local, git-ignored**). **Read-only reference material — do not modify these clones.**
 - `docs/research/` — our analysis of every reference repo. **Start with
   [`docs/research/00-overview.md`](docs/research/00-overview.md)**, which synthesizes the
   cross-cutting design conclusions and indexes the seven per-cluster analysis files (01–07).
@@ -31,9 +36,10 @@ There is **no Rust code yet.** The current contents are research and (forthcomin
 - The research in `docs/research/` is the institutional memory — consult it before proposing
   architecture; it already records what each reference does well/badly and what is reusable.
 - When analyzing a reference project, the clones in `refrences/` are authoritative — read the actual
-  source rather than relying on the README's one-line descriptions.
+  source rather than relying on the one-line descriptions in `projectref.md`.
 - Design work follows the superpowers flow: **brainstorming → spec in `docs/superpowers/specs/`
   → writing-plans → implementation.** Do not jump to scaffolding code before a design is approved.
+- Implementation milestones are tracked in `docs/superpowers/plans/`; M1 is complete and merged.
 
 ## Key architectural decisions reached during research
 

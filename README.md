@@ -1,0 +1,89 @@
+# yip
+
+**A low-latency, high-performance, P2P mesh-network VPN tunnel, written in Rust.**
+
+yip is built for *insane* low latency on direct peer-to-peer links — fast enough for gaming and
+streaming, and for L2 IXP-style offloading with forward-error-correction autocorrection — while
+also serving as a general-purpose L2/L3 mesh VPN. Censorship-resistance, traffic-analysis defense,
+and anonymity are opt-in dials layered on top, not always-on costs.
+
+> **Status:** early implementation. The design is approved and the data-plane core is being built
+> milestone by milestone. **M1 (workspace scaffold + quality gates) is merged**; protocol behavior
+> lands in M2 onward. See [Roadmap](#roadmap).
+
+## Goals
+
+- **Insane low latency** on direct P2P paths — the north star. The latency lever is the I/O model
+  (single `io_uring` ring over UDP + TUN/TAP, then AF_XDP zero-copy), not the crypto.
+- **L2 (TAP) and L3 (TUN)** data planes — Ethernet bridging *and* IP tunneling.
+- **Adaptive RaptorQ FEC** — rateless forward error correction that recovers packet loss with
+  **zero extra round-trips**, tuned per-flow so realtime traffic pays no latency tax and lossy/bulk
+  links spend redundancy where it helps. Loss recovery without retransmission keeps p99 latency flat
+  under loss, where plain tunnels spike.
+- **NAT hole-punching** — rendezvous + UDP hole-punching, with a zero-knowledge relay fallback.
+- **Post-quantum-ready crypto** — classical Noise-IK now (reusing audited primitives), structured so
+  a Rosenpass-style hybrid PQ handshake (Classic McEliece + ML-KEM) drops in later. ~120 s rekey.
+- **No DPI-detectable signatures** — no fixed magic bytes or constant header offsets; keyed
+  header-protection, randomized padding, timing jitter. nDPI/nDPId are the test adversary.
+
+## Architecture
+
+yip is a control/data split. The whole project is decomposed into five sub-projects, each built and
+shipped independently:
+
+| # | Sub-project | What it adds |
+|---|---|---|
+| **1** | **Core data plane + FEC transport** *(in progress)* | Encrypted L2+L3 tunnel between peers over an adaptive RaptorQ-FEC UDP transport on a kernel-bypass-ready I/O layer. |
+| 2 | Control plane | Decentralized discovery (DHT/gossip), self-certifying key-derived addresses, NAT traversal, relay fallback. |
+| 3 | Anti-DPI / obfuscation | Pluggable obfuscating link layer (AmneziaWG recipe, optional REALITY TLS-mimicry); nDPI in CI. |
+| 4 | Traffic-analysis defense | DAITA-style padding/timing; optional per-flow onion routing (Arti crates). |
+| 5 | Hardening / multi-platform | macOS/Windows, optional AF_XDP/kernel-module relay tier, management UX. |
+
+The data plane (sub-project #1) is a Cargo workspace of focused crates, each one trait behind a
+clean interface:
+
+| Crate | Responsibility |
+|---|---|
+| `yip-io` | Kernel-bypass-ready packet I/O (`io_uring` ring over UDP + TUN/TAP; AF_XDP backend). The latency core. |
+| `yip-wire` | Lean, DPI-resistant wire framing: keyed header-protection, coverage-based auth, explicit FEC headers. |
+| `yip-crypto` | AEAD session crypto (Noise-IK), anti-replay, rekey — PQ-ready. |
+| `yip-transport` | Adaptive RaptorQ FEC, per-flow classifier, redundancy controller, thin ARQ. |
+| `yip-device` | L3 (TUN) and L2 (TAP, with MAC learning) tunnel endpoints. |
+| `yipd` | The daemon that wires it all together. |
+
+Full design: [`docs/superpowers/specs/2026-06-28-data-plane-fec-transport-design.md`](docs/superpowers/specs/2026-06-28-data-plane-fec-transport-design.md).
+Architecture summary: [`docs/architecture.md`](docs/architecture.md).
+
+## Roadmap
+
+- [x] **M1** — Workspace scaffold + all quality gates (lints, CI, coverage, mutation, fuzz).
+- [ ] **M2** — `yip-wire`: framing, keyed header-protection, coverage-auth (fuzzed).
+- [ ] **M3** — `yip-crypto`: Noise-IK session + rekey.
+- [ ] **M4** — `yip-io` (io_uring) + `yip-device`: working L3 then L2 tunnel.
+- [ ] **M5** — `yip-transport`: adaptive RaptorQ pipeline + ARQ.
+- [ ] **M6** — `yipd` end-to-end 2-peer tunnel + benchmark harness (vs WireGuard, n2n, ZeroTier, …).
+
+## Building
+
+Requires a recent stable Rust toolchain (Linux).
+
+```sh
+cargo build --workspace      # build everything
+cargo test  --workspace      # run the test suite
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
+
+CI additionally runs `cargo-shear` (unused deps), `cargo-deny` (licenses + advisories),
+`cargo-llvm-cov` (≥90 % line coverage on logic crates), `cargo-mutants`, and `cargo-fuzz`.
+
+## Contributing
+
+Code follows the [Mullvad coding guidelines](https://github.com/mullvad/mullvadvpn-app): the
+workspace lint set with `-D warnings`, no `as` casts for numeric conversion (`From`/`TryFrom`),
+`#![forbid(unsafe_code)]` on every crate except `yip-io`, pinned dependency versions, and a
+[Keep a Changelog](https://keepachangelog.com/en/1.0.0/) `CHANGELOG.md`.
+
+## License
+
+[MPL-2.0](LICENSE).

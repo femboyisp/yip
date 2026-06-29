@@ -1,6 +1,6 @@
 # Reference Research — Overview & Synthesis
 
-This directory contains the analysis of every reference project listed in the root `README.md`,
+This directory contains the analysis of every reference project listed in the original brief (`projectref.md`),
 grouped by role. Each file covers, per repo: what it does, language/license, protocols & crypto,
 architecture, strengths/weaknesses, what could be done better (privacy, performance, latency,
 decentralization/mesh/p2p, anti-DPI, encryption, security), and reusable ideas for our project.
@@ -17,7 +17,7 @@ decentralization/mesh/p2p, anti-DPI, encryption, security), and reusable ideas f
 
 ---
 
-## The goal (from README.md)
+## The goal (from projectref.md)
 
 A **low-latency, high-performance, P2P mesh-network VPN tunnel**, written in **Rust**, with:
 NAT hole-punching · RaptorQ FEC · L2 (TAP) bridging + L3 (TUN) tunneling · post-quantum
@@ -48,7 +48,7 @@ each cluster file.
 - Reuse **fastd's dynamic peer-admission model** (`on-verify` hooks + peer groups) for mesh joins.
 
 ### 3. NAT traversal & relay
-- Implement full UDP hole-punching (STUN-like rendezvous; see Bryan Ford's paper cited in README).
+- Implement full UDP hole-punching (STUN-like rendezvous; see Bryan Ford's paper cited in projectref.md).
 - Provide a **zero-knowledge relay fallback** (gsocket GSRN model: peers find each other by
   `hash(shared_secret)`, relay only ever sees ciphertext) when direct connection fails.
 
