@@ -66,6 +66,37 @@ fn auth_tag(auth_key: &[u8; 16], covered: &[u8]) -> [u8; TAG_LEN] {
     hasher.finish().to_be_bytes()
 }
 
+/// Generate `n` mask bytes as a SipHash-CTR keystream under `hp_key`,
+/// seeded by `sample`. Block i = SipHash24(hp_key, sample ‖ i_be_u32).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the Codec in M2 Task 4")
+)]
+fn keystream(hp_key: &[u8; 16], sample: &[u8], n: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(n);
+    let mut counter: u32 = 0;
+    while out.len() < n {
+        let mut hasher = SipHasher24::new_with_key(hp_key);
+        hasher.write(sample);
+        hasher.write(&counter.to_be_bytes());
+        out.extend_from_slice(&hasher.finish().to_be_bytes());
+        counter += 1;
+    }
+    out.truncate(n);
+    out
+}
+
+/// XOR `mask` into `buf` byte-for-byte (`buf.len()` must be `<= mask.len()`).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the Codec in M2 Task 4")
+)]
+fn xor_in_place(buf: &mut [u8], mask: &[u8]) {
+    for (b, m) in buf.iter_mut().zip(mask.iter()) {
+        *b ^= *m;
+    }
+}
+
 /// Errors from decoding a wire datagram.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum WireError {
@@ -112,6 +143,26 @@ mod tests {
             payload: vec![1, 2, 3],
         };
         assert_eq!(frame.object_id, 42);
+    }
+
+    #[test]
+    fn keystream_masks_reversibly_and_hides_constants() {
+        let hp = [3u8; 16];
+        let sample = [0xAAu8; TAG_LEN];
+        let mut header = [0u8; HEADER_LEN]; // all-zero "constant" header
+        let mask = keystream(&hp, &sample, HEADER_LEN);
+        assert_eq!(mask.len(), HEADER_LEN);
+        xor_in_place(&mut header, &mask);
+        assert_ne!(
+            header, [0u8; HEADER_LEN],
+            "constant header is hidden after masking"
+        );
+        // XOR again with the same mask restores the original
+        xor_in_place(&mut header, &mask);
+        assert_eq!(header, [0u8; HEADER_LEN], "masking is reversible");
+        // a different sample yields a different stream
+        let mask2 = keystream(&hp, &[0xBBu8; TAG_LEN], HEADER_LEN);
+        assert_ne!(mask, mask2);
     }
 
     #[test]
