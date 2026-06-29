@@ -1,0 +1,28 @@
+# cargo-mutants configuration for the yip workspace.
+#
+# Equivalent-mutant exclusions: these are mutations that cannot be killed by
+# any test because the mutated form produces identical runtime behaviour to
+# the original code.  Each entry is a regexp matched against the full mutant
+# name (file:line:col: description).
+#
+# Three mutations have been proven equivalent and are excluded here:
+#
+# 1. `delete ! in ReplayWindow::check_and_set` (lib.rs ~line 53)
+#    The first-packet init path and the default advance/else paths produce
+#    identical (latest, bitmap) state for every u64 counter value, because
+#    u64 counters are never below the default `latest = 0`.
+#
+# 2. `replace | with ^ in ReplayWindow::check_and_set` (lib.rs ~line 64)
+#    The advance path computes `(bitmap << shift) | 1` with shift ≥ 1.
+#    Because shift ≥ 1, bit-0 of `bitmap << shift` is always 0, so
+#    `| 1` and `^ 1` produce the same result.
+#
+# 3. `replace < with <= in keystream` (lib.rs ~line 63)
+#    The extra loop iteration produced by `<=` appends an 8-byte SipHash
+#    block that is immediately discarded by the unconditional `truncate(n)`
+#    below the loop.  The returned slice is identical in both cases.
+exclude_re = [
+    "delete ! in ReplayWindow::check_and_set",
+    "replace \\| with \\^ in ReplayWindow::check_and_set",
+    "replace < with <= in keystream",
+]
