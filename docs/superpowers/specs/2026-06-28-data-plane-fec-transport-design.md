@@ -35,8 +35,8 @@ Build #1 first: it is the latency-critical core and the only piece fully testabl
 ### Locked decisions
 
 - **Data-plane foundation:** custom protocol — our own I/O + lean wire framing (norp-inspired
-  ideas), reusing **gotatun's audited Noise-IK + AEAD** as a crypto library only. Not a gotatun
-  fork; not building out norp; not hand-rolling crypto.
+  ideas). Crypto is **Noise-IK via the `snow` crate** (not hand-rolled), feeding our own framing.
+  Not a gotatun fork (gotatun emits WireGuard wire format, which we replace); not building out norp.
 - **Layering:** encrypt-then-FEC. AEAD-encrypt each inner frame end-to-end, then RaptorQ-encode the
   ciphertext for the wire. FEC never sees plaintext.
 - **FEC strategy:** adaptive per-flow dial (not fixed, not lane-based).
@@ -69,7 +69,7 @@ project (workspace lints, rustfmt, pre-commit, CI, coverage script, crate-splitt
 |---|---|
 | **`yip-io`** ⭐ | The latency core. `DataPlaneIo` trait. Backend A: a single `io_uring` ring servicing both the UDP socket and the TUN/TAP fd (DEFER_TASKRUN, NAPI busy-poll, registered files, multishot recv, opportunistic non-blocking batching; skip `SEND_ZC`). Backend B: AF_XDP zero-copy with graceful fallback (zerocopy → copy → io_uring → `recvmmsg`/`sendmmsg`). |
 | **`yip-wire`** | Lean custom framing: keyed header-protection (no fixed magic from byte 0), coverage-style selective authentication (NAT-survivable), epoch-rotating keyed conn tag, explicit FEC block header, 8-byte alignment, one symbol per datagram, no cross-packet fragmentation. |
-| **`yip-crypto`** | Reuse gotatun's audited Noise-IK + AEAD session (Curve25519 / ChaCha20-Poly1305 / BLAKE2s), anti-replay window, ~120 s rekey with an overlap window. Handshake structured for later PQ KEM drop-in. |
+| **`yip-crypto`** | Noise-IK handshake + AEAD session via the **`snow`** crate (`Noise_IK_25519_ChaChaPoly_BLAKE2s`), using snow's **stateless** transport (explicit `u64` nonce) so seal/open tolerate FEC reordering, plus our own sliding **anti-replay window**. ~120 s rekey via re-handshake with an overlap window. PSK-modifier insertion point reserved for the later Rosenpass PQ KEM. *(M3 decision: gotatun only exposes WireGuard-framed output — the DPI-fingerprintable format `yip-wire` replaces — and hides the raw Noise session; `snow` gives a clean handshake + raw explicit-nonce AEAD that feeds our own framing.)* |
 | **`yip-transport`** | RaptorQ encode/decode · per-flow classifier (precedence: policy → DSCP/ToS → heuristic → default) · adaptive controller (piggyback + periodic feedback) · thin ARQ for residual loss on reliable classes · per-flow coalescing/GRO dial unified with FEC class. The algorithmic heart. |
 | **`yip-device`** | `Tun` (L3) and `Tap` (L2 + MAC-learning table + broadcast) behind one `Device` trait, fed by `yip-io`'s ring. |
 | **`yipd`** | Daemon: static 2-peer config, wires device ↔ transport ↔ crypto ↔ wire ↔ io, runs the busy-poll loop, exposes tuning knobs (core pinning off the IRQ core, `rx-usecs 0–2`, C-state cap, `performance` governor, optional `SO_PREFER_BUSY_POLL` IRQ-suspension). |
