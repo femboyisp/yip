@@ -538,6 +538,10 @@ dependencies = [
 [[package]]
 name = "yip-device"
 version = "0.0.0"
+dependencies = [
+ "libc",
+ "thiserror",
+]
 
 [[package]]
 name = "yip-io"
