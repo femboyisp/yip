@@ -1,5 +1,10 @@
 //! Per-flow classification: map an inner packet to a [`FlowClass`] via the
-//! precedence policy rule -> DSCP/ToS -> heuristic -> default.
+//! precedence policy rule -> DSCP/ToS -> default.
+//!
+//! A heuristic layer (between DSCP and default) is deferred: a correct one needs
+//! per-5-tuple rate/burstiness state, since a lone small unmarked packet is
+//! indistinguishable from a realtime packet on a single-packet basis. It lands
+//! when the flow table arrives in a later milestone.
 
 use crate::FlowClass;
 
