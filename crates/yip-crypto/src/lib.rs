@@ -28,6 +28,60 @@ pub fn generate_keypair() -> Keypair {
     Keypair { private, public }
 }
 
+/// Number of past counters the replay window tracks behind the latest.
+const REPLAY_WINDOW_BITS: u64 = 64;
+
+/// A WireGuard-style sliding replay window over a monotonic `u64` counter.
+/// Bit `i` of `bitmap` records that `latest - i` has been seen.
+struct ReplayWindow {
+    latest: u64,
+    bitmap: u64,
+    started: bool,
+}
+
+impl ReplayWindow {
+    #[cfg_attr(not(test), expect(dead_code, reason = "used by Session in M3 Task 4"))]
+    fn new() -> Self {
+        Self {
+            latest: 0,
+            bitmap: 0,
+            started: false,
+        }
+    }
+
+    /// Accept `counter` if fresh, recording it; reject replays and too-old counters.
+    #[cfg_attr(not(test), expect(dead_code, reason = "used by Session in M3 Task 4"))]
+    fn check_and_set(&mut self, counter: u64) -> bool {
+        if !self.started {
+            self.started = true;
+            self.latest = counter;
+            self.bitmap = 1;
+            return true;
+        }
+        if counter > self.latest {
+            let shift = counter - self.latest;
+            self.bitmap = if shift >= REPLAY_WINDOW_BITS {
+                1
+            } else {
+                (self.bitmap << shift) | 1
+            };
+            self.latest = counter;
+            true
+        } else {
+            let diff = self.latest - counter;
+            if diff >= REPLAY_WINDOW_BITS {
+                return false; // too old
+            }
+            let bit = 1u64 << diff;
+            if self.bitmap & bit != 0 {
+                return false; // replay
+            }
+            self.bitmap |= bit;
+            true
+        }
+    }
+}
+
 /// Errors from the crypto layer.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CryptoError {
@@ -54,5 +108,21 @@ mod tests {
         assert_eq!(a.public.len(), 32);
         assert_ne!(a.private, b.private, "two keypairs differ");
         assert_ne!(a.public, [0u8; 32], "public key is not all-zero");
+    }
+
+    #[test]
+    fn replay_window_accepts_fresh_rejects_replays_and_old() {
+        let mut w = ReplayWindow::new();
+        assert!(w.check_and_set(0), "first counter accepted");
+        assert!(!w.check_and_set(0), "exact replay rejected");
+        assert!(w.check_and_set(1), "next in order accepted");
+        assert!(w.check_and_set(5), "jump ahead accepted");
+        assert!(w.check_and_set(3), "in-window out-of-order accepted");
+        assert!(!w.check_and_set(3), "replay of out-of-order rejected");
+        assert!(w.check_and_set(100), "large advance accepted");
+        assert!(
+            !w.check_and_set(5),
+            "counter now far below window rejected as too old"
+        );
     }
 }
