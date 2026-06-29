@@ -204,7 +204,7 @@ Quick taxonomy:
   `Accept()` yields a per-remote-peer pseudo-connection; built on `udpfrag` for
   transparent frag/reassembly.
 - **Language / license:** Go, MIT.
-- **Mechanism:** One `net.UDPConn` + a `readLoop` goroutine. Each packet → 
+- **Mechanism:** One `net.UDPConn` + a `readLoop` goroutine. Each packet →
   `udpfrag.ReassembleData`; completed messages are **demultiplexed by source
   address** into a `map[remoteAddr]*UDPpseudoConn`. New address → create
   pseudo-conn + push to `acceptChan`. Each `UDPpseudoConn` has its own buffered
