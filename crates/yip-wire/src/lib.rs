@@ -3,6 +3,9 @@
 //! milestone establishes the public surface later crates depend on.
 #![forbid(unsafe_code)]
 
+use siphasher::sip::SipHasher24;
+use std::hash::Hasher;
+
 /// A single on-wire frame carrying one FEC symbol.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
@@ -52,6 +55,17 @@ fn read_header(bytes: &[u8; HEADER_LEN]) -> (u64, u16, [u8; 4], u8) {
     (conn_tag, object_id, payload_id, flags)
 }
 
+/// Compute the 8-byte coverage-auth tag over `covered` under `auth_key`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the Codec in M2 Task 4")
+)]
+fn auth_tag(auth_key: &[u8; 16], covered: &[u8]) -> [u8; TAG_LEN] {
+    let mut hasher = SipHasher24::new_with_key(auth_key);
+    hasher.write(covered);
+    hasher.finish().to_be_bytes()
+}
+
 /// Errors from decoding a wire datagram.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum WireError {
@@ -74,6 +88,19 @@ pub trait WireCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_tag_is_keyed_and_covers_input() {
+        let k1 = [1u8; 16];
+        let k2 = [2u8; 16];
+        let a = auth_tag(&k1, b"hello");
+        let b = auth_tag(&k1, b"hello");
+        let c = auth_tag(&k1, b"hellp"); // one byte different
+        let d = auth_tag(&k2, b"hello"); // different key
+        assert_eq!(a, b, "deterministic for same key+input");
+        assert_ne!(a, c, "changes when covered bytes change");
+        assert_ne!(a, d, "changes when key changes");
+    }
 
     #[test]
     fn frame_carries_object_id() {
