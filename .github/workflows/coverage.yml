@@ -16,8 +16,8 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Coverage (logic crates)
+      - name: Coverage (logic + io_uring crates)
         run: >
           cargo llvm-cov --workspace
-          --exclude yip-io --exclude yipd
+          --exclude yip-device --exclude yipd
           --fail-under-lines 90 --summary-only

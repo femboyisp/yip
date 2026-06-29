@@ -1,0 +1,26 @@
+---
+name: Integration (privileged)
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  device-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build device tests
+        run: cargo test -p yip-device --no-run
+      - name: Run device tests under sudo (CAP_NET_ADMIN)
+        run: |
+          BIN=$(cargo test -p yip-device --no-run --message-format=json \
+            | jq -r 'select(.profile.test == true and (.target.name == "yip-device")) | .executable' \
+            | head -n1)
+          echo "running $BIN under sudo"
+          sudo -E "$BIN" --nocapture

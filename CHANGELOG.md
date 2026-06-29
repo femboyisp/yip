@@ -16,3 +16,5 @@ All notable changes to this project are documented here, following
   keyed header protection, with fuzzing of the deframe path.
 - `yip-crypto` Noise-IK handshake (via `snow`) and AEAD `Session` with explicit
   per-frame nonces and a sliding anti-replay window.
+- `yip-device` TUN (L3) and TAP (L2) tunnel devices, and `yip-io` io_uring
+  DataPlaneIo backend with a portable plain-socket fallback.
