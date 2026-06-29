@@ -20,3 +20,6 @@ All notable changes to this project are documented here, following
   DataPlaneIo backend with a portable plain-socket fallback.
 - `yip-transport` adaptive RaptorQ FEC: per-flow classifier, object encoder,
   pipelined erasure-tolerant reassembler, and a repair-ratio controller.
+- `yip-transport` stateful flow-table heuristic: classifies unmarked flows by
+  observed packet size/rate, completing the policy -> DSCP -> heuristic -> default
+  precedence chain.

@@ -6,6 +6,9 @@
 pub mod classify;
 pub use classify::{Classifier, PolicyRule};
 
+pub mod flow;
+pub use flow::FlowTable;
+
 pub mod control;
 pub use control::AdaptiveController;
 
@@ -100,13 +103,16 @@ impl Transport {
     }
 
     /// Classify `inner`, then FEC-encode the sealed `ciphertext` for that class.
+    /// `now_ms` is the current wall-clock time in milliseconds, forwarded to the
+    /// flow-table heuristic inside the classifier.
     pub fn encode(
         &mut self,
         ciphertext: &[u8],
         inner: &[u8],
         l2: bool,
+        now_ms: u64,
     ) -> (FlowClass, Vec<Symbol>) {
-        let class = self.classifier.classify(inner, l2);
+        let class = self.classifier.classify(inner, l2, now_ms);
         let params = class.params();
         let source = u32::try_from(ciphertext.len().div_ceil(usize::from(params.symbol_size)))
             .unwrap_or(u32::MAX)
@@ -152,7 +158,7 @@ mod tests {
         let mut inner = vec![0u8; 64];
         inner[0] = 0x45;
         inner[1] = 46 << 2; // DSCP EF -> Realtime
-        let (class, mut syms) = tx.encode(&ciphertext, &inner, false);
+        let (class, mut syms) = tx.encode(&ciphertext, &inner, false, 0);
         assert_eq!(class, FlowClass::Realtime);
         // drop every 6th symbol; decode the rest
         let mut out = None;
@@ -195,7 +201,7 @@ mod tests {
             .map(|i| u8::try_from(i % 251).unwrap())
             .collect();
         let inner = vec![0u8; 20]; // malformed -> Default class
-        let (class, syms) = tx.encode(&ciphertext, &inner, false);
+        let (class, syms) = tx.encode(&ciphertext, &inner, false, 0);
         // Decode to completion
         let mut decoded = false;
         for s in &syms {
@@ -227,7 +233,7 @@ mod tests {
                        // dst port at offset 40 + 2 = 42
         inner[42] = 0x13;
         inner[43] = 0x88; // port 5000
-        let (class, _syms) = tx.encode(&ciphertext, &inner, false);
+        let (class, _syms) = tx.encode(&ciphertext, &inner, false, 0);
         assert_eq!(class, FlowClass::Realtime);
     }
 }
