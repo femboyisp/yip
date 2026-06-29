@@ -14,3 +14,5 @@ All notable changes to this project are documented here, following
 - Public `README.md` and `docs/architecture.md`.
 - `yip-wire` frame codec: header serialization, SipHash coverage-auth tag, and
   keyed header protection, with fuzzing of the deframe path.
+- `yip-crypto` Noise-IK handshake (via `snow`) and AEAD `Session` with explicit
+  per-frame nonces and a sliding anti-replay window.
