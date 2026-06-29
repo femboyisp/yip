@@ -261,6 +261,79 @@ mod tests {
         );
     }
 
+    /// Advancing the window from counter A to B and then replaying A must be
+    /// rejected.  Kills the `shift = counter + latest` mutant on the advance
+    /// path (line 60) and the `bitmap << shift` → `bitmap >> shift` mutant on
+    /// the same path (line 64): both mutations misplace the old-counter bits so
+    /// the replay is no longer detected.
+    #[test]
+    fn replay_window_advance_then_replay_old_counter_rejected() {
+        let mut w = ReplayWindow::new();
+        // Establish counter 10 as the first-ever packet.
+        assert!(w.check_and_set(10), "counter 10 accepted as first");
+        // Advance to counter 15 (shift = 5 in real code; shift = 25 under the
+        // `counter + latest` mutant, and bits shift wrong under `>> shift`).
+        assert!(w.check_and_set(15), "advance to 15 accepted");
+        // Counter 10 is now diff=5 from latest=15; its bit must still be set.
+        assert!(
+            !w.check_and_set(10),
+            "replay of counter 10 after advance to 15 rejected"
+        );
+    }
+
+    /// After advancing the window to a new latest, an immediate replay of that
+    /// latest counter must be rejected.  Kills the `bitmap | 1` → `bitmap & 1`
+    /// and `bitmap | 1` → `bitmap ^ 1` mutants: both can leave bit-0 of the
+    /// new bitmap unset, making the just-accepted counter replayable.
+    #[test]
+    fn replay_window_new_latest_immediately_replayable_rejected() {
+        let mut w = ReplayWindow::new();
+        // Build a window where counter 9 is also recorded (bit 1 will be set
+        // at latest=10), so that when we advance to 11 the shifted bitmap has
+        // its LSB = 1.  Under `^ 1` that would clear bit-0, leaving latest-11
+        // unprotected.
+        assert!(w.check_and_set(10), "first packet at 10");
+        assert!(w.check_and_set(9), "counter 9 accepted in-order-ish");
+        // Advance from 10 to 11: shift=1, old bitmap has bit-1 set (counter 9).
+        // `bitmap << 1` yields a value with LSB = old-bit-1 = 1.
+        // Under `^ 1` that XORs the LSB back to 0, so the replay check below
+        // would wrongly accept.
+        assert!(w.check_and_set(11), "advance to 11 accepted");
+        assert!(!w.check_and_set(11), "replay of new latest 11 rejected");
+    }
+
+    /// The `diff = self.latest - counter` on the in-window path (line 69) must
+    /// use subtraction, not addition.  With `diff = latest + counter` the
+    /// diff is 25 (not 5) for latest=15 counter=10, so bit-5 (which is set)
+    /// is not checked and the replay slips through.
+    #[test]
+    fn replay_window_in_window_replay_rejected_after_advance() {
+        let mut w = ReplayWindow::new();
+        assert!(w.check_and_set(10), "first packet");
+        assert!(w.check_and_set(15), "advance to 15");
+        // Counter 10 is 5 below the new latest; real diff = 5, mutant diff = 25.
+        // Both are < 64, but bit-5 is set while bit-25 is not.
+        assert!(!w.check_and_set(10), "in-window replay at diff=5 rejected");
+    }
+
+    /// A freshly-built responder `Handshake` must not report `is_finished`
+    /// before any messages have been exchanged.  Kills the mutant that
+    /// replaces the `is_finished` body with `true` (line 150).
+    #[test]
+    fn handshake_not_finished_before_message_exchange() {
+        let kp = generate_keypair();
+        let res = Handshake::responder(&kp.private).unwrap();
+        assert!(
+            !res.is_finished(),
+            "responder reports not-finished before any messages"
+        );
+        let ini = Handshake::initiator(&kp.private, &kp.public).unwrap();
+        assert!(
+            !ini.is_finished(),
+            "initiator reports not-finished before any messages"
+        );
+    }
+
     // Helper: run a full handshake and return (initiator_session, responder_session).
     fn established_pair() -> (Session, Session) {
         let resp_kp = generate_keypair();
