@@ -39,7 +39,11 @@ mod tests {
 
     #[test]
     fn frame_carries_object_id() {
-        let frame = Frame { conn_tag: 7, object_id: 42, payload: vec![1, 2, 3] };
+        let frame = Frame {
+            conn_tag: 7,
+            object_id: 42,
+            payload: vec![1, 2, 3],
+        };
         assert_eq!(frame.object_id, 42);
     }
 }
