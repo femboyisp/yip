@@ -14,6 +14,7 @@ decentralization/mesh/p2p, anti-DPI, encryption, security), and reusable ideas f
 | [05-transport-fec.md](05-transport-fec.md) | Reliable-UDP / FEC / encapsulation | kcp, kcp2k-rust, UDPspeeder, udpfrag, udplistener, tcp-in-udp, icmptunnel, etherconn, norp, nyxpsi |
 | [06-crypto-pq-he.md](06-crypto-pq-he.md) | Crypto: AEAD, PQ, homomorphic | chacha20-blake3, lattigo, rosenpass (crypto) |
 | [07-dpi-detection.md](07-dpi-detection.md) | DPI engines (the adversary) | nDPI, nDPId, rustnet |
+| [08-xdp-ebpf.md](08-xdp-ebpf.md) | XDP/eBPF for the AF_XDP backend + shared `xdp-io` | xdpcap, stateful-XDP firewall, eBPF unit-testing (`BPF_PROG_RUN`) |
 
 ---
 
