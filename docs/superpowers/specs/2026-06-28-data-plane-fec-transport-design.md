@@ -285,10 +285,12 @@ by `blackwall`, so the two repos stay consistent.
   lengths, counters) and **nyxpsi's fatal bug was literally `let packet_symbol_size = size as u16`**.
   The guideline that forbids `as` would have caught it at compile time — so this rule is a primary
   defense, not a style nicety.
-- **Unsafe:** `yip-io` (io_uring/AF_XDP) is the only crate with significant `unsafe`. Every `unsafe`
-  block gets a `// SAFETY:` comment; every `unsafe fn` a `# Safety` doc section; blocks kept minimal.
-  `undocumented_unsafe_blocks` lint enforces it. Goal: confine `unsafe` to `yip-io`; the protocol
-  crates stay `#![forbid(unsafe_code)]`.
+- **Unsafe:** confined to the two **I/O crates** — `yip-io` (io_uring/AF_XDP) and `yip-device`
+  (TUN/TAP `TUNSETIFF` ioctl). Every `unsafe` block gets a `// SAFETY:` comment; every `unsafe fn` a
+  `# Safety` doc section; blocks kept minimal. `undocumented_unsafe_blocks` lint enforces it. The
+  three **protocol crates** (`yip-wire`, `yip-crypto`, `yip-transport`) stay `#![forbid(unsafe_code)]`.
+  *(M4 update: `yip-device` was originally slated forbid-unsafe, but creating a TUN/TAP device needs
+  a raw ioctl; rather than pull a device crate it carries one small documented `unsafe` block.)*
 - **Borrowed types:** `&[u8]` / `&str` / `&Path`, never `&Vec` / `&String` / `&PathBuf` in signatures.
 - **Dependencies:** pin full versions (`x.y.z`, not `x`); prefer crates.io; any git dep is forked to
   our org and pinned by `rev`. `cargo-shear` (unused deps) and `cargo-deny` (licenses + RUSTSEC

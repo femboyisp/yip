@@ -5,5 +5,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+io-uring = "0.7.10"
+
 [lints]
 workspace = true

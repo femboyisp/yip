@@ -5,5 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+libc = "0.2.180"
+thiserror = { workspace = true }
+
 [lints]
 workspace = true
