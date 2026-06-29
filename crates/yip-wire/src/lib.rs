@@ -205,6 +205,64 @@ mod tests {
         assert_ne!(mask, mask2);
     }
 
+    /// `keystream` must advance its internal counter so successive 8-byte
+    /// blocks are distinct.  Kills the `counter += 1` → `counter *= 1` mutant
+    /// (line 68): with `*= 1` the counter stays at 0 forever, every block is
+    /// the same hash output, so the two halves of a 16-byte stream are equal.
+    #[test]
+    fn keystream_consecutive_blocks_are_distinct() {
+        let hp = [7u8; 16];
+        let sample = [0x55u8; TAG_LEN];
+        // Request exactly two SipHash-CTR blocks (16 bytes = 2 × 8).
+        let stream = keystream(&hp, &sample, 16);
+        assert_eq!(stream.len(), 16);
+        assert_ne!(
+            stream[..8],
+            stream[8..],
+            "block-0 (counter=0) and block-1 (counter=1) must differ"
+        );
+    }
+
+    /// `MIN_FRAME` must equal `HEADER_LEN + TAG_LEN`.  Kills the `+` → `-`
+    /// mutant on line 30: with subtraction MIN_FRAME would be 7 instead of 23,
+    /// letting the short-datagram gate in `deframe` accept datagrams too small
+    /// to contain a real frame.
+    #[test]
+    fn min_frame_equals_header_plus_tag() {
+        assert_eq!(
+            MIN_FRAME,
+            HEADER_LEN + TAG_LEN,
+            "MIN_FRAME must be HEADER_LEN + TAG_LEN"
+        );
+    }
+
+    /// `deframe` must accept a datagram of exactly `MIN_FRAME` bytes (empty
+    /// payload).  Kills the `datagram.len() < MIN_FRAME` → `<= MIN_FRAME`
+    /// mutant (line 130): that mutant rejects exact-MIN_FRAME datagrams as
+    /// Malformed even though they are structurally valid.
+    #[test]
+    fn codec_accepts_exact_min_frame_datagram() {
+        let codec = Codec::new([9u8; 16], [10u8; 16]);
+        let frame = Frame {
+            conn_tag: 0xCAFE_BABE_0000_0001,
+            object_id: 3,
+            payload_id: [0xAB, 0xCD, 0xEF, 0x01],
+            flags: 0x42,
+            payload: vec![], // empty payload → wire length == MIN_FRAME
+        };
+        let wire = codec.frame(&frame);
+        assert_eq!(
+            wire.len(),
+            MIN_FRAME,
+            "empty-payload frame must be exactly MIN_FRAME bytes"
+        );
+        assert_eq!(
+            codec.deframe(&wire).unwrap(),
+            frame,
+            "exact-MIN_FRAME datagram must be accepted"
+        );
+    }
+
     #[test]
     fn codec_roundtrips_a_frame() {
         let codec = Codec::new([4u8; 16], [5u8; 16]);
