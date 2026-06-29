@@ -10,8 +10,46 @@ pub struct Frame {
     pub conn_tag: u64,
     /// Which pipelined FEC object this symbol belongs to.
     pub object_id: u16,
+    /// RaptorQ payload identifier (SBN + ESI), opaque to the wire layer.
+    pub payload_id: [u8; 4],
+    /// Symbol kind / control bits (source/repair, feedback, ARQ).
+    pub flags: u8,
     /// The ciphertext symbol payload.
     pub payload: Vec<u8>,
+}
+
+/// Length of the logical (and protected) frame header in bytes.
+pub const HEADER_LEN: usize = 15;
+/// Length of the trailing coverage-auth tag in bytes.
+pub const TAG_LEN: usize = 8;
+/// Smallest valid frame: header + tag, empty payload.
+pub const MIN_FRAME: usize = HEADER_LEN + TAG_LEN;
+
+/// Serialize the logical header (big-endian, fixed layout).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used in M2 codec implementation")
+)]
+fn write_header(frame: &Frame) -> [u8; HEADER_LEN] {
+    let mut out = [0u8; HEADER_LEN];
+    out[0..8].copy_from_slice(&frame.conn_tag.to_be_bytes());
+    out[8..10].copy_from_slice(&frame.object_id.to_be_bytes());
+    out[10..14].copy_from_slice(&frame.payload_id);
+    out[14] = frame.flags;
+    out
+}
+
+/// Parse the logical header fields back out.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used in M2 codec implementation")
+)]
+fn read_header(bytes: &[u8; HEADER_LEN]) -> (u64, u16, [u8; 4], u8) {
+    let conn_tag = u64::from_be_bytes(bytes[0..8].try_into().expect("8 bytes"));
+    let object_id = u16::from_be_bytes(bytes[8..10].try_into().expect("2 bytes"));
+    let payload_id: [u8; 4] = bytes[10..14].try_into().expect("4 bytes");
+    let flags = bytes[14];
+    (conn_tag, object_id, payload_id, flags)
 }
 
 /// Errors from decoding a wire datagram.
@@ -42,8 +80,28 @@ mod tests {
         let frame = Frame {
             conn_tag: 7,
             object_id: 42,
+            payload_id: [0; 4],
+            flags: 0,
             payload: vec![1, 2, 3],
         };
         assert_eq!(frame.object_id, 42);
+    }
+
+    #[test]
+    fn header_roundtrips() {
+        let frame = Frame {
+            conn_tag: 0x0102_0304_0506_0708,
+            object_id: 0xABCD,
+            payload_id: [9, 8, 7, 6],
+            flags: 0x5A,
+            payload: vec![],
+        };
+        let bytes = write_header(&frame);
+        assert_eq!(bytes.len(), HEADER_LEN);
+        let (conn_tag, object_id, payload_id, flags) = read_header(&bytes);
+        assert_eq!(conn_tag, frame.conn_tag);
+        assert_eq!(object_id, frame.object_id);
+        assert_eq!(payload_id, frame.payload_id);
+        assert_eq!(flags, frame.flags);
     }
 }
