@@ -92,9 +92,55 @@ pub trait DataPlaneIo {
     fn recv(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
 }
 
+/// A portable fallback backend over a plain (connected) UDP socket.
+pub struct PlainIo {
+    socket: UdpSocket,
+}
+
+impl PlainIo {
+    /// Wrap a connected UDP socket.
+    pub fn new(socket: UdpSocket) -> PlainIo {
+        PlainIo { socket }
+    }
+}
+
+impl DataPlaneIo for PlainIo {
+    fn backend(&self) -> Backend {
+        Backend::Mmsg
+    }
+
+    fn send(&mut self, datagram: &[u8]) -> io::Result<()> {
+        self.socket.send(datagram).map(|_| ())
+    }
+
+    fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.socket.recv(buf)
+    }
+}
+
+/// Choose the lowest-latency backend that initializes: io_uring if its ring
+/// builds on this kernel, else the portable plain-socket fallback.
+pub fn select_backend(socket: UdpSocket) -> Box<dyn DataPlaneIo> {
+    let clone = socket.try_clone().expect("clone udp socket");
+    match IoUringIo::new(clone) {
+        Ok(io) => Box::new(io),
+        Err(_) => Box::new(PlainIo::new(socket)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // io_uring setup and teardown is asynchronous in the kernel: the ring's locked-memory
+    // accounting is not fully released until some time after the fd is closed.  On kernels
+    // with a tight RLIMIT_MEMLOCK (this dev machine has 1 MiB), creating a third ring in
+    // the same process fails with ENOMEM even though the previous two have been dropped.
+    //
+    // Serialising every io_uring-bearing test through this mutex, combined with a short
+    // post-drop sleep, keeps the total concurrent ring count at one and gives the kernel
+    // time to reclaim its accounting between tests.
+    static URING_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn backends_are_ordered_by_preference() {
@@ -104,6 +150,7 @@ mod tests {
 
     #[test]
     fn iouring_sends_and_receives_over_udp() {
+        let _guard = URING_SERIAL.lock().unwrap();
         use std::net::UdpSocket;
         let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -118,5 +165,36 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = rx_io.recv(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"datagram via uring");
+        // Explicit drop + sleep: give the kernel time to reclaim ring accounting before
+        // the next io_uring test (kernel cleanup is asynchronous).
+        drop(tx_io);
+        drop(rx_io);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    #[test]
+    fn plain_io_sends_and_receives() {
+        use std::net::UdpSocket;
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        tx.connect(rx.local_addr().unwrap()).unwrap();
+        rx.connect(tx.local_addr().unwrap()).unwrap();
+        let mut t = PlainIo::new(tx);
+        let mut r = PlainIo::new(rx);
+        assert_eq!(t.backend(), Backend::Mmsg);
+        t.send(b"plain path").unwrap();
+        let mut buf = [0u8; 32];
+        let n = r.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"plain path");
+    }
+
+    #[test]
+    fn select_backend_prefers_io_uring_when_available() {
+        let _guard = URING_SERIAL.lock().unwrap();
+        use std::net::UdpSocket;
+        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let io = select_backend(s);
+        // On any modern kernel (CI included) io_uring builds, so we expect it.
+        assert_eq!(io.backend(), Backend::IoUring);
     }
 }
