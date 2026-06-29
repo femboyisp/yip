@@ -12,3 +12,5 @@ All notable changes to this project are documented here, following
   coverage, and mutation testing.
 - Pre-commit hooks (file hygiene, cargo fmt, clippy, and test).
 - Public `README.md` and `docs/architecture.md`.
+- `yip-wire` frame codec: header serialization, SipHash coverage-auth tag, and
+  keyed header protection, with fuzzing of the deframe path.
