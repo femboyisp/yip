@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+snow = "0.10.0"
 
 [lints]
 workspace = true
