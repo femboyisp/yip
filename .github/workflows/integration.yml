@@ -15,12 +15,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build device tests
-        run: cargo test -p yip-device --no-run
-      - name: Run device tests under sudo (CAP_NET_ADMIN)
+      - name: Build and run yip-device tests under sudo (CAP_NET_ADMIN)
         run: |
+          # In a single-crate --no-run build the only artifact with an
+          # executable is the test binary; this filter is robust to target-name
+          # normalization (yip-device vs yip_device).
           BIN=$(cargo test -p yip-device --no-run --message-format=json \
-            | jq -r 'select(.profile.test == true and (.target.name == "yip-device")) | .executable' \
-            | head -n1)
+            | jq -r 'select(.executable != null) | .executable' \
+            | tail -n1)
+          test -n "$BIN" || { echo "::error::could not locate yip-device test binary"; exit 1; }
           echo "running $BIN under sudo"
-          sudo -E "$BIN" --nocapture
+          # --test-threads=1: these tests create fixed-named kernel interfaces and
+          # must not run concurrently (parallel runs race on the interface name).
+          sudo -E "$BIN" --nocapture --test-threads=1 2>&1 | tee /tmp/devtest.log
+          # Honesty guard: this job exists to run the privileged path for real.
+          # If the device tests SKIPped, the runner couldn't create TUN/TAP — fail loudly
+          # rather than report a vacuous green.
+          if grep -q "needs CAP_NET_ADMIN" /tmp/devtest.log; then
+            echo "::error::privileged device tests skipped — runner cannot create TUN/TAP"
+            exit 1
+          fi
