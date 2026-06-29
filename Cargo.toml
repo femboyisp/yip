@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "bin/*"]
+
+[workspace.package]
+edition = "2021"
+license = "MPL-2.0"
+repository = "https://github.com/femboyisp/yip"
+
+[workspace.dependencies]
+thiserror = "2.0.9"
+tracing = "0.1.41"
+
+[workspace.lints.clippy]
+allow_attributes = "warn"
+as_ptr_cast_mut = "warn"
+as_underscore = "warn"
+borrow_as_ptr = "warn"
+implicit_clone = "warn"
+undocumented_unsafe_blocks = "warn"
+unicode_not_nfc = "warn"
+unused_async = "deny"
+wildcard_dependencies = "deny"
+
+[workspace.lints.rust]
+absolute_paths_not_starting_with_crate = "deny"
+explicit_outlives_requirements = "warn"
+macro_use_extern_crate = "deny"
+missing_abi = "deny"
+non_ascii_idents = "forbid"
+rust_2018_idioms = { level = "deny", priority = -1 }
+single_use_lifetimes = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"

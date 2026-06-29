@@ -1,0 +1,3 @@
+# Mullvad reference configuration (mullvadvpn-app/rustfmt.toml)
+edition = "2021"
+max_width = 100

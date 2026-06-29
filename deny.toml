@@ -1,0 +1,10 @@
+[advisories]
+yanked = "deny"
+
+[licenses]
+allow = ["MPL-2.0", "MIT", "Apache-2.0", "BSD-3-Clause", "ISC", "Unicode-3.0"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcard-dependencies = "deny"
