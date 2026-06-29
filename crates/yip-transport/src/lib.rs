@@ -6,6 +6,9 @@
 pub mod classify;
 pub use classify::{Classifier, PolicyRule};
 
+pub mod fec;
+pub use fec::{FecEncoder, Symbol};
+
 use std::time::Duration;
 
 /// Latency/reliability class assigned to a flow by the classifier.
