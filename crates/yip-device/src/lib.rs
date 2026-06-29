@@ -157,6 +157,9 @@ impl TunTap {
     }
 }
 
+// NOTE: a TAP device yields raw Ethernet frames. MAC learning and L2 forwarding
+// (bridging frames between peers by destination MAC) belong to the data-plane
+// forwarding loop wired in M6, not to the device itself, which is a dumb fd.
 impl Device for TunTap {
     fn kind(&self) -> DeviceKind {
         self.kind
@@ -212,5 +215,16 @@ mod tests {
         ];
         let n = dev.write_frame(&pkt).unwrap();
         assert_eq!(n, pkt.len());
+    }
+
+    #[test]
+    fn tap_create_reports_l2_kind() {
+        if !can_create_devices() {
+            eprintln!("SKIP tap_create_reports_l2_kind: needs CAP_NET_ADMIN (run under sudo)");
+            return;
+        }
+        let dev = TunTap::create("yiptap0", DeviceKind::Tap).unwrap();
+        assert_eq!(dev.kind(), DeviceKind::Tap);
+        assert_eq!(dev.name(), "yiptap0");
     }
 }
