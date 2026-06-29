@@ -7,7 +7,7 @@ pub mod classify;
 pub use classify::{Classifier, PolicyRule};
 
 pub mod fec;
-pub use fec::{FecEncoder, Symbol};
+pub use fec::{FecEncoder, FecReassembler, Symbol};
 
 use std::time::Duration;
 

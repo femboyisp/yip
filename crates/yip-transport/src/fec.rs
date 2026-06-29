@@ -3,7 +3,8 @@
 //! source + repair symbols carrying an explicit OTI (object size) so the
 //! decoder never has to infer it.
 
-use raptorq::{Encoder, EncodingPacket, ObjectTransmissionInformation};
+use raptorq::{Decoder, Encoder, EncodingPacket, ObjectTransmissionInformation};
+use std::collections::{HashMap, VecDeque};
 
 /// One wire-bound RaptorQ symbol plus the metadata the receiver needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +67,80 @@ fn split_packet(object_id: u16, object_size: u32, packet: &EncodingPacket) -> Sy
     }
 }
 
+struct ObjState {
+    decoder: Decoder,
+    done: bool,
+}
+
+/// Reassembles RaptorQ symbols into objects, keeping multiple objects in flight
+/// (keyed by `object_id`), tolerating loss and reordering, and evicting the
+/// oldest object once `max_objects` is exceeded.
+pub struct FecReassembler {
+    symbol_size: u16,
+    objects: HashMap<u16, ObjState>,
+    order: VecDeque<u16>,
+    max_objects: usize,
+}
+
+impl FecReassembler {
+    /// Create a reassembler for a class's `symbol_size`, keeping at most
+    /// `max_objects` partially-received objects.
+    pub fn new(symbol_size: u16, max_objects: usize) -> Self {
+        Self {
+            symbol_size,
+            objects: HashMap::new(),
+            order: VecDeque::new(),
+            max_objects: max_objects.max(1),
+        }
+    }
+
+    /// Number of objects currently being reassembled.
+    pub fn in_flight(&self) -> usize {
+        self.objects.len()
+    }
+
+    /// Feed one received symbol. Returns the decoded object when it completes.
+    pub fn push(&mut self, symbol: &Symbol) -> Option<Vec<u8>> {
+        if !self.objects.contains_key(&symbol.object_id) {
+            // Build the decoder from this first symbol's OTI.
+            let oti = ObjectTransmissionInformation::with_defaults(
+                u64::from(symbol.object_size),
+                self.symbol_size,
+            );
+            let decoder = Decoder::new(oti);
+            // Evict the oldest object if at capacity.
+            if self.objects.len() >= self.max_objects {
+                if let Some(oldest_id) = self.order.pop_front() {
+                    self.objects.remove(&oldest_id);
+                }
+            }
+            self.objects.insert(
+                symbol.object_id,
+                ObjState {
+                    decoder,
+                    done: false,
+                },
+            );
+            self.order.push_back(symbol.object_id);
+        }
+
+        let state = self.objects.get_mut(&symbol.object_id)?;
+        if state.done {
+            return None; // late/duplicate symbol for an already-decoded object
+        }
+
+        let mut wire = Vec::with_capacity(4 + symbol.data.len());
+        wire.extend_from_slice(&symbol.payload_id);
+        wire.extend_from_slice(&symbol.data);
+        let packet = EncodingPacket::deserialize(&wire);
+        if let Some(object) = state.decoder.decode(packet) {
+            state.done = true;
+            return Some(object);
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,5 +165,51 @@ mod tests {
         assert!(!syms[0].data.is_empty());
         // at least source symbols (ceil(3000/1200)=3) plus 8 repair
         assert!(syms.len() >= 3 + 8);
+    }
+
+    #[test]
+    fn reassembles_through_erasure_and_reordering() {
+        let mut enc = FecEncoder::new();
+        let ct: Vec<u8> = (0..5000u32)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let params = crate::FlowClass::Bulk.params();
+        let mut syms = enc.encode(&ct, params, 12);
+        // reorder + drop every 4th
+        syms.reverse();
+        let mut re = FecReassembler::new(params.symbol_size, 64);
+        let mut out = None;
+        for (i, s) in syms.iter().enumerate() {
+            if i % 4 == 0 {
+                continue;
+            } // erasure
+            if let Some(frame) = re.push(s) {
+                out = Some(frame);
+                break;
+            }
+        }
+        assert_eq!(out.as_deref(), Some(ct.as_slice()));
+    }
+
+    #[test]
+    fn pipelines_two_objects_and_evicts_when_full() {
+        let mut enc = FecEncoder::new();
+        let params = crate::FlowClass::Default.params();
+        let a = enc.encode(b"first object payload contents here", params, 4);
+        let b = enc.encode(b"second object payload contents here", params, 4);
+        let mut re = FecReassembler::new(params.symbol_size, 1); // cap 1 -> pushing b evicts a
+                                                                 // feed only the first symbol of `a` (incomplete), then all of `b`
+        re.push(&a[0]);
+        assert_eq!(re.in_flight(), 1);
+        let mut got_b = None;
+        for s in &b {
+            if let Some(f) = re.push(s) {
+                got_b = Some(f);
+            }
+        }
+        assert_eq!(
+            got_b.as_deref(),
+            Some(&b"second object payload contents here"[..])
+        );
     }
 }
