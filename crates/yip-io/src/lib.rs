@@ -317,7 +317,8 @@ pub fn set_socket_buffers(sock: &UdpSocket, bytes: usize) -> io::Result<()> {
             libc::SOL_SOCKET,
             libc::SO_SNDBUF,
             std::ptr::addr_of!(size).cast::<libc::c_void>(),
-            std::mem::size_of::<i32>() as libc::socklen_t,
+            libc::socklen_t::try_from(std::mem::size_of::<i32>())
+                .expect("size_of::<i32>() fits socklen_t"),
         )
     };
     if ret_snd != 0 {
@@ -331,7 +332,8 @@ pub fn set_socket_buffers(sock: &UdpSocket, bytes: usize) -> io::Result<()> {
             libc::SOL_SOCKET,
             libc::SO_RCVBUF,
             std::ptr::addr_of!(size).cast::<libc::c_void>(),
-            std::mem::size_of::<i32>() as libc::socklen_t,
+            libc::socklen_t::try_from(std::mem::size_of::<i32>())
+                .expect("size_of::<i32>() fits socklen_t"),
         )
     };
     if ret_rcv != 0 {
