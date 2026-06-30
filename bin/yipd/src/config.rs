@@ -208,4 +208,119 @@ peer_public=00000000000000000000000000000000000000000000000000000000000000bb
 ";
         assert!(Config::parse(text).is_err());
     }
+
+    #[test]
+    fn hex_to_32_wrong_length_returns_error() {
+        // Too short — exercises the hex.len() != 64 branch in hex_to_32.
+        let text = "\
+device=yip0
+listen=0.0.0.0:51820
+peer_endpoint=10.0.0.2:51820
+initiate=true
+local_private=deadbeef
+local_public=00000000000000000000000000000000000000000000000000000000000000aa
+peer_public=00000000000000000000000000000000000000000000000000000000000000bb
+";
+        let err = Config::parse(text).unwrap_err();
+        assert!(err.to_string().contains("64 hex chars"));
+    }
+
+    #[test]
+    fn parse_config_malformed_line_no_equals() {
+        // A line without '=' triggers the split_once error path.
+        let text = "\
+device=yip0
+listen=0.0.0.0:51820
+peer_endpoint=10.0.0.2:51820
+initiate=true
+local_private=0000000000000000000000000000000000000000000000000000000000000001
+local_public=0000000000000000000000000000000000000000000000000000000000000002
+peer_public=0000000000000000000000000000000000000000000000000000000000000003
+THISISMALFORMED
+";
+        assert!(Config::parse(text).is_err());
+    }
+
+    #[test]
+    fn parse_config_bad_peer_endpoint_returns_error() {
+        let text = "\
+device=yip0
+listen=0.0.0.0:51820
+peer_endpoint=not_a_valid_addr
+initiate=true
+local_private=0000000000000000000000000000000000000000000000000000000000000001
+local_public=0000000000000000000000000000000000000000000000000000000000000002
+peer_public=0000000000000000000000000000000000000000000000000000000000000003
+";
+        assert!(Config::parse(text).is_err());
+    }
+
+    #[test]
+    fn parse_config_bad_listen_returns_error() {
+        let text = "\
+device=yip0
+listen=not_valid
+peer_endpoint=10.0.0.2:51820
+initiate=true
+local_private=0000000000000000000000000000000000000000000000000000000000000001
+local_public=0000000000000000000000000000000000000000000000000000000000000002
+peer_public=0000000000000000000000000000000000000000000000000000000000000003
+";
+        assert!(Config::parse(text).is_err());
+    }
+
+    #[test]
+    fn parse_config_bad_initiate_returns_error() {
+        let text = "\
+device=yip0
+listen=0.0.0.0:51820
+peer_endpoint=10.0.0.2:51820
+initiate=maybe
+local_private=0000000000000000000000000000000000000000000000000000000000000001
+local_public=0000000000000000000000000000000000000000000000000000000000000002
+peer_public=0000000000000000000000000000000000000000000000000000000000000003
+";
+        let err = Config::parse(text).unwrap_err();
+        assert!(err.to_string().contains("invalid boolean"));
+    }
+
+    #[test]
+    fn parse_config_unknown_key_is_silently_ignored() {
+        // Unknown keys must not cause an error (forward-compat).
+        let text = "\
+device=yip0
+listen=0.0.0.0:51820
+peer_endpoint=10.0.0.2:51820
+initiate=false
+local_private=0000000000000000000000000000000000000000000000000000000000000001
+local_public=0000000000000000000000000000000000000000000000000000000000000002
+peer_public=0000000000000000000000000000000000000000000000000000000000000003
+future_key=whatever
+";
+        assert!(Config::parse(text).is_ok());
+    }
+
+    #[test]
+    fn parse_config_initiate_numeric_aliases() {
+        let yes_text = "\
+device=yip0\nlisten=0.0.0.0:51820\npeer_endpoint=10.0.0.2:51820\ninitiate=1\n\
+local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+peer_public=0000000000000000000000000000000000000000000000000000000000000003\n";
+        assert!(Config::parse(yes_text).unwrap().initiate);
+
+        let no_text = "\
+device=yip0\nlisten=0.0.0.0:51820\npeer_endpoint=10.0.0.2:51820\ninitiate=0\n\
+local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+peer_public=0000000000000000000000000000000000000000000000000000000000000003\n";
+        assert!(!Config::parse(no_text).unwrap().initiate);
+
+        let yes_text2 = "\
+device=yip0\nlisten=0.0.0.0:51820\npeer_endpoint=10.0.0.2:51820\ninitiate=yes\n\
+local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+peer_public=0000000000000000000000000000000000000000000000000000000000000003\n";
+        assert!(Config::parse(yes_text2).unwrap().initiate);
+    }
 }

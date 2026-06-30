@@ -203,4 +203,73 @@ mod tests {
             b"after handshake"
         );
     }
+
+    #[test]
+    fn crypto_err_converts_to_io_error() {
+        // Exercise the crypto_err helper: a CryptoError converts to io::Error.
+        use yip_crypto::CryptoError;
+        let io_e = super::crypto_err(CryptoError::Handshake);
+        assert_eq!(io_e.kind(), std::io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn responder_rejects_wrong_packet_type() {
+        // Send a datagram with type=Data (2) instead of HandshakeInit (0).
+        // The responder must return an error immediately.
+        let kp = generate_keypair();
+        let resp_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let resp_addr = resp_sock.local_addr().unwrap();
+
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        // Wrong type byte: Data=2, not HandshakeInit=0.
+        sender
+            .send_to(&[PacketType::Data as u8, 0, 0], resp_addr)
+            .unwrap();
+
+        match run_responder(&resp_sock, &kp.private) {
+            Err(e) => {
+                assert!(
+                    e.to_string().contains("HandshakeInit"),
+                    "unexpected error: {e}"
+                )
+            }
+            Ok(_) => panic!("expected error but responder succeeded"),
+        }
+    }
+
+    #[test]
+    fn initiator_exhausts_retries_when_responder_sends_wrong_type() {
+        // Bind a "fake responder" that always replies with the wrong packet type.
+        // The initiator should exhaust its retries and return an error.
+        use std::time::Duration;
+        let kp_i = generate_keypair();
+        let kp_r = generate_keypair();
+
+        let fake_resp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let resp_addr = fake_resp.local_addr().unwrap();
+        fake_resp
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+
+        let init_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let i_priv = kp_i.private;
+        let r_pub = kp_r.public;
+
+        // Spawn a thread that drains incoming datagrams and always replies with
+        // a Data packet so the initiator never sees a valid HandshakeResp.
+        let faker = std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            for _ in 0..MAX_RETRIES {
+                if let Ok((_, from)) = fake_resp.recv_from(&mut buf) {
+                    let _ = fake_resp.send_to(&[PacketType::Data as u8], from);
+                }
+            }
+        });
+
+        match run_initiator(&init_sock, resp_addr, &i_priv, &r_pub) {
+            Err(_) => {}
+            Ok(_) => panic!("expected error but initiator succeeded"),
+        }
+        let _ = faker.join();
+    }
 }
