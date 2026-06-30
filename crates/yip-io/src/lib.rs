@@ -59,6 +59,9 @@ pub trait DataPlaneIo {
         bufs: &mut [[u8; MAX_WIRE_DATAGRAM]],
         lens: &mut [usize],
     ) -> io::Result<usize> {
+        if bufs.is_empty() || lens.is_empty() {
+            return Ok(0);
+        }
         let n = self.recv(&mut bufs[0])?;
         lens[0] = n;
         Ok(1)
