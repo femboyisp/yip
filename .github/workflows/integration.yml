@@ -18,8 +18,11 @@ jobs:
       - name: Bench smoke (compile + quick run, not a perf gate)
         # --warm-up-time 1 --measurement-time 1 --sample-size 10 keeps the job
         # fast while proving every Criterion group compiles and executes.
+        # --bench hotpath targets only the harness=false Criterion bench; a bare
+        # `cargo bench -p yip-bench` would also invoke the lib's default test
+        # harness, which rejects the Criterion `--warm-up-time` flag.
         run: >
-          cargo bench -p yip-bench --
+          cargo bench -p yip-bench --bench hotpath --
           --warm-up-time 1 --measurement-time 1 --sample-size 10
 
   netem-comparison:
