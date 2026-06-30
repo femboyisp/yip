@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use yip_device::{DeviceKind, TunTap};
+use yip_io::{DataPlaneIo, PlainIo, MAX_DATAGRAM_BATCH};
 use yip_transport::Transport;
 use yip_wire::{Codec, WireCodec};
 
@@ -109,6 +110,16 @@ pub fn run(config: Config) -> io::Result<()> {
         .spawn(move || -> io::Result<()> {
             let start = Instant::now();
             let mut buf = vec![0u8; MAX_DATAGRAM];
+
+            // Thread-owned arena of pre-allocated datagram buffers, reused every
+            // packet to avoid per-symbol heap allocation.  Each slot holds one
+            // framed datagram (1-byte PacketType prefix + codec output).
+            let mut arena: Vec<Vec<u8>> = (0..MAX_DATAGRAM_BATCH).map(|_| Vec::new()).collect();
+
+            // Wrap the egress socket in the DataPlaneIo abstraction so that we can
+            // emit all of a packet's symbols in a single sendmmsg(2) syscall.
+            let mut io = PlainIo::new(udp_tx);
+
             loop {
                 // Read one inner frame from the TUN device.
                 let n = tun_reader.read_frame(&mut buf)?;
@@ -129,17 +140,44 @@ pub fn run(config: Config) -> io::Result<()> {
                     .expect("transport lock poisoned")
                     .encode(&sealed.ciphertext, inner, false, now_ms);
 
-                // Emit one UDP datagram per FEC symbol.
-                for sym in &symbols {
+                // Frame each symbol into a reused arena slot, then emit all
+                // datagrams in one batched syscall (chunked by MAX_DATAGRAM_BATCH).
+                let n_syms = symbols.len();
+
+                // Grow the arena on the (rare) first call or overflow.
+                if arena.len() < n_syms {
+                    arena.resize_with(n_syms, Vec::new);
+                }
+
+                for (slot, sym) in arena[..n_syms].iter_mut().zip(symbols.iter()) {
                     let frame = wire_glue::symbol_to_frame(conn_tag, sym, sealed.counter, class);
                     let dg = codec_tx.frame(&frame);
-                    let mut out = Vec::with_capacity(1 + dg.len());
-                    out.push(PacketType::Data as u8);
-                    out.extend_from_slice(&dg);
-                    // A transient send error (e.g. ENOBUFS) is logged but does
-                    // not terminate the egress loop; the packet is simply dropped.
-                    if let Err(e) = udp_tx.send(&out) {
-                        eprintln!("yipd egress: send error: {e}");
+                    slot.clear();
+                    slot.push(PacketType::Data as u8);
+                    slot.extend_from_slice(&dg);
+                }
+
+                // Collect &[u8] views pointing into the populated arena slots.
+                // The arena owns the bytes and lives for the entire loop iteration,
+                // so the slices are valid across the send_batch call.
+                // This is a small stack-scoped Vec of pointer-sized elements.
+                let slices: Vec<&[u8]> = arena[..n_syms].iter().map(Vec::as_slice).collect();
+
+                // Send in chunks of MAX_DATAGRAM_BATCH (one sendmmsg per chunk).
+                for chunk in slices.chunks(MAX_DATAGRAM_BATCH) {
+                    match io.send_batch(chunk) {
+                        Ok(sent) if sent < chunk.len() => {
+                            eprintln!(
+                                "yipd egress: short batch send ({sent}/{} datagrams)",
+                                chunk.len()
+                            );
+                        }
+                        Ok(_) => {}
+                        // A transient send error (e.g. ENOBUFS) is logged but does
+                        // not terminate the egress loop; the packet is simply dropped.
+                        Err(e) => {
+                            eprintln!("yipd egress: send_batch error: {e}");
+                        }
                     }
                 }
             }
