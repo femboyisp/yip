@@ -142,6 +142,14 @@ impl Transport {
     pub fn observe_loss(&mut self, class: FlowClass, loss: f32) {
         self.controllers[class_index(class)].observe_loss(loss);
     }
+
+    /// Current repair ratio for the `Bulk` class controller.
+    ///
+    /// Useful for diagnostics: on a clean link this decays to 0.0 (ARQ bypass
+    /// fires, no proactive FEC symbols sent for bulk traffic).
+    pub fn bulk_repair_ratio(&self) -> f32 {
+        self.controllers[class_index(FlowClass::Bulk)].ratio()
+    }
 }
 
 #[cfg(test)]
