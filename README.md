@@ -56,12 +56,17 @@ Architecture summary: [`docs/architecture.md`](docs/architecture.md).
 
 ## Roadmap
 
+Sub-project #1 (core data plane + FEC transport) is **complete** — a working encrypted FEC VPN
+tunnel, proven by pinging across it between two daemons in separate network namespaces.
+
 - [x] **M1** — Workspace scaffold + all quality gates (lints, CI, coverage, mutation, fuzz).
-- [ ] **M2** — `yip-wire`: framing, keyed header-protection, coverage-auth (fuzzed).
-- [ ] **M3** — `yip-crypto`: Noise-IK session + rekey.
-- [ ] **M4** — `yip-io` (io_uring) + `yip-device`: working L3 then L2 tunnel.
-- [ ] **M5** — `yip-transport`: adaptive RaptorQ pipeline + ARQ.
-- [ ] **M6** — `yipd` end-to-end 2-peer tunnel + benchmark harness (vs WireGuard, n2n, ZeroTier, …).
+- [x] **M2** — `yip-wire`: framing, keyed header-protection, coverage-auth (fuzzed).
+- [x] **M3** — `yip-crypto`: Noise-IK session (via `snow`) + explicit-nonce AEAD + replay window.
+- [x] **M4** — `yip-io` (io_uring) + `yip-device`: TUN/TAP devices and packet I/O.
+- [x] **M5** — `yip-transport`: adaptive RaptorQ FEC + per-flow classifier + stateful flow heuristic.
+- [x] **M6** — `yipd` end-to-end 2-peer encrypted tunnel (ping-tested across network namespaces).
+- [ ] **Next** — benchmark harness (vs WireGuard, n2n, ZeroTier); then the control plane, anti-DPI,
+  DAITA/anonymity, and hardening sub-projects.
 
 ## Building
 
