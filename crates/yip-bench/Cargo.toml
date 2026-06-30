@@ -8,11 +8,11 @@ publish = false
 
 [dependencies]
 yip-crypto = { path = "../yip-crypto" }
-yip-wire = { path = "../yip-wire" }
-yip-transport = { path = "../yip-transport" }
 
 [dev-dependencies]
 criterion = "0.5.1"
+yip-wire = { path = "../yip-wire" }
+yip-transport = { path = "../yip-transport" }
 
 [[bench]]
 name = "hotpath"

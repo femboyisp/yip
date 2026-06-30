@@ -10,6 +10,49 @@ permissions:
   contents: read
 
 jobs:
+  bench-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Bench smoke (compile + quick run, not a perf gate)
+        # --warm-up-time 1 --measurement-time 1 --sample-size 10 keeps the job
+        # fast while proving every Criterion group compiles and executes.
+        run: >
+          cargo bench -p yip-bench --
+          --warm-up-time 1 --measurement-time 1 --sample-size 10
+
+  netem-comparison:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install wireguard-tools
+        run: sudo apt-get install -y wireguard-tools
+      - name: Load wireguard kernel module
+        run: sudo modprobe wireguard || echo "[note] wireguard module unavailable; WG column will be skipped"
+      - name: Build test binaries
+        run: cargo test -p yip-bench --test netem_bench --no-run --message-format=json | tee /tmp/netem-build.json
+      - name: Run netem harness tests under sudo
+        run: |
+          BIN=$(jq -r 'select(.executable != null) | .executable' /tmp/netem-build.json | tail -n1)
+          test -n "$BIN" || { echo "::error::could not locate netem_bench test binary"; exit 1; }
+          echo "running $BIN under sudo"
+          # Build yipd so the test harness can find it (avoids a second in-script build).
+          cargo build -p yipd
+          # Run both tests sequentially; the WG test gracefully skips if WG is unavailable.
+          sudo -E "$BIN" yip_tunnel_under_netem_loss    --nocapture --test-threads=1 2>&1 | tee /tmp/netem-yip.log
+          sudo -E "$BIN" comparison_under_netem_loss    --nocapture --test-threads=1 2>&1 | tee /tmp/netem-compare.log
+          # Honesty guard: the yip-only tests must have run for real, not skipped.
+          if grep -q "SKIP yip_tunnel_under_netem_loss" /tmp/netem-yip.log; then
+            echo "::error::yip netem test skipped — runner is not root"
+            exit 1
+          fi
+          if grep -q "SKIP comparison_under_netem_loss" /tmp/netem-compare.log; then
+            echo "::error::comparison netem test skipped — runner is not root"
+            exit 1
+          fi
+
   device-tests:
     runs-on: ubuntu-latest
     steps:

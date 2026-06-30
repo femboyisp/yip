@@ -65,8 +65,12 @@ tunnel, proven by pinging across it between two daemons in separate network name
 - [x] **M4** — `yip-io` (io_uring) + `yip-device`: TUN/TAP devices and packet I/O.
 - [x] **M5** — `yip-transport`: adaptive RaptorQ FEC + per-flow classifier + stateful flow heuristic.
 - [x] **M6** — `yipd` end-to-end 2-peer encrypted tunnel (ping-tested across network namespaces).
-- [ ] **Next** — benchmark harness (vs WireGuard, n2n, ZeroTier); then the control plane, anti-DPI,
-  DAITA/anonymity, and hardening sub-projects.
+- [x] **M7** — benchmark harness: hot-path micro-benchmarks (AEAD ~2 µs/frame, wire framing
+  ~512 ns/frame, RaptorQ encode ~24 µs/frame) and a `tc netem` yip-vs-WireGuard loss comparison —
+  yip's FEC recovers loss WireGuard passes through (~3 % effective at 10 % injected vs ~12 % for WG).
+  See [`crates/yip-bench/README.md`](crates/yip-bench/README.md) for the full results.
+- [ ] **Next** — control plane (decentralized discovery, NAT traversal, relay fallback); then
+  anti-DPI / obfuscation, DAITA/anonymity, and hardening sub-projects.
 
 ## Building
 

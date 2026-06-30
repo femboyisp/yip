@@ -26,3 +26,6 @@ All notable changes to this project are documented here, following
 - `yipd` end-to-end tunnel: Noise handshake over UDP, session-derived wire keys,
   and L3 (TUN) traffic tunneled through the encrypted adaptive-FEC transport
   between two static peers (ping-tested across network namespaces).
+- `yip-bench`: hot-path micro-benchmarks (AEAD, wire framing, RaptorQ FEC encode)
+  via Criterion, and a `tc netem` latency/loss harness comparing the yip tunnel
+  against kernel WireGuard (results in `crates/yip-bench/README.md`).
