@@ -46,6 +46,7 @@ jobs:
           # Run both tests sequentially; the WG test gracefully skips if WG is unavailable.
           sudo -E "$BIN" yip_tunnel_under_netem_loss    --nocapture --test-threads=1 2>&1 | tee /tmp/netem-yip.log
           sudo -E "$BIN" comparison_under_netem_loss    --nocapture --test-threads=1 2>&1 | tee /tmp/netem-compare.log
+          sudo -E "$BIN" scp_throughput_comparison    --nocapture --test-threads=1 2>&1 | tee /tmp/netem-scp.log
           # Honesty guard: the yip-only tests must have run for real, not skipped.
           if grep -q "SKIP yip_tunnel_under_netem_loss" /tmp/netem-yip.log; then
             echo "::error::yip netem test skipped — runner is not root"
@@ -53,6 +54,12 @@ jobs:
           fi
           if grep -q "SKIP comparison_under_netem_loss" /tmp/netem-compare.log; then
             echo "::error::comparison netem test skipped — runner is not root"
+            exit 1
+          fi
+          # Honesty guard: the scp test must have run for real, not skipped.
+          # Exception: if sshd/scp are absent, the harness itself logs SKIP and exits 0 — that is acceptable.
+          if grep -q "SKIP scp_throughput_comparison: needs root" /tmp/netem-scp.log; then
+            echo "::error::scp throughput test skipped — runner is not root"
             exit 1
           fi
 

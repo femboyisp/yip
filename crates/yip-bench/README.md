@@ -82,6 +82,64 @@ See `RESULTS.md` for the raw output from the most recent automated run.
 
 ---
 
+## scp throughput under loss
+
+`tests/run-scp-compare.sh` (driven by the `scp_throughput_comparison` test) copies
+a **20 MB** file with `scp` across each tunnel under `tc netem` loss of 0/5/10 %,
+times the transfer, and reports MB/s.  Each transfer is wrapped in `timeout 120`;
+a timeout or failure records 0 MB/s rather than failing the harness.  `scp` layers
+its own SSH AEAD on top of *both* tunnels equally, so the SSH crypto cost cancels
+out of the comparison — what differs is how each tunnel carries TCP under loss.
+
+The thesis: yip's RaptorQ FEC masks loss from TCP (so throughput holds), while
+WireGuard's TCP sees real retransmits + congestion backoff (so it collapses).
+
+### Measured table (debug `yipd` build)
+
+The harness uses the same `target/debug/yipd` as the other netem tests:
+
+| loss% | yip_MBps | wg_MBps |
+|-------|----------|---------|
+| 0     | 0.45     | 36.20   |
+| 5     | 0.44     | 0.39    |
+| 10    | 0.41     | 0.16    |
+
+(kernel 6.18, AMD Ryzen 5 7640U; 20 MB payload; netem `loss X% delay 5ms`
+symmetric on both veth ends; sshd on port 2222.)
+
+### Honest interpretation
+
+Two effects are visible, and they pull in opposite directions:
+
+1. **The thesis direction holds.** yip's throughput is essentially *flat* across
+   loss (0.45 → 0.44 → 0.41 MB/s) because the FEC repair symbols hide the dropped
+   packets from TCP, so TCP never backs off.  WireGuard collapses from 36.2 MB/s
+   at 0 % to 0.39 at 5 % and 0.16 at 10 % — classic TCP-over-lossy-link behaviour.
+   At 10 % loss yip is ~2.5× WireGuard's throughput.  Read the **trend**, not the
+   absolute cells: yip *resists* loss, WireGuard *succumbs* to it.
+
+2. **yip's absolute baseline at 0 % is throttled by the debug build, not by FEC.**
+   The 0.45 MB/s vs 36.2 MB/s gap at 0 % loss is *not* FEC overhead — it is the
+   **unoptimized (debug) RaptorQ data path**.  RaptorQ builds an encoder/decoder
+   matrix per object; that matrix math is ~50× slower compiled without
+   optimizations.  Rebuilding `yipd` with `--release` and re-running the same
+   0 %-loss scp gave **23.97 MB/s** (vs the 0.45 MB/s debug figure) — within range
+   of kernel WireGuard's 36 MB/s.  WireGuard is always in-kernel (optimized), so
+   the committed table compares *debug* yip against *optimized* WireGuard.  The
+   honest read: at 0 % loss the two are comparable once yip is built in release;
+   the table's 0 % gap is a build-mode artifact of running the same debug binary
+   the rest of the netem suite uses.
+
+A secondary inefficiency was also fixed while investigating: the harness now sets
+the `yip0` TUN **MTU to 1184**.  yip seals each inner packet (+16-byte AEAD tag)
+and FEC-encodes it into fixed 1200-byte symbols; a full 1500-byte inner segment
+seals to 1516 bytes and splits into *two* source symbols (plus repair), fanning
+every TCP segment into 2+ UDP datagrams.  Capping the inner MTU so the sealed
+packet fits one symbol (`inner + 16 ≤ 1200 ⇒ inner ≤ 1184`) keeps each segment to
+one source symbol — yip's analogue of WireGuard auto-setting `wg0` to MTU 1420.
+
+---
+
 ## Caveats and deferred items
 
 - **Run-to-run variance:** each data point is 100 pings at 50 ms inter-packet

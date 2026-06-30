@@ -87,3 +87,43 @@ fn comparison_under_netem_loss() {
         .expect("failed to launch compare harness script");
     assert!(status.success(), "yip vs WireGuard compare harness failed");
 }
+
+/// Measures scp (TCP) throughput over yip vs kernel WireGuard under tc netem
+/// loss profiles.  The thesis: yip's RaptorQ FEC keeps TCP throughput higher
+/// than WireGuard under loss (WireGuard's TCP sees real retransmits; yip's FEC
+/// hides the loss from TCP).
+///
+/// Requires root (netns, netem, TUN/WireGuard module, sshd/scp).  SKIPs
+/// otherwise.
+#[test]
+fn scp_throughput_comparison() {
+    if !is_root() {
+        eprintln!("SKIP scp_throughput_comparison: needs root");
+        return;
+    }
+
+    let root = workspace_root();
+
+    let yipd_path = root.join("target/debug/yipd");
+    let yipd_arg = if yipd_path.exists() {
+        yipd_path.to_string_lossy().into_owned()
+    } else {
+        String::new()
+    };
+
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-scp-compare.sh");
+
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg(script);
+    if !yipd_arg.is_empty() {
+        cmd.arg(&yipd_arg);
+    }
+
+    let status = cmd
+        .status()
+        .expect("failed to launch scp compare harness script");
+    assert!(
+        status.success(),
+        "yip vs WireGuard scp throughput harness failed"
+    );
+}
