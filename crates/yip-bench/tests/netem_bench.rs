@@ -2,16 +2,26 @@
 //! Requires root (netns + netem + TUN); SKIPs otherwise.
 use std::process::Command;
 
-#[test]
-fn yip_tunnel_under_netem_loss() {
-    let is_root = Command::new("id")
+fn is_root() -> bool {
+    Command::new("id")
         .arg("-u")
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim() == "0")
-        .unwrap_or(false);
-    if !is_root {
+        .unwrap_or(false)
+}
+
+fn workspace_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("could not resolve workspace root")
+}
+
+#[test]
+fn yip_tunnel_under_netem_loss() {
+    if !is_root() {
         eprintln!("SKIP yip_tunnel_under_netem_loss: needs root");
         return;
     }
@@ -19,14 +29,10 @@ fn yip_tunnel_under_netem_loss() {
     // Locate the workspace root from this crate's manifest dir:
     //   CARGO_MANIFEST_DIR = <workspace>/crates/yip-bench
     //   workspace root     = ../../ from there
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let workspace_root = std::path::Path::new(manifest_dir)
-        .join("../..")
-        .canonicalize()
-        .expect("could not resolve workspace root");
+    let root = workspace_root();
 
     // Use the pre-built binary if it exists; the script will build it otherwise.
-    let yipd_path = workspace_root.join("target/debug/yipd");
+    let yipd_path = root.join("target/debug/yipd");
     let yipd_arg = if yipd_path.exists() {
         yipd_path.to_string_lossy().into_owned()
     } else {
@@ -43,4 +49,41 @@ fn yip_tunnel_under_netem_loss() {
 
     let status = cmd.status().expect("failed to launch netem harness script");
     assert!(status.success(), "yip netem harness failed");
+}
+
+/// Runs yip and kernel WireGuard side-by-side under the same tc netem loss
+/// profiles and emits a comparison table.  The thesis: yip's RaptorQ FEC
+/// keeps effective loss below WireGuard's (which has no FEC) at every nonzero
+/// injected loss rate.
+///
+/// Requires root (netns, netem, TUN/WireGuard module).  SKIPs otherwise.
+/// Saves the combined table to crates/yip-bench/RESULTS.md.
+#[test]
+fn comparison_under_netem_loss() {
+    if !is_root() {
+        eprintln!("SKIP comparison_under_netem_loss: needs root");
+        return;
+    }
+
+    let root = workspace_root();
+
+    let yipd_path = root.join("target/debug/yipd");
+    let yipd_arg = if yipd_path.exists() {
+        yipd_path.to_string_lossy().into_owned()
+    } else {
+        String::new()
+    };
+
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-compare.sh");
+
+    let mut cmd = Command::new("bash");
+    cmd.arg(script);
+    if !yipd_arg.is_empty() {
+        cmd.arg(&yipd_arg);
+    }
+
+    let status = cmd
+        .status()
+        .expect("failed to launch compare harness script");
+    assert!(status.success(), "yip vs WireGuard compare harness failed");
 }
