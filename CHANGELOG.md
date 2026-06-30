@@ -5,6 +5,15 @@ All notable changes to this project are documented here, following
 
 ## [Unreleased]
 
+### Changed
+- Data-plane throughput pass: yipd now batches egress sends (`sendmmsg`) and
+  ingress reads (`recvmmsg`) through yip-io's `PlainIo`, reuses framing buffers
+  (no per-symbol allocation), and sizes `SO_SNDBUF`/`SO_RCVBUF` to 4 MiB via a
+  yip-io `set_socket_buffers` helper. `yip-transport` gained a byte-identical
+  RaptorQ encode bypass for the zero-repair case (dormant until the controller
+  can request zero repair — see `crates/yip-bench/README.md`). yipd is now
+  `#![forbid(unsafe_code)]`; `yip-io` pins `libc` exactly.
+
 ### Added
 - Workspace scaffold with `yip-io`, `yip-wire`, `yip-crypto`, `yip-transport`,
   `yip-device`, and `yipd` crate stubs.

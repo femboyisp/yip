@@ -3,7 +3,10 @@
 //! source + repair symbols carrying an explicit OTI (object size) so the
 //! decoder never has to infer it.
 
-use raptorq::{Decoder, Encoder, EncodingPacket, ObjectTransmissionInformation};
+use raptorq::{
+    calculate_block_offsets, Decoder, Encoder, EncodingPacket, ObjectTransmissionInformation,
+    PayloadId,
+};
 use std::collections::{HashMap, VecDeque};
 
 /// Maximum permitted object size for a single FEC-coded frame (256 KiB).
@@ -49,10 +52,23 @@ impl FecEncoder {
         let object_id = self.next_object_id;
         self.next_object_id = self.next_object_id.wrapping_add(1);
         let object_size = u32::try_from(ciphertext.len()).expect("frame fits u32");
+
         let oti = ObjectTransmissionInformation::with_defaults(
             u64::from(object_size),
             params.symbol_size,
         );
+
+        if repair == 0 {
+            // Fast path: systematic source symbols are the data itself — emit them
+            // directly, skipping the ~25 µs intermediate-symbol solve in Encoder::new.
+            // Only bypass when sub_blocks == 1 (no sub-symbol interleaving needed).
+            // In practice this is always true for packet-sized objects; fall through
+            // to the full encoder for the rare multi-sub-block case.
+            if oti.sub_blocks() == 1 {
+                return source_symbols(object_id, object_size, ciphertext, &oti);
+            }
+        }
+
         let encoder = Encoder::new(ciphertext, oti);
         encoder
             .get_encoded_packets(repair)
@@ -60,6 +76,66 @@ impl FecEncoder {
             .map(|p| split_packet(object_id, object_size, &p))
             .collect()
     }
+}
+
+/// Emit the source symbols of `ciphertext` directly without constructing a
+/// full `Encoder` (which solves for intermediate symbols even when no repair
+/// symbols are needed).  Byte-identical to `Encoder::get_encoded_packets(0)`.
+///
+/// Precondition: `oti.sub_blocks() == 1` (caller must enforce).
+fn source_symbols(
+    object_id: u16,
+    object_size: u32,
+    ciphertext: &[u8],
+    oti: &ObjectTransmissionInformation,
+) -> Vec<Symbol> {
+    let sym_size = usize::from(oti.symbol_size());
+    let mut out = Vec::new();
+
+    for (sbn_usize, (start, end)) in calculate_block_offsets(ciphertext, oti).iter().enumerate() {
+        // sbn is the source block number; validate it fits in u8 (RFC 6330 limits Z ≤ 256).
+        let sbn = u8::try_from(sbn_usize).expect("source block count fits u8");
+
+        // The block data may extend past the end of ciphertext (zero-padding required
+        // by the raptorq spec for the last block).  Mirror Encoder::new's padding logic.
+        let block: &[u8] = if *end <= ciphertext.len() {
+            &ciphertext[*start..*end]
+        } else {
+            // This branch handles the normal case where the last source block extends
+            // past the object end and requires zero-padding up to symbol_size.  This is
+            // the common path when the object length is not an exact multiple of the
+            // symbol size (e.g., ciphertext + 16-byte AEAD tag).  The padding remains
+            // byte-identical to Encoder::get_encoded_packets(0).  Use a temporary slice.
+            &ciphertext[*start..]
+        };
+
+        // chunk + zero-pad the last chunk to sym_size, then emit one EncodingPacket per chunk.
+        let chunk_count = block.len() / sym_size;
+        for esi in 0..chunk_count {
+            let chunk_start = esi * sym_size;
+            let chunk_end = chunk_start + sym_size;
+            // chunk_end <= block.len() since esi < chunk_count = block.len()/sym_size
+            let data = block[chunk_start..chunk_end].to_vec();
+            let packet = EncodingPacket::new(
+                PayloadId::new(sbn, u32::try_from(esi).expect("esi fits u32")),
+                data,
+            );
+            out.push(split_packet(object_id, object_size, &packet));
+        }
+
+        // The last chunk may need zero-padding if block.len() > chunk_count * sym_size.
+        // (Occurs when the final source block is under-full.)
+        let remainder_start = chunk_count * sym_size;
+        if remainder_start < block.len() {
+            let mut data = vec![0u8; sym_size];
+            data[..block.len() - remainder_start].copy_from_slice(&block[remainder_start..]);
+            let esi = u32::try_from(chunk_count).expect("esi fits u32");
+            let packet = EncodingPacket::new(PayloadId::new(sbn, esi), data);
+            out.push(split_packet(object_id, object_size, &packet));
+        }
+    }
+
+    out
 }
 
 /// Split a serialized EncodingPacket into the 4-byte payload-id and the symbol bytes.
@@ -201,6 +277,123 @@ impl FecReassembler {
 mod tests {
     use super::*;
     use crate::FlowClass;
+
+    /// Construct symbols via the real `Encoder` with 0 repair — the exact
+    /// pre-bypass code path — so `zero_repair_bypass_is_byte_identical_to_encoder`
+    /// has a stable reference to compare against.
+    fn encode_via_real_encoder(
+        _e: &mut FecEncoder,
+        ciphertext: &[u8],
+        params: crate::FlowParams,
+    ) -> Vec<Symbol> {
+        use raptorq::{Encoder, ObjectTransmissionInformation};
+        let object_size = u32::try_from(ciphertext.len()).unwrap();
+        let oti = ObjectTransmissionInformation::with_defaults(
+            u64::from(object_size),
+            params.symbol_size,
+        );
+        let encoder = Encoder::new(ciphertext, oti);
+        encoder
+            .get_encoded_packets(0)
+            .iter()
+            .map(|p| split_packet(0, object_size, p))
+            .collect()
+    }
+
+    #[test]
+    fn zero_repair_bypass_is_byte_identical_to_encoder() {
+        let params = FlowClass::Default.params();
+        let ciphertext = vec![0x5Au8; 1200]; // exactly one full source symbol at symbol_size 1200
+
+        // Reference path: force the real Encoder with repair = 0.
+        let mut ref_enc = FecEncoder::new();
+        let reference = encode_via_real_encoder(&mut ref_enc, &ciphertext, params);
+
+        // Production path: FecEncoder::encode with repair = 0 (should bypass).
+        let mut enc = FecEncoder::new();
+        let produced = enc.encode(&ciphertext, params, 0);
+
+        assert_eq!(produced.len(), reference.len(), "symbol count differs");
+        for (p, r) in produced.iter().zip(reference.iter()) {
+            assert_eq!(p.payload_id, r.payload_id, "payload_id differs");
+            assert_eq!(p.object_size, r.object_size, "object_size differs");
+            assert_eq!(p.data, r.data, "symbol data differs");
+        }
+    }
+
+    /// Two full source symbols (2400 bytes = 2 × symbol_size 1200, no remainder),
+    /// confirming the `for esi in 0..chunk_count` loop runs exactly twice with no
+    /// remainder branch taken.
+    #[test]
+    fn zero_repair_bypass_byte_identical_two_full_symbols() {
+        let params = FlowClass::Default.params();
+        let ciphertext = vec![0x5Au8; 2400]; // exactly 2 full source symbols, no padding
+
+        // Reference path: force the real Encoder with repair = 0.
+        let mut ref_enc = FecEncoder::new();
+        let reference = encode_via_real_encoder(&mut ref_enc, &ciphertext, params);
+
+        // Production path: FecEncoder::encode with repair = 0 (should bypass).
+        let mut enc = FecEncoder::new();
+        let produced = enc.encode(&ciphertext, params, 0);
+
+        assert_eq!(produced.len(), reference.len(), "symbol count differs");
+        for (p, r) in produced.iter().zip(reference.iter()) {
+            assert_eq!(p.payload_id, r.payload_id, "payload_id differs");
+            assert_eq!(p.object_size, r.object_size, "object_size differs");
+            assert_eq!(p.data, r.data, "symbol data differs");
+        }
+    }
+
+    #[test]
+    fn zero_repair_symbols_still_decode() {
+        let params = crate::FlowClass::Default.params();
+        let ciphertext = vec![0x5Au8; 1200];
+        let mut enc = FecEncoder::new();
+        let syms = enc.encode(&ciphertext, params, 0);
+        let mut re = FecReassembler::new(params.symbol_size, 256);
+        let mut out = None;
+        for s in &syms {
+            if let Some(o) = re.push(s) {
+                out = Some(o);
+                break;
+            }
+        }
+        assert_eq!(out.as_deref(), Some(ciphertext.as_slice()));
+    }
+
+    /// Exercises the zero-padding path: 1201 bytes needs two symbols with the
+    /// second symbol's final 1199 bytes zero-padded.  Checks byte-identity
+    /// and that the decoder recovers the original data.
+    #[test]
+    fn zero_repair_bypass_padded_last_symbol_is_byte_identical_and_decodes() {
+        let params = FlowClass::Default.params();
+        let ciphertext: Vec<u8> = (0..1201u32)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+
+        let mut ref_enc = FecEncoder::new();
+        let reference = encode_via_real_encoder(&mut ref_enc, &ciphertext, params);
+        let mut enc = FecEncoder::new();
+        let produced = enc.encode(&ciphertext, params, 0);
+
+        assert_eq!(produced.len(), reference.len(), "symbol count differs");
+        for (p, r) in produced.iter().zip(reference.iter()) {
+            assert_eq!(p.payload_id, r.payload_id, "payload_id differs");
+            assert_eq!(p.data, r.data, "symbol data differs");
+        }
+
+        // Also verify the decoder recovers the original.
+        let mut re = FecReassembler::new(params.symbol_size, 256);
+        let mut out = None;
+        for s in &produced {
+            if let Some(o) = re.push(s) {
+                out = Some(o);
+                break;
+            }
+        }
+        assert_eq!(out.as_deref(), Some(ciphertext.as_slice()));
+    }
 
     #[test]
     fn encode_produces_source_plus_repair_with_explicit_oti() {
