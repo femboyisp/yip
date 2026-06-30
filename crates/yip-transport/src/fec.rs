@@ -101,15 +101,11 @@ fn source_symbols(
         let block: &[u8] = if *end <= ciphertext.len() {
             &ciphertext[*start..*end]
         } else {
-            // This branch handles the rare case where the block extends past object
-            // end; we'd need a temporary buffer.  In practice with sub_blocks == 1
-            // and typical packet sizes this is never hit, but handle it for safety.
-            // Fall back to the full encoder for this object.
-            //
-            // We can't return early here without abandoning already-emitted symbols,
-            // so this case is prevented by the caller checking sub_blocks == 1 and
-            // the encoder's own block layout guarantees (Kt*T == sum of block lengths
-            // which may exceed F only in the last block).  We re-use a padded copy.
+            // This branch handles the normal case where the last source block extends
+            // past the object end and requires zero-padding up to symbol_size.  This is
+            // the common path when the object length is not an exact multiple of the
+            // symbol size (e.g., ciphertext + 16-byte AEAD tag).  The padding remains
+            // byte-identical to Encoder::get_encoded_packets(0).  Use a temporary slice.
             &ciphertext[*start..]
         };
 
