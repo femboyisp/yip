@@ -321,3 +321,40 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 **Placeholder scan:** the bench skeletons are concrete; the implementer fills all Criterion groups and the WG setup. The `CARGO_BIN_EXE_yipd` cross-package caveat is called out with the build-yipd-in-script resolution.
 
 **Definition of done:** `cargo test --workspace` green (bench fixture test + sudo-gated harness skips cleanly unprivileged); `cargo bench -p yip-bench` produces hot-path numbers; under sudo the netem harness runs the yip tunnel (and WireGuard where available) and emits a comparison table showing yip's FEC reducing effective loss; `RESULTS.md` records real figures; whole-workspace fmt/clippy/shear/deny green; CI passes.
+
+---
+
+### Task 5: scp (TCP) throughput comparison under netem loss
+
+**Files:**
+- Create: `crates/yip-bench/tests/run-scp-compare.sh`
+- Modify: `crates/yip-bench/tests/netem_bench.rs` (add `scp_throughput_comparison` test), `crates/yip-bench/README.md`, `.github/workflows/integration.yml`
+
+**Why:** The latency/loss sweep uses ICMP (no retransmit). A TCP file copy (scp) shows the *throughput* thesis: under loss WireGuard's TCP collapses (retransmits + congestion backoff) while yip's FEC hides the loss from TCP, so throughput holds. This is the bulk/L2 case the design targets.
+
+**Verified scp-in-netns mechanics (spiked, works under sudo):**
+```sh
+ssh-keygen -t ed25519 -f host -N '' -q
+ssh-keygen -t ed25519 -f client -N '' -q ; cat client.pub > authkeys ; chmod 600 authkeys host
+# sshd in the RECEIVER netns, bound on the tunnel IP, key-only, no PAM:
+ip netns exec <recv_ns> /usr/sbin/sshd -p 2222 -h host \
+  -o PidFile=sshd.pid -o AuthorizedKeysFile=authkeys -o UsePAM=no \
+  -o PasswordAuthentication=no -o StrictModes=no -o PermitRootLogin=yes -E sshd.log
+# scp from the SENDER netns over the TUNNEL IP, timed, non-interactive:
+ip netns exec <send_ns> scp -q -P 2222 -i client \
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  payload root@<recv_tunnel_ip>:/tmp/payload.copy
+```
+50MB over loopback measured ~155 MB/s with integrity OK.
+
+**Interfaces:** a sudo-gated `scp_throughput_comparison` test (SKIPs unless root) shelling out to `run-scp-compare.sh`, which:
+- Reuses the yip + WireGuard two-netns topology from `run-compare.sh`.
+- Uses a modest payload (e.g. `dd if=/dev/zero ... bs=1M count=20` = 20 MB) so transfers stay bounded; wrap each scp in `timeout 120` and treat a timeout/failure as "throughput ≈ 0 (collapsed)" rather than failing the whole harness.
+- For each loss in `0 5 10` %: apply `tc netem loss X% delay 5ms` to both tunnels' veths, run sshd in each receiver netns (yip recv = the netns holding tunnel IP 10.9.0.1; wg recv = the netns holding 10.99.0.1), scp the payload over each tunnel, time it, compute MB/s.
+- Emit `| loss% | yip_MBps | wg_MBps |` to stdout and append to the curated `crates/yip-bench/README.md` (a new "## scp throughput" section) — and verify integrity (`cmp`) on at least the 0% transfers.
+- `set -euo pipefail`, trap cleanup killing ALL sshd + daemons and deleting ALL netns. If `scp`/`sshd` absent, SKIP with a reason.
+
+- [ ] **Step 1:** Write `run-scp-compare.sh` (base it on `run-compare.sh` for the topology) + the `scp_throughput_comparison` test in `netem_bench.rs` (mirror the existing root-gated tests).
+- [ ] **Step 2:** Run unprivileged → SKIPs+passes. Run under sudo for real → produces the throughput table. CONFIRM the thesis direction: at 0% yip and WG are comparable (yip maybe lower from FEC overhead); at 5-10% yip throughput >> WG (WG collapses). Capture the REAL table; if the direction doesn't hold, report what you observe — do NOT fake it. Verify no leaked netns/sshd processes (`pgrep sshd`, `ip netns list` clean after).
+- [ ] **Step 3:** Add the throughput table + interpretation to `crates/yip-bench/README.md` (honest: note payload size, timeout, that scp adds SSH crypto on top of both tunnels equally). Add a CI step running the scp test under sudo (honesty guard). `cargo clippy`/`fmt` clean.
+- [ ] **Step 4:** Commit `Add scp throughput comparison to the netem harness` (body ends with `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`).
