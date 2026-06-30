@@ -308,3 +308,36 @@ Environment: Linux 6.18 · AMD Ryzen 5 7640U · release build
 The headline: **encode is the confirmed dominant term** at ~24.2 µs/packet, validating Task 2's focus on FEC
 encode throughput optimization. Decode is negligible (~0.8 µs), confirming asymmetric pipeline cost. The example uses
 a 1184-byte inner MTU (the bench standard) sealed to 1200 bytes with 16-byte AEAD tag.
+
+Note the **symbols/packet = 2.00**: a single-symbol (1200-byte) object is sent as 1 source + 1 repair, because
+the repair-ratio controller floors at `max(1)`. Every packet therefore carries ≥100 % redundancy *and* runs the
+encoder — see the throughput-pass finding below.
+
+---
+
+## Throughput pass (egress/ingress optimization)
+
+A measurement-driven pass on the data-plane hot path. What landed, and the honest verdict:
+
+**Shipped (correct, no wire change, all netns ping/byte-identical tests green):**
+- **Batched I/O via yip-io.** Egress sends all of a packet's symbols in one `sendmmsg`; ingress reads
+  bursts with `recvmmsg` (`MSG_WAITFORONE`). yipd now uses yip-io's `PlainIo` instead of a raw `UdpSocket`.
+- **No per-symbol allocation** — egress frames into a reused thread-owned arena.
+- **4 MiB `SO_SNDBUF`/`SO_RCVBUF`** (set via a yip-io `set_socket_buffers` helper; yipd stays
+  `#![forbid(unsafe_code)]`).
+- **FEC-encode bypass when `repair == 0`** (`yip-transport`) — skips the ~24 µs `Encoder::new` solve,
+  emitting source symbols byte-identically to the encoder. Implemented and tested.
+
+**Measured (release, kernel 6.18, Ryzen 5 7640U):** clean-link single-stream TCP ≈ 220–285 Mbit/s — **no
+regression** vs the pre-pass baseline (single-stream-over-RTT is noisy; the larger socket buffers likely help the
+windowed case). UDP 100 Mbit still delivers at 0 % loss.
+
+**The honest finding — the headline win is gated.** The FEC-encode bypass is **dormant**: the controller's
+`repair_count` floors at `max(1)`, so it never requests zero repair, so the bypass never fires and every packet
+still runs the encoder *and* carries a redundant repair symbol (the 2.00 symbols/packet above). That floor is
+currently **load-bearing**: the daemon does not yet feed observed loss back to the controller (deferred
+ARQ/feedback), so the repair ratio is effectively static — dropping it to zero would disable FEC entirely and
+forfeit yip's loss-recovery thesis. **The clean-link throughput win (skip the encode *and* halve the per-packet
+datagram count) is therefore unlocked by the adaptive loss-feedback loop, not by this pass alone.** This pass
+delivered the plumbing (batched I/O, buffers, a ready-and-tested bypass fast-path); activating the win is the
+next milestone.
