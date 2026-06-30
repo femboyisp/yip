@@ -290,6 +290,57 @@ impl DataPlaneIo for PlainIo {
     }
 }
 
+/// Set the OS send and receive socket buffer sizes to `bytes` bytes on `sock`.
+///
+/// Raises `SO_SNDBUF` and `SO_RCVBUF` via `setsockopt(2)`.  The kernel may
+/// silently clamp or double the requested value (Linux doubles it to account for
+/// bookkeeping overhead), so callers should not assume the returned kernel value
+/// matches `bytes` exactly — only that the call succeeded.
+///
+/// This function lives in yip-io (the only crate where `unsafe` is permitted)
+/// so that the yipd daemon can stay `#![forbid(unsafe_code)]`.
+pub fn set_socket_buffers(sock: &UdpSocket, bytes: usize) -> io::Result<()> {
+    let size = i32::try_from(bytes)
+        .map_err(|_| io::Error::other("buffer size too large for setsockopt"))?;
+    let fd = sock.as_raw_fd();
+
+    // SAFETY: `fd` is a valid file descriptor owned by `sock`, which outlives
+    // this call.  `size` is a correctly-typed `i32` matching `SO_SNDBUF`/
+    // `SO_RCVBUF`'s expected `optval` type.  We pass its address and exact
+    // `size_of::<i32>()` as `optlen`, which is what the kernel expects for
+    // these two socket options.  No aliasing or memory-safety issues arise
+    // because `size` is a stack-local that we only read (never write) in the
+    // unsafe block.
+    let ret_snd = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            std::ptr::addr_of!(size).cast::<libc::c_void>(),
+            std::mem::size_of::<i32>() as libc::socklen_t,
+        )
+    };
+    if ret_snd != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: same rationale as above; only the option name differs.
+    let ret_rcv = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            std::ptr::addr_of!(size).cast::<libc::c_void>(),
+            std::mem::size_of::<i32>() as libc::socklen_t,
+        )
+    };
+    if ret_rcv != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
 /// Choose the lowest-latency backend that initializes: io_uring if its ring
 /// builds on this kernel, else the portable plain-socket fallback.
 pub fn select_backend(socket: UdpSocket) -> Box<dyn DataPlaneIo> {
@@ -405,6 +456,20 @@ mod tests {
         } else {
             assert_eq!(io.backend(), Backend::Mmsg);
         }
+    }
+
+    #[test]
+    fn set_socket_buffers_succeeds_on_loopback() {
+        use std::net::UdpSocket;
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        // Request 4 MiB buffers; the kernel may clamp or double the value, so
+        // we only assert that the call itself succeeds.
+        let result = set_socket_buffers(&sock, 4 * 1024 * 1024);
+        assert!(
+            result.is_ok(),
+            "set_socket_buffers returned error: {:?}",
+            result
+        );
     }
 
     #[test]

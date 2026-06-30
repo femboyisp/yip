@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use yip_device::{DeviceKind, TunTap};
-use yip_io::{DataPlaneIo, PlainIo, MAX_DATAGRAM_BATCH};
+use yip_io::{set_socket_buffers, DataPlaneIo, PlainIo, MAX_DATAGRAM_BATCH, MAX_WIRE_DATAGRAM};
 use yip_transport::Transport;
 use yip_wire::{Codec, WireCodec};
 
@@ -66,6 +66,11 @@ pub fn run(config: Config) -> io::Result<()> {
     // Connect the socket so plain send/recv work on both threads without
     // carrying the peer address on every call.
     sock.connect(peer_addr)?;
+
+    // Raise kernel socket buffers to 4 MiB so bursts do not overflow the
+    // OS receive ring.  The kernel may clamp or double the value; we ignore
+    // the exact result and only propagate hard errors.
+    set_socket_buffers(&sock, 4 * 1024 * 1024)?;
 
     let cb = {
         // We need the channel binding to derive conn_tag; it was consumed during
@@ -190,64 +195,79 @@ pub fn run(config: Config) -> io::Result<()> {
     let ingress = std::thread::Builder::new()
         .name("yipd-ingress".into())
         .spawn(move || -> io::Result<()> {
-            let mut buf = vec![0u8; MAX_DATAGRAM];
+            // Wrap the ingress socket in the DataPlaneIo abstraction so that
+            // recvmmsg(2) harvests bursts of datagrams in a single syscall.
+            let mut io = PlainIo::new(udp_rx);
+
+            // Allocate batch buffers once on the heap; reused every iteration
+            // to avoid per-datagram allocation.
+            let mut bufs = vec![[0u8; MAX_WIRE_DATAGRAM]; MAX_DATAGRAM_BATCH];
+            let mut lens = vec![0usize; MAX_DATAGRAM_BATCH];
+
             loop {
-                let n = udp_rx.recv(&mut buf)?;
-                let dg = &buf[..n];
+                // Block until ≥1 datagram arrives (MSG_WAITFORONE), then drain
+                // however many are immediately available (up to MAX_DATAGRAM_BATCH).
+                let n = io.recv_batch(&mut bufs, &mut lens)?;
 
-                // Validate and strip the 1-byte packet type prefix.
-                if dg.is_empty() || dg[0] != PacketType::Data as u8 {
-                    continue;
+                for i in 0..n {
+                    let dg = &bufs[i][..lens[i]];
+
+                    // Validate and strip the 1-byte packet type prefix.
+                    if dg.is_empty() || dg[0] != PacketType::Data as u8 {
+                        continue;
+                    }
+                    let wire = &dg[1..];
+
+                    // Deframe (auth + header-deprotect). On failure, drop the
+                    // packet without killing the loop.
+                    let frame = match codec_rx.deframe(wire) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            eprintln!("yipd ingress: deframe error: {e}");
+                            continue;
+                        }
+                    };
+
+                    // Parse the FEC symbol + counter out of the frame.
+                    let (sym, counter, class) = match wire_glue::frame_to_symbol(&frame) {
+                        Some(t) => t,
+                        None => {
+                            eprintln!(
+                                "yipd ingress: frame_to_symbol returned None (short payload)"
+                            );
+                            continue;
+                        }
+                    };
+
+                    // Feed the symbol to the FEC reassembler; continue until an
+                    // object decodes.
+                    let ciphertext = match transport_rx
+                        .lock()
+                        .expect("transport lock poisoned")
+                        .decode(&sym, class)
+                    {
+                        Some(ct) => ct,
+                        None => continue,
+                    };
+
+                    // Open the AEAD ciphertext. Replay / AEAD failures are logged
+                    // and the packet is dropped.
+                    let inner = match session_rx
+                        .lock()
+                        .expect("session lock poisoned")
+                        .open(counter, &ciphertext)
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("yipd ingress: open error: {e}");
+                            continue;
+                        }
+                    };
+
+                    // Inject the plaintext inner frame into the TUN device.
+                    // An I/O error here is fatal (device gone).
+                    tun_writer.write_frame(&inner)?;
                 }
-                let wire = &dg[1..];
-
-                // Deframe (auth + header-deprotect). On failure, drop the
-                // packet without killing the loop.
-                let frame = match codec_rx.deframe(wire) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        eprintln!("yipd ingress: deframe error: {e}");
-                        continue;
-                    }
-                };
-
-                // Parse the FEC symbol + counter out of the frame.
-                let (sym, counter, class) = match wire_glue::frame_to_symbol(&frame) {
-                    Some(t) => t,
-                    None => {
-                        eprintln!("yipd ingress: frame_to_symbol returned None (short payload)");
-                        continue;
-                    }
-                };
-
-                // Feed the symbol to the FEC reassembler; continue until an
-                // object decodes.
-                let ciphertext = match transport_rx
-                    .lock()
-                    .expect("transport lock poisoned")
-                    .decode(&sym, class)
-                {
-                    Some(ct) => ct,
-                    None => continue,
-                };
-
-                // Open the AEAD ciphertext. Replay / AEAD failures are logged
-                // and the packet is dropped.
-                let inner = match session_rx
-                    .lock()
-                    .expect("session lock poisoned")
-                    .open(counter, &ciphertext)
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("yipd ingress: open error: {e}");
-                        continue;
-                    }
-                };
-
-                // Inject the plaintext inner frame into the TUN device.
-                // An I/O error here is fatal (device gone).
-                tun_writer.write_frame(&inner)?;
             }
         })?;
 
