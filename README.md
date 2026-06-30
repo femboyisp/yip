@@ -7,9 +7,10 @@ streaming, and for L2 IXP-style offloading with forward-error-correction autocor
 also serving as a general-purpose L2/L3 mesh VPN. Censorship-resistance, traffic-analysis defense,
 and anonymity are opt-in dials layered on top, not always-on costs.
 
-> **Status:** early implementation. The design is approved and the data-plane core is being built
-> milestone by milestone. **M1 (workspace scaffold + quality gates) is merged**; protocol behavior
-> lands in M2 onward. See [Roadmap](#roadmap).
+> **Status:** sub-project #1 (the core data plane + FEC transport) is **complete** — a working
+> encrypted FEC VPN tunnel, ping-tested across network namespaces, with benchmarks showing its FEC
+> recovers packet loss that plain WireGuard passes through. The control plane, anti-DPI, and
+> hardening sub-projects are next. See [Roadmap](#roadmap).
 
 ## Goals
 
@@ -33,7 +34,7 @@ shipped independently:
 
 | # | Sub-project | What it adds |
 |---|---|---|
-| **1** | **Core data plane + FEC transport** *(in progress)* | Encrypted L2+L3 tunnel between peers over an adaptive RaptorQ-FEC UDP transport on a kernel-bypass-ready I/O layer. |
+| **1** | **Core data plane + FEC transport** *(complete)* | Encrypted L2+L3 tunnel between peers over an adaptive RaptorQ-FEC UDP transport on a kernel-bypass-ready I/O layer. |
 | 2 | Control plane | Decentralized discovery (DHT/gossip), self-certifying key-derived addresses, NAT traversal, relay fallback. |
 | 3 | Anti-DPI / obfuscation | Pluggable obfuscating link layer (AmneziaWG recipe, optional REALITY TLS-mimicry); nDPI in CI. |
 | 4 | Traffic-analysis defense | DAITA-style padding/timing; optional per-flow onion routing (Arti crates). |
@@ -65,8 +66,14 @@ tunnel, proven by pinging across it between two daemons in separate network name
 - [x] **M4** — `yip-io` (io_uring) + `yip-device`: TUN/TAP devices and packet I/O.
 - [x] **M5** — `yip-transport`: adaptive RaptorQ FEC + per-flow classifier + stateful flow heuristic.
 - [x] **M6** — `yipd` end-to-end 2-peer encrypted tunnel (ping-tested across network namespaces).
-- [ ] **Next** — benchmark harness (vs WireGuard, n2n, ZeroTier); then the control plane, anti-DPI,
-  DAITA/anonymity, and hardening sub-projects.
+- [x] **M7** — benchmark harness: hot-path micro-benchmarks (AEAD ~2 µs/frame, wire framing
+  ~512 ns/frame, RaptorQ encode ~24 µs/frame) and a `tc netem` yip-vs-WireGuard comparison (release
+  build) — yip's FEC recovers loss WireGuard passes through (~1 % effective at 10 % injected vs ~17 %
+  for WG) for a ~0.2 ms RTT premium, and under loss yip's scp throughput holds while WireGuard's TCP
+  collapses (~6× yip at 5–10 % loss). See [`crates/yip-bench/README.md`](crates/yip-bench/README.md)
+  for the full results.
+- [ ] **Next** — control plane (decentralized discovery, NAT traversal, relay fallback); then
+  anti-DPI / obfuscation, DAITA/anonymity, and hardening sub-projects.
 
 ## Building
 
