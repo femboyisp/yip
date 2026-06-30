@@ -594,6 +594,7 @@ dependencies = [
 name = "yipd"
 version = "0.0.0"
 dependencies = [
+ "blake2",
  "yip-crypto",
  "yip-device",
  "yip-io",
