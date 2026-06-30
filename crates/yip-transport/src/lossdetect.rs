@@ -31,6 +31,15 @@ use crate::{LossReport, MAX_NACK};
 /// The pending set is bounded to `window` entries; when it would exceed that
 /// size the smallest (oldest-sequence) entries are evicted to prevent a huge
 /// gap from exhausting memory.
+///
+/// # Limitation: Incomplete objects are not reported as missing
+///
+/// A counter that is *seen* (via `on_seen`) but never *delivered* (never
+/// calls `on_delivered`) — such as a multi-symbol FEC object that received
+/// some but insufficient symbols to decode — is **not** reported as missing.
+/// Only fully-absent counters (true gaps in the sequence, where `on_seen` is
+/// never called) produce `missing` entries. This is exact for single-symbol
+/// (zero-repair) objects, where a loss is always a full gap.
 pub struct LossDetector {
     /// Grace period in milliseconds before an implied-pending entry is
     /// promoted to missing.
@@ -204,6 +213,6 @@ mod tests {
         d.on_seen(0, 0);
         d.on_seen(1000, 1); // implies a huge gap
         let r = d.report(5);
-        assert!(r.missing.len() <= 8 + 64); // bounded by window and MAX_NACK at encode
+        assert!(r.missing.len() <= 8); // bounded by window
     }
 }
