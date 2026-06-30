@@ -240,21 +240,37 @@ setup_ovpn() {
     if ! command -v openvpn >/dev/null 2>&1; then
         echo "[ovpn] SKIP: 'openvpn' not found"; OVPN_AVAILABLE=false; return
     fi
+    if ! command -v openssl >/dev/null 2>&1; then
+        echo "[ovpn] SKIP: 'openssl' not found (needed for TLS certs)"; OVPN_AVAILABLE=false; return
+    fi
     echo "[ovpn] creating namespaces and veth pair"
     make_pair "$NS_OA" "$NS_OB" "$VOA" "$VOB" "$VOA_IP" "$VOB_IP"
-    echo "[ovpn] genkey"
-    if ! openvpn --genkey secret "$TMPDIR_TEST/static.key" >/dev/null 2>&1; then
-        echo "[ovpn] SKIP: openvpn --genkey failed"; OVPN_AVAILABLE=false; return
+    # Modern fair config: TLS + AES-256-GCM (AEAD) via peer-fingerprint mode (no
+    # PKI server needed). Static-key/CBC would understate OpenVPN — its DCO+GCM
+    # data channel is its real deployed performance.
+    echo "[ovpn] generating self-signed EC certs (peer-fingerprint mode)"
+    if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+            -keyout "$TMPDIR_TEST/ovpn-a.key" -out "$TMPDIR_TEST/ovpn-a.crt" \
+            -days 2 -nodes -subj /CN=ovpn-a >/dev/null 2>&1 \
+       || ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+            -keyout "$TMPDIR_TEST/ovpn-b.key" -out "$TMPDIR_TEST/ovpn-b.crt" \
+            -days 2 -nodes -subj /CN=ovpn-b >/dev/null 2>&1; then
+        echo "[ovpn] SKIP: openssl cert generation failed"; OVPN_AVAILABLE=false; return
     fi
+    local FA FB
+    FA=$(openssl x509 -in "$TMPDIR_TEST/ovpn-a.crt" -noout -fingerprint -sha256 | sed 's/.*=//')
+    FB=$(openssl x509 -in "$TMPDIR_TEST/ovpn-b.crt" -noout -fingerprint -sha256 | sed 's/.*=//')
     ip netns exec "$NS_OA" openvpn --dev tun --dev-type tun --local "$VOA_IP" --lport 1194 \
         --remote "$VOB_IP" --rport 1194 --ifconfig "$TUN_OA_IP" "$TUN_OB_IP" \
-        --secret "$TMPDIR_TEST/static.key" --allow-deprecated-insecure-static-crypto \
-        --proto udp --auth SHA256 --cipher AES-256-CBC --verb 1 --ping 10 --ping-restart 0 \
+        --tls-server --dh none --cert "$TMPDIR_TEST/ovpn-a.crt" --key "$TMPDIR_TEST/ovpn-a.key" \
+        --peer-fingerprint "$FB" --data-ciphers AES-256-GCM \
+        --proto udp --verb 1 --ping 10 --ping-restart 0 \
         >"$TMPDIR_TEST/ovpn-a.log" 2>&1 &
     ip netns exec "$NS_OB" openvpn --dev tun --dev-type tun --local "$VOB_IP" --lport 1194 \
         --remote "$VOA_IP" --rport 1194 --ifconfig "$TUN_OB_IP" "$TUN_OA_IP" \
-        --secret "$TMPDIR_TEST/static.key" --allow-deprecated-insecure-static-crypto \
-        --proto udp --auth SHA256 --cipher AES-256-CBC --verb 1 --ping 10 --ping-restart 0 \
+        --tls-client --cert "$TMPDIR_TEST/ovpn-b.crt" --key "$TMPDIR_TEST/ovpn-b.key" \
+        --peer-fingerprint "$FA" --data-ciphers AES-256-GCM \
+        --proto udp --verb 1 --ping 10 --ping-restart 0 \
         >"$TMPDIR_TEST/ovpn-b.log" 2>&1 &
     local i
     for i in $(seq 1 60); do
