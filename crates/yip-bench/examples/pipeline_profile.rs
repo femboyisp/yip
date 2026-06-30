@@ -34,7 +34,8 @@ fn main() {
     }
     let encdec_us = t.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
 
-    println!("symbols/packet : {:.2}", nsym as f64 / f64::from(iters));
+    let nsym_f = f64::from(u32::try_from(nsym).expect("symbol count fits u32"));
+    println!("symbols/packet : {:.2}", nsym_f / f64::from(iters));
     println!("encode         : {enc_us:.1} us/packet");
     println!("decode (approx): {:.1} us/packet", encdec_us - enc_us);
     println!("decoded ok     : {decoded}/{iters}");
