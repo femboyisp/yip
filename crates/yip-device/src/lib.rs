@@ -3,7 +3,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 const TUN_PATH: &str = "/dev/net/tun";
 const IFF_TUN: libc::c_short = 0x0001;
@@ -159,6 +159,51 @@ impl TunTap {
     }
 }
 
+/// The read half of a split [`TunTap`].
+pub struct TunReader {
+    file: std::fs::File,
+}
+
+/// The write half of a split [`TunTap`].
+pub struct TunWriter {
+    file: std::fs::File,
+}
+
+impl TunReader {
+    /// Read one inner frame.
+    pub fn read_frame(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        use std::io::Read;
+        self.file.read(buf)
+    }
+}
+
+impl TunWriter {
+    /// Write one inner frame.
+    pub fn write_frame(&mut self, frame: &[u8]) -> io::Result<usize> {
+        use std::io::Write;
+        self.file.write(frame)
+    }
+}
+
+impl TunTap {
+    /// Split into independent reader/writer halves backed by duplicated fds,
+    /// so one thread can read while another writes the same device.
+    pub fn split(self) -> Result<(TunReader, TunWriter), DeviceError> {
+        let raw = self.file.as_raw_fd();
+        // SAFETY: `raw` is a valid open fd owned by `self.file`; `dup` returns a new
+        // independent fd referring to the same TUN/TAP device, or -1 on error.
+        let dup = unsafe { libc::dup(raw) };
+        if dup < 0 {
+            return Err(DeviceError::Io(io::Error::last_os_error()));
+        }
+        // SAFETY: `dup` is a fresh, valid, exclusively-owned fd from `dup`.
+        let dup_file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(dup) });
+        let reader = TunReader { file: dup_file };
+        let writer = TunWriter { file: self.file };
+        Ok((reader, writer))
+    }
+}
+
 // NOTE: a TAP device yields raw Ethernet frames. MAC learning and L2 forwarding
 // (bridging frames between peers by destination MAC) belong to the data-plane
 // forwarding loop wired in M6, not to the device itself, which is a dumb fd.
@@ -228,5 +273,20 @@ mod tests {
         let dev = TunTap::create("yiptap0", DeviceKind::Tap).unwrap();
         assert_eq!(dev.kind(), DeviceKind::Tap);
         assert_eq!(dev.name(), "yiptap0");
+    }
+
+    #[test]
+    fn split_yields_independent_reader_writer() {
+        if !can_create_devices() {
+            eprintln!("SKIP split_yields_independent_reader_writer: needs CAP_NET_ADMIN");
+            return;
+        }
+        let dev = TunTap::create("yipsplit0", DeviceKind::Tun).unwrap();
+        let (_reader, mut writer) = dev.split().unwrap();
+        // the writer half can still inject a frame
+        let pkt = [
+            0x45u8, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 10, 9, 9, 1, 10, 9, 9, 2,
+        ];
+        assert_eq!(writer.write_frame(&pkt).unwrap(), pkt.len());
     }
 }

@@ -159,6 +159,15 @@ impl Handshake {
         })
     }
 
+    /// The Noise channel-binding hash (snow's handshake hash), identical on both
+    /// peers after the handshake completes. Use it to derive subkeys (e.g. the
+    /// wire codec keys) bound to this session.
+    pub fn channel_binding(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(self.inner.get_handshake_hash());
+        out
+    }
+
     /// Convert a completed handshake into an AEAD [`Session`].
     pub fn into_session(self) -> Result<Session, CryptoError> {
         let transport = self
@@ -381,6 +390,25 @@ mod tests {
         let mut bad = s.ciphertext.clone();
         bad[0] ^= 0x01;
         assert_eq!(b.open(s.counter, &bad), Err(CryptoError::Decrypt));
+    }
+
+    #[test]
+    fn channel_binding_matches_on_both_peers() {
+        let resp_kp = generate_keypair();
+        let init_kp = generate_keypair();
+        let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
+        let mut res = Handshake::responder(&resp_kp.private).unwrap();
+        let m1 = ini.write_message().unwrap();
+        res.read_message(&m1).unwrap();
+        let m2 = res.write_message().unwrap();
+        ini.read_message(&m2).unwrap();
+        assert!(ini.is_finished() && res.is_finished());
+        assert_eq!(
+            ini.channel_binding(),
+            res.channel_binding(),
+            "both peers derive the same binding"
+        );
+        assert_ne!(ini.channel_binding(), [0u8; 32]);
     }
 
     #[test]

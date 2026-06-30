@@ -23,3 +23,6 @@ All notable changes to this project are documented here, following
 - `yip-transport` stateful flow-table heuristic: classifies unmarked flows by
   observed packet size/rate, completing the policy -> DSCP -> heuristic -> default
   precedence chain.
+- `yipd` end-to-end tunnel: Noise handshake over UDP, session-derived wire keys,
+  and L3 (TUN) traffic tunneled through the encrypted adaptive-FEC transport
+  between two static peers (ping-tested across network namespaces).

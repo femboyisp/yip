@@ -11,9 +11,10 @@ yip-wire = { path = "../../crates/yip-wire" }
 yip-crypto = { path = "../../crates/yip-crypto" }
 yip-transport = { path = "../../crates/yip-transport" }
 yip-device = { path = "../../crates/yip-device" }
+blake2 = "0.10.6"
 
 [lints]
 workspace = true
 
 [package.metadata.cargo-shear]
-ignored = ["yip-io", "yip-wire", "yip-crypto", "yip-transport", "yip-device"]
+ignored = ["yip-io"]
