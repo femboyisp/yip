@@ -100,9 +100,9 @@ impl Transport {
             classifier: Classifier::new(rules),
             encoder: FecEncoder::new(),
             controllers: [
-                AdaptiveController::new(FlowClass::Realtime.params()),
-                AdaptiveController::new(FlowClass::Bulk.params()),
-                AdaptiveController::new(FlowClass::Default.params()),
+                AdaptiveController::new_for(FlowClass::Realtime.params()),
+                AdaptiveController::new_for(FlowClass::Bulk.params()),
+                AdaptiveController::new_for(FlowClass::Default.params()),
             ],
             reassemblers: HashMap::new(),
         }
