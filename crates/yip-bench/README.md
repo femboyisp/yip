@@ -51,10 +51,14 @@ At 10 % injected loss, yip showed ~3 % effective loss (FEC recovered ~70 % of
 dropped packets); WireGuard showed ~12 % effective loss.  The FEC cost is an RTT
 premium of ~8 ms (~18 ms yip vs ~10 ms WireGuard) from the encode/decode pipeline.
 
-The effective-loss law: with independent per-direction loss *p* and proactive
-repair symbols, yip effective loss ≈ *p*² (residual that escapes FEC recovery);
-WireGuard effective loss ≈ 1 − (1 − *p*)² bidirectional (both hops must deliver
-for a round-trip ping to succeed).
+The effective-loss law (expected values; a single 100-ping sample scatters around
+these): with independent per-direction loss *p* and proactive repair symbols, yip
+effective loss ≈ *p*² (only the residual that escapes FEC recovery survives);
+WireGuard, which has no FEC, passes loss through at roughly *p* up to the
+bidirectional bound 1 − (1 − *p*)² (a round-trip ping must deliver on both hops).
+At *p* = 10 % that band is ≈ 10–19 %; across runs we observed WireGuard at ~12–20 %
+and yip at ~1–3 % — the single committed table below is one such sample, so read
+the **gap** between the columns, not the exact per-cell value.
 
 ### Latest sweep
 

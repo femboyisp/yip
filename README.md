@@ -7,9 +7,10 @@ streaming, and for L2 IXP-style offloading with forward-error-correction autocor
 also serving as a general-purpose L2/L3 mesh VPN. Censorship-resistance, traffic-analysis defense,
 and anonymity are opt-in dials layered on top, not always-on costs.
 
-> **Status:** early implementation. The design is approved and the data-plane core is being built
-> milestone by milestone. **M1 (workspace scaffold + quality gates) is merged**; protocol behavior
-> lands in M2 onward. See [Roadmap](#roadmap).
+> **Status:** sub-project #1 (the core data plane + FEC transport) is **complete** — a working
+> encrypted FEC VPN tunnel, ping-tested across network namespaces, with benchmarks showing its FEC
+> recovers packet loss that plain WireGuard passes through. The control plane, anti-DPI, and
+> hardening sub-projects are next. See [Roadmap](#roadmap).
 
 ## Goals
 
@@ -33,7 +34,7 @@ shipped independently:
 
 | # | Sub-project | What it adds |
 |---|---|---|
-| **1** | **Core data plane + FEC transport** *(in progress)* | Encrypted L2+L3 tunnel between peers over an adaptive RaptorQ-FEC UDP transport on a kernel-bypass-ready I/O layer. |
+| **1** | **Core data plane + FEC transport** *(complete)* | Encrypted L2+L3 tunnel between peers over an adaptive RaptorQ-FEC UDP transport on a kernel-bypass-ready I/O layer. |
 | 2 | Control plane | Decentralized discovery (DHT/gossip), self-certifying key-derived addresses, NAT traversal, relay fallback. |
 | 3 | Anti-DPI / obfuscation | Pluggable obfuscating link layer (AmneziaWG recipe, optional REALITY TLS-mimicry); nDPI in CI. |
 | 4 | Traffic-analysis defense | DAITA-style padding/timing; optional per-flow onion routing (Arti crates). |
