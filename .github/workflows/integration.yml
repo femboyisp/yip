@@ -35,3 +35,22 @@ jobs:
             echo "::error::privileged device tests skipped — runner cannot create TUN/TAP"
             exit 1
           fi
+
+  netns-tunnel-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build and run yipd netns tunnel test under sudo
+        run: |
+          BIN=$(cargo test -p yipd --test tunnel_netns --no-run --message-format=json \
+            | jq -r 'select(.executable != null) | .executable' \
+            | tail -n1)
+          test -n "$BIN" || { echo "::error::could not locate tunnel_netns test binary"; exit 1; }
+          echo "running $BIN under sudo"
+          sudo -E "$BIN" ping_across_yipd_tunnel --nocapture --test-threads=1 2>&1 | tee /tmp/tunnel-test.log
+          # Honesty guard: fail if the test skipped (runner must be root-capable).
+          if grep -q "SKIP ping_across_yipd_tunnel" /tmp/tunnel-test.log; then
+            echo "::error::netns tunnel test skipped — runner is not root"
+            exit 1
+          fi
