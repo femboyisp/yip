@@ -44,8 +44,8 @@ The benchmark comment in `benches/hotpath.rs` explains this in detail.
 
 The headline result:
 
-> **yip's RaptorQ FEC recovers nearly all injected packet loss;
-> WireGuard, which has no FEC, passes it through.**
+> **yip's RaptorQ FEC recovers most injected packet loss — nearly all at low
+> rates, ~70 % at 10 % — while WireGuard, which has no FEC, passes it through.**
 
 At 10 % injected loss, yip showed ~3 % effective loss (FEC recovered ~70 % of
 dropped packets); WireGuard showed ~12 % effective loss.  The FEC cost is an RTT
