@@ -17,4 +17,4 @@ blake2 = "0.10.6"
 workspace = true
 
 [package.metadata.cargo-shear]
-ignored = ["yip-io", "yip-device"]
+ignored = ["yip-io"]

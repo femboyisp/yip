@@ -5,9 +5,6 @@
 //! sub-project #3 replaces them with randomised header protection so the
 //! wire carries no fixed magic bytes.
 
-// These items are consumed by later tunnel tasks (M6 Task 5+).
-#![allow(dead_code)]
-
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;

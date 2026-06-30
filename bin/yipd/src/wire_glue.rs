@@ -1,10 +1,6 @@
 //! Glue mapping the FEC transport's `Symbol`s onto authenticated wire `Frame`s,
 //! and deriving the wire codec keys from the session channel binding.
 
-// These functions are consumed by later tasks in M6 (Task 5+). Silence the
-// dead-code lint here rather than leaving stub call-sites in main.
-#![allow(dead_code)]
-
 use yip_transport::{FlowClass, Symbol};
 use yip_wire::Frame;
 
