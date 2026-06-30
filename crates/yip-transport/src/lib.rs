@@ -15,6 +15,9 @@ pub use control::AdaptiveController;
 pub mod fec;
 pub use fec::{FecEncoder, FecReassembler, Symbol};
 
+pub mod feedback;
+pub use feedback::{LossReport, MAX_NACK};
+
 use std::collections::HashMap;
 use std::time::Duration;
 
