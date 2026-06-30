@@ -53,13 +53,14 @@ impl FecEncoder {
         self.next_object_id = self.next_object_id.wrapping_add(1);
         let object_size = u32::try_from(ciphertext.len()).expect("frame fits u32");
 
+        let oti = ObjectTransmissionInformation::with_defaults(
+            u64::from(object_size),
+            params.symbol_size,
+        );
+
         if repair == 0 {
             // Fast path: systematic source symbols are the data itself — emit them
             // directly, skipping the ~25 µs intermediate-symbol solve in Encoder::new.
-            let oti = ObjectTransmissionInformation::with_defaults(
-                u64::from(object_size),
-                params.symbol_size,
-            );
             // Only bypass when sub_blocks == 1 (no sub-symbol interleaving needed).
             // In practice this is always true for packet-sized objects; fall through
             // to the full encoder for the rare multi-sub-block case.
@@ -68,10 +69,6 @@ impl FecEncoder {
             }
         }
 
-        let oti = ObjectTransmissionInformation::with_defaults(
-            u64::from(object_size),
-            params.symbol_size,
-        );
         let encoder = Encoder::new(ciphertext, oti);
         encoder
             .get_encoded_packets(repair)
@@ -310,7 +307,31 @@ mod tests {
     #[test]
     fn zero_repair_bypass_is_byte_identical_to_encoder() {
         let params = FlowClass::Default.params();
-        let ciphertext = vec![0x5Au8; 1200]; // > one symbol to exercise multi-symbol objects
+        let ciphertext = vec![0x5Au8; 1200]; // exactly one full source symbol at symbol_size 1200
+
+        // Reference path: force the real Encoder with repair = 0.
+        let mut ref_enc = FecEncoder::new();
+        let reference = encode_via_real_encoder(&mut ref_enc, &ciphertext, params);
+
+        // Production path: FecEncoder::encode with repair = 0 (should bypass).
+        let mut enc = FecEncoder::new();
+        let produced = enc.encode(&ciphertext, params, 0);
+
+        assert_eq!(produced.len(), reference.len(), "symbol count differs");
+        for (p, r) in produced.iter().zip(reference.iter()) {
+            assert_eq!(p.payload_id, r.payload_id, "payload_id differs");
+            assert_eq!(p.object_size, r.object_size, "object_size differs");
+            assert_eq!(p.data, r.data, "symbol data differs");
+        }
+    }
+
+    /// Two full source symbols (2400 bytes = 2 × symbol_size 1200, no remainder),
+    /// confirming the `for esi in 0..chunk_count` loop runs exactly twice with no
+    /// remainder branch taken.
+    #[test]
+    fn zero_repair_bypass_byte_identical_two_full_symbols() {
+        let params = FlowClass::Default.params();
+        let ciphertext = vec![0x5Au8; 2400]; // exactly 2 full source symbols, no padding
 
         // Reference path: force the real Encoder with repair = 0.
         let mut ref_enc = FecEncoder::new();
