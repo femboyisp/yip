@@ -150,6 +150,120 @@ one source symbol — yip's analogue of WireGuard auto-setting `wg0` to MTU 1420
 
 ---
 
+## UDP loss recovery: yip vs UDPspeeder
+
+`tests/run-fec-compare.sh` (driven by the `udp_loss_recovery_comparison` test) is
+the **FEC-vs-FEC headline**. UDPspeeder is yip's closest competitor — both add
+rateless/blockwise FEC over UDP to recover packet loss. This harness measures
+raw UDP **delivered-loss** with a pure-UDP sequenced blaster (`udp_tx.py` /
+`udp_rx.py`: send *N* seq-numbered datagrams, count unique sequence numbers at
+the receiver) across three transports under the same netem loss:
+
+- **bare-link** — straight veth, no FEC (the loss floor)
+- **UDPspeeder** — Reed-Solomon FEC forwarder, `f20:10` (20 source : 10 repair)
+- **yip** — RaptorQ-FEC tunnel (release `yipd`)
+
+A pure-UDP blaster is required because iperf3 needs a TCP control channel even in
+`-u` mode, so it cannot traverse a UDP-only forwarder like UDPspeeder.
+
+### Measured table (release `yipd`)
+
+N = 20000 packets at 4000 pps; netem `loss X% delay 5ms` symmetric on both veth
+ends (kernel 6.18, AMD Ryzen 5 7640U):
+
+| loss% | bare_recv% | udpspeeder_recv% | yip_recv% |
+|-------|------------|------------------|-----------|
+| 0     | 100.0      | 100.0            | 100.0     |
+| 5     | 95.2       | 100.0            | 99.8      |
+| 10    | 90.0       | 100.0            | 99.0      |
+
+### Honest interpretation
+
+The bare-link column is the control: it delivers ~`100 − loss`% exactly, proving
+the netem impairment is real. Both FEC transports then recover almost all of it.
+UDPspeeder's fixed-block `f20:10` Reed-Solomon recovered **100%** at both 5% and
+10% loss here; yip's RaptorQ recovered **99.8%** and **99.0%** — within a hair of
+perfect. The takeaway is that yip is in the same league as the purpose-built
+FEC forwarder on raw loss recovery, while *also* being a full encrypted L2/L3 VPN
+(UDPspeeder is only a loss-hiding UDP relay with no tunneling or crypto of its
+own). Read the **gap from the bare column**, not the last decimal between the two
+FEC columns — both effectively erase the loss.
+
+---
+
+## Throughput matrix: yip vs WireGuard vs OpenVPN vs n2n
+
+`tests/run-iperf-compare.sh` (driven by the `iperf_throughput_comparison` test)
+sets up each full-IP tunnel in its own netns pair and, at each loss rate, runs
+`ping -c 50 -i 0.1` (effective loss + RTT) and `iperf3 -c <tun> -t 8` (TCP
+Mbit/s). The contenders:
+
+- **yip** — RaptorQ-FEC tunnel (release `yipd`), inner MTU 1184
+- **WireGuard** — in-kernel, no FEC
+- **OpenVPN** — static-key p2p TUN, AES-256-CBC (static-key mode has no AEAD/GCM)
+- **n2n** — v3 supernode + 2 edges, TAP overlay. One TAP data plane serves both
+  L2 and L3, so it is measured **once** (not split into two fabricated columns).
+
+### Measured tables (release `yipd`)
+
+netem `loss X% delay 5ms` symmetric (kernel 6.18, AMD Ryzen 5 7640U):
+
+**loss = 0%**
+
+| contender | eff_loss% | rtt_ms | tcp_Mbit/s |
+|-----------|-----------|--------|------------|
+| yip       | 0         | 10.65  | 167        |
+| wireguard | 0         | 10.34  | 1010       |
+| openvpn   | 0         | 10.31  | 173        |
+| n2n       | 0         | 10.24  | 191        |
+
+**loss = 5%**
+
+| contender | eff_loss% | rtt_ms | tcp_Mbit/s |
+|-----------|-----------|--------|------------|
+| yip       | 2         | 10.56  | 24.1       |
+| wireguard | 4         | 10.38  | 3.40       |
+| openvpn   | 6         | 10.38  | 3.14       |
+| n2n       | 6         | 10.27  | 2.62       |
+
+**loss = 10%**
+
+| contender | eff_loss% | rtt_ms | tcp_Mbit/s |
+|-----------|-----------|--------|------------|
+| yip       | 6         | 10.65  | 9.29       |
+| wireguard | 18        | 10.39  | 1.31       |
+| openvpn   | 22        | 10.32  | N/A        |
+| n2n       | 18        | 10.32  | 1.70       |
+
+(`N/A` = iperf3 transfer did not complete within the window — the no-FEC tunnel
+collapsed under 10% loss, which is the point. Single-stream TCP over a 10 ms RTT
+path is stochastic; read the trend, not the cell.)
+
+### Honest interpretation
+
+Two stories, the same one yip is built to tell:
+
+1. **On a clean link, the kernel wins on raw speed.** At 0% loss WireGuard moves
+   ~1 Gbit/s — it is in-kernel with no FEC. The userspace tunnels cluster together
+   (yip 167, OpenVPN 173, n2n 191 Mbit/s); yip pays for sealing + FEC-encoding
+   every packet single-threaded, and the others are comparable userspace overhead.
+   On a link that does not need FEC, FEC is pure cost.
+
+2. **Under loss, yip pulls ahead of everyone — including WireGuard.** At 5% loss
+   yip holds 24 Mbit/s while every no-FEC tunnel collapses to ~3 Mbit/s (yip ~7×).
+   At 10% the gap widens: yip 9.3 Mbit/s vs WireGuard 1.3, n2n 1.7, OpenVPN
+   timed out entirely. The ping column tells the same story — yip's effective loss
+   (2%, 6%) stays well under the no-FEC tunnels (4–6%, 18–22%) because RaptorQ
+   repair symbols reconstruct the drops before TCP ever sees them. yip *resists*
+   loss; the FEC-less tunnels *succumb* to it. RTT is within ~0.4 ms across all
+   four (the 10 ms netem delay dominates), so FEC adds no meaningful latency.
+
+This is yip's thesis as a matrix: trade a little clean-link throughput for large
+loss resilience — the right call on the lossy/contended links yip targets, and
+cheap on a clean fast path where every tunnel is fast enough.
+
+---
+
 ## Caveats and deferred items
 
 - **Run-to-run variance:** each data point is 100 pings at 50 ms inter-packet
@@ -159,13 +273,15 @@ one source symbol — yip's analogue of WireGuard auto-setting `wg0` to MTU 1420
   harness and CI build `--release`.  A debug binary is ~75× slower on the RaptorQ
   path and produces meaningless throughput/latency numbers (see the build note
   above).  The Criterion hot-path micro-benchmarks are always release.
-- **iperf3 throughput:** the ~270 Mbit/s clean-link single-stream figure quoted
-  above was measured with iperf3 over the tunnel; a committed iperf3 sweep
-  (TCP + UDP-under-loss) wired into the harness is the next addition.
-- **Additional contenders:** OpenVPN (L3) and n2n (L2/L3) are installed and
-  queued as comparison contenders alongside yip and WireGuard.
-- **TCP-under-loss latency-spike comparison:** deferred (requires the iperf3 sweep
-  above or a dedicated TCP load generator).
+- **iperf3 throughput:** a committed iperf3 TCP sweep (`run-iperf-compare.sh`,
+  see the throughput matrix above) is now wired into the harness across yip,
+  WireGuard, OpenVPN, and n2n.
+- **Additional contenders:** OpenVPN (L3 static-key) and n2n (L2/L3 TAP overlay)
+  are now committed comparison contenders alongside yip and WireGuard in the
+  iperf matrix; UDPspeeder (RS-FEC) is the committed contender in the UDP loss
+  matrix. Each SKIPs cleanly with a logged reason when its tool/module is absent.
+- **TCP-under-loss latency-spike comparison:** deferred (the iperf3 sweep reports
+  steady-state throughput + RTT, not per-segment latency spikes).
 - **WireGuard column:** if the runner does not have the `wireguard` kernel module
   or the `wg` CLI tool the WireGuard column is skipped with a logged reason, and
   the yip-only columns are still reported.

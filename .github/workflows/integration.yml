@@ -49,6 +49,8 @@ jobs:
           sudo -E "$BIN" yip_tunnel_under_netem_loss    --nocapture --test-threads=1 2>&1 | tee /tmp/netem-yip.log
           sudo -E "$BIN" comparison_under_netem_loss    --nocapture --test-threads=1 2>&1 | tee /tmp/netem-compare.log
           sudo -E "$BIN" scp_throughput_comparison    --nocapture --test-threads=1 2>&1 | tee /tmp/netem-scp.log
+          sudo -E "$BIN" udp_loss_recovery_comparison --nocapture --test-threads=1 2>&1 | tee /tmp/netem-fec.log
+          sudo -E "$BIN" iperf_throughput_comparison  --nocapture --test-threads=1 2>&1 | tee /tmp/netem-iperf.log
           # Honesty guard: the yip-only tests must have run for real, not skipped.
           if grep -q "SKIP yip_tunnel_under_netem_loss" /tmp/netem-yip.log; then
             echo "::error::yip netem test skipped — runner is not root"
@@ -62,6 +64,19 @@ jobs:
           # Exception: if sshd/scp are absent, the harness itself logs SKIP and exits 0 — that is acceptable.
           if grep -q "SKIP scp_throughput_comparison: needs root" /tmp/netem-scp.log; then
             echo "::error::scp throughput test skipped — runner is not root"
+            exit 1
+          fi
+          # Honesty guard: the FEC + iperf tests must have run for real, not skipped
+          # for "needs root". The harness's own tool-absent SKIPs are ALLOWED:
+          # UDPspeeder/OpenVPN/n2n won't be installed in CI — the yip (+ WireGuard)
+          # paths are the must-run core, and each absent contender SKIPs its column
+          # cleanly while the harness still exits 0.
+          if grep -q "SKIP udp_loss_recovery_comparison: needs root" /tmp/netem-fec.log; then
+            echo "::error::UDP loss recovery test skipped — runner is not root"
+            exit 1
+          fi
+          if grep -q "SKIP iperf_throughput_comparison: needs root" /tmp/netem-iperf.log; then
+            echo "::error::iperf throughput test skipped — runner is not root"
             exit 1
           fi
 

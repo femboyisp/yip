@@ -358,3 +358,72 @@ ip netns exec <send_ns> scp -q -P 2222 -i client \
 - [ ] **Step 2:** Run unprivileged → SKIPs+passes. Run under sudo for real → produces the throughput table. CONFIRM the thesis direction: at 0% yip and WG are comparable (yip maybe lower from FEC overhead); at 5-10% yip throughput >> WG (WG collapses). Capture the REAL table; if the direction doesn't hold, report what you observe — do NOT fake it. Verify no leaked netns/sshd processes (`pgrep sshd`, `ip netns list` clean after).
 - [ ] **Step 3:** Add the throughput table + interpretation to `crates/yip-bench/README.md` (honest: note payload size, timeout, that scp adds SSH crypto on top of both tunnels equally). Add a CI step running the scp test under sudo (honesty guard). `cargo clippy`/`fmt` clean.
 - [ ] **Step 4:** Commit `Add scp throughput comparison to the netem harness` (body ends with `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`).
+
+---
+
+## Contender expansion (2026-06-30) — iperf3 + OpenVPN + n2n + UDPspeeder
+
+Added after the release-build fix (commit e62a635). All four setups spiked and
+verified end-to-end in netns under sudo before any harness was written.
+
+### Verified mechanics
+
+**iperf3** — works across any full-IP tunnel (yip / WireGuard / OpenVPN / n2n).
+TCP: `iperf3 -s -1 -B <tun_ip>` + `iperf3 -c <tun_ip> -t N`. UDP-under-loss:
+`iperf3 -c <tun_ip> -u -b <rate> -t N` (reports delivered/lost at receiver).
+NOTE: iperf3 needs a TCP control channel even for `-u`, so it CANNOT traverse a
+UDP-only forwarder like UDPspeeder — use the python blaster for that.
+
+**OpenVPN** (2.7.4, L3) — static-key point-to-point TUN. `--secret` is deprecated
+in 2.7 and needs `--allow-deprecated-insecure-static-crypto`; static-key mode does
+NOT support AEAD/GCM (TLS-only), so use `--cipher AES-256-CBC`:
+```
+openvpn --genkey secret static.key
+# peer A:
+openvpn --dev tun --dev-type tun --local <ipA> --lport 1194 --remote <ipB> --rport 1194 \
+  --ifconfig 10.60.0.1 10.60.0.2 --secret static.key \
+  --allow-deprecated-insecure-static-crypto --proto udp --auth SHA256 --cipher AES-256-CBC
+# peer B: swap local/remote and --ifconfig args
+```
+Verified: 0.28 ms ping, 816 Mbit/s iperf3 (DCO kernel offload). Creates `tun0`.
+
+**n2n** (v3.0.0, L2 TAP overlay; `-r` adds L3 routing on the same data path) —
+supernode + two edges:
+```
+supernode -p 7654 -f
+edge -c bench -k benchkey -a 10.90.0.1 -l <supernode_ip>:7654 -d n2n0 -f   # edge A
+edge -c bench -k benchkey -a 10.90.0.2 -l <supernode_ip>:7654 -d n2n0 -f   # edge B
+```
+Verified: 0.32 ms ping, 776 Mbit/s iperf3. One TAP data plane serves both L2 and
+L3 — measure once, document it does both (do NOT claim two perf profiles).
+
+**UDPspeeder** (RS-FEC over UDP, L4 forwarder — yip's closest thesis-competitor) —
+source in read-only `refrences/UDPspeeder`; build native static binary to the
+git-ignored `.bench-tools/speederv2` (do NOT build in the clone):
+```
+g++ -o speederv2 -I. main.cpp log.cpp common.cpp lib/fec.cpp lib/rs.cpp crc32/Crc32.cpp \
+  packet.cpp delay_manager.cpp fd_manager.cpp connection.cpp fec_manager.cpp misc.cpp \
+  tunnel_client.cpp tunnel_server.cpp my_ev.cpp -isystem libev -std=c++11 -lrt -O2
+# (stamp a dummy git_version.h with `const char *gitversion="bench";` to skip the git target)
+```
+Run (server decodes to a local UDP target, client FEC-encodes to server):
+```
+speederv2 -s -l<recv_ip>:4096 -r 127.0.0.1:7777 -f20:10 -k benchpw --mode 0
+speederv2 -c -l127.0.0.1:3333 -r<recv_ip>:4096 -f20:10 -k benchpw --mode 0
+```
+Verified at 10% netem loss: pure-UDP blast delivered 20000/20000 (0% loss) through
+UDPspeeder vs 14402/20000 (~28%) direct — full FEC recovery.
+
+### Harness deliverables (all SKIP-if-tool-absent with CI honesty guards)
+
+1. `run-fec-compare.sh` — UDP delivered-loss under a netem loss sweep across
+   bare-link (no FEC) vs UDPspeeder (RS-FEC) vs yip (RaptorQ-FEC) [vs WireGuard].
+   Pure-UDP python blaster (`udp_tx.py`/`udp_rx.py`, seq-numbered, count unique).
+   The FEC-vs-FEC headline.
+2. `run-iperf-compare.sh` — iperf3 TCP throughput + ping latency/loss under a
+   netem sweep across yip / WireGuard / OpenVPN / n2n (full-IP tunnels).
+3. netem_bench.rs root-gated tests wrapping each (SKIP if the tool is absent);
+   CI steps with honesty guards; results written up in crates/yip-bench/README.md.
+
+All VPN binaries built/run `--release` for yip (see e62a635); WireGuard is
+in-kernel; OpenVPN/n2n are distro binaries; UDPspeeder is the local static build.

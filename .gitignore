@@ -4,3 +4,6 @@
 **/target/
 /.superpowers/
 /mutants.out*/
+
+# Locally-built benchmark contender binaries (UDPspeeder etc.)
+.bench-tools/
