@@ -1081,6 +1081,7 @@ name = "yip-io"
 version = "0.0.0"
 dependencies = [
  "io-uring",
+ "libc",
 ]
 
 [[package]]
