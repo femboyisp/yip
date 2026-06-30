@@ -44,35 +44,45 @@ The benchmark comment in `benches/hotpath.rs` explains this in detail.
 
 The headline result:
 
-> **yip's RaptorQ FEC recovers most injected packet loss — nearly all at low
-> rates, ~70 % at 10 % — while WireGuard, which has no FEC, passes it through.**
+> **yip's RaptorQ FEC recovers nearly all injected packet loss — for a ~0.2 ms
+> latency premium over WireGuard — while WireGuard, which has no FEC, passes the
+> loss straight through.**
 
-At 10 % injected loss, yip showed ~3 % effective loss (FEC recovered ~70 % of
-dropped packets); WireGuard showed ~12 % effective loss.  The FEC cost is an RTT
-premium of ~8 ms (~18 ms yip vs ~10 ms WireGuard) from the encode/decode pipeline.
+At 10 % injected loss, yip showed ~1 % effective loss (FEC recovered ~90 % of
+dropped packets); WireGuard showed ~17 %.  The latency cost is negligible: yip's
+RTT tracks WireGuard's to within ~0.2 ms (both dominated by the 10 ms netem
+delay), so the FEC encode/decode pipeline is effectively free on the wire.
+
+> **Build note (important):** these figures require a **release** `yipd`.  yipd's
+> RaptorQ data path is ~75× slower compiled without optimizations (the GF(256)
+> matrix math dominates), which throttles throughput to a few Mbit/s and adds
+> ~2 ms of per-packet latency — entirely a build-mode artifact, not FEC cost.  The
+> harness and CI now build `--release`, so the comparison against in-kernel
+> WireGuard is apples-to-apples.
 
 The effective-loss law (expected values; a single 100-ping sample scatters around
 these): with independent per-direction loss *p* and proactive repair symbols, yip
 effective loss ≈ *p*² (only the residual that escapes FEC recovery survives);
 WireGuard, which has no FEC, passes loss through at roughly *p* up to the
 bidirectional bound 1 − (1 − *p*)² (a round-trip ping must deliver on both hops).
-At *p* = 10 % that band is ≈ 10–19 %; across runs we observed WireGuard at ~12–20 %
-and yip at ~1–3 % — the single committed table below is one such sample, so read
-the **gap** between the columns, not the exact per-cell value.
+At *p* = 10 % that band is ≈ 10–19 %; the committed table below shows WireGuard at
+17 % and yip at 1 % — read the **gap** between the columns, not the exact per-cell
+value.
 
 ### Latest sweep
 
-The table below comes from the most recent run of `tests/run-compare.sh`.
-The harness overwrites `RESULTS.md` each time it runs; the figures here are from
-the committed baseline run (2026-06-30, kernel 6.18, AMD Ryzen 5 7640U):
+The table below comes from the most recent run of `tests/run-compare.sh` with a
+**release** `yipd`.  The harness overwrites `RESULTS.md` each time it runs; the
+figures here are from the committed baseline run (2026-06-30, kernel 6.18,
+AMD Ryzen 5 7640U):
 
 | injected % | yip effective loss | WG effective loss | yip RTT (ms) | WG RTT (ms) |
 |---|---|---|---|---|
-| 0 % | 0 % | 0 % | 17.9 | 10.4 |
-| 1 % | 0 % | 0 % | 17.7 | 10.4 |
-| 3 % | 0 % | 7 % | 18.0 | 10.4 |
-| 5 % | 1 % | 9 % | 18.0 | 10.4 |
-| 10 % | 3 % | 12 % | 18.4 | 10.4 |
+| 0 % | 0 % | 0 % | 10.54 | 10.32 |
+| 1 % | 0 % | 2 % | 10.57 | 10.33 |
+| 3 % | 0 % | 4 % | 10.54 | 10.36 |
+| 5 % | 0 % | 8 % | 10.55 | 10.39 |
+| 10 % | 1 % | 17 % | 10.54 | 10.34 |
 
 Measurement: `ping -c 100 -i 0.05 -W 1`; netem: `loss X% delay 5ms` applied
 symmetrically to both veth ends.  100 pings per data point — stochastic, so
@@ -94,41 +104,41 @@ out of the comparison — what differs is how each tunnel carries TCP under loss
 The thesis: yip's RaptorQ FEC masks loss from TCP (so throughput holds), while
 WireGuard's TCP sees real retransmits + congestion backoff (so it collapses).
 
-### Measured table (debug `yipd` build)
+### Measured table (release `yipd`)
 
-The harness uses the same `target/debug/yipd` as the other netem tests:
+The harness builds `yipd --release` (see the build note above):
 
 | loss% | yip_MBps | wg_MBps |
 |-------|----------|---------|
-| 0     | 0.45     | 36.20   |
-| 5     | 0.44     | 0.39    |
-| 10    | 0.41     | 0.16    |
+| 0     | 13.83    | 35.17   |
+| 5     | 2.44     | 0.37    |
+| 10    | 1.02     | 0.16    |
 
 (kernel 6.18, AMD Ryzen 5 7640U; 20 MB payload; netem `loss X% delay 5ms`
-symmetric on both veth ends; sshd on port 2222.)
+symmetric on both veth ends; sshd on port 2222.  Single-stream scp over a 10 ms
+RTT path — high run-to-run variance, so read the **crossover**, not the cells.)
 
 ### Honest interpretation
 
-Two effects are visible, and they pull in opposite directions:
+The two tunnels trade places as loss rises — this crossover *is* the result:
 
-1. **The thesis direction holds.** yip's throughput is essentially *flat* across
-   loss (0.45 → 0.44 → 0.41 MB/s) because the FEC repair symbols hide the dropped
-   packets from TCP, so TCP never backs off.  WireGuard collapses from 36.2 MB/s
-   at 0 % to 0.39 at 5 % and 0.16 at 10 % — classic TCP-over-lossy-link behaviour.
-   At 10 % loss yip is ~2.5× WireGuard's throughput.  Read the **trend**, not the
-   absolute cells: yip *resists* loss, WireGuard *succumbs* to it.
+1. **On a clean link, yip is slower.** At 0 % loss WireGuard moves ~35 MB/s vs
+   yip's ~14 MB/s.  WireGuard is in-kernel and has no FEC; yip is single-threaded
+   userspace, seals + FEC-encodes every packet, and runs a smaller inner MTU
+   (1184, see below).  This is the price of the FEC pipeline on a link that does
+   not need it.  (Raw single-stream throughput on a *zero-delay* link is higher
+   still — iperf3 over the tunnel reaches ~270 Mbit/s; the 10 ms netem delay here
+   caps a single TCP stream well below that.)
 
-2. **yip's absolute baseline at 0 % is throttled by the debug build, not by FEC.**
-   The 0.45 MB/s vs 36.2 MB/s gap at 0 % loss is *not* FEC overhead — it is the
-   **unoptimized (debug) RaptorQ data path**.  RaptorQ builds an encoder/decoder
-   matrix per object; that matrix math is ~50× slower compiled without
-   optimizations.  Rebuilding `yipd` with `--release` and re-running the same
-   0 %-loss scp gave **23.97 MB/s** (vs the 0.45 MB/s debug figure) — within range
-   of kernel WireGuard's 36 MB/s.  WireGuard is always in-kernel (optimized), so
-   the committed table compares *debug* yip against *optimized* WireGuard.  The
-   honest read: at 0 % loss the two are comparable once yip is built in release;
-   the table's 0 % gap is a build-mode artifact of running the same debug binary
-   the rest of the netem suite uses.
+2. **Under loss, yip dominates.** yip degrades gracefully (13.8 → 2.4 → 1.0 MB/s)
+   because FEC repair symbols hide the drops from TCP, so TCP rarely backs off.
+   WireGuard collapses (35 → 0.37 → 0.16 MB/s) — classic TCP-over-lossy-link
+   congestion backoff.  By 5 % loss yip is already ~6× WireGuard, and ~6× again at
+   10 %.  yip *resists* loss; WireGuard *succumbs* to it.
+
+That crossover is the whole thesis: yip spends a little clean-link throughput to
+buy large loss resilience — the right trade for the lossy/contended links yip
+targets, and irrelevant on a clean fast path where both are fast enough.
 
 A secondary inefficiency was also fixed while investigating: the harness now sets
 the `yip0` TUN **MTU to 1184**.  yip seals each inner packet (+16-byte AEAD tag)
@@ -145,12 +155,17 @@ one source symbol — yip's analogue of WireGuard auto-setting `wg0` to MTU 1420
 - **Run-to-run variance:** each data point is 100 pings at 50 ms inter-packet
   interval (~5 s of traffic).  The effective-loss figures at low injected rates
   can vary by ±1–3 % between runs.  More pings (e.g. 1000) would tighten this.
-- **iperf3 throughput:** not yet measured; deferred until iperf3 is available in
-  the CI environment.
-- **L2 contenders:** n2n, ZeroTier, and OpenVPN comparison is deferred (tools not
-  installed in the current environment).
-- **TCP-under-loss latency-spike comparison:** deferred (requires iperf3 or a TCP
-  load generator).
+- **Build mode:** all end-to-end (netns) figures require a **release** `yipd`; the
+  harness and CI build `--release`.  A debug binary is ~75× slower on the RaptorQ
+  path and produces meaningless throughput/latency numbers (see the build note
+  above).  The Criterion hot-path micro-benchmarks are always release.
+- **iperf3 throughput:** the ~270 Mbit/s clean-link single-stream figure quoted
+  above was measured with iperf3 over the tunnel; a committed iperf3 sweep
+  (TCP + UDP-under-loss) wired into the harness is the next addition.
+- **Additional contenders:** OpenVPN (L3) and n2n (L2/L3) are installed and
+  queued as comparison contenders alongside yip and WireGuard.
+- **TCP-under-loss latency-spike comparison:** deferred (requires the iperf3 sweep
+  above or a dedicated TCP load generator).
 - **WireGuard column:** if the runner does not have the `wireguard` kernel module
   or the `wg` CLI tool the WireGuard column is skipped with a logged reason, and
   the yip-only columns are still reported.

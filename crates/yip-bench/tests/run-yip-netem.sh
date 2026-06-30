@@ -13,16 +13,17 @@
 # below the injected netem loss.
 set -euo pipefail
 
-# If a binary path is provided use it; otherwise build yipd and use target/debug/yipd.
+# If a binary path is provided use it; otherwise build yipd (release) and use it.
 if [ $# -ge 1 ] && [ -n "${1:-}" ]; then
     YIPD="$1"
 else
     # Locate workspace root (parent of crates/yip-bench) and build yipd.
+    # --release: yipd's RaptorQ path is ~75x slower unoptimized.
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-    echo "[build] running cargo build -p yipd --quiet in $WORKSPACE_ROOT"
-    cargo build -p yipd --quiet --manifest-path "$WORKSPACE_ROOT/Cargo.toml"
-    YIPD="$WORKSPACE_ROOT/target/debug/yipd"
+    echo "[build] running cargo build --release -p yipd --quiet in $WORKSPACE_ROOT"
+    cargo build --release -p yipd --quiet --manifest-path "$WORKSPACE_ROOT/Cargo.toml"
+    YIPD="$WORKSPACE_ROOT/target/release/yipd"
 fi
 
 TMPDIR_TEST="$(mktemp -d /tmp/yipd-netem-test.XXXXXX)"

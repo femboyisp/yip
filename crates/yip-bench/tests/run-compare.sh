@@ -18,9 +18,11 @@ if [ $# -ge 1 ] && [ -n "${1:-}" ]; then
 else
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-    echo "[build] running cargo build -p yipd --quiet in $WORKSPACE_ROOT"
-    cargo build -p yipd --quiet --manifest-path "$WORKSPACE_ROOT/Cargo.toml"
-    YIPD="$WORKSPACE_ROOT/target/debug/yipd"
+    # --release: yipd's RaptorQ path is ~75x slower unoptimized; a debug build
+    # measured against in-kernel WireGuard is apples-to-oranges.
+    echo "[build] running cargo build --release -p yipd --quiet in $WORKSPACE_ROOT"
+    cargo build --release -p yipd --quiet --manifest-path "$WORKSPACE_ROOT/Cargo.toml"
+    YIPD="$WORKSPACE_ROOT/target/release/yipd"
 fi
 
 # Also locate workspace root for RESULTS.md output

@@ -67,9 +67,11 @@ tunnel, proven by pinging across it between two daemons in separate network name
 - [x] **M5** — `yip-transport`: adaptive RaptorQ FEC + per-flow classifier + stateful flow heuristic.
 - [x] **M6** — `yipd` end-to-end 2-peer encrypted tunnel (ping-tested across network namespaces).
 - [x] **M7** — benchmark harness: hot-path micro-benchmarks (AEAD ~2 µs/frame, wire framing
-  ~512 ns/frame, RaptorQ encode ~24 µs/frame) and a `tc netem` yip-vs-WireGuard loss comparison —
-  yip's FEC recovers loss WireGuard passes through (~3 % effective at 10 % injected vs ~12 % for WG).
-  See [`crates/yip-bench/README.md`](crates/yip-bench/README.md) for the full results.
+  ~512 ns/frame, RaptorQ encode ~24 µs/frame) and a `tc netem` yip-vs-WireGuard comparison (release
+  build) — yip's FEC recovers loss WireGuard passes through (~1 % effective at 10 % injected vs ~17 %
+  for WG) for a ~0.2 ms RTT premium, and under loss yip's scp throughput holds while WireGuard's TCP
+  collapses (~6× yip at 5–10 % loss). See [`crates/yip-bench/README.md`](crates/yip-bench/README.md)
+  for the full results.
 - [ ] **Next** — control plane (decentralized discovery, NAT traversal, relay fallback); then
   anti-DPI / obfuscation, DAITA/anonymity, and hardening sub-projects.
 

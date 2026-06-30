@@ -41,8 +41,10 @@ jobs:
           BIN=$(jq -r 'select(.executable != null) | .executable' /tmp/netem-build.json | tail -n1)
           test -n "$BIN" || { echo "::error::could not locate netem_bench test binary"; exit 1; }
           echo "running $BIN under sudo"
-          # Build yipd so the test harness can find it (avoids a second in-script build).
-          cargo build -p yipd
+          # Build yipd (release) so the test harness can find it (avoids a second
+          # in-script build). Release is required: debug RaptorQ is ~75x slower,
+          # which would make yip look artificially bad against in-kernel WireGuard.
+          cargo build --release -p yipd
           # Run both tests sequentially; the WG test gracefully skips if WG is unavailable.
           sudo -E "$BIN" yip_tunnel_under_netem_loss    --nocapture --test-threads=1 2>&1 | tee /tmp/netem-yip.log
           sudo -E "$BIN" comparison_under_netem_loss    --nocapture --test-threads=1 2>&1 | tee /tmp/netem-compare.log

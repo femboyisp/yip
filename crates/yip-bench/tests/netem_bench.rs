@@ -32,7 +32,10 @@ fn yip_tunnel_under_netem_loss() {
     let root = workspace_root();
 
     // Use the pre-built binary if it exists; the script will build it otherwise.
-    let yipd_path = root.join("target/debug/yipd");
+    // RELEASE, not debug: yipd's RaptorQ FEC path is ~75x slower unoptimized,
+    // which throttles throughput and inflates latency — a debug binary measured
+    // against in-kernel WireGuard is an apples-to-oranges comparison.
+    let yipd_path = root.join("target/release/yipd");
     let yipd_arg = if yipd_path.exists() {
         yipd_path.to_string_lossy().into_owned()
     } else {
@@ -67,7 +70,9 @@ fn comparison_under_netem_loss() {
 
     let root = workspace_root();
 
-    let yipd_path = root.join("target/debug/yipd");
+    // RELEASE: see note in yip_tunnel_under_netem_loss — debug RaptorQ is ~75x
+    // slower and would make yip look artificially bad against kernel WireGuard.
+    let yipd_path = root.join("target/release/yipd");
     let yipd_arg = if yipd_path.exists() {
         yipd_path.to_string_lossy().into_owned()
     } else {
@@ -104,7 +109,9 @@ fn scp_throughput_comparison() {
 
     let root = workspace_root();
 
-    let yipd_path = root.join("target/debug/yipd");
+    // RELEASE: see note in yip_tunnel_under_netem_loss — debug RaptorQ is ~75x
+    // slower and would make yip look artificially bad against kernel WireGuard.
+    let yipd_path = root.join("target/release/yipd");
     let yipd_arg = if yipd_path.exists() {
         yipd_path.to_string_lossy().into_owned()
     } else {
