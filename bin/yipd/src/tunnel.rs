@@ -20,7 +20,6 @@
 //! fractions, and feeds them to `Transport::observe_loss`, which adjusts the
 //! FEC repair ratios.
 
-use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,6 +32,7 @@ use yip_transport::{FlowClass, LossDetector, LossReport, RetxBuffer, Transport};
 use yip_wire::{Codec, WireCodec};
 
 use crate::config::Config;
+use crate::dataplane::SentLog;
 use crate::handshake::{self, PacketType};
 use crate::wire_glue;
 
@@ -58,46 +58,6 @@ const RETX_BUFFER_MAX: usize = 16_384;
 const RETX_BUFFER_TTL_MS: u64 = 2000;
 // Number of extra repair symbols to emit per ARQ retransmit.
 const RETX_EXTRA_REPAIR: u32 = 4;
-
-/// A bounded ring-log that maps sealed-packet counters to their `FlowClass`.
-///
-/// Entries are inserted in arrival order (monotone counter sequence from the
-/// AEAD) and evicted oldest-first once `capacity` is reached.  Lookup is
-/// O(1) via the `HashMap`; eviction is O(1) via the `VecDeque`.
-struct SentLog {
-    capacity: usize,
-    map: HashMap<u64, FlowClass>,
-    order: VecDeque<u64>,
-}
-
-impl SentLog {
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            map: HashMap::with_capacity(capacity),
-            order: VecDeque::with_capacity(capacity),
-        }
-    }
-
-    fn insert(&mut self, counter: u64, class: FlowClass) {
-        if self.map.len() >= self.capacity {
-            if let Some(oldest) = self.order.pop_front() {
-                self.map.remove(&oldest);
-            }
-        }
-        self.map.insert(counter, class);
-        self.order.push_back(counter);
-    }
-
-    fn get(&self, counter: u64) -> Option<FlowClass> {
-        self.map.get(&counter).copied()
-    }
-
-    /// Number of entries in the log whose `FlowClass` matches `class`.
-    fn count_class(&self, class: FlowClass) -> u32 {
-        u32::try_from(self.map.values().filter(|&&c| c == class).count()).unwrap_or(u32::MAX)
-    }
-}
 
 // ── conn_tag derivation ───────────────────────────────────────────────────────
 

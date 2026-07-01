@@ -4,6 +4,7 @@
 //! and loads a static 2-peer config from a key=value file.
 
 mod config;
+mod dataplane;
 mod handshake;
 mod tunnel;
 mod wire_glue;
