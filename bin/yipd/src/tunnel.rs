@@ -431,11 +431,16 @@ pub fn run(config: Config) -> io::Result<()> {
 
                             // Authentication succeeded: notify the detector that we
                             // saw this control counter, keeping the unified counter
-                            // sequence consistent.
-                            detector_rx
-                                .lock()
-                                .expect("detector lock poisoned")
-                                .on_seen(counter, now_ms);
+                            // sequence consistent.  Also call on_delivered so the
+                            // unified pending model does not linger on the control
+                            // counter — a received+authenticated control packet is
+                            // fully resolved and must never be reported as missing.
+                            {
+                                let mut det =
+                                    detector_rx.lock().expect("detector lock poisoned");
+                                det.on_seen(counter, now_ms);
+                                det.on_delivered(counter);
+                            }
 
                             // Decode the LossReport.
                             let report = match LossReport::decode(&plaintext) {
