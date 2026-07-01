@@ -409,14 +409,9 @@ pub fn run(config: Config) -> io::Result<()> {
                             );
                             let ct = &dg[9..];
 
-                            // Notify the detector that we saw this control counter too,
-                            // so the unified counter sequence stays consistent.
-                            detector_rx
-                                .lock()
-                                .expect("detector lock poisoned")
-                                .on_seen(counter, now_ms);
-
-                            // Decrypt the control payload.
+                            // Decrypt the control payload FIRST — authenticate before
+                            // any side-effect. A forged packet with a bogus counter
+                            // must not poison the loss detector's high_counter.
                             let plaintext = match session_rx
                                 .lock()
                                 .expect("session lock poisoned")
@@ -428,6 +423,14 @@ pub fn run(config: Config) -> io::Result<()> {
                                     continue;
                                 }
                             };
+
+                            // Authentication succeeded: notify the detector that we
+                            // saw this control counter, keeping the unified counter
+                            // sequence consistent.
+                            detector_rx
+                                .lock()
+                                .expect("detector lock poisoned")
+                                .on_seen(counter, now_ms);
 
                             // Decode the LossReport.
                             let report = match LossReport::decode(&plaintext) {
