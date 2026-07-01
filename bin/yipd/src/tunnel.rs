@@ -485,8 +485,8 @@ pub fn run(config: Config) -> io::Result<()> {
 
                             drop(log); // release before locking transport
 
-                            // Compute loss fractions as f64 (lossless from u32),
-                            // then narrow to f32 via saturating conversion.
+                            // Compute loss fractions by narrowing u32 counts to u16
+                            // (saturating), then converting to f32 without any numeric cast.
                             let frac_rt = fraction_f32(missing_rt, sent_rt);
                             let frac_bulk = fraction_f32(missing_bulk, sent_bulk);
                             let frac_default = fraction_f32(missing_default, sent_default);
