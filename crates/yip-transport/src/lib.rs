@@ -141,6 +141,24 @@ impl Transport {
             .push(symbol)
     }
 
+    /// Generate fresh RaptorQ repair symbols for a previously-sent object,
+    /// carrying the ORIGINAL `object_id` so the receiver's existing decoder
+    /// can be topped up rather than starting a new one.
+    ///
+    /// Returns all source + `extra_repair` repair symbols — enough that a
+    /// receiver that got zero original symbols can still reconstruct.
+    pub fn repair_object(
+        &mut self,
+        ciphertext: &[u8],
+        class: FlowClass,
+        object_id: u16,
+        extra_repair: u32,
+    ) -> Vec<Symbol> {
+        let params = class.params();
+        self.encoder
+            .repair_with_id(ciphertext, params, object_id, extra_repair)
+    }
+
     /// Feed an observed loss fraction into `class`'s controller.
     pub fn observe_loss(&mut self, class: FlowClass, loss: f32) {
         self.controllers[class_index(class)].observe_loss(loss);
@@ -231,6 +249,31 @@ mod tests {
         // Push a late/duplicate symbol after decode: should return None
         let late = rx.decode(&syms[0], class);
         assert!(late.is_none(), "late symbol returns None after completion");
+    }
+
+    #[test]
+    fn retransmitted_repair_completes_a_missing_object() {
+        let mut tx = Transport::new(vec![]);
+        let ct = vec![0x33u8; 2400]; // 2 source symbols
+        let (cls, syms) = tx.encode(&ct, &ct, false, 0);
+        let oid = syms[0].object_id; // the original object's identity
+                                     // Feed only the very first symbol; with 2 source symbols, 1 symbol is never enough.
+        let mut rx = Transport::new(vec![]);
+        let mut out = None;
+        for s in syms.iter().take(1) {
+            out = out.or(rx.decode(s, cls));
+        }
+        assert!(out.is_none(), "one of N symbols -> not yet decoded");
+        // Retransmit: fresh repair symbols carrying the SAME object_id top up the decoder.
+        let repair = tx.repair_object(&ct, cls, oid, 4);
+        assert!(
+            repair.iter().all(|s| s.object_id == oid),
+            "repair reuses object identity"
+        );
+        for s in &repair {
+            out = out.or(rx.decode(s, cls));
+        }
+        assert_eq!(out.as_deref(), Some(ct.as_slice()));
     }
 
     #[test]

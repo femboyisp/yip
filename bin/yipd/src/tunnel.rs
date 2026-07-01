@@ -28,7 +28,7 @@ use std::time::Instant;
 
 use yip_device::{DeviceKind, TunTap};
 use yip_io::{set_socket_buffers, DataPlaneIo, PlainIo, MAX_DATAGRAM_BATCH, MAX_WIRE_DATAGRAM};
-use yip_transport::{FlowClass, LossDetector, LossReport, Transport};
+use yip_transport::{FlowClass, LossDetector, LossReport, RetxBuffer, Transport};
 use yip_wire::{Codec, WireCodec};
 
 use crate::config::Config;
@@ -45,6 +45,13 @@ const FEEDBACK_INTERVAL_MS: u64 = 30;
 // Maximum number of entries in the sent-log (counter → FlowClass).  Once full,
 // the oldest entry is evicted before each new insertion, so memory is O(1).
 const SENT_LOG_CAPACITY: usize = 4096;
+
+// ARQ retransmit buffer: maximum number of sent ciphertext objects to hold.
+const RETX_BUFFER_MAX: usize = 1024;
+// How long (ms) to keep a sent object available for retransmission.
+const RETX_BUFFER_TTL_MS: u64 = 2000;
+// Number of extra repair symbols to emit per ARQ retransmit.
+const RETX_EXTRA_REPAIR: u32 = 4;
 
 /// A bounded ring-log that maps sealed-packet counters to their `FlowClass`.
 ///
@@ -159,6 +166,13 @@ pub fn run(config: Config) -> io::Result<()> {
     // ingress thread also reads it periodically to emit feedback.
     let detector: Arc<Mutex<LossDetector>> = Arc::new(Mutex::new(LossDetector::new(5, 1024)));
 
+    // ARQ retransmit buffer: egress puts sent ciphertext objects here; ingress
+    // retrieves them by counter when a NACK arrives.
+    let retx: Arc<Mutex<RetxBuffer>> = Arc::new(Mutex::new(RetxBuffer::new(
+        RETX_BUFFER_MAX,
+        RETX_BUFFER_TTL_MS,
+    )));
+
     // ── create + split the TUN device ────────────────────────────────────────
     let tun = TunTap::create(&config.device, DeviceKind::Tun).map_err(io::Error::other)?;
     let (mut tun_reader, mut tun_writer) = tun.split().map_err(io::Error::other)?;
@@ -176,6 +190,7 @@ pub fn run(config: Config) -> io::Result<()> {
     let session_tx = Arc::clone(&session);
     let transport_tx = Arc::clone(&transport);
     let sent_log_tx = Arc::clone(&sent_log);
+    let retx_tx = Arc::clone(&retx);
 
     let egress = std::thread::Builder::new()
         .name("yipd-egress".into())
@@ -218,6 +233,18 @@ pub fn run(config: Config) -> io::Result<()> {
                     .lock()
                     .expect("sent_log lock poisoned")
                     .insert(sealed.counter, class);
+
+                // Record in the ARQ retransmit buffer so NACKs can top up the
+                // receiver's decoder with fresh repair symbols.
+                if let Some(oid) = symbols.first().map(|s| s.object_id) {
+                    retx_tx.lock().expect("retx lock poisoned").put(
+                        sealed.counter,
+                        sealed.ciphertext.clone(),
+                        class,
+                        oid,
+                        now_ms,
+                    );
+                }
 
                 // Frame each symbol into a reused arena slot, then emit all
                 // datagrams in one batched syscall (chunked by MAX_DATAGRAM_BATCH).
@@ -267,6 +294,7 @@ pub fn run(config: Config) -> io::Result<()> {
     let transport_rx = Arc::clone(&transport);
     let sent_log_rx = Arc::clone(&sent_log);
     let detector_rx = Arc::clone(&detector);
+    let retx_rx = Arc::clone(&retx);
 
     let ingress = std::thread::Builder::new()
         .name("yipd-ingress".into())
@@ -460,10 +488,68 @@ pub fn run(config: Config) -> io::Result<()> {
                             let frac_bulk = fraction_f32(missing_bulk, sent_bulk);
                             let frac_default = fraction_f32(missing_default, sent_default);
 
-                            let mut t = transport_rx.lock().expect("transport lock poisoned");
-                            t.observe_loss(FlowClass::Realtime, frac_rt);
-                            t.observe_loss(FlowClass::Bulk, frac_bulk);
-                            t.observe_loss(FlowClass::Default, frac_default);
+                            {
+                                let mut t =
+                                    transport_rx.lock().expect("transport lock poisoned");
+                                t.observe_loss(FlowClass::Realtime, frac_rt);
+                                t.observe_loss(FlowClass::Bulk, frac_bulk);
+                                t.observe_loss(FlowClass::Default, frac_default);
+                            } // transport lock released here
+
+                            // ARQ: for each missing counter reported by the peer,
+                            // retransmit fresh repair symbols carrying the original
+                            // object_id so the receiver's in-progress decoder is
+                            // topped up rather than starting over.
+                            //
+                            // Lock discipline: never hold retx lock across transport
+                            // or io operations — copy data out first.
+                            for &counter in &report.missing {
+                                let retx_entry = {
+                                    let buf =
+                                        retx_rx.lock().expect("retx lock poisoned");
+                                    buf.get(counter, now_ms)
+                                        .map(|(ct, cls, oid)| (ct.to_vec(), cls, oid))
+                                };
+
+                                let Some((ct, cls, oid)) = retx_entry else {
+                                    continue;
+                                };
+                                if !cls.params().arq {
+                                    continue;
+                                }
+
+                                // Generate fresh repair symbols with the original object_id.
+                                let repair_syms = transport_rx
+                                    .lock()
+                                    .expect("transport lock poisoned")
+                                    .repair_object(&ct, cls, oid, RETX_EXTRA_REPAIR);
+
+                                // Frame and collect all repair datagrams, then send.
+                                let mut repair_frames: Vec<Vec<u8>> =
+                                    Vec::with_capacity(repair_syms.len());
+                                for sym in &repair_syms {
+                                    let frame = wire_glue::symbol_to_frame(
+                                        conn_tag, sym, counter, cls,
+                                    );
+                                    let dg = codec_rx.frame(&frame);
+                                    let mut pkt =
+                                        Vec::with_capacity(1 + dg.len());
+                                    pkt.push(PacketType::Data as u8);
+                                    pkt.extend_from_slice(&dg);
+                                    repair_frames.push(pkt);
+                                }
+                                let slices: Vec<&[u8]> = repair_frames
+                                    .iter()
+                                    .map(Vec::as_slice)
+                                    .collect();
+                                for chunk in slices.chunks(MAX_DATAGRAM_BATCH) {
+                                    if let Err(e) = io.send_batch(chunk) {
+                                        eprintln!(
+                                            "yipd ingress: retransmit send error: {e}"
+                                        );
+                                    }
+                                }
+                            }
                         }
 
                         _ => {

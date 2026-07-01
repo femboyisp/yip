@@ -76,6 +76,28 @@ impl FecEncoder {
             .map(|p| split_packet(object_id, object_size, &p))
             .collect()
     }
+
+    /// Encode a ciphertext with an EXPLICIT `object_id` (used for retransmits),
+    /// returning source + `extra_repair` repair symbols, all carrying `object_id`.
+    pub fn repair_with_id(
+        &self,
+        ciphertext: &[u8],
+        params: crate::FlowParams,
+        object_id: u16,
+        extra_repair: u32,
+    ) -> Vec<Symbol> {
+        let object_size = u32::try_from(ciphertext.len()).expect("frame fits u32");
+        let oti = ObjectTransmissionInformation::with_defaults(
+            u64::from(object_size),
+            params.symbol_size,
+        );
+        let encoder = Encoder::new(ciphertext, oti);
+        encoder
+            .get_encoded_packets(extra_repair)
+            .into_iter()
+            .map(|p| split_packet(object_id, object_size, &p))
+            .collect()
+    }
 }
 
 /// Emit the source symbols of `ciphertext` directly without constructing a
