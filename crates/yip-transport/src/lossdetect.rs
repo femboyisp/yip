@@ -117,9 +117,11 @@ impl LossDetector {
         self.resolved_set.insert(c, ());
 
         // Advance the watermark over any consecutive prefix.
+        // `saturating_add` is belt-and-suspenders: reaching u64::MAX would take
+        // ~1.8e19 objects, but it keeps the loop panic-free in debug builds.
         while self.resolved_set.contains_key(&self.resolved_below) {
             self.resolved_set.remove(&self.resolved_below);
-            self.resolved_below += 1;
+            self.resolved_below = self.resolved_below.saturating_add(1);
         }
 
         // Bound the resolved set: evict the smallest entries if over capacity.

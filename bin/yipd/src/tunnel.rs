@@ -315,6 +315,12 @@ pub fn run(config: Config) -> io::Result<()> {
 
             // Track when we last emitted a feedback packet (in tunnel-uptime ms).
             let start = Instant::now();
+            // Feedback is emitted from this ingress loop, which blocks in
+            // `recv_batch` (MSG_WAITFORONE) until a datagram arrives — so a
+            // fully silent inbound link sends no feedback. That is correct: a
+            // silent link has received no data, hence has no loss to report;
+            // feedback resumes the moment inbound traffic (and thus any loss)
+            // flows again.
             let mut last_feedback_ms: u64 = 0;
 
             // Periodic log interval for controller ratio (every ~5 s).
@@ -462,6 +468,15 @@ pub fn run(config: Config) -> io::Result<()> {
                             // It underestimates the true window (the log only holds the
                             // last SENT_LOG_CAPACITY entries) but is always ≥ class_missing,
                             // so the fraction stays ∈ [0, 1].
+                            //
+                            // Accepted tradeoff: underestimating the denominator biases the
+                            // fraction HIGH, so the controller errs toward *more* repair
+                            // under loss — conservative (never under-protects). An exact
+                            // per-class windowed rate is hard here (the receiver knows the
+                            // window totals but not the class of a fully-lost object; the
+                            // sender knows the class but not the receiver's window), and the
+                            // accurate version would risk under-repair for marginal savings —
+                            // on a clean link there is no loss to over-repair anyway.
                             let log = sent_log_rx.lock().expect("sent_log lock poisoned");
 
                             let mut missing_rt: u32 = 0;
