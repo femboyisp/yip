@@ -6,6 +6,10 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- Single-threaded data loop (Phase A): replaced the two-thread `Arc<Mutex>`
+  data plane with a mutex-free `DataPlane` driven by an `epoll` `PollDriver`
+  (io_uring driver to follow). Removes per-packet lock/handoff overhead — tunnel
+  RTT ~0.51 ms -> ~0.36 ms; throughput holds. No wire change.
 - Adaptive loss-feedback loop + reactive ARQ. The receiver detects post-FEC
   residual loss as gaps in the object counter and reports it (with NACKs) in an
   authenticated `Control` packet; the sender attributes loss per class and drives

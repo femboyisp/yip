@@ -2,6 +2,8 @@
 //! servicing UDP + TUN/TAP), then AF_XDP. This is the only crate permitted to
 //! contain `unsafe`; every `unsafe` block must carry a `// SAFETY:` comment.
 
+pub mod poll;
+
 /// Maximum number of datagrams in a single batched send/recv call.
 pub const MAX_DATAGRAM_BATCH: usize = 64;
 
