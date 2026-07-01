@@ -47,7 +47,12 @@ const FEEDBACK_INTERVAL_MS: u64 = 30;
 const SENT_LOG_CAPACITY: usize = 4096;
 
 // ARQ retransmit buffer: maximum number of sent ciphertext objects to hold.
-const RETX_BUFFER_MAX: usize = 1024;
+// Sized so that even a high-rate flow retains objects long enough for a NACK to
+// round-trip: at ~100k objects/s a 1024-entry cap held only ~10 ms, far shorter
+// than the feedback interval + RTT, so NACKed objects were already evicted.
+// 16384 covers ~160 ms at that rate; the TTL still bounds memory at lower rates.
+// Worst-case memory ≈ 16384 × ~1.25 KiB ciphertext ≈ 20 MiB.
+const RETX_BUFFER_MAX: usize = 16_384;
 // How long (ms) to keep a sent object available for retransmission.
 const RETX_BUFFER_TTL_MS: u64 = 2000;
 // Number of extra repair symbols to emit per ARQ retransmit.
