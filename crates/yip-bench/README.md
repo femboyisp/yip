@@ -341,3 +341,29 @@ forfeit yip's loss-recovery thesis. **The clean-link throughput win (skip the en
 datagram count) is therefore unlocked by the adaptive loss-feedback loop, not by this pass alone.** This pass
 delivered the plumbing (batched I/O, buffers, a ready-and-tested bypass fast-path); activating the win is the
 next milestone.
+
+---
+
+## Feedback loop — Phase A (the clean-link throughput unlock)
+
+The throughput pass shipped a *dormant* zero-repair FEC bypass. The adaptive
+loss-feedback loop (this milestone) activates it: the receiver reports post-FEC
+residual loss in an authenticated `Control` packet, the sender feeds it to the
+per-class controller, and an ARQ-eligible (`Bulk`) flow on a clean link decays
+its repair ratio to **zero** — firing the bypass (skip the ~24 µs encode) and
+halving the per-packet datagram count (1 source symbol, no repair).
+
+Measured (release, kernel 6.18, Ryzen 5 7640U; clean-link single-stream TCP over
+the netns tunnel):
+
+| build | bulk repair ratio | clean-link TCP |
+|-------|-------------------|----------------|
+| throughput pass (bypass dormant) | 0.05 floor (≥1 repair, encode always runs) | ~273–285 Mbit/s |
+| feedback loop (Phase A) | **0.0000** (converged; bypass fires) | **~457 Mbit/s** |
+
+The bulk controller's repair ratio was confirmed at `0.0000` throughout a 40 s
+run via yipd's diagnostic log — direct proof the loop converged, not merely
+inferred from the throughput rise. The ~60 % jump is consistent with removing the
+FEC encode (which the per-stage profile showed is ~80 % of egress CPU) and sending
+one datagram per packet instead of two. Under loss the controller snaps repair
+back up immediately (Phase B's ARQ then backstops the residual).
