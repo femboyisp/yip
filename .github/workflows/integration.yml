@@ -111,16 +111,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build and run yipd netns tunnel test under sudo
+      - name: Build and run yipd netns tunnel tests under sudo
         run: |
+          # Filter for the tunnel_netns test binary specifically: a --no-run build
+          # of -p yipd also emits the yipd daemon binary, and a bare `tail -n1`
+          # can grab that instead of the test harness.
           BIN=$(cargo test -p yipd --test tunnel_netns --no-run --message-format=json \
             | jq -r 'select(.executable != null) | .executable' \
-            | tail -n1)
+            | grep tunnel_netns | tail -n1)
           test -n "$BIN" || { echo "::error::could not locate tunnel_netns test binary"; exit 1; }
-          echo "running $BIN under sudo"
-          sudo -E "$BIN" ping_across_yipd_tunnel --nocapture --test-threads=1 2>&1 | tee /tmp/tunnel-test.log
-          # Honesty guard: fail if the test skipped (runner must be root-capable).
-          if grep -q "SKIP ping_across_yipd_tunnel" /tmp/tunnel-test.log; then
-            echo "::error::netns tunnel test skipped — runner is not root"
-            exit 1
-          fi
+          # arq_recovers_bulk_loss drives a real Bulk flow and needs a release yipd
+          # (debug RaptorQ is ~75x slower).
+          cargo build --release -p yipd
+          echo "running netns tunnel tests under sudo: $BIN"
+          # --exact so ping_across_yipd_tunnel does not also match _under_loss.
+          for t in ping_across_yipd_tunnel ping_across_yipd_tunnel_under_loss arq_recovers_bulk_loss; do
+            sudo -E "$BIN" "$t" --exact --nocapture --test-threads=1 2>&1 | tee "/tmp/netns-$t.log"
+            # Honesty guard: these tests must run for real, not skip for non-root.
+            # (A tool-absent SKIP from the harness itself, exit 0, is acceptable.)
+            if grep -q "SKIP $t: needs root" "/tmp/netns-$t.log"; then
+              echo "::error::netns test $t skipped — runner is not root"
+              exit 1
+            fi
+          done
