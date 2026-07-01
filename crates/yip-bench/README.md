@@ -367,3 +367,25 @@ inferred from the throughput rise. The ~60 % jump is consistent with removing th
 FEC encode (which the per-stage profile showed is ~80 % of egress CPU) and sending
 one datagram per packet instead of two. Under loss the controller snaps repair
 back up immediately (Phase B's ARQ then backstops the residual).
+
+### Phase B — reactive ARQ + loss-recovery under the feedback loop
+
+With the feedback loop active, loss recovery is unchanged — the controller
+re-arms FEC the instant loss is reported. Measured UDP delivery under `tc netem`
+(`run-fec-compare.sh`), feedback loop live:
+
+| loss% | bare_recv% | yip_recv% |
+|-------|------------|-----------|
+| 0     | 100.0      | 100.0     |
+| 5     | 94.7       | 99.7      |
+| 10    | 89.9       | 99.0      |
+
+Reactive ARQ retransmits `Bulk` objects the receiver NACKs, using fresh RaptorQ
+repair symbols that carry the original object id (so the receiver tops up its
+existing decoder). The retransmit codec is unit-proven (`repair_object` completes
+an object delivered only one symbol short), the daemon wiring was reviewed for
+object-id preservation and lock discipline, and the tunnel stays alive under 10 %
+netem loss (netns ping 10/10). A dedicated end-to-end harness that forces
+FEC-insufficiency and asserts ARQ-specific `Bulk` recovery (establishing the
+tunnel *before* applying loss, with a retransmit buffer sized to the flow rate)
+is a tracked follow-up.
