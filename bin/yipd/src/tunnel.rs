@@ -23,6 +23,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::UdpSocket;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -47,7 +48,12 @@ const FEEDBACK_INTERVAL_MS: u64 = 30;
 const SENT_LOG_CAPACITY: usize = 4096;
 
 // ARQ retransmit buffer: maximum number of sent ciphertext objects to hold.
-const RETX_BUFFER_MAX: usize = 1024;
+// Sized so that even a high-rate flow retains objects long enough for a NACK to
+// round-trip: at ~100k objects/s a 1024-entry cap held only ~10 ms, far shorter
+// than the feedback interval + RTT, so NACKed objects were already evicted.
+// 16384 covers ~160 ms at that rate; the TTL still bounds memory at lower rates.
+// Worst-case memory ≈ 16384 × ~1.25 KiB ciphertext ≈ 20 MiB.
+const RETX_BUFFER_MAX: usize = 16_384;
 // How long (ms) to keep a sent object available for retransmission.
 const RETX_BUFFER_TTL_MS: u64 = 2000;
 // Number of extra repair symbols to emit per ARQ retransmit.
@@ -173,6 +179,10 @@ pub fn run(config: Config) -> io::Result<()> {
         RETX_BUFFER_TTL_MS,
     )));
 
+    // ARQ retransmit counter: incremented once per object actually retransmitted.
+    // Exposed in the periodic log and used by integration tests to verify ARQ fired.
+    let arq_retx_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+
     // ── create + split the TUN device ────────────────────────────────────────
     let tun = TunTap::create(&config.device, DeviceKind::Tun).map_err(io::Error::other)?;
     let (mut tun_reader, mut tun_writer) = tun.split().map_err(io::Error::other)?;
@@ -295,6 +305,7 @@ pub fn run(config: Config) -> io::Result<()> {
     let sent_log_rx = Arc::clone(&sent_log);
     let detector_rx = Arc::clone(&detector);
     let retx_rx = Arc::clone(&retx);
+    let arq_retx_count_rx = Arc::clone(&arq_retx_count);
 
     let ingress = std::thread::Builder::new()
         .name("yipd-ingress".into())
@@ -310,6 +321,12 @@ pub fn run(config: Config) -> io::Result<()> {
 
             // Track when we last emitted a feedback packet (in tunnel-uptime ms).
             let start = Instant::now();
+            // Feedback is emitted from this ingress loop, which blocks in
+            // `recv_batch` (MSG_WAITFORONE) until a datagram arrives — so a
+            // fully silent inbound link sends no feedback. That is correct: a
+            // silent link has received no data, hence has no loss to report;
+            // feedback resumes the moment inbound traffic (and thus any loss)
+            // flows again.
             let mut last_feedback_ms: u64 = 0;
 
             // Periodic log interval for controller ratio (every ~5 s).
@@ -426,11 +443,16 @@ pub fn run(config: Config) -> io::Result<()> {
 
                             // Authentication succeeded: notify the detector that we
                             // saw this control counter, keeping the unified counter
-                            // sequence consistent.
-                            detector_rx
-                                .lock()
-                                .expect("detector lock poisoned")
-                                .on_seen(counter, now_ms);
+                            // sequence consistent.  Also call on_delivered so the
+                            // unified pending model does not linger on the control
+                            // counter — a received+authenticated control packet is
+                            // fully resolved and must never be reported as missing.
+                            {
+                                let mut det =
+                                    detector_rx.lock().expect("detector lock poisoned");
+                                det.on_seen(counter, now_ms);
+                                det.on_delivered(counter);
+                            }
 
                             // Decode the LossReport.
                             let report = match LossReport::decode(&plaintext) {
@@ -452,6 +474,15 @@ pub fn run(config: Config) -> io::Result<()> {
                             // It underestimates the true window (the log only holds the
                             // last SENT_LOG_CAPACITY entries) but is always ≥ class_missing,
                             // so the fraction stays ∈ [0, 1].
+                            //
+                            // Accepted tradeoff: underestimating the denominator biases the
+                            // fraction HIGH, so the controller errs toward *more* repair
+                            // under loss — conservative (never under-protects). An exact
+                            // per-class windowed rate is hard here (the receiver knows the
+                            // window totals but not the class of a fully-lost object; the
+                            // sender knows the class but not the receiver's window), and the
+                            // accurate version would risk under-repair for marginal savings —
+                            // on a clean link there is no loss to over-repair anyway.
                             let log = sent_log_rx.lock().expect("sent_log lock poisoned");
 
                             let mut missing_rt: u32 = 0;
@@ -485,8 +516,8 @@ pub fn run(config: Config) -> io::Result<()> {
 
                             drop(log); // release before locking transport
 
-                            // Compute loss fractions as f64 (lossless from u32),
-                            // then narrow to f32 via saturating conversion.
+                            // Compute loss fractions by narrowing u32 counts to u16
+                            // (saturating), then converting to f32 without any numeric cast.
                             let frac_rt = fraction_f32(missing_rt, sent_rt);
                             let frac_bulk = fraction_f32(missing_bulk, sent_bulk);
                             let frac_default = fraction_f32(missing_default, sent_default);
@@ -520,6 +551,9 @@ pub fn run(config: Config) -> io::Result<()> {
                                 if !cls.params().arq {
                                     continue;
                                 }
+
+                                // Count this retransmit for observability.
+                                arq_retx_count_rx.fetch_add(1, Ordering::Relaxed);
 
                                 // Generate fresh repair symbols with the original object_id.
                                 let repair_syms = transport_rx
@@ -607,6 +641,8 @@ pub fn run(config: Config) -> io::Result<()> {
                             t.bulk_repair_ratio(),
                         );
                     }
+                    let n = arq_retx_count_rx.load(Ordering::Relaxed);
+                    eprintln!("yipd [{}ms] ARQ retransmits: {}", now_ms, n);
                 }
             }
         })?;

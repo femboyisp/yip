@@ -51,6 +51,10 @@ impl RetxBuffer {
 
     /// Store a sent object.  If the buffer is already at capacity the oldest
     /// entry is evicted to make room.
+    ///
+    /// Counters are expected to be unique and strictly increasing. If a duplicate
+    /// counter is inserted, the stored fields (ciphertext, class, object_id, timestamp)
+    /// are updated in place without adding a phantom entry to the order deque.
     pub fn put(
         &mut self,
         counter: u64,
@@ -59,6 +63,16 @@ impl RetxBuffer {
         object_id: u16,
         now_ms: u64,
     ) {
+        // Defensive: if this counter already exists, update it in place without
+        // pushing to the order deque again (which would create a phantom entry).
+        if let Some(existing) = self.map.get_mut(&counter) {
+            existing.ciphertext = ciphertext;
+            existing.class = class;
+            existing.object_id = object_id;
+            existing.inserted_ms = now_ms;
+            return;
+        }
+
         // Evict any entries that have passed their TTL before checking capacity.
         self.evict_expired(now_ms);
 
@@ -139,5 +153,30 @@ mod tests {
             b.put(c, vec![0u8; 4], FlowClass::Bulk, 0, c);
         }
         assert!(b.len() <= 16);
+    }
+
+    #[test]
+    fn retx_duplicate_put_no_phantom_entry() {
+        let mut b = RetxBuffer::new(10, 2_000_000);
+        // Put the same counter twice with different ciphertext/class/object_id.
+        b.put(42, vec![1], FlowClass::Bulk, 11, 0);
+        assert_eq!(b.len(), 1, "first put: len == 1");
+        let (ct, cls, oid) = b.get(42, 100).expect("present");
+        assert_eq!(ct, &[1]);
+        assert_eq!(cls, FlowClass::Bulk);
+        assert_eq!(oid, 11);
+
+        b.put(42, vec![2, 2, 2], FlowClass::Default, 22, 100);
+        assert_eq!(b.len(), 1, "duplicate put: len still == 1 (no phantom)");
+        let (ct, cls, oid) = b.get(42, 200).expect("present");
+        assert_eq!(ct, &[2, 2, 2], "ciphertext updated");
+        assert_eq!(cls, FlowClass::Default, "class updated");
+        assert_eq!(oid, 22, "object_id updated");
+
+        // Fill the buffer with duplicates of one counter; len should stay 1.
+        for _ in 0..100 {
+            b.put(42, vec![99], FlowClass::Realtime, 33, 200);
+        }
+        assert_eq!(b.len(), 1, "after 100 duplicate puts: len == 1");
     }
 }
