@@ -157,6 +157,33 @@ impl TunTap {
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    /// Return the raw file descriptor for this TUN/TAP device.
+    ///
+    /// The fd is bidirectional: `read` pulls frames injected by the kernel
+    /// (egress path for the tunnel), and `write` injects frames into the
+    /// kernel network stack (ingress path for the tunnel).
+    ///
+    /// The fd is valid as long as this `TunTap` value lives.
+    pub fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.file.as_raw_fd()
+    }
+
+    /// Set the TUN/TAP fd non-blocking via `fcntl(F_SETFL, O_NONBLOCK)`.
+    ///
+    /// Required before passing the fd to an `epoll`-based event loop that
+    /// drains with `MSG_DONTWAIT` / non-blocking `read`.
+    pub fn set_nonblocking(&self) -> Result<(), DeviceError> {
+        // SAFETY: `self.file` is a valid open fd owned by this `TunTap`
+        // instance, which outlives this call.  `fcntl(F_SETFL, O_NONBLOCK)`
+        // is a pure flag-set on the open-file description and cannot cause UB.
+        let rc = unsafe { libc::fcntl(self.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+        if rc < 0 {
+            Err(DeviceError::Io(io::Error::last_os_error()))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// The read half of a split [`TunTap`].
@@ -175,6 +202,11 @@ impl TunReader {
         use std::io::Read;
         self.file.read(buf)
     }
+
+    /// Return the raw fd for this reader half.
+    pub fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.file.as_raw_fd()
+    }
 }
 
 impl TunWriter {
@@ -182,6 +214,11 @@ impl TunWriter {
     pub fn write_frame(&mut self, frame: &[u8]) -> io::Result<usize> {
         use std::io::Write;
         self.file.write(frame)
+    }
+
+    /// Return the raw fd for this writer half.
+    pub fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.file.as_raw_fd()
     }
 }
 

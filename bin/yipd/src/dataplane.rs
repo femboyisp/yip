@@ -1,10 +1,5 @@
 //! Mutex-free data plane: owns the AEAD session, FEC transport, wire codec,
-//! and auxiliary buffers.  Driven by the io_uring event loop (Task 3+); for
-//! now it is constructed and tested in isolation.
-//!
-//! Task 3 will wire `DataPlane` into the binary entry point and remove the
-//! `#[allow(dead_code)]` below.
-#![allow(dead_code)]
+//! and auxiliary buffers.  Driven by the epoll event loop in `yip_io::poll`.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -85,6 +80,7 @@ pub enum Outcome<'a> {
     /// Send these datagrams to the peer (control path: ARQ retransmits).
     Send(&'a [Vec<u8>]),
     /// Write to TUN *and* send datagrams (currently unused, reserved for future).
+    #[expect(dead_code, reason = "reserved for future combined TUN+UDP paths")]
     TunWriteThenSend(&'a [u8], &'a [Vec<u8>]),
 }
 
@@ -476,6 +472,27 @@ fn fraction_f32(numerator: u32, denominator: u32) -> f32 {
     let n = f32::from(u16::try_from(numerator).unwrap_or(u16::MAX));
     let d = f32::from(u16::try_from(denominator).unwrap_or(u16::MAX));
     (n / d).clamp(0.0_f32, 1.0_f32)
+}
+
+// ── Dispatch impl ─────────────────────────────────────────────────────────────
+
+impl yip_io::poll::Dispatch for DataPlane {
+    fn on_udp(&mut self, dg: &[u8], now_ms: u64) -> yip_io::poll::DispatchOut<'_> {
+        match self.on_udp_datagram(dg, now_ms) {
+            Outcome::None => yip_io::poll::DispatchOut::None,
+            Outcome::TunWrite(buf) => yip_io::poll::DispatchOut::Tun(buf),
+            Outcome::Send(pkts) => yip_io::poll::DispatchOut::Udp(pkts),
+            Outcome::TunWriteThenSend(buf, pkts) => yip_io::poll::DispatchOut::Both(buf, pkts),
+        }
+    }
+
+    fn on_tun(&mut self, inner: &[u8], now_ms: u64) -> &[Vec<u8>] {
+        self.on_tun_packet(inner, now_ms)
+    }
+
+    fn tick(&mut self, now_ms: u64) -> Option<&[u8]> {
+        self.tick(now_ms)
+    }
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
