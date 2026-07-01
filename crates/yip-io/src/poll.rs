@@ -176,14 +176,26 @@ fn send_to_tun(tun_fd: RawFd, buf: &[u8]) {
 
 /// Send one datagram on the UDP socket.
 ///
-/// Propagates errors so that a closed socket terminates the event loop.
+/// Transient errors (`EWOULDBLOCK`, `EAGAIN`, `ENOBUFS`) cause the datagram to
+/// be silently dropped — the UDP socket send buffer is momentarily full and this
+/// single packet loss is acceptable.  All other errors (e.g. `EBADF`) propagate
+/// so that a closed or invalid socket terminates the event loop.
 #[inline]
 fn send_to_udp(udp_fd: RawFd, buf: &[u8]) -> io::Result<()> {
     // SAFETY: `buf` is a valid slice.  `udp_fd` is a valid connected UDP
     // socket fd.  MSG_NOSIGNAL suppresses SIGPIPE if the peer has closed.
     let rc = unsafe { libc::send(udp_fd, buf.as_ptr().cast(), buf.len(), libc::MSG_NOSIGNAL) };
     if rc < 0 {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        // EWOULDBLOCK == EAGAIN on Linux; list both for portability.
+        // ENOBUFS means the socket send buffer is exhausted — drop the packet
+        // rather than tearing down the tunnel.
+        let raw = e.raw_os_error().unwrap_or(0);
+        if raw == libc::EAGAIN || raw == libc::EWOULDBLOCK || raw == libc::ENOBUFS {
+            eprintln!("poll: udp send dropped ({e})");
+            return Ok(());
+        }
+        return Err(e);
     }
     Ok(())
 }
@@ -252,7 +264,7 @@ pub fn run_poll<D: Dispatch>(udp_fd: RawFd, tun_fd: RawFd, d: &mut D) -> io::Res
             libc::epoll_wait(
                 epoll_fd,
                 events.as_mut_ptr(),
-                events.len() as libc::c_int,
+                libc::c_int::try_from(events.len()).expect("event array len fits c_int"),
                 10, // 10 ms timeout
             )
         };
@@ -400,5 +412,80 @@ mod tests {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         set_nonblocking(sock.as_raw_fd()).unwrap();
         set_nonblocking(sock.as_raw_fd()).unwrap(); // second call must not error
+    }
+
+    /// A [`Dispatch`] whose `on_udp` returns `DispatchOut::Udp` — i.e. it
+    /// reflects the received datagram back out on the UDP socket, optionally
+    /// replacing its payload.  This exercises the forwarding arm and
+    /// `send_to_udp` end-to-end via `drain_udp`.
+    struct ForwardDispatch {
+        /// Payload to send back.  Cloned once per `on_udp` call.
+        reply: Vec<u8>,
+        /// Scratch storage so the `&[Vec<u8>]` returned by `on_udp` lives long
+        /// enough (it borrows `self`).
+        scratch: Vec<Vec<u8>>,
+    }
+
+    impl ForwardDispatch {
+        fn new(reply: impl Into<Vec<u8>>) -> Self {
+            Self {
+                reply: reply.into(),
+                scratch: Vec::new(),
+            }
+        }
+    }
+
+    impl Dispatch for ForwardDispatch {
+        fn on_udp(&mut self, _dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
+            self.scratch = vec![self.reply.clone()];
+            DispatchOut::Udp(&self.scratch)
+        }
+
+        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[Vec<u8>] {
+            &[]
+        }
+
+        fn tick(&mut self, _now_ms: u64) -> Option<&[u8]> {
+            None
+        }
+    }
+
+    /// Verify that `drain_udp` honours `DispatchOut::Udp`: a datagram arriving
+    /// on socket `b` causes `on_udp` to return `DispatchOut::Udp`, whose
+    /// payload is forwarded by `send_to_udp` and received on the peer socket
+    /// `a`.
+    #[test]
+    fn drain_udp_forwards_dispatch_out_udp_to_peer() {
+        // Two connected loopback sockets: a ↔ b.
+        let a = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").unwrap();
+        a.connect(b.local_addr().unwrap()).unwrap();
+        b.connect(a.local_addr().unwrap()).unwrap();
+
+        // `b` must be non-blocking so drain_udp can drain it.
+        set_nonblocking(b.as_raw_fd()).unwrap();
+        // `a` must be non-blocking so we can do a best-effort receive check.
+        set_nonblocking(a.as_raw_fd()).unwrap();
+
+        // Send a trigger datagram from `a` → `b`.
+        a.send(b"trigger").unwrap();
+
+        // Use /dev/null as the TUN fd (DispatchOut::Udp never writes to TUN).
+        let devnull = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let null_fd = devnull.as_raw_fd();
+
+        // `ForwardDispatch` will reply with "forwarded" for each received dg.
+        let mut d = ForwardDispatch::new(b"forwarded".as_slice());
+        drain_udp(b.as_raw_fd(), null_fd, &mut d, 0).unwrap();
+
+        // The forwarded datagram must now be readable on `a`.
+        let mut recv_buf = [0u8; 64];
+        let n = a
+            .recv(&mut recv_buf)
+            .expect("forwarded datagram must arrive on peer socket");
+        assert_eq!(&recv_buf[..n], b"forwarded");
     }
 }
