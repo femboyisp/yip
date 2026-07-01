@@ -389,3 +389,25 @@ netem loss (netns ping 10/10). A dedicated end-to-end harness that forces
 FEC-insufficiency and asserts ARQ-specific `Bulk` recovery (establishing the
 tunnel *before* applying loss, with a retransmit buffer sized to the flow rate)
 is a tracked follow-up.
+
+---
+
+## Single-thread data loop — Phase A (lock removal, epoll `PollDriver`)
+
+The two-thread `Arc<Mutex>` data plane was replaced by a single-threaded event
+loop: all packet logic lives in a mutex-free `DataPlane`, driven by an `epoll`
+`PollDriver` (io_uring driver is Phase B). `bin/yipd/src/tunnel.rs` went from
+~637 to ~93 lines; no threads, no locks, no `.join()`.
+
+Measured (release, kernel 6.18, Ryzen 5 7640U, netns tunnel, no netem):
+
+| metric | two-thread `Arc<Mutex>` | single-thread `PollDriver` |
+|--------|-------------------------|----------------------------|
+| tunnel RTT (added over veth) | ~0.51 ms | **~0.36 ms** |
+| clean-link single-stream TCP | ~457 Mbit/s | ~419 Mbit/s (within single-stream variance) |
+
+Removing per-packet lock/handoff overhead **lowered latency** (the north-star
+metric) with throughput holding inside single-stream noise. The small single-core
+ceiling is the accepted trade — multi-queue throughput sharding is the deferred
+scaling lever. All three netns tests (ping, ping-under-loss, arq-integrity) pass
+unchanged on the single-threaded daemon (same wire format).
