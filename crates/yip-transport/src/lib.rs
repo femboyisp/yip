@@ -21,6 +21,9 @@ pub use feedback::{LossReport, MAX_NACK};
 pub mod lossdetect;
 pub use lossdetect::LossDetector;
 
+pub mod retxbuf;
+pub use retxbuf::RetxBuffer;
+
 use std::collections::HashMap;
 use std::time::Duration;
 
