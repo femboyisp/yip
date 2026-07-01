@@ -23,7 +23,7 @@
 
 Phase A alone is a shippable win: it removes every data-path mutex and the two-thread model, replacing them with one epoll thread driving a unit-tested `DataPlane`. It introduces NO io_uring and NO new unsafe.
 
-### Task A1: `DataPlane` struct + egress path (`on_tun_packet`)
+### Task 1: [Phase A]  `DataPlane` struct + egress path (`on_tun_packet`)
 
 **Files:**
 - Create: `bin/yipd/src/dataplane.rs`
@@ -64,7 +64,7 @@ fn on_tun_packet_produces_decodable_egress() {
 
 - [ ] **Step 5: Commit** — `git commit -m "Extract DataPlane egress path (on_tun_packet)"`
 
-### Task A2: ingress + control + tick (`on_udp_datagram`, `tick`)
+### Task 2: [Phase A]  ingress + control + tick (`on_udp_datagram`, `tick`)
 
 **Files:**
 - Modify: `bin/yipd/src/dataplane.rs`
@@ -111,7 +111,7 @@ fn forged_control_packet_is_rejected() {
 - [ ] **Step 4: Run tests → pass** (plus round-trip test from A1 now fully green).
 - [ ] **Step 5: Commit** — `git commit -m "Extract DataPlane ingress/control/tick paths"`
 
-### Task A3: single-thread `PollDriver`; retire the two-thread model
+### Task 3: [Phase A]  single-thread `PollDriver`; retire the two-thread model
 
 **Files:**
 - Create: `crates/yip-io/src/poll.rs` (or a `PollDriver` in lib.rs) — the epoll loop.
@@ -138,7 +138,7 @@ fn forged_control_packet_is_rejected() {
 - [ ] **Step 4: netns gate.** Build the test binary + run all three netns tests under sudo (build the binary, run under `sudo -E`; `sudo cargo` does not work). All must PASS — same wire, same behavior, now single-threaded.
 - [ ] **Step 5: Commit** — `git commit -m "Single-thread PollDriver over DataPlane; retire two-thread Arc<Mutex> model"`
 
-### Task A4: Phase-A verification + docs
+### Task 4: [Phase A]  Phase-A verification + docs
 
 - [ ] Run `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, coverage on the touched crates; the three netns tests under sudo. Record a latency/throughput before-after (poll driver vs the old two-thread) in the bench README. Update `CHANGELOG.md`. Commit. **This is the mergeable Phase-A checkpoint** — the lock-free single-thread win with no io_uring yet.
 
@@ -146,7 +146,7 @@ fn forged_control_packet_is_rejected() {
 
 ## Phase B — `UringDriver` (the io_uring busy-poll driver; the only new `unsafe`)
 
-### Task B1: `UringDriver` — one ring over UDP+TUN, provided-buffer recvs
+### Task 5: [Phase B]  `UringDriver` — one ring over UDP+TUN, provided-buffer recvs
 
 **Files:**
 - Create: `crates/yip-io/src/uring.rs`
@@ -164,7 +164,7 @@ fn forged_control_packet_is_rejected() {
 - [ ] **Step 4: Run test → pass (or skip-on-Err).** `cargo test -p yip-io uring`.
 - [ ] **Step 5: Commit** — `git commit -m "UringDriver: single ring over UDP+TUN with provided-buffer recvs"`
 
-### Task B2: GSO egress + bounded in-flight send table
+### Task 6: [Phase B]  GSO egress + bounded in-flight send table
 
 **Files:** Modify `crates/yip-io/src/uring.rs`; test in the same module.
 
@@ -174,7 +174,7 @@ fn forged_control_packet_is_rejected() {
 - [ ] **Step 2-4:** implement, run, verify (GSO path + sendmmsg fallback both deliver identical bytes).
 - [ ] **Step 5: Commit** — `git commit -m "UringDriver: GSO egress + bounded in-flight send table"`
 
-### Task B3: wire `UringDriver` into yipd; run netns suite on both drivers
+### Task 7: [Phase B]  wire `UringDriver` into yipd; run netns suite on both drivers
 
 **Files:** Modify `bin/yipd/src/tunnel.rs` (driver selection).
 
@@ -183,7 +183,7 @@ fn forged_control_packet_is_rejected() {
 - [ ] **Step 3: netns gate on BOTH drivers** — run all three netns tests (a) default (UringDriver active on this box) and (b) with `YIP_FORCE_POLL=1`. All six runs PASS (byte-identical wire; behavior parity).
 - [ ] **Step 4: Commit** — `git commit -m "Select UringDriver at startup with PollDriver fallback (YIP_FORCE_POLL forces fallback)"`
 
-### Task B4: bench + CI + docs
+### Task 8: [Phase B]  bench + CI + docs
 
 **Files:** Modify `crates/yip-bench/README.md`, `.github/workflows/integration.yml`, `CHANGELOG.md`.
 
