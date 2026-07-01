@@ -23,6 +23,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::UdpSocket;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -178,6 +179,10 @@ pub fn run(config: Config) -> io::Result<()> {
         RETX_BUFFER_TTL_MS,
     )));
 
+    // ARQ retransmit counter: incremented once per object actually retransmitted.
+    // Exposed in the periodic log and used by integration tests to verify ARQ fired.
+    let arq_retx_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+
     // ── create + split the TUN device ────────────────────────────────────────
     let tun = TunTap::create(&config.device, DeviceKind::Tun).map_err(io::Error::other)?;
     let (mut tun_reader, mut tun_writer) = tun.split().map_err(io::Error::other)?;
@@ -300,6 +305,7 @@ pub fn run(config: Config) -> io::Result<()> {
     let sent_log_rx = Arc::clone(&sent_log);
     let detector_rx = Arc::clone(&detector);
     let retx_rx = Arc::clone(&retx);
+    let arq_retx_count_rx = Arc::clone(&arq_retx_count);
 
     let ingress = std::thread::Builder::new()
         .name("yipd-ingress".into())
@@ -546,6 +552,9 @@ pub fn run(config: Config) -> io::Result<()> {
                                     continue;
                                 }
 
+                                // Count this retransmit for observability.
+                                arq_retx_count_rx.fetch_add(1, Ordering::Relaxed);
+
                                 // Generate fresh repair symbols with the original object_id.
                                 let repair_syms = transport_rx
                                     .lock()
@@ -632,6 +641,8 @@ pub fn run(config: Config) -> io::Result<()> {
                             t.bulk_repair_ratio(),
                         );
                     }
+                    let n = arq_retx_count_rx.load(Ordering::Relaxed);
+                    eprintln!("yipd [{}ms] ARQ retransmits: {}", now_ms, n);
                 }
             }
         })?;
