@@ -41,6 +41,7 @@ impl LossReport {
     ///
     /// Returns `None` if the input is malformed (too short, or inconsistent
     /// missing count vs. payload length).
+    /// Caps the decoded `missing` vec at `MAX_NACK` entries (defense-in-depth).
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         // Check minimum header length
         if bytes.len() < 14 {
@@ -77,6 +78,9 @@ impl LossReport {
             ]);
             missing.push(num);
         }
+
+        // Defense-in-depth: cap missing at MAX_NACK regardless of what peer sent.
+        missing.truncate(MAX_NACK);
 
         Some(LossReport {
             delivered_count,
@@ -119,5 +123,38 @@ mod tests {
         };
         let got = LossReport::decode(&r.encode()).expect("decodes");
         assert_eq!(got.missing.len(), MAX_NACK);
+    }
+
+    #[test]
+    fn decode_caps_missing_at_max_nack() {
+        // Construct raw bytes for a report claiming n_missing = 100
+        // Layout: [delivered:4][high:8][n_missing=100:2 BE][100 × 8-byte counters]
+        let delivered_count = 42u32;
+        let high_counter = 9999u64;
+        let n_missing = 100u16;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&delivered_count.to_be_bytes());
+        bytes.extend_from_slice(&high_counter.to_be_bytes());
+        bytes.extend_from_slice(&n_missing.to_be_bytes());
+
+        // Add 100 × 8-byte missing sequence numbers (just incrementing values)
+        for i in 0..100 {
+            bytes.extend_from_slice(&u64::try_from(i).unwrap().to_be_bytes());
+        }
+
+        // Decode should succeed and cap missing at MAX_NACK
+        let report = LossReport::decode(&bytes).expect("decode succeeds");
+        assert_eq!(report.delivered_count, 42);
+        assert_eq!(report.high_counter, 9999);
+        assert_eq!(
+            report.missing.len(),
+            MAX_NACK,
+            "missing should be capped at MAX_NACK"
+        );
+        // Verify the first MAX_NACK values are correctly decoded
+        for i in 0..MAX_NACK {
+            assert_eq!(report.missing[i], u64::try_from(i).unwrap());
+        }
     }
 }
