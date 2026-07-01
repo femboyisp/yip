@@ -28,6 +28,8 @@ pub enum PacketType {
     HandshakeResp = 1,
     /// Data-plane packet (used by later tunnel tasks).
     Data = 2,
+    /// Loss-feedback control packet (receiver → sender).
+    Control = 3,
 }
 
 // ── established session ───────────────────────────────────────────────────────

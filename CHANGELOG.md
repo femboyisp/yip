@@ -5,6 +5,19 @@ All notable changes to this project are documented here, following
 
 ## [Unreleased]
 
+### Added
+- Adaptive loss-feedback loop + reactive ARQ. The receiver detects post-FEC
+  residual loss as gaps in the object counter and reports it (with NACKs) in an
+  authenticated `Control` packet; the sender attributes loss per class and drives
+  the repair controller. ARQ-eligible (`Bulk`) flows on a clean link now decay
+  their repair ratio to **zero**, activating the FEC-encode bypass — clean-link
+  single-stream TCP rises from ~273–285 to ~457 Mbit/s. On loss the controller
+  re-arms FEC instantly and NACKed `Bulk` objects are retransmitted with fresh
+  RaptorQ repair symbols (reusing the original object id); `Realtime`/`Default`
+  flows keep a proactive floor and are not retransmitted. New `yip-transport`
+  modules: `feedback` (`LossReport`), `lossdetect` (`LossDetector`), `retxbuf`
+  (`RetxBuffer`), plus `Transport::repair_object`.
+
 ### Changed
 - Data-plane throughput pass: yipd now batches egress sends (`sendmmsg`) and
   ingress reads (`recvmmsg`) through yip-io's `PlainIo`, reuses framing buffers

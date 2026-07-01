@@ -15,6 +15,15 @@ pub use control::AdaptiveController;
 pub mod fec;
 pub use fec::{FecEncoder, FecReassembler, Symbol};
 
+pub mod feedback;
+pub use feedback::{LossReport, MAX_NACK};
+
+pub mod lossdetect;
+pub use lossdetect::LossDetector;
+
+pub mod retxbuf;
+pub use retxbuf::RetxBuffer;
+
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -94,9 +103,9 @@ impl Transport {
             classifier: Classifier::new(rules),
             encoder: FecEncoder::new(),
             controllers: [
-                AdaptiveController::new(FlowClass::Realtime.params()),
-                AdaptiveController::new(FlowClass::Bulk.params()),
-                AdaptiveController::new(FlowClass::Default.params()),
+                AdaptiveController::new_for(FlowClass::Realtime.params()),
+                AdaptiveController::new_for(FlowClass::Bulk.params()),
+                AdaptiveController::new_for(FlowClass::Default.params()),
             ],
             reassemblers: HashMap::new(),
         }
@@ -132,9 +141,35 @@ impl Transport {
             .push(symbol)
     }
 
+    /// Generate fresh RaptorQ repair symbols for a previously-sent object,
+    /// carrying the ORIGINAL `object_id` so the receiver's existing decoder
+    /// can be topped up rather than starting a new one.
+    ///
+    /// Returns all source + `extra_repair` repair symbols — enough that a
+    /// receiver that got zero original symbols can still reconstruct.
+    pub fn repair_object(
+        &mut self,
+        ciphertext: &[u8],
+        class: FlowClass,
+        object_id: u16,
+        extra_repair: u32,
+    ) -> Vec<Symbol> {
+        let params = class.params();
+        self.encoder
+            .repair_with_id(ciphertext, params, object_id, extra_repair)
+    }
+
     /// Feed an observed loss fraction into `class`'s controller.
     pub fn observe_loss(&mut self, class: FlowClass, loss: f32) {
         self.controllers[class_index(class)].observe_loss(loss);
+    }
+
+    /// Current repair ratio for the `Bulk` class controller.
+    ///
+    /// Useful for diagnostics: on a clean link this decays to 0.0 (ARQ bypass
+    /// fires, no proactive FEC symbols sent for bulk traffic).
+    pub fn bulk_repair_ratio(&self) -> f32 {
+        self.controllers[class_index(FlowClass::Bulk)].ratio()
     }
 }
 
@@ -214,6 +249,34 @@ mod tests {
         // Push a late/duplicate symbol after decode: should return None
         let late = rx.decode(&syms[0], class);
         assert!(late.is_none(), "late symbol returns None after completion");
+    }
+
+    #[test]
+    fn retransmitted_repair_completes_a_missing_object() {
+        let mut tx = Transport::new(vec![]);
+        let ct = vec![0x33u8; 2400]; // 2 source symbols
+        let (cls, syms) = tx.encode(&ct, &ct, false, 0);
+        let oid = syms[0].object_id; // the original object's identity
+                                     // Deliver only ONE symbol of a 2-source-symbol object; decode stalls.
+                                     // (The class emits 3 symbols — 2 source + 1 proactive repair — so
+                                     // skipping a single symbol would still leave enough to decode; feed
+                                     // exactly one to guarantee the object is genuinely incomplete.)
+        let mut rx = Transport::new(vec![]);
+        let mut out = None;
+        for s in syms.iter().take(1) {
+            out = out.or(rx.decode(s, cls));
+        }
+        assert!(out.is_none(), "one symbol short -> not yet decoded");
+        // Retransmit: fresh repair symbols carrying the SAME object_id top up the decoder.
+        let repair = tx.repair_object(&ct, cls, oid, 2);
+        assert!(
+            repair.iter().all(|s| s.object_id == oid),
+            "repair reuses object identity"
+        );
+        for s in &repair {
+            out = out.or(rx.decode(s, cls));
+        }
+        assert_eq!(out.as_deref(), Some(ct.as_slice()));
     }
 
     #[test]

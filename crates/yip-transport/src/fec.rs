@@ -76,6 +76,28 @@ impl FecEncoder {
             .map(|p| split_packet(object_id, object_size, &p))
             .collect()
     }
+
+    /// Encode a ciphertext with an EXPLICIT `object_id` (used for retransmits),
+    /// returning source + `extra_repair` repair symbols, all carrying `object_id`.
+    pub fn repair_with_id(
+        &self,
+        ciphertext: &[u8],
+        params: crate::FlowParams,
+        object_id: u16,
+        extra_repair: u32,
+    ) -> Vec<Symbol> {
+        let object_size = u32::try_from(ciphertext.len()).expect("frame fits u32");
+        let oti = ObjectTransmissionInformation::with_defaults(
+            u64::from(object_size),
+            params.symbol_size,
+        );
+        let encoder = Encoder::new(ciphertext, oti);
+        encoder
+            .get_encoded_packets(extra_repair)
+            .into_iter()
+            .map(|p| split_packet(object_id, object_size, &p))
+            .collect()
+    }
 }
 
 /// Emit the source symbols of `ciphertext` directly without constructing a
@@ -501,6 +523,118 @@ mod tests {
     }
 
     // --- End malformed-input tests -----------------------------------------------
+
+    /// C2 (existing object): A second symbol for an already-tracked object whose
+    /// SBN is out of range must be rejected with None, not passed to raptorq.
+    #[test]
+    fn push_out_of_range_sbn_for_existing_object_returns_none() {
+        let params = FlowClass::Default.params();
+        let ct = vec![0x42u8; 1200];
+        let mut enc = FecEncoder::new();
+        // Encode with repair symbols so we have multiple symbols for the same object.
+        let syms = enc.encode(&ct, params, 4);
+        let mut re = FecReassembler::new(params.symbol_size, 64);
+
+        // Feed the first (valid) symbol to register the object.
+        re.push(&syms[0]);
+        assert_eq!(re.in_flight(), 1, "object should be registered");
+
+        // Now craft a symbol with the same object_id but SBN out of range.
+        let mut bad = syms[0].clone();
+        bad.payload_id[0] = 255; // SBN 255 is always out of range for a single-block object
+        assert_eq!(
+            re.push(&bad),
+            None,
+            "out-of-range SBN on tracked object must be rejected"
+        );
+    }
+
+    /// Late/duplicate symbol after the object has already decoded must return None.
+    #[test]
+    fn push_late_symbol_after_decode_returns_none() {
+        let params = FlowClass::Default.params();
+        let ct = vec![0xABu8; 1200];
+        let mut enc = FecEncoder::new();
+        let syms = enc.encode(&ct, params, 4);
+        let mut re = FecReassembler::new(params.symbol_size, 64);
+
+        // Feed all symbols until the object decodes.
+        let mut decoded = false;
+        for s in &syms {
+            if re.push(s).is_some() {
+                decoded = true;
+                break;
+            }
+        }
+        assert!(decoded, "object must decode");
+
+        // Now push another symbol for the same object_id — must get None.
+        let result = re.push(&syms[0]);
+        assert_eq!(result, None, "late symbol after decode must return None");
+    }
+
+    /// `repair_with_id` encodes with an explicit object_id and the symbols
+    /// carry that id; the reassembler can decode the result.
+    #[test]
+    fn repair_with_id_produces_decodable_symbols() {
+        let params = FlowClass::Default.params();
+        let ct: Vec<u8> = (0..3000u32)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let enc = FecEncoder::new();
+        // Use explicit object_id 42.
+        let repair_syms = enc.repair_with_id(&ct, params, 42, 8);
+        assert!(!repair_syms.is_empty(), "must produce symbols");
+        assert!(
+            repair_syms.iter().all(|s| s.object_id == 42),
+            "all symbols must carry object_id 42"
+        );
+        assert!(
+            repair_syms.iter().all(|s| s.object_size == 3000),
+            "all symbols must carry correct object_size"
+        );
+
+        // Verify the symbols decode correctly.
+        let mut re = FecReassembler::new(params.symbol_size, 64);
+        let mut out = None;
+        for s in &repair_syms {
+            if let Some(o) = re.push(s) {
+                out = Some(o);
+                break;
+            }
+        }
+        assert_eq!(
+            out.as_deref(),
+            Some(ct.as_slice()),
+            "repair_with_id symbols must decode to original"
+        );
+    }
+
+    /// Exercises the `encode` full-encoder fallthrough path (repair > 0 when
+    /// sub_blocks == 1 means the fast bypass is skipped and Encoder::new is used).
+    #[test]
+    fn encode_with_repair_uses_full_encoder_and_decodes() {
+        let params = FlowClass::Realtime.params();
+        let ct = vec![0x55u8; 600];
+        let mut enc = FecEncoder::new();
+        // repair > 0 takes the full Encoder path even for small objects.
+        let syms = enc.encode(&ct, params, 2);
+        assert!(!syms.is_empty());
+
+        let mut re = FecReassembler::new(params.symbol_size, 64);
+        let mut out = None;
+        for s in &syms {
+            if let Some(o) = re.push(s) {
+                out = Some(o);
+                break;
+            }
+        }
+        assert_eq!(
+            out.as_deref(),
+            Some(ct.as_slice()),
+            "full-encoder path must decode"
+        );
+    }
 
     #[test]
     fn pipelines_two_objects_and_evicts_when_full() {
