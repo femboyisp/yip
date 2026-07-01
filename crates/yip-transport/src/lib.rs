@@ -257,15 +257,18 @@ mod tests {
         let ct = vec![0x33u8; 2400]; // 2 source symbols
         let (cls, syms) = tx.encode(&ct, &ct, false, 0);
         let oid = syms[0].object_id; // the original object's identity
-                                     // Feed only the very first symbol; with 2 source symbols, 1 symbol is never enough.
+                                     // Deliver only ONE symbol of a 2-source-symbol object; decode stalls.
+                                     // (The class emits 3 symbols — 2 source + 1 proactive repair — so
+                                     // skipping a single symbol would still leave enough to decode; feed
+                                     // exactly one to guarantee the object is genuinely incomplete.)
         let mut rx = Transport::new(vec![]);
         let mut out = None;
         for s in syms.iter().take(1) {
             out = out.or(rx.decode(s, cls));
         }
-        assert!(out.is_none(), "one of N symbols -> not yet decoded");
+        assert!(out.is_none(), "one symbol short -> not yet decoded");
         // Retransmit: fresh repair symbols carrying the SAME object_id top up the decoder.
-        let repair = tx.repair_object(&ct, cls, oid, 4);
+        let repair = tx.repair_object(&ct, cls, oid, 2);
         assert!(
             repair.iter().all(|s| s.object_id == oid),
             "repair reuses object identity"
