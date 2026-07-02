@@ -15,7 +15,8 @@ and anonymity are opt-in dials layered on top, not always-on costs.
 ## Goals
 
 - **Insane low latency** on direct P2P paths — the north star. The latency lever is the I/O model
-  (single `io_uring` ring over UDP + TUN/TAP, then AF_XDP zero-copy), not the crypto.
+  — a single-threaded event loop over UDP + TUN/TAP (a lean `epoll` driver today; a single-ring
+  `io_uring` driver and AF_XDP zero-copy as they prove out on latency) — not the crypto.
 - **L2 (TAP) and L3 (TUN)** data planes — Ethernet bridging *and* IP tunneling.
 - **Adaptive RaptorQ FEC** — rateless forward error correction that recovers packet loss with
   **zero extra round-trips**, tuned per-flow so realtime traffic pays no latency tax and lossy/bulk
@@ -45,7 +46,7 @@ clean interface:
 
 | Crate | Responsibility |
 |---|---|
-| `yip-io` | Kernel-bypass-ready packet I/O (`io_uring` ring over UDP + TUN/TAP; AF_XDP backend). The latency core. |
+| `yip-io` | Kernel-bypass-ready packet I/O: a single-threaded event loop over UDP + TUN/TAP (`epoll` driver by default; opt-in single-ring `io_uring`; AF_XDP backend planned). The latency core. |
 | `yip-wire` | Lean, DPI-resistant wire framing: keyed header-protection, coverage-based auth, explicit FEC headers. |
 | `yip-crypto` | AEAD session crypto (Noise-IK), anti-replay, rekey — PQ-ready. |
 | `yip-transport` | Adaptive RaptorQ FEC, per-flow classifier, redundancy controller, thin ARQ. |

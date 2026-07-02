@@ -414,21 +414,22 @@ unchanged on the single-threaded daemon (same wire format).
 
 ---
 
-## io_uring Phase B — driver A/B (default `UringDriver` vs `YIP_FORCE_POLL=1`)
+## io_uring Phase B — driver A/B (default `PollDriver` vs opt-in `YIP_USE_URING=1`)
 
 > **Honest finding: the io_uring driver currently *regresses* the north-star
-> metric (latency) and shows no throughput upside over the epoll `PollDriver`
-> fallback.** It exists to lower latency; on this host it does the opposite.
+> metric (latency) and shows no throughput upside over the epoll `PollDriver`.**
+> It exists to lower latency; on this host it does the opposite — so the epoll
+> driver is the **default** and io_uring is opt-in via `YIP_USE_URING=1`.
 
 - **RTT command:** `crates/yip-bench/tests/run-driver-ab-rtt.sh` (ping
   `-c 100 -i 0.02` across the tunnel, `target/release/yipd`).
 - **Clean-link throughput command:** `iperf3 -t 8` across the tunnel, no netem
   (`inner MTU 1184`); each cell is the median of repeated runs.
 
-| metric | default (io_uring path) | `YIP_FORCE_POLL=1` (poll path) |
-|--------|---------------------------|--------------------------------|
-| tunnel RTT avg (ms) — **lower is better** | 0.63 (0.605–0.643) | **0.48 (0.473–0.514)** |
-| clean-link iperf3 (Mbit/s) | ~306–356 | ~305–319 (tied) |
+| metric | default (`PollDriver`) | opt-in `YIP_USE_URING=1` (io_uring) |
+|--------|--------------------------|-------------------------------------|
+| tunnel RTT avg (ms) — **lower is better** | **0.48 (0.473–0.514)** | 0.63 (0.605–0.643) |
+| clean-link iperf3 (Mbit/s) | ~305–319 | ~306–356 (tied) |
 
 Re-measured 2026-07-02 (kernel 6.18, AMD Ryzen 5 7640U, release `yipd`),
 median of 3 RTT runs (`ping -c 100 -i 0.02`) and 2 iperf3 runs per driver.
@@ -443,12 +444,16 @@ which a latency-bound tunnel ping-pong does not present. Bulk throughput is a
 wash because both drivers are single-core, userspace, and FEC-bound — the I/O
 model is not the bottleneck there.
 
-**Implication:** the `UringDriver` should **not** be the default until it either
-adopts SQPOLL (or another mechanism that actually beats epoll on single-packet
-latency) or demonstrates a throughput win under a workload that has one. Until
-then it is extra `unsafe` surface for no measured benefit. The epoll `PollDriver`
-is the faster, simpler, safe-Rust path. CI continues to gate **both** drivers in
-`netns-tunnel-test` so the uring path stays correct while it is tuned.
+**Resolution:** as of this finding the epoll `PollDriver` is the **default** and
+the `UringDriver` is opt-in (`YIP_USE_URING=1`). It should not become the default
+again until it either adopts SQPOLL (or another mechanism that actually beats
+epoll on single-packet latency) or demonstrates a throughput win under a workload
+that has one — today it is extra `unsafe` surface for no measured benefit. A
+known first step is the `MAX_GSO_SEGMENTS_PER_SEND = 1` cap in `uring.rs`, which
+currently makes GSO batching a no-op (one datagram per "batch") while still
+paying the cmsg cost; raising it must be re-validated against
+`arq_recovers_bulk_loss` (coalesced bursts were why it was capped). CI continues
+to gate **both** drivers in `netns-tunnel-test` so the opt-in path stays correct.
 
 - RTT/throughput at this scale are noisy run-to-run; re-run the same commands for
   stricter medians. The direction (uring RTT > poll RTT) reproduced on every run.
