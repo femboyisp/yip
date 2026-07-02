@@ -7,6 +7,8 @@
 use std::io;
 use std::net::SocketAddr;
 
+use crate::mode::TunnelMode;
+
 /// Static configuration for one yip tunnel endpoint.
 #[derive(Debug)]
 pub struct Config {
@@ -28,6 +30,12 @@ pub struct Config {
     pub listen: SocketAddr,
     /// TUN/TAP device name (e.g. `"yip0"`).
     pub device: String,
+    /// Tunnel mode selected from `device_kind=tun|tap` (`tun` by default).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by tunnel mode selection in follow-up task")
+    )]
+    pub device_kind: TunnelMode,
     /// Whether this peer initiates the Noise-IK handshake.
     pub initiate: bool,
 }
@@ -85,6 +93,7 @@ impl Config {
         let mut peer_endpoint: Option<SocketAddr> = None;
         let mut listen: Option<SocketAddr> = None;
         let mut device: Option<String> = None;
+        let mut device_kind = TunnelMode::default();
         let mut initiate: Option<bool> = None;
 
         for line in text.lines() {
@@ -117,6 +126,7 @@ impl Config {
                         })?)
                 }
                 "device" => device = Some(val.to_owned()),
+                "device_kind" => device_kind = TunnelMode::parse_device_kind(val)?,
                 "initiate" => match val {
                     "true" | "1" | "yes" => initiate = Some(true),
                     "false" | "0" | "no" => initiate = Some(false),
@@ -139,6 +149,7 @@ impl Config {
             peer_endpoint: peer_endpoint.ok_or_else(|| missing("peer_endpoint"))?,
             listen: listen.ok_or_else(|| missing("listen"))?,
             device: device.ok_or_else(|| missing("device"))?,
+            device_kind,
             initiate: initiate.ok_or_else(|| missing("initiate"))?,
         })
     }
@@ -149,6 +160,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mode::TunnelMode;
 
     #[test]
     fn parse_config_from_kv() {
@@ -298,6 +310,69 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 future_key=whatever
 ";
         assert!(Config::parse(text).is_ok());
+    }
+
+    #[test]
+    fn parse_config_device_kind_tun() {
+        let text = "\
+device=yip0
+device_kind=tun
+listen=0.0.0.0:51820
+peer_endpoint=10.0.0.2:51820
+initiate=false
+local_private=0000000000000000000000000000000000000000000000000000000000000001
+local_public=0000000000000000000000000000000000000000000000000000000000000002
+peer_public=0000000000000000000000000000000000000000000000000000000000000003
+";
+        let c = Config::parse(text).unwrap();
+        assert_eq!(c.device_kind, TunnelMode::L3Tun);
+    }
+
+    #[test]
+    fn parse_config_device_kind_tap() {
+        let text = "\
+device=yip0
+device_kind=tap
+listen=0.0.0.0:51820
+peer_endpoint=10.0.0.2:51820
+initiate=false
+local_private=0000000000000000000000000000000000000000000000000000000000000001
+local_public=0000000000000000000000000000000000000000000000000000000000000002
+peer_public=0000000000000000000000000000000000000000000000000000000000000003
+";
+        let c = Config::parse(text).unwrap();
+        assert_eq!(c.device_kind, TunnelMode::L2Tap);
+    }
+
+    #[test]
+    fn parse_config_device_kind_defaults_to_tun_when_absent() {
+        let text = "\
+device=yip0
+listen=0.0.0.0:51820
+peer_endpoint=10.0.0.2:51820
+initiate=false
+local_private=0000000000000000000000000000000000000000000000000000000000000001
+local_public=0000000000000000000000000000000000000000000000000000000000000002
+peer_public=0000000000000000000000000000000000000000000000000000000000000003
+";
+        let c = Config::parse(text).unwrap();
+        assert_eq!(c.device_kind, TunnelMode::L3Tun);
+    }
+
+    #[test]
+    fn parse_config_device_kind_unknown_value_returns_error() {
+        let text = "\
+device=yip0
+device_kind=foo
+listen=0.0.0.0:51820
+peer_endpoint=10.0.0.2:51820
+initiate=false
+local_private=0000000000000000000000000000000000000000000000000000000000000001
+local_public=0000000000000000000000000000000000000000000000000000000000000002
+peer_public=0000000000000000000000000000000000000000000000000000000000000003
+";
+        let err = Config::parse(text).unwrap_err();
+        assert_eq!(err.to_string(), "invalid device_kind: foo");
     }
 
     #[test]

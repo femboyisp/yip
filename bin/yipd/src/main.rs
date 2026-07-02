@@ -6,6 +6,7 @@
 mod config;
 mod dataplane;
 mod handshake;
+mod mode;
 mod tunnel;
 mod wire_glue;
 
