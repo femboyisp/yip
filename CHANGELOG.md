@@ -47,6 +47,10 @@ All notable changes to this project are documented here, following
   **beating the epoll `PollDriver` (~0.37 ms)** — a "burn CPU for latency" knob,
   off by default so idle tunnels don't spin. (Making it the default / auto-tuning
   the spin budget wants clean-hardware measurement; io_uring stays opt-in for now.)
+  The `UringDriver` blocking wait is now bounded by a 10 ms timeout (via io_uring
+  `EXT_ARG`, kernel 5.11+), so `Dispatch::tick` fires on cadence even on a fully
+  idle tunnel — parity with poll.rs's `epoll_wait` timeout, fixing a latent gap
+  where an idle uring tunnel could starve rekey/feedback timers.
 - Coverage CI: exclude `yip-io/src/uring.rs` from the llvm-cov denominator (honest
   exclusion — the `UringDriver` syscall loop is netns/integration-gated, same
   pattern as `yip-device` privileged paths).
