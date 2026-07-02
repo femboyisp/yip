@@ -4,7 +4,6 @@
 
 pub mod poll;
 pub mod uring;
-pub use uring::{run_uring, uring_available};
 
 /// Maximum number of datagrams in a single batched send/recv call.
 pub const MAX_DATAGRAM_BATCH: usize = 64;

@@ -91,8 +91,8 @@ pub fn run(config: Config) -> io::Result<()> {
     // `udp_fd` remain valid for the duration of the selected driver loop.
     if std::env::var("YIP_FORCE_POLL").is_ok() {
         yip_io::poll::run_poll(udp_fd, tun_fd, &mut dataplane)
-    } else if yip_io::uring_available() {
-        yip_io::run_uring(udp_fd, tun_fd, &mut dataplane)
+    } else if yip_io::uring::uring_available() {
+        yip_io::uring::run_uring(udp_fd, tun_fd, &mut dataplane)
     } else {
         yip_io::poll::run_poll(udp_fd, tun_fd, &mut dataplane)
     }

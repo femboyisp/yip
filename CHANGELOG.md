@@ -28,6 +28,9 @@ All notable changes to this project are documented here, following
   (`RetxBuffer`), plus `Transport::repair_object`.
 
 ### Changed
+- Coverage CI: exclude `yip-io/src/uring.rs` from the llvm-cov denominator (honest
+  exclusion — the `UringDriver` syscall loop is netns/integration-gated, same
+  pattern as `yip-device` privileged paths).
 - Data-plane throughput pass: yipd now batches egress sends (`sendmmsg`) and
   ingress reads (`recvmmsg`) through yip-io's `PlainIo`, reuses framing buffers
   (no per-symbol allocation), and sizes `SO_SNDBUF`/`SO_RCVBUF` to 4 MiB via a
