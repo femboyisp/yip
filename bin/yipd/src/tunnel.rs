@@ -34,6 +34,7 @@ use yip_io::set_socket_buffers;
 use crate::config::Config;
 use crate::dataplane::{conn_tag_from_keys, DataPlane};
 use crate::handshake;
+use crate::mode::TunnelMode;
 
 // ── public entry point ────────────────────────────────────────────────────────
 
@@ -71,8 +72,13 @@ pub fn run(config: Config) -> io::Result<()> {
     // binding, so they derive the same conn_tag without extra signaling.
     let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
 
-    // ── create the TUN device ─────────────────────────────────────────────────
-    let tun = TunTap::create(&config.device, DeviceKind::Tun).map_err(io::Error::other)?;
+    // ── create the tunnel device (TUN or TAP) ────────────────────────────────
+    let mode = config.device_kind;
+    let device_kind = match mode {
+        TunnelMode::L3Tun => DeviceKind::Tun,
+        TunnelMode::L2Tap => DeviceKind::Tap,
+    };
+    let tun = TunTap::create(&config.device, device_kind).map_err(io::Error::other)?;
 
     // Set TUN non-blocking before entering the epoll loop.  run_poll also
     // calls fcntl internally (belt-and-suspenders; idempotent).
@@ -84,7 +90,7 @@ pub fn run(config: Config) -> io::Result<()> {
     let udp_fd = sock.as_raw_fd();
 
     // ── build DataPlane ───────────────────────────────────────────────────────
-    let mut dataplane = DataPlane::new(established, conn_tag);
+    let mut dataplane = DataPlane::new(established, conn_tag, mode);
 
     // ── run the selected event loop ───────────────────────────────────────────
     // `tun` and `sock` are kept alive on the stack here, so `tun_fd` and

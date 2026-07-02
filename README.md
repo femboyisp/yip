@@ -80,6 +80,9 @@ tunnel, proven by pinging across it between two daemons in separate network name
 
 Requires a recent stable Rust toolchain (Linux).
 
+`yipd` tunnel mode is selected in config via `device_kind=tun|tap` (`tun` by
+default).
+
 ```sh
 cargo build --workspace      # build everything
 cargo test  --workspace      # run the test suite

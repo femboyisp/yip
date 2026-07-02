@@ -6,6 +6,9 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- L2 TAP tunnel mode in `yipd`: config now supports `device_kind=tap` for
+  Ethernet (L2) tunnel interfaces; `device_kind=tun` remains the default for
+  IP (L3) mode.
 - io_uring Phase B driver (`UringDriver`): a single-ring (UDP+TUN) io_uring data
   loop, available **opt-in** via `YIP_USE_URING=1`. The **default is the epoll
   `PollDriver`**: on measurement the uring path currently *regresses* tunnel RTT
