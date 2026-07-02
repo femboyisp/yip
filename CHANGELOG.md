@@ -45,8 +45,11 @@ All notable changes to this project are documented here, following
   **busy-poll** mode (`YIP_URING_BUSYPOLL=1`): `poll_once` spins the completion
   queue before blocking, cutting tunnel RTT from ~0.47 ms to ~0.31 ms and
   **beating the epoll `PollDriver` (~0.37 ms)** — a "burn CPU for latency" knob,
-  off by default so idle tunnels don't spin. (Making it the default / auto-tuning
-  the spin budget wants clean-hardware measurement; io_uring stays opt-in for now.)
+  off by default so idle tunnels don't spin. The spin is **adaptive**: it only
+  runs while an exchange is active (recent completions) and backs off to a plain
+  blocking wait the moment a wait times out, so an idle tunnel burns no CPU while
+  an active one still catches imminent completions. (Making it the default /
+  tuning the spin budget wants clean-hardware measurement; io_uring stays opt-in.)
   The `UringDriver` blocking wait is now bounded by a 10 ms timeout (via io_uring
   `EXT_ARG`, kernel 5.11+), so `Dispatch::tick` fires on cadence even on a fully
   idle tunnel — parity with poll.rs's `epoll_wait` timeout, fixing a latent gap

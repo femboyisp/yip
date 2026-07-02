@@ -154,6 +154,10 @@ pub struct UringDriver {
     /// Busy-poll the completion queue before blocking (opt-in via
     /// `YIP_URING_BUSYPOLL=1`) — lower RTT at the cost of CPU while active.
     busy_poll: bool,
+    /// Adaptive-spin state: true while an exchange is active (recent completions),
+    /// false once a wait times out. Gates whether `busy_poll` actually spins, so
+    /// an idle tunnel does not burn CPU.
+    active: bool,
     /// Whether the kernel supports `EXT_ARG` (5.11+), i.e. a timed blocking wait.
     /// When true, the idle wait is bounded so `tick` fires on cadence.
     ext_arg: bool,
@@ -199,6 +203,7 @@ impl UringDriver {
                 usize::try_from(RING_ENTRIES).expect("RING_ENTRIES fits usize"),
             ),
             busy_poll: std::env::var_os("YIP_URING_BUSYPOLL").is_some(),
+            active: false,
             ext_arg,
             gso_enabled: true,
             started: Instant::now(),
@@ -701,23 +706,35 @@ impl UringDriver {
         // mutable `self` access while processing each CQE.
         let mut cqes = std::mem::take(&mut self.cqe_buf);
         cqes.clear();
-        // With busy-poll off (default) the budget is 0, so the spin never runs
-        // and we block immediately — identical to the prior behavior.
-        let budget = if self.busy_poll { CQ_SPIN_BUDGET } else { 0 };
+        // Adaptive busy-poll: spin only while an exchange is active, so we catch
+        // imminent completions at low latency but never burn CPU on an idle
+        // tunnel. `self.active` carries "did the previous wait get real work"
+        // across calls; it is set true when completions arrive and false when a
+        // wait times out. With busy-poll off (default) the budget is always 0, so
+        // the spin never runs and we block immediately — the prior behavior.
+        let budget = if self.busy_poll && self.active {
+            CQ_SPIN_BUDGET
+        } else {
+            0
+        };
         let mut spins = 0_u32;
         loop {
             for cqe in &mut self.ring.completion() {
                 cqes.push((cqe.user_data(), cqe.result(), cqe.flags()));
             }
             if !cqes.is_empty() {
+                // Got work — stay hot so the next wait spins for the imminent
+                // follow-up (e.g. the reply completion of this round trip).
+                self.active = true;
                 break;
             }
             if spins >= budget {
-                // Nothing ready (spin budget exhausted, or busy-poll off) — block
-                // until a completion arrives or the tick timeout elapses. On
-                // timeout, stop draining and fall through so `tick` fires on
-                // cadence even with no traffic.
+                // Nothing ready (spin budget exhausted, or busy-poll off/idle) —
+                // block until a completion arrives or the tick timeout elapses.
+                // On timeout, go cold (stop spinning next time) and fall through
+                // so `tick` fires on cadence even with no traffic.
                 if self.wait_for_completions()? {
+                    self.active = false;
                     break;
                 }
             } else {
