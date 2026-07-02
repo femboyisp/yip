@@ -1258,6 +1258,21 @@ mod tests {
         }
 
         assert_eq!(received, total, "must echo all datagrams");
+
+        // The echoed data can arrive at `a` before the driver reaps the matching
+        // SEND completion CQE (observed on slower CI runners), so the loop above
+        // can exit with send CQEs still pending. Drain them before asserting slot
+        // hygiene. Because every echoed send physically completed, its CQE is
+        // already queued, so `poll_once` (submit_and_wait(1)) returns without
+        // blocking; a genuine slot leak would never reach 0 and still fail below.
+        for _ in 0..1000 {
+            if driver.in_flight_used_count() == 0 {
+                break;
+            }
+            driver
+                .poll_once(&mut dispatch)
+                .expect("poll_once drains pending send completions");
+        }
         assert_eq!(
             driver.in_flight_used_count(),
             0,
