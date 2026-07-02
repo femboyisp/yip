@@ -11,7 +11,7 @@ use std::time::Instant;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 
 use crate::poll::{Dispatch, DispatchOut};
-use crate::MAX_WIRE_DATAGRAM;
+use crate::{MAX_DATAGRAM_BATCH, MAX_WIRE_DATAGRAM};
 
 const RING_ENTRIES: u32 = 512;
 const RING_BUFS: usize = 256;
@@ -28,6 +28,8 @@ const SQE_FLAGS_BUFFER_SELECT: squeue::Flags = squeue::Flags::BUFFER_SELECT;
 const MAX_WIRE_DATAGRAM_I32: i32 = 2048;
 const MAX_WIRE_DATAGRAM_U32: u32 = 2048;
 const RING_BUFS_U16: u16 = 256;
+const MAX_GSO_DATAGRAMS: usize = MAX_DATAGRAM_BATCH;
+const MAX_GSO_PAYLOAD: usize = MAX_WIRE_DATAGRAM * MAX_GSO_DATAGRAMS;
 const GSO_CONTROL_PAYLOAD_LEN_U32: u32 = 2;
 const GSO_CONTROL_SPACE: usize = 64;
 
@@ -120,6 +122,8 @@ pub struct UringDriver {
     tun_armed: bool,
     #[cfg(test)]
     gso_submission_count: usize,
+    #[cfg(test)]
+    force_gso_submit_failure: bool,
 }
 
 impl UringDriver {
@@ -150,6 +154,8 @@ impl UringDriver {
             tun_armed: false,
             #[cfg(test)]
             gso_submission_count: 0,
+            #[cfg(test)]
+            force_gso_submit_failure: false,
         };
 
         driver.provide_all_buffers()?;
@@ -255,9 +261,18 @@ impl UringDriver {
         self.in_flight.iter().filter(|slot| slot.is_some()).count()
     }
 
-    fn alloc_in_flight_slot(&mut self, payload: Vec<u8>) -> io::Result<usize> {
-        if payload.len() > MAX_WIRE_DATAGRAM {
-            return Err(io::Error::other("payload exceeds MAX_WIRE_DATAGRAM"));
+    #[cfg(test)]
+    fn set_force_gso_submit_failure(&mut self, force: bool) {
+        self.force_gso_submit_failure = force;
+    }
+
+    fn alloc_in_flight_slot(
+        &mut self,
+        payload: Vec<u8>,
+        payload_limit: usize,
+    ) -> io::Result<usize> {
+        if payload.len() > payload_limit {
+            return Err(io::Error::other("payload exceeds in-flight slot limit"));
         }
         let Some((idx, slot)) = self
             .in_flight
@@ -275,7 +290,7 @@ impl UringDriver {
     }
 
     fn queue_udp_send(&mut self, datagram: &[u8]) -> io::Result<()> {
-        let slot_id = self.alloc_in_flight_slot(datagram.to_vec())?;
+        let slot_id = self.alloc_in_flight_slot(datagram.to_vec(), MAX_WIRE_DATAGRAM)?;
         let (ptr, len_u32) = {
             let slot_buf = self.in_flight[slot_id]
                 .as_ref()
@@ -297,7 +312,7 @@ impl UringDriver {
     }
 
     fn queue_tun_write(&mut self, frame: &[u8]) -> io::Result<()> {
-        let slot_id = self.alloc_in_flight_slot(frame.to_vec())?;
+        let slot_id = self.alloc_in_flight_slot(frame.to_vec(), MAX_WIRE_DATAGRAM)?;
         let (ptr, len_u32) = {
             let slot_buf = self.in_flight[slot_id]
                 .as_ref()
@@ -347,12 +362,10 @@ impl UringDriver {
         }
         if self.gso_enabled {
             if let Some(segment_size) = Self::can_coalesce_gso(datagrams) {
-                match self.queue_udp_gso(datagrams, segment_size) {
-                    Ok(()) => return Ok(()),
-                    Err(e) => {
-                        eprintln!("uring: GSO submit failed, trying per-datagram sends: {e}");
-                    }
+                if self.queue_udp_gso(datagrams, segment_size)? {
+                    return Ok(());
                 }
+                eprintln!("uring: GSO submit failed, trying per-datagram sends");
             }
         }
         for datagram in datagrams {
@@ -361,16 +374,30 @@ impl UringDriver {
         Ok(())
     }
 
-    fn queue_udp_gso(&mut self, datagrams: &[Vec<u8>], segment_size: u16) -> io::Result<()> {
+    fn queue_udp_gso(&mut self, datagrams: &[Vec<u8>], segment_size: u16) -> io::Result<bool> {
+        if datagrams.len() > MAX_GSO_DATAGRAMS {
+            return Ok(false);
+        }
         let payload_len = usize::from(segment_size);
         let total_len = payload_len
             .checked_mul(datagrams.len())
             .ok_or_else(|| io::Error::other("GSO payload size overflow"))?;
+        if total_len > MAX_GSO_PAYLOAD {
+            return Ok(false);
+        }
         let mut coalesced = Vec::with_capacity(total_len);
         for datagram in datagrams {
             coalesced.extend_from_slice(datagram);
         }
-        let slot_id = self.alloc_in_flight_slot(coalesced)?;
+        let slot_id = match self.alloc_in_flight_slot(coalesced, MAX_GSO_PAYLOAD) {
+            Ok(slot_id) => slot_id,
+            Err(_) => return Ok(false),
+        };
+        #[cfg(test)]
+        if self.force_gso_submit_failure {
+            self.release_in_flight_slot(slot_id);
+            return Ok(false);
+        }
         let payload_ptr = {
             let payload = self.in_flight[slot_id]
                 .as_mut()
@@ -382,7 +409,10 @@ impl UringDriver {
             .ok_or_else(|| io::Error::other("missing in-flight GSO payload"))?
             .len();
         let ctx = self.gso_ctx[slot_id].get_or_insert_with(GsoSendContext::new);
-        ctx.prepare(payload_ptr, payload_len_now, segment_size)?;
+        if let Err(e) = ctx.prepare(payload_ptr, payload_len_now, segment_size) {
+            self.release_in_flight_slot(slot_id);
+            return Err(e);
+        }
         self.gso_meta[slot_id] = Some(GsoMeta {
             segment_size,
             datagram_count: datagrams.len(),
@@ -393,15 +423,15 @@ impl UringDriver {
             .flags(u32::try_from(libc::MSG_NOSIGNAL).expect("MSG_NOSIGNAL fits u32"))
             .build()
             .user_data(tag);
-        if let Err(e) = self.push_entry(entry) {
+        if self.push_entry(entry).is_err() {
             self.release_in_flight_slot(slot_id);
-            return Err(e);
+            return Ok(false);
         }
         #[cfg(test)]
         {
             self.gso_submission_count = self.gso_submission_count.saturating_add(1);
         }
-        Ok(())
+        Ok(true)
     }
 
     fn recover_gso_fallback_datagrams(&self, slot_id: usize) -> Vec<Vec<u8>> {
@@ -846,6 +876,89 @@ mod tests {
         assert_eq!(got.len(), expected.len(), "must receive all GSO datagrams");
         for datagram in expected {
             assert!(got.contains(&datagram), "missing datagram from GSO output");
+        }
+
+        // SAFETY: these fds came from `pipe2` and are still open here.
+        unsafe {
+            libc::close(tun_rd);
+            libc::close(tun_wr);
+        }
+        drop(driver);
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    #[test]
+    fn uring_gso_submit_fallback_uses_per_datagram_send() {
+        let _guard = URING_SERIAL.lock().expect("lock test serialization");
+        let a = UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        let b = UdpSocket::bind("127.0.0.1:0").expect("bind uring peer");
+        a.connect(b.local_addr().expect("sender local addr"))
+            .expect("connect sender");
+        b.connect(a.local_addr().expect("uring peer local addr"))
+            .expect("connect uring peer");
+        a.set_nonblocking(true).expect("set sender nonblocking");
+
+        let (tun_rd, tun_wr) = make_pipe().expect("make tun placeholder pipe");
+        let mut dispatch = GsoDispatch::new();
+        let mut driver = match UringDriver::new(b.as_raw_fd(), tun_rd) {
+            Ok(driver) => driver,
+            Err(_) => {
+                eprintln!(
+                    "SKIP uring_gso_submit_fallback_uses_per_datagram_send: \
+                     io_uring ring or buffer registration unavailable (RLIMIT_MEMLOCK)"
+                );
+                // SAFETY: these fds came from `pipe2` and are still open here.
+                unsafe {
+                    libc::close(tun_rd);
+                    libc::close(tun_wr);
+                }
+                return;
+            }
+        };
+        driver.set_force_gso_submit_failure(true);
+
+        a.send(b"trigger-gso-fallback")
+            .expect("send trigger datagram");
+        driver.poll_once(&mut dispatch).expect("poll_once succeeds");
+
+        let mut got = Vec::new();
+        let mut recv_buf = [0_u8; MAX_WIRE_DATAGRAM];
+        for _ in 0..1024 {
+            loop {
+                match a.recv(&mut recv_buf) {
+                    Ok(n) => got.push(recv_buf[..n].to_vec()),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("recv failed: {e}"),
+                }
+            }
+            if got.len() >= 5 {
+                break;
+            }
+            driver.poll_once(&mut dispatch).expect("poll_once succeeds");
+        }
+
+        assert_eq!(
+            driver.gso_submission_count(),
+            0,
+            "forced submit failure should prevent GSO send submissions"
+        );
+        let expected: Vec<Vec<u8>> = (0_u8..5_u8)
+            .map(|i| {
+                let mut datagram = vec![b'a'; 64];
+                datagram[0] = b'0' + i;
+                datagram
+            })
+            .collect();
+        assert_eq!(
+            got.len(),
+            expected.len(),
+            "must receive all fallback datagrams"
+        );
+        for datagram in expected {
+            assert!(
+                got.contains(&datagram),
+                "missing datagram from fallback output"
+            );
         }
 
         // SAFETY: these fds came from `pipe2` and are still open here.
