@@ -9,11 +9,18 @@ All notable changes to this project are documented here, following
 - L2 TAP tunnel mode in `yipd`: config now supports `device_kind=tap` for
   Ethernet (L2) tunnel interfaces; `device_kind=tun` remains the default for
   IP (L3) mode.
-- io_uring Phase B: yipd now defaults to a single-threaded `UringDriver` data
-  loop (one ring over UDP+TUN) with startup fallback to `PollDriver`, and
-  `YIP_FORCE_POLL=1` to force fallback for parity testing. netns CI now runs
-  all tunnel tests under both drivers, and the bench docs record measured RTT
-  + clean-link throughput deltas for uring vs poll.
+- io_uring Phase B driver (`UringDriver`): a single-ring (UDP+TUN) io_uring data
+  loop, available **opt-in** via `YIP_USE_URING=1`. The **default is the epoll
+  `PollDriver`**: on measurement the uring path currently *regresses* tunnel RTT
+  (~0.63 vs ~0.48 ms, the north-star metric) with no throughput upside — its GSO
+  batching is disabled by a `MAX_GSO_SEGMENTS_PER_SEND = 1` cap and per-packet
+  heap copies offset the provided-buffer design — so io_uring stays opt-in until
+  it beats epoll (SQPOLL / working GSO batching, re-benchmarked). netns CI runs
+  all tunnel tests under **both** drivers. The opt-in path was hardened to match
+  `PollDriver`'s robustness contract: `EINTR` on the blocking ring wait is now
+  retried (a signal no longer tears down the tunnel), and non-GSO send-completion
+  errors drop on transient buffer pressure but propagate genuinely fatal errors
+  (TUN writes always drop) instead of being swallowed forever.
 - Single-threaded data loop (Phase A): replaced the two-thread `Arc<Mutex>`
   data plane with a mutex-free `DataPlane` driven by an `epoll` `PollDriver`
   (io_uring driver to follow). Removes per-packet lock/handoff overhead — tunnel

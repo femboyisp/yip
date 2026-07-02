@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Measure tunnel RTT for default driver vs YIP_FORCE_POLL=1 (clean link, no netem).
+# Measure tunnel RTT for the default PollDriver vs the opt-in UringDriver
+# (YIP_USE_URING=1), clean link, no netem.
 # Usage: run-driver-ab-rtt.sh <path-to-release-yipd>
 set -euo pipefail
 
@@ -127,5 +128,5 @@ EOF
     echo "RTT mode=${mode} avg_ms=${rtt_avg}"
 }
 
-measure_mode "uring"
-measure_mode "poll" YIP_FORCE_POLL=1
+measure_mode "poll"
+measure_mode "uring" YIP_USE_URING=1

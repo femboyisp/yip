@@ -125,14 +125,14 @@ jobs:
           cargo build --release -p yipd
           echo "running netns tunnel tests under sudo: $BIN"
           # --exact so ping_across_yipd_tunnel does not also match _under_loss.
-          for mode in uring poll; do
+          for mode in poll uring; do
             for t in ping_across_yipd_tunnel ping_across_yipd_tunnel_under_loss arq_recovers_bulk_loss l2_tap_ping_or_arp_across_tunnel; do
               LOG="/tmp/netns-$mode-$t.log"
-              if [ "$mode" = "poll" ]; then
-                echo "running $t with PollDriver fallback (YIP_FORCE_POLL=1)"
-                sudo -E env YIP_FORCE_POLL=1 "$BIN" "$t" --exact --nocapture --test-threads=1 2>&1 | tee "$LOG"
+              if [ "$mode" = "uring" ]; then
+                echo "running $t with UringDriver (opt-in: YIP_USE_URING=1)"
+                sudo -E env YIP_USE_URING=1 "$BIN" "$t" --exact --nocapture --test-threads=1 2>&1 | tee "$LOG"
               else
-                echo "running $t with default driver selection"
+                echo "running $t with default driver (PollDriver)"
                 sudo -E "$BIN" "$t" --exact --nocapture --test-threads=1 2>&1 | tee "$LOG"
               fi
               # Honesty guard: these tests must run for real, not skip for non-root.

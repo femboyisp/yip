@@ -95,9 +95,13 @@ pub fn run(config: Config) -> io::Result<()> {
     // ── run the selected event loop ───────────────────────────────────────────
     // `tun` and `sock` are kept alive on the stack here, so `tun_fd` and
     // `udp_fd` remain valid for the duration of the selected driver loop.
-    if std::env::var("YIP_FORCE_POLL").is_ok() {
-        yip_io::poll::run_poll(udp_fd, tun_fd, &mut dataplane)
-    } else if yip_io::uring::uring_available() {
+    // Default to the epoll `PollDriver`: on measurement it is the faster path
+    // (lower tunnel RTT — the north-star metric) and is safe Rust. The
+    // `UringDriver` currently regresses RTT with no throughput upside and is the
+    // workspace's only `unsafe`, so it is opt-in via `YIP_USE_URING=1` for A/B
+    // work until it beats epoll (SQPOLL / working GSO batching) and re-benchmarks
+    // favourably. See crates/yip-bench/README.md "io_uring Phase B — driver A/B".
+    if std::env::var_os("YIP_USE_URING").is_some() && yip_io::uring::uring_available() {
         yip_io::uring::run_uring(udp_fd, tun_fd, &mut dataplane)
     } else {
         yip_io::poll::run_poll(udp_fd, tun_fd, &mut dataplane)

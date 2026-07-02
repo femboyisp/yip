@@ -42,6 +42,15 @@ struct GsoMeta {
     datagram_count: usize,
 }
 
+/// Which fd an in-flight send slot targets, so completion-error handling can
+/// mirror `PollDriver`: TUN writes are always dropped, UDP sends drop on
+/// transient buffer pressure but propagate genuinely fatal errors.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SendKind {
+    Udp,
+    Tun,
+}
+
 struct GsoSendContext {
     iov: libc::iovec,
     msg: libc::msghdr,
@@ -119,6 +128,7 @@ pub struct UringDriver {
     in_flight: Vec<Option<Vec<u8>>>,
     gso_meta: Vec<Option<GsoMeta>>,
     gso_ctx: Vec<Option<GsoSendContext>>,
+    send_kind: Vec<Option<SendKind>>,
     gso_enabled: bool,
     started: Instant,
     udp_armed: bool,
@@ -137,10 +147,12 @@ impl UringDriver {
         let mut in_flight = Vec::with_capacity(SEND_SLOTS);
         let mut gso_meta = Vec::with_capacity(SEND_SLOTS);
         let mut gso_ctx = Vec::with_capacity(SEND_SLOTS);
+        let mut send_kind = Vec::with_capacity(SEND_SLOTS);
         for _ in 0..SEND_SLOTS {
             in_flight.push(None);
             gso_meta.push(None);
             gso_ctx.push(None);
+            send_kind.push(None);
         }
 
         let mut driver = Self {
@@ -151,6 +163,7 @@ impl UringDriver {
             in_flight,
             gso_meta,
             gso_ctx,
+            send_kind,
             gso_enabled: true,
             started: Instant::now(),
             udp_armed: false,
@@ -201,7 +214,7 @@ impl UringDriver {
         .build()
         .user_data(TAG_REPROVIDE);
         self.push_entry(entry)?;
-        self.ring.submit_and_wait(1)?;
+        self.submit_and_wait_1()?;
         let cqe = self
             .ring
             .completion()
@@ -296,6 +309,7 @@ impl UringDriver {
 
     fn queue_udp_send(&mut self, datagram: &[u8]) -> io::Result<()> {
         let slot_id = self.alloc_in_flight_slot(datagram.to_vec(), MAX_WIRE_DATAGRAM)?;
+        self.send_kind[slot_id] = Some(SendKind::Udp);
         let (ptr, len_u32) = {
             let slot_buf = self.in_flight[slot_id]
                 .as_ref()
@@ -318,6 +332,7 @@ impl UringDriver {
 
     fn queue_tun_write(&mut self, frame: &[u8]) -> io::Result<()> {
         let slot_id = self.alloc_in_flight_slot(frame.to_vec(), MAX_WIRE_DATAGRAM)?;
+        self.send_kind[slot_id] = Some(SendKind::Tun);
         let (ptr, len_u32) = {
             let slot_buf = self.in_flight[slot_id]
                 .as_ref()
@@ -344,6 +359,7 @@ impl UringDriver {
         self.in_flight[slot_id] = None;
         self.gso_meta[slot_id] = None;
         self.gso_ctx[slot_id] = None;
+        self.send_kind[slot_id] = None;
     }
 
     fn can_coalesce_gso(datagrams: &[Vec<u8>]) -> Option<u16> {
@@ -414,6 +430,7 @@ impl UringDriver {
             Ok(slot_id) => slot_id,
             Err(_) => return Ok(false),
         };
+        self.send_kind[slot_id] = Some(SendKind::Udp);
         #[cfg(test)]
         if self.force_gso_submit_failure {
             self.release_in_flight_slot(slot_id);
@@ -519,6 +536,30 @@ impl UringDriver {
             || errno == libc::ENOTSUP
     }
 
+    /// Transient UDP-send errno: the socket send buffer is momentarily full, so
+    /// drop this datagram rather than tear down the tunnel (parity with
+    /// `poll.rs::send_to_udp`). `EWOULDBLOCK == EAGAIN` on Linux; both listed.
+    fn is_transient_send_errno(errno: i32) -> bool {
+        errno == libc::EAGAIN || errno == libc::EWOULDBLOCK || errno == libc::ENOBUFS
+    }
+
+    /// Wait for at least one completion, retrying on `EINTR`.
+    ///
+    /// `IoUring::submit_and_wait` wraps the blocking `io_uring_enter` syscall,
+    /// which returns `EINTR` if a signal is delivered while it waits. The
+    /// `io-uring` crate does not retry internally, so without this a signal
+    /// would propagate out of `poll_once` and terminate the whole tunnel —
+    /// parity with `poll.rs`, whose `epoll_wait` loop `continue`s on `EINTR`.
+    fn submit_and_wait_1(&self) -> io::Result<()> {
+        loop {
+            match self.ring.submit_and_wait(1) {
+                Ok(_) => return Ok(()),
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     fn handle_dispatch_udp(&mut self, d: &mut impl Dispatch, datagram: &[u8], now_ms: u64) {
         match d.on_udp(datagram, now_ms) {
             DispatchOut::None => {}
@@ -554,7 +595,7 @@ impl UringDriver {
 
     /// Process at least one CQE and dispatch resulting I/O.
     pub fn poll_once<D: Dispatch>(&mut self, d: &mut D) -> io::Result<()> {
-        self.ring.submit_and_wait(1)?;
+        self.submit_and_wait_1()?;
         let mut cqes = Vec::new();
         for cqe in &mut self.ring.completion() {
             cqes.push((cqe.user_data(), cqe.result(), cqe.flags()));
@@ -589,10 +630,29 @@ impl UringDriver {
                         }
                         continue;
                     }
-                    eprintln!(
-                        "uring: send/write completion error on slot {slot_id}: {}",
-                        io::Error::from_raw_os_error(errno)
-                    );
+                    // Non-GSO send/write completion error. Mirror the
+                    // PollDriver contract (poll.rs `send_to_tun`/`send_to_udp`):
+                    // a failed TUN write is always dropped (a lost inner frame
+                    // beats tearing down the tunnel), and a failed UDP send is
+                    // dropped only on transient buffer pressure — a genuinely
+                    // fatal error propagates so a supervisor can restart, rather
+                    // than the tunnel going silently dark forever.
+                    let kind = self.send_kind.get(slot_id).and_then(|k| *k);
+                    let err = io::Error::from_raw_os_error(errno);
+                    self.release_in_flight_slot(slot_id);
+                    match kind {
+                        Some(SendKind::Tun) => {
+                            eprintln!("uring: tun write error on slot {slot_id} (dropped): {err}");
+                            continue;
+                        }
+                        _ => {
+                            if Self::is_transient_send_errno(errno) {
+                                eprintln!("uring: udp send dropped on slot {slot_id}: {err}");
+                                continue;
+                            }
+                            return Err(err);
+                        }
+                    }
                 } else if let Some(meta) = self.gso_meta.get(slot_id).and_then(|entry| *entry) {
                     let bytes_sent =
                         usize::try_from(result).expect("non-negative send result fits usize");
