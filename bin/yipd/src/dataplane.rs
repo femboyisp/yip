@@ -27,6 +27,11 @@ const FEEDBACK_INTERVAL_MS: u64 = 30;
 
 // Periodic log interval for controller ratio (every ~5 s).
 const LOG_INTERVAL_MS: u64 = 5_000;
+// How often to sweep the MAC table for expired entries. `tick` fires on every
+// epoll iteration (≥100 Hz), so an unconditional O(n) sweep would scan the whole
+// table on every loop pass; gate it to ~1 s (TTL is independently enforced on
+// lookup, so a coarse sweep only bounds memory).
+const MAC_SWEEP_INTERVAL_MS: u64 = 1_000;
 const SINGLE_REMOTE_PEER_ID: u64 = 1;
 const LOCAL_TAP_PEER_ID: u64 = 0;
 const ETHERNET_HEADER_LEN: usize = 14;
@@ -117,6 +122,7 @@ pub struct DataPlane {
     // Feedback / log timers (mirror what ingress thread holds in tunnel.rs).
     last_feedback_ms: u64,
     last_log_ms: u64,
+    last_sweep_ms: u64,
     /// Count of ARQ retransmits emitted (for observability / periodic log).
     arq_retx_count: u64,
 
@@ -151,6 +157,7 @@ impl DataPlane {
             mac_table: MacTable::new(DEFAULT_MAC_TABLE_CAPACITY, DEFAULT_MAC_TABLE_TTL_MS),
             last_feedback_ms: 0,
             last_log_ms: 0,
+            last_sweep_ms: 0,
             arq_retx_count: 0,
             egress_scratch: Vec::new(),
             inner_scratch: Vec::new(),
@@ -431,7 +438,10 @@ impl DataPlane {
     /// when a feedback packet was built (the caller must send it to the peer).
     /// Returns `None` if no feedback interval has elapsed.
     pub fn tick(&mut self, now_ms: u64) -> Option<&[u8]> {
-        self.mac_table.sweep(now_ms);
+        if now_ms.saturating_sub(self.last_sweep_ms) >= MAC_SWEEP_INTERVAL_MS {
+            self.last_sweep_ms = now_ms;
+            self.mac_table.sweep(now_ms);
+        }
 
         // ── periodic controller ratio log ─────────────────────────────────────
         if now_ms.saturating_sub(self.last_log_ms) >= LOG_INTERVAL_MS {
