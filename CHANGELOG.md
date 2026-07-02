@@ -38,6 +38,15 @@ All notable changes to this project are documented here, following
   (`RetxBuffer`), plus `Transport::repair_object`.
 
 ### Changed
+- io_uring driver RTT work: the `UringDriver` hot path no longer allocates per
+  packet — received datagrams dispatch from a reused scratch buffer, send buffers
+  are recycled through a pool, and `poll_once` drains completions into a reused
+  vec (matching `PollDriver`, which was already alloc-free). Adds an opt-in
+  **busy-poll** mode (`YIP_URING_BUSYPOLL=1`): `poll_once` spins the completion
+  queue before blocking, cutting tunnel RTT from ~0.47 ms to ~0.31 ms and
+  **beating the epoll `PollDriver` (~0.37 ms)** — a "burn CPU for latency" knob,
+  off by default so idle tunnels don't spin. (Making it the default / auto-tuning
+  the spin budget wants clean-hardware measurement; io_uring stays opt-in for now.)
 - Coverage CI: exclude `yip-io/src/uring.rs` from the llvm-cov denominator (honest
   exclusion — the `UringDriver` syscall loop is netns/integration-gated, same
   pattern as `yip-device` privileged paths).
