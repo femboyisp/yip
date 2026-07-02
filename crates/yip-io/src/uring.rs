@@ -635,7 +635,14 @@ impl UringDriver {
                 if let Some(bid) = bid_opt {
                     self.reprovide_buffer(bid)?;
                 }
-                if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                // ENOBUFS on a recv completion means the provided-buffer ring was
+                // momentarily exhausted (no buffer for the kernel to place this
+                // datagram) — the multishot recv stops and must be re-armed. Like
+                // EAGAIN, this is transient, not fatal: drop the datagram and
+                // re-arm; buffers are re-provided as other completions process.
+                // (Treating ENOBUFS as fatal tore the driver down under burst and
+                // flaked the uring unit tests on the CI runner.)
+                if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK || errno == libc::ENOBUFS {
                     if kind == TAG_UDP_RECV {
                         self.udp_armed = false;
                         self.arm_udp_recv()?;
@@ -880,7 +887,9 @@ mod tests {
 
     #[test]
     fn uring_loopback_roundtrip_recycles_recv_buffers() {
-        let _guard = URING_SERIAL.lock().expect("lock test serialization");
+        let _guard = URING_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let a = UdpSocket::bind("127.0.0.1:0").expect("bind sender");
         let b = UdpSocket::bind("127.0.0.1:0").expect("bind uring peer");
         a.connect(b.local_addr().expect("sender local addr"))
@@ -949,7 +958,9 @@ mod tests {
 
     #[test]
     fn uring_gso_loopback_preserves_multi_datagram_payloads() {
-        let _guard = URING_SERIAL.lock().expect("lock test serialization");
+        let _guard = URING_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let a = UdpSocket::bind("127.0.0.1:0").expect("bind sender");
         let b = UdpSocket::bind("127.0.0.1:0").expect("bind uring peer");
         a.connect(b.local_addr().expect("sender local addr"))
@@ -1027,7 +1038,9 @@ mod tests {
 
     #[test]
     fn uring_gso_submit_fallback_uses_per_datagram_send() {
-        let _guard = URING_SERIAL.lock().expect("lock test serialization");
+        let _guard = URING_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let a = UdpSocket::bind("127.0.0.1:0").expect("bind sender");
         let b = UdpSocket::bind("127.0.0.1:0").expect("bind uring peer");
         a.connect(b.local_addr().expect("sender local addr"))
@@ -1109,7 +1122,9 @@ mod tests {
 
     #[test]
     fn uring_gso_large_batch_chunks_payload_to_udp_limits() {
-        let _guard = URING_SERIAL.lock().expect("lock test serialization");
+        let _guard = URING_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let a = UdpSocket::bind("127.0.0.1:0").expect("bind sender");
         let b = UdpSocket::bind("127.0.0.1:0").expect("bind uring peer");
         a.connect(b.local_addr().expect("sender local addr"))
@@ -1191,7 +1206,9 @@ mod tests {
 
     #[test]
     fn uring_in_flight_send_table_reuses_slots_after_completions() {
-        let _guard = URING_SERIAL.lock().expect("lock test serialization");
+        let _guard = URING_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let a = UdpSocket::bind("127.0.0.1:0").expect("bind sender");
         let b = UdpSocket::bind("127.0.0.1:0").expect("bind uring peer");
         a.connect(b.local_addr().expect("sender local addr"))
@@ -1241,6 +1258,21 @@ mod tests {
         }
 
         assert_eq!(received, total, "must echo all datagrams");
+
+        // The echoed data can arrive at `a` before the driver reaps the matching
+        // SEND completion CQE (observed on slower CI runners), so the loop above
+        // can exit with send CQEs still pending. Drain them before asserting slot
+        // hygiene. Because every echoed send physically completed, its CQE is
+        // already queued, so `poll_once` (submit_and_wait(1)) returns without
+        // blocking; a genuine slot leak would never reach 0 and still fail below.
+        for _ in 0..1000 {
+            if driver.in_flight_used_count() == 0 {
+                break;
+            }
+            driver
+                .poll_once(&mut dispatch)
+                .expect("poll_once drains pending send completions");
+        }
         assert_eq!(
             driver.in_flight_used_count(),
             0,
