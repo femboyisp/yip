@@ -31,10 +31,6 @@ pub struct Config {
     /// TUN/TAP device name (e.g. `"yip0"`).
     pub device: String,
     /// Tunnel mode selected from `device_kind=tun|tap` (`tun` by default).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by tunnel mode selection in follow-up task")
-    )]
     pub device_kind: TunnelMode,
     /// Whether this peer initiates the Noise-IK handshake.
     pub initiate: bool,

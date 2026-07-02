@@ -7,6 +7,7 @@ use yip_transport::{FlowClass, LossDetector, LossReport, RetxBuffer, Transport};
 use yip_wire::{Codec, WireCodec as _};
 
 use crate::handshake::{Established, PacketType};
+use crate::mode::TunnelMode;
 use crate::wire_glue;
 
 // ── constants (wired into DataPlane::new; tunnel.rs keeps its own copies until
@@ -100,6 +101,7 @@ pub struct DataPlane {
     transport: Transport,
     codec: Codec,
     conn_tag: u64,
+    l2: bool,
     sent_log: SentLog,
     retx: RetxBuffer,
     detector: LossDetector,
@@ -127,13 +129,14 @@ impl DataPlane {
     /// The wire codec keys are derived from the same channel-binding sub-keys
     /// that were derived during the handshake (`established.auth_key` /
     /// `established.hp_key`), so both peers end up with the same codec.
-    pub fn new(established: Established, conn_tag: u64) -> Self {
+    pub fn new(established: Established, conn_tag: u64, mode: TunnelMode) -> Self {
         let codec = Codec::new(established.auth_key, established.hp_key);
         Self {
             session: established.session,
             transport: Transport::new(vec![]),
             codec,
             conn_tag,
+            l2: matches!(mode, TunnelMode::L2Tap),
             sent_log: SentLog::new(SENT_LOG_CAPACITY),
             retx: RetxBuffer::new(RETX_BUFFER_MAX, RETX_BUFFER_TTL_MS),
             detector: LossDetector::new(5, 1024),
@@ -168,7 +171,7 @@ impl DataPlane {
         // ── 2. FEC-encode ─────────────────────────────────────────────────────
         let (class, symbols) = self
             .transport
-            .encode(&sealed.ciphertext, inner, false, now_ms);
+            .encode(&sealed.ciphertext, inner, self.l2, now_ms);
 
         // ── 3. Auxiliary bookkeeping ──────────────────────────────────────────
         self.sent_log.insert(sealed.counter, class);
@@ -500,13 +503,14 @@ impl yip_io::poll::Dispatch for DataPlane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mode::TunnelMode;
     use yip_crypto::{generate_keypair, Handshake};
 
     use crate::wire_glue::derive_wire_keys;
 
     /// Build two [`DataPlane`]s whose sessions can talk to each other, by
     /// running a full in-process Noise-IK handshake.
-    fn dataplane_pair() -> (DataPlane, DataPlane) {
+    fn dataplane_pair(mode: TunnelMode) -> (DataPlane, DataPlane) {
         let resp_kp = generate_keypair();
         let init_kp = generate_keypair();
 
@@ -544,8 +548,8 @@ mod tests {
         let conn_tag = conn_tag_from_keys(&auth_key, &hp_key);
 
         (
-            DataPlane::new(est_i, conn_tag),
-            DataPlane::new(est_r, conn_tag),
+            DataPlane::new(est_i, conn_tag, mode),
+            DataPlane::new(est_r, conn_tag, mode),
         )
     }
 
@@ -553,7 +557,7 @@ mod tests {
     /// and the recovered inner bytes equal the original.
     #[test]
     fn on_tun_packet_produces_decodable_egress() {
-        let (mut a, mut b) = dataplane_pair();
+        let (mut a, mut b) = dataplane_pair(TunnelMode::L3Tun);
         let inner = vec![0x11u8; 200];
         let dgrams: Vec<Vec<u8>> = a.on_tun_packet(&inner, 0).to_vec();
 
@@ -589,7 +593,7 @@ mod tests {
     /// Bulk traffic) emits ARQ retransmit datagrams.
     #[test]
     fn control_packet_drives_observe_loss_and_arq() {
-        let (mut a, mut b) = dataplane_pair();
+        let (mut a, mut b) = dataplane_pair(TunnelMode::L3Tun);
         // A sends 3 objects; drop the middle datagram so B sees a gap.
         let d0 = a.on_tun_packet(&[0u8; 100], 0).to_vec();
         let _d1 = a.on_tun_packet(&[1u8; 100], 0).to_vec(); // dropped
@@ -612,11 +616,51 @@ mod tests {
     /// A forged Control packet must fail authentication and produce no side-effects.
     #[test]
     fn forged_control_packet_is_rejected() {
-        let (mut a, _b) = dataplane_pair();
+        let (mut a, _b) = dataplane_pair(TunnelMode::L3Tun);
         let mut forged = vec![PacketType::Control as u8];
         forged.extend_from_slice(&7u64.to_be_bytes());
         forged.extend_from_slice(&[0xAB; 32]); // garbage ciphertext
                                                // Must not panic; auth fails so no observe_loss / retransmit.
         let _ = a.on_udp_datagram(&forged, 0);
+    }
+
+    #[test]
+    fn tunnel_mode_controls_l2_encode_hint() {
+        // Ethernet + IPv4 header with DSCP EF should classify as Realtime only
+        // when the classifier is told this is an L2 frame (l2=true).
+        let mut l2_inner = vec![0u8; 14 + 24];
+        l2_inner[12] = 0x08;
+        l2_inner[13] = 0x00; // EtherType IPv4
+        l2_inner[14] = 0x45; // v4, IHL 5
+        l2_inner[15] = 46 << 2; // DSCP EF
+        l2_inner[23] = 17; // UDP protocol
+        l2_inner[36] = 0x13;
+        l2_inner[37] = 0x88; // dport 5000
+
+        let (mut tun_dp, _) = dataplane_pair(TunnelMode::L3Tun);
+        tun_dp.on_tun_packet(&l2_inner, 0);
+        let tun_counter = *tun_dp
+            .sent_log
+            .order
+            .back()
+            .expect("TUN dataplane inserts a sent-log entry");
+        assert_eq!(
+            tun_dp.sent_log.get(tun_counter),
+            Some(FlowClass::Default),
+            "TUN mode passes l2=false and keeps Ethernet payload as Default"
+        );
+
+        let (mut tap_dp, _) = dataplane_pair(TunnelMode::L2Tap);
+        tap_dp.on_tun_packet(&l2_inner, 0);
+        let tap_counter = *tap_dp
+            .sent_log
+            .order
+            .back()
+            .expect("TAP dataplane inserts a sent-log entry");
+        assert_eq!(
+            tap_dp.sent_log.get(tap_counter),
+            Some(FlowClass::Realtime),
+            "TAP mode passes l2=true and classifies inner IPv4 DSCP EF"
+        );
     }
 }
