@@ -298,35 +298,42 @@ impl UringDriver {
                 continue;
             }
 
+            let bid_opt = cqueue::buffer_select(flags);
             if result < 0 {
                 let err = io::Error::from_raw_os_error(-result);
+                if let Some(bid) = bid_opt {
+                    self.reprovide_buffer(bid)?;
+                }
                 if kind == TAG_UDP_RECV {
                     self.udp_armed = false;
-                    if let Err(rearm_err) = self.arm_udp_recv() {
-                        return Err(io::Error::other(format!(
-                            "failed to re-arm udp recv after {err}: {rearm_err}"
-                        )));
-                    }
-                } else if kind == TAG_TUN_RECV {
-                    self.tun_armed = false;
-                    if let Err(rearm_err) = self.arm_tun_read() {
-                        return Err(io::Error::other(format!(
-                            "failed to re-arm tun read after {err}: {rearm_err}"
-                        )));
-                    }
+                    return Err(io::Error::other(format!(
+                        "udp recv completion error: {err}"
+                    )));
                 }
-                continue;
+                if kind == TAG_TUN_RECV {
+                    self.tun_armed = false;
+                    return Err(io::Error::other(format!(
+                        "tun recv completion error: {err}"
+                    )));
+                }
+                return Err(io::Error::other(format!(
+                    "unexpected completion kind 0x{kind:016x} with error {err}"
+                )));
             }
 
-            let Some(bid) = cqueue::buffer_select(flags) else {
-                if kind == TAG_UDP_RECV {
-                    self.udp_armed = false;
-                    self.arm_udp_recv()?;
-                } else if kind == TAG_TUN_RECV {
-                    self.tun_armed = false;
-                    self.arm_tun_read()?;
+            let bid = if kind == TAG_UDP_RECV || kind == TAG_TUN_RECV {
+                bid_opt.ok_or_else(|| {
+                    io::Error::other(
+                        "recv completion missing buffer_select; aborting to avoid pool-slot leak",
+                    )
+                })?
+            } else {
+                if let Some(bid) = bid_opt {
+                    self.reprovide_buffer(bid)?;
                 }
-                continue;
+                return Err(io::Error::other(format!(
+                    "unexpected completion kind 0x{kind:016x}"
+                )));
             };
 
             let idx = usize::from(bid);
@@ -335,6 +342,7 @@ impl UringDriver {
             }
             let n = usize::try_from(result).expect("non-negative CQE result fits usize");
             if n > MAX_WIRE_DATAGRAM {
+                self.reprovide_buffer(bid)?;
                 return Err(io::Error::other("kernel returned oversized datagram"));
             }
 
@@ -346,13 +354,14 @@ impl UringDriver {
                     self.udp_armed = false;
                     self.arm_udp_recv()?;
                 }
-            } else if kind == TAG_TUN_RECV {
-                let frame = self.recv_pool[idx][..n].to_vec();
-                self.handle_dispatch_tun(d, &frame, now_ms);
-                self.reprovide_buffer(bid)?;
-                self.tun_armed = false;
-                self.arm_tun_read()?;
+                continue;
             }
+
+            let frame = self.recv_pool[idx][..n].to_vec();
+            self.handle_dispatch_tun(d, &frame, now_ms);
+            self.reprovide_buffer(bid)?;
+            self.tun_armed = false;
+            self.arm_tun_read()?;
         }
 
         if let Some(pkt) = d.tick(now_ms) {
