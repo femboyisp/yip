@@ -7,6 +7,9 @@ use yip_transport::{FlowClass, LossDetector, LossReport, RetxBuffer, Transport};
 use yip_wire::{Codec, WireCodec as _};
 
 use crate::handshake::{Established, PacketType};
+use crate::mac_table::{
+    LearnOrigin, MacTable, DEFAULT_MAC_TABLE_CAPACITY, DEFAULT_MAC_TABLE_TTL_MS,
+};
 use crate::mode::TunnelMode;
 use crate::wire_glue;
 
@@ -24,6 +27,10 @@ const FEEDBACK_INTERVAL_MS: u64 = 30;
 
 // Periodic log interval for controller ratio (every ~5 s).
 const LOG_INTERVAL_MS: u64 = 5_000;
+const SINGLE_REMOTE_PEER_ID: u64 = 1;
+const LOCAL_TAP_PEER_ID: u64 = 0;
+const ETHERNET_HEADER_LEN: usize = 14;
+const ETHERNET_SOURCE_MAC_OFFSET: usize = 6;
 
 // ── SentLog ───────────────────────────────────────────────────────────────────
 
@@ -105,6 +112,7 @@ pub struct DataPlane {
     sent_log: SentLog,
     retx: RetxBuffer,
     detector: LossDetector,
+    mac_table: MacTable,
 
     // Feedback / log timers (mirror what ingress thread holds in tunnel.rs).
     last_feedback_ms: u64,
@@ -140,6 +148,7 @@ impl DataPlane {
             sent_log: SentLog::new(SENT_LOG_CAPACITY),
             retx: RetxBuffer::new(RETX_BUFFER_MAX, RETX_BUFFER_TTL_MS),
             detector: LossDetector::new(5, 1024),
+            mac_table: MacTable::new(DEFAULT_MAC_TABLE_CAPACITY, DEFAULT_MAC_TABLE_TTL_MS),
             last_feedback_ms: 0,
             last_log_ms: 0,
             arq_retx_count: 0,
@@ -161,6 +170,13 @@ impl DataPlane {
     /// possible after counter exhaustion — practically impossible in testing).
     pub fn on_tun_packet(&mut self, inner: &[u8], now_ms: u64) -> &[Vec<u8>] {
         self.egress_scratch.clear();
+
+        if self.l2 {
+            if let Some(src_mac) = source_mac_from_ethernet_frame(inner) {
+                self.mac_table
+                    .learn(src_mac, LOCAL_TAP_PEER_ID, LearnOrigin::LocalTap, now_ms);
+            }
+        }
 
         // ── 1. Seal ───────────────────────────────────────────────────────────
         let sealed = match self.session.seal(inner) {
@@ -269,6 +285,17 @@ impl DataPlane {
                 // Copy the opened inner frame into the reused scratch buffer.
                 self.inner_scratch.clear();
                 self.inner_scratch.extend_from_slice(&inner);
+
+                if self.l2 {
+                    if let Some(src_mac) = source_mac_from_ethernet_frame(&self.inner_scratch) {
+                        self.mac_table.learn(
+                            src_mac,
+                            SINGLE_REMOTE_PEER_ID,
+                            LearnOrigin::Peer,
+                            now_ms,
+                        );
+                    }
+                }
                 Outcome::TunWrite(&self.inner_scratch)
             }
 
@@ -404,6 +431,8 @@ impl DataPlane {
     /// when a feedback packet was built (the caller must send it to the peer).
     /// Returns `None` if no feedback interval has elapsed.
     pub fn tick(&mut self, now_ms: u64) -> Option<&[u8]> {
+        self.mac_table.sweep(now_ms);
+
         // ── periodic controller ratio log ─────────────────────────────────────
         if now_ms.saturating_sub(self.last_log_ms) >= LOG_INTERVAL_MS {
             self.last_log_ms = now_ms;
@@ -475,6 +504,16 @@ fn fraction_f32(numerator: u32, denominator: u32) -> f32 {
     let n = f32::from(u16::try_from(numerator).unwrap_or(u16::MAX));
     let d = f32::from(u16::try_from(denominator).unwrap_or(u16::MAX));
     (n / d).clamp(0.0_f32, 1.0_f32)
+}
+
+#[inline]
+fn source_mac_from_ethernet_frame(inner: &[u8]) -> Option<[u8; 6]> {
+    if inner.len() < ETHERNET_HEADER_LEN {
+        return None;
+    }
+    let mut src = [0u8; 6];
+    src.copy_from_slice(&inner[ETHERNET_SOURCE_MAC_OFFSET..ETHERNET_SOURCE_MAC_OFFSET + 6]);
+    Some(src)
 }
 
 // ── Dispatch impl ─────────────────────────────────────────────────────────────
