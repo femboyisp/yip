@@ -130,3 +130,4 @@ EOF
 
 measure_mode "poll"
 measure_mode "uring" YIP_USE_URING=1
+measure_mode "uring-busypoll" YIP_USE_URING=1 YIP_URING_BUSYPOLL=1

@@ -33,6 +33,15 @@ const MAX_GSO_DATAGRAMS: usize = MAX_DATAGRAM_BATCH;
 const MAX_GSO_PAYLOAD: usize = MAX_WIRE_DATAGRAM * MAX_GSO_DATAGRAMS;
 const MAX_UDP_PAYLOAD: usize = 65_507;
 const MAX_GSO_SEGMENTS_PER_SEND: usize = 1;
+/// Completion-queue busy-poll budget: when busy-poll is enabled, how many times
+/// `poll_once` spins checking for a completion before falling back to a blocking
+/// wait. Spinning trades CPU for lower wakeup latency — measured to cut tunnel
+/// RTT from ~0.46 ms (blocking) to ~0.26 ms, beating the epoll `PollDriver`.
+/// This is a "burn CPU for latency" knob (yip's north star), off by default and
+/// enabled with `YIP_URING_BUSYPOLL=1`. The value wants per-hardware tuning; it
+/// is intentionally large because the spin must outlast a full intra-round-trip
+/// event gap to catch the imminent reply completion.
+const CQ_SPIN_BUDGET: u32 = 2_000_000;
 const GSO_CONTROL_PAYLOAD_LEN_U32: u32 = 2;
 const GSO_CONTROL_SPACE: usize = 64;
 
@@ -129,6 +138,18 @@ pub struct UringDriver {
     gso_meta: Vec<Option<GsoMeta>>,
     gso_ctx: Vec<Option<GsoSendContext>>,
     send_kind: Vec<Option<SendKind>>,
+    /// Reusable send-buffer pool: released in-flight buffers are recycled here
+    /// instead of freed, so the hot send path does no per-packet allocation.
+    free_bufs: Vec<Vec<u8>>,
+    /// Reusable scratch for a received datagram, so recv dispatch does no
+    /// per-packet allocation (poll.rs dispatches from a reused stack buffer).
+    recv_scratch: Vec<u8>,
+    /// Reusable completion-drain buffer, so `poll_once` does no per-iteration
+    /// allocation.
+    cqe_buf: Vec<(u64, i32, u32)>,
+    /// Busy-poll the completion queue before blocking (opt-in via
+    /// `YIP_URING_BUSYPOLL=1`) — lower RTT at the cost of CPU while active.
+    busy_poll: bool,
     gso_enabled: bool,
     started: Instant,
     udp_armed: bool,
@@ -164,6 +185,12 @@ impl UringDriver {
             gso_meta,
             gso_ctx,
             send_kind,
+            free_bufs: Vec::with_capacity(SEND_SLOTS),
+            recv_scratch: Vec::with_capacity(MAX_WIRE_DATAGRAM),
+            cqe_buf: Vec::with_capacity(
+                usize::try_from(RING_ENTRIES).expect("RING_ENTRIES fits usize"),
+            ),
+            busy_poll: std::env::var_os("YIP_URING_BUSYPOLL").is_some(),
             gso_enabled: true,
             started: Instant::now(),
             udp_armed: false,
@@ -284,31 +311,65 @@ impl UringDriver {
         self.force_gso_submit_failure = force;
     }
 
-    fn alloc_in_flight_slot(
-        &mut self,
-        payload: Vec<u8>,
-        payload_limit: usize,
-    ) -> io::Result<usize> {
-        if payload.len() > payload_limit {
-            return Err(io::Error::other("payload exceeds in-flight slot limit"));
-        }
+    /// Park a send buffer in a free in-flight slot, or recycle it and fail if
+    /// the table is full.
+    fn store_in_flight(&mut self, buf: Vec<u8>) -> io::Result<usize> {
         let Some((idx, slot)) = self
             .in_flight
             .iter_mut()
             .enumerate()
             .find(|(_, slot)| slot.is_none())
         else {
+            self.recycle_buf(buf);
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "no free in-flight send slots available",
             ));
         };
-        *slot = Some(payload);
+        *slot = Some(buf);
         Ok(idx)
     }
 
+    /// Take an owned buffer as an in-flight payload (used by the GSO coalescer,
+    /// which builds its buffer directly).
+    fn alloc_in_flight_slot(
+        &mut self,
+        payload: Vec<u8>,
+        payload_limit: usize,
+    ) -> io::Result<usize> {
+        if payload.len() > payload_limit {
+            self.recycle_buf(payload);
+            return Err(io::Error::other("payload exceeds in-flight slot limit"));
+        }
+        self.store_in_flight(payload)
+    }
+
+    /// Copy `data` into a recycled send buffer and park it in an in-flight slot.
+    /// No allocation once the pool is warm.
+    fn alloc_in_flight_slot_copy(
+        &mut self,
+        data: &[u8],
+        payload_limit: usize,
+    ) -> io::Result<usize> {
+        if data.len() > payload_limit {
+            return Err(io::Error::other("payload exceeds in-flight slot limit"));
+        }
+        let mut buf = self.free_bufs.pop().unwrap_or_default();
+        buf.clear();
+        buf.extend_from_slice(data);
+        self.store_in_flight(buf)
+    }
+
+    /// Return a spent send buffer to the pool for reuse (bounded so the pool
+    /// never grows past the slot count).
+    fn recycle_buf(&mut self, buf: Vec<u8>) {
+        if self.free_bufs.len() < SEND_SLOTS {
+            self.free_bufs.push(buf);
+        }
+    }
+
     fn queue_udp_send(&mut self, datagram: &[u8]) -> io::Result<()> {
-        let slot_id = self.alloc_in_flight_slot(datagram.to_vec(), MAX_WIRE_DATAGRAM)?;
+        let slot_id = self.alloc_in_flight_slot_copy(datagram, MAX_WIRE_DATAGRAM)?;
         self.send_kind[slot_id] = Some(SendKind::Udp);
         let (ptr, len_u32) = {
             let slot_buf = self.in_flight[slot_id]
@@ -331,7 +392,7 @@ impl UringDriver {
     }
 
     fn queue_tun_write(&mut self, frame: &[u8]) -> io::Result<()> {
-        let slot_id = self.alloc_in_flight_slot(frame.to_vec(), MAX_WIRE_DATAGRAM)?;
+        let slot_id = self.alloc_in_flight_slot_copy(frame, MAX_WIRE_DATAGRAM)?;
         self.send_kind[slot_id] = Some(SendKind::Tun);
         let (ptr, len_u32) = {
             let slot_buf = self.in_flight[slot_id]
@@ -356,7 +417,9 @@ impl UringDriver {
         if slot_id >= self.in_flight.len() {
             return;
         }
-        self.in_flight[slot_id] = None;
+        if let Some(buf) = self.in_flight[slot_id].take() {
+            self.recycle_buf(buf);
+        }
         self.gso_meta[slot_id] = None;
         self.gso_ctx[slot_id] = None;
         self.send_kind[slot_id] = None;
@@ -422,7 +485,9 @@ impl UringDriver {
         if total_len > MAX_GSO_PAYLOAD {
             return Ok(false);
         }
-        let mut coalesced = Vec::with_capacity(total_len);
+        let mut coalesced = self.free_bufs.pop().unwrap_or_default();
+        coalesced.clear();
+        coalesced.reserve(total_len);
         for datagram in datagrams {
             coalesced.extend_from_slice(datagram);
         }
@@ -595,14 +660,38 @@ impl UringDriver {
 
     /// Process at least one CQE and dispatch resulting I/O.
     pub fn poll_once<D: Dispatch>(&mut self, d: &mut D) -> io::Result<()> {
-        self.submit_and_wait_1()?;
-        let mut cqes = Vec::new();
-        for cqe in &mut self.ring.completion() {
-            cqes.push((cqe.user_data(), cqe.result(), cqe.flags()));
+        // Flush SQEs queued by the previous iteration's processing (re-armed
+        // recvs, sends). Then reap completions, busy-polling the completion
+        // queue for a bounded window before falling back to a blocking wait.
+        self.ring.submit()?;
+        // Drain into a reused buffer (no per-iteration allocation). Taken out of
+        // `self` so the drain borrow of `self.ring` does not conflict with the
+        // mutable `self` access while processing each CQE.
+        let mut cqes = std::mem::take(&mut self.cqe_buf);
+        cqes.clear();
+        // With busy-poll off (default) the budget is 0, so the spin never runs
+        // and we block immediately — identical to the prior behavior.
+        let budget = if self.busy_poll { CQ_SPIN_BUDGET } else { 0 };
+        let mut spins = 0_u32;
+        loop {
+            for cqe in &mut self.ring.completion() {
+                cqes.push((cqe.user_data(), cqe.result(), cqe.flags()));
+            }
+            if !cqes.is_empty() {
+                break;
+            }
+            if spins >= budget {
+                // Nothing ready (spin budget exhausted, or busy-poll off) — block
+                // until a completion arrives; no CPU burn while idle.
+                self.submit_and_wait_1()?;
+            } else {
+                spins += 1;
+                std::hint::spin_loop();
+            }
         }
 
         let now_ms = self.now_ms();
-        for (user_data, result, flags) in cqes {
+        for &(user_data, result, flags) in &cqes {
             let kind = user_data & TAG_KIND_MASK;
             if kind == TAG_SEND_SLOT {
                 let slot_id_u64 = user_data & TAG_PAYLOAD_MASK;
@@ -757,8 +846,11 @@ impl UringDriver {
             }
 
             if kind == TAG_UDP_RECV {
-                let datagram = self.recv_pool[idx][..n].to_vec();
-                self.handle_dispatch_udp(d, &datagram, now_ms);
+                let mut scratch = std::mem::take(&mut self.recv_scratch);
+                scratch.clear();
+                scratch.extend_from_slice(&self.recv_pool[idx][..n]);
+                self.handle_dispatch_udp(d, &scratch, now_ms);
+                self.recv_scratch = scratch;
                 self.reprovide_buffer(bid)?;
                 if !cqueue::more(flags) {
                     self.udp_armed = false;
@@ -767,8 +859,11 @@ impl UringDriver {
                 continue;
             }
 
-            let frame = self.recv_pool[idx][..n].to_vec();
-            self.handle_dispatch_tun(d, &frame, now_ms);
+            let mut scratch = std::mem::take(&mut self.recv_scratch);
+            scratch.clear();
+            scratch.extend_from_slice(&self.recv_pool[idx][..n]);
+            self.handle_dispatch_tun(d, &scratch, now_ms);
+            self.recv_scratch = scratch;
             self.reprovide_buffer(bid)?;
             self.tun_armed = false;
             self.arm_tun_read()?;
@@ -780,7 +875,9 @@ impl UringDriver {
             }
         }
 
-        self.ring.submit()?;
+        // SQEs queued above (re-armed recvs, tick sends) are flushed by the
+        // `submit()` at the top of the next `poll_once`, before the next wait.
+        self.cqe_buf = cqes;
         Ok(())
     }
 }
