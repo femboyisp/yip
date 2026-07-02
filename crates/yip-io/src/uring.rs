@@ -15,6 +15,7 @@ use crate::{MAX_DATAGRAM_BATCH, MAX_WIRE_DATAGRAM};
 
 const RING_ENTRIES: u32 = 512;
 const RING_BUFS: usize = 256;
+const TUN_READ_DEPTH: usize = 16;
 const BUF_GROUP: u16 = 17;
 const SEND_SLOTS: usize = 256;
 const TAG_SHIFT: u32 = 56;
@@ -148,7 +149,8 @@ impl UringDriver {
             in_flight,
             gso_meta,
             gso_ctx,
-            gso_enabled: true,
+            // Keep GSO disabled by default until loss-path parity is validated.
+            gso_enabled: false,
             started: Instant::now(),
             udp_armed: false,
             tun_armed: false,
@@ -160,7 +162,9 @@ impl UringDriver {
 
         driver.provide_all_buffers()?;
         driver.arm_udp_recv()?;
-        driver.arm_tun_read()?;
+        for _ in 0..TUN_READ_DEPTH {
+            driver.arm_tun_read()?;
+        }
         driver.ring.submit()?;
         Ok(driver)
     }
@@ -553,9 +557,22 @@ impl UringDriver {
 
             let bid_opt = cqueue::buffer_select(flags);
             if result < 0 {
-                let err = io::Error::from_raw_os_error(-result);
+                let errno = -result;
+                let err = io::Error::from_raw_os_error(errno);
                 if let Some(bid) = bid_opt {
                     self.reprovide_buffer(bid)?;
+                }
+                if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                    if kind == TAG_UDP_RECV {
+                        self.udp_armed = false;
+                        self.arm_udp_recv()?;
+                        continue;
+                    }
+                    if kind == TAG_TUN_RECV {
+                        self.tun_armed = false;
+                        self.arm_tun_read()?;
+                        continue;
+                    }
                 }
                 if kind == TAG_UDP_RECV {
                     self.udp_armed = false;
