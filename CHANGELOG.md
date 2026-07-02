@@ -6,6 +6,9 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- L2 TAP tunnel mode in `yipd`: config now supports `device_kind=tap` for
+  Ethernet (L2) tunnel interfaces; `device_kind=tun` remains the default for
+  IP (L3) mode.
 - io_uring Phase B: yipd now defaults to a single-threaded `UringDriver` data
   loop (one ring over UDP+TUN) with startup fallback to `PollDriver`, and
   `YIP_FORCE_POLL=1` to force fallback for parity testing. netns CI now runs
