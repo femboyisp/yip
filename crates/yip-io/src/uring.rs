@@ -42,6 +42,10 @@ const MAX_GSO_SEGMENTS_PER_SEND: usize = 1;
 /// is intentionally large because the spin must outlast a full intra-round-trip
 /// event gap to catch the imminent reply completion.
 const CQ_SPIN_BUDGET: u32 = 2_000_000;
+/// Blocking-wait timeout so `tick` fires on cadence even when the tunnel is
+/// idle (parity with poll.rs's 10 ms `epoll_wait` timeout). Requires the io_uring
+/// `EXT_ARG` feature (kernel 5.11+); on older kernels the wait is unbounded.
+const TICK_TIMEOUT_NS: u32 = 10_000_000;
 const GSO_CONTROL_PAYLOAD_LEN_U32: u32 = 2;
 const GSO_CONTROL_SPACE: usize = 64;
 
@@ -150,6 +154,9 @@ pub struct UringDriver {
     /// Busy-poll the completion queue before blocking (opt-in via
     /// `YIP_URING_BUSYPOLL=1`) — lower RTT at the cost of CPU while active.
     busy_poll: bool,
+    /// Whether the kernel supports `EXT_ARG` (5.11+), i.e. a timed blocking wait.
+    /// When true, the idle wait is bounded so `tick` fires on cadence.
+    ext_arg: bool,
     gso_enabled: bool,
     started: Instant,
     udp_armed: bool,
@@ -164,6 +171,7 @@ impl UringDriver {
     /// Build and arm a ring over the provided UDP and TUN file descriptors.
     pub fn new(udp_fd: RawFd, tun_fd: RawFd) -> io::Result<Self> {
         let ring = IoUring::new(RING_ENTRIES)?;
+        let ext_arg = ring.params().is_feature_ext_arg();
         let recv_pool = Box::new([[0_u8; MAX_WIRE_DATAGRAM]; RING_BUFS]);
         let mut in_flight = Vec::with_capacity(SEND_SLOTS);
         let mut gso_meta = Vec::with_capacity(SEND_SLOTS);
@@ -191,6 +199,7 @@ impl UringDriver {
                 usize::try_from(RING_ENTRIES).expect("RING_ENTRIES fits usize"),
             ),
             busy_poll: std::env::var_os("YIP_URING_BUSYPOLL").is_some(),
+            ext_arg,
             gso_enabled: true,
             started: Instant::now(),
             udp_armed: false,
@@ -625,6 +634,29 @@ impl UringDriver {
         }
     }
 
+    /// Block for at least one completion, but wake after `TICK_TIMEOUT_NS` so the
+    /// caller can run `tick` on cadence even with no traffic (parity with
+    /// poll.rs's `epoll_wait` timeout — fixes `tick` starving on an idle tunnel).
+    /// Returns `true` if the wait timed out with no completion (caller should
+    /// stop draining and let `tick` fire), `false` if a completion likely
+    /// arrived. Falls back to an unbounded wait on kernels without `EXT_ARG`.
+    fn wait_for_completions(&self) -> io::Result<bool> {
+        if !self.ext_arg {
+            self.submit_and_wait_1()?;
+            return Ok(false);
+        }
+        let ts = types::Timespec::new().nsec(TICK_TIMEOUT_NS);
+        let args = types::SubmitArgs::new().timespec(&ts);
+        loop {
+            match self.ring.submitter().submit_with_args(1, &args) {
+                Ok(_) => return Ok(false),
+                Err(e) if e.raw_os_error() == Some(libc::ETIME) => return Ok(true),
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     fn handle_dispatch_udp(&mut self, d: &mut impl Dispatch, datagram: &[u8], now_ms: u64) {
         match d.on_udp(datagram, now_ms) {
             DispatchOut::None => {}
@@ -682,8 +714,12 @@ impl UringDriver {
             }
             if spins >= budget {
                 // Nothing ready (spin budget exhausted, or busy-poll off) — block
-                // until a completion arrives; no CPU burn while idle.
-                self.submit_and_wait_1()?;
+                // until a completion arrives or the tick timeout elapses. On
+                // timeout, stop draining and fall through so `tick` fires on
+                // cadence even with no traffic.
+                if self.wait_for_completions()? {
+                    break;
+                }
             } else {
                 spins += 1;
                 std::hint::spin_loop();
@@ -952,6 +988,27 @@ mod tests {
         }
     }
 
+    /// Counts `tick` invocations; produces no I/O. Used to prove the idle wait
+    /// still fires `tick` on cadence.
+    struct TickCountDispatch {
+        ticks: usize,
+    }
+
+    impl Dispatch for TickCountDispatch {
+        fn on_udp(&mut self, _dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
+            DispatchOut::None
+        }
+
+        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[Vec<u8>] {
+            &[]
+        }
+
+        fn tick(&mut self, _now_ms: u64) -> Option<&[u8]> {
+            self.ticks += 1;
+            None
+        }
+    }
+
     struct GsoDispatch {
         scratch: Vec<Vec<u8>>,
     }
@@ -1111,6 +1168,53 @@ mod tests {
         }
         drop(driver);
         std::thread::sleep(Duration::from_millis(200));
+    }
+
+    #[test]
+    fn uring_idle_poll_fires_tick_via_timeout() {
+        let _guard = URING_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // An idle driver: no UDP peer sends anything, nothing is written to the
+        // TUN pipe, so no completion ever arrives.
+        let sock = UdpSocket::bind("127.0.0.1:0").expect("bind idle udp");
+        let (tun_rd, tun_wr) = make_pipe().expect("make tun placeholder pipe");
+        let mut driver = match UringDriver::new(sock.as_raw_fd(), tun_rd) {
+            Ok(driver) => driver,
+            Err(_) => {
+                eprintln!("SKIP uring_idle_poll_fires_tick_via_timeout: io_uring unavailable");
+                // SAFETY: these fds came from `pipe2` and are still open here.
+                unsafe {
+                    libc::close(tun_rd);
+                    libc::close(tun_wr);
+                }
+                return;
+            }
+        };
+
+        let mut dispatch = TickCountDispatch { ticks: 0 };
+        // With no traffic, `poll_once` must still return via the tick timeout and
+        // fire `tick` — before this fix it blocked forever, starving `tick`.
+        let started = std::time::Instant::now();
+        driver
+            .poll_once(&mut dispatch)
+            .expect("idle poll_once returns via the tick timeout");
+        assert!(
+            dispatch.ticks >= 1,
+            "tick must fire on the idle-timeout path (fired {})",
+            dispatch.ticks
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "idle poll_once must return promptly via timeout, not block"
+        );
+
+        drop(driver);
+        // SAFETY: these fds came from `pipe2` and are still open here.
+        unsafe {
+            libc::close(tun_rd);
+            libc::close(tun_wr);
+        }
     }
 
     #[test]
