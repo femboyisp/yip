@@ -411,3 +411,27 @@ metric) with throughput holding inside single-stream noise. The small single-cor
 ceiling is the accepted trade — multi-queue throughput sharding is the deferred
 scaling lever. All three netns tests (ping, ping-under-loss, arq-integrity) pass
 unchanged on the single-threaded daemon (same wire format).
+
+---
+
+## io_uring Phase B — driver A/B (default `UringDriver` vs `YIP_FORCE_POLL=1`)
+
+Task-8 measured both startup paths on the same host/branch:
+
+- **RTT command:** a dedicated netns harness pinging `-c 100 -i 0.02`
+  across the yip tunnel (`target/release/yipd`).
+- **Clean-link throughput command:** `run-scp-compare.sh` at **0% loss**
+  (`20 MB` payload, `delay 5ms` symmetric netem; throughput is MB/s).
+
+| metric | default (io_uring path) | `YIP_FORCE_POLL=1` (poll path) |
+|--------|---------------------------|--------------------------------|
+| tunnel RTT avg (ms) | 0.456 | 0.349 |
+| clean-link throughput (MB/s) | 16.69 | 24.18 |
+
+Notes:
+
+- These are fresh Task-8 measurements on `feat/uring-phase-b`; CI now gates
+  both drivers in `netns-tunnel-test` to keep parity honest as the uring path
+  is tuned further.
+- RTT/throughput at this scale are noisy run-to-run; compare trends with the
+  surrounding phase tables and re-run the same commands for stricter medians.

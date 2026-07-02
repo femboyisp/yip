@@ -6,6 +6,11 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- io_uring Phase B: yipd now defaults to a single-threaded `UringDriver` data
+  loop (one ring over UDP+TUN) with startup fallback to `PollDriver`, and
+  `YIP_FORCE_POLL=1` to force fallback for parity testing. netns CI now runs
+  all tunnel tests under both drivers, and the bench docs record measured RTT
+  + clean-link throughput deltas for uring vs poll.
 - Single-threaded data loop (Phase A): replaced the two-thread `Arc<Mutex>`
   data plane with a mutex-free `DataPlane` driven by an `epoll` `PollDriver`
   (io_uring driver to follow). Removes per-packet lock/handoff overhead — tunnel
