@@ -16,7 +16,7 @@ regressions on the netns gate.
 | Issue | Title | Wave | Agent model |
 |-------|-------|------|-------------|
 | #7 | io_uring Phase B: `UringDriver` | 1 | Single agent, sequential (plan tasks 5–8) |
-| #11a | Test/coverage gaps | 1 | Single agent, parallel to #7 |
+| #11a | Test/coverage polish | Optional | Not gate-blocking (see coverage note); may run parallel to #7 |
 | #8 | L2 (TAP) + MAC learning | 2 | Brainstorm → spec → plan, then impl |
 | #9 | Session rekey + PQ-hybrid | 2 | Brainstorm → spec; classical rekey first |
 | #11b | Correctness follow-ups | 2 | Parallel after #7 merges |
@@ -30,12 +30,25 @@ regressions on the netns gate.
 - **Wave 1:** `UringDriver` ships (tasks 5–8 of
   `docs/superpowers/plans/2026-06-30-io-uring-busy-poll.md`); all three netns
   tests pass on both `UringDriver` and `PollDriver` (`YIP_FORCE_POLL=1`); bench
-  RTT/throughput deltas recorded; `yip-io/poll.rs` and `bin/yipd/dataplane.rs`
-  reach ≥90% line coverage.
+  RTT/throughput deltas recorded; **the workspace-aggregate coverage gate stays
+  green** — `cargo llvm-cov --workspace --exclude yip-device --exclude yipd
+  --fail-under-lines 90` (the actual CI gate). Because `uring.rs` is in `yip-io`
+  (included) and is hard-to-test `unsafe`, Wave 1 must add enough `uring.rs`
+  loopback/helper tests (or rely on its skip-on-Err keeping counted lines low) to
+  keep the aggregate ≥90%. This — not per-module targets — is the coverage bar.
 - **Wave 2:** Approved specs for #8 and #9; #11b correctness items scoped and
   tasked.
 - **No wire-format change** across Wave 1 (netns suite is the gate throughout).
 - **`unsafe` only in `yip-io`**; yipd stays `#![forbid(unsafe_code)]`.
+
+> **Coverage-gate reality (drives the #11a scoping below):** the CI gate is a
+> **workspace *aggregate*** line-coverage check at 90%, **excluding `yipd` and
+> `yip-device`**. So (a) `dataplane.rs` lives in `yipd` and is **not gated at all**;
+> (b) `poll.rs` (in `yip-io`) contributes to the aggregate but is **not** gated
+> per-module — it currently sits well below 90% and CI is green because the
+> aggregate holds. Raising `poll.rs`/`dataplane.rs` is therefore **optional polish**,
+> not a Wave-1 requirement. The only coverage work Wave 1 *must* do is keep the
+> aggregate ≥90% once the gated, hard-to-test `uring.rs` lands (folded into #7).
 
 ## Dependency graph
 
@@ -46,7 +59,12 @@ regressions on the netns gate.
 
 #9 Rekey ──► #11c conn_tag rotation / anti-DPI
 
-#11a Tests ── parallel with #7 (no file overlap on uring.rs)
+#11a Tests ── optional, may run parallel with #7 (separate branch)
+              CAVEAT: the `Dispatch` trait lives in poll.rs (Agent 2's file) and
+              is consumed by uring.rs (Agent 1). FREEZE the Dispatch trait
+              signature; Agent 2 is additive-tests + private-helper extraction
+              ONLY (no trait/`run_poll`-signature change) so it can't ripple
+              into the merged uring.rs at rebase.
 
 #11b Correctness ── after #7 merges (may touch dataplane)
 
@@ -82,46 +100,58 @@ regressions on the netns gate.
 - No wire change; byte-identical framing.
 - Buffer-lifetime `unsafe` confined to `uring.rs` with `// SAFETY:` per block.
 - Single-core by design (throughput scaling is #10, out of scope).
+- **Freeze the `Dispatch` trait** (defined in `poll.rs`) before Agent 2 runs in
+  parallel — `uring.rs` builds against it.
 
 **Gate:** `cargo test --workspace`, clippy `-D warnings`, six netns runs green,
-bench deltas committed.
+bench deltas committed, **and the aggregate coverage gate stays ≥90%** (`cargo
+llvm-cov --workspace --exclude yip-device --exclude yipd --fail-under-lines 90`) —
+`uring.rs` is gated (`yip-io`), so add loopback/helper tests for it (skip-on-Err
+under memlock) sufficient to hold the aggregate. This is #7's job, not #11a's.
 
-### Agent 2: #11a test/coverage (parallel)
+### Agent 2: #11a test/coverage — OPTIONAL polish (not gate-blocking)
 
-- **Branch:** `feat/coverage-11a`
-- **Files:** `crates/yip-io/src/poll.rs`, `bin/yipd/src/dataplane.rs` (and helpers
-  only as needed for coverage)
-- **No behavior changes** — tests only unless a trivial refactor improves
-  testability without semantic change.
+Per the coverage-gate reality note above, this is **not a Wave-1 requirement**:
+`dataplane.rs` (in `yipd`) is excluded from the gate entirely, and `poll.rs` is
+only an aggregate contributor, not a per-module gate. Run this only if higher
+module coverage is independently wanted; it does **not** block #7 or the CI gate.
 
-**Targets (baseline 2026-07-01):**
+- **Branch:** `feat/coverage-11a` (separate branch; only merge-time conflicts).
+- **Files:** `crates/yip-io/src/poll.rs` (aggregate contributor) and
+  `bin/yipd/src/dataplane.rs` (ungated — polish only).
+- **Hard constraint:** tests + private-helper extraction ONLY. Do **not** change
+  the `Dispatch` trait or `run_poll`'s public signature — `uring.rs` (#7) builds
+  against them, and a change would ripple into the merged `uring.rs` at rebase.
 
-| Module | Current line coverage | Target |
-|--------|----------------------|--------|
-| `yip-io/poll.rs` | 48% | ≥90% |
-| `yipd/dataplane.rs` | 76% | ≥90% |
-| `yip-io/lib.rs` | 87% | ≥90% if touched |
+**Baselines (⚠️ unverified — measure with `cargo llvm-cov` before targeting):**
+approx `poll.rs` ~48%, `dataplane.rs` ~76%, `yip-io/lib.rs` ~87%. These are the
+spec author's estimates; confirm before acting, and remember only the *workspace
+aggregate* (excl. `yipd`/`yip-device`) is gated.
 
 **Approach:**
 
 - Factor testable helpers from `run_poll` where the epoll loop is hard to drive
-  end-to-end (readable-handling, send-output paths).
+  end-to-end (readable-handling, send-output paths) — additive, no signature change.
 - Extend `dataplane` unit tests for branches not hit by existing round-trip /
-  control / forged-packet tests.
-- `tunnel.rs` and `main.rs` remain integration-covered (excluded from hermetic
-  90% gate by design).
+  control / forged-packet tests (polish; `yipd` is ungated).
 
-**Gate:** `cargo llvm-cov` ≥90% on touched modules; `cargo test --workspace` green.
+**Gate:** `cargo test --workspace` green; the workspace aggregate coverage stays
+≥90% (it already is). No per-module gate applies.
 
 ### Wave 1 merge order
 
-1. Merge **#7** first (functional milestone).
-2. Rebase and merge **#11a** (tests only; resolve any trivial conflicts in
-   shared imports only).
+1. Merge **#7** first (the functional milestone; carries the `uring.rs` coverage
+   needed to hold the aggregate).
+2. If run, rebase and merge **#11a** onto #7 (tests only; trivial conflicts in
+   shared imports / the frozen `Dispatch` trait only).
 
 ## Wave 2 — after #7 merges
 
-Three parallel tracks:
+Three parallel tracks, but note the split: #8 and #9 here are **design only**
+(brainstorm → spec; no code), which is safe to run in parallel; their
+**implementations run sequentially in Wave 3** (#8 then #9) because both touch
+`tunnel.rs`/`DataPlane`. #11b is the one track that writes code in Wave 2 — it may
+run alongside the #8/#9 *design* work since those aren't editing files yet.
 
 ### Agent 3: #8 L2/TAP
 
@@ -181,16 +211,18 @@ Does not block Wave 1.
 ## Subagent dispatch template
 
 ```text
-Agent 1 (generalPurpose):
+Agent 1 (general-purpose):
   Branch: feat/uring-phase-b
   Read: docs/superpowers/plans/2026-06-30-io-uring-busy-poll.md (tasks 5–8)
   Skill: subagent-driven-development
-  Gate: 6 netns runs, bench README, CHANGELOG
+  Gate: 6 netns runs, bench README, CHANGELOG, AND workspace-aggregate
+        llvm-cov ≥90% (uring.rs is gated — add its loopback/helper tests)
 
-Agent 2 (generalPurpose):
+Agent 2 (general-purpose) — OPTIONAL, not gate-blocking:
   Branch: feat/coverage-11a
-  Targets: poll.rs, dataplane.rs
-  Gate: llvm-cov ≥90% on touched modules
+  Targets: poll.rs (aggregate contributor), dataplane.rs (ungated polish)
+  Constraint: additive tests only; DO NOT touch the Dispatch trait / run_poll sig
+  Gate: cargo test green; aggregate coverage stays ≥90% (already does)
 ```
 
 Do **not** dispatch Agents 3–5 until Agent 1 merges (avoids `tunnel.rs` /
@@ -201,7 +233,8 @@ Do **not** dispatch Agents 3–5 until Agent 1 merges (avoids `tunnel.rs` /
 | Risk | Mitigation |
 |------|------------|
 | `UringDriver` buffer-lifetime bugs | Phase A (`PollDriver`) already ships; `YIP_FORCE_POLL=1` fallback |
-| Merge conflict #7 vs #11a | Separate branches; merge #7 first |
+| Merge conflict #7 vs #11a | Separate branches; merge #7 first; **freeze the `Dispatch` trait** so Agent 2's poll.rs work can't ripple into the merged uring.rs |
+| `uring.rs` drags workspace-aggregate coverage < 90% (gated crate, hard-to-test unsafe) | #7 adds uring.rs loopback/helper tests (skip-on-Err under memlock) to hold the aggregate — this is #7's gate, not #11a's |
 | #8/#9 both touch `DataPlane` | Spec in Wave 2, implement sequentially (#8 then #9) |
 | Coverage drive changes behavior | Agent 2 constrained to tests + testability refactors only |
 
@@ -214,5 +247,8 @@ Do **not** dispatch Agents 3–5 until Agent 1 merges (avoids `tunnel.rs` /
 
 ## Next step after this spec
 
-Invoke **writing-plans** to produce a Wave 1 implementation plan (Agent 1 + Agent 2
-task breakdown with checkboxes), then dispatch subagents.
+Wave 1's implementation plan **already exists** — `docs/superpowers/plans/2026-06-30-io-uring-busy-poll.md`
+tasks 5–8 are #7. So the next step is simply to **dispatch Agent 1** via
+`subagent-driven-development` on those tasks (adding the `uring.rs` coverage tests
+to hold the aggregate gate). Agent 2 (#11a) is optional and needs no plan — it's
+additive tests only. No new Wave-1 plan doc is required.
