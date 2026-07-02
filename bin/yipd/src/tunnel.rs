@@ -38,7 +38,7 @@ use crate::handshake;
 // ── public entry point ────────────────────────────────────────────────────────
 
 /// Run the tunnel: bind, handshake, create TUN, then loop forever via the
-/// single-threaded epoll `PollDriver`.
+/// selected I/O driver.
 ///
 /// Only returns on a fatal I/O error.
 pub fn run(config: Config) -> io::Result<()> {
@@ -86,8 +86,14 @@ pub fn run(config: Config) -> io::Result<()> {
     // ── build DataPlane ───────────────────────────────────────────────────────
     let mut dataplane = DataPlane::new(established, conn_tag);
 
-    // ── run the epoll event loop ──────────────────────────────────────────────
+    // ── run the selected event loop ───────────────────────────────────────────
     // `tun` and `sock` are kept alive on the stack here, so `tun_fd` and
-    // `udp_fd` remain valid for the duration of `run_poll`.
-    yip_io::poll::run_poll(udp_fd, tun_fd, &mut dataplane)
+    // `udp_fd` remain valid for the duration of the selected driver loop.
+    if std::env::var("YIP_FORCE_POLL").is_ok() {
+        yip_io::poll::run_poll(udp_fd, tun_fd, &mut dataplane)
+    } else if yip_io::uring::uring_available() {
+        yip_io::uring::run_uring(udp_fd, tun_fd, &mut dataplane)
+    } else {
+        yip_io::poll::run_poll(udp_fd, tun_fd, &mut dataplane)
+    }
 }

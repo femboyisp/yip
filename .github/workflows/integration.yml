@@ -125,12 +125,21 @@ jobs:
           cargo build --release -p yipd
           echo "running netns tunnel tests under sudo: $BIN"
           # --exact so ping_across_yipd_tunnel does not also match _under_loss.
-          for t in ping_across_yipd_tunnel ping_across_yipd_tunnel_under_loss arq_recovers_bulk_loss; do
-            sudo -E "$BIN" "$t" --exact --nocapture --test-threads=1 2>&1 | tee "/tmp/netns-$t.log"
-            # Honesty guard: these tests must run for real, not skip for non-root.
-            # (A tool-absent SKIP from the harness itself, exit 0, is acceptable.)
-            if grep -q "SKIP $t: needs root" "/tmp/netns-$t.log"; then
-              echo "::error::netns test $t skipped — runner is not root"
-              exit 1
-            fi
+          for mode in uring poll; do
+            for t in ping_across_yipd_tunnel ping_across_yipd_tunnel_under_loss arq_recovers_bulk_loss; do
+              LOG="/tmp/netns-$mode-$t.log"
+              if [ "$mode" = "poll" ]; then
+                echo "running $t with PollDriver fallback (YIP_FORCE_POLL=1)"
+                sudo -E env YIP_FORCE_POLL=1 "$BIN" "$t" --exact --nocapture --test-threads=1 2>&1 | tee "$LOG"
+              else
+                echo "running $t with default driver selection"
+                sudo -E "$BIN" "$t" --exact --nocapture --test-threads=1 2>&1 | tee "$LOG"
+              fi
+              # Honesty guard: these tests must run for real, not skip for non-root.
+              # (A tool-absent SKIP from the harness itself, exit 0, is acceptable.)
+              if grep -q "SKIP $t: needs root" "$LOG"; then
+                echo "::error::netns test $t ($mode) skipped — runner is not root"
+                exit 1
+              fi
+            done
           done

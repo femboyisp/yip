@@ -3,6 +3,7 @@
 //! contain `unsafe`; every `unsafe` block must carry a `// SAFETY:` comment.
 
 pub mod poll;
+pub mod uring;
 
 /// Maximum number of datagrams in a single batched send/recv call.
 pub const MAX_DATAGRAM_BATCH: usize = 64;

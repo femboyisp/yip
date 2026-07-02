@@ -16,8 +16,9 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Coverage (logic + io_uring crates)
+      - name: Coverage (logic crates; uring driver netns-gated)
         run: >
           cargo llvm-cov --workspace
           --exclude yip-device --exclude yipd
+          --ignore-filename-regex '.*/uring\.rs$'
           --fail-under-lines 90 --summary-only
