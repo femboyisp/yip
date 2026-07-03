@@ -10,17 +10,19 @@ All notable changes to this project are documented here, following
   Ethernet (L2) tunnel interfaces; `device_kind=tun` remains the default for
   IP (L3) mode.
 - io_uring Phase B driver (`UringDriver`): a single-ring (UDP+TUN) io_uring data
-  loop, available **opt-in** via `YIP_USE_URING=1`. The **default is the epoll
-  `PollDriver`**: on measurement the uring path currently *regresses* tunnel RTT
-  (~0.63 vs ~0.48 ms, the north-star metric) with no throughput upside — its GSO
-  batching is disabled by a `MAX_GSO_SEGMENTS_PER_SEND = 1` cap and per-packet
-  heap copies offset the provided-buffer design — so io_uring stays opt-in until
-  it beats epoll (SQPOLL / working GSO batching, re-benchmarked). netns CI runs
-  all tunnel tests under **both** drivers. The opt-in path was hardened to match
-  `PollDriver`'s robustness contract: `EINTR` on the blocking ring wait is now
-  retried (a signal no longer tears down the tunnel), and non-GSO send-completion
-  errors drop on transient buffer pressure but propagate genuinely fatal errors
-  (TUN writes always drop) instead of being swallowed forever.
+  loop, available **opt-in** via `YIP_USE_URING=1` (the **default is the epoll
+  `PollDriver`**). netns CI runs all tunnel tests under **both** drivers. The
+  opt-in path was hardened to match `PollDriver`'s robustness contract: `EINTR`
+  on the blocking ring wait is retried (a signal no longer tears down the tunnel),
+  and non-GSO send-completion errors drop on transient buffer pressure but
+  propagate genuinely fatal errors (TUN writes always drop) instead of being
+  swallowed forever. (Latency tuning — where io_uring goes from regressing to
+  *beating* epoll via adaptive busy-poll — is in the "io_uring driver RTT work"
+  entry under Changed; GSO throughput batching remains tracked in issue #17.)
+- `docs/configuration.md`: a single reference for everything `yipd` reads at
+  startup — config-file keys (`device_kind`, keys, endpoints…), the
+  `YIP_USE_URING` / `YIP_URING_BUSYPOLL` env knobs, and CLI flags — linked from
+  the README.
 - Single-threaded data loop (Phase A): replaced the two-thread `Arc<Mutex>`
   data plane with a mutex-free `DataPlane` driven by an `epoll` `PollDriver`
   (io_uring driver to follow). Removes per-packet lock/handoff overhead — tunnel
