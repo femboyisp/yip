@@ -54,6 +54,13 @@ All notable changes to this project are documented here, following
   `EXT_ARG`, kernel 5.11+), so `Dispatch::tick` fires on cadence even on a fully
   idle tunnel — parity with poll.rs's `epoll_wait` timeout, fixing a latent gap
   where an idle uring tunnel could starve rekey/feedback timers.
+- io_uring cleanup: the `UringDriver` now exposes a `dropped_sends` counter (folded
+  into the send-drop logs) so slot-exhaustion drops are observable in aggregate,
+  and drops the dead `udp_armed`/`tun_armed` fields. The two provided-buffer/send-
+  slot reuse unit tests were made robust to bounded, load-dependent datagram loss
+  (they assert pool *reuse* — round-tripping more than the fixed pool holds — plus
+  the leak checks, rather than 100% round-trip), so the local suite is fast and
+  reliable again.
 - Coverage CI: exclude `yip-io/src/uring.rs` from the llvm-cov denominator (honest
   exclusion — the `UringDriver` syscall loop is netns/integration-gated, same
   pattern as `yip-device` privileged paths).
