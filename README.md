@@ -15,8 +15,8 @@ and anonymity are opt-in dials layered on top, not always-on costs.
 ## Goals
 
 - **Insane low latency** on direct P2P paths — the north star. The latency lever is the I/O model
-  — a single-threaded event loop over UDP + TUN/TAP (a lean `epoll` driver today; a single-ring
-  `io_uring` driver and AF_XDP zero-copy as they prove out on latency) — not the crypto.
+  — a single-threaded event loop over UDP + TUN/TAP — not the crypto. A lean `epoll` driver is the
+  default; a single-ring `io_uring` driver is opt-in (see [I/O driver](#io-driver) below).
 - **L2 (TAP) and L3 (TUN)** data planes — Ethernet bridging *and* IP tunneling.
 - **Adaptive RaptorQ FEC** — rateless forward error correction that recovers packet loss with
   **zero extra round-trips**, tuned per-flow so realtime traffic pays no latency tax and lossy/bulk
@@ -55,6 +55,26 @@ clean interface:
 
 Full design: [`docs/superpowers/specs/2026-06-28-data-plane-fec-transport-design.md`](docs/superpowers/specs/2026-06-28-data-plane-fec-transport-design.md).
 Architecture summary: [`docs/architecture.md`](docs/architecture.md).
+
+### I/O driver
+
+The data loop can run on either of two `yip-io` drivers. After benchmarking on bare metal and cloud
+VMs across kernels, the conclusion is:
+
+- **The epoll `PollDriver` is the default** — it is the faster, simpler, safe-Rust path and works
+  everywhere. On measurement it has *lower* tunnel RTT than the io_uring driver's blocking wait, with
+  identical (FEC/CPU-bound) throughput.
+- **The io_uring `UringDriver` is opt-in** (`YIP_USE_URING=1`) and is the workspace's only `unsafe`.
+  It carries an optional **adaptive busy-poll** mode (`YIP_URING_BUSYPOLL=1`) that spins the
+  completion queue to cut RTT **below** epoll — but only on **bare metal with a dedicated core per
+  peer** and a **recent kernel**. On shared-vCPU cloud instances the win disappears (hypervisor
+  jitter, core oversubscription), and on Debian 13 stable's kernel 6.12 io_uring's multishot recv is
+  rejected outright (issue #25); it now **falls back to the `PollDriver`** at runtime instead of
+  crashing. So io_uring is a **"burn a core for latency on bare metal"** knob, not a general default.
+
+Bottom line: use the default (epoll) everywhere; reach for `YIP_USE_URING=1 YIP_URING_BUSYPOLL=1`
+only on a dedicated-core, recent-kernel host where sub-millisecond RTT is worth a spinning core.
+Env knobs are documented in [`docs/configuration.md`](docs/configuration.md).
 
 ## Roadmap
 
