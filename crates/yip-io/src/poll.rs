@@ -23,12 +23,35 @@ pub trait Dispatch {
     fn on_udp(&mut self, dg: &[u8], now_ms: u64) -> DispatchOut<'_>;
 
     /// Called when a TUN frame arrives.  Returns egress datagrams to send on
-    /// the UDP socket (may be empty).
-    fn on_tun(&mut self, inner: &[u8], now_ms: u64) -> &[Vec<u8>];
+    /// the UDP socket (may be empty), each tagged with its FEC fate group so a
+    /// GSO-capable driver can coalesce safely (see [`EgressDatagram`]).
+    fn on_tun(&mut self, inner: &[u8], now_ms: u64) -> &[EgressDatagram];
 
     /// Called at least every 10 ms.  Returns `Some(pkt)` if a feedback
     /// control packet should be sent on the UDP socket.
     fn tick(&mut self, now_ms: u64) -> Option<&[u8]>;
+}
+
+/// One egress datagram plus the FEC "fate group" it belongs to.
+///
+/// GSO coalesces same-length UDP datagrams into one `UDP_SEGMENT` super-skb;
+/// under loss the whole skb is dropped/delayed as a unit (segmentation is
+/// deferred to the receiver). Two datagrams that are symbols of the same
+/// RaptorQ object must never share a skb — losing them together can defeat FEC
+/// recovery for that object. `fate` is the RaptorQ object id (source symbols and
+/// this object's repair symbols share it; a different object gets a different
+/// value). A GSO-capable driver must guarantee at most one datagram per distinct
+/// `fate` in any single coalesced send. Non-GSO drivers ignore `fate`.
+#[derive(Debug, Clone)]
+pub struct EgressDatagram {
+    pub fate: u16,
+    pub bytes: Vec<u8>,
+}
+
+impl AsRef<[u8]> for EgressDatagram {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 /// What [`run_poll`] must do after a call to [`Dispatch::on_udp`].
@@ -149,9 +172,9 @@ fn drain_tun(tun_fd: RawFd, udp_fd: RawFd, d: &mut impl Dispatch, now_ms: u64) -
         let inner = &buf[..usize::try_from(n).expect("non-negative read return fits usize")];
         // Clone the packet slices so we don't hold an immutable borrow on `d`
         // while calling the mutable send_to_udp.
-        let pkts_owned: Vec<Vec<u8>> = d.on_tun(inner, now_ms).to_vec();
+        let pkts_owned: Vec<EgressDatagram> = d.on_tun(inner, now_ms).to_vec();
         for pkt in &pkts_owned {
-            send_to_udp(udp_fd, pkt)?;
+            send_to_udp(udp_fd, &pkt.bytes)?;
         }
     }
     Ok(())
@@ -341,7 +364,7 @@ mod tests {
             DispatchOut::None
         }
 
-        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[Vec<u8>] {
+        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[EgressDatagram] {
             &[]
         }
 
@@ -441,7 +464,7 @@ mod tests {
             DispatchOut::Udp(&self.scratch)
         }
 
-        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[Vec<u8>] {
+        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[EgressDatagram] {
             &[]
         }
 

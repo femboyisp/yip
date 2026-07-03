@@ -18,7 +18,8 @@ All notable changes to this project are documented here, following
   propagate genuinely fatal errors (TUN writes always drop) instead of being
   swallowed forever. (Latency tuning — where io_uring goes from regressing to
   *beating* epoll via adaptive busy-poll — is in the "io_uring driver RTT work"
-  entry under Changed; GSO throughput batching remains tracked in issue #17.)
+  entry under Changed; GSO throughput batching is the "io_uring GSO batching"
+  entry under Changed.)
 - `docs/configuration.md`: a single reference for everything `yipd` reads at
   startup — config-file keys (`device_kind`, keys, endpoints…), the
   `YIP_USE_URING` / `YIP_URING_BUSYPOLL` env knobs, and CLI flags — linked from
@@ -40,6 +41,18 @@ All notable changes to this project are documented here, following
   (`RetxBuffer`), plus `Transport::repair_object`.
 
 ### Changed
+- io_uring GSO batching (issue #17): the `UringDriver` egress path coalesces
+  TUN-egress datagrams into `UDP_SEGMENT` sends again (`MAX_GSO_SEGMENTS_PER_SEND`
+  1 → 32), made **FEC-safe** by tagging each egress datagram with its RaptorQ
+  object id ("fate") across the `Dispatch::on_tun` boundary (new `EgressDatagram`)
+  and coalescing **at most one datagram per fate per skb** — so a dropped GSO
+  super-skb never costs an object both its source symbol and its own repair
+  (which previously pinned the cap to 1). The invariant is enforced at a single
+  unit-tested choke point (`can_coalesce_gso_tagged`); `arq_recovers_bulk_loss`
+  stays ≥ 98% delivery under uring with GSO active. No wire-format or
+  `yip-transport` API change. (Single-stream throughput is unchanged on
+  measurement — that path is FEC/CPU-bound, not syscall-bound; GSO's win is on
+  syscall-bound bursts. The ARQ-retransmit egress path is left non-GSO for now.)
 - io_uring driver RTT work: the `UringDriver` hot path no longer allocates per
   packet — received datagrams dispatch from a reused scratch buffer, send buffers
   are recycled through a pool, and `poll_once` drains completions into a reused

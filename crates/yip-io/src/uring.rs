@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 
-use crate::poll::{Dispatch, DispatchOut};
+use crate::poll::{Dispatch, DispatchOut, EgressDatagram};
 use crate::{MAX_DATAGRAM_BATCH, MAX_WIRE_DATAGRAM};
 
 const RING_ENTRIES: u32 = 512;
@@ -32,7 +32,13 @@ const RING_BUFS_U16: u16 = 256;
 const MAX_GSO_DATAGRAMS: usize = MAX_DATAGRAM_BATCH;
 const MAX_GSO_PAYLOAD: usize = MAX_WIRE_DATAGRAM * MAX_GSO_DATAGRAMS;
 const MAX_UDP_PAYLOAD: usize = 65_507;
-const MAX_GSO_SEGMENTS_PER_SEND: usize = 1;
+/// Max datagrams coalesced into one `UDP_SEGMENT` send. No longer a correctness
+/// guard (that is `can_coalesce_gso_tagged`, which forbids same-FEC-object
+/// datagrams sharing a skb) — purely a throughput/blast-radius knob. See #17.
+const MAX_GSO_SEGMENTS_PER_SEND: usize = 32;
+/// Cap on egress datagrams staged for GSO within one `poll_once`, bounding the
+/// dedup pass in `flush_pending_gso`.
+const MAX_PENDING_GSO_DATAGRAMS: usize = 512;
 /// Completion-queue busy-poll budget: when busy-poll is enabled, how many times
 /// `poll_once` spins checking for a completion before falling back to a blocking
 /// wait. Spinning trades CPU for lower wakeup latency — measured to cut tunnel
@@ -158,6 +164,10 @@ pub struct UringDriver {
     /// false once a wait times out. Gates whether `busy_poll` actually spins, so
     /// an idle tunnel does not burn CPU.
     active: bool,
+    /// Egress datagrams staged this `poll_once`, tagged with their FEC fate
+    /// group. Flushed by `flush_pending_gso` before `poll_once` returns, so no
+    /// cross-call buffering / added latency.
+    pending_gso: Vec<EgressDatagram>,
     /// Whether the kernel supports `EXT_ARG` (5.11+), i.e. a timed blocking wait.
     /// When true, the idle wait is bounded so `tick` fires on cadence.
     ext_arg: bool,
@@ -206,6 +216,7 @@ impl UringDriver {
             ),
             busy_poll: std::env::var_os("YIP_URING_BUSYPOLL").is_some(),
             active: false,
+            pending_gso: Vec::with_capacity(MAX_PENDING_GSO_DATAGRAMS),
             ext_arg,
             gso_enabled: true,
             started: Instant::now(),
@@ -483,6 +494,89 @@ impl UringDriver {
         Ok(())
     }
 
+    /// Like `can_coalesce_gso` but also rejects any batch that contains two
+    /// datagrams of the same FEC fate group — the invariant that keeps a source
+    /// symbol and its own repair out of the same (fate-shared) GSO skb. This is
+    /// the single correctness choke point for GSO+FEC safety.
+    fn can_coalesce_gso_tagged(datagrams: &[EgressDatagram]) -> Option<u16> {
+        if datagrams.len() < 2 {
+            return None;
+        }
+        let first_len = datagrams.first()?.bytes.len();
+        if first_len == 0 {
+            return None;
+        }
+        let segment_size = u16::try_from(first_len).ok()?;
+        for (i, dg) in datagrams.iter().enumerate() {
+            if dg.bytes.len() != first_len {
+                return None;
+            }
+            if datagrams[..i].iter().any(|prior| prior.fate == dg.fate) {
+                return None;
+            }
+        }
+        Some(segment_size)
+    }
+
+    /// GSO-send a batch of fate-tagged datagrams. Only coalesces when
+    /// `can_coalesce_gso_tagged` proves every datagram is the same length *and*
+    /// a distinct fate group; otherwise (or on any GSO submit failure) falls back
+    /// to per-datagram sends.
+    fn queue_udp_batch_tagged(
+        &mut self,
+        datagrams: &[EgressDatagram],
+        allow_gso: bool,
+    ) -> io::Result<()> {
+        if datagrams.is_empty() {
+            return Ok(());
+        }
+        if allow_gso && self.gso_enabled {
+            if let Some(segment_size) = Self::can_coalesce_gso_tagged(datagrams) {
+                let max_chunk = Self::max_gso_datagrams_for_segment(segment_size);
+                for chunk in datagrams.chunks(max_chunk) {
+                    if self.queue_udp_gso(chunk, segment_size)? {
+                        continue;
+                    }
+                    eprintln!("uring: GSO submit failed, trying per-datagram sends");
+                    for dg in chunk {
+                        self.queue_udp_send(&dg.bytes)?;
+                    }
+                }
+                return Ok(());
+            }
+        }
+        for dg in datagrams {
+            self.queue_udp_send(&dg.bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Flush all datagrams staged this `poll_once` in fate-safe GSO batches.
+    /// Each pass takes at most one datagram per distinct fate group (arrival
+    /// order) — so a coalesced skb never carries two symbols of one FEC object —
+    /// and defers the rest to the next pass. Bounded by `MAX_PENDING_GSO_DATAGRAMS`.
+    fn flush_pending_gso(&mut self) {
+        while !self.pending_gso.is_empty() {
+            let mut chunk: Vec<EgressDatagram> = Vec::with_capacity(self.pending_gso.len());
+            let mut deferred: Vec<EgressDatagram> = Vec::with_capacity(self.pending_gso.len());
+            for dg in self.pending_gso.drain(..) {
+                if chunk.iter().any(|c| c.fate == dg.fate) {
+                    deferred.push(dg);
+                } else {
+                    chunk.push(dg);
+                }
+            }
+            self.pending_gso = deferred;
+            if let Err(e) = self.queue_udp_batch_tagged(&chunk, true) {
+                self.dropped_sends += 1;
+                eprintln!(
+                    "uring: drop udp send batch from tun: {e} (dropped_sends={})",
+                    self.dropped_sends
+                );
+            }
+        }
+    }
+
     fn max_gso_datagrams_for_segment(segment_size: u16) -> usize {
         let segment_len = usize::from(segment_size);
         if segment_len == 0 {
@@ -492,7 +586,11 @@ impl UringDriver {
         mtu_cap.clamp(1, MAX_GSO_SEGMENTS_PER_SEND.min(MAX_GSO_DATAGRAMS))
     }
 
-    fn queue_udp_gso(&mut self, datagrams: &[Vec<u8>], segment_size: u16) -> io::Result<bool> {
+    fn queue_udp_gso<T: AsRef<[u8]>>(
+        &mut self,
+        datagrams: &[T],
+        segment_size: u16,
+    ) -> io::Result<bool> {
         if datagrams.len() > MAX_GSO_DATAGRAMS {
             return Ok(false);
         }
@@ -507,7 +605,7 @@ impl UringDriver {
         coalesced.clear();
         coalesced.reserve(total_len);
         for datagram in datagrams {
-            coalesced.extend_from_slice(datagram);
+            coalesced.extend_from_slice(datagram.as_ref());
         }
         let slot_id = match self.alloc_in_flight_slot(coalesced, MAX_GSO_PAYLOAD) {
             Ok(slot_id) => slot_id,
@@ -709,13 +807,12 @@ impl UringDriver {
     }
 
     fn handle_dispatch_tun(&mut self, d: &mut impl Dispatch, frame: &[u8], now_ms: u64) {
-        let pkts_owned = d.on_tun(frame, now_ms).to_vec();
-        if let Err(e) = self.queue_udp_batch(&pkts_owned, true) {
-            self.dropped_sends += 1;
-            eprintln!(
-                "uring: drop udp send batch from tun: {e} (dropped_sends={})",
-                self.dropped_sends
-            );
+        // Stage this object's symbols; GSO batching across objects happens in
+        // `flush_pending_gso` at the end of `poll_once`. Flush early if the
+        // staging buffer fills mid-drain.
+        self.pending_gso.extend_from_slice(d.on_tun(frame, now_ms));
+        if self.pending_gso.len() >= MAX_PENDING_GSO_DATAGRAMS {
+            self.flush_pending_gso();
         }
     }
 
@@ -940,6 +1037,9 @@ impl UringDriver {
             self.arm_tun_read()?;
         }
 
+        // Flush TUN-egress datagrams staged this pass in fate-safe GSO batches.
+        self.flush_pending_gso();
+
         if let Some(pkt) = d.tick(now_ms) {
             if let Err(e) = self.queue_udp_send(pkt) {
                 eprintln!("uring: drop tick packet: {e}");
@@ -1014,7 +1114,7 @@ mod tests {
             DispatchOut::Udp(&self.scratch)
         }
 
-        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[Vec<u8>] {
+        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[EgressDatagram] {
             &[]
         }
 
@@ -1034,7 +1134,7 @@ mod tests {
             DispatchOut::None
         }
 
-        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[Vec<u8>] {
+        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[EgressDatagram] {
             &[]
         }
 
@@ -1044,8 +1144,11 @@ mod tests {
         }
     }
 
+    /// Returns 5 same-length datagrams all tagged with ONE fate group, i.e. the
+    /// symbols of a single FEC object (source + its repair). A GSO driver must
+    /// NEVER coalesce these — losing them together would defeat FEC.
     struct GsoDispatch {
-        scratch: Vec<Vec<u8>>,
+        scratch: Vec<EgressDatagram>,
     }
 
     impl GsoDispatch {
@@ -1061,12 +1164,15 @@ mod tests {
             DispatchOut::None
         }
 
-        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[Vec<u8>] {
+        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[EgressDatagram] {
             self.scratch.clear();
             for i in 0_u8..5_u8 {
                 let mut datagram = vec![b'a'; 64];
                 datagram[0] = b'0' + i;
-                self.scratch.push(datagram);
+                self.scratch.push(EgressDatagram {
+                    fate: 7,
+                    bytes: datagram,
+                });
             }
             &self.scratch
         }
@@ -1076,8 +1182,12 @@ mod tests {
         }
     }
 
+    /// Returns `datagram_count` same-length datagrams each tagged with a DISTINCT
+    /// fate group, i.e. one symbol from each of N different FEC objects. A GSO
+    /// driver may coalesce these (a dropped skb costs each object at most one
+    /// symbol, recoverable from its repair in a different skb).
     struct GsoLargeBatchDispatch {
-        scratch: Vec<Vec<u8>>,
+        scratch: Vec<EgressDatagram>,
         datagram_count: usize,
         datagram_size: usize,
     }
@@ -1097,12 +1207,15 @@ mod tests {
             DispatchOut::None
         }
 
-        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[Vec<u8>] {
+        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[EgressDatagram] {
             self.scratch.clear();
             for i in 0..self.datagram_count {
                 let mut datagram = vec![b'z'; self.datagram_size];
                 datagram[0] = u8::try_from(i % 251).expect("modulo bound fits u8");
-                self.scratch.push(datagram);
+                self.scratch.push(EgressDatagram {
+                    fate: u16::try_from(i).expect("datagram_count fits u16"),
+                    bytes: datagram,
+                });
             }
             &self.scratch
         }
@@ -1132,6 +1245,33 @@ mod tests {
             bytes.len(),
             "must write full trigger frame into pipe"
         );
+    }
+
+    fn dg(fate: u16, len: usize) -> EgressDatagram {
+        EgressDatagram {
+            fate,
+            bytes: vec![b'x'; len],
+        }
+    }
+
+    #[test]
+    fn can_coalesce_gso_tagged_rejects_duplicate_fate() {
+        // Two same-length datagrams of the SAME fate (an object's source + its
+        // repair) must never be judged coalesceable.
+        let dgs = [dg(3, 64), dg(3, 64)];
+        assert!(UringDriver::can_coalesce_gso_tagged(&dgs).is_none());
+    }
+
+    #[test]
+    fn can_coalesce_gso_tagged_accepts_distinct_fates_same_length() {
+        let dgs = [dg(3, 64), dg(4, 64), dg(5, 64)];
+        assert_eq!(UringDriver::can_coalesce_gso_tagged(&dgs), Some(64));
+    }
+
+    #[test]
+    fn can_coalesce_gso_tagged_rejects_mismatched_length() {
+        let dgs = [dg(3, 64), dg(4, 32)];
+        assert!(UringDriver::can_coalesce_gso_tagged(&dgs).is_none());
     }
 
     #[test]
@@ -1284,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn uring_gso_loopback_preserves_multi_datagram_payloads() {
+    fn uring_gso_same_object_datagrams_are_never_coalesced() {
         let _guard = URING_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1297,12 +1437,13 @@ mod tests {
         a.set_nonblocking(true).expect("set sender nonblocking");
 
         let (tun_rd, tun_wr) = make_pipe().expect("make tun placeholder pipe");
+        // GsoDispatch returns 5 datagrams all sharing ONE fate (one FEC object).
         let mut dispatch = GsoDispatch::new();
         let mut driver = match UringDriver::new(b.as_raw_fd(), tun_rd) {
             Ok(driver) => driver,
             Err(_) => {
                 eprintln!(
-                    "SKIP uring_gso_loopback_preserves_multi_datagram_payloads: \
+                    "SKIP uring_gso_same_object_datagrams_are_never_coalesced: \
                      io_uring ring or buffer registration unavailable (RLIMIT_MEMLOCK)"
                 );
                 // SAFETY: these fds came from `pipe2` and are still open here.
@@ -1315,20 +1456,10 @@ mod tests {
         };
 
         write_pipe_once(tun_wr, b"trigger-gso");
-        for _ in 0..1024 {
-            driver.poll_once(&mut dispatch).expect("poll_once succeeds");
-            if driver.gso_submission_count() > 0 {
-                break;
-            }
-        }
-        assert!(
-            driver.gso_submission_count() > 0,
-            "driver must submit at least one GSO send"
-        );
-
         let mut got = Vec::new();
         let mut recv_buf = [0_u8; MAX_WIRE_DATAGRAM];
         for _ in 0..1024 {
+            driver.poll_once(&mut dispatch).expect("poll_once succeeds");
             loop {
                 match a.recv(&mut recv_buf) {
                     Ok(n) => got.push(recv_buf[..n].to_vec()),
@@ -1339,8 +1470,16 @@ mod tests {
             if got.len() >= 5 {
                 break;
             }
-            driver.poll_once(&mut dispatch).expect("poll_once succeeds");
         }
+
+        // The invariant: a source symbol and its own repair must never share a
+        // GSO skb, so 5 same-fate datagrams must NEVER be coalesced — they go out
+        // as individual sends.
+        assert_eq!(
+            driver.gso_submission_count(),
+            0,
+            "same-object (same-fate) datagrams must never be GSO-coalesced"
+        );
 
         let expected: Vec<Vec<u8>> = (0_u8..5_u8)
             .map(|i| {
@@ -1349,9 +1488,9 @@ mod tests {
                 datagram
             })
             .collect();
-        assert_eq!(got.len(), expected.len(), "must receive all GSO datagrams");
+        assert_eq!(got.len(), expected.len(), "must receive all datagrams");
         for datagram in expected {
-            assert!(got.contains(&datagram), "missing datagram from GSO output");
+            assert!(got.contains(&datagram), "missing datagram from output");
         }
 
         // SAFETY: these fds came from `pipe2` and are still open here.
@@ -1377,7 +1516,8 @@ mod tests {
         a.set_nonblocking(true).expect("set sender nonblocking");
 
         let (tun_rd, tun_wr) = make_pipe().expect("make tun placeholder pipe");
-        let mut dispatch = GsoDispatch::new();
+        // Distinct fates so GSO is genuinely attempted (then forced to fail).
+        let mut dispatch = GsoLargeBatchDispatch::new(5, 64);
         let mut driver = match UringDriver::new(b.as_raw_fd(), tun_rd) {
             Ok(driver) => driver,
             Err(_) => {
@@ -1396,11 +1536,10 @@ mod tests {
         driver.set_force_gso_submit_failure(true);
 
         write_pipe_once(tun_wr, b"trigger-gso-fallback");
-        driver.poll_once(&mut dispatch).expect("poll_once succeeds");
-
         let mut got = Vec::new();
         let mut recv_buf = [0_u8; MAX_WIRE_DATAGRAM];
         for _ in 0..1024 {
+            driver.poll_once(&mut dispatch).expect("poll_once succeeds");
             loop {
                 match a.recv(&mut recv_buf) {
                     Ok(n) => got.push(recv_buf[..n].to_vec()),
@@ -1411,7 +1550,6 @@ mod tests {
             if got.len() >= 5 {
                 break;
             }
-            driver.poll_once(&mut dispatch).expect("poll_once succeeds");
         }
 
         assert_eq!(
@@ -1419,10 +1557,10 @@ mod tests {
             0,
             "forced submit failure should prevent GSO send submissions"
         );
-        let expected: Vec<Vec<u8>> = (0_u8..5_u8)
+        let expected: Vec<Vec<u8>> = (0..5_usize)
             .map(|i| {
-                let mut datagram = vec![b'a'; 64];
-                datagram[0] = b'0' + i;
+                let mut datagram = vec![b'z'; 64];
+                datagram[0] = u8::try_from(i % 251).expect("fits u8");
                 datagram
             })
             .collect();
@@ -1508,13 +1646,22 @@ mod tests {
             driver.poll_once(&mut dispatch).expect("poll_once succeeds");
         }
 
-        let expected_submissions =
-            datagram_count.div_ceil(UringDriver::max_gso_datagrams_for_segment(
-                u16::try_from(datagram_size).expect("test datagram size fits u16"),
-            ));
+        // Independently computed expected chunk count — deliberately does NOT
+        // call `max_gso_datagrams_for_segment` (the function under test). These
+        // literals mirror the module constants MAX_UDP_PAYLOAD (65507),
+        // MAX_GSO_SEGMENTS_PER_SEND (32), and MAX_GSO_DATAGRAMS (64); keep them in
+        // sync with the constants by hand if those change.
+        let mtu_cap = 65_507_usize / datagram_size;
+        let max_chunk = mtu_cap.min(32).min(64);
+        let expected_submissions = datagram_count.div_ceil(max_chunk);
+        assert!(expected_submissions >= 2, "test should exercise chunking");
         assert!(
             driver.gso_submission_count() >= expected_submissions,
-            "driver must chunk large GSO batches into multiple submissions"
+            "driver must chunk large GSO batches into multiple submissions \
+             ({} distinct-fate datagrams, expected >= {expected_submissions} sends, \
+             got {})",
+            datagram_count,
+            driver.gso_submission_count()
         );
         assert_eq!(
             got.len(),
