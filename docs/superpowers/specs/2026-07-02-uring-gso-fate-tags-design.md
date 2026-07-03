@@ -1,6 +1,6 @@
 # io_uring GSO batching without breaking FEC — fate-tagged egress design
 
-**Status:** proposed (design only — pending human sign-off before implementation)
+**Status:** implemented (signed off and landed; this file remains the design record)
 **Scope:** issue #17, sub-project #1 (core data plane), `UringDriver` GSO egress path
 **Predecessors:** issue #7 / `docs/superpowers/specs/2026-06-30-io-uring-busy-poll-design.md`
 (introduced `UringDriver` + GSO), the follow-up hardening pass that pinned

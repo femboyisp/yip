@@ -106,8 +106,9 @@ pub enum Outcome<'a> {
 /// All methods take `&mut self`; no locks are acquired.
 ///
 /// Framed egress datagrams are returned as a borrow of an internal reused
-/// `Vec<Vec<u8>>` scratch buffer — the caller must consume or clone them
-/// before calling any other `&mut self` method.
+/// `Vec<EgressDatagram>` scratch buffer (each tagged with its FEC fate group) —
+/// the caller must consume or clone them before calling any other `&mut self`
+/// method.
 pub struct DataPlane {
     session: yip_crypto::Session,
     transport: Transport,
@@ -127,8 +128,9 @@ pub struct DataPlane {
     arq_retx_count: u64,
 
     // ── reused per-call scratch buffers ──────────────────────────────────────
-    /// Reused per-call scratch: each element holds one framed egress datagram.
-    egress_scratch: Vec<Vec<u8>>,
+    /// Reused per-call scratch: each element holds one framed egress datagram
+    /// tagged with its FEC object id (fate group) for GSO-safe coalescing.
+    egress_scratch: Vec<yip_io::poll::EgressDatagram>,
     /// Reused scratch for the decoded inner packet (TUN write target).
     inner_scratch: Vec<u8>,
     /// Reused scratch for ARQ retransmit datagrams (control-path sends).
@@ -175,7 +177,7 @@ impl DataPlane {
     ///
     /// Returns an empty slice if the AEAD seal step fails (which is only
     /// possible after counter exhaustion — practically impossible in testing).
-    pub fn on_tun_packet(&mut self, inner: &[u8], now_ms: u64) -> &[Vec<u8>] {
+    pub fn on_tun_packet(&mut self, inner: &[u8], now_ms: u64) -> &[yip_io::poll::EgressDatagram] {
         self.egress_scratch.clear();
 
         if self.l2 {
@@ -212,15 +214,22 @@ impl DataPlane {
         // ── 4. Frame each symbol into the reused scratch ──────────────────────
         let n_syms = symbols.len();
         if self.egress_scratch.len() < n_syms {
-            self.egress_scratch.resize_with(n_syms, Vec::new);
+            self.egress_scratch
+                .resize_with(n_syms, || yip_io::poll::EgressDatagram {
+                    fate: 0,
+                    bytes: Vec::new(),
+                });
         }
 
         for (slot, sym) in self.egress_scratch[..n_syms].iter_mut().zip(symbols.iter()) {
             let frame = wire_glue::symbol_to_frame(self.conn_tag, sym, sealed.counter, class);
             let dg = self.codec.frame(&frame);
-            slot.clear();
-            slot.push(PacketType::Data as u8);
-            slot.extend_from_slice(&dg);
+            // `fate` = the RaptorQ object id: all symbols of one object (source +
+            // its repair) share it, so a GSO driver keeps them in separate skbs.
+            slot.fate = sym.object_id;
+            slot.bytes.clear();
+            slot.bytes.push(PacketType::Data as u8);
+            slot.bytes.extend_from_slice(&dg);
         }
 
         &self.egress_scratch[..n_syms]
@@ -538,7 +547,7 @@ impl yip_io::poll::Dispatch for DataPlane {
         }
     }
 
-    fn on_tun(&mut self, inner: &[u8], now_ms: u64) -> &[Vec<u8>] {
+    fn on_tun(&mut self, inner: &[u8], now_ms: u64) -> &[yip_io::poll::EgressDatagram] {
         self.on_tun_packet(inner, now_ms)
     }
 
@@ -608,7 +617,7 @@ mod tests {
     fn on_tun_packet_produces_decodable_egress() {
         let (mut a, mut b) = dataplane_pair(TunnelMode::L3Tun);
         let inner = vec![0x11u8; 200];
-        let dgrams: Vec<Vec<u8>> = a.on_tun_packet(&inner, 0).to_vec();
+        let dgrams = a.on_tun_packet(&inner, 0).to_vec();
 
         assert!(
             !dgrams.is_empty(),
@@ -616,19 +625,25 @@ mod tests {
         );
 
         for (i, dg) in dgrams.iter().enumerate() {
-            assert!(!dg.is_empty(), "datagram {i} must not be empty");
+            assert!(!dg.bytes.is_empty(), "datagram {i} must not be empty");
             assert_eq!(
-                dg[0],
+                dg.bytes[0],
                 PacketType::Data as u8,
                 "datagram {i} must begin with PacketType::Data"
             );
         }
+        // All symbols of one inner packet share one FEC object id (fate group).
+        let fate = dgrams[0].fate;
+        assert!(
+            dgrams.iter().all(|dg| dg.fate == fate),
+            "all symbols of one object must share one fate"
+        );
 
         // Full round-trip: feed all datagrams to B's ingress; at least one must
         // produce a TunWrite with the original inner bytes.
         let mut recovered: Option<Vec<u8>> = None;
         for dg in &dgrams {
-            if let Outcome::TunWrite(payload) = b.on_udp_datagram(dg, 1) {
+            if let Outcome::TunWrite(payload) = b.on_udp_datagram(&dg.bytes, 1) {
                 recovered = Some(payload.to_vec());
                 break;
             }
@@ -648,7 +663,7 @@ mod tests {
         let _d1 = a.on_tun_packet(&[1u8; 100], 0).to_vec(); // dropped
         let d2 = a.on_tun_packet(&[2u8; 100], 1).to_vec();
         for dg in d0.iter().chain(d2.iter()) {
-            let _ = b.on_udp_datagram(dg, 2);
+            let _ = b.on_udp_datagram(&dg.bytes, 2);
         }
         // After grace+feedback-interval, B's tick emits a Control feedback
         // with the missing counter.  now_ms=50 exceeds both the 5 ms grace
