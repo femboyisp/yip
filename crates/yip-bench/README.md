@@ -414,46 +414,59 @@ unchanged on the single-threaded daemon (same wire format).
 
 ---
 
-## io_uring Phase B — driver A/B (default `PollDriver` vs opt-in `YIP_USE_URING=1`)
+## io_uring driver A/B — RTT (default `PollDriver` vs opt-in io_uring)
 
-> **Honest finding: the io_uring driver currently *regresses* the north-star
-> metric (latency) and shows no throughput upside over the epoll `PollDriver`.**
-> It exists to lower latency; on this host it does the opposite — so the epoll
-> driver is the **default** and io_uring is opt-in via `YIP_USE_URING=1`.
+> **The io_uring driver was demoted from the default when its *blocking* wait
+> regressed RTT, then re-tuned: with adaptive busy-poll it now *beats* the epoll
+> `PollDriver`.** It remains opt-in pending clean-hardware numbers to justify
+> re-defaulting (see "What's needed to re-default" below).
 
 - **RTT command:** `crates/yip-bench/tests/run-driver-ab-rtt.sh` (ping
-  `-c 100 -i 0.02` across the tunnel, `target/release/yipd`).
-- **Clean-link throughput command:** `iperf3 -t 8` across the tunnel, no netem
-  (`inner MTU 1184`); each cell is the median of repeated runs.
+  `-c 100 -i 0.02` across the tunnel, `target/release/yipd`) — measures all three
+  modes: `poll`, `uring` (blocking), `uring-busypoll` (`YIP_URING_BUSYPOLL=1`).
 
-| metric | default (`PollDriver`) | opt-in `YIP_USE_URING=1` (io_uring) |
-|--------|--------------------------|-------------------------------------|
-| tunnel RTT avg (ms) — **lower is better** | **0.48 (0.473–0.514)** | 0.63 (0.605–0.643) |
-| clean-link iperf3 (Mbit/s) | ~305–319 | ~306–356 (tied) |
+| mode | env | tunnel RTT avg (ms) — **lower is better** |
+|------|-----|-------------------------------------------|
+| poll (default) | — | ~0.37 |
+| uring (blocking) | `YIP_USE_URING=1` | ~0.41 |
+| **uring + adaptive busy-poll** | `YIP_USE_URING=1 YIP_URING_BUSYPOLL=1` | **~0.30** |
 
-Re-measured 2026-07-02 (kernel 6.18, AMD Ryzen 5 7640U, release `yipd`),
-median of 3 RTT runs (`ping -c 100 -i 0.02`) and 2 iperf3 runs per driver.
+Measured 2026-07-02 (kernel 6.18, AMD Ryzen 5 7640U, release `yipd`) under
+`chrt -f 50` (SCHED_FIFO) — see the measurement note below.
 
-**Why:** for a single-flow ping-pong there is no batch to amortize, so io_uring's
-per-op cost (submit SQE + reap CQE + provided-buffer accounting + reprovide)
-lands *on top of* the same two syscalls epoll already pays — with more
-bookkeeping, not less. The classic io_uring latency win requires **SQPOLL** (a
-kernel-side submission-queue poller, so submit is syscall-free), which this
-driver does not use; batched submission only helps under many concurrent ops,
-which a latency-bound tunnel ping-pong does not present. Bulk throughput is a
-wash because both drivers are single-core, userspace, and FEC-bound — the I/O
-model is not the bottleneck there.
+**What the regression was, and the fix.** The single-flow ping-pong has nothing
+to batch, so io_uring's blocking `submit_and_wait` pays the **thread wakeup /
+scheduling latency** on every event — that, not allocation or batching, was the
+whole ~0.1 ms regression. Two changes closed it:
 
-**Resolution:** as of this finding the epoll `PollDriver` is the **default** and
-the `UringDriver` is opt-in (`YIP_USE_URING=1`). It should not become the default
-again until it either adopts SQPOLL (or another mechanism that actually beats
-epoll on single-packet latency) or demonstrates a throughput win under a workload
-that has one — today it is extra `unsafe` surface for no measured benefit. A
-known first step is the `MAX_GSO_SEGMENTS_PER_SEND = 1` cap in `uring.rs`, which
-currently makes GSO batching a no-op (one datagram per "batch") while still
-paying the cmsg cost; raising it must be re-validated against
-`arq_recovers_bulk_loss` (coalesced bursts were why it was capped). CI continues
-to gate **both** drivers in `netns-tunnel-test` so the opt-in path stays correct.
+- **Alloc-free hot path** (recv scratch reuse, send-buffer pool, reused CQE vec) —
+  matches poll.rs; RTT-neutral but removes malloc churn / cuts throughput-path CPU.
+- **Adaptive busy-poll** (`YIP_URING_BUSYPOLL=1`): spin the completion queue to
+  catch the imminent reply completion instead of blocking. Adaptive = spin only
+  while an exchange is active; an idle tunnel backs off to a blocking wait and
+  burns no CPU. This is the "burn CPU for latency" knob (yip's north star).
 
-- RTT/throughput at this scale are noisy run-to-run; re-run the same commands for
-  stricter medians. The direction (uring RTT > poll RTT) reproduced on every run.
+The blocking wait is also bounded by a 10 ms timeout (io_uring `EXT_ARG`) so
+`tick` fires on cadence on an idle tunnel — parity with poll.rs's `epoll_wait`.
+
+**Measurement note.** This dev box runs background load that preempts the yipd
+thread on CFS and adds run-to-run noise (busy-poll competes for the core). Running
+the harness under `sudo chrt -f 50 bash …/run-driver-ab-rtt.sh <yipd>` gives
+SCHED_FIFO priority and a clean, consistent read. On a genuinely quiet box the
+`chrt` wrapper is unnecessary.
+
+**What's needed to re-default io_uring** (all on a quiet box):
+
+1. RTT **p50 + p99** over many samples, uring+busypoll vs poll (the tail is the
+   "insane low latency" claim).
+2. **Idle yipd CPU ≈ 0%** with adaptive busy-poll and no traffic (confirm the backoff).
+3. **Active-traffic CPU** of busy-poll (it spins ~1 core per busy tunnel) — make
+   the tradeoff explicit before it is default.
+4. **Throughput uring ≥ poll** (iperf3 + scp-under-loss) — re-defaulting must not
+   regress bulk. (Earlier: iperf3 clean-link was a wash, ~305–356 Mbit/s both.)
+5. A **spin-budget sweep** for the minimum `CQ_SPIN_BUDGET` that still wins
+   (`2_000_000` is over-provisioned for the loaded box; the knee is lower on quiet
+   hardware, which cuts the active-CPU cost).
+
+CI gates **both** drivers in `netns-tunnel-test` so the opt-in path stays correct.
+Throughput-side GSO batching is a separate track (issue #17).
