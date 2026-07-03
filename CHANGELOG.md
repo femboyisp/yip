@@ -41,6 +41,15 @@ All notable changes to this project are documented here, following
   (`RetxBuffer`), plus `Transport::repair_object`.
 
 ### Changed
+- io_uring graceful fallback (issue #25): `run_uring` now falls back to the
+  `PollDriver` on any `UringDriver` failure (init or runtime) instead of killing
+  the tunnel. Found on a clean Debian 13 (kernel 6.12) box: io_uring's multishot
+  UDP recv is rejected there with `EINVAL` and was fatal ~4/6 runs; it works on
+  6.18+. Opting into io_uring (`YIP_USE_URING=1`) is now safe on any kernel — it
+  degrades to epoll where io_uring is buggy/unsupported. (The re-default question
+  is settled: **epoll `PollDriver` stays the default** — io_uring's busy-poll RTT
+  win needs bare metal + a dedicated core + a recent kernel, so it remains a
+  bare-metal opt-in. See the README "I/O driver" section.)
 - io_uring GSO batching (issue #17): the `UringDriver` egress path coalesces
   TUN-egress datagrams into `UDP_SEGMENT` sends again (`MAX_GSO_SEGMENTS_PER_SEND`
   1 → 32), made **FEC-safe** by tagging each egress datagram with its RaptorQ
