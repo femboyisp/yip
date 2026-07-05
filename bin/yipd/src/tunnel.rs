@@ -47,21 +47,29 @@ pub fn run(config: Config) -> io::Result<()> {
     let sock = UdpSocket::bind(config.listen)?;
 
     // ── handshake ─────────────────────────────────────────────────────────────
-    let (established, peer_addr) = if config.initiate {
-        let est = handshake::run_initiator(
+    let established = if config.initiate {
+        handshake::run_initiator(
             &sock,
             config.peers[0].endpoint,
             &config.local_private,
             &config.peers[0].public_key,
-        )?;
-        (est, config.peers[0].endpoint)
+        )?
     } else {
-        let (est, addr) = handshake::run_responder(&sock, &config.local_private)?;
-        (est, addr)
+        // The responder learns the initiator's source address from the first
+        // handshake datagram, but we deliberately discard it here: DataPlane
+        // is stamped with `config.peers[0].endpoint` regardless of role (both
+        // sides' static config agrees on each other's endpoint — see
+        // `bin/yipd/tests/run-netns-tunnel*.sh`). Routing by a *learned*
+        // address is the Task 5 `PeerManager`'s job, not this single-peer seam.
+        let (est, _addr) = handshake::run_responder(&sock, &config.local_private)?;
+        est
     };
 
-    // Connect so plain send/recv work without carrying the peer address.
-    sock.connect(peer_addr)?;
+    // The socket stays unconnected (the addressed socket seam, #33): drivers
+    // now use recvfrom/sendto (poll.rs) or recvmsg/sendmsg (uring.rs) and
+    // carry the peer address on every datagram instead of relying on a fixed
+    // connected peer. `config.peers[0].endpoint` is instead stamped on every
+    // egress datagram by `DataPlane`.
 
     // Raise kernel socket buffers to 4 MiB so bursts do not overflow the
     // OS receive ring.
@@ -90,7 +98,7 @@ pub fn run(config: Config) -> io::Result<()> {
     let udp_fd = sock.as_raw_fd();
 
     // ── build DataPlane ───────────────────────────────────────────────────────
-    let mut dataplane = DataPlane::new(established, conn_tag, mode);
+    let mut dataplane = DataPlane::new(established, conn_tag, mode, config.peers[0].endpoint);
 
     // ── run the selected event loop ───────────────────────────────────────────
     // `tun` and `sock` are kept alive on the stack here, so `tun_fd` and

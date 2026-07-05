@@ -2,6 +2,7 @@
 //! and auxiliary buffers.  Driven by the epoll event loop in `yip_io::poll`.
 
 use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 
 use yip_transport::{FlowClass, LossDetector, LossReport, RetxBuffer, Transport};
 use yip_wire::{Codec, WireCodec as _};
@@ -91,10 +92,10 @@ pub enum Outcome<'a> {
     /// Write this slice to the TUN device (data path: decoded inner packet).
     TunWrite(&'a [u8]),
     /// Send these datagrams to the peer (control path: ARQ retransmits).
-    Send(&'a [Vec<u8>]),
+    Send(&'a [yip_io::poll::EgressDatagram]),
     /// Write to TUN *and* send datagrams (currently unused, reserved for future).
     #[expect(dead_code, reason = "reserved for future combined TUN+UDP paths")]
-    TunWriteThenSend(&'a [u8], &'a [Vec<u8>]),
+    TunWriteThenSend(&'a [u8], &'a [yip_io::poll::EgressDatagram]),
 }
 
 // ── DataPlane ─────────────────────────────────────────────────────────────────
@@ -115,6 +116,12 @@ pub struct DataPlane {
     codec: Codec,
     conn_tag: u64,
     l2: bool,
+    /// This (single) peer's UDP endpoint, stamped as `dst` on every egress
+    /// datagram (data, ARQ retransmit, and feedback/tick alike). Multipeer
+    /// 2a seam (#33): `on_udp`'s `src` is ignored here — the `PeerManager`
+    /// arriving in Task 5 is what actually routes by address; until then,
+    /// one peer must behave exactly as it did when the socket was connected.
+    peer_addr: SocketAddr,
     sent_log: SentLog,
     retx: RetxBuffer,
     detector: LossDetector,
@@ -134,9 +141,10 @@ pub struct DataPlane {
     /// Reused scratch for the decoded inner packet (TUN write target).
     inner_scratch: Vec<u8>,
     /// Reused scratch for ARQ retransmit datagrams (control-path sends).
-    retx_scratch: Vec<Vec<u8>>,
-    /// Reused scratch for the sealed feedback Control packet.
-    feedback_scratch: Vec<u8>,
+    retx_scratch: Vec<yip_io::poll::EgressDatagram>,
+    /// Reused scratch holding exactly one entry: the sealed feedback Control
+    /// packet built by `tick`, addressed to `peer_addr`.
+    tick_scratch: Vec<yip_io::poll::EgressDatagram>,
 }
 
 impl DataPlane {
@@ -145,7 +153,15 @@ impl DataPlane {
     /// The wire codec keys are derived from the same channel-binding sub-keys
     /// that were derived during the handshake (`established.auth_key` /
     /// `established.hp_key`), so both peers end up with the same codec.
-    pub fn new(established: Established, conn_tag: u64, mode: TunnelMode) -> Self {
+    ///
+    /// `peer_addr` is this (single) peer's UDP endpoint; it is stamped as
+    /// `dst` on every egress datagram this `DataPlane` produces.
+    pub fn new(
+        established: Established,
+        conn_tag: u64,
+        mode: TunnelMode,
+        peer_addr: SocketAddr,
+    ) -> Self {
         let codec = Codec::new(established.auth_key, established.hp_key);
         Self {
             session: established.session,
@@ -153,6 +169,7 @@ impl DataPlane {
             codec,
             conn_tag,
             l2: matches!(mode, TunnelMode::L2Tap),
+            peer_addr,
             sent_log: SentLog::new(SENT_LOG_CAPACITY),
             retx: RetxBuffer::new(RETX_BUFFER_MAX, RETX_BUFFER_TTL_MS),
             detector: LossDetector::new(5, 1024),
@@ -164,8 +181,20 @@ impl DataPlane {
             egress_scratch: Vec::new(),
             inner_scratch: Vec::new(),
             retx_scratch: Vec::new(),
-            feedback_scratch: Vec::new(),
+            tick_scratch: Vec::new(),
         }
+    }
+
+    /// The wire `conn_tag` this session's frames carry (both peers derive the
+    /// same value from the handshake channel binding — see
+    /// [`conn_tag_from_keys`]). Exposed for the Task 5 `PeerManager`, which
+    /// will route ingress by `conn_tag` once it demultiplexes across peers.
+    #[expect(
+        dead_code,
+        reason = "consumed by the Task 5 PeerManager, not yet wired up"
+    )]
+    pub fn conn_tag(&self) -> u64 {
+        self.conn_tag
     }
 
     /// Seal `inner`, FEC-encode, frame each symbol, and return the resulting
@@ -213,10 +242,12 @@ impl DataPlane {
 
         // ── 4. Frame each symbol into the reused scratch ──────────────────────
         let n_syms = symbols.len();
+        let peer_addr = self.peer_addr;
         if self.egress_scratch.len() < n_syms {
             self.egress_scratch
                 .resize_with(n_syms, || yip_io::poll::EgressDatagram {
                     fate: 0,
+                    dst: peer_addr,
                     bytes: Vec::new(),
                 });
         }
@@ -227,6 +258,7 @@ impl DataPlane {
             // `fate` = the RaptorQ object id: all symbols of one object (source +
             // its repair) share it, so a GSO driver keeps them in separate skbs.
             slot.fate = sym.object_id;
+            slot.dst = peer_addr;
             slot.bytes.clear();
             slot.bytes.push(PacketType::Data as u8);
             slot.bytes.extend_from_slice(&dg);
@@ -422,7 +454,11 @@ impl DataPlane {
                         let mut pkt = Vec::with_capacity(1 + dg_bytes.len());
                         pkt.push(PacketType::Data as u8);
                         pkt.extend_from_slice(&dg_bytes);
-                        self.retx_scratch.push(pkt);
+                        self.retx_scratch.push(yip_io::poll::EgressDatagram {
+                            fate: oid,
+                            dst: self.peer_addr,
+                            bytes: pkt,
+                        });
                     }
                 }
 
@@ -443,10 +479,11 @@ impl DataPlane {
     /// Periodic tick: emit a feedback `Control` packet if enough time has elapsed,
     /// and drive the periodic diagnostic logs.
     ///
-    /// Returns `Some(&[u8])` — a borrow of the internal feedback scratch buffer —
-    /// when a feedback packet was built (the caller must send it to the peer).
+    /// Returns `Some(&[EgressDatagram])` — a borrow of the internal
+    /// single-element tick scratch buffer, addressed to `peer_addr` — when a
+    /// feedback packet was built (the caller must send it to the peer).
     /// Returns `None` if no feedback interval has elapsed.
-    pub fn tick(&mut self, now_ms: u64) -> Option<&[u8]> {
+    pub fn tick(&mut self, now_ms: u64) -> Option<&[yip_io::poll::EgressDatagram]> {
         if now_ms.saturating_sub(self.last_sweep_ms) >= MAC_SWEEP_INTERVAL_MS {
             self.last_sweep_ms = now_ms;
             self.mac_table.sweep(now_ms);
@@ -486,14 +523,23 @@ impl DataPlane {
             }
         };
 
-        // Build:  [type:1][counter:8be][ciphertext]
-        self.feedback_scratch.clear();
-        self.feedback_scratch.push(PacketType::Control as u8);
-        self.feedback_scratch
-            .extend_from_slice(&sealed.counter.to_be_bytes());
-        self.feedback_scratch.extend_from_slice(&sealed.ciphertext);
+        // Build:  [type:1][counter:8be][ciphertext] into the single reused
+        // tick-scratch entry (allocated once, then just cleared/refilled).
+        if self.tick_scratch.is_empty() {
+            self.tick_scratch.push(yip_io::poll::EgressDatagram {
+                fate: 0,
+                dst: self.peer_addr,
+                bytes: Vec::new(),
+            });
+        }
+        let dg = &mut self.tick_scratch[0];
+        dg.dst = self.peer_addr;
+        dg.bytes.clear();
+        dg.bytes.push(PacketType::Control as u8);
+        dg.bytes.extend_from_slice(&sealed.counter.to_be_bytes());
+        dg.bytes.extend_from_slice(&sealed.ciphertext);
 
-        Some(&self.feedback_scratch)
+        Some(&self.tick_scratch)
     }
 }
 
@@ -538,7 +584,16 @@ fn source_mac_from_ethernet_frame(inner: &[u8]) -> Option<[u8; 6]> {
 // ── Dispatch impl ─────────────────────────────────────────────────────────────
 
 impl yip_io::poll::Dispatch for DataPlane {
-    fn on_udp(&mut self, dg: &[u8], now_ms: u64) -> yip_io::poll::DispatchOut<'_> {
+    /// `src` is ignored: this `DataPlane` has exactly one peer (`peer_addr`,
+    /// fixed at construction), so it behaves exactly as it did when the
+    /// socket was `connect`-ed. The Task 5 `PeerManager` is what will
+    /// actually route ingress by `src`.
+    fn on_udp(
+        &mut self,
+        _src: SocketAddr,
+        dg: &[u8],
+        now_ms: u64,
+    ) -> yip_io::poll::DispatchOut<'_> {
         match self.on_udp_datagram(dg, now_ms) {
             Outcome::None => yip_io::poll::DispatchOut::None,
             Outcome::TunWrite(buf) => yip_io::poll::DispatchOut::Tun(buf),
@@ -551,7 +606,7 @@ impl yip_io::poll::Dispatch for DataPlane {
         self.on_tun_packet(inner, now_ms)
     }
 
-    fn tick(&mut self, now_ms: u64) -> Option<&[u8]> {
+    fn tick(&mut self, now_ms: u64) -> Option<&[yip_io::poll::EgressDatagram]> {
         self.tick(now_ms)
     }
 }
@@ -566,8 +621,15 @@ mod tests {
 
     use crate::wire_glue::derive_wire_keys;
 
+    /// `a`'s configured peer address (i.e. `b`'s endpoint) in [`dataplane_pair`].
+    const TEST_ADDR_B: &str = "203.0.113.2:51820";
+    /// `b`'s configured peer address (i.e. `a`'s endpoint) in [`dataplane_pair`].
+    const TEST_ADDR_A: &str = "203.0.113.1:51820";
+
     /// Build two [`DataPlane`]s whose sessions can talk to each other, by
-    /// running a full in-process Noise-IK handshake.
+    /// running a full in-process Noise-IK handshake. `a`'s `peer_addr` is
+    /// [`TEST_ADDR_B`] and `b`'s is [`TEST_ADDR_A`] — distinct, so tests can
+    /// assert that each stamps the *other*'s address as `dst`.
     fn dataplane_pair(mode: TunnelMode) -> (DataPlane, DataPlane) {
         let resp_kp = generate_keypair();
         let init_kp = generate_keypair();
@@ -606,8 +668,8 @@ mod tests {
         let conn_tag = conn_tag_from_keys(&auth_key, &hp_key);
 
         (
-            DataPlane::new(est_i, conn_tag, mode),
-            DataPlane::new(est_r, conn_tag, mode),
+            DataPlane::new(est_i, conn_tag, mode, TEST_ADDR_B.parse().unwrap()),
+            DataPlane::new(est_r, conn_tag, mode, TEST_ADDR_A.parse().unwrap()),
         )
     }
 
@@ -637,6 +699,13 @@ mod tests {
         assert!(
             dgrams.iter().all(|dg| dg.fate == fate),
             "all symbols of one object must share one fate"
+        );
+        // A's DataPlane stamps every egress datagram with its configured peer
+        // address (TEST_ADDR_B) — the Task 3 addressed-seam contract.
+        let expected_dst: SocketAddr = TEST_ADDR_B.parse().unwrap();
+        assert!(
+            dgrams.iter().all(|dg| dg.dst == expected_dst),
+            "every egress datagram must be stamped with the configured peer_addr"
         );
 
         // Full round-trip: feed all datagrams to B's ingress; at least one must
@@ -669,8 +738,14 @@ mod tests {
         // with the missing counter.  now_ms=50 exceeds both the 5 ms grace
         // and the 30 ms FEEDBACK_INTERVAL_MS, so a packet is guaranteed.
         let fb = b.tick(50).expect("feedback emitted").to_vec();
+        assert_eq!(fb.len(), 1, "tick emits exactly one feedback datagram");
+        let expected_dst: SocketAddr = TEST_ADDR_A.parse().unwrap();
+        assert_eq!(
+            fb[0].dst, expected_dst,
+            "B's tick stamps its configured peer_addr (A's address)"
+        );
         // A ingests the control packet → attributes loss + (for Bulk) retransmits.
-        if let Outcome::Send(s) = a.on_udp_datagram(&fb, 51) {
+        if let Outcome::Send(s) = a.on_udp_datagram(&fb[0].bytes, 51) {
             assert!(!s.is_empty());
         }
         // (Exact retransmit depends on class; at minimum assert the control packet
