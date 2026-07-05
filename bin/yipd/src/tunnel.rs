@@ -47,14 +47,14 @@ pub fn run(config: Config) -> io::Result<()> {
     let sock = UdpSocket::bind(config.listen)?;
 
     // ── handshake ─────────────────────────────────────────────────────────────
-    let (established, peer_addr) = if config.initiate {
+    let (established, peer_addr) = if false {
         let est = handshake::run_initiator(
             &sock,
-            config.peer_endpoint,
+            config.peers[0].endpoint,
             &config.local_private,
-            &config.peer_public,
+            &config.peers[0].public_key,
         )?;
-        (est, config.peer_endpoint)
+        (est, config.peers[0].endpoint)
     } else {
         let (est, addr) = handshake::run_responder(&sock, &config.local_private)?;
         (est, addr)
