@@ -8,6 +8,7 @@ license = "MPL-2.0"
 repository = "https://github.com/femboyisp/yip"
 
 [workspace.dependencies]
+blake2 = "=0.10.6"
 thiserror = "2.0.9"
 tracing = "0.1.41"
 

@@ -3,6 +3,7 @@
 //! The yip daemon. M6 wires device <-> transport <-> crypto <-> wire <-> io
 //! and loads a static 2-peer config from a key=value file.
 
+mod addr;
 mod config;
 mod dataplane;
 mod handshake;

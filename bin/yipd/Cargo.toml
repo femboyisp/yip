@@ -11,7 +11,7 @@ yip-wire = { path = "../../crates/yip-wire" }
 yip-crypto = { path = "../../crates/yip-crypto" }
 yip-transport = { path = "../../crates/yip-transport" }
 yip-device = { path = "../../crates/yip-device" }
-blake2 = "0.10.6"
+blake2 = { workspace = true }
 
 [lints]
 workspace = true
