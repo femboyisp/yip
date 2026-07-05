@@ -36,6 +36,9 @@ pub struct Config {
     pub device: String,
     /// Tunnel mode selected from `device_kind=tun|tap` (`tun` by default).
     pub device_kind: TunnelMode,
+    /// Whether to initiate the handshake (true) or respond (false).
+    /// Deprecated: removed in Task 5 (PeerManager lazy handshake).
+    pub initiate: bool,
 }
 
 // ── hex decode helper ─────────────────────────────────────────────────────────
@@ -77,6 +80,40 @@ fn missing(key: &str) -> io::Error {
     )
 }
 
+// ── bool parser helper ───────────────────────────────────────────────────────
+
+fn parse_bool(val: &str) -> io::Result<bool> {
+    match val.to_lowercase().as_str() {
+        "true" | "1" | "yes" => Ok(true),
+        "false" | "0" | "no" => Ok(false),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid boolean value: {val}"),
+        )),
+    }
+}
+
+// ── peer block flush helper ──────────────────────────────────────────────────
+
+fn flush_peer_block(
+    cur_pk: Option<[u8; 32]>,
+    cur_ep: Option<SocketAddr>,
+    peers: &mut Vec<PeerConfig>,
+) -> io::Result<()> {
+    if let (Some(pk), Some(ep)) = (cur_pk, cur_ep) {
+        peers.push(PeerConfig {
+            public_key: pk,
+            endpoint: ep,
+        });
+    } else if cur_pk.is_some() || cur_ep.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "peer block missing public_key or endpoint".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 // ── Config::parse ─────────────────────────────────────────────────────────────
 
 impl Config {
@@ -97,6 +134,7 @@ impl Config {
         let mut listen: Option<SocketAddr> = None;
         let mut device: Option<String> = None;
         let mut device_kind = TunnelMode::default();
+        let mut initiate = false;
 
         for line in text.lines() {
             let line = line.trim();
@@ -106,18 +144,7 @@ impl Config {
 
             // Check for [peer] block header
             if line == "[peer]" {
-                // Flush current peer if it has both fields
-                if let (Some(pk), Some(ep)) = (cur_pk, cur_ep) {
-                    peers.push(PeerConfig {
-                        public_key: pk,
-                        endpoint: ep,
-                    });
-                } else if cur_pk.is_some() || cur_ep.is_some() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "peer block missing public_key or endpoint".to_string(),
-                    ));
-                }
+                flush_peer_block(cur_pk, cur_ep, &mut peers)?;
                 cur_pk = None;
                 cur_ep = None;
                 continue;
@@ -156,23 +183,14 @@ impl Config {
                 }
                 "device" => device = Some(val.to_owned()),
                 "device_kind" => device_kind = TunnelMode::parse_device_kind(val)?,
-                // Silently ignore unknown keys (including legacy "initiate") for forward-compatibility.
+                "initiate" => initiate = parse_bool(val)?,
+                // Silently ignore unknown keys for forward-compatibility.
                 _ => {}
             }
         }
 
         // Flush any trailing peer block
-        if let (Some(pk), Some(ep)) = (cur_pk, cur_ep) {
-            peers.push(PeerConfig {
-                public_key: pk,
-                endpoint: ep,
-            });
-        } else if cur_pk.is_some() || cur_ep.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "peer block missing public_key or endpoint".to_string(),
-            ));
-        }
+        flush_peer_block(cur_pk, cur_ep, &mut peers)?;
 
         // If no [peer] blocks, try legacy single-peer format
         if peers.is_empty() {
@@ -200,6 +218,7 @@ impl Config {
             listen: listen.ok_or_else(|| missing("listen"))?,
             device: device.ok_or_else(|| missing("device"))?,
             device_kind,
+            initiate,
         })
     }
 }

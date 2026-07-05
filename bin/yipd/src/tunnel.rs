@@ -47,7 +47,7 @@ pub fn run(config: Config) -> io::Result<()> {
     let sock = UdpSocket::bind(config.listen)?;
 
     // ── handshake ─────────────────────────────────────────────────────────────
-    let (established, peer_addr) = if false {
+    let (established, peer_addr) = if config.initiate {
         let est = handshake::run_initiator(
             &sock,
             config.peers[0].endpoint,
