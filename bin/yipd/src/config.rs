@@ -21,12 +21,8 @@ pub struct PeerConfig {
 pub struct Config {
     /// Local X25519 private key (32 bytes).
     pub local_private: [u8; 32],
-    /// Local X25519 public key (32 bytes). Carried in config for key-management /
-    /// re-advertisement in future milestones; not consumed by the M6 data path itself.
-    #[expect(
-        dead_code,
-        reason = "used for key identity; data path reads local_private"
-    )]
+    /// Local X25519 public key (32 bytes). Used by `PeerManager` to derive
+    /// this node's self-certifying mesh address (`node_addr`).
     pub local_public: [u8; 32],
     /// List of remote peers.
     pub peers: Vec<PeerConfig>,
@@ -36,9 +32,6 @@ pub struct Config {
     pub device: String,
     /// Tunnel mode selected from `device_kind=tun|tap` (`tun` by default).
     pub device_kind: TunnelMode,
-    /// Whether to initiate the handshake (true) or respond (false).
-    /// Deprecated: removed in Task 5 (PeerManager lazy handshake).
-    pub initiate: bool,
 }
 
 // ── hex decode helper ─────────────────────────────────────────────────────────
@@ -78,19 +71,6 @@ fn missing(key: &str) -> io::Error {
         io::ErrorKind::InvalidData,
         format!("missing required config key: {key}"),
     )
-}
-
-// ── bool parser helper ───────────────────────────────────────────────────────
-
-fn parse_bool(val: &str) -> io::Result<bool> {
-    match val.to_lowercase().as_str() {
-        "true" | "1" | "yes" => Ok(true),
-        "false" | "0" | "no" => Ok(false),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid boolean value: {val}"),
-        )),
-    }
 }
 
 // ── peer block flush helper ──────────────────────────────────────────────────
@@ -134,7 +114,6 @@ impl Config {
         let mut listen: Option<SocketAddr> = None;
         let mut device: Option<String> = None;
         let mut device_kind = TunnelMode::default();
-        let mut initiate = false;
 
         for line in text.lines() {
             let line = line.trim();
@@ -183,8 +162,12 @@ impl Config {
                 }
                 "device" => device = Some(val.to_owned()),
                 "device_kind" => device_kind = TunnelMode::parse_device_kind(val)?,
-                "initiate" => initiate = parse_bool(val)?,
-                // Silently ignore unknown keys for forward-compatibility.
+                // Silently ignore unknown keys for forward-compatibility. The
+                // netns config files still contain `initiate=true|false` from
+                // before Task 5 removed the field; this is intentional so
+                // those fixtures don't need editing (verified by
+                // `parse_config_unknown_key_is_silently_ignored`, which this
+                // arm's removal now also exercises for `initiate` itself).
                 _ => {}
             }
         }
@@ -218,7 +201,6 @@ impl Config {
             listen: listen.ok_or_else(|| missing("listen"))?,
             device: device.ok_or_else(|| missing("device"))?,
             device_kind,
-            initiate,
         })
     }
 }

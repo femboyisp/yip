@@ -642,15 +642,29 @@ impl UringDriver {
     }
 
     /// Flush all datagrams staged this `poll_once` in fate-safe GSO batches.
-    /// Each pass takes at most one datagram per distinct fate group (arrival
-    /// order) — so a coalesced skb never carries two symbols of one FEC object —
-    /// and defers the rest to the next pass. Bounded by `MAX_PENDING_GSO_DATAGRAMS`.
+    /// Each pass takes at most one datagram per distinct `(fate, dst)` pair
+    /// (arrival order) — so a coalesced skb never carries two symbols of one
+    /// FEC object *and* never mixes destinations — and defers the rest to the
+    /// next pass. Bounded by `MAX_PENDING_GSO_DATAGRAMS`.
+    ///
+    /// Grouping by fate alone (pre-multipeer) let a batch mix `dst`s whenever
+    /// two different peers happened to emit distinct-fate datagrams in the
+    /// same `poll_once`; `queue_udp_batch_tagged`'s `can_coalesce_gso_tagged`
+    /// check would then reject the *whole* mixed chunk and fall back to
+    /// per-datagram sends, silently losing the GSO win for same-peer pairs
+    /// that were incidentally batched with a different peer's datagram.
+    /// Grouping by `(fate, dst)` keeps distinct peers in separate chunks so
+    /// same-peer datagrams still coalesce.
     fn flush_pending_gso(&mut self) {
         while !self.pending_gso.is_empty() {
             let mut chunk: Vec<EgressDatagram> = Vec::with_capacity(self.pending_gso.len());
             let mut deferred: Vec<EgressDatagram> = Vec::with_capacity(self.pending_gso.len());
             for dg in self.pending_gso.drain(..) {
-                if chunk.iter().any(|c| c.fate == dg.fate) {
+                let dst_conflict = chunk
+                    .first()
+                    .is_some_and(|c: &EgressDatagram| c.dst != dg.dst);
+                let fate_conflict = chunk.iter().any(|c| c.fate == dg.fate);
+                if dst_conflict || fate_conflict {
                     deferred.push(dg);
                 } else {
                     chunk.push(dg);

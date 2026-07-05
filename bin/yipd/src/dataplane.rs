@@ -187,12 +187,8 @@ impl DataPlane {
 
     /// The wire `conn_tag` this session's frames carry (both peers derive the
     /// same value from the handshake channel binding — see
-    /// [`conn_tag_from_keys`]). Exposed for the Task 5 `PeerManager`, which
-    /// will route ingress by `conn_tag` once it demultiplexes across peers.
-    #[expect(
-        dead_code,
-        reason = "consumed by the Task 5 PeerManager, not yet wired up"
-    )]
+    /// [`conn_tag_from_keys`]). Used by `PeerManager` to register this peer
+    /// in its `conn_tag -> peer` map once the handshake completes.
     pub fn conn_tag(&self) -> u64 {
         self.conn_tag
     }
