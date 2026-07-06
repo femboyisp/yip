@@ -27,22 +27,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// pubkey. Returns `Err` (message on stderr already emitted by the caller)
 /// on wrong length or a non-hex digit.
 fn hex_decode_32(hex: &str) -> Result<[u8; 32], String> {
-    if hex.len() != 64 {
-        return Err(format!("expected 64 hex chars, got {}", hex.len()));
-    }
-    fn nibble(b: u8) -> Result<u8, String> {
-        match b {
-            b'0'..=b'9' => Ok(b - b'0'),
-            b'a'..=b'f' => Ok(b - b'a' + 10),
-            b'A'..=b'F' => Ok(b - b'A' + 10),
-            _ => Err(format!("invalid hex digit: {}", b as char)),
-        }
-    }
-    let mut out = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        out[i] = (nibble(chunk[0])? << 4) | nibble(chunk[1])?;
-    }
-    Ok(out)
+    // Single-sourced with the config parser so the two decoders can't drift.
+    crate::config::hex_to_32(hex).map_err(|e| e.to_string())
 }
 
 fn main() -> std::io::Result<()> {

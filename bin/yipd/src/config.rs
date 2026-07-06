@@ -36,7 +36,9 @@ pub struct Config {
 
 // ── hex decode helper ─────────────────────────────────────────────────────────
 
-fn hex_to_32(hex: &str) -> io::Result<[u8; 32]> {
+/// Decode a 64-char hex string into 32 bytes. Shared with `main.rs`'s
+/// `--addr` subcommand so the two paths cannot drift.
+pub(crate) fn hex_to_32(hex: &str) -> io::Result<[u8; 32]> {
     if hex.len() != 64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
