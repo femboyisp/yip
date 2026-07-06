@@ -84,9 +84,28 @@ use crate::mode::TunnelMode;
 /// How long an in-flight initiator handshake waits before resending
 /// `[HandshakeInit]`.
 const HANDSHAKE_RETRY_MS: u64 = 1_000;
-/// How many retries an in-flight initiator handshake gets before it reverts
-/// to `Idle` (dropping anything buffered in `pending_tun`).
-const HANDSHAKE_MAX_RETRIES: u32 = 5;
+/// Total time an initiator keeps retransmitting *the same* `[HandshakeInit]`
+/// (holding one Noise ephemeral) before giving up and reverting to `Idle`.
+///
+/// This is deliberately a long window (WireGuard's `REKEY_ATTEMPT_TIME`), not
+/// a small retry count. A responder that admits our `Init` caches its
+/// `[HandshakeResp]` keyed to *this* ephemeral and replays that cached reply
+/// on every retransmit (see `handle_handshake_init`). If we instead gave up
+/// early and later re-initiated with a *fresh* ephemeral, the responder —
+/// which has no idle-timeout and never rebuilds a live session (there is no
+/// anti-replay in the handshake yet, so it cannot safely tell a genuine
+/// re-initiation from a replayed old `Init` — see issue: handshake
+/// anti-replay) — would keep replaying its stale reply forever and we could
+/// never complete. Retransmitting the *same* `Init` keeps our ephemeral
+/// matching the responder's cached session, so ordinary handshake-packet loss
+/// is overcome by retransmission rather than wedging the peer permanently.
+const HANDSHAKE_TOTAL_MS: u64 = 90_000;
+
+/// Cap on TUN packets buffered per peer while its handshake is in flight.
+/// Bounds memory when a peer streams into an unestablished (or unreachable)
+/// peer during the `HANDSHAKE_TOTAL_MS` window; the oldest are dropped, like
+/// a small tail queue (WireGuard stages a single packet).
+const MAX_PENDING_TUN: usize = 16;
 
 /// An initiator handshake in flight, awaiting `[HandshakeResp]`. Boxed by
 /// [`PeerState::Handshaking`] so that variant stays pointer-sized like
@@ -94,13 +113,13 @@ const HANDSHAKE_MAX_RETRIES: u32 = 5;
 /// larger than the other `PeerState` variants (clippy `large_enum_variant`).
 struct HandshakingState {
     hs: HandshakeState,
-    /// When this handshake attempt first started (for logging/future use;
-    /// retries are tracked by `last_sent_ms`/`retries`).
-    #[expect(dead_code, reason = "retained for future backoff/metrics use")]
+    /// When this handshake attempt first started. The attempt is abandoned
+    /// once `now - started_ms >= HANDSHAKE_TOTAL_MS`; until then the same
+    /// `init_pkt` is retransmitted every `HANDSHAKE_RETRY_MS`.
     started_ms: u64,
     /// When `[HandshakeInit]` was last (re)sent.
     last_sent_ms: u64,
-    /// How many times `[HandshakeInit]` has been resent.
+    /// How many times `[HandshakeInit]` has been resent (for logging/metrics).
     retries: u32,
     /// The framed `[HandshakeInit]` datagram, resent verbatim on retry.
     /// `HandshakeState` cannot regenerate this: Noise's ephemeral key is
@@ -225,6 +244,16 @@ impl PeerManager {
     /// local TUN/TAP device's address.
     pub fn local_addr(&self) -> Ipv6Addr {
         node_addr(&self.local_pub)
+    }
+
+    /// Append a TUN packet to a peer's pending buffer, dropping the oldest if
+    /// the buffer is at [`MAX_PENDING_TUN`] so a peer streaming into an
+    /// unestablished/unreachable peer cannot grow memory without bound.
+    fn push_pending(pending: &mut Vec<Vec<u8>>, inner: &[u8]) {
+        if pending.len() >= MAX_PENDING_TUN {
+            pending.remove(0);
+        }
+        pending.push(inner.to_vec());
     }
 
     // ── TUN routing ───────────────────────────────────────────────────────
@@ -544,12 +573,12 @@ impl Dispatch for PeerManager {
         }
 
         if matches!(self.peers[idx].state, PeerState::Handshaking(_)) {
-            self.peers[idx].pending_tun.push(inner.to_vec());
+            Self::push_pending(&mut self.peers[idx].pending_tun, inner);
             return &[];
         }
 
         // Idle: buffer this packet and kick off a lazy handshake.
-        self.peers[idx].pending_tun.push(inner.to_vec());
+        Self::push_pending(&mut self.peers[idx].pending_tun, inner);
         match HandshakeState::start_initiator(&self.local_priv, &self.peers[idx].pubkey) {
             Ok((hs, init_pkt)) => {
                 let peer_endpoint = self.peers[idx].endpoint;
@@ -590,11 +619,17 @@ impl Dispatch for PeerManager {
                 PeerState::Handshaking(mut handshaking)
                     if now_ms.saturating_sub(handshaking.last_sent_ms) >= HANDSHAKE_RETRY_MS =>
                 {
-                    if handshaking.retries >= HANDSHAKE_MAX_RETRIES {
+                    if now_ms.saturating_sub(handshaking.started_ms) >= HANDSHAKE_TOTAL_MS {
+                        // Whole attempt window elapsed without completing: the
+                        // peer is unreachable. Give up and free the ephemeral;
+                        // the next TUN packet starts a fresh attempt.
                         self.peers[i].pending_tun.clear();
                         PeerState::Idle
                     } else {
-                        handshaking.retries += 1;
+                        // Retransmit the SAME init (same ephemeral) so the
+                        // responder's cached reply stays valid — see
+                        // HANDSHAKE_TOTAL_MS.
+                        handshaking.retries = handshaking.retries.saturating_add(1);
                         handshaking.last_sent_ms = now_ms;
                         self.tick_egress.push(EgressDatagram {
                             fate: 0,
@@ -939,6 +974,94 @@ mod tests {
         assert_eq!(
             resp2, resp1,
             "duplicate init must re-send the cached HandshakeResp verbatim"
+        );
+    }
+
+    #[test]
+    fn initiator_retransmits_same_init_within_total_window_then_gives_up() {
+        // Regression for the loss-induced wedge: the initiator must keep
+        // retransmitting the SAME init (holding one ephemeral) well past the
+        // old 5-retry cap, so a responder's cached reply stays valid and
+        // ordinary handshake-packet loss is overcome by retransmission — never
+        // resetting to a fresh ephemeral mid-attempt. Only after the whole
+        // HANDSHAKE_TOTAL_MS window does it give up.
+        let kp_local = generate_keypair();
+        let peer = PeerConfig {
+            public_key: [7u8; 32],
+            endpoint: "10.0.0.9:9000".parse().unwrap(),
+        };
+        let mut pm = PeerManager::new(
+            kp_local.private,
+            kp_local.public,
+            &[peer],
+            TunnelMode::L3Tun,
+        );
+
+        // Kick off a lazy handshake with an outbound TUN packet.
+        let init_out = pm.on_tun(&dummy_tun_pkt(), 0).to_vec();
+        assert_eq!(init_out.len(), 1);
+        let init_bytes = init_out[0].bytes.clone();
+        assert_eq!(init_bytes[0], PacketType::HandshakeInit as u8);
+        assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+
+        // Drive tick ~20 retry intervals — 4x the old MAX_RETRIES=5 cap. Each
+        // interval must retransmit the identical init and keep it Handshaking.
+        let mut t = 0u64;
+        for _ in 0..20 {
+            t += HANDSHAKE_RETRY_MS;
+            let out = pm.tick(t).map(<[_]>::to_vec).unwrap_or_default();
+            assert_eq!(out.len(), 1, "a retransmit is emitted every retry interval");
+            assert_eq!(
+                out[0].bytes, init_bytes,
+                "retransmit reuses the same init (same ephemeral)"
+            );
+            assert!(
+                matches!(pm.peers[0].state, PeerState::Handshaking(_)),
+                "peer keeps handshaking within the total window (past the old 5-retry cap)"
+            );
+        }
+
+        // Once the whole window elapses, the attempt is abandoned.
+        let out = pm
+            .tick(HANDSHAKE_TOTAL_MS + HANDSHAKE_RETRY_MS)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
+        assert!(
+            out.is_empty(),
+            "no further init once the total window elapsed"
+        );
+        assert!(
+            matches!(pm.peers[0].state, PeerState::Idle),
+            "peer reverts to Idle after the total window"
+        );
+        assert!(
+            pm.peers[0].pending_tun.is_empty(),
+            "pending buffer cleared on give-up"
+        );
+    }
+
+    #[test]
+    fn pending_tun_is_capped_while_handshaking() {
+        let kp_local = generate_keypair();
+        let peer = PeerConfig {
+            public_key: [7u8; 32],
+            endpoint: "10.0.0.9:9000".parse().unwrap(),
+        };
+        let mut pm = PeerManager::new(
+            kp_local.private,
+            kp_local.public,
+            &[peer],
+            TunnelMode::L3Tun,
+        );
+
+        // Stream far more packets than the cap while the peer is Handshaking.
+        for _ in 0..(MAX_PENDING_TUN + 50) {
+            let _ = pm.on_tun(&dummy_tun_pkt(), 0);
+        }
+        assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+        assert!(
+            pm.peers[0].pending_tun.len() <= MAX_PENDING_TUN,
+            "pending buffer must stay capped at MAX_PENDING_TUN"
         );
     }
 }

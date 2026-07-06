@@ -406,6 +406,15 @@ impl UringDriver {
     /// one submission serving an unbounded burst. Acceptable: io_uring is
     /// opt-in and correctness (recovering `src`) comes first (see #33).
     fn arm_udp_recv_slot(&mut self, idx: usize) -> io::Result<()> {
+        // Restore `msg_namelen` to the full `sockaddr_storage` capacity before
+        // re-submitting: `recvmsg` writes back the *actual* source address size
+        // on completion (16 for a v4 sender, 28 for v6), so without this reset
+        // a slot that last received a v4 datagram would offer only 16 bytes of
+        // name capacity to the next `recvmsg`, truncating a v6 source address
+        // to a wrong value on a dual-stack underlay.
+        let namelen = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>())
+            .expect("size_of::<sockaddr_storage>() fits socklen_t");
+        self.udp_recv_slots[idx].msg.msg_namelen = namelen;
         let msg_ptr = std::ptr::addr_of_mut!(self.udp_recv_slots[idx].msg);
         let tag = TAG_UDP_RECV | u64::try_from(idx).expect("udp recv slot index fits u64");
         let entry = opcode::RecvMsg::new(types::Fd(self.udp_fd), msg_ptr)

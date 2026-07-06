@@ -5,16 +5,25 @@ variables that select the I/O driver, and the command-line flags. This is the si
 reference for everything `yipd` reads at startup — it is otherwise scattered across
 `bin/yipd/src/` and the bench harness in `crates/yip-bench/`.
 
-`yipd` today runs a **static two-peer tunnel**: one config file per endpoint, no
-control plane yet (discovery, NAT traversal, and relay arrive in sub-project #2). Both
-peers must agree on keys and endpoints out of band.
+`yipd` today runs a **static multi-peer data plane**: one config file per node, each
+listing one or more peers, with keys and endpoints agreed out of band. The remaining
+control plane (discovery, NAT traversal, relay) arrives in later sub-project #2
+milestones. There is **no `initiate` flag**: the handshake is lazy and in-loop
+(WireGuard-style) — whichever side has traffic for a peer first sends the
+`[HandshakeInit]`, and simultaneous initiation is resolved deterministically.
+
+Each node has a **self-certifying mesh address** derived from its public key
+(`fd00::/8`); print it with `yipd --addr <pubkey-hex>`. Assign that `/128` to the node's
+TUN device and route the mesh prefix over it so inner packets addressed to a peer's mesh
+address are tunnelled to that peer.
 
 ## Invocation
 
 ```sh
-yipd <config-file>     # run a tunnel from a config file
-yipd --genkey          # generate an X25519 keypair and exit
-yipd --version         # print "yipd <version>" and exit
+yipd <config-file>       # run a tunnel from a config file
+yipd --genkey            # generate an X25519 keypair and exit
+yipd --addr <pubkey-hex> # print the mesh address (node_addr) for a public key and exit
+yipd --version           # print "yipd <version>" and exit
 ```
 
 ## Config file
@@ -26,54 +35,73 @@ keys are silently ignored for forward-compatibility.
 
 Generate a keypair with `yipd --genkey`; it prints `private=<hex>` and `public=<hex>`.
 
-### Keys
+### Node keys
 
 | Key | Required | Value | Meaning |
 |---|---|---|---|
-| `local_private` | yes | 64 hex digits | This endpoint's X25519 private key. Feeds the Noise-IK handshake. |
-| `local_public` | yes | 64 hex digits | This endpoint's X25519 public key. Carried for key identity / future re-advertisement; the data path itself reads `local_private`. |
-| `peer_public` | yes | 64 hex digits | The remote peer's X25519 public key. |
+| `local_private` | yes | 64 hex digits | This node's X25519 private key. Feeds the Noise-IK handshake. |
+| `local_public` | yes | 64 hex digits | This node's X25519 public key. Determines this node's mesh address (`yipd --addr`); the data path itself reads `local_private`. |
 | `listen` | yes | `IP:port` socket address | Local UDP address to bind (e.g. `0.0.0.0:51820`). |
-| `peer_endpoint` | yes | `IP:port` socket address | The remote peer's UDP endpoint. Used by the initiator to send the first handshake message; the responder learns the peer's address from the incoming datagram, so on a pure responder this can be a placeholder that is reachable-shaped but is not dialed. |
 | `device` | yes | string | TUN/TAP device name to create (e.g. `yip0`). |
 | `device_kind` | no | `tun` \| `tap` | Tunnel mode. `tun` = L3 IP tunnel, `tap` = L2 Ethernet bridging. **Defaults to `tun`** when the key is absent. An unrecognized value is a startup error. |
-| `initiate` | yes | boolean | Whether this peer initiates the Noise-IK handshake. Exactly one of the two peers should set `true`. Accepted truthy values: `true`, `1`, `yes`; falsy: `false`, `0`, `no`. Any other value is a startup error. |
+
+### Peers
+
+List each remote peer in a `[peer]` block. Repeat the block once per peer:
+
+| Key | Required | Value | Meaning |
+|---|---|---|---|
+| `public_key` | yes | 64 hex digits | The peer's X25519 public key. Also determines the peer's mesh address you route to (`yipd --addr`). |
+| `endpoint` | yes | `IP:port` socket address | The peer's UDP endpoint, used to send it the first handshake message. The actual source address is (re)learned from the peer's own handshake datagram. |
+
+**Legacy single-peer form:** for a one-peer node you may instead use the flat keys
+`peer_public=<hex>` and `peer_endpoint=<IP:port>` (no `[peer]` header); they fold into a
+single peer entry. The `[peer]` block form is required for two or more peers.
 
 A missing required key, malformed line (no `=`), bad hex, unparseable socket address,
-or invalid boolean/`device_kind` all cause `yipd` to exit with a parse error.
+or invalid `device_kind` all cause `yipd` to exit with a parse error. Unknown keys are
+ignored (so a leftover `initiate=` from an older config is harmless).
 
 ### Example
 
-Two endpoints, A and B. B initiates; A responds. Keys are illustrative — generate real
-ones with `yipd --genkey`.
+Two nodes, A and B, peered with each other. There is no initiator/responder role — the
+first side with traffic brings the tunnel up. Keys are illustrative — generate real ones
+with `yipd --genkey`, and compute each node's mesh address with `yipd --addr <public>`.
 
-`yipA.conf` (responder):
+`yipA.conf`:
 
 ```ini
-# Endpoint A — responder
+# Node A
 local_private=0000000000000000000000000000000000000000000000000000000000000001
 local_public=0000000000000000000000000000000000000000000000000000000000000002
-peer_public=00000000000000000000000000000000000000000000000000000000000000bb
 listen=10.0.0.1:51820
-peer_endpoint=10.0.0.2:51820
 device=yip0
 device_kind=tun
-initiate=false
+
+[peer]
+public_key=00000000000000000000000000000000000000000000000000000000000000bb
+endpoint=10.0.0.2:51820
 ```
 
-`yipB.conf` (initiator):
+`yipB.conf`:
 
 ```ini
-# Endpoint B — initiator
+# Node B
 local_private=00000000000000000000000000000000000000000000000000000000000000aa
 local_public=00000000000000000000000000000000000000000000000000000000000000bb
-peer_public=0000000000000000000000000000000000000000000000000000000000000002
 listen=10.0.0.2:51820
-peer_endpoint=10.0.0.1:51820
 device=yip0
 device_kind=tun
-initiate=true
+
+[peer]
+public_key=0000000000000000000000000000000000000000000000000000000000000002
+endpoint=10.0.0.1:51820
 ```
+
+Then assign each node its own mesh address and route the mesh prefix over the tunnel,
+e.g. on A: `ip -6 addr add $(yipd --addr 0000…0002)/128 dev yip0` and
+`ip -6 route add fd00::/8 dev yip0`. A third node C is added by giving A and B a second
+`[peer]` block for C (and C a config listing both A and B).
 
 ## Environment variables
 
@@ -116,6 +144,7 @@ no other flags.
 |---|---|
 | `<config-file>` | Load the config file and run the tunnel. |
 | `--genkey` | Generate an X25519 keypair, print `private=<hex>` / `public=<hex>` to stdout, and exit. |
+| `--addr <pubkey-hex>` | Print the self-certifying mesh address (`node_addr`, in `fd00::/8`) derived from a 64-hex-digit public key, and exit. |
 | `--version`, `-V` | Print `yipd <version>` and exit. |
 
 Running `yipd` with no argument prints a usage message and exits with an error.
