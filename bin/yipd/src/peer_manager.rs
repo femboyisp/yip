@@ -1180,9 +1180,37 @@ impl Dispatch for PeerManager {
                         }
                         continue;
                     }
-                    // Same target / NeedLookup / Idle / Failed: leave the
-                    // in-flight handshake alone; the retransmit arm below
-                    // handles it (do not double-send).
+                    PathAction::NeedLookup => {
+                        // The path SM escalated into (or is still in) the punch
+                        // stage but has no reflexive candidate yet — e.g. a peer
+                        // configured with BOTH a direct endpoint and a
+                        // rendezvous: it starts `Handshaking` on the direct
+                        // endpoint (via `on_tun`'s Idle branch, which never
+                        // touches the path SM again once `Handshaking`), so
+                        // without this arm the escalation-only `advance` call
+                        // above would see `Direct -> Punching` and return
+                        // `NeedLookup` here forever, and this match's old
+                        // catch-all treated that as "do nothing" — no `Lookup`
+                        // is ever sent, no reflexive candidate is learned, and
+                        // the peer can never punch (it just rides out
+                        // `HANDSHAKE_TOTAL_MS` on the doomed direct `Init` and
+                        // eventually gives up). Emit the debounced lookup, same
+                        // as `drive_path_idle` does for an `Idle` peer.
+                        //
+                        // This does NOT abandon the in-flight direct `Init` —
+                        // no state mutation happens here, so the retransmit arm
+                        // below still fires this tick if due, keeping the
+                        // direct attempt alive alongside the new lookup. Once a
+                        // candidate arrives (`on_rdv` -> `on_peer_candidate`), a
+                        // later tick's `advance` returns `Probe(candidate)`,
+                        // which the `addr != target` arm above re-targets to.
+                        if let Some(dg) = self.maybe_lookup(i, now_ms) {
+                            self.tick_egress.push(dg);
+                        }
+                    }
+                    // Same target / Idle / Failed: leave the in-flight
+                    // handshake alone; the retransmit arm below handles it (do
+                    // not double-send).
                     _ => {}
                 }
             }
@@ -2200,5 +2228,112 @@ mod tests {
                 )),
             "the relay attempt keeps retransmitting via the server, unbroken by the stray reply"
         );
+    }
+
+    /// (h) F2 fix: a peer configured with BOTH a direct endpoint AND a
+    /// rendezvous must still hole-punch. It starts `Handshaking` on the direct
+    /// endpoint via `on_tun`'s `Idle` branch (not via `drive_path_idle`, which
+    /// only ever runs for `Idle` peers), so the *only* place that can drive its
+    /// path SM onward is the tick escalation arm. Pre-fix, that arm's `match`
+    /// treated `PathAction::NeedLookup` as `_ => {}` — once the direct window
+    /// (`DIRECT_MS`) elapses and the SM escalates `Direct -> Punching` with no
+    /// candidate yet known, `advance` returns `NeedLookup` every tick and NONE
+    /// of them ever emit a `Lookup`: no reflexive candidate is ever learned, so
+    /// this peer can never punch (it just rides the direct `Init` out to
+    /// `HANDSHAKE_TOTAL_MS` and gives up, or — with the 2b relay-escalation
+    /// fix — eventually relays instead of punching). Step 2's assertion below
+    /// is the load-bearing one and FAILS pre-fix (the mock records no `Lookup`
+    /// at all).
+    #[test]
+    fn endpoint_peer_emits_lookup_and_punches_after_direct_window() {
+        use crate::path::DIRECT_MS;
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let endpoint: SocketAddr = "10.0.0.2:51820".parse().unwrap();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: Some(endpoint), // BOTH a direct endpoint AND (via the mock) a rendezvous
+        };
+        let (mut pm, sent) = pm_with_mock_rdv(&local, &[peer]);
+
+        // 1. First TUN packet: on_tun's Idle branch drives the path SM, which
+        // (still within DIRECT_MS at t=0) returns Probe(endpoint) — the peer
+        // starts Handshaking on the direct endpoint, exactly like 2a.
+        let out = pm.on_tun(&dummy_tun_pkt(), 0).to_vec();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].dst, endpoint, "Init targets the configured endpoint");
+        assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+        assert_eq!(pm.peers[0].path.stage(), PathStage::Direct);
+
+        // 2. Tick past DIRECT_MS: the peer is still Handshaking (no resp
+        // arrived), so only the tick escalation arm touches its path SM. The
+        // SM escalates Direct -> Punching and (no candidate known yet) returns
+        // NeedLookup. THE LOAD-BEARING ASSERTION: a Lookup for this peer's
+        // node id must have been emitted — this fails pre-fix, where
+        // NeedLookup fell into the escalation arm's `_ => {}` and nothing was
+        // ever sent.
+        let out = pm
+            .tick(DIRECT_MS + 1)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
+        assert_eq!(pm.peers[0].path.stage(), PathStage::Punching);
+        assert!(
+            out.iter().any(|d| d.dst == mock_server()
+                && matches!(
+                    yip_rendezvous::decode(&d.bytes),
+                    Some(yip_rendezvous::Message::Lookup { node })
+                        if node == node_id(&peer_kp.public)
+                )),
+            "a Lookup for the peer's node id must be emitted once the direct \
+             window elapses and the SM escalates to Punching, even though the \
+             peer is still Handshaking on the direct endpoint"
+        );
+        assert!(
+            sent.borrow()
+                .iter()
+                .any(|m| matches!(m, yip_rendezvous::Message::Lookup { .. })),
+            "the mock recorded a Lookup"
+        );
+        // The direct Init stays in flight alongside the lookup (NeedLookup
+        // does not abandon it) — the peer is still Handshaking, not relayed.
+        assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+        assert!(!pm.peers[0].relay);
+
+        // 3. A reflexive candidate for the peer now arrives (as if the lookup
+        // above had been answered). A later tick's `advance` returns
+        // `Probe(candidate)`, which the escalation arm's existing
+        // `addr != target` re-target branch handles: abandon the direct Init,
+        // begin a fresh handshake toward the punch candidate.
+        let candidate: SocketAddr = "198.51.100.7:41000".parse().unwrap();
+        let mut buf = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PeerInfo {
+                node: node_id(&peer_kp.public),
+                reflexive: candidate,
+            },
+            &mut buf,
+        );
+        assert!(matches!(
+            pm.on_udp(mock_server(), &buf, DIRECT_MS + 2),
+            DispatchOut::None
+        ));
+
+        let out = pm
+            .tick(DIRECT_MS + 3)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
+        assert!(
+            out.iter().any(|d| d.dst == candidate
+                && d.bytes.first() == Some(&(PacketType::HandshakeInit as u8))),
+            "the peer re-targets to the punch candidate: a fresh Init is sent \
+             to it, proving the punch path is reachable for an \
+             endpoint-configured peer"
+        );
+        assert_eq!(
+            pm.peers[0].endpoint,
+            Some(candidate),
+            "endpoint re-stamped to the punch candidate"
+        );
+        assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
     }
 }
