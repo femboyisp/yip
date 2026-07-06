@@ -345,6 +345,9 @@ impl PeerManager {
         match stage {
             PathStage::Direct => PathKind::Direct,
             PathStage::Punching => PathKind::Punched,
+            // Lossy fallback: only reached for a *non-relayed* completion (a
+            // relayed completion commits `Relayed` explicitly, never routing
+            // here), so mapping these residual stages to `Punched` is safe.
             PathStage::Relaying | PathStage::Failed => PathKind::Punched,
         }
     }
@@ -905,6 +908,11 @@ impl PeerManager {
                 let kind = Self::kind_for_stage(self.peers[idx].path.stage());
                 self.peers[idx].path.committed(kind);
                 self.peers[idx].path_kind = Some(kind);
+                // A non-relayed init completed: this is a direct/punched
+                // session. Clear any stale `relay` flag left by an earlier
+                // escalation whose relayed attempt this direct/punch completion
+                // raced (else `on_tun`/`tick` would relay-wrap direct egress).
+                self.peers[idx].relay = false;
 
                 self.egress.clear();
                 self.egress.push(EgressDatagram {
@@ -960,6 +968,10 @@ impl PeerManager {
                 let kind = Self::kind_for_stage(self.peers[idx].path.stage());
                 self.peers[idx].path.committed(kind);
                 self.peers[idx].path_kind = Some(kind);
+                // Non-relayed resp completed a direct/punched session: clear any
+                // stale `relay` flag from a raced escalation (see the mirror in
+                // `handle_handshake_init`).
+                self.peers[idx].relay = false;
 
                 self.egress.clear();
                 let pending = std::mem::take(&mut self.peers[idx].pending_tun);
@@ -1106,6 +1118,53 @@ impl Dispatch for PeerManager {
         }
 
         for i in 0..self.peers.len() {
+            // ── proactive escalation of an in-flight direct/punch handshake ──
+            // With a rendezvous configured, keep driving the path SM while a
+            // *non-relay* handshake is in flight (pure-2a peers set no
+            // rendezvous and never enter this block, so they cannot regress).
+            // The probed candidate's window may have elapsed; escalate NOW
+            // rather than retransmitting a doomed Init for the full
+            // HANDSHAKE_TOTAL_MS. Escalation supersedes the 2a retransmit arm
+            // below — we `continue`, so a peer is never both retransmitted (old
+            // target) AND escalated in the same tick.
+            if self.rendezvous.is_some()
+                && !self.peers[i].relay
+                && matches!(self.peers[i].state, PeerState::Handshaking(_))
+            {
+                let target = match &self.peers[i].state {
+                    PeerState::Handshaking(h) => h.target,
+                    _ => unreachable!("matched Handshaking above"),
+                };
+                match self.peers[i].path.advance(now_ms) {
+                    PathAction::Relay => {
+                        // Abandon the in-flight direct/punch handshake (drop its
+                        // ephemeral) and begin a relay handshake. `pending_tun`
+                        // is left intact — it drains when the relay session
+                        // completes (strictly better than the 90s-then-clear
+                        // give-up path).
+                        self.peers[i].state = PeerState::Idle;
+                        let server = self.server_addr();
+                        if let Some(dg) = self.begin_handshake(i, server, true, now_ms) {
+                            self.tick_egress.push(dg);
+                        }
+                        continue;
+                    }
+                    PathAction::Probe(addr) if addr != target => {
+                        // The SM chose a *different* candidate: re-target by
+                        // abandoning the current attempt and probing `addr`.
+                        self.peers[i].state = PeerState::Idle;
+                        if let Some(dg) = self.begin_handshake(i, addr, false, now_ms) {
+                            self.tick_egress.push(dg);
+                        }
+                        continue;
+                    }
+                    // Same target / NeedLookup / Idle / Failed: leave the
+                    // in-flight handshake alone; the retransmit arm below
+                    // handles it (do not double-send).
+                    _ => {}
+                }
+            }
+
             let relay = self.peers[i].relay;
             let old_state = std::mem::replace(&mut self.peers[i].state, PeerState::Idle);
             let new_state = match old_state {
@@ -1873,5 +1932,134 @@ mod tests {
         assert_eq!(pm.peers[0].endpoint, Some(endpoint));
         assert!(!pm.peers[0].relay);
         assert_eq!(pm.peers[0].path.stage(), PathStage::Direct);
+    }
+
+    /// (e) Escalation regression (the Critical fix): a rendezvous-only peer
+    /// driven to `Handshaking` on a punch candidate must escalate to the relay
+    /// at ~`PUNCH_MS` — NOT keep retransmitting the doomed punch `Init` for the
+    /// full `HANDSHAKE_TOTAL_MS` (90s). Pre-fix `tick` advanced the path SM only
+    /// for `Idle` peers, so a `Handshaking` peer froze; this test asserts a
+    /// relay-wrapped `Init` (a `RelaySend` to the server) is emitted just past
+    /// the punch window, and FAILS against the pre-fix code.
+    #[test]
+    fn punch_handshake_escalates_to_relay_at_punch_window_not_90s() {
+        use crate::path::PUNCH_MS;
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None, // rendezvous-only: starts in the Punching stage
+        };
+        let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
+
+        // Learn a reflexive candidate for the peer (arrives from the server).
+        let candidate: SocketAddr = "198.51.100.7:41000".parse().unwrap();
+        let mut buf = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PeerInfo {
+                node: node_id(&peer_kp.public),
+                reflexive: candidate,
+            },
+            &mut buf,
+        );
+        assert!(matches!(
+            pm.on_udp(mock_server(), &buf, 0),
+            DispatchOut::None
+        ));
+
+        // Tick once inside the punch window: the SM probes the candidate, so the
+        // peer transitions to Handshaking on a punch probe (dst = candidate).
+        let out = pm.tick(1).map(<[_]>::to_vec).unwrap_or_default();
+        assert!(
+            out.iter().any(|d| d.dst == candidate
+                && d.bytes.first() == Some(&(PacketType::HandshakeInit as u8))),
+            "punch Init is probed toward the candidate"
+        );
+        assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+        assert!(!pm.peers[0].relay);
+
+        // Tick just past the punch window (measured from the candidate/stage
+        // start at 0). Pre-fix: the Handshaking peer only retransmits to the
+        // candidate — NO server-addressed relay datagram appears until 90s.
+        // Post-fix: it escalates to the relay now.
+        let out = pm.tick(PUNCH_MS + 2).map(<[_]>::to_vec).unwrap_or_default();
+        let relayed = out.iter().find(|d| {
+            d.dst == mock_server()
+                && matches!(
+                    yip_rendezvous::decode(&d.bytes),
+                    Some(yip_rendezvous::Message::RelaySend { .. })
+                )
+        });
+        let relayed = relayed.expect(
+            "escalated to relay at ~PUNCH_MS: a RelaySend (relay-wrapped Init) is sent to the server",
+        );
+        // The relayed payload is the handshake Init itself.
+        if let Some(yip_rendezvous::Message::RelaySend { payload, .. }) =
+            yip_rendezvous::decode(&relayed.bytes)
+        {
+            assert_eq!(
+                payload.first(),
+                Some(&(PacketType::HandshakeInit as u8)),
+                "the relay-wrapped payload is a HandshakeInit"
+            );
+        } else {
+            unreachable!("matched RelaySend above");
+        }
+        // The escalation flipped the peer onto the relay, still handshaking.
+        assert!(pm.peers[0].relay, "peer is now relay-reached");
+        assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    }
+
+    /// (f) Anti-hijack over the relay: an `RdvEvent::Relayed` HandshakeInit whose
+    /// `src` maps to an ALREADY-`Established` peer must NOT disturb the live
+    /// session — the `on_relayed`/`relayed_handshake_init` Established-guard keeps
+    /// `relay`, `endpoint`, and the session (conn_tag) untouched. This fails if
+    /// either guard is removed (the peer would be flipped onto the relay).
+    #[test]
+    fn anti_hijack_established_peer_ignores_relayed_handshake_init() {
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let endpoint: SocketAddr = "10.0.0.2:51820".parse().unwrap();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: Some(endpoint),
+        };
+        let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
+
+        // Splice in a live direct session reaching `endpoint`.
+        const TAG: u64 = 0x1122_3344_5566_7788;
+        pm.peers[0].state =
+            PeerState::Established(Box::new(fake_established_dataplane(TAG, endpoint)));
+        pm.by_tag.insert(TAG, 0);
+        pm.peers[0].path_kind = Some(PathKind::Direct);
+        assert!(!pm.peers[0].relay);
+        let tag_before = established_tag(&pm, 0).expect("established");
+
+        // A valid HandshakeInit from the peer, delivered THROUGH the relay
+        // (RelayDeliver from the server, src = peer node).
+        let (_hs, init_pkt) =
+            HandshakeState::start_initiator(&peer_kp.private, &local.public).unwrap();
+        let mut buf = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::RelayDeliver {
+                src: node_id(&peer_kp.public),
+                payload: init_pkt,
+            },
+            &mut buf,
+        );
+        assert!(matches!(
+            pm.on_udp(mock_server(), &buf, 0),
+            DispatchOut::None
+        ));
+
+        // The live session is untouched: not flipped onto the relay, endpoint
+        // and conn_tag unchanged.
+        assert!(!pm.peers[0].relay, "relay flag must not be flipped");
+        assert_eq!(pm.peers[0].endpoint, Some(endpoint), "endpoint unchanged");
+        assert_eq!(
+            established_tag(&pm, 0),
+            Some(tag_before),
+            "session (conn_tag) unchanged"
+        );
     }
 }
