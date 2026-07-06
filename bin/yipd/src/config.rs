@@ -36,15 +36,8 @@ pub struct Config {
     /// Tunnel mode selected from `device_kind=tun|tap` (`tun` by default).
     pub device_kind: TunnelMode,
     /// Configured rendezvous+relay server, if any (`rendezvous=<IP:port>`).
-    /// Not yet consumed outside tests — Task 6 wires this into
-    /// `PeerManager`/`ConfiguredServerRendezvous`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read by config tests today; wired into the rendezvous client in Task 6"
-        )
-    )]
+    /// Enables lazy Direct→Punch→Relay peer bring-up in `PeerManager` via
+    /// `ConfiguredServerRendezvous`.
     pub rendezvous: Option<SocketAddr>,
 }
 

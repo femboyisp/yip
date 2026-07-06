@@ -74,12 +74,15 @@ use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddr};
 
 use yip_io::poll::{Dispatch, DispatchOut, EgressDatagram};
+use yip_rendezvous::{node_id, NodeId};
 
 use crate::addr::node_addr;
 use crate::config::PeerConfig;
 use crate::dataplane::{conn_tag_from_keys, DataPlane, Outcome};
 use crate::handshake::{HandshakeState, PacketType};
 use crate::mode::TunnelMode;
+use crate::path::{PathAction, PathKind, PathStage, PathState};
+use crate::rendezvous::{RdvEvent, Rendezvous};
 
 /// How long an in-flight initiator handshake waits before resending
 /// `[HandshakeInit]`.
@@ -100,6 +103,16 @@ const HANDSHAKE_RETRY_MS: u64 = 1_000;
 /// matching the responder's cached session, so ordinary handshake-packet loss
 /// is overcome by retransmission rather than wedging the peer permanently.
 const HANDSHAKE_TOTAL_MS: u64 = 90_000;
+
+/// How often (ms) we re-emit `register(local_node_id)` to the rendezvous
+/// server so it keeps our reflexive UDP binding fresh (only when a rendezvous
+/// server is configured).
+const REG_REFRESH_MS: u64 = 20_000;
+
+/// Minimum spacing (ms) between successive `lookup` datagrams for the same
+/// peer while it is still searching for a candidate — debounces the
+/// `NeedLookup` action so `tick`/`on_tun` do not spam the server every call.
+const LOOKUP_INTERVAL_MS: u64 = 1_000;
 
 /// Cap on TUN packets buffered per peer while its handshake is in flight.
 /// Bounds memory when a peer streams into an unestablished (or unreachable)
@@ -126,6 +139,12 @@ struct HandshakingState {
     /// drawn once, in `start_initiator`'s `write_message`, and the peer must
     /// see that exact message again (not a fresh one) on retry.
     init_pkt: Vec<u8>,
+    /// The address this `Init` is being probed toward (the path SM's chosen
+    /// candidate: the configured endpoint for a Direct probe, a reflexive
+    /// candidate for a Punch probe, or the rendezvous server for a Relay
+    /// probe). Retransmits target this address (or are relay-wrapped when the
+    /// peer is `relay`).
+    target: SocketAddr,
 }
 
 /// One remote peer's handshake/session state.
@@ -169,6 +188,26 @@ struct Peer {
     /// the responder step again — see `handle_handshake_init`. `None` when we
     /// have no session, or hold one we built as the initiator.
     cached_resp: Option<Vec<u8>>,
+    /// This peer's self-certifying rendezvous node id (`node_id(pubkey)`),
+    /// used to `lookup`/`relay` for it and to demux `RdvEvent`s back to it.
+    node: NodeId,
+    /// Per-peer connection path state machine (Direct → Punch → Relay). Only
+    /// consulted when a rendezvous server is configured; with no rendezvous a
+    /// peer's direct endpoint is probed exactly as in 2a and this SM is never
+    /// advanced.
+    path: PathState,
+    /// The committed path kind, set once a handshake completes. `None` until
+    /// the session is established. Drives relay egress re-wrap for `Relayed`.
+    path_kind: Option<PathKind>,
+    /// Whether this peer is currently reached via the relay (server) rather
+    /// than directly: every egress datagram for it (handshake and data plane)
+    /// is wrapped through `rendezvous.relay`. Set on a Relay-stage probe or on
+    /// admitting a relayed handshake; only mutated while the peer is
+    /// non-`Established` (anti-hijack).
+    relay: bool,
+    /// When we last emitted a `lookup` for this peer (debounces `NeedLookup`);
+    /// `None` until the first lookup is sent.
+    last_lookup_ms: Option<u64>,
 }
 
 /// Multi-peer router/demuxer + lazy in-loop handshake driver.
@@ -193,6 +232,22 @@ pub struct PeerManager {
     /// `node_addr -> peers index`, populated at construction (addresses are
     /// derived from each peer's configured public key and never change).
     by_addr: HashMap<Ipv6Addr, usize>,
+    /// `node_id -> peers index`, populated at construction. Used to demux
+    /// `RdvEvent`s (which are keyed by rendezvous node id) back to a peer.
+    by_node: HashMap<NodeId, usize>,
+    /// The configured rendezvous+relay client, or `None` for a pure-2a
+    /// (direct-only) deployment. When `None`, `on_udp`/`on_tun`/`tick` never
+    /// consult the path SM and behave byte-identically to 2a.
+    rendezvous: Option<Box<dyn Rendezvous>>,
+    /// This node's own rendezvous node id (`node_id(local_pub)`), the `src`
+    /// for `register`/`relay`.
+    local_node_id: NodeId,
+    /// When we last emitted `register(local_node_id)` (see [`REG_REFRESH_MS`]).
+    last_register_ms: u64,
+    /// Whether we have registered at least once (so the first `tick` registers
+    /// promptly rather than waiting a full [`REG_REFRESH_MS`] interval — the
+    /// loop clock starts at 0).
+    registered_once: bool,
     /// Reused scratch for `on_udp`/`on_tun` return values.
     egress: Vec<EgressDatagram>,
     /// Reused scratch for `tick`'s return value.
@@ -215,12 +270,24 @@ impl PeerManager {
         local_pub: [u8; 32],
         peers_cfg: &[PeerConfig],
         mode: TunnelMode,
+        rendezvous: Option<Box<dyn Rendezvous>>,
     ) -> Self {
+        let has_rendezvous = rendezvous.is_some();
         let mut peers = Vec::with_capacity(peers_cfg.len());
         let mut by_addr = HashMap::with_capacity(peers_cfg.len());
+        let mut by_node = HashMap::with_capacity(peers_cfg.len());
         for (i, p) in peers_cfg.iter().enumerate() {
             let addr = node_addr(&p.public_key);
             by_addr.insert(addr, i);
+            let node = node_id(&p.public_key);
+            by_node.insert(node, i);
+            // A peer with a configured endpoint starts in the Direct stage with
+            // that endpoint seeded; a rendezvous-only peer starts in Punching
+            // (if a server is configured) or Failed. See `PathState::new`.
+            let mut path = PathState::new(p.endpoint.is_some(), has_rendezvous, 0);
+            if let Some(ep) = p.endpoint {
+                path.on_direct_addr(ep);
+            }
             peers.push(Peer {
                 pubkey: p.public_key,
                 addr,
@@ -228,6 +295,11 @@ impl PeerManager {
                 state: PeerState::Idle,
                 pending_tun: Vec::new(),
                 cached_resp: None,
+                node,
+                path,
+                path_kind: None,
+                relay: false,
+                last_lookup_ms: None,
             });
         }
         Self {
@@ -237,6 +309,11 @@ impl PeerManager {
             peers,
             by_tag: HashMap::new(),
             by_addr,
+            by_node,
+            rendezvous,
+            local_node_id: node_id(&local_pub),
+            last_register_ms: 0,
+            registered_once: false,
             egress: Vec::new(),
             tick_egress: Vec::new(),
             tun_scratch: Vec::new(),
@@ -247,6 +324,362 @@ impl PeerManager {
     /// local TUN/TAP device's address.
     pub fn local_addr(&self) -> Ipv6Addr {
         node_addr(&self.local_pub)
+    }
+
+    // ── rendezvous / path helpers ─────────────────────────────────────────
+
+    /// The configured rendezvous server address (only meaningful when a
+    /// rendezvous is configured; falls back to the unspecified address).
+    fn server_addr(&self) -> SocketAddr {
+        self.rendezvous
+            .as_ref()
+            .map(|r| r.server_addr())
+            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)))
+    }
+
+    /// Map a path stage to the committed [`PathKind`] for a session that
+    /// completes while in that stage. `Relayed` peers are committed
+    /// explicitly (they never sit in the `Relaying` *stage* when admitted via
+    /// a relayed handshake), so `Relaying`/`Failed` fall back to `Punched`.
+    fn kind_for_stage(stage: PathStage) -> PathKind {
+        match stage {
+            PathStage::Direct => PathKind::Direct,
+            PathStage::Punching => PathKind::Punched,
+            PathStage::Relaying | PathStage::Failed => PathKind::Punched,
+        }
+    }
+
+    /// Wrap a raw egress datagram destined for peer `idx` through the relay
+    /// (`rendezvous.relay(local, peer_node, raw)` → dst = server). Returns
+    /// `None` if no rendezvous is configured (should not happen for a peer
+    /// marked `relay`).
+    fn relay_wrap(&mut self, idx: usize, raw: Vec<u8>) -> Option<EgressDatagram> {
+        let node = self.peers[idx].node;
+        let local = self.local_node_id;
+        self.rendezvous.as_mut().map(|r| r.relay(local, node, &raw))
+    }
+
+    /// Start a fresh initiator handshake toward `target` for peer `idx`,
+    /// returning the framed egress datagram to send (relay-wrapped when
+    /// `via_relay`). Transitions the peer to `Handshaking`. Returns `None`
+    /// (leaving the peer as it was) if the Noise step or the relay wrap fails.
+    ///
+    /// The caller is responsible for only invoking this on a peer that is not
+    /// already `Handshaking`/`Established`.
+    fn begin_handshake(
+        &mut self,
+        idx: usize,
+        target: SocketAddr,
+        via_relay: bool,
+        now_ms: u64,
+    ) -> Option<EgressDatagram> {
+        let pubkey = self.peers[idx].pubkey;
+        let (hs, init_pkt) = match HandshakeState::start_initiator(&self.local_priv, &pubkey) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("peer_manager: failed to start handshake: {e}");
+                return None;
+            }
+        };
+        let dg = if via_relay {
+            self.relay_wrap(idx, init_pkt.clone())?
+        } else {
+            EgressDatagram {
+                fate: 0,
+                dst: target,
+                bytes: init_pkt.clone(),
+            }
+        };
+        if via_relay {
+            self.peers[idx].relay = true;
+        } else {
+            // Direct/Punch probe: route this peer's traffic (and the
+            // `[HandshakeResp]` match in `handle_handshake_resp`) to `target`.
+            self.peers[idx].endpoint = Some(target);
+        }
+        self.peers[idx].state = PeerState::Handshaking(Box::new(HandshakingState {
+            hs,
+            started_ms: now_ms,
+            last_sent_ms: now_ms,
+            retries: 0,
+            init_pkt,
+            target,
+        }));
+        Some(dg)
+    }
+
+    /// Emit a `lookup(peer_node)` for peer `idx`, debounced to at most one per
+    /// [`LOOKUP_INTERVAL_MS`]. Returns `None` if throttled or no rendezvous.
+    fn maybe_lookup(&mut self, idx: usize, now_ms: u64) -> Option<EgressDatagram> {
+        let due = match self.peers[idx].last_lookup_ms {
+            None => true,
+            Some(t) => now_ms.saturating_sub(t) >= LOOKUP_INTERVAL_MS,
+        };
+        if !due {
+            return None;
+        }
+        let node = self.peers[idx].node;
+        let dg = self.rendezvous.as_mut().map(|r| r.lookup(node))?;
+        self.peers[idx].last_lookup_ms = Some(now_ms);
+        Some(dg)
+    }
+
+    /// Drive the path SM for a non-`Established`, non-`Handshaking` (i.e.
+    /// `Idle`) peer `idx` and act on the resulting [`PathAction`], pushing any
+    /// egress into `tick_egress`. Only called when a rendezvous is configured.
+    fn drive_path_idle(&mut self, idx: usize, now_ms: u64) {
+        match self.peers[idx].path.advance(now_ms) {
+            PathAction::Probe(addr) => {
+                if let Some(dg) = self.begin_handshake(idx, addr, false, now_ms) {
+                    self.tick_egress.push(dg);
+                }
+            }
+            PathAction::Relay => {
+                let server = self.server_addr();
+                if let Some(dg) = self.begin_handshake(idx, server, true, now_ms) {
+                    self.tick_egress.push(dg);
+                }
+            }
+            PathAction::NeedLookup => {
+                if let Some(dg) = self.maybe_lookup(idx, now_ms) {
+                    self.tick_egress.push(dg);
+                }
+            }
+            PathAction::Idle | PathAction::Failed => {}
+        }
+    }
+
+    /// Demux a datagram that arrived from the rendezvous server: parse it into
+    /// an [`RdvEvent`] and drive the path SM / relay path accordingly. Every
+    /// mutation is guarded to affect only a non-`Established` peer
+    /// (anti-hijack): a live session's committed egress target is never
+    /// redirected by an unauthenticated server message.
+    fn on_rdv(&mut self, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
+        let ev = match self.rendezvous.as_ref() {
+            Some(r) => r.parse(dg),
+            None => return DispatchOut::None,
+        };
+        match ev {
+            RdvEvent::PeerCandidate { node, addr } => {
+                if let Some(&idx) = self.by_node.get(&node) {
+                    if !matches!(self.peers[idx].state, PeerState::Established(_)) {
+                        self.peers[idx].path.on_peer_candidate(addr, now_ms);
+                    }
+                }
+                DispatchOut::None
+            }
+            RdvEvent::PunchTo { node, addr } => {
+                if let Some(&idx) = self.by_node.get(&node) {
+                    if !matches!(self.peers[idx].state, PeerState::Established(_)) {
+                        self.peers[idx].path.on_peer_candidate(addr, now_ms);
+                        // Open our own binding toward `addr` immediately so the
+                        // two NATs punch simultaneously — but only if we are not
+                        // already probing (keep the in-flight ephemeral).
+                        if matches!(self.peers[idx].state, PeerState::Idle) {
+                            if let Some(dg) = self.begin_handshake(idx, addr, false, now_ms) {
+                                self.egress.clear();
+                                self.egress.push(dg);
+                                return DispatchOut::Udp(&self.egress);
+                            }
+                        }
+                    }
+                }
+                DispatchOut::None
+            }
+            RdvEvent::Relayed { src, payload } => self.on_relayed(src, &payload, now_ms),
+            RdvEvent::NotFound { .. } | RdvEvent::Ignored => DispatchOut::None,
+        }
+    }
+
+    /// Process a peer datagram delivered *through the relay* (`RdvEvent::Relayed`):
+    /// it is a handshake or data-plane packet from `src_node`, and any egress it
+    /// produces must go back out through the relay (dst = server). Mirrors the
+    /// direct `on_udp` demux but relay-wraps replies and commits `Relayed`.
+    fn on_relayed(&mut self, src_node: NodeId, payload: &[u8], now_ms: u64) -> DispatchOut<'_> {
+        if payload.is_empty() {
+            return DispatchOut::None;
+        }
+        let Some(&idx) = self.by_node.get(&src_node) else {
+            return DispatchOut::None;
+        };
+        // Mark this peer as relay-reached before producing any egress — but only
+        // while it is not Established (anti-hijack: never re-route a live
+        // session onto the relay from an unauthenticated server message).
+        if !matches!(self.peers[idx].state, PeerState::Established(_)) {
+            self.peers[idx].relay = true;
+        }
+
+        if payload[0] == PacketType::HandshakeInit as u8 {
+            self.relayed_handshake_init(idx, payload, now_ms)
+        } else if payload[0] == PacketType::HandshakeResp as u8 {
+            self.relayed_handshake_resp(idx, payload, now_ms)
+        } else {
+            self.relayed_data(idx, payload, now_ms)
+        }
+    }
+
+    /// Relay-path counterpart of [`handle_handshake_init`]: admit a relayed
+    /// `[HandshakeInit]` from peer `idx`, reply and drain via the relay, and
+    /// commit `PathKind::Relayed`.
+    fn relayed_handshake_init(&mut self, idx: usize, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
+        let (established, resp_pkt, remote_static) =
+            match HandshakeState::start_responder(&self.local_priv, dg) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("peer_manager: relayed start_responder failed: {e}");
+                    return DispatchOut::None;
+                }
+            };
+        if remote_static != self.peers[idx].pubkey {
+            return DispatchOut::None;
+        }
+
+        match &self.peers[idx].state {
+            PeerState::Established(_) => match self.peers[idx].cached_resp.clone() {
+                Some(resp) => {
+                    self.egress.clear();
+                    if let Some(d) = self.relay_wrap(idx, resp) {
+                        self.egress.push(d);
+                    }
+                    DispatchOut::Udp(&self.egress)
+                }
+                None => DispatchOut::None,
+            },
+            PeerState::Handshaking(_) if self.local_pub < self.peers[idx].pubkey => {
+                DispatchOut::None
+            }
+            PeerState::Idle | PeerState::Handshaking(_) => {
+                let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
+                // A relay peer's egress is always re-wrapped, so the DataPlane's
+                // stamped `dst` is unused: seed it with the server address.
+                let placeholder = self.server_addr();
+                let mut dp = Box::new(DataPlane::new(
+                    established,
+                    conn_tag,
+                    self.mode,
+                    placeholder,
+                ));
+
+                self.peers[idx].cached_resp = Some(resp_pkt.clone());
+                self.peers[idx].relay = true;
+                self.peers[idx].path.committed(PathKind::Relayed);
+                self.peers[idx].path_kind = Some(PathKind::Relayed);
+                self.by_tag.insert(dp.conn_tag(), idx);
+
+                self.egress.clear();
+                if let Some(d) = self.relay_wrap(idx, resp_pkt) {
+                    self.egress.push(d);
+                }
+                let pending = std::mem::take(&mut self.peers[idx].pending_tun);
+                let mut owned: Vec<Vec<u8>> = Vec::new();
+                for inner in &pending {
+                    owned.extend(
+                        dp.on_tun_packet(inner, now_ms)
+                            .iter()
+                            .map(|d| d.bytes.clone()),
+                    );
+                }
+                self.peers[idx].state = PeerState::Established(dp);
+                for b in owned {
+                    if let Some(d) = self.relay_wrap(idx, b) {
+                        self.egress.push(d);
+                    }
+                }
+                DispatchOut::Udp(&self.egress)
+            }
+        }
+    }
+
+    /// Relay-path counterpart of [`handle_handshake_resp`]: complete a relayed
+    /// `[HandshakeResp]` from peer `idx` and commit `PathKind::Relayed`.
+    fn relayed_handshake_resp(&mut self, idx: usize, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
+        if !matches!(self.peers[idx].state, PeerState::Handshaking(_)) {
+            return DispatchOut::None;
+        }
+        let old_state = std::mem::replace(&mut self.peers[idx].state, PeerState::Idle);
+        let PeerState::Handshaking(handshaking) = old_state else {
+            unreachable!("just matched Handshaking above");
+        };
+        match handshaking.hs.read_response(dg) {
+            Ok(established) => {
+                let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
+                let placeholder = self.server_addr();
+                let mut dp = Box::new(DataPlane::new(
+                    established,
+                    conn_tag,
+                    self.mode,
+                    placeholder,
+                ));
+                self.by_tag.insert(dp.conn_tag(), idx);
+                self.peers[idx].relay = true;
+                self.peers[idx].path.committed(PathKind::Relayed);
+                self.peers[idx].path_kind = Some(PathKind::Relayed);
+
+                self.egress.clear();
+                let pending = std::mem::take(&mut self.peers[idx].pending_tun);
+                let mut owned: Vec<Vec<u8>> = Vec::new();
+                for inner in &pending {
+                    owned.extend(
+                        dp.on_tun_packet(inner, now_ms)
+                            .iter()
+                            .map(|d| d.bytes.clone()),
+                    );
+                }
+                self.peers[idx].state = PeerState::Established(dp);
+                for b in owned {
+                    if let Some(d) = self.relay_wrap(idx, b) {
+                        self.egress.push(d);
+                    }
+                }
+                if self.egress.is_empty() {
+                    DispatchOut::None
+                } else {
+                    DispatchOut::Udp(&self.egress)
+                }
+            }
+            Err(e) => {
+                eprintln!("peer_manager: relayed read_response failed: {e}");
+                DispatchOut::None
+            }
+        }
+    }
+
+    /// Relay-path counterpart of the `Data`/`Control` demux: dispatch a relayed
+    /// data-plane datagram to peer `idx`'s `DataPlane` and relay-wrap any UDP
+    /// egress it produces (TUN writes still go to the local device).
+    fn relayed_data(&mut self, idx: usize, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
+        let (tun, udp): (Option<Vec<u8>>, Vec<Vec<u8>>) = {
+            let PeerState::Established(dp) = &mut self.peers[idx].state else {
+                return DispatchOut::None;
+            };
+            match dp.on_udp_datagram(dg, now_ms) {
+                Outcome::None => (None, Vec::new()),
+                Outcome::TunWrite(buf) => (Some(buf.to_vec()), Vec::new()),
+                Outcome::Send(pkts) => (None, pkts.iter().map(|d| d.bytes.clone()).collect()),
+                Outcome::TunWriteThenSend(buf, pkts) => (
+                    Some(buf.to_vec()),
+                    pkts.iter().map(|d| d.bytes.clone()).collect(),
+                ),
+            }
+        };
+        self.egress.clear();
+        for b in udp {
+            if let Some(d) = self.relay_wrap(idx, b) {
+                self.egress.push(d);
+            }
+        }
+        match (tun, self.egress.is_empty()) {
+            (Some(t), true) => {
+                self.tun_scratch = t;
+                DispatchOut::Tun(&self.tun_scratch)
+            }
+            (Some(t), false) => {
+                self.tun_scratch = t;
+                DispatchOut::Both(&self.tun_scratch, &self.egress)
+            }
+            (None, false) => DispatchOut::Udp(&self.egress),
+            (None, true) => DispatchOut::None,
+        }
     }
 
     /// Append a TUN packet to a peer's pending buffer, dropping the oldest if
@@ -465,6 +898,13 @@ impl PeerManager {
                 self.peers[idx].endpoint = Some(src); // learn the observed endpoint
                 self.peers[idx].cached_resp = Some(resp_pkt.clone());
                 self.by_tag.insert(dp.conn_tag(), idx);
+                // Commit the path we completed over. `src` is a direct address
+                // (this arm is only reached for non-relayed inits — relayed
+                // inits go through `relayed_handshake_init`), so the kind is
+                // Direct (stage Direct) or Punched (stage Punching).
+                let kind = Self::kind_for_stage(self.peers[idx].path.stage());
+                self.peers[idx].path.committed(kind);
+                self.peers[idx].path_kind = Some(kind);
 
                 self.egress.clear();
                 self.egress.push(EgressDatagram {
@@ -513,6 +953,13 @@ impl PeerManager {
                 // is exactly this peer's endpoint.
                 let mut dp = Box::new(DataPlane::new(established, conn_tag, self.mode, src));
                 self.by_tag.insert(dp.conn_tag(), idx);
+                // `src` == this peer's `endpoint` (matched above). Commit the
+                // path stage we completed over (Direct or Punched); a relayed
+                // resp is handled by `relayed_handshake_resp` instead.
+                self.peers[idx].endpoint = Some(src);
+                let kind = Self::kind_for_stage(self.peers[idx].path.stage());
+                self.peers[idx].path.committed(kind);
+                self.peers[idx].path_kind = Some(kind);
 
                 self.egress.clear();
                 let pending = std::mem::take(&mut self.peers[idx].pending_tun);
@@ -544,6 +991,14 @@ impl Dispatch for PeerManager {
         if dg.is_empty() {
             return DispatchOut::None;
         }
+        // Rendezvous-server demux: a datagram from the configured server is a
+        // control/relay message, not peer traffic. Skipped entirely when no
+        // rendezvous is configured (pure-2a: no server-addr check at all).
+        if let Some(server) = self.rendezvous.as_ref().map(|r| r.server_addr()) {
+            if src == server {
+                return self.on_rdv(dg, now_ms);
+            }
+        }
         if dg[0] == PacketType::HandshakeInit as u8 {
             self.handle_handshake_init(src, dg, now_ms)
         } else if dg[0] == PacketType::HandshakeResp as u8 {
@@ -566,10 +1021,33 @@ impl Dispatch for PeerManager {
         // other arm that also touches `self.peers[idx]`. Splitting into
         // independent statements gives each one its own borrow region.
         if matches!(self.peers[idx].state, PeerState::Established(_)) {
-            let PeerState::Established(dp) = &mut self.peers[idx].state else {
-                unreachable!("just matched Established above");
+            // A relay-reached peer's data-plane egress must be re-wrapped
+            // through the server (dst = server); copy the bytes out first (the
+            // DataPlane borrows `self.peers[idx]`) then wrap. A direct/punched
+            // peer's datagrams already carry the correct `dst` — return them
+            // borrowed, byte-identical to 2a.
+            if !self.peers[idx].relay {
+                let PeerState::Established(dp) = &mut self.peers[idx].state else {
+                    unreachable!("just matched Established above");
+                };
+                return dp.on_tun_packet(inner, now_ms);
+            }
+            let owned: Vec<Vec<u8>> = {
+                let PeerState::Established(dp) = &mut self.peers[idx].state else {
+                    unreachable!("just matched Established above");
+                };
+                dp.on_tun_packet(inner, now_ms)
+                    .iter()
+                    .map(|d| d.bytes.clone())
+                    .collect()
             };
-            return dp.on_tun_packet(inner, now_ms);
+            self.egress.clear();
+            for b in owned {
+                if let Some(d) = self.relay_wrap(idx, b) {
+                    self.egress.push(d);
+                }
+            }
+            return &self.egress;
         }
 
         if matches!(self.peers[idx].state, PeerState::Handshaking(_)) {
@@ -577,48 +1055,75 @@ impl Dispatch for PeerManager {
             return &[];
         }
 
-        // Idle: buffer this packet and kick off a lazy handshake — but only if
-        // we have a direct endpoint to target. A peer configured with no
-        // `endpoint` (rendezvous-only) has no direct candidate yet; it stays
-        // `Idle` with its packet buffered until Task 6 supplies one via the
-        // rendezvous path.
+        // Idle: buffer this packet and decide how to bring the peer up.
         Self::push_pending(&mut self.peers[idx].pending_tun, inner);
-        let Some(peer_endpoint) = self.peers[idx].endpoint else {
-            return &[];
+        // With no rendezvous configured, behave exactly as 2a: probe the
+        // configured endpoint if there is one (else the peer is unreachable and
+        // the packet stays buffered). With a rendezvous configured, ask the
+        // path SM which candidate/action to take.
+        let action = if self.rendezvous.is_some() {
+            self.peers[idx].path.advance(now_ms)
+        } else {
+            match self.peers[idx].endpoint {
+                Some(ep) => PathAction::Probe(ep),
+                None => PathAction::Idle,
+            }
         };
-        match HandshakeState::start_initiator(&self.local_priv, &self.peers[idx].pubkey) {
-            Ok((hs, init_pkt)) => {
+        let dg = match action {
+            PathAction::Probe(addr) => self.begin_handshake(idx, addr, false, now_ms),
+            PathAction::Relay => {
+                let server = self.server_addr();
+                self.begin_handshake(idx, server, true, now_ms)
+            }
+            PathAction::NeedLookup => self.maybe_lookup(idx, now_ms),
+            PathAction::Idle | PathAction::Failed => None,
+        };
+        match dg {
+            Some(d) => {
                 self.egress.clear();
-                self.egress.push(EgressDatagram {
-                    fate: 0,
-                    dst: peer_endpoint,
-                    bytes: init_pkt.clone(),
-                });
-                self.peers[idx].state = PeerState::Handshaking(Box::new(HandshakingState {
-                    hs,
-                    started_ms: now_ms,
-                    last_sent_ms: now_ms,
-                    retries: 0,
-                    init_pkt,
-                }));
+                self.egress.push(d);
                 &self.egress
             }
-            Err(e) => {
-                eprintln!("peer_manager: failed to start handshake: {e}");
-                &[]
-            }
+            None => &[],
         }
     }
 
     fn tick(&mut self, now_ms: u64) -> Option<&[EgressDatagram]> {
         self.tick_egress.clear();
+
+        // ── registration refresh ──────────────────────────────────────────
+        // Keep our reflexive binding fresh on the server so peers can find us.
+        if self.rendezvous.is_some()
+            && (!self.registered_once
+                || now_ms.saturating_sub(self.last_register_ms) >= REG_REFRESH_MS)
+        {
+            let node = self.local_node_id;
+            if let Some(r) = self.rendezvous.as_mut() {
+                self.tick_egress.push(r.register(node));
+            }
+            self.last_register_ms = now_ms;
+            self.registered_once = true;
+        }
+
         for i in 0..self.peers.len() {
-            let endpoint = self.peers[i].endpoint;
+            let relay = self.peers[i].relay;
             let old_state = std::mem::replace(&mut self.peers[i].state, PeerState::Idle);
             let new_state = match old_state {
                 PeerState::Established(mut dp) => {
                     if let Some(pkts) = dp.tick(now_ms) {
-                        self.tick_egress.extend(pkts.iter().cloned());
+                        if relay {
+                            // Relay-reached peer: re-wrap each datagram through
+                            // the server. Copy bytes out (borrow ends) then wrap.
+                            let owned: Vec<Vec<u8>> =
+                                pkts.iter().map(|d| d.bytes.clone()).collect();
+                            for b in owned {
+                                if let Some(d) = self.relay_wrap(i, b) {
+                                    self.tick_egress.push(d);
+                                }
+                            }
+                        } else {
+                            self.tick_egress.extend(pkts.iter().cloned());
+                        }
                     }
                     PeerState::Established(dp)
                 }
@@ -634,16 +1139,19 @@ impl Dispatch for PeerManager {
                     } else {
                         // Retransmit the SAME init (same ephemeral) so the
                         // responder's cached reply stays valid — see
-                        // HANDSHAKE_TOTAL_MS. A peer only ever reaches
-                        // `Handshaking` via `on_tun`'s `Idle` branch, which
-                        // requires `endpoint` to be `Some` — see that branch's
-                        // doc comment — so `endpoint` is still `Some` here.
+                        // HANDSHAKE_TOTAL_MS. Relay-reached peers re-wrap the
+                        // retransmit through the server; direct/punched peers
+                        // target the probed `target` address.
                         handshaking.retries = handshaking.retries.saturating_add(1);
                         handshaking.last_sent_ms = now_ms;
-                        if let Some(dst) = endpoint {
+                        if relay {
+                            if let Some(d) = self.relay_wrap(i, handshaking.init_pkt.clone()) {
+                                self.tick_egress.push(d);
+                            }
+                        } else {
                             self.tick_egress.push(EgressDatagram {
                                 fate: 0,
-                                dst,
+                                dst: handshaking.target,
                                 bytes: handshaking.init_pkt.clone(),
                             });
                         }
@@ -654,6 +1162,21 @@ impl Dispatch for PeerManager {
             };
             self.peers[i].state = new_state;
         }
+
+        // ── proactive path advancement ────────────────────────────────────
+        // Only with a rendezvous configured (pure-2a `tick` is byte-identical
+        // to before this block). For each Idle peer, drive the path SM: probe a
+        // learned candidate, request a lookup, or escalate to relay — this is
+        // what brings up a rendezvous-only (endpoint:None) peer, and keeps
+        // hole-punching proactive rather than waiting on TUN traffic.
+        if self.rendezvous.is_some() {
+            for i in 0..self.peers.len() {
+                if matches!(self.peers[i].state, PeerState::Idle) {
+                    self.drive_path_idle(i, now_ms);
+                }
+            }
+        }
+
         if self.tick_egress.is_empty() {
             None
         } else {
@@ -725,6 +1248,7 @@ mod tests {
             [8u8; 32],
             &[peer_a.clone(), peer_b.clone()],
             TunnelMode::L3Tun,
+            None,
         );
 
         let addr_a = node_addr(&peer_a.public_key);
@@ -744,6 +1268,7 @@ mod tests {
             [8u8; 32],
             &[peer_a.clone(), peer_b.clone()],
             TunnelMode::L3Tun,
+            None,
         );
         let addr_b = node_addr(&peer_b.public_key);
 
@@ -760,7 +1285,7 @@ mod tests {
         // Mirrors the existing single-peer netns tests, which assign plain
         // IPv4 addresses to the TUN device (not the IPv6 mesh address).
         let peer_a = peer_cfg(1, "10.0.0.1:1000");
-        let pm = PeerManager::new([9u8; 32], [8u8; 32], &[peer_a], TunnelMode::L3Tun);
+        let pm = PeerManager::new([9u8; 32], [8u8; 32], &[peer_a], TunnelMode::L3Tun, None);
 
         // A bare IPv4 packet: first nibble is 4, not 6.
         let inner = vec![0x45u8; 40];
@@ -771,7 +1296,13 @@ mod tests {
     fn route_tun_index_l3_ambiguous_multi_peer_drops() {
         let peer_a = peer_cfg(1, "10.0.0.1:1000");
         let peer_b = peer_cfg(2, "10.0.0.2:2000");
-        let pm = PeerManager::new([9u8; 32], [8u8; 32], &[peer_a, peer_b], TunnelMode::L3Tun);
+        let pm = PeerManager::new(
+            [9u8; 32],
+            [8u8; 32],
+            &[peer_a, peer_b],
+            TunnelMode::L3Tun,
+            None,
+        );
 
         let inner = vec![0x45u8; 40]; // IPv4, matches no by_addr entry
         assert_eq!(pm.route_tun_index(&inner), None);
@@ -780,7 +1311,7 @@ mod tests {
     #[test]
     fn route_tun_index_l2_single_peer_forwards_regardless_of_inner() {
         let peer_a = peer_cfg(1, "10.0.0.1:1000");
-        let pm = PeerManager::new([9u8; 32], [8u8; 32], &[peer_a], TunnelMode::L2Tap);
+        let pm = PeerManager::new([9u8; 32], [8u8; 32], &[peer_a], TunnelMode::L2Tap, None);
 
         // An arbitrary Ethernet-looking frame; L2 mode ignores its contents
         // entirely and forwards to the sole configured peer.
@@ -797,6 +1328,7 @@ mod tests {
             [8u8; 32],
             &[peer_a.clone(), peer_b.clone()],
             TunnelMode::L3Tun,
+            None,
         );
 
         // by_addr maps each peer's node_addr to its index.
@@ -849,6 +1381,7 @@ mod tests {
             local_kp.public,
             &[peer_a],
             TunnelMode::L3Tun,
+            None,
         );
 
         // A valid HandshakeInit from a real, but unconfigured, key.
@@ -867,7 +1400,7 @@ mod tests {
     #[test]
     fn local_addr_matches_node_addr_of_local_pub() {
         let local_pub = [42u8; 32];
-        let pm = PeerManager::new([1u8; 32], local_pub, &[], TunnelMode::L3Tun);
+        let pm = PeerManager::new([1u8; 32], local_pub, &[], TunnelMode::L3Tun, None);
         assert_eq!(pm.local_addr(), node_addr(&local_pub));
     }
 
@@ -918,8 +1451,10 @@ mod tests {
             public_key: kp_a.public,
             endpoint: Some(ep_a),
         };
-        let mut pm_a = PeerManager::new(kp_a.private, kp_a.public, &[cfg_b], TunnelMode::L3Tun);
-        let mut pm_b = PeerManager::new(kp_b.private, kp_b.public, &[cfg_a], TunnelMode::L3Tun);
+        let mut pm_a =
+            PeerManager::new(kp_a.private, kp_a.public, &[cfg_b], TunnelMode::L3Tun, None);
+        let mut pm_b =
+            PeerManager::new(kp_b.private, kp_b.public, &[cfg_a], TunnelMode::L3Tun, None);
 
         // Each side sends a HandshakeInit (triggered by its own outbound TUN
         // traffic) before hearing from the other — the glare.
@@ -970,7 +1505,8 @@ mod tests {
             public_key: kp_i.public,
             endpoint: Some(ep_i),
         };
-        let mut pm_r = PeerManager::new(kp_r.private, kp_r.public, &[cfg_i], TunnelMode::L3Tun);
+        let mut pm_r =
+            PeerManager::new(kp_r.private, kp_r.public, &[cfg_i], TunnelMode::L3Tun, None);
 
         // The initiator's HandshakeInit (built out-of-band, as if received).
         let (_hs, init_pkt) = HandshakeState::start_initiator(&kp_i.private, &kp_r.public).unwrap();
@@ -1009,6 +1545,7 @@ mod tests {
             kp_local.public,
             &[peer],
             TunnelMode::L3Tun,
+            None,
         );
 
         // Kick off a lazy handshake with an outbound TUN packet.
@@ -1066,6 +1603,7 @@ mod tests {
             kp_local.public,
             &[peer],
             TunnelMode::L3Tun,
+            None,
         );
 
         // Stream far more packets than the cap while the peer is Handshaking.
@@ -1077,5 +1615,263 @@ mod tests {
             pm.peers[0].pending_tun.len() <= MAX_PENDING_TUN,
             "pending buffer must stay capped at MAX_PENDING_TUN"
         );
+    }
+
+    // ── rendezvous wiring (mock Rendezvous) ───────────────────────────────
+
+    /// A mock `Rendezvous` that records the messages it is asked to send (so a
+    /// test can assert on them) and parses injected server datagrams the same
+    /// way `ConfiguredServerRendezvous` does. `parse` reuses the real decoder,
+    /// so a test injects an event by `encode`-ing a `Message` and feeding it to
+    /// `on_udp(server, ..)`.
+    struct MockRdv {
+        server: SocketAddr,
+        sent: std::rc::Rc<std::cell::RefCell<Vec<yip_rendezvous::Message>>>,
+    }
+
+    impl MockRdv {
+        fn to_server(&self, msg: yip_rendezvous::Message) -> EgressDatagram {
+            self.sent.borrow_mut().push(msg.clone());
+            let mut bytes = Vec::new();
+            yip_rendezvous::encode(&msg, &mut bytes);
+            EgressDatagram {
+                fate: 0,
+                dst: self.server,
+                bytes,
+            }
+        }
+    }
+
+    impl Rendezvous for MockRdv {
+        fn register(&mut self, node: NodeId) -> EgressDatagram {
+            self.to_server(yip_rendezvous::Message::Register { node })
+        }
+        fn lookup(&mut self, node: NodeId) -> EgressDatagram {
+            self.to_server(yip_rendezvous::Message::Lookup { node })
+        }
+        fn relay(&mut self, src: NodeId, dst: NodeId, payload: &[u8]) -> EgressDatagram {
+            self.to_server(yip_rendezvous::Message::RelaySend {
+                src,
+                dst,
+                payload: payload.to_vec(),
+            })
+        }
+        fn parse(&self, dg: &[u8]) -> RdvEvent {
+            match yip_rendezvous::decode(dg) {
+                Some(yip_rendezvous::Message::PeerInfo { node, reflexive }) => {
+                    RdvEvent::PeerCandidate {
+                        node,
+                        addr: reflexive,
+                    }
+                }
+                Some(yip_rendezvous::Message::PunchHint { node, reflexive }) => RdvEvent::PunchTo {
+                    node,
+                    addr: reflexive,
+                },
+                Some(yip_rendezvous::Message::RelayDeliver { src, payload }) => {
+                    RdvEvent::Relayed { src, payload }
+                }
+                Some(yip_rendezvous::Message::NotFound { node }) => RdvEvent::NotFound { node },
+                _ => RdvEvent::Ignored,
+            }
+        }
+        fn server_addr(&self) -> SocketAddr {
+            self.server
+        }
+    }
+
+    fn mock_server() -> SocketAddr {
+        "203.0.113.1:51821".parse().unwrap()
+    }
+
+    /// Build a `PeerManager` with a `MockRdv` rendezvous, returning the manager
+    /// and a shared handle to the messages the mock is asked to send.
+    fn pm_with_mock_rdv(
+        local: &yip_crypto::Keypair,
+        peers: &[PeerConfig],
+    ) -> (
+        PeerManager,
+        std::rc::Rc<std::cell::RefCell<Vec<yip_rendezvous::Message>>>,
+    ) {
+        let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let rdv: Box<dyn Rendezvous> = Box::new(MockRdv {
+            server: mock_server(),
+            sent: sent.clone(),
+        });
+        let pm = PeerManager::new(
+            local.private,
+            local.public,
+            peers,
+            TunnelMode::L3Tun,
+            Some(rdv),
+        );
+        (pm, sent)
+    }
+
+    /// (a) A rendezvous-only peer (endpoint `None`) with a rendezvous
+    /// configured emits a `Lookup` when TUN traffic first needs it.
+    #[test]
+    fn rendezvous_only_peer_emits_lookup_on_tun_traffic() {
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let (mut pm, sent) = pm_with_mock_rdv(&local, &[peer]);
+
+        let out = pm.on_tun(&dummy_tun_pkt(), 0).to_vec();
+        assert_eq!(out.len(), 1, "one lookup datagram is emitted");
+        assert_eq!(out[0].dst, mock_server(), "lookup targets the server");
+        assert_eq!(
+            yip_rendezvous::decode(&out[0].bytes),
+            Some(yip_rendezvous::Message::Lookup {
+                node: node_id(&peer_kp.public),
+            }),
+            "the datagram is a Lookup for the peer's node id"
+        );
+        assert!(
+            sent.borrow()
+                .iter()
+                .any(|m| matches!(m, yip_rendezvous::Message::Lookup { .. })),
+            "the mock recorded a Lookup"
+        );
+        // Still Idle (searching), packet buffered.
+        assert!(matches!(pm.peers[0].state, PeerState::Idle));
+        assert_eq!(pm.peers[0].pending_tun.len(), 1);
+    }
+
+    /// (b) Feeding a `PeerCandidate` and then ticking produces a handshake
+    /// `Init` whose `dst` is the candidate address.
+    #[test]
+    fn peer_candidate_then_tick_probes_candidate_with_init() {
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
+
+        // Inject a PeerInfo (→ PeerCandidate) from the server for this peer.
+        let candidate: SocketAddr = "198.51.100.7:41000".parse().unwrap();
+        let mut buf = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PeerInfo {
+                node: node_id(&peer_kp.public),
+                reflexive: candidate,
+            },
+            &mut buf,
+        );
+        // Arrives from the server address → routed to on_rdv → sets candidate.
+        assert!(matches!(
+            pm.on_udp(mock_server(), &buf, 0),
+            DispatchOut::None
+        ));
+        assert_eq!(pm.peers[0].path.stage(), PathStage::Punching);
+
+        // Tick drives the path SM: probe the candidate with a fresh Init.
+        // (Filter by dst — a `Register` control datagram to the server shares
+        // the leading byte 0 with `HandshakeInit`, but goes to the server.)
+        let out = pm.tick(1).map(<[_]>::to_vec).unwrap_or_default();
+        let init = out
+            .iter()
+            .find(|d| d.dst == candidate)
+            .expect("a handshake Init is emitted toward the candidate");
+        assert_eq!(
+            init.bytes[0],
+            PacketType::HandshakeInit as u8,
+            "the datagram to the candidate is a handshake Init"
+        );
+        assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    }
+
+    /// (c) With NO rendezvous configured, a peer with a direct endpoint behaves
+    /// exactly as 2a: the first TUN packet emits an `Init` to the configured
+    /// endpoint (no server-addr demux, no path-SM escalation).
+    #[test]
+    fn no_rendezvous_direct_endpoint_is_pure_2a() {
+        let local = generate_keypair();
+        let endpoint: SocketAddr = "10.0.0.2:51820".parse().unwrap();
+        let peer = PeerConfig {
+            public_key: [7u8; 32],
+            endpoint: Some(endpoint),
+        };
+        let mut pm = PeerManager::new(
+            local.private,
+            local.public,
+            &[peer],
+            TunnelMode::L3Tun,
+            None,
+        );
+
+        let out = pm.on_tun(&dummy_tun_pkt(), 0).to_vec();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].dst, endpoint, "Init targets the configured endpoint");
+        assert_eq!(out[0].bytes[0], PacketType::HandshakeInit as u8);
+        assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+        // No relay flag, no path commitment yet.
+        assert!(!pm.peers[0].relay);
+        assert_eq!(pm.peers[0].path_kind, None);
+    }
+
+    /// (d) Anti-hijack: an `Established` peer that receives a `PeerCandidate`
+    /// or `PunchTo` from the (unauthenticated) server does NOT change its
+    /// egress target — no path mutation, no fresh probe.
+    #[test]
+    fn anti_hijack_established_peer_ignores_rendezvous_candidates() {
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let endpoint: SocketAddr = "10.0.0.2:51820".parse().unwrap();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: Some(endpoint),
+        };
+        let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
+
+        // Splice in a live Established session reaching `endpoint`.
+        const TAG: u64 = 0x0102_0304_0506_0708;
+        pm.peers[0].state =
+            PeerState::Established(Box::new(fake_established_dataplane(TAG, endpoint)));
+        pm.by_tag.insert(TAG, 0);
+        pm.peers[0].path_kind = Some(PathKind::Direct);
+
+        let hijack: SocketAddr = "198.51.100.9:40000".parse().unwrap();
+
+        // A PeerCandidate pointing at a different address must be ignored.
+        let mut buf = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PeerInfo {
+                node: node_id(&peer_kp.public),
+                reflexive: hijack,
+            },
+            &mut buf,
+        );
+        assert!(matches!(
+            pm.on_udp(mock_server(), &buf, 0),
+            DispatchOut::None
+        ));
+
+        // And a PunchTo must not start a competing probe.
+        buf.clear();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PunchHint {
+                node: node_id(&peer_kp.public),
+                reflexive: hijack,
+            },
+            &mut buf,
+        );
+        assert!(matches!(
+            pm.on_udp(mock_server(), &buf, 0),
+            DispatchOut::None
+        ));
+
+        // Egress target unchanged: still Established, endpoint still `endpoint`,
+        // relay never enabled, and the path never left Direct (on_peer_candidate
+        // was never applied — it would have moved the stage to Punching).
+        assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+        assert_eq!(pm.peers[0].endpoint, Some(endpoint));
+        assert!(!pm.peers[0].relay);
+        assert_eq!(pm.peers[0].path.stage(), PathStage::Direct);
     }
 }

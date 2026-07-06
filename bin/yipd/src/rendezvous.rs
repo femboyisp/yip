@@ -31,13 +31,6 @@ pub enum RdvEvent {
 ///
 /// Not yet consumed outside tests — Task 6 wires a `Rendezvous` impl into
 /// `PeerManager`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "exercised via ConfiguredServerRendezvous in tests today; wired into PeerManager in Task 6"
-    )
-)]
 pub trait Rendezvous {
     fn register(&mut self, node: NodeId) -> EgressDatagram;
     fn lookup(&mut self, node: NodeId) -> EgressDatagram;
@@ -55,13 +48,6 @@ pub struct ConfiguredServerRendezvous {
 }
 
 impl ConfiguredServerRendezvous {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "constructed in tests today; built from Config::rendezvous in Task 6"
-        )
-    )]
     pub fn new(server: SocketAddr) -> Self {
         Self { server }
     }

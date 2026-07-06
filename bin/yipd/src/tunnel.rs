@@ -63,11 +63,19 @@ pub fn run(config: Config) -> io::Result<()> {
 
     // ── build the peer manager ────────────────────────────────────────────────
     let mode = config.device_kind;
+    // A configured rendezvous server enables lazy Direct→Punch→Relay peer
+    // bring-up; with none, `PeerManager` is pure-2a (direct endpoints only).
+    let rendezvous: Option<Box<dyn crate::rendezvous::Rendezvous>> =
+        config.rendezvous.map(|addr| {
+            Box::new(crate::rendezvous::ConfiguredServerRendezvous::new(addr))
+                as Box<dyn crate::rendezvous::Rendezvous>
+        });
     let mut manager = PeerManager::new(
         config.local_private,
         config.local_public,
         &config.peers,
         mode,
+        rendezvous,
     );
     let local_addr = manager.local_addr();
 

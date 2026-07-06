@@ -12,23 +12,8 @@ pub const PUNCH_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathKind {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "constructed by these unit tests only until task 6"
-        )
-    )]
     Direct,
-    #[expect(
-        dead_code,
-        reason = "constructed by PeerManager in task 6 on a punched commit"
-    )]
     Punched,
-    #[expect(
-        dead_code,
-        reason = "constructed by PeerManager in task 6 on a relayed commit"
-    )]
     Relayed,
 }
 
@@ -65,10 +50,6 @@ pub struct PathState {
     looked_up: bool,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "driven by PeerManager in task 6")
-)]
 impl PathState {
     pub fn new(has_direct: bool, has_rendezvous: bool, now_ms: u64) -> Self {
         let stage = if has_direct {
@@ -95,7 +76,7 @@ impl PathState {
 
     #[expect(
         dead_code,
-        reason = "getter surfaced for PeerManager in task 6; not exercised by these unit tests"
+        reason = "candidate getter surfaced for later milestones; PeerManager routes via endpoint"
     )]
     pub fn candidate(&self) -> Option<SocketAddr> {
         match self.stage {
@@ -175,6 +156,13 @@ impl PathState {
         self.committed = true;
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "session-stale reset is a local decision wired in a later milestone"
+        )
+    )]
     pub fn reset(&mut self, now_ms: u64) {
         self.committed = false;
         self.candidate = None;
