@@ -1085,6 +1085,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "yip-rendezvous"
+version = "0.1.0"
+dependencies = [
+ "blake2",
+]
+
+[[package]]
 name = "yip-transport"
 version = "0.0.0"
 dependencies = [
