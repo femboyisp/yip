@@ -59,6 +59,10 @@ fn main() -> std::io::Result<()> {
         if last_sweep.elapsed() >= SWEEP_INTERVAL {
             server.sweep(now_ms(base));
             last_sweep = Instant::now();
+            // Lets the netns money tests (and operators) grep stderr for the
+            // final relay-forward count to assert *which path* carried
+            // traffic, without needing any extra IPC/metrics surface.
+            eprintln!("relay-forwarded={}", server.forwarded_count());
         }
     }
 }
