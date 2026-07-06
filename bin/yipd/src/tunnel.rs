@@ -120,17 +120,21 @@ pub fn run(config: Config) -> io::Result<()> {
 /// to function in single-peer 2a scope.
 fn assign_mesh_address(device: &str, local_addr: std::net::Ipv6Addr) {
     let addr_arg = format!("{local_addr}/128");
-    if let Err(e) = Command::new("ip")
+    match Command::new("ip")
         .args(["-6", "addr", "add", &addr_arg, "dev", device])
         .status()
     {
-        eprintln!("yipd: could not assign mesh address {addr_arg} to {device}: {e}");
+        Ok(s) if s.success() => {}
+        Ok(s) => eprintln!("yipd: `ip -6 addr add {addr_arg} dev {device}` exited {s}"),
+        Err(e) => eprintln!("yipd: could not run ip to assign mesh address {addr_arg}: {e}"),
     }
     let prefix_arg = format!("fd00::/{MESH_PREFIX_LEN}");
-    if let Err(e) = Command::new("ip")
+    match Command::new("ip")
         .args(["-6", "route", "add", &prefix_arg, "dev", device])
         .status()
     {
-        eprintln!("yipd: could not add mesh route {prefix_arg} via {device}: {e}");
+        Ok(s) if s.success() => {}
+        Ok(s) => eprintln!("yipd: `ip -6 route add {prefix_arg} dev {device}` exited {s}"),
+        Err(e) => eprintln!("yipd: could not run ip to add mesh route {prefix_arg}: {e}"),
     }
 }

@@ -140,6 +140,13 @@ struct Peer {
     state: PeerState,
     /// TUN packets buffered while no `Established` session exists yet.
     pending_tun: Vec<Vec<u8>>,
+    /// The `[HandshakeResp]` bytes that established the *current* session,
+    /// cached when this peer was admitted as responder. A repeated
+    /// `HandshakeInit` (a duplicate, or a retransmit after our reply was
+    /// lost) is answered by re-sending these exact bytes rather than running
+    /// the responder step again — see `handle_handshake_init`. `None` when we
+    /// have no session, or hold one we built as the initiator.
+    cached_resp: Option<Vec<u8>>,
 }
 
 /// Multi-peer router/demuxer + lazy in-loop handshake driver.
@@ -155,7 +162,11 @@ pub struct PeerManager {
     peers: Vec<Peer>,
     /// `conn_tag -> peers index`, populated whenever a peer reaches
     /// `Established`. Consulted as a fast-path hint by `route_data` (see the
-    /// module doc for why it is not the primary demux mechanism).
+    /// module doc for why it is not the primary demux mechanism). In 2a a peer
+    /// establishes exactly once (duplicate/retransmitted inits re-send the
+    /// cached reply rather than rebuilding — see `handle_handshake_init`), so
+    /// each peer contributes one entry that never goes stale. M7 rekey will
+    /// rotate `conn_tag`s per epoch and must evict the superseded entry here.
     by_tag: HashMap<u64, usize>,
     /// `node_addr -> peers index`, populated at construction (addresses are
     /// derived from each peer's configured public key and never change).
@@ -194,6 +205,7 @@ impl PeerManager {
                 endpoint: p.endpoint,
                 state: PeerState::Idle,
                 pending_tun: Vec::new(),
+                cached_resp: None,
             });
         }
         Self {
@@ -374,46 +386,70 @@ impl PeerManager {
             return DispatchOut::None;
         };
 
-        // Glare resolution. In the lazy model either side may send a
-        // `HandshakeInit` first, so both can initiate simultaneously (e.g. the
-        // TUN's IPv6 autoconf multicast races the peer's traffic at startup).
-        // Without a tiebreak each side would adopt the session in which *it*
-        // was the responder; those are two different Noise sessions with
-        // different keys, and every subsequent data/control frame would fail
-        // to decrypt. Break the tie deterministically by static-key order so
-        // both peers converge on ONE session: the larger public key adopts the
-        // responder role (accepts this `Init`, replacing any of its own
-        // in-flight/established state); the smaller key is the designated
-        // initiator and ignores the competing `Init`, keeping its own attempt
-        // (it will complete when the peer's `[HandshakeResp]` arrives). When
-        // the peer is still `Idle` there is no competition, so whoever
-        // initiates first simply wins — this preserves lazy establishment.
-        if !matches!(self.peers[idx].state, PeerState::Idle)
-            && self.local_pub < self.peers[idx].pubkey
-        {
-            return DispatchOut::None;
+        // `start_responder` above drew a fresh Noise ephemeral, so `established`
+        // is a BRAND-NEW session distinct from any we already hold — installing
+        // it unconditionally would silently rekey. Branch on our current state
+        // with that in mind.
+        match &self.peers[idx].state {
+            // Already have a live session: this `Init` is a duplicate, a
+            // retransmit after our earlier reply was lost, or a peer restart.
+            // Never tear down the running session (2a has no rekey — a rebuilt
+            // session would strand a peer that stays on the old keys and drops
+            // the new reply). Re-send the cached `[HandshakeResp]` verbatim so a
+            // peer still handshaking (its reply was lost) completes on the SAME
+            // session; a peer already established harmlessly ignores it. Discard
+            // the freshly-built `established`/`resp_pkt`.
+            PeerState::Established(_) => match &self.peers[idx].cached_resp {
+                Some(resp) => {
+                    self.egress.clear();
+                    self.egress.push(EgressDatagram {
+                        fate: 0,
+                        dst: src,
+                        bytes: resp.clone(),
+                    });
+                    DispatchOut::Udp(&self.egress)
+                }
+                // We hold this session as the initiator (no cached reply): a new
+                // `Init` from the peer is a restart/rekey, deferred to M7.
+                None => DispatchOut::None,
+            },
+            // Glare: both sides initiated simultaneously (e.g. the TUN's IPv6
+            // autoconf multicast races the peer's traffic at startup). Break
+            // the tie deterministically by static-key order so both converge on
+            // ONE session: the larger public key adopts the responder role
+            // (accepts this `Init`); the smaller key is the designated
+            // initiator and ignores the competing `Init`, keeping its own
+            // attempt (it completes when the peer's `[HandshakeResp]` arrives).
+            PeerState::Handshaking(_) if self.local_pub < self.peers[idx].pubkey => {
+                DispatchOut::None
+            }
+            // `Idle` (no competition — whoever initiates first wins, preserving
+            // lazy establishment) or `Handshaking` with the larger key (adopt
+            // responder role): admit this session.
+            PeerState::Idle | PeerState::Handshaking(_) => {
+                let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
+                let mut dp = Box::new(DataPlane::new(established, conn_tag, self.mode, src));
+
+                self.peers[idx].endpoint = src; // learn the observed endpoint
+                self.peers[idx].cached_resp = Some(resp_pkt.clone());
+                self.by_tag.insert(dp.conn_tag(), idx);
+
+                self.egress.clear();
+                self.egress.push(EgressDatagram {
+                    fate: 0,
+                    dst: src,
+                    bytes: resp_pkt,
+                });
+                let pending = std::mem::take(&mut self.peers[idx].pending_tun);
+                for inner in &pending {
+                    let out = dp.on_tun_packet(inner, now_ms);
+                    self.egress.extend(out.iter().cloned());
+                }
+                self.peers[idx].state = PeerState::Established(dp);
+
+                DispatchOut::Udp(&self.egress)
+            }
         }
-
-        let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
-        let mut dp = Box::new(DataPlane::new(established, conn_tag, self.mode, src));
-
-        self.peers[idx].endpoint = src; // learn the observed endpoint
-        self.by_tag.insert(dp.conn_tag(), idx);
-
-        self.egress.clear();
-        self.egress.push(EgressDatagram {
-            fate: 0,
-            dst: src,
-            bytes: resp_pkt,
-        });
-        let pending = std::mem::take(&mut self.peers[idx].pending_tun);
-        for inner in &pending {
-            let out = dp.on_tun_packet(inner, now_ms);
-            self.egress.extend(out.iter().cloned());
-        }
-        self.peers[idx].state = PeerState::Established(dp);
-
-        DispatchOut::Udp(&self.egress)
     }
 
     /// Handle an incoming `[HandshakeResp]`: find the `Handshaking` peer
@@ -784,5 +820,125 @@ mod tests {
         let local_pub = [42u8; 32];
         let pm = PeerManager::new([1u8; 32], local_pub, &[], TunnelMode::L3Tun);
         assert_eq!(pm.local_addr(), node_addr(&local_pub));
+    }
+
+    /// The `conn_tag` of a peer's Established session, or `None` if it is not
+    /// (yet) Established. Used by the handshake state-machine tests below.
+    fn established_tag(pm: &PeerManager, idx: usize) -> Option<u64> {
+        match &pm.peers[idx].state {
+            PeerState::Established(dp) => Some(dp.conn_tag()),
+            _ => None,
+        }
+    }
+
+    /// Copy out every `[HandshakeResp]` datagram's bytes from a `DispatchOut`
+    /// (decoupling from the borrow so the caller can keep driving the manager).
+    fn resp_bytes(out: &DispatchOut<'_>) -> Vec<Vec<u8>> {
+        let egress: &[EgressDatagram] = match out {
+            DispatchOut::Udp(e) | DispatchOut::Both(_, e) => e,
+            _ => &[],
+        };
+        egress
+            .iter()
+            .filter(|d| d.bytes.first() == Some(&(PacketType::HandshakeResp as u8)))
+            .map(|d| d.bytes.clone())
+            .collect()
+    }
+
+    /// A minimal IPv4 packet, enough to drive `on_tun` (single-peer fallback
+    /// routes it to the sole peer regardless of contents).
+    fn dummy_tun_pkt() -> Vec<u8> {
+        vec![0x45u8; 40]
+    }
+
+    #[test]
+    fn glare_simultaneous_init_converges_on_one_session() {
+        // Both peers configured with each other; neither initiates until it
+        // has traffic. Drive *both* to initiate at once (the startup-glare
+        // race), then cross-feed the messages and assert both converge on ONE
+        // shared session (identical conn_tag) rather than two mismatched ones.
+        let kp_a = generate_keypair();
+        let kp_b = generate_keypair();
+        let ep_a: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+        let ep_b: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+        let cfg_b = PeerConfig {
+            public_key: kp_b.public,
+            endpoint: ep_b,
+        };
+        let cfg_a = PeerConfig {
+            public_key: kp_a.public,
+            endpoint: ep_a,
+        };
+        let mut pm_a = PeerManager::new(kp_a.private, kp_a.public, &[cfg_b], TunnelMode::L3Tun);
+        let mut pm_b = PeerManager::new(kp_b.private, kp_b.public, &[cfg_a], TunnelMode::L3Tun);
+
+        // Each side sends a HandshakeInit (triggered by its own outbound TUN
+        // traffic) before hearing from the other — the glare.
+        let pkt = dummy_tun_pkt();
+        let init_a = pm_a.on_tun(&pkt, 0)[0].bytes.clone();
+        let init_b = pm_b.on_tun(&pkt, 0)[0].bytes.clone();
+        assert_eq!(init_a[0], PacketType::HandshakeInit as u8);
+        assert_eq!(init_b[0], PacketType::HandshakeInit as u8);
+
+        // Cross-feed the competing inits. Exactly one side (the larger key)
+        // adopts the responder role and replies; the other (smaller key)
+        // ignores the competing init and keeps its own attempt.
+        let resp_from_a = resp_bytes(&pm_a.on_udp(ep_b, &init_b, 0));
+        let resp_from_b = resp_bytes(&pm_b.on_udp(ep_a, &init_a, 0));
+        let total_resps = resp_from_a.len() + resp_from_b.len();
+        assert_eq!(
+            total_resps, 1,
+            "exactly one side must adopt the responder role under glare"
+        );
+
+        // Deliver whichever HandshakeResp was produced back to the initiator
+        // that is still handshaking; it completes on the responder's session.
+        for r in &resp_from_a {
+            pm_b.on_udp(ep_a, r, 0);
+        }
+        for r in &resp_from_b {
+            pm_a.on_udp(ep_b, r, 0);
+        }
+
+        let tag_a = established_tag(&pm_a, 0).expect("pm_a must be Established");
+        let tag_b = established_tag(&pm_b, 0).expect("pm_b must be Established");
+        assert_eq!(
+            tag_a, tag_b,
+            "both peers must converge on ONE shared session (matching conn_tag)"
+        );
+    }
+
+    #[test]
+    fn duplicate_init_after_established_does_not_tear_down_session() {
+        // Regression: a duplicated/retransmitted HandshakeInit arriving after
+        // the responder has already established MUST NOT rebuild the session
+        // (a fresh Noise ephemeral would strand the peer on the old keys).
+        // The responder re-sends its cached HandshakeResp verbatim instead.
+        let kp_r = generate_keypair();
+        let kp_i = generate_keypair();
+        let ep_i: SocketAddr = "10.0.0.7:7000".parse().unwrap();
+        let cfg_i = PeerConfig {
+            public_key: kp_i.public,
+            endpoint: ep_i,
+        };
+        let mut pm_r = PeerManager::new(kp_r.private, kp_r.public, &[cfg_i], TunnelMode::L3Tun);
+
+        // The initiator's HandshakeInit (built out-of-band, as if received).
+        let (_hs, init_pkt) = HandshakeState::start_initiator(&kp_i.private, &kp_r.public).unwrap();
+
+        // First delivery establishes the responder session; capture its reply.
+        let resp1 = resp_bytes(&pm_r.on_udp(ep_i, &init_pkt, 0));
+        assert_eq!(resp1.len(), 1, "first init must produce one HandshakeResp");
+        let tag1 = established_tag(&pm_r, 0).expect("responder must be Established");
+
+        // A duplicate of the SAME init: session must be untouched and the
+        // reply must be the exact cached bytes (not a freshly-built one).
+        let resp2 = resp_bytes(&pm_r.on_udp(ep_i, &init_pkt, 0));
+        let tag2 = established_tag(&pm_r, 0).expect("responder must stay Established");
+        assert_eq!(tag1, tag2, "duplicate init must not rekey the live session");
+        assert_eq!(
+            resp2, resp1,
+            "duplicate init must re-send the cached HandshakeResp verbatim"
+        );
     }
 }
