@@ -1,21 +1,32 @@
 //! io_uring driver using one ring over UDP + TUN with provided-buffer receives.
 //!
-//! This backend keeps one ring alive and drives both fds from it. UDP receives
-//! use multishot `recv` with `BUFFER_SELECT`. TUN uses a single pooled read that
-//! is re-submitted after each completion; multishot `read` is not yet relied on.
+//! This backend keeps one ring alive and drives both fds from it. UDP is now
+//! unconnected (the addressed socket seam, #33): receives use single-shot
+//! `recvmsg`, each carrying its own dedicated buffer + `sockaddr_storage`, so
+//! the driver recovers each datagram's source address; a fresh recv is
+//! re-armed on the same slot after every completion. Sends use `sendmsg` with
+//! an explicit per-datagram destination (see [`EgressDatagram::dst`]). TUN
+//! uses a single pooled read that is re-submitted after each completion;
+//! multishot `read` is not yet relied on.
 
 use std::io;
+use std::net::SocketAddr;
 use std::os::fd::RawFd;
 use std::time::Instant;
 
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 
 use crate::poll::{Dispatch, DispatchOut, EgressDatagram};
-use crate::{MAX_DATAGRAM_BATCH, MAX_WIRE_DATAGRAM};
+use crate::{sockaddr_to_std, std_to_sockaddr, MAX_DATAGRAM_BATCH, MAX_WIRE_DATAGRAM};
 
 const RING_ENTRIES: u32 = 512;
 const RING_BUFS: usize = 256;
 const TUN_READ_DEPTH: usize = 16;
+/// How many single-shot UDP `recvmsg` requests are kept outstanding at once.
+/// Each has its own dedicated buffer + `sockaddr_storage` (no provided-buffer
+/// pool, unlike TUN reads) — see the module doc for why UDP recv moved off
+/// multishot `RecvMulti`/`BUFFER_SELECT`.
+const UDP_RECV_DEPTH: usize = 16;
 const BUF_GROUP: u16 = 17;
 const SEND_SLOTS: usize = 256;
 const TAG_SHIFT: u32 = 56;
@@ -59,6 +70,11 @@ const GSO_CONTROL_SPACE: usize = 64;
 struct GsoMeta {
     segment_size: u16,
     datagram_count: usize,
+    /// Shared destination of every datagram in this coalesced send —
+    /// `can_coalesce_gso_tagged` guarantees every datagram in a GSO batch
+    /// shares one `dst`, so recovering a fallback/unsent datagram (below)
+    /// can reuse it directly.
+    dst: SocketAddr,
 }
 
 /// Which fd an in-flight send slot targets, so completion-error handling can
@@ -70,10 +86,16 @@ enum SendKind {
     Tun,
 }
 
+/// Per-send-slot `sendmsg` context: the datagram's own destination
+/// (`name`/`namelen`), its iovec, and (GSO sends only) the `UDP_SEGMENT`
+/// control message. Every UDP send now goes through `sendmsg` (the socket is
+/// unconnected — the addressed seam), so both plain and GSO sends need
+/// `msg_name` populated; only GSO sends need the `control` cmsg.
 struct GsoSendContext {
     iov: libc::iovec,
     msg: libc::msghdr,
     control: [u8; GSO_CONTROL_SPACE],
+    name: libc::sockaddr_storage,
 }
 
 impl GsoSendContext {
@@ -93,19 +115,43 @@ impl GsoSendContext {
                 msg_flags: 0,
             },
             control: [0_u8; GSO_CONTROL_SPACE],
+            // SAFETY: `sockaddr_storage` is plain-old-data (integers/byte
+            // arrays); the all-zero bit pattern is a valid value for it.
+            // `set_destination` overwrites it before every send.
+            name: unsafe { std::mem::zeroed() },
         }
     }
 
-    fn prepare(
+    /// Point `msg_name`/`msg_namelen` at this datagram's destination.
+    fn set_destination(&mut self, dst: SocketAddr) {
+        let (storage, len) = std_to_sockaddr(dst);
+        self.name = storage;
+        self.msg.msg_name = std::ptr::addr_of_mut!(self.name).cast::<libc::c_void>();
+        self.msg.msg_namelen = len;
+    }
+
+    /// Prepare a plain (non-GSO) `sendmsg`: payload + destination, no cmsg.
+    fn prepare_plain(&mut self, payload_ptr: *mut u8, payload_len: usize, dst: SocketAddr) {
+        self.iov.iov_base = payload_ptr.cast::<libc::c_void>();
+        self.iov.iov_len = payload_len;
+        self.msg.msg_iov = std::ptr::addr_of_mut!(self.iov);
+        self.msg.msg_iovlen = 1;
+        self.msg.msg_control = std::ptr::null_mut();
+        self.msg.msg_controllen = 0;
+        self.msg.msg_flags = 0;
+        self.set_destination(dst);
+    }
+
+    /// Prepare a GSO `sendmsg`: payload + destination + `UDP_SEGMENT` cmsg.
+    fn prepare_gso(
         &mut self,
         payload_ptr: *mut u8,
         payload_len: usize,
         segment_size: u16,
+        dst: SocketAddr,
     ) -> io::Result<()> {
         self.iov.iov_base = payload_ptr.cast::<libc::c_void>();
         self.iov.iov_len = payload_len;
-        self.msg.msg_name = std::ptr::null_mut();
-        self.msg.msg_namelen = 0;
         self.msg.msg_iov = std::ptr::addr_of_mut!(self.iov);
         self.msg.msg_iovlen = 1;
         self.msg.msg_control = self.control.as_mut_ptr().cast::<libc::c_void>();
@@ -118,6 +164,7 @@ impl GsoSendContext {
         }
         self.msg.msg_controllen = cmsg_space;
         self.msg.msg_flags = 0;
+        self.set_destination(dst);
 
         // SAFETY: `self.msg` points to valid in-struct iovec/control storage.
         // We write exactly one SOL_UDP/UDP_SEGMENT cmsg payload (u16 segment size)
@@ -138,12 +185,44 @@ impl GsoSendContext {
     }
 }
 
+/// One outstanding single-shot UDP `recvmsg` request: its own dedicated
+/// payload buffer + `sockaddr_storage`, plus the `iovec`/`msghdr` that
+/// self-reference them.
+///
+/// These are allocated once into a `Box<[UdpRecvSlot]>` that is never resized
+/// after `UringDriver::new` — so the addresses `iov`/`msg` point at (`buf`,
+/// `name`, and `iov` itself) stay valid for the driver's whole lifetime,
+/// exactly like `recv_pool`'s stable buffer addresses below.
+struct UdpRecvSlot {
+    buf: [u8; MAX_WIRE_DATAGRAM],
+    name: libc::sockaddr_storage,
+    iov: libc::iovec,
+    msg: libc::msghdr,
+}
+
+impl UdpRecvSlot {
+    /// A slot with every field zeroed and no pointers fixed up yet. Callers
+    /// must fix up `iov`/`msg` to self-reference `buf`/`name` immediately
+    /// after the slot reaches its final (never-to-move-again) address — see
+    /// `UringDriver::new`.
+    fn zeroed() -> Self {
+        // SAFETY: every field is plain-old-data (byte array / integers /
+        // pointers); the all-zero bit pattern is valid for all of them. Null
+        // `iov`/`msg` pointers are never submitted to the kernel — they are
+        // fixed up before the first `arm_udp_recv_slot` call.
+        unsafe { std::mem::zeroed() }
+    }
+}
+
 /// One-ring io_uring driver handling UDP + TUN.
 pub struct UringDriver {
     ring: IoUring,
     udp_fd: RawFd,
     tun_fd: RawFd,
     recv_pool: Box<[[u8; MAX_WIRE_DATAGRAM]; RING_BUFS]>,
+    /// Fixed pool of outstanding single-shot UDP `recvmsg` requests (see
+    /// [`UdpRecvSlot`]); indexed by `TAG_UDP_RECV`'s payload bits.
+    udp_recv_slots: Box<[UdpRecvSlot]>,
     in_flight: Vec<Option<Vec<u8>>>,
     gso_meta: Vec<Option<GsoMeta>>,
     gso_ctx: Vec<Option<GsoSendContext>>,
@@ -189,6 +268,32 @@ impl UringDriver {
         let ring = IoUring::new(RING_ENTRIES)?;
         let ext_arg = ring.params().is_feature_ext_arg();
         let recv_pool = Box::new([[0_u8; MAX_WIRE_DATAGRAM]; RING_BUFS]);
+
+        // Build the UDP recv slot pool, then fix up each slot's self-referencing
+        // iovec/msghdr pointers now that every slot has reached its final,
+        // never-to-move-again address inside the boxed slice.
+        let mut udp_recv_slots: Box<[UdpRecvSlot]> = (0..UDP_RECV_DEPTH)
+            .map(|_| UdpRecvSlot::zeroed())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let namelen = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>())
+            .expect("size_of::<sockaddr_storage>() fits socklen_t");
+        for slot in udp_recv_slots.iter_mut() {
+            slot.iov = libc::iovec {
+                iov_base: slot.buf.as_mut_ptr().cast::<libc::c_void>(),
+                iov_len: slot.buf.len(),
+            };
+            slot.msg = libc::msghdr {
+                msg_name: std::ptr::addr_of_mut!(slot.name).cast::<libc::c_void>(),
+                msg_namelen: namelen,
+                msg_iov: std::ptr::addr_of_mut!(slot.iov),
+                msg_iovlen: 1,
+                msg_control: std::ptr::null_mut(),
+                msg_controllen: 0,
+                msg_flags: 0,
+            };
+        }
+
         let mut in_flight = Vec::with_capacity(SEND_SLOTS);
         let mut gso_meta = Vec::with_capacity(SEND_SLOTS);
         let mut gso_ctx = Vec::with_capacity(SEND_SLOTS);
@@ -205,6 +310,7 @@ impl UringDriver {
             udp_fd,
             tun_fd,
             recv_pool,
+            udp_recv_slots,
             in_flight,
             gso_meta,
             gso_ctx,
@@ -228,7 +334,9 @@ impl UringDriver {
         };
 
         driver.provide_all_buffers()?;
-        driver.arm_udp_recv()?;
+        for i in 0..UDP_RECV_DEPTH {
+            driver.arm_udp_recv_slot(i)?;
+        }
         for _ in 0..TUN_READ_DEPTH {
             driver.arm_tun_read()?;
         }
@@ -291,18 +399,28 @@ impl UringDriver {
         self.push_entry(entry)
     }
 
-    fn arm_udp_recv(&mut self) -> io::Result<()> {
-        // Multishot recv (high throughput) where supported. On kernels that
-        // reject it for datagram sockets with EINVAL (notably Debian 13's 6.12,
-        // issue #25), the fatal completion is caught by `run_uring`, which falls
-        // back to the PollDriver — so opting into io_uring degrades gracefully
-        // instead of crashing.
-        let entry = opcode::RecvMulti::new(types::Fd(self.udp_fd), BUF_GROUP)
-            .len(MAX_WIRE_DATAGRAM_U32)
+    /// (Re-)arm one single-shot UDP `recvmsg` on slot `idx`. Unlike the old
+    /// multishot `RecvMulti`, this surfaces the datagram's source address (via
+    /// the slot's own `sockaddr_storage`) — the whole point of the addressed
+    /// socket seam — at the cost of one submission per completion instead of
+    /// one submission serving an unbounded burst. Acceptable: io_uring is
+    /// opt-in and correctness (recovering `src`) comes first (see #33).
+    fn arm_udp_recv_slot(&mut self, idx: usize) -> io::Result<()> {
+        // Restore `msg_namelen` to the full `sockaddr_storage` capacity before
+        // re-submitting: `recvmsg` writes back the *actual* source address size
+        // on completion (16 for a v4 sender, 28 for v6), so without this reset
+        // a slot that last received a v4 datagram would offer only 16 bytes of
+        // name capacity to the next `recvmsg`, truncating a v6 source address
+        // to a wrong value on a dual-stack underlay.
+        let namelen = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>())
+            .expect("size_of::<sockaddr_storage>() fits socklen_t");
+        self.udp_recv_slots[idx].msg.msg_namelen = namelen;
+        let msg_ptr = std::ptr::addr_of_mut!(self.udp_recv_slots[idx].msg);
+        let tag = TAG_UDP_RECV | u64::try_from(idx).expect("udp recv slot index fits u64");
+        let entry = opcode::RecvMsg::new(types::Fd(self.udp_fd), msg_ptr)
             .build()
-            .user_data(TAG_UDP_RECV);
-        self.push_entry(entry)?;
-        Ok(())
+            .user_data(tag);
+        self.push_entry(entry)
     }
 
     fn arm_tun_read(&mut self) -> io::Result<()> {
@@ -402,20 +520,23 @@ impl UringDriver {
         }
     }
 
-    fn queue_udp_send(&mut self, datagram: &[u8]) -> io::Result<()> {
-        let slot_id = self.alloc_in_flight_slot_copy(datagram, MAX_WIRE_DATAGRAM)?;
+    /// Send one addressed datagram via `sendmsg` (the socket is unconnected —
+    /// the addressed seam — so every UDP send needs an explicit destination).
+    fn queue_udp_send(&mut self, dg: &EgressDatagram) -> io::Result<()> {
+        let slot_id = self.alloc_in_flight_slot_copy(&dg.bytes, MAX_WIRE_DATAGRAM)?;
         self.send_kind[slot_id] = Some(SendKind::Udp);
-        let (ptr, len_u32) = {
+        let (payload_ptr, payload_len) = {
             let slot_buf = self.in_flight[slot_id]
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| io::Error::other("missing in-flight buffer for udp send"))?;
-            let len_u32 = u32::try_from(slot_buf.len())
-                .map_err(|_| io::Error::other("send buffer too large"))?;
-            (slot_buf.as_ptr(), len_u32)
+            (slot_buf.as_mut_ptr(), slot_buf.len())
         };
+        let ctx = self.gso_ctx[slot_id].get_or_insert_with(GsoSendContext::new);
+        ctx.prepare_plain(payload_ptr, payload_len, dg.dst);
         let tag = TAG_SEND_SLOT | u64::try_from(slot_id).expect("slot id fits u64");
-        let entry = opcode::Send::new(types::Fd(self.udp_fd), ptr, len_u32)
-            .flags(libc::MSG_NOSIGNAL)
+        let msg_ptr = std::ptr::from_ref(&ctx.msg);
+        let entry = opcode::SendMsg::new(types::Fd(self.udp_fd), msg_ptr)
+            .flags(u32::try_from(libc::MSG_NOSIGNAL).expect("MSG_NOSIGNAL fits u32"))
             .build()
             .user_data(tag);
         if let Err(e) = self.push_entry(entry) {
@@ -459,61 +580,29 @@ impl UringDriver {
         self.send_kind[slot_id] = None;
     }
 
-    fn can_coalesce_gso(datagrams: &[Vec<u8>]) -> Option<u16> {
-        if datagrams.len() < 2 {
-            return None;
-        }
-        let first_len = datagrams.first()?.len();
-        if first_len == 0 {
-            return None;
-        }
-        let segment_size = u16::try_from(first_len).ok()?;
-        if datagrams.iter().any(|dg| dg.len() != first_len) {
-            return None;
-        }
-        Some(segment_size)
-    }
-
-    fn queue_udp_batch(&mut self, datagrams: &[Vec<u8>], allow_gso: bool) -> io::Result<()> {
-        if datagrams.is_empty() {
-            return Ok(());
-        }
-        if allow_gso && self.gso_enabled {
-            if let Some(segment_size) = Self::can_coalesce_gso(datagrams) {
-                let max_chunk = Self::max_gso_datagrams_for_segment(segment_size);
-                for chunk in datagrams.chunks(max_chunk) {
-                    if self.queue_udp_gso(chunk, segment_size)? {
-                        continue;
-                    }
-                    eprintln!("uring: GSO submit failed, trying per-datagram sends");
-                    for datagram in chunk {
-                        self.queue_udp_send(datagram)?;
-                    }
-                }
-                return Ok(());
-            }
-        }
-        for datagram in datagrams {
-            self.queue_udp_send(datagram)?;
-        }
-        Ok(())
-    }
-
-    /// Like `can_coalesce_gso` but also rejects any batch that contains two
-    /// datagrams of the same FEC fate group — the invariant that keeps a source
-    /// symbol and its own repair out of the same (fate-shared) GSO skb. This is
-    /// the single correctness choke point for GSO+FEC safety.
+    /// Rejects any batch that contains two datagrams of the same FEC fate
+    /// group — the invariant that keeps a source symbol and its own repair
+    /// out of the same (fate-shared) GSO skb — *or* mixed destinations, since
+    /// a coalesced `UDP_SEGMENT` send has exactly one `msg_name` and would
+    /// silently misdirect every datagram after the first to the wrong peer.
+    /// This is the single correctness choke point for GSO+FEC(+addressing)
+    /// safety.
     fn can_coalesce_gso_tagged(datagrams: &[EgressDatagram]) -> Option<u16> {
         if datagrams.len() < 2 {
             return None;
         }
-        let first_len = datagrams.first()?.bytes.len();
+        let first = datagrams.first()?;
+        let first_len = first.bytes.len();
         if first_len == 0 {
             return None;
         }
         let segment_size = u16::try_from(first_len).ok()?;
+        let first_dst = first.dst;
         for (i, dg) in datagrams.iter().enumerate() {
             if dg.bytes.len() != first_len {
+                return None;
+            }
+            if dg.dst != first_dst {
                 return None;
             }
             if datagrams[..i].iter().any(|prior| prior.fate == dg.fate) {
@@ -523,10 +612,11 @@ impl UringDriver {
         Some(segment_size)
     }
 
-    /// GSO-send a batch of fate-tagged datagrams. Only coalesces when
-    /// `can_coalesce_gso_tagged` proves every datagram is the same length *and*
-    /// a distinct fate group; otherwise (or on any GSO submit failure) falls back
-    /// to per-datagram sends.
+    /// GSO-send a batch of fate-tagged, addressed datagrams. Only coalesces
+    /// when `can_coalesce_gso_tagged` proves every datagram is the same
+    /// length, a distinct fate group, *and* shares one destination;
+    /// otherwise (or on any GSO submit failure) falls back to per-datagram
+    /// sends.
     fn queue_udp_batch_tagged(
         &mut self,
         datagrams: &[EgressDatagram],
@@ -539,33 +629,51 @@ impl UringDriver {
             if let Some(segment_size) = Self::can_coalesce_gso_tagged(datagrams) {
                 let max_chunk = Self::max_gso_datagrams_for_segment(segment_size);
                 for chunk in datagrams.chunks(max_chunk) {
-                    if self.queue_udp_gso(chunk, segment_size)? {
+                    // Every datagram in `datagrams` shares one `dst` (proven by
+                    // `can_coalesce_gso_tagged` above), so any chunk's dst is that
+                    // same shared destination.
+                    let dst = chunk[0].dst;
+                    if self.queue_udp_gso(chunk, segment_size, dst)? {
                         continue;
                     }
                     eprintln!("uring: GSO submit failed, trying per-datagram sends");
                     for dg in chunk {
-                        self.queue_udp_send(&dg.bytes)?;
+                        self.queue_udp_send(dg)?;
                     }
                 }
                 return Ok(());
             }
         }
         for dg in datagrams {
-            self.queue_udp_send(&dg.bytes)?;
+            self.queue_udp_send(dg)?;
         }
         Ok(())
     }
 
     /// Flush all datagrams staged this `poll_once` in fate-safe GSO batches.
-    /// Each pass takes at most one datagram per distinct fate group (arrival
-    /// order) — so a coalesced skb never carries two symbols of one FEC object —
-    /// and defers the rest to the next pass. Bounded by `MAX_PENDING_GSO_DATAGRAMS`.
+    /// Each pass takes at most one datagram per distinct `(fate, dst)` pair
+    /// (arrival order) — so a coalesced skb never carries two symbols of one
+    /// FEC object *and* never mixes destinations — and defers the rest to the
+    /// next pass. Bounded by `MAX_PENDING_GSO_DATAGRAMS`.
+    ///
+    /// Grouping by fate alone (pre-multipeer) let a batch mix `dst`s whenever
+    /// two different peers happened to emit distinct-fate datagrams in the
+    /// same `poll_once`; `queue_udp_batch_tagged`'s `can_coalesce_gso_tagged`
+    /// check would then reject the *whole* mixed chunk and fall back to
+    /// per-datagram sends, silently losing the GSO win for same-peer pairs
+    /// that were incidentally batched with a different peer's datagram.
+    /// Grouping by `(fate, dst)` keeps distinct peers in separate chunks so
+    /// same-peer datagrams still coalesce.
     fn flush_pending_gso(&mut self) {
         while !self.pending_gso.is_empty() {
             let mut chunk: Vec<EgressDatagram> = Vec::with_capacity(self.pending_gso.len());
             let mut deferred: Vec<EgressDatagram> = Vec::with_capacity(self.pending_gso.len());
             for dg in self.pending_gso.drain(..) {
-                if chunk.iter().any(|c| c.fate == dg.fate) {
+                let dst_conflict = chunk
+                    .first()
+                    .is_some_and(|c: &EgressDatagram| c.dst != dg.dst);
+                let fate_conflict = chunk.iter().any(|c| c.fate == dg.fate);
+                if dst_conflict || fate_conflict {
                     deferred.push(dg);
                 } else {
                     chunk.push(dg);
@@ -595,6 +703,7 @@ impl UringDriver {
         &mut self,
         datagrams: &[T],
         segment_size: u16,
+        dst: SocketAddr,
     ) -> io::Result<bool> {
         if datagrams.len() > MAX_GSO_DATAGRAMS {
             return Ok(false);
@@ -633,13 +742,14 @@ impl UringDriver {
             .ok_or_else(|| io::Error::other("missing in-flight GSO payload"))?
             .len();
         let ctx = self.gso_ctx[slot_id].get_or_insert_with(GsoSendContext::new);
-        if let Err(e) = ctx.prepare(payload_ptr, payload_len_now, segment_size) {
+        if let Err(e) = ctx.prepare_gso(payload_ptr, payload_len_now, segment_size, dst) {
             self.release_in_flight_slot(slot_id);
             return Err(e);
         }
         self.gso_meta[slot_id] = Some(GsoMeta {
             segment_size,
             datagram_count: datagrams.len(),
+            dst,
         });
         let tag = TAG_SEND_SLOT | u64::try_from(slot_id).expect("slot id fits u64");
         let msg_ptr = std::ptr::from_ref(&ctx.msg);
@@ -658,7 +768,13 @@ impl UringDriver {
         Ok(true)
     }
 
-    fn recover_gso_fallback_datagrams(&self, slot_id: usize) -> Vec<Vec<u8>> {
+    /// Recover a failed GSO send's datagrams for per-datagram retry. `fate` is
+    /// not preserved (set to `0`) — these are always retried via
+    /// `queue_udp_send`, which ignores `fate` (it's only consulted by the GSO
+    /// coalescing decision, which this path has already abandoned); `dst` is
+    /// `meta.dst`, the one destination `can_coalesce_gso_tagged` guaranteed
+    /// every datagram in this send shared.
+    fn recover_gso_fallback_datagrams(&self, slot_id: usize) -> Vec<EgressDatagram> {
         let Some(meta) = self.gso_meta.get(slot_id).and_then(|meta| *meta) else {
             return Vec::new();
         };
@@ -677,12 +793,22 @@ impl UringDriver {
             if end > payload.len() {
                 break;
             }
-            datagrams.push(payload[start..end].to_vec());
+            datagrams.push(EgressDatagram {
+                fate: 0,
+                dst: meta.dst,
+                bytes: payload[start..end].to_vec(),
+            });
         }
         datagrams
     }
 
-    fn recover_gso_unsent_datagrams(&self, slot_id: usize, bytes_sent: usize) -> Vec<Vec<u8>> {
+    /// Same as [`Self::recover_gso_fallback_datagrams`] but for a *partial*
+    /// send completion: only the datagrams past `bytes_sent` are recovered.
+    fn recover_gso_unsent_datagrams(
+        &self,
+        slot_id: usize,
+        bytes_sent: usize,
+    ) -> Vec<EgressDatagram> {
         let Some(meta) = self.gso_meta.get(slot_id).and_then(|meta| *meta) else {
             return Vec::new();
         };
@@ -709,7 +835,11 @@ impl UringDriver {
             if end > payload.len() {
                 break;
             }
-            datagrams.push(payload[start..end].to_vec());
+            datagrams.push(EgressDatagram {
+                fate: 0,
+                dst: meta.dst,
+                bytes: payload[start..end].to_vec(),
+            });
         }
         datagrams
     }
@@ -769,8 +899,14 @@ impl UringDriver {
         }
     }
 
-    fn handle_dispatch_udp(&mut self, d: &mut impl Dispatch, datagram: &[u8], now_ms: u64) {
-        match d.on_udp(datagram, now_ms) {
+    fn handle_dispatch_udp(
+        &mut self,
+        d: &mut impl Dispatch,
+        src: SocketAddr,
+        datagram: &[u8],
+        now_ms: u64,
+    ) {
+        match d.on_udp(src, datagram, now_ms) {
             DispatchOut::None => {}
             DispatchOut::Tun(inner) => {
                 if let Err(e) = self.queue_tun_write(inner) {
@@ -783,7 +919,9 @@ impl UringDriver {
             }
             DispatchOut::Udp(pkts) => {
                 let pkts_owned = pkts.to_vec();
-                if let Err(e) = self.queue_udp_batch(&pkts_owned, false) {
+                // `allow_gso=false`: control/ARQ-retransmit traffic is never
+                // GSO-coalesced, matching pre-addressing behavior exactly.
+                if let Err(e) = self.queue_udp_batch_tagged(&pkts_owned, false) {
                     self.dropped_sends += 1;
                     eprintln!(
                         "uring: drop udp send batch: {e} (dropped_sends={})",
@@ -800,7 +938,7 @@ impl UringDriver {
                     );
                 }
                 let pkts_owned = pkts.to_vec();
-                if let Err(e) = self.queue_udp_batch(&pkts_owned, false) {
+                if let Err(e) = self.queue_udp_batch_tagged(&pkts_owned, false) {
                     self.dropped_sends += 1;
                     eprintln!(
                         "uring: drop udp send batch: {e} (dropped_sends={})",
@@ -956,6 +1094,62 @@ impl UringDriver {
                 continue;
             }
 
+            if kind == TAG_UDP_RECV {
+                let slot_idx_u64 = user_data & TAG_PAYLOAD_MASK;
+                let slot_idx =
+                    usize::try_from(slot_idx_u64).expect("udp recv slot index fits usize");
+                if slot_idx >= self.udp_recv_slots.len() {
+                    return Err(io::Error::other(
+                        "kernel returned udp recv slot out of range",
+                    ));
+                }
+                if result < 0 {
+                    let errno = -result;
+                    // Transient: re-arm the same slot and keep going. Anything
+                    // else is fatal — a permanently failing recv would otherwise
+                    // silently blind the tunnel rather than propagating so a
+                    // supervisor can restart (mirrors the TAG_TUN_RECV contract
+                    // below and `poll.rs`'s `drain_udp`).
+                    if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK || errno == libc::ENOBUFS
+                    {
+                        self.arm_udp_recv_slot(slot_idx)?;
+                        continue;
+                    }
+                    return Err(io::Error::other(format!(
+                        "udp recv completion error: {}",
+                        io::Error::from_raw_os_error(errno)
+                    )));
+                }
+                let n = usize::try_from(result).expect("non-negative CQE result fits usize");
+                if n > MAX_WIRE_DATAGRAM {
+                    self.arm_udp_recv_slot(slot_idx)?;
+                    return Err(io::Error::other("kernel returned oversized datagram"));
+                }
+                // Recover the sender's address from this slot's own
+                // `sockaddr_storage`/`msg_namelen` — the whole point of moving
+                // off multishot `RecvMulti` (see the module doc).
+                let namelen = self.udp_recv_slots[slot_idx].msg.msg_namelen;
+                let src = match sockaddr_to_std(&self.udp_recv_slots[slot_idx].name, namelen) {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        eprintln!(
+                            "uring: dropping udp datagram with unparseable source address: {e}"
+                        );
+                        self.arm_udp_recv_slot(slot_idx)?;
+                        continue;
+                    }
+                };
+                let mut scratch = std::mem::take(&mut self.recv_scratch);
+                scratch.clear();
+                scratch.extend_from_slice(&self.udp_recv_slots[slot_idx].buf[..n]);
+                self.handle_dispatch_udp(d, src, &scratch, now_ms);
+                self.recv_scratch = scratch;
+                self.arm_udp_recv_slot(slot_idx)?;
+                continue;
+            }
+
+            // Everything from here on is TAG_TUN_RECV: provided-buffer,
+            // single-shot, re-armed after every completion.
             let bid_opt = cqueue::buffer_select(flags);
             if result < 0 {
                 let errno = -result;
@@ -965,25 +1159,15 @@ impl UringDriver {
                 }
                 // ENOBUFS on a recv completion means the provided-buffer ring was
                 // momentarily exhausted (no buffer for the kernel to place this
-                // datagram) — the multishot recv stops and must be re-armed. Like
-                // EAGAIN, this is transient, not fatal: drop the datagram and
-                // re-arm; buffers are re-provided as other completions process.
+                // frame) — transient, not fatal: drop the frame and re-arm;
+                // buffers are re-provided as other completions process.
                 // (Treating ENOBUFS as fatal tore the driver down under burst and
                 // flaked the uring unit tests on the CI runner.)
-                if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK || errno == libc::ENOBUFS {
-                    if kind == TAG_UDP_RECV {
-                        self.arm_udp_recv()?;
-                        continue;
-                    }
-                    if kind == TAG_TUN_RECV {
-                        self.arm_tun_read()?;
-                        continue;
-                    }
-                }
-                if kind == TAG_UDP_RECV {
-                    return Err(io::Error::other(format!(
-                        "udp recv completion error: {err}"
-                    )));
+                if (errno == libc::EAGAIN || errno == libc::EWOULDBLOCK || errno == libc::ENOBUFS)
+                    && kind == TAG_TUN_RECV
+                {
+                    self.arm_tun_read()?;
+                    continue;
                 }
                 if kind == TAG_TUN_RECV {
                     return Err(io::Error::other(format!(
@@ -995,7 +1179,7 @@ impl UringDriver {
                 )));
             }
 
-            let bid = if kind == TAG_UDP_RECV || kind == TAG_TUN_RECV {
+            let bid = if kind == TAG_TUN_RECV {
                 bid_opt.ok_or_else(|| {
                     io::Error::other(
                         "recv completion missing buffer_select; aborting to avoid pool-slot leak",
@@ -1020,19 +1204,6 @@ impl UringDriver {
                 return Err(io::Error::other("kernel returned oversized datagram"));
             }
 
-            if kind == TAG_UDP_RECV {
-                let mut scratch = std::mem::take(&mut self.recv_scratch);
-                scratch.clear();
-                scratch.extend_from_slice(&self.recv_pool[idx][..n]);
-                self.handle_dispatch_udp(d, &scratch, now_ms);
-                self.recv_scratch = scratch;
-                self.reprovide_buffer(bid)?;
-                if !cqueue::more(flags) {
-                    self.arm_udp_recv()?;
-                }
-                continue;
-            }
-
             let mut scratch = std::mem::take(&mut self.recv_scratch);
             scratch.clear();
             scratch.extend_from_slice(&self.recv_pool[idx][..n]);
@@ -1045,9 +1216,11 @@ impl UringDriver {
         // Flush TUN-egress datagrams staged this pass in fate-safe GSO batches.
         self.flush_pending_gso();
 
-        if let Some(pkt) = d.tick(now_ms) {
-            if let Err(e) = self.queue_udp_send(pkt) {
-                eprintln!("uring: drop tick packet: {e}");
+        if let Some(pkts) = d.tick(now_ms) {
+            for pkt in pkts {
+                if let Err(e) = self.queue_udp_send(pkt) {
+                    eprintln!("uring: drop tick packet: {e}");
+                }
             }
         }
 
@@ -1118,7 +1291,7 @@ mod tests {
     static URING_SERIAL: Mutex<()> = Mutex::new(());
 
     struct EchoDispatch {
-        scratch: Vec<Vec<u8>>,
+        scratch: Vec<EgressDatagram>,
     }
 
     impl EchoDispatch {
@@ -1130,8 +1303,12 @@ mod tests {
     }
 
     impl Dispatch for EchoDispatch {
-        fn on_udp(&mut self, dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
-            self.scratch = vec![dg.to_vec()];
+        fn on_udp(&mut self, src: SocketAddr, dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
+            self.scratch = vec![EgressDatagram {
+                fate: 0,
+                dst: src,
+                bytes: dg.to_vec(),
+            }];
             DispatchOut::Udp(&self.scratch)
         }
 
@@ -1139,7 +1316,7 @@ mod tests {
             &[]
         }
 
-        fn tick(&mut self, _now_ms: u64) -> Option<&[u8]> {
+        fn tick(&mut self, _now_ms: u64) -> Option<&[EgressDatagram]> {
             None
         }
     }
@@ -1151,7 +1328,7 @@ mod tests {
     }
 
     impl Dispatch for TickCountDispatch {
-        fn on_udp(&mut self, _dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
+        fn on_udp(&mut self, _src: SocketAddr, _dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
             DispatchOut::None
         }
 
@@ -1159,7 +1336,7 @@ mod tests {
             &[]
         }
 
-        fn tick(&mut self, _now_ms: u64) -> Option<&[u8]> {
+        fn tick(&mut self, _now_ms: u64) -> Option<&[EgressDatagram]> {
             self.ticks += 1;
             None
         }
@@ -1169,19 +1346,21 @@ mod tests {
     /// symbols of a single FEC object (source + its repair). A GSO driver must
     /// NEVER coalesce these — losing them together would defeat FEC.
     struct GsoDispatch {
+        dst: SocketAddr,
         scratch: Vec<EgressDatagram>,
     }
 
     impl GsoDispatch {
-        fn new() -> Self {
+        fn new(dst: SocketAddr) -> Self {
             Self {
+                dst,
                 scratch: Vec::new(),
             }
         }
     }
 
     impl Dispatch for GsoDispatch {
-        fn on_udp(&mut self, _dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
+        fn on_udp(&mut self, _src: SocketAddr, _dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
             DispatchOut::None
         }
 
@@ -1192,13 +1371,14 @@ mod tests {
                 datagram[0] = b'0' + i;
                 self.scratch.push(EgressDatagram {
                     fate: 7,
+                    dst: self.dst,
                     bytes: datagram,
                 });
             }
             &self.scratch
         }
 
-        fn tick(&mut self, _now_ms: u64) -> Option<&[u8]> {
+        fn tick(&mut self, _now_ms: u64) -> Option<&[EgressDatagram]> {
             None
         }
     }
@@ -1208,14 +1388,16 @@ mod tests {
     /// driver may coalesce these (a dropped skb costs each object at most one
     /// symbol, recoverable from its repair in a different skb).
     struct GsoLargeBatchDispatch {
+        dst: SocketAddr,
         scratch: Vec<EgressDatagram>,
         datagram_count: usize,
         datagram_size: usize,
     }
 
     impl GsoLargeBatchDispatch {
-        fn new(datagram_count: usize, datagram_size: usize) -> Self {
+        fn new(dst: SocketAddr, datagram_count: usize, datagram_size: usize) -> Self {
             Self {
+                dst,
                 scratch: Vec::new(),
                 datagram_count,
                 datagram_size,
@@ -1224,7 +1406,7 @@ mod tests {
     }
 
     impl Dispatch for GsoLargeBatchDispatch {
-        fn on_udp(&mut self, _dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
+        fn on_udp(&mut self, _src: SocketAddr, _dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
             DispatchOut::None
         }
 
@@ -1235,13 +1417,14 @@ mod tests {
                 datagram[0] = u8::try_from(i % 251).expect("modulo bound fits u8");
                 self.scratch.push(EgressDatagram {
                     fate: u16::try_from(i).expect("datagram_count fits u16"),
+                    dst: self.dst,
                     bytes: datagram,
                 });
             }
             &self.scratch
         }
 
-        fn tick(&mut self, _now_ms: u64) -> Option<&[u8]> {
+        fn tick(&mut self, _now_ms: u64) -> Option<&[EgressDatagram]> {
             None
         }
     }
@@ -1268,9 +1451,22 @@ mod tests {
         );
     }
 
+    fn test_dst() -> SocketAddr {
+        "127.0.0.1:1".parse().expect("valid test address")
+    }
+
+    fn other_dst() -> SocketAddr {
+        "127.0.0.1:2".parse().expect("valid test address")
+    }
+
     fn dg(fate: u16, len: usize) -> EgressDatagram {
+        dg_to(fate, len, test_dst())
+    }
+
+    fn dg_to(fate: u16, len: usize, dst: SocketAddr) -> EgressDatagram {
         EgressDatagram {
             fate,
+            dst,
             bytes: vec![b'x'; len],
         }
     }
@@ -1292,6 +1488,15 @@ mod tests {
     #[test]
     fn can_coalesce_gso_tagged_rejects_mismatched_length() {
         let dgs = [dg(3, 64), dg(4, 32)];
+        assert!(UringDriver::can_coalesce_gso_tagged(&dgs).is_none());
+    }
+
+    #[test]
+    fn can_coalesce_gso_tagged_rejects_mixed_destinations() {
+        // Distinct fates and equal length would otherwise coalesce, but a
+        // coalesced `UDP_SEGMENT` send has exactly one `msg_name` — datagrams
+        // bound for different peers must never share a skb.
+        let dgs = [dg_to(3, 64, test_dst()), dg_to(4, 64, other_dst())];
         assert!(UringDriver::can_coalesce_gso_tagged(&dgs).is_none());
     }
 
@@ -1458,8 +1663,9 @@ mod tests {
         a.set_nonblocking(true).expect("set sender nonblocking");
 
         let (tun_rd, tun_wr) = make_pipe().expect("make tun placeholder pipe");
-        // GsoDispatch returns 5 datagrams all sharing ONE fate (one FEC object).
-        let mut dispatch = GsoDispatch::new();
+        // GsoDispatch returns 5 datagrams all sharing ONE fate (one FEC object),
+        // all destined for `a` (the loopback peer that will receive them).
+        let mut dispatch = GsoDispatch::new(a.local_addr().expect("sender local addr"));
         let mut driver = match UringDriver::new(b.as_raw_fd(), tun_rd) {
             Ok(driver) => driver,
             Err(_) => {
@@ -1538,7 +1744,8 @@ mod tests {
 
         let (tun_rd, tun_wr) = make_pipe().expect("make tun placeholder pipe");
         // Distinct fates so GSO is genuinely attempted (then forced to fail).
-        let mut dispatch = GsoLargeBatchDispatch::new(5, 64);
+        let mut dispatch =
+            GsoLargeBatchDispatch::new(a.local_addr().expect("sender local addr"), 5, 64);
         let mut driver = match UringDriver::new(b.as_raw_fd(), tun_rd) {
             Ok(driver) => driver,
             Err(_) => {
@@ -1622,7 +1829,11 @@ mod tests {
         let (tun_rd, tun_wr) = make_pipe().expect("make tun placeholder pipe");
         let datagram_count = 64usize;
         let datagram_size = 1400usize;
-        let mut dispatch = GsoLargeBatchDispatch::new(datagram_count, datagram_size);
+        let mut dispatch = GsoLargeBatchDispatch::new(
+            a.local_addr().expect("sender local addr"),
+            datagram_count,
+            datagram_size,
+        );
         let mut driver = match UringDriver::new(b.as_raw_fd(), tun_rd) {
             Ok(driver) => driver,
             Err(_) => {

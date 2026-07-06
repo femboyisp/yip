@@ -67,6 +67,29 @@ fn l2_tap_ping_or_arp_across_tunnel() {
 }
 
 #[test]
+fn triangle_full_mesh_ping() {
+    // Requires root: netns creation + TUN devices + a shared bridge underlay.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP triangle_full_mesh_ping: needs root (run under sudo in CI)");
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-netns-triangle.sh");
+    let status = Command::new("bash").arg(script).arg(yipd).status().unwrap();
+    assert!(
+        status.success(),
+        "3-peer netns triangle full-mesh ping failed"
+    );
+}
+
+#[test]
 fn arq_recovers_bulk_loss() {
     // Requires root: netns creation + TUN device + tc netem.
     let is_root = Command::new("id")

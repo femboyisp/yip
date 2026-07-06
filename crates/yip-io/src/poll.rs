@@ -8,43 +8,59 @@
 //! `unsafe` block carries a `// SAFETY:` comment explaining the invariants.
 
 use std::io;
+use std::net::SocketAddr;
 use std::os::fd::RawFd;
 use std::time::Instant;
 
-use crate::MAX_WIRE_DATAGRAM;
+use crate::{sockaddr_to_std, std_to_sockaddr, MAX_WIRE_DATAGRAM};
 
 /// A single-threaded data-plane dispatch interface.
 ///
 /// Implementors hold all mutable state (AEAD session, FEC transport, codec,
 /// auxiliary logs).  [`run_poll`] drives this trait from an `epoll` loop.
+///
+/// # Addressing (multipeer 2a seam)
+///
+/// `on_udp` is told the datagram's source address and every egress datagram
+/// carries its own destination (see [`EgressDatagram::dst`]), so a future
+/// multi-peer `Dispatch` can route by address. A single-peer implementor is
+/// free to ignore `src` and stamp a fixed `dst` on everything it emits —
+/// exactly what [`crate::poll`]'s test dispatches below do, and what
+/// `yipd`'s `DataPlane` does until the Task 5 `PeerManager` lands.
 pub trait Dispatch {
-    /// Called when a UDP datagram arrives.  Returns what [`run_poll`] must
-    /// forward (to TUN, back to UDP, both, or nothing).
-    fn on_udp(&mut self, dg: &[u8], now_ms: u64) -> DispatchOut<'_>;
+    /// Called when a UDP datagram arrives, with the address it came from.
+    /// Returns what [`run_poll`] must forward (to TUN, back to UDP, both, or
+    /// nothing).
+    fn on_udp(&mut self, src: SocketAddr, dg: &[u8], now_ms: u64) -> DispatchOut<'_>;
 
     /// Called when a TUN frame arrives.  Returns egress datagrams to send on
-    /// the UDP socket (may be empty), each tagged with its FEC fate group so a
-    /// GSO-capable driver can coalesce safely (see [`EgressDatagram`]).
+    /// the UDP socket (may be empty), each tagged with its FEC fate group and
+    /// destination so a GSO-capable driver can coalesce safely (see
+    /// [`EgressDatagram`]).
     fn on_tun(&mut self, inner: &[u8], now_ms: u64) -> &[EgressDatagram];
 
-    /// Called at least every 10 ms.  Returns `Some(pkt)` if a feedback
-    /// control packet should be sent on the UDP socket.
-    fn tick(&mut self, now_ms: u64) -> Option<&[u8]>;
+    /// Called at least every 10 ms.  Returns addressed feedback/keepalive
+    /// datagrams (usually 0 or 1) that should be sent on the UDP socket.
+    fn tick(&mut self, now_ms: u64) -> Option<&[EgressDatagram]>;
 }
 
-/// One egress datagram plus the FEC "fate group" it belongs to.
+/// One egress datagram: its destination, plus the FEC "fate group" it
+/// belongs to.
 ///
-/// GSO coalesces same-length UDP datagrams into one `UDP_SEGMENT` super-skb;
-/// under loss the whole skb is dropped/delayed as a unit (segmentation is
-/// deferred to the receiver). Two datagrams that are symbols of the same
-/// RaptorQ object must never share a skb — losing them together can defeat FEC
-/// recovery for that object. `fate` is the RaptorQ object id (source symbols and
-/// this object's repair symbols share it; a different object gets a different
-/// value). A GSO-capable driver must guarantee at most one datagram per distinct
-/// `fate` in any single coalesced send. Non-GSO drivers ignore `fate`.
+/// GSO coalesces same-length, same-destination UDP datagrams into one
+/// `UDP_SEGMENT` super-skb; under loss the whole skb is dropped/delayed as a
+/// unit (segmentation is deferred to the receiver). Two datagrams that are
+/// symbols of the same RaptorQ object must never share a skb — losing them
+/// together can defeat FEC recovery for that object. `fate` is the RaptorQ
+/// object id (source symbols and this object's repair symbols share it; a
+/// different object gets a different value). A GSO-capable driver must
+/// guarantee at most one datagram per distinct `fate` *and* per distinct
+/// `dst` in any single coalesced send (datagrams to different peers must
+/// never share a skb either). Non-GSO drivers ignore `fate`.
 #[derive(Debug, Clone)]
 pub struct EgressDatagram {
     pub fate: u16,
+    pub dst: SocketAddr,
     pub bytes: Vec<u8>,
 }
 
@@ -61,9 +77,9 @@ pub enum DispatchOut<'a> {
     /// Write this slice to the TUN device (decoded inner packet).
     Tun(&'a [u8]),
     /// Send these datagrams on the UDP socket (ARQ retransmits).
-    Udp(&'a [Vec<u8>]),
+    Udp(&'a [EgressDatagram]),
     /// Write to TUN *and* send datagrams.
-    Both(&'a [u8], &'a [Vec<u8>]),
+    Both(&'a [u8], &'a [EgressDatagram]),
 }
 
 // ── internal helpers ──────────────────────────────────────────────────────────
@@ -86,15 +102,28 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
 fn drain_udp(udp_fd: RawFd, tun_fd: RawFd, d: &mut impl Dispatch, now_ms: u64) -> io::Result<()> {
     let mut buf = [0u8; MAX_WIRE_DATAGRAM];
     loop {
+        // SAFETY: `storage` is a valid, suitably-sized/aligned stack buffer for
+        // any sockaddr the kernel writes back into it (see `sockaddr_storage`'s
+        // definition). `addr_len` is initialized to its capacity, as `recvfrom`
+        // requires on entry.
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut addr_len = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>())
+            .expect("size_of::<sockaddr_storage>() fits socklen_t");
+
         // SAFETY: `buf` is a valid stack buffer of length MAX_WIRE_DATAGRAM.
-        // `recv` with MSG_DONTWAIT is a non-blocking receive into that buffer.
-        // `udp_fd` is a valid connected UDP socket fd supplied by the caller.
+        // `recvfrom` with MSG_DONTWAIT is a non-blocking receive into that
+        // buffer; `storage`/`addr_len` are valid out-parameters for the
+        // sender's address as described above. `udp_fd` is a valid UDP
+        // socket fd supplied by the caller (unconnected — the seam is
+        // addressed, not connected).
         let n = unsafe {
-            libc::recv(
+            libc::recvfrom(
                 udp_fd,
                 buf.as_mut_ptr().cast(),
                 buf.len(),
                 libc::MSG_DONTWAIT,
+                std::ptr::from_mut(&mut storage).cast::<libc::sockaddr>(),
+                &raw mut addr_len,
             )
         };
 
@@ -116,11 +145,19 @@ fn drain_udp(udp_fd: RawFd, tun_fd: RawFd, d: &mut impl Dispatch, now_ms: u64) -
             break;
         }
 
+        let src = match sockaddr_to_std(&storage, addr_len) {
+            Ok(addr) => addr,
+            Err(e) => {
+                eprintln!("poll: dropping datagram with unparseable source address: {e}");
+                continue;
+            }
+        };
+
         let dg = &buf[..usize::try_from(n).expect("non-negative recv return fits usize")];
 
         // Dispatch and forward the result.  The borrow of `d` from `on_udp`
         // (inside `DispatchOut`) is dropped at the end of the match arm.
-        match d.on_udp(dg, now_ms) {
+        match d.on_udp(src, dg, now_ms) {
             DispatchOut::None => {}
             DispatchOut::Tun(inner) => {
                 send_to_tun(tun_fd, inner);
@@ -174,7 +211,7 @@ fn drain_tun(tun_fd: RawFd, udp_fd: RawFd, d: &mut impl Dispatch, now_ms: u64) -
         // while calling the mutable send_to_udp.
         let pkts_owned: Vec<EgressDatagram> = d.on_tun(inner, now_ms).to_vec();
         for pkt in &pkts_owned {
-            send_to_udp(udp_fd, &pkt.bytes)?;
+            send_to_udp(udp_fd, pkt)?;
         }
     }
     Ok(())
@@ -197,17 +234,30 @@ fn send_to_tun(tun_fd: RawFd, buf: &[u8]) {
     }
 }
 
-/// Send one datagram on the UDP socket.
+/// Send one datagram on the UDP socket, to its own [`EgressDatagram::dst`].
 ///
 /// Transient errors (`EWOULDBLOCK`, `EAGAIN`, `ENOBUFS`) cause the datagram to
 /// be silently dropped — the UDP socket send buffer is momentarily full and this
 /// single packet loss is acceptable.  All other errors (e.g. `EBADF`) propagate
 /// so that a closed or invalid socket terminates the event loop.
 #[inline]
-fn send_to_udp(udp_fd: RawFd, buf: &[u8]) -> io::Result<()> {
-    // SAFETY: `buf` is a valid slice.  `udp_fd` is a valid connected UDP
-    // socket fd.  MSG_NOSIGNAL suppresses SIGPIPE if the peer has closed.
-    let rc = unsafe { libc::send(udp_fd, buf.as_ptr().cast(), buf.len(), libc::MSG_NOSIGNAL) };
+fn send_to_udp(udp_fd: RawFd, dg: &EgressDatagram) -> io::Result<()> {
+    let (storage, addr_len) = std_to_sockaddr(dg.dst);
+    let buf = &dg.bytes;
+    // SAFETY: `buf` is a valid slice.  `udp_fd` is a valid UDP socket fd
+    // (unconnected — the seam is addressed).  `storage`/`addr_len` describe a
+    // valid destination sockaddr built by `std_to_sockaddr`. MSG_NOSIGNAL
+    // suppresses SIGPIPE if the peer has closed.
+    let rc = unsafe {
+        libc::sendto(
+            udp_fd,
+            buf.as_ptr().cast(),
+            buf.len(),
+            libc::MSG_NOSIGNAL,
+            std::ptr::from_ref(&storage).cast::<libc::sockaddr>(),
+            addr_len,
+        )
+    };
     if rc < 0 {
         let e = io::Error::last_os_error();
         // EWOULDBLOCK == EAGAIN on Linux; list both for portability.
@@ -323,11 +373,13 @@ pub fn run_poll<D: Dispatch>(udp_fd: RawFd, tun_fd: RawFd, d: &mut D) -> io::Res
         }
 
         // Always tick — even on timeout with no events.
-        if let Some(pkt) = d.tick(now_ms) {
-            if let Err(e) = send_to_udp(udp_fd, pkt) {
-                // SAFETY: `epoll_fd` is valid.
-                unsafe { libc::close(epoll_fd) };
-                return Err(e);
+        if let Some(pkts) = d.tick(now_ms) {
+            for pkt in pkts {
+                if let Err(e) = send_to_udp(udp_fd, pkt) {
+                    // SAFETY: `epoll_fd` is valid.
+                    unsafe { libc::close(epoll_fd) };
+                    return Err(e);
+                }
             }
         }
     }
@@ -358,7 +410,7 @@ mod tests {
     }
 
     impl Dispatch for CountDispatch {
-        fn on_udp(&mut self, dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
+        fn on_udp(&mut self, _src: SocketAddr, dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
             self.received.push(dg.to_vec());
             self.call_count += 1;
             DispatchOut::None
@@ -368,7 +420,7 @@ mod tests {
             &[]
         }
 
-        fn tick(&mut self, _now_ms: u64) -> Option<&[u8]> {
+        fn tick(&mut self, _now_ms: u64) -> Option<&[EgressDatagram]> {
             None
         }
     }
@@ -438,15 +490,16 @@ mod tests {
     }
 
     /// A [`Dispatch`] whose `on_udp` returns `DispatchOut::Udp` — i.e. it
-    /// reflects the received datagram back out on the UDP socket, optionally
-    /// replacing its payload.  This exercises the forwarding arm and
-    /// `send_to_udp` end-to-end via `drain_udp`.
+    /// reflects the received datagram back out on the UDP socket (to the
+    /// datagram's own source address), optionally replacing its payload.
+    /// This exercises the forwarding arm and `send_to_udp` end-to-end via
+    /// `drain_udp`.
     struct ForwardDispatch {
         /// Payload to send back.  Cloned once per `on_udp` call.
         reply: Vec<u8>,
-        /// Scratch storage so the `&[Vec<u8>]` returned by `on_udp` lives long
-        /// enough (it borrows `self`).
-        scratch: Vec<Vec<u8>>,
+        /// Scratch storage so the `&[EgressDatagram]` returned by `on_udp`
+        /// lives long enough (it borrows `self`).
+        scratch: Vec<EgressDatagram>,
     }
 
     impl ForwardDispatch {
@@ -459,8 +512,12 @@ mod tests {
     }
 
     impl Dispatch for ForwardDispatch {
-        fn on_udp(&mut self, _dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
-            self.scratch = vec![self.reply.clone()];
+        fn on_udp(&mut self, src: SocketAddr, _dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
+            self.scratch = vec![EgressDatagram {
+                fate: 0,
+                dst: src,
+                bytes: self.reply.clone(),
+            }];
             DispatchOut::Udp(&self.scratch)
         }
 
@@ -468,7 +525,7 @@ mod tests {
             &[]
         }
 
-        fn tick(&mut self, _now_ms: u64) -> Option<&[u8]> {
+        fn tick(&mut self, _now_ms: u64) -> Option<&[EgressDatagram]> {
             None
         }
     }

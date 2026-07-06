@@ -67,6 +67,19 @@ const MAX_RETRIES: u32 = 5;
 /// then derives an [`Established`] session. Retries up to [`MAX_RETRIES`] times
 /// (each with a [`RETRY_TIMEOUT`] read timeout) so the companion test is not
 /// flaky even when the responder thread has not started yet.
+///
+/// Superseded in production by [`HandshakeState`]'s step-functions (Task 5):
+/// `tunnel.rs` no longer does a pre-loop blocking handshake, so this blocking,
+/// socket-owning variant is unreachable outside its own tests. Kept (per the
+/// Task 5 addendum) rather than deleted, since it is still the simplest way to
+/// exercise a full initiator/responder round-trip in a unit test.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "superseded by HandshakeState's step-functions; kept for its own unit tests"
+    )
+)]
 pub fn run_initiator(
     sock: &UdpSocket,
     peer: SocketAddr,
@@ -135,6 +148,16 @@ pub fn run_initiator(
 /// Blocks until a `[HandshakeInit]` datagram arrives, sends the
 /// `[HandshakeResp]` reply, then returns an [`Established`] session together
 /// with the initiator's [`SocketAddr`].
+///
+/// Superseded in production by [`HandshakeState`]'s step-functions; see
+/// [`run_initiator`]'s doc comment.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "superseded by HandshakeState's step-functions; kept for its own unit tests"
+    )
+)]
 pub fn run_responder(
     sock: &UdpSocket,
     local_priv: &[u8; 32],
@@ -171,6 +194,111 @@ pub fn run_responder(
     ))
 }
 
+// ── step-functions (in-band handshakes) ────────────────────────────────────────
+
+/// A handshake in progress, driven step-by-step instead of blocking on a
+/// socket. This lets a caller (e.g. `PeerManager`'s event loop) multiplex
+/// several concurrent handshakes without dedicating a thread to each.
+///
+/// Only the initiator side needs to carry state between steps (it must
+/// remember the in-progress [`Handshake`] while awaiting the responder's
+/// reply); the responder completes in a single step.
+pub struct HandshakeState {
+    handshake: Handshake,
+}
+
+impl HandshakeState {
+    /// Start the initiator role: build `[HandshakeInit] ++ msg1`.
+    ///
+    /// Returns the in-progress state (to be resumed via [`Self::read_response`])
+    /// together with the framed bytes to send to the peer.
+    pub fn start_initiator(
+        local_priv: &[u8; 32],
+        peer_pub: &[u8; 32],
+    ) -> io::Result<(Self, Vec<u8>)> {
+        let mut handshake = Handshake::initiator(local_priv, peer_pub).map_err(crypto_err)?;
+
+        let msg1 = handshake.write_message().map_err(crypto_err)?;
+        let mut init_pkt = Vec::with_capacity(1 + msg1.len());
+        init_pkt.push(PacketType::HandshakeInit as u8);
+        init_pkt.extend_from_slice(&msg1);
+
+        Ok((Self { handshake }, init_pkt))
+    }
+
+    /// Run the responder role to completion in a single step: read
+    /// `[HandshakeInit] ++ msg1` from `init_pkt`, and return the
+    /// `[HandshakeResp] ++ msg2` reply bytes, the completed [`Established`]
+    /// session (Noise-IK completes for the responder as soon as it has read
+    /// msg1 and written msg2), and the initiator's recovered static public
+    /// key.
+    ///
+    /// The static key is required by `PeerManager`'s admission check: a
+    /// `HandshakeInit` must only be admitted (and a peer transitioned to
+    /// `Established`) if the recovered static key matches a *configured*
+    /// peer — otherwise any UDP sender could get a `DataPlane` allocated for
+    /// it. The key is captured from `handshake.remote_static()` before
+    /// `into_session()` consumes the handshake (the transport-mode
+    /// conversion drops the handshake state that holds it).
+    pub fn start_responder(
+        local_priv: &[u8; 32],
+        init_pkt: &[u8],
+    ) -> io::Result<(Established, Vec<u8>, [u8; 32])> {
+        let mut handshake = Handshake::responder(local_priv).map_err(crypto_err)?;
+
+        if init_pkt.is_empty() || init_pkt[0] != PacketType::HandshakeInit as u8 {
+            return Err(io::Error::other("expected HandshakeInit packet"));
+        }
+        handshake.read_message(&init_pkt[1..]).map_err(crypto_err)?;
+
+        let msg2 = handshake.write_message().map_err(crypto_err)?;
+        let mut resp_pkt = Vec::with_capacity(1 + msg2.len());
+        resp_pkt.push(PacketType::HandshakeResp as u8);
+        resp_pkt.extend_from_slice(&msg2);
+
+        // Capture the initiator's static key and the channel binding BEFORE
+        // consuming the handshake into a session.
+        let remote_static = handshake
+            .remote_static()
+            .ok_or_else(|| io::Error::other("responder handshake has no remote static key"))?;
+        let cb = handshake.channel_binding();
+        let session = handshake.into_session().map_err(crypto_err)?;
+        let (auth_key, hp_key) = derive_wire_keys(&cb);
+
+        Ok((
+            Established {
+                session,
+                auth_key,
+                hp_key,
+            },
+            resp_pkt,
+            remote_static,
+        ))
+    }
+
+    /// Resume the initiator role: read `[HandshakeResp] ++ msg2` and
+    /// finalize into an [`Established`] session.
+    pub fn read_response(mut self, resp_pkt: &[u8]) -> io::Result<Established> {
+        if resp_pkt.is_empty() || resp_pkt[0] != PacketType::HandshakeResp as u8 {
+            return Err(io::Error::other("expected HandshakeResp packet"));
+        }
+        self.handshake
+            .read_message(&resp_pkt[1..])
+            .map_err(crypto_err)?;
+
+        // Capture channel binding BEFORE consuming the handshake.
+        let cb = self.handshake.channel_binding();
+        let session = self.handshake.into_session().map_err(crypto_err)?;
+        let (auth_key, hp_key) = derive_wire_keys(&cb);
+
+        Ok(Established {
+            session,
+            auth_key,
+            hp_key,
+        })
+    }
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -204,6 +332,24 @@ mod tests {
             sr.open(sealed.counter, &sealed.ciphertext).unwrap(),
             b"after handshake"
         );
+    }
+
+    #[test]
+    fn step_handshake_initiator_responder_agree() {
+        let a = generate_keypair();
+        let b = generate_keypair();
+
+        let (ha, init_pkt) = HandshakeState::start_initiator(&a.private, &b.public).unwrap();
+        let (b_est, resp_pkt, initiator_static) =
+            HandshakeState::start_responder(&b.private, &init_pkt).unwrap();
+        let a_est = ha.read_response(&resp_pkt).unwrap();
+
+        // Both derive the same channel binding (conn_tag inputs).
+        assert_eq!(a_est.auth_key, b_est.auth_key);
+        assert_eq!(a_est.hp_key, b_est.hp_key);
+        // The responder recovers the initiator's static public key — this is
+        // what `PeerManager` admission-checks against configured peers.
+        assert_eq!(initiator_static, a.public);
     }
 
     #[test]

@@ -2,8 +2,11 @@
 //! servicing UDP + TUN/TAP), then AF_XDP. This is the only crate permitted to
 //! contain `unsafe`; every `unsafe` block must carry a `// SAFETY:` comment.
 
+pub mod addr;
 pub mod poll;
 pub mod uring;
+
+pub use addr::{sockaddr_to_std, std_to_sockaddr};
 
 /// Maximum number of datagrams in a single batched send/recv call.
 pub const MAX_DATAGRAM_BATCH: usize = 64;
