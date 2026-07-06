@@ -1143,6 +1143,28 @@ impl Dispatch for PeerManager {
                         // completes (strictly better than the 90s-then-clear
                         // give-up path).
                         self.peers[i].state = PeerState::Idle;
+                        // Clear the stale direct/punch `endpoint` (the abandoned
+                        // attempt's candidate `C`): a relayed peer routes egress
+                        // via the `relay` flag through `rendezvous.relay`, NOT
+                        // via `endpoint`, and the relay handshake completes
+                        // through the `RdvEvent::Relayed` ->
+                        // `relayed_handshake_resp` path, which does not use
+                        // `endpoint` matching at all. Without this clear, a
+                        // late-arriving direct `[HandshakeResp]` from `C` for the
+                        // abandoned ephemeral (very plausible on a lossy/
+                        // high-latency link — a punch reply just past the
+                        // PUNCH_MS window) would still match this peer in
+                        // `handle_handshake_resp` (`p.endpoint == Some(src) &&
+                        // Handshaking`) and get fed into the *new* relay
+                        // ephemeral's `read_response`, which fails
+                        // cryptographically and silently discards the fresh
+                        // relay attempt (reverting to `Idle` and re-escalating
+                        // forever, since `PathStage` only moves forward). With
+                        // `endpoint` cleared the stray reply matches no peer and
+                        // is dropped harmlessly instead. (Preferring a late punch
+                        // reply over the already-committed relay attempt would be
+                        // a nicer recovery, but is out of 2b scope.)
+                        self.peers[i].endpoint = None;
                         let server = self.server_addr();
                         if let Some(dg) = self.begin_handshake(i, server, true, now_ms) {
                             self.tick_egress.push(dg);
@@ -2060,6 +2082,123 @@ mod tests {
             established_tag(&pm, 0),
             Some(tag_before),
             "session (conn_tag) unchanged"
+        );
+    }
+
+    /// (g) Fix-pass-2 regression: escalating an in-flight punch handshake to
+    /// relay MUST clear the stale `endpoint` left pointing at the abandoned
+    /// punch candidate `C`. Pre-fix, `endpoint` stayed `Some(C)` after
+    /// escalation, so a late direct `[HandshakeResp]` arriving from `C` (very
+    /// plausible on a lossy/high-latency link — a punch reply just past the
+    /// `PUNCH_MS` window) matched this peer in `handle_handshake_resp`
+    /// (`p.endpoint == Some(src) && Handshaking`) and was fed into the *new*
+    /// relay ephemeral's `read_response`, which fails cryptographically and
+    /// silently discards the fresh relay attempt (peer reverts to `Idle`).
+    /// Post-fix, `endpoint` is cleared on escalation so the stray reply
+    /// matches no peer and is dropped harmlessly, leaving the relay
+    /// handshake intact.
+    #[test]
+    fn late_punch_reply_after_relay_escalation_does_not_poison_relay() {
+        use crate::path::PUNCH_MS;
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None, // rendezvous-only: starts in the Punching stage
+        };
+        let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
+
+        // 1. Learn a reflexive candidate `C` for the peer, then tick inside
+        // the punch window: the peer probes `C` directly (endpoint = Some(C)).
+        let candidate: SocketAddr = "198.51.100.7:41000".parse().unwrap();
+        let mut buf = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PeerInfo {
+                node: node_id(&peer_kp.public),
+                reflexive: candidate,
+            },
+            &mut buf,
+        );
+        assert!(matches!(
+            pm.on_udp(mock_server(), &buf, 0),
+            DispatchOut::None
+        ));
+        let out = pm.tick(1).map(<[_]>::to_vec).unwrap_or_default();
+        assert!(
+            out.iter().any(|d| d.dst == candidate
+                && d.bytes.first() == Some(&(PacketType::HandshakeInit as u8))),
+            "punch Init is probed toward the candidate C"
+        );
+        assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+        assert_eq!(
+            pm.peers[0].endpoint,
+            Some(candidate),
+            "endpoint is the punch candidate C while probing directly"
+        );
+        assert!(!pm.peers[0].relay);
+
+        // 2. Tick past PUNCH_MS: escalates to relay. The fix: `endpoint` is
+        // cleared (no longer pointing at the abandoned punch target C).
+        let out = pm.tick(PUNCH_MS + 2).map(<[_]>::to_vec).unwrap_or_default();
+        assert!(
+            out.iter().any(|d| d.dst == mock_server()
+                && matches!(
+                    yip_rendezvous::decode(&d.bytes),
+                    Some(yip_rendezvous::Message::RelaySend { .. })
+                )),
+            "escalated to relay: a RelaySend goes to the server"
+        );
+        assert!(pm.peers[0].relay, "peer is now relay-reached");
+        assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+        assert_eq!(
+            pm.peers[0].endpoint, None,
+            "fix: stale punch-candidate endpoint C must be cleared on escalation \
+             to relay, so a late direct reply from C cannot match this peer"
+        );
+
+        // 3. Simulate a late direct HandshakeResp arriving from C — a
+        // plausible handshake-resp-shaped datagram (only the leading
+        // PacketType byte and the source/state match matter for demux; its
+        // payload need not decrypt against anything, since — post-fix — it
+        // must never even reach `read_response`).
+        let stray = vec![PacketType::HandshakeResp as u8; 64];
+        let result = pm.on_udp(candidate, &stray, PUNCH_MS + 3);
+        assert!(
+            matches!(result, DispatchOut::None),
+            "the stray late reply from C produces no egress"
+        );
+
+        // The load-bearing assertions: the relay handshake must NOT have been
+        // poisoned/discarded by the stray datagram. Pre-fix, `endpoint` would
+        // still equal `Some(candidate)`, so `handle_handshake_resp` would have
+        // matched this peer, fed the garbage into the relay ephemeral's
+        // `read_response` (which errors), and reverted the peer to `Idle` —
+        // silently destroying the in-flight relay attempt. Post-fix,
+        // `endpoint == None` means no match, so the relay attempt survives
+        // untouched.
+        assert!(
+            matches!(pm.peers[0].state, PeerState::Handshaking(_)),
+            "relay handshake must survive the stray late punch reply from C \
+             (pre-fix this would be Idle, having been poisoned)"
+        );
+        assert!(
+            pm.peers[0].relay,
+            "peer must still be relay-reached after the stray datagram"
+        );
+
+        // A subsequent tick still drives the (intact) relay attempt rather
+        // than starting over from a clobbered Idle state.
+        let out2 = pm
+            .tick(PUNCH_MS + HANDSHAKE_RETRY_MS + 3)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
+        assert!(
+            out2.iter().any(|d| d.dst == mock_server()
+                && matches!(
+                    yip_rendezvous::decode(&d.bytes),
+                    Some(yip_rendezvous::Message::RelaySend { .. })
+                )),
+            "the relay attempt keeps retransmitting via the server, unbroken by the stray reply"
         );
     }
 }
