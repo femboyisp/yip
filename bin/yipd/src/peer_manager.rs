@@ -154,8 +154,11 @@ struct Peer {
     addr: Ipv6Addr,
     /// This peer's UDP endpoint: the configured value until a `HandshakeInit`
     /// admission *learns* the actual observed source address (see
-    /// `PeerManager::handle_handshake_init`).
-    endpoint: SocketAddr,
+    /// `PeerManager::handle_handshake_init`). `None` until a direct candidate
+    /// is known — a peer configured with no `endpoint` is reachable only via
+    /// rendezvous/relay, which Task 6 wires into this path; such a peer
+    /// cannot yet be routed to directly (see `on_tun`'s `Idle` branch).
+    endpoint: Option<SocketAddr>,
     state: PeerState,
     /// TUN packets buffered while no `Established` session exists yet.
     pending_tun: Vec<Vec<u8>>,
@@ -304,7 +307,7 @@ impl PeerManager {
         }
         self.peers
             .iter()
-            .position(|p| p.endpoint == src && matches!(p.state, PeerState::Established(_)))
+            .position(|p| p.endpoint == Some(src) && matches!(p.state, PeerState::Established(_)))
     }
 
     /// Dispatch a `Data`/`Control` datagram to peer `idx`'s `DataPlane` and
@@ -459,7 +462,7 @@ impl PeerManager {
                 let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
                 let mut dp = Box::new(DataPlane::new(established, conn_tag, self.mode, src));
 
-                self.peers[idx].endpoint = src; // learn the observed endpoint
+                self.peers[idx].endpoint = Some(src); // learn the observed endpoint
                 self.peers[idx].cached_resp = Some(resp_pkt.clone());
                 self.by_tag.insert(dp.conn_tag(), idx);
 
@@ -493,7 +496,7 @@ impl PeerManager {
         let Some(idx) = self
             .peers
             .iter()
-            .position(|p| p.endpoint == src && matches!(p.state, PeerState::Handshaking(_)))
+            .position(|p| p.endpoint == Some(src) && matches!(p.state, PeerState::Handshaking(_)))
         else {
             return DispatchOut::None;
         };
@@ -506,12 +509,9 @@ impl PeerManager {
         match handshaking.hs.read_response(dg) {
             Ok(established) => {
                 let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
-                let mut dp = Box::new(DataPlane::new(
-                    established,
-                    conn_tag,
-                    self.mode,
-                    self.peers[idx].endpoint,
-                ));
+                // `idx` was matched above via `p.endpoint == Some(src)`, so `src`
+                // is exactly this peer's endpoint.
+                let mut dp = Box::new(DataPlane::new(established, conn_tag, self.mode, src));
                 self.by_tag.insert(dp.conn_tag(), idx);
 
                 self.egress.clear();
@@ -577,11 +577,17 @@ impl Dispatch for PeerManager {
             return &[];
         }
 
-        // Idle: buffer this packet and kick off a lazy handshake.
+        // Idle: buffer this packet and kick off a lazy handshake — but only if
+        // we have a direct endpoint to target. A peer configured with no
+        // `endpoint` (rendezvous-only) has no direct candidate yet; it stays
+        // `Idle` with its packet buffered until Task 6 supplies one via the
+        // rendezvous path.
         Self::push_pending(&mut self.peers[idx].pending_tun, inner);
+        let Some(peer_endpoint) = self.peers[idx].endpoint else {
+            return &[];
+        };
         match HandshakeState::start_initiator(&self.local_priv, &self.peers[idx].pubkey) {
             Ok((hs, init_pkt)) => {
-                let peer_endpoint = self.peers[idx].endpoint;
                 self.egress.clear();
                 self.egress.push(EgressDatagram {
                     fate: 0,
@@ -628,14 +634,19 @@ impl Dispatch for PeerManager {
                     } else {
                         // Retransmit the SAME init (same ephemeral) so the
                         // responder's cached reply stays valid — see
-                        // HANDSHAKE_TOTAL_MS.
+                        // HANDSHAKE_TOTAL_MS. A peer only ever reaches
+                        // `Handshaking` via `on_tun`'s `Idle` branch, which
+                        // requires `endpoint` to be `Some` — see that branch's
+                        // doc comment — so `endpoint` is still `Some` here.
                         handshaking.retries = handshaking.retries.saturating_add(1);
                         handshaking.last_sent_ms = now_ms;
-                        self.tick_egress.push(EgressDatagram {
-                            fate: 0,
-                            dst: endpoint,
-                            bytes: handshaking.init_pkt.clone(),
-                        });
+                        if let Some(dst) = endpoint {
+                            self.tick_egress.push(EgressDatagram {
+                                fate: 0,
+                                dst,
+                                bytes: handshaking.init_pkt.clone(),
+                            });
+                        }
                         PeerState::Handshaking(handshaking)
                     }
                 }
@@ -676,7 +687,7 @@ mod tests {
     fn peer_cfg(tag_byte: u8, endpoint: &str) -> PeerConfig {
         PeerConfig {
             public_key: [tag_byte; 32],
-            endpoint: endpoint.parse().unwrap(),
+            endpoint: Some(endpoint.parse().unwrap()),
         }
     }
 
@@ -798,7 +809,7 @@ mod tests {
         const FAKE_TAG: u64 = 0xAAAA_BBBB_CCCC_DDDD;
         pm.peers[1].state = PeerState::Established(Box::new(fake_established_dataplane(
             FAKE_TAG,
-            peer_b.endpoint,
+            peer_b.endpoint.unwrap(),
         )));
         pm.by_tag.insert(FAKE_TAG, 1);
 
@@ -820,7 +831,10 @@ mod tests {
         let mut untagged_dg = vec![PacketType::Data as u8];
         untagged_dg.extend_from_slice(&0u64.to_be_bytes());
         untagged_dg.extend_from_slice(&[0u8; 8]);
-        assert_eq!(pm.route_data(peer_b.endpoint, &untagged_dg), Some(1));
+        assert_eq!(
+            pm.route_data(peer_b.endpoint.unwrap(), &untagged_dg),
+            Some(1)
+        );
     }
 
     #[test]
@@ -898,11 +912,11 @@ mod tests {
         let ep_b: SocketAddr = "10.0.0.2:2000".parse().unwrap();
         let cfg_b = PeerConfig {
             public_key: kp_b.public,
-            endpoint: ep_b,
+            endpoint: Some(ep_b),
         };
         let cfg_a = PeerConfig {
             public_key: kp_a.public,
-            endpoint: ep_a,
+            endpoint: Some(ep_a),
         };
         let mut pm_a = PeerManager::new(kp_a.private, kp_a.public, &[cfg_b], TunnelMode::L3Tun);
         let mut pm_b = PeerManager::new(kp_b.private, kp_b.public, &[cfg_a], TunnelMode::L3Tun);
@@ -954,7 +968,7 @@ mod tests {
         let ep_i: SocketAddr = "10.0.0.7:7000".parse().unwrap();
         let cfg_i = PeerConfig {
             public_key: kp_i.public,
-            endpoint: ep_i,
+            endpoint: Some(ep_i),
         };
         let mut pm_r = PeerManager::new(kp_r.private, kp_r.public, &[cfg_i], TunnelMode::L3Tun);
 
@@ -988,7 +1002,7 @@ mod tests {
         let kp_local = generate_keypair();
         let peer = PeerConfig {
             public_key: [7u8; 32],
-            endpoint: "10.0.0.9:9000".parse().unwrap(),
+            endpoint: Some("10.0.0.9:9000".parse().unwrap()),
         };
         let mut pm = PeerManager::new(
             kp_local.private,
@@ -1045,7 +1059,7 @@ mod tests {
         let kp_local = generate_keypair();
         let peer = PeerConfig {
             public_key: [7u8; 32],
-            endpoint: "10.0.0.9:9000".parse().unwrap(),
+            endpoint: Some("10.0.0.9:9000".parse().unwrap()),
         };
         let mut pm = PeerManager::new(
             kp_local.private,

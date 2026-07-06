@@ -1123,6 +1123,7 @@ dependencies = [
  "yip-crypto",
  "yip-device",
  "yip-io",
+ "yip-rendezvous",
  "yip-transport",
  "yip-wire",
 ]

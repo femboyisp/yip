@@ -10,6 +10,7 @@ mod handshake;
 mod mac_table;
 mod mode;
 mod peer_manager;
+mod rendezvous;
 mod tunnel;
 mod wire_glue;
 
