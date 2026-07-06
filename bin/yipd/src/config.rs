@@ -13,7 +13,10 @@ use crate::mode::TunnelMode;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerConfig {
     pub public_key: [u8; 32],
-    pub endpoint: SocketAddr,
+    /// This peer's known direct UDP endpoint, or `None` if the peer is known
+    /// only by public key (reachable only via rendezvous/relay once Task 6
+    /// wires that path in).
+    pub endpoint: Option<SocketAddr>,
 }
 
 /// Static configuration for one yip tunnel endpoint.
@@ -32,6 +35,10 @@ pub struct Config {
     pub device: String,
     /// Tunnel mode selected from `device_kind=tun|tap` (`tun` by default).
     pub device_kind: TunnelMode,
+    /// Configured rendezvous+relay server, if any (`rendezvous=<IP:port>`).
+    /// Enables lazy Direct→Punch→Relay peer bring-up in `PeerManager` via
+    /// `ConfiguredServerRendezvous`.
+    pub rendezvous: Option<SocketAddr>,
 }
 
 // ── hex decode helper ─────────────────────────────────────────────────────────
@@ -82,16 +89,21 @@ fn flush_peer_block(
     cur_ep: Option<SocketAddr>,
     peers: &mut Vec<PeerConfig>,
 ) -> io::Result<()> {
-    if let (Some(pk), Some(ep)) = (cur_pk, cur_ep) {
-        peers.push(PeerConfig {
+    match cur_pk {
+        // `endpoint` is optional: a peer known only by public key is
+        // rendezvous-only (unreachable directly until Task 6 supplies a
+        // candidate).
+        Some(pk) => peers.push(PeerConfig {
             public_key: pk,
-            endpoint: ep,
-        });
-    } else if cur_pk.is_some() || cur_ep.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "peer block missing public_key or endpoint".to_string(),
-        ));
+            endpoint: cur_ep,
+        }),
+        None if cur_ep.is_some() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "peer block has an endpoint but no public_key".to_string(),
+            ));
+        }
+        None => {}
     }
     Ok(())
 }
@@ -116,6 +128,7 @@ impl Config {
         let mut listen: Option<SocketAddr> = None;
         let mut device: Option<String> = None;
         let mut device_kind = TunnelMode::default();
+        let mut rendezvous: Option<SocketAddr> = None;
 
         for line in text.lines() {
             let line = line.trim();
@@ -164,6 +177,12 @@ impl Config {
                 }
                 "device" => device = Some(val.to_owned()),
                 "device_kind" => device_kind = TunnelMode::parse_device_kind(val)?,
+                "rendezvous" => {
+                    rendezvous =
+                        Some(val.parse::<SocketAddr>().map_err(|e| {
+                            io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                        })?)
+                }
                 // Silently ignore unknown keys for forward-compatibility. The
                 // netns config files still contain `initiate=true|false` from
                 // before Task 5 removed the field; this is intentional so
@@ -182,7 +201,7 @@ impl Config {
             if let (Some(pk), Some(ep)) = (legacy_peer_public, legacy_peer_endpoint) {
                 peers.push(PeerConfig {
                     public_key: pk,
-                    endpoint: ep,
+                    endpoint: Some(ep),
                 });
             }
         }
@@ -203,6 +222,7 @@ impl Config {
             listen: listen.ok_or_else(|| missing("listen"))?,
             device: device.ok_or_else(|| missing("device"))?,
             device_kind,
+            rendezvous,
         })
     }
 }
@@ -421,7 +441,10 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
                     [peer]\npublic_key=00000000000000000000000000000000000000000000000000000000000000b2\nendpoint=10.0.0.3:51820\n";
         let cfg = Config::parse(text).expect("parses");
         assert_eq!(cfg.peers.len(), 2);
-        assert_eq!(cfg.peers[0].endpoint, "10.0.0.2:51820".parse().unwrap());
+        assert_eq!(
+            cfg.peers[0].endpoint,
+            Some("10.0.0.2:51820".parse().unwrap())
+        );
         assert_eq!(cfg.peers[1].public_key[31], 0xb2);
     }
 
@@ -434,5 +457,34 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         let cfg = Config::parse(text).expect("legacy parses");
         assert_eq!(cfg.peers.len(), 1);
         assert_eq!(cfg.peers[0].public_key[31], 0xbb);
+    }
+
+    #[test]
+    fn parses_rendezvous_and_optional_endpoint() {
+        let text = "local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
+                    local_public=000000000000000000000000000000000000000000000000000000000000aa01\n\
+                    listen=0.0.0.0:51820\ndevice=yip0\nrendezvous=203.0.113.1:51821\n\
+                    [peer]\npublic_key=00000000000000000000000000000000000000000000000000000000000000b1\n";
+        let cfg = Config::parse(text).expect("parses");
+        assert_eq!(cfg.rendezvous, Some("203.0.113.1:51821".parse().unwrap()));
+        assert_eq!(cfg.peers.len(), 1);
+        assert_eq!(
+            cfg.peers[0].endpoint, None,
+            "peer with no endpoint is rendezvous-only"
+        );
+    }
+
+    #[test]
+    fn rendezvous_absent_is_none() {
+        let text = "local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
+                    local_public=000000000000000000000000000000000000000000000000000000000000aa01\n\
+                    listen=0.0.0.0:51820\ndevice=yip0\n\
+                    [peer]\npublic_key=00000000000000000000000000000000000000000000000000000000000000b1\nendpoint=10.0.0.2:51820\n";
+        let cfg = Config::parse(text).unwrap();
+        assert_eq!(cfg.rendezvous, None);
+        assert_eq!(
+            cfg.peers[0].endpoint,
+            Some("10.0.0.2:51820".parse().unwrap())
+        );
     }
 }

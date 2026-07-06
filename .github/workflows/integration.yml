@@ -123,10 +123,17 @@ jobs:
           # arq_recovers_bulk_loss drives a real Bulk flow and needs a release yipd
           # (debug RaptorQ is ~75x slower).
           cargo build --release -p yipd
+          # relay_path_ping and hole_punch_ping need the yip-rendezvous server
+          # binary (a debug build is fine: these are ping-only tests). It lives
+          # in a different package, so cargo does not build it as a side effect
+          # of the tunnel_netns test build above; the test locates it at
+          # target/debug/yip-rendezvous and SKIPs with instructions if absent,
+          # so build it here to keep this job honest (not vacuously green).
+          cargo build -p yip-rendezvous-bin
           echo "running netns tunnel tests under sudo: $BIN"
           # --exact so ping_across_yipd_tunnel does not also match _under_loss.
           for mode in poll uring; do
-            for t in ping_across_yipd_tunnel ping_across_yipd_tunnel_under_loss arq_recovers_bulk_loss l2_tap_ping_or_arp_across_tunnel triangle_full_mesh_ping; do
+            for t in ping_across_yipd_tunnel ping_across_yipd_tunnel_under_loss arq_recovers_bulk_loss l2_tap_ping_or_arp_across_tunnel triangle_full_mesh_ping relay_path_ping hole_punch_ping; do
               LOG="/tmp/netns-$mode-$t.log"
               if [ "$mode" = "uring" ]; then
                 echo "running $t with UringDriver (opt-in: YIP_USE_URING=1)"

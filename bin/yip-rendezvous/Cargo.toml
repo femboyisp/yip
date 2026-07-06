@@ -1,0 +1,16 @@
+[package]
+name = "yip-rendezvous-bin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "yip-rendezvous"
+path = "src/main.rs"
+
+[dependencies]
+yip-rendezvous = { path = "../../crates/yip-rendezvous" }
+
+[lints]
+workspace = true

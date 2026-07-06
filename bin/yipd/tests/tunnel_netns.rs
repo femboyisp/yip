@@ -1,5 +1,15 @@
 //! End-to-end tunnel test: two yipd in separate netns ping across the tunnel.
 //! Requires root (CAP_NET_ADMIN + netns); SKIPs otherwise. Run in CI under sudo.
+//!
+//! `relay_path_ping` and `hole_punch_ping` (2b Task 7) are the rendezvous
+//! money tests: each asserts not just that the ping succeeds, but *which*
+//! path (blind relay vs. punch/direct) carried the traffic, via the
+//! server's `relay-forwarded=<N>` counter. Graceful degradation (no
+//! `rendezvous` configured) is already covered by the plain 2a tests above
+//! (`ping_across_yipd_tunnel`, `triangle_full_mesh_ping`, etc.), and
+//! optional-endpoint reachability is exercised by both money tests, whose
+//! peers are configured by `public_key` only (no `endpoint`) — so no
+//! separate script is needed for either.
 use std::process::Command;
 
 #[test]
@@ -129,5 +139,97 @@ fn arq_recovers_bulk_loss() {
     assert!(
         status.success(),
         "ARQ integrity test failed: FEC+ARQ did not recover 5% bulk loss or ARQ did not fire"
+    );
+}
+
+/// Locate the `yip-rendezvous` debug binary in the shared workspace target
+/// dir. Unlike `yipd` (built in-package via `CARGO_BIN_EXE_yipd`, resolved at
+/// compile time), `yip-rendezvous` lives in a different workspace package
+/// (`yip-rendezvous-bin`); Cargo only populates `CARGO_BIN_EXE_<name>` for a
+/// package's own binaries on stable (cross-package binary exe paths need the
+/// nightly-only `artifact-dependencies`/`-Z bindeps` feature), so this
+/// resolves the path the same way `arq_recovers_bulk_loss` resolves the
+/// release `yipd` binary: relative to `CARGO_MANIFEST_DIR`, two levels up to
+/// the workspace root, then into `target/debug`.
+fn yip_rendezvous_bin() -> std::path::PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let workspace_root = std::path::Path::new(manifest_dir)
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root two levels up from CARGO_MANIFEST_DIR");
+    workspace_root.join("target/debug/yip-rendezvous")
+}
+
+#[test]
+fn relay_path_ping() {
+    // Requires root: netns creation + TUN devices + yip-rendezvous.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP relay_path_ping: needs root (run under sudo in CI)");
+        return;
+    }
+    let rdv = yip_rendezvous_bin();
+    if !rdv.exists() {
+        eprintln!(
+            "SKIP relay_path_ping: yip-rendezvous binary not found at {}; \
+             run `cargo build -p yip-rendezvous-bin` first",
+            rdv.display()
+        );
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-netns-relay.sh");
+    let status = Command::new("bash")
+        .arg(script)
+        .arg(yipd)
+        .arg(&rdv)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "relay-path netns test failed (ping did not succeed, or relay-forwarded stayed 0)"
+    );
+}
+
+#[test]
+fn hole_punch_ping() {
+    // Requires root: netns creation + TUN devices + yip-rendezvous + NAT.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP hole_punch_ping: needs root (run under sudo in CI)");
+        return;
+    }
+    let rdv = yip_rendezvous_bin();
+    if !rdv.exists() {
+        eprintln!(
+            "SKIP hole_punch_ping: yip-rendezvous binary not found at {}; \
+             run `cargo build -p yip-rendezvous-bin` first",
+            rdv.display()
+        );
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-netns-punch.sh");
+    let status = Command::new("bash")
+        .arg(script)
+        .arg(yipd)
+        .arg(&rdv)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "hole-punch netns test failed (ping did not succeed, or relay-forwarded was nonzero)"
     );
 }
