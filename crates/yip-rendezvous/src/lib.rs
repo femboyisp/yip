@@ -4,5 +4,7 @@
 #![forbid(unsafe_code)]
 
 pub mod proto;
+pub mod server;
 
 pub use proto::{decode, encode, node_id, Message, NodeId};
+pub use server::RendezvousServer;
