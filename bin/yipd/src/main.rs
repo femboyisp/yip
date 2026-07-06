@@ -9,6 +9,7 @@ mod dataplane;
 mod handshake;
 mod mac_table;
 mod mode;
+mod path;
 mod peer_manager;
 mod rendezvous;
 mod tunnel;
