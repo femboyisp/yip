@@ -254,4 +254,36 @@ mod tests {
         assert!(matches!(p.advance(1000), PathAction::Probe(x) if x == a("10.0.0.2:51820")));
         assert_eq!(p.stage(), PathStage::Direct);
     }
+
+    #[test]
+    fn candidate_during_direct_restamps_punch_window() {
+        let mut p = PathState::new(true, true, 0);
+        p.on_direct_addr(a("10.0.0.2:51820"));
+
+        // At early time 1000 (still within DIRECT_MS=3000), a reflexive candidate arrives.
+        let reflexive = a("198.51.100.7:41000");
+        p.on_peer_candidate(reflexive, 1000);
+
+        // Transition to Punching happens immediately.
+        assert_eq!(p.stage(), PathStage::Punching);
+
+        // At the candidate-arrival time, it probes the reflexive addr.
+        assert!(matches!(p.advance(1000), PathAction::Probe(x) if x == reflexive));
+
+        // The load-bearing assertion: PUNCH_MS window is measured from candidate arrival (1000),
+        // not from new()'s time (0).
+        // At now_ms = 1000 + PUNCH_MS - 1 = 5999, elapsed from 1000 is 4999 < PUNCH_MS.
+        // Still within the punch window, so it should probe and stay Punching.
+        assert!(matches!(p.advance(5999), PathAction::Probe(x) if x == reflexive));
+        assert_eq!(p.stage(), PathStage::Punching);
+
+        // At now_ms = 1000 + PUNCH_MS + 1 = 6001, elapsed from 1000 is 5001 >= PUNCH_MS.
+        // Window elapsed, escalate to Relaying.
+        assert!(matches!(p.advance(6001), PathAction::Relay));
+        assert_eq!(p.stage(), PathStage::Relaying);
+
+        // If the bug existed and the window was measured from new()'s time 0:
+        // At 5999, elapsed from 0 would be 5999 >= PUNCH_MS (5000), causing premature escalation.
+        // This test would fail on the assertion at 5999 expecting Punching.
+    }
 }
