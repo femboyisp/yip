@@ -61,6 +61,13 @@ pub struct Membership {
     network_id: [u8; 16],
     roots: RootSet,
     own_node_id: NodeId,
+    /// This node's own cert, kept independent of `directory` so
+    /// `own_cert_bytes` never depends on the own record surviving
+    /// `sweep_expired` (or any other directory churn). It may become
+    /// expired over wall-clock time; that's the operator's renewal
+    /// concern, not a reason to panic — an expired own cert is still
+    /// returned as-is and left for the peer to reject.
+    own_cert: Cert,
     /// WALL-CLOCK-seconds timestamp is not stored here; only the MONOTONIC
     /// millisecond mark of the last digest we emitted, for `tick_digest`'s
     /// debounce.
@@ -103,6 +110,7 @@ impl Membership {
         own_endpoints: Vec<SocketAddr>,
     ) -> Self {
         let own_node_id = node_id(&own_cert.member_pubkey);
+        let own_cert_stored = own_cert.clone();
         let own_record = build_signed_record(own_cert, own_endpoints, INITIAL_SEQ, &own_sign_priv);
 
         let mut m = Membership {
@@ -112,6 +120,7 @@ impl Membership {
             network_id,
             roots,
             own_node_id,
+            own_cert: own_cert_stored,
             last_digest_ms: None,
         };
         m.insert_record(own_record);
@@ -145,13 +154,17 @@ impl Membership {
     }
 
     /// This node's own cert, encoded — for the handshake payload (Task 6).
+    ///
+    /// Reads from the dedicated `own_cert` field, never from `directory` —
+    /// the own record can (deliberately) still be evicted-and-reinserted or
+    /// otherwise churned in the directory without this ever panicking. If
+    /// the own cert has itself expired (wall-clock), this still returns its
+    /// encoded bytes as-is: presenting an expired cert is the operator's
+    /// renewal problem and is correctly rejected by peers, not a reason for
+    /// the daemon to crash.
     pub fn own_cert_bytes(&self) -> Vec<u8> {
-        let rec = self
-            .directory
-            .get(&self.own_node_id)
-            .expect("own record is always present after Membership::new");
         let mut out = Vec::new();
-        rec.cert.encode(&mut out);
+        self.own_cert.encode(&mut out);
         out
     }
 
@@ -283,12 +296,17 @@ impl Membership {
     }
 
     /// Remove every directory entry whose cert is no longer valid at `now`
-    /// (WALL-CLOCK seconds, widened by `CLOCK_SKEW_SECS`). Returns whether
-    /// anything was evicted.
+    /// (WALL-CLOCK seconds, widened by `CLOCK_SKEW_SECS`), EXCEPT this
+    /// node's own record (`own_node_id`), which is never evicted here: our
+    /// own cert expiring over wall-clock time is inevitable and must not
+    /// churn our own directory entry (`own_cert_bytes` is independent of
+    /// this anyway, but keeping the own record present is the consistent
+    /// behavior for gossip). Returns whether anything was evicted.
     fn sweep_expired(&mut self, now: u64) -> bool {
         let expired: Vec<NodeId> = self
             .directory
             .iter()
+            .filter(|(nid, _)| **nid != self.own_node_id)
             .filter(|(_, rec)| {
                 yip_membership::verify_cert(
                     &rec.cert,
@@ -595,5 +613,72 @@ mod tests {
         assert_eq!(a.directory, b.directory);
         assert!(a.directory.contains_key(&a_nid));
         assert!(a.directory.contains_key(&b_nid));
+    }
+
+    // (h) regression: once wall-clock time passes the OWN cert's
+    // `not_after + CLOCK_SKEW_SECS`, `own_cert_bytes()` must still return
+    // the (expired) own cert rather than panicking, and the own record
+    // must survive `sweep_expired` (driven here via `ingest_record`)
+    // rather than being evicted like any other expired record.
+    //
+    // Pre-fix, `own_cert_bytes` read from `directory.get(&own_node_id)`
+    // with `.expect("own record is always present...")`, and
+    // `sweep_expired` evicted ANY expired entry with no own-record
+    // special-case — so this test panics on the pre-fix code and passes
+    // after the fix.
+    #[test]
+    fn own_cert_bytes_survives_own_cert_expiry() {
+        let ca = ca_key(1);
+        let net = [7u8; 16];
+        let own_member_pk = [90u8; 32];
+        let own_sign_key = SigningKey::from_bytes(&[91u8; 32]);
+        let own_sign_pub = own_sign_key.verifying_key().to_bytes();
+        // Narrow validity window: own cert expires (wall-clock) at 200.
+        let own_cert = make_cert(&ca, own_member_pk, own_sign_pub, net, 0, 200);
+        let own_nid = node_id(&own_member_pk);
+        let ca_pub = ca.verifying_key().to_bytes();
+        let mut m = Membership::new(
+            vec![ca_pub],
+            net,
+            own_cert.clone(),
+            own_sign_key.to_bytes(),
+            empty_roots(),
+            vec!["10.0.0.2:51820".parse().unwrap()],
+        );
+
+        // Sanity: own record present right after construction.
+        assert!(m.directory.contains_key(&own_nid));
+        assert!(m.resolve(&node_addr(&own_member_pk)).is_some());
+
+        // Drive an ingest_record call (as `on_gossip`/the handshake path
+        // would) with `now` well past not_after(200) + CLOCK_SKEW_SECS(300)
+        // = 500 — this is exactly the condition that trips `sweep_expired`.
+        let other_member_pk = [95u8; 32];
+        let other_sign_key = SigningKey::from_bytes(&[96u8; 32]);
+        let other_sign_pub = other_sign_key.verifying_key().to_bytes();
+        let other_cert = make_cert(&ca, other_member_pk, other_sign_pub, net, 0, 1_000_000);
+        let other_rec = build_signed_record(
+            other_cert,
+            vec!["192.0.2.50:7777".parse().unwrap()],
+            1,
+            &other_sign_key.to_bytes(),
+        );
+        let now_past_own_expiry = 900u64;
+        let _ = m.ingest_record(other_rec, now_past_own_expiry);
+
+        // Own record must survive the sweep (not evicted like an ordinary
+        // expired entry would be).
+        assert!(
+            m.directory.contains_key(&own_nid),
+            "own record must survive sweep_expired even after its own cert expires"
+        );
+        assert!(m.resolve(&node_addr(&own_member_pk)).is_some());
+
+        // own_cert_bytes() must not panic and must still return the
+        // correct (now-expired) own cert, unconditionally of directory
+        // state.
+        let mut expected = Vec::new();
+        own_cert.encode(&mut expected);
+        assert_eq!(m.own_cert_bytes(), expected);
     }
 }
