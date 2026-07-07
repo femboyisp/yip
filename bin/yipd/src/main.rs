@@ -8,6 +8,7 @@ mod config;
 mod dataplane;
 mod handshake;
 mod mac_table;
+mod membership;
 mod mode;
 mod path;
 mod peer_manager;

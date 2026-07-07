@@ -12,7 +12,11 @@ yip-crypto = { path = "../../crates/yip-crypto" }
 yip-transport = { path = "../../crates/yip-transport" }
 yip-device = { path = "../../crates/yip-device" }
 yip-rendezvous = { path = "../../crates/yip-rendezvous" }
+yip-membership = { path = "../../crates/yip-membership" }
 blake2 = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { version = "2.1", default-features = false }
 
 [lints]
 workspace = true

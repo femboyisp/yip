@@ -9,5 +9,6 @@ pub mod ids;
 pub mod record;
 
 pub use cert::{verify_cert, Cert, CertError, RootSet};
+pub use gossip::GossipMsg;
 pub use ids::{node_addr, node_id, NodeId};
 pub use record::Record;

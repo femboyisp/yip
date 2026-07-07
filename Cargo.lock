@@ -1225,9 +1225,11 @@ name = "yipd"
 version = "0.0.0"
 dependencies = [
  "blake2",
+ "ed25519-dalek",
  "yip-crypto",
  "yip-device",
  "yip-io",
+ "yip-membership",
  "yip-rendezvous",
  "yip-transport",
  "yip-wire",

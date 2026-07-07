@@ -4,10 +4,17 @@
 //! `#`-prefixed comment lines and blank lines are ignored). All three 32-byte
 //! keys are hex-encoded (64 hex digits). No external parser is required.
 
+// The mesh fields (`ca_public`/`cert`/`roots`/`member_sign_private`/
+// `network_id`) are parsed here in Task 5 but only *read* once Task 6 wires
+// `Membership::new` into `tunnel.rs`; until then they're dead code outside
+// this module's own tests.
+#![allow(dead_code)]
+
 use std::io;
 use std::net::SocketAddr;
 
 use crate::mode::TunnelMode;
+use yip_membership::{Cert, RootSet};
 
 /// Configuration for a single remote peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +46,22 @@ pub struct Config {
     /// Enables lazy Direct→Punch→Relay peer bring-up in `PeerManager` via
     /// `ConfiguredServerRendezvous`.
     pub rendezvous: Option<SocketAddr>,
+    /// Mesh CA public key(s) trusted to sign member certs (repeatable
+    /// `ca_public=<hex64>`). Empty when mesh mode is not configured.
+    pub ca_public: Vec<[u8; 32]>,
+    /// This node's CA-issued membership cert, decoded from the file named
+    /// by `cert=<path>` (a hex-encoded `Cert::encode` blob, one line).
+    pub cert: Option<Cert>,
+    /// The CA-signed bootstrap root set, decoded from the file named by
+    /// `roots=<path>` (a hex-encoded `RootSet::encode` blob, one line).
+    pub roots: Option<RootSet>,
+    /// This node's Ed25519 record-signing private key
+    /// (`member_sign_private=<hex64>`), generated alongside the X25519
+    /// data-plane key. Used to sign this node's gossip `Record`.
+    pub member_sign_private: Option<[u8; 32]>,
+    /// The mesh network id (`network_id=<hex32>`), embedded in and checked
+    /// against every cert/record.
+    pub network_id: Option<[u8; 16]>,
 }
 
 // ── hex decode helper ─────────────────────────────────────────────────────────
@@ -59,6 +82,69 @@ pub(crate) fn hex_to_32(hex: &str) -> io::Result<[u8; 32]> {
         out[i] = (hi << 4) | lo;
     }
     Ok(out)
+}
+
+/// Decode a 32-char hex string into 16 bytes (`network_id=<hex32>`).
+pub(crate) fn hex_to_16(hex: &str) -> io::Result<[u8; 16]> {
+    if hex.len() != 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected 32 hex chars, got {}", hex.len()),
+        ));
+    }
+    let mut out = [0u8; 16];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+/// Decode an arbitrary-length hex string into bytes — used for the
+/// variable-length `cert=<path>`/`roots=<path>` file contents (a
+/// `Cert`/`RootSet` encodes to a variable number of bytes, unlike the
+/// fixed-size 32/16-byte keys `hex_to_32`/`hex_to_16` handle).
+fn hex_decode_vec(hex: &str) -> io::Result<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "odd-length hex string".to_string(),
+        ));
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    for chunk in hex.as_bytes().chunks(2) {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+/// Load and decode a `cert=<path>` file: one line of hex-encoded
+/// `Cert::encode` bytes.
+fn load_cert_file(path: &str) -> io::Result<Cert> {
+    let contents = std::fs::read_to_string(path)?;
+    let bytes = hex_decode_vec(contents.trim())?;
+    Cert::decode(&bytes).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to decode cert file {path}"),
+        )
+    })
+}
+
+/// Load and decode a `roots=<path>` file: one line of hex-encoded
+/// `RootSet::encode` bytes.
+fn load_roots_file(path: &str) -> io::Result<RootSet> {
+    let contents = std::fs::read_to_string(path)?;
+    let bytes = hex_decode_vec(contents.trim())?;
+    RootSet::decode(&bytes).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to decode roots file {path}"),
+        )
+    })
 }
 
 fn hex_nibble(b: u8) -> io::Result<u8> {
@@ -129,6 +215,11 @@ impl Config {
         let mut device: Option<String> = None;
         let mut device_kind = TunnelMode::default();
         let mut rendezvous: Option<SocketAddr> = None;
+        let mut ca_public: Vec<[u8; 32]> = Vec::new();
+        let mut cert: Option<Cert> = None;
+        let mut roots: Option<RootSet> = None;
+        let mut member_sign_private: Option<[u8; 32]> = None;
+        let mut network_id: Option<[u8; 16]> = None;
 
         for line in text.lines() {
             let line = line.trim();
@@ -183,6 +274,11 @@ impl Config {
                             io::Error::new(io::ErrorKind::InvalidData, e.to_string())
                         })?)
                 }
+                "ca_public" => ca_public.push(hex_to_32(val)?),
+                "cert" => cert = Some(load_cert_file(val)?),
+                "roots" => roots = Some(load_roots_file(val)?),
+                "member_sign_private" => member_sign_private = Some(hex_to_32(val)?),
+                "network_id" => network_id = Some(hex_to_16(val)?),
                 // Silently ignore unknown keys for forward-compatibility. The
                 // netns config files still contain `initiate=true|false` from
                 // before Task 5 removed the field; this is intentional so
@@ -223,6 +319,11 @@ impl Config {
             device: device.ok_or_else(|| missing("device"))?,
             device_kind,
             rendezvous,
+            ca_public,
+            cert,
+            roots,
+            member_sign_private,
+            network_id,
         })
     }
 }
@@ -486,5 +587,128 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
             cfg.peers[0].endpoint,
             Some("10.0.0.2:51820".parse().unwrap())
         );
+    }
+
+    // ── mesh config (2c/Task 5) ────────────────────────────────────────
+
+    fn hex_encode_bytes(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    }
+
+    const BASE_CFG: &str = "\
+device=yip0
+listen=0.0.0.0:51820
+peer_endpoint=10.0.0.2:51820
+local_private=0000000000000000000000000000000000000000000000000000000000000001
+local_public=0000000000000000000000000000000000000000000000000000000000000002
+peer_public=0000000000000000000000000000000000000000000000000000000000000003
+";
+
+    #[test]
+    fn mesh_fields_absent_are_default() {
+        let cfg = Config::parse(BASE_CFG).unwrap();
+        assert!(cfg.ca_public.is_empty());
+        assert!(cfg.cert.is_none());
+        assert!(cfg.roots.is_none());
+        assert!(cfg.member_sign_private.is_none());
+        assert!(cfg.network_id.is_none());
+    }
+
+    #[test]
+    fn mesh_fields_present_are_some() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use yip_membership::cert::{cert_signing_body, rootset_signing_body};
+
+        let ca = SigningKey::from_bytes(&[9u8; 32]);
+        let mut cert = Cert {
+            version: 1,
+            member_pubkey: [2u8; 32],
+            member_sign_pubkey: [3u8; 32],
+            network_id: [4u8; 16],
+            not_before: 0,
+            not_after: 1_000_000,
+            tags: vec![],
+            ca_sig: [0u8; 64],
+        };
+        cert.ca_sig = ca.sign(&cert_signing_body(&cert)).to_bytes();
+        let mut cert_bytes = Vec::new();
+        cert.encode(&mut cert_bytes);
+
+        let mut roots = RootSet {
+            roots: vec![],
+            version: 1,
+            ca_sig: [0u8; 64],
+        };
+        roots.ca_sig = ca.sign(&rootset_signing_body(&roots)).to_bytes();
+        let mut roots_bytes = Vec::new();
+        roots.encode(&mut roots_bytes);
+
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join("yipd_test_mesh_cert_present.hex");
+        let roots_path = dir.join("yipd_test_mesh_roots_present.hex");
+        std::fs::write(&cert_path, hex_encode_bytes(&cert_bytes)).unwrap();
+        std::fs::write(&roots_path, hex_encode_bytes(&roots_bytes)).unwrap();
+
+        let ca_pub_1 = [0x11u8; 32];
+        let ca_pub_2 = [0x22u8; 32];
+        let member_sign_priv = [0x33u8; 32];
+        let network_id = [0x44u8; 16];
+
+        let text = format!(
+            "{BASE_CFG}\
+             ca_public={}\n\
+             ca_public={}\n\
+             member_sign_private={}\n\
+             network_id={}\n\
+             cert={}\n\
+             roots={}\n",
+            hex_encode_bytes(&ca_pub_1),
+            hex_encode_bytes(&ca_pub_2),
+            hex_encode_bytes(&member_sign_priv),
+            hex_encode_bytes(&network_id),
+            cert_path.display(),
+            roots_path.display(),
+        );
+        let cfg = Config::parse(&text).expect("mesh config parses");
+
+        assert_eq!(cfg.ca_public, vec![ca_pub_1, ca_pub_2]);
+        assert_eq!(cfg.member_sign_private, Some(member_sign_priv));
+        assert_eq!(cfg.network_id, Some(network_id));
+        assert_eq!(cfg.cert, Some(cert));
+        assert_eq!(cfg.roots, Some(roots));
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&roots_path);
+    }
+
+    #[test]
+    fn bad_cert_file_missing_path_is_parse_error() {
+        let text = format!("{BASE_CFG}cert=/nonexistent/path/yipd-does-not-exist.hex\n");
+        assert!(Config::parse(&text).is_err());
+    }
+
+    #[test]
+    fn bad_cert_file_garbage_content_is_parse_error() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("yipd_test_mesh_cert_garbage.hex");
+        std::fs::write(&path, "not_valid_hex!!").unwrap();
+        let text = format!("{BASE_CFG}cert={}\n", path.display());
+        assert!(Config::parse(&text).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bad_roots_file_garbage_content_is_parse_error() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("yipd_test_mesh_roots_garbage.hex");
+        std::fs::write(&path, "deadbeef").unwrap(); // valid hex, not a valid RootSet
+        let text = format!("{BASE_CFG}roots={}\n", path.display());
+        assert!(Config::parse(&text).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 }
