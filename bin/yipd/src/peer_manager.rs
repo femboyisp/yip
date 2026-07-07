@@ -128,8 +128,12 @@ const MAX_PENDING_TUN: usize = 16;
 const MAX_GOSSIP_TARGETS: usize = 4;
 
 /// Cap on the number of `GossipMsg` replies emitted for one inbound gossip
-/// datagram. `Membership::on_gossip` already returns a bounded reply (at most
-/// one message), so this is a belt-and-suspenders ceiling.
+/// datagram. `Membership::on_gossip` already bounds each `Records` message to
+/// `MAX_GOSSIP_RECORDS_PER_REPLY` records (splitting a large `PullRequest`
+/// answer across multiple messages rather than one unboundedly large one), so
+/// this is a belt-and-suspenders ceiling on the number of such messages sent
+/// per inbound datagram (also caps `Digest`/`PullRequest` replies, which are
+/// always exactly one message).
 const MAX_GOSSIP_REPLIES: usize = 8;
 
 /// An initiator handshake in flight, awaiting `[HandshakeResp]`. Boxed by
@@ -1148,7 +1152,27 @@ impl PeerManager {
     /// any bounded reply back to `src` as `[Gossip ++ msg]` datagrams
     /// (relay-wrapped iff `src` maps to a `Relayed` peer). Only called with
     /// membership configured.
+    ///
+    /// Source-restricted to `Established` peers ONLY: gossip only ever
+    /// legitimately flows between admitted members (a joining node
+    /// cert-verifies into `Established` before it gossips), so a `src` that
+    /// does not match a currently `Established` peer's endpoint is dropped
+    /// before decoding, let alone before any per-record Ed25519 verify or
+    /// reply is produced. Without this, `src` is fully attacker-controlled
+    /// (UDP has no source authentication) and a spoofed `PullRequest` would
+    /// be an unauthenticated reflection/amplification primitive (a small
+    /// request naming known `node_id`s reflecting a much larger `Records`
+    /// reply at a forged victim address) plus an unbounded per-record-verify
+    /// CPU sink for inbound `Records`. Restricting to `Established` peers
+    /// bounds both costs to already-admitted members.
     fn on_gossip(&mut self, src: SocketAddr, dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
+        let Some(peer_idx) = self
+            .peers
+            .iter()
+            .position(|p| p.endpoint == Some(src) && matches!(p.state, PeerState::Established(_)))
+        else {
+            return DispatchOut::None;
+        };
         let Some(msg) = GossipMsg::decode(&dg[1..]) else {
             return DispatchOut::None;
         };
@@ -1159,22 +1183,19 @@ impl PeerManager {
         if replies.is_empty() {
             return DispatchOut::None;
         }
-        // Decide the return path: if `src` is a known peer reached via the
-        // relay, wrap replies through the server; otherwise reply direct to
-        // `src`. (An Established peer's committed egress is untouched — we only
-        // read its `relay` flag.)
-        let peer_idx = self.peers.iter().position(|p| p.endpoint == Some(src));
-        let relay = peer_idx.is_some_and(|i| self.peers[i].relay);
+        // Decide the return path: if `src` is reached via the relay, wrap
+        // replies through the server; otherwise reply direct to `src`. (The
+        // peer's committed egress is untouched — we only read its `relay`
+        // flag.)
+        let relay = self.peers[peer_idx].relay;
         self.egress.clear();
         for reply in replies.iter().take(MAX_GOSSIP_REPLIES) {
             let mut bytes = Vec::new();
             bytes.push(PacketType::Gossip as u8);
             reply.encode(&mut bytes);
             if relay {
-                if let Some(i) = peer_idx {
-                    if let Some(d) = self.relay_wrap(i, bytes) {
-                        self.egress.push(d);
-                    }
+                if let Some(d) = self.relay_wrap(peer_idx, bytes) {
+                    self.egress.push(d);
                 }
             } else {
                 self.egress.push(EgressDatagram {
@@ -2995,12 +3016,14 @@ mod tests {
         pm.peers[0].path_kind = Some(PathKind::Direct);
 
         // A gossip Records frame advertising a DIFFERENT endpoint for `peer`.
+        // Gossip is source-restricted to `Established` peers (Task 6 fix), so
+        // this must arrive from `committed_ep` — the only Established peer's
+        // endpoint — for it to be processed at all.
         let hijack_ep: SocketAddr = "198.51.100.9:40000".parse().unwrap();
         let rec = mk_record(&ca, 213, peer.public, vec![hijack_ep], 9);
         let mut dg = vec![PacketType::Gossip as u8];
         GossipMsg::Records(vec![rec]).encode(&mut dg);
-        let gossip_src: SocketAddr = "203.0.113.77:7777".parse().unwrap();
-        assert!(matches!(pm.on_udp(gossip_src, &dg, 0), DispatchOut::None));
+        assert!(matches!(pm.on_udp(committed_ep, &dg, 0), DispatchOut::None));
 
         // The directory learned the new endpoint …
         assert_eq!(
@@ -3033,20 +3056,31 @@ mod tests {
 
     /// (e) A `PacketType::Gossip` datagram with a valid record ingests into the
     /// directory (a subsequent `resolve` finds it); a forged record (untrusted
-    /// CA) does not.
+    /// CA) does not. Gossip is source-restricted to `Established` peers (Task
+    /// 6 fix), so both datagrams are sent from a spliced-in Established
+    /// peer's endpoint — a joining node handshakes into `Established` before
+    /// it ever legitimately gossips.
     #[test]
     fn gossip_ingest_accepts_valid_rejects_forged() {
         let ca = test_ca();
         let local = generate_keypair();
+        let gossip_peer = generate_keypair();
+        let src: SocketAddr = "203.0.113.8:8".parse().unwrap();
+        let cfg = PeerConfig {
+            public_key: gossip_peer.public,
+            endpoint: Some(src),
+        };
         let mut pm = PeerManager::new(
             local.private,
             local.public,
-            &[],
+            &[cfg],
             TunnelMode::L3Tun,
             None,
             Some(membership_for(&ca, local.public)),
         );
-        let src: SocketAddr = "203.0.113.8:8".parse().unwrap();
+        const TAG: u64 = 0x9988_7766_5544_3322;
+        pm.peers[0].state = PeerState::Established(Box::new(fake_established_dataplane(TAG, src)));
+        pm.by_tag.insert(TAG, 0);
 
         // Valid record → ingested → resolvable.
         let good = generate_keypair();
@@ -3086,5 +3120,156 @@ mod tests {
                 .is_none(),
             "a forged record is rejected by ingest_record"
         );
+    }
+
+    /// (f) Fix-pass (Task 6, Important): gossip is source-restricted to
+    /// `Established` peers. A `PacketType::Gossip` datagram from a `src` that
+    /// matches no currently `Established` peer's endpoint is dropped
+    /// outright — not decoded, not ingested into the directory, no reply —
+    /// which is what closes the unauthenticated reflection/amplification
+    /// vector (UDP `src` is otherwise fully attacker-controlled: a spoofed
+    /// `PullRequest` would reflect a `Records` reply at a forged victim, and
+    /// every inbound `Records` costs an unbounded number of Ed25519
+    /// verifies). The identical datagram from the Established peer's own
+    /// endpoint is accepted and ingested normally — legitimate gossip is
+    /// unaffected.
+    #[test]
+    fn gossip_from_non_established_src_is_dropped() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let peer = generate_keypair();
+        let peer_ep: SocketAddr = "10.0.0.3:51820".parse().unwrap();
+        let cfg = PeerConfig {
+            public_key: peer.public,
+            endpoint: Some(peer_ep),
+        };
+        let mut pm = PeerManager::new(
+            local.private,
+            local.public,
+            &[cfg],
+            TunnelMode::L3Tun,
+            None,
+            Some(membership_for(&ca, local.public)),
+        );
+        const TAG: u64 = 0x1357_9bdf_2468_ace0;
+        pm.peers[0].state =
+            PeerState::Established(Box::new(fake_established_dataplane(TAG, peer_ep)));
+        pm.by_tag.insert(TAG, 0);
+
+        let member = generate_keypair();
+        let member_ep: SocketAddr = "192.0.2.40:9000".parse().unwrap();
+        let rec = mk_record(&ca, 216, member.public, vec![member_ep], 1);
+        let mut dg = vec![PacketType::Gossip as u8];
+        GossipMsg::Records(vec![rec]).encode(&mut dg);
+
+        // A spoofed src matching no Established peer: dropped, not ingested.
+        let spoofed_src: SocketAddr = "203.0.113.200:4000".parse().unwrap();
+        assert!(matches!(pm.on_udp(spoofed_src, &dg, 0), DispatchOut::None));
+        assert!(
+            pm.membership
+                .as_ref()
+                .unwrap()
+                .resolve(&node_addr(&member.public))
+                .is_none(),
+            "gossip from a non-Established src must be dropped, not ingested"
+        );
+
+        // The identical datagram from the Established peer's own endpoint:
+        // accepted and ingested — legitimate gossip still works.
+        assert!(matches!(pm.on_udp(peer_ep, &dg, 0), DispatchOut::None));
+        assert_eq!(
+            pm.membership
+                .as_ref()
+                .unwrap()
+                .resolve(&node_addr(&member.public))
+                .map(|i| i.endpoints),
+            Some(vec![member_ep]),
+            "gossip from an Established peer's endpoint is ingested normally"
+        );
+    }
+
+    /// (g) Fix-pass (Task 6, Minor): mutual-proof rejection on the INITIATOR
+    /// side. With membership configured, a `[HandshakeResp]` whose msg2 cert
+    /// payload is absent or invalid must NOT establish the session — even
+    /// though the underlying Noise handshake completes cryptographically —
+    /// covering `handle_handshake_resp`'s `responder_cert_ok` guard.
+    /// Complements (b) `cert_in_handshake_admits_valid_rejects_invalid`,
+    /// which covers only the responder side of mutual proof.
+    #[test]
+    fn initiator_rejects_responder_with_bad_cert() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer_ep: SocketAddr = "10.0.0.4:51820".parse().unwrap();
+        let cfg = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: Some(peer_ep),
+        };
+
+        // ── absent cert in msg2 → rejected ──
+        {
+            let mut pm = PeerManager::new(
+                local.private,
+                local.public,
+                std::slice::from_ref(&cfg),
+                TunnelMode::L3Tun,
+                None,
+                Some(membership_for(&ca, local.public)),
+            );
+            let init_out = pm.on_tun(&dummy_tun_pkt(), 0).to_vec();
+            assert_eq!(init_out.len(), 1);
+            let init_pkt = init_out[0].bytes.clone();
+            assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+
+            // Out-of-band responder step with NO cert payload in msg2.
+            let (_established, resp_pkt, _remote_static, _initiator_payload) =
+                HandshakeState::start_responder(&peer_kp.private, &init_pkt, &[]).unwrap();
+
+            assert!(matches!(
+                pm.on_udp(peer_ep, &resp_pkt, 0),
+                DispatchOut::None
+            ));
+            assert!(
+                matches!(pm.peers[0].state, PeerState::Idle),
+                "no responder cert ⇒ session must not establish, reverts to Idle"
+            );
+        }
+
+        // ── invalid (untrusted-CA) cert in msg2 → rejected ──
+        {
+            let mut pm = PeerManager::new(
+                local.private,
+                local.public,
+                &[cfg],
+                TunnelMode::L3Tun,
+                None,
+                Some(membership_for(&ca, local.public)),
+            );
+            let init_out = pm.on_tun(&dummy_tun_pkt(), 0).to_vec();
+            let init_pkt = init_out[0].bytes.clone();
+
+            let untrusted_ca = SigningKey::from_bytes(&[77u8; 32]);
+            let peer_sign = SigningKey::from_bytes(&[78u8; 32]);
+            let bad_cert = mk_cert(
+                &untrusted_ca,
+                peer_kp.public,
+                peer_sign.verifying_key().to_bytes(),
+            );
+            let mut bad_cert_bytes = Vec::new();
+            bad_cert.encode(&mut bad_cert_bytes);
+
+            let (_established, resp_pkt, _remote_static, _initiator_payload) =
+                HandshakeState::start_responder(&peer_kp.private, &init_pkt, &bad_cert_bytes)
+                    .unwrap();
+
+            assert!(matches!(
+                pm.on_udp(peer_ep, &resp_pkt, 0),
+                DispatchOut::None
+            ));
+            assert!(
+                matches!(pm.peers[0].state, PeerState::Idle),
+                "untrusted-CA responder cert ⇒ session must not establish, reverts to Idle"
+            );
+        }
     }
 }

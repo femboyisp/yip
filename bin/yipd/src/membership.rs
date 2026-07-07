@@ -33,6 +33,17 @@ const CLOCK_SKEW_SECS: u64 = 300;
 /// `tick_digest` — pure gossip-chattiness control, unrelated to cert clocks.
 const GOSSIP_INTERVAL_MS: u64 = 5_000;
 
+/// Max `Record`s carried in a single `GossipMsg::Records` reply to a
+/// `PullRequest`. Bounds the reply size regardless of how many `node_id`s a
+/// single request names — a crafted `PullRequest` listing every `node_id` we
+/// hold must not turn into one unboundedly large `Records` datagram (an
+/// amplification concern even when the requester is a legitimate,
+/// source-validated peer: `PeerManager::on_gossip` restricts *who* may ask,
+/// not how much a single ask can cost). When we hold more records than fit
+/// in one reply, `on_gossip` splits them across multiple bounded `Records`
+/// messages instead of emitting one oversized one.
+const MAX_GOSSIP_RECORDS_PER_REPLY: usize = 32;
+
 /// The `seq` a node's own record starts at. Zero is fine: `ingest_record`'s
 /// seq-supersession means any received record for our own `node_id` with a
 /// higher seq would be a stale/duplicate broadcast of ourselves, which is
@@ -196,7 +207,9 @@ impl Membership {
     /// - `Digest`: reply with a `PullRequest` for every `node_id` we lack or
     ///   hold at a lower-or-equal `seq` than advertised.
     /// - `PullRequest`: reply with the `Records` we actually hold for the
-    ///   requested ids (silently skipping ones we don't have).
+    ///   requested ids (silently skipping ones we don't have), split across
+    ///   multiple messages of at most `MAX_GOSSIP_RECORDS_PER_REPLY` records
+    ///   each so one request cannot produce one unboundedly large reply.
     /// - `Records`: `ingest_record` each (invalid ones are dropped, not
     ///   poisoned); no reply.
     pub fn on_gossip(&mut self, msg: GossipMsg, now: u64) -> Vec<GossipMsg> {
@@ -223,11 +236,9 @@ impl Membership {
                     .iter()
                     .filter_map(|nid| self.directory.get(nid).cloned())
                     .collect();
-                if recs.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![GossipMsg::Records(recs)]
-                }
+                recs.chunks(MAX_GOSSIP_RECORDS_PER_REPLY)
+                    .map(|chunk| GossipMsg::Records(chunk.to_vec()))
+                    .collect()
             }
             GossipMsg::Records(recs) => {
                 for r in recs {
@@ -680,5 +691,64 @@ mod tests {
         let mut expected = Vec::new();
         own_cert.encode(&mut expected);
         assert_eq!(m.own_cert_bytes(), expected);
+    }
+
+    // (i) Fix-pass (Task 6): a `PullRequest` naming more `node_id`s than fit
+    // in one `MAX_GOSSIP_RECORDS_PER_REPLY` batch must not produce one
+    // unboundedly large `Records` reply — an amplification/CPU concern even
+    // once the caller (`PeerManager::on_gossip`) restricts *who* may ask.
+    // `on_gossip` must instead split the reply across multiple `Records`
+    // messages, each respecting the cap, while still eventually delivering
+    // every record the requester lacked.
+    #[test]
+    fn pull_request_reply_is_capped_and_split() {
+        let ca = ca_key(1);
+        let net = [7u8; 16];
+        let (mut m, _own_nid) = fresh_membership(&ca, net, 10);
+
+        let member_sign_key = SigningKey::from_bytes(&[199u8; 32]);
+        let member_sign_pub = member_sign_key.verifying_key().to_bytes();
+
+        let total = MAX_GOSSIP_RECORDS_PER_REPLY * 2 + 5;
+        let mut ids = Vec::with_capacity(total);
+        for i in 0..total {
+            let mut member_pk = [0u8; 32];
+            member_pk[0..2].copy_from_slice(&(100 + i as u16).to_be_bytes());
+            let cert = make_cert(&ca, member_pk, member_sign_pub, net, 0, 1_000_000);
+            let endpoints = vec![format!("192.0.2.1:{}", 10_000 + i).parse().unwrap()];
+            let rec = build_signed_record(cert, endpoints, 1, &member_sign_key.to_bytes());
+            ids.push(rec.node_id);
+            assert!(m.ingest_record(rec, 500));
+        }
+
+        let resp = m.on_gossip(GossipMsg::PullRequest(ids.clone()), 500);
+        assert!(
+            resp.len() > 1,
+            "a request larger than one batch must split across multiple Records messages"
+        );
+
+        let mut got_ids = std::collections::HashSet::new();
+        for msg in &resp {
+            match msg {
+                GossipMsg::Records(recs) => {
+                    assert!(
+                        recs.len() <= MAX_GOSSIP_RECORDS_PER_REPLY,
+                        "each Records message must respect the per-reply cap"
+                    );
+                    for r in recs {
+                        got_ids.insert(r.node_id);
+                    }
+                }
+                other => panic!("expected Records, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            got_ids.len(),
+            total,
+            "every requested record must still be delivered, just split across replies"
+        );
+        for nid in &ids {
+            assert!(got_ids.contains(nid), "missing requested record {nid:?}");
+        }
     }
 }
