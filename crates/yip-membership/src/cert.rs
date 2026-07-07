@@ -152,7 +152,7 @@ pub struct RootSet {
     pub ca_sig: [u8; 64],
 }
 
-fn put_addr(out: &mut Vec<u8>, addr: &SocketAddr) {
+pub(crate) fn put_addr(out: &mut Vec<u8>, addr: &SocketAddr) {
     match addr.ip() {
         IpAddr::V4(ip) => {
             out.push(4);
@@ -166,7 +166,7 @@ fn put_addr(out: &mut Vec<u8>, addr: &SocketAddr) {
     out.extend_from_slice(&addr.port().to_be_bytes());
 }
 
-fn take_addr(buf: &[u8]) -> Option<(SocketAddr, usize)> {
+pub(crate) fn take_addr(buf: &[u8]) -> Option<(SocketAddr, usize)> {
     let (&fam, rest) = buf.split_first()?;
     let (ip, used): (IpAddr, usize) = match fam {
         4 => {

@@ -4,8 +4,10 @@
 #![forbid(unsafe_code)]
 
 pub mod cert;
+pub mod gossip;
 pub mod ids;
-// task 2: pub mod record; pub mod gossip;
+pub mod record;
 
 pub use cert::{verify_cert, Cert, CertError, RootSet};
 pub use ids::{node_addr, node_id, NodeId};
+pub use record::Record;
