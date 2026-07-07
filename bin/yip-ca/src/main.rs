@@ -166,7 +166,11 @@ fn load_ca_private(arg: Option<&str>) -> Result<SigningKey, String> {
             std::io::stdin()
                 .read_to_string(&mut buf)
                 .map_err(|e| format!("failed to read CA private key from stdin: {e}"))?;
-            buf.trim().to_string()
+            buf.lines()
+                .next()
+                .ok_or_else(|| "stdin was empty".to_string())?
+                .trim()
+                .to_string()
         }
     };
     let raw = raw.strip_prefix("ca_private=").unwrap_or(&raw);

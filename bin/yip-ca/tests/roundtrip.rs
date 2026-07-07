@@ -1,6 +1,7 @@
 //! Round-trip proof: a cert (and root set) emitted by the `yip-ca` binary
 //! decodes and verifies against `yip-membership`'s own verifier.
-use std::process::Command;
+use std::io::Write as _;
+use std::process::{Command, Stdio};
 
 use yip_membership::cert::{verify_cert, Cert, RootSet};
 
@@ -135,4 +136,86 @@ fn rootset_issued_by_yip_ca_verifies_in_yip_membership() {
 
     let ca_pub: [u8; 32] = hex_decode(&key.ca_public).try_into().unwrap();
     assert!(rootset.verify_rootset(&[ca_pub]));
+}
+
+#[test]
+fn genkey_piped_into_sign_cert_works() {
+    // Run yip-ca genkey and capture its two-line output
+    let genkey_output = run(&["genkey"]);
+
+    // Extract ca_public from the output for verification
+    let mut ca_public = None;
+    for line in genkey_output.lines() {
+        if let Some(v) = line.strip_prefix("ca_public=") {
+            ca_public = Some(v.to_string());
+        }
+    }
+    let ca_public = ca_public.expect("genkey printed ca_public=<hex>");
+
+    // Prepare sign-cert arguments
+    let member_hex = "aa".repeat(32);
+    let member_sign_hex = "bb".repeat(32);
+    let network_hex = "cc".repeat(16);
+
+    // Spawn yip-ca sign-cert with stdin piped and capture its output
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yip-ca"))
+        .args([
+            "sign-cert",
+            "--member",
+            &member_hex,
+            "--member-sign",
+            &member_sign_hex,
+            "--network",
+            &network_hex,
+            "--days",
+            "30",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn yip-ca sign-cert");
+
+    {
+        let mut stdin = child.stdin.take().expect("failed to open stdin");
+        stdin
+            .write_all(genkey_output.as_bytes())
+            .expect("failed to write to stdin");
+    }
+
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for yip-ca sign-cert");
+    assert!(
+        output.status.success(),
+        "yip-ca sign-cert exited with {}: stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let cert_hex = String::from_utf8(output.stdout)
+        .expect("yip-ca stdout was not utf8")
+        .trim()
+        .to_string();
+    let cert_bytes = hex_decode(&cert_hex);
+    let cert = Cert::decode(&cert_bytes).expect("emitted cert decodes");
+
+    let member_pubkey: [u8; 32] = hex_decode(&member_hex).try_into().unwrap();
+    let member_sign_pubkey: [u8; 32] = hex_decode(&member_sign_hex).try_into().unwrap();
+    let network_id: [u8; 16] = hex_decode(&network_hex).try_into().unwrap();
+    let ca_pub: [u8; 32] = hex_decode(&ca_public).try_into().unwrap();
+
+    // Verify the cert is well-formed
+    assert_eq!(cert.version, 1);
+    assert_eq!(cert.member_pubkey, member_pubkey);
+    assert_eq!(cert.member_sign_pubkey, member_sign_pubkey);
+    assert_eq!(cert.network_id, network_id);
+    assert_eq!(cert.not_after - cert.not_before, 30 * 86400);
+
+    // Verify the cert signature is valid
+    let now = now_secs();
+    assert_eq!(
+        verify_cert(&cert, &[ca_pub], &network_id, &member_pubkey, now, 0),
+        Ok(())
+    );
 }
