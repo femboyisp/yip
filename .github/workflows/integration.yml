@@ -130,10 +130,16 @@ jobs:
           # target/debug/yip-rendezvous and SKIPs with instructions if absent,
           # so build it here to keep this job honest (not vacuously green).
           cargo build -p yip-rendezvous-bin
+          # discovery_dynamic_ping / admission_rejects_uncertified /
+          # discovery_survives_root_outage (2c) need the `yip-ca` offline-CA
+          # binary to mint keys/certs/root sets; it lives in a different
+          # workspace package too (like yip-rendezvous-bin above), so build it
+          # here to keep this job honest (not vacuously green via a SKIP).
+          cargo build -p yip-ca
           echo "running netns tunnel tests under sudo: $BIN"
           # --exact so ping_across_yipd_tunnel does not also match _under_loss.
           for mode in poll uring; do
-            for t in ping_across_yipd_tunnel ping_across_yipd_tunnel_under_loss arq_recovers_bulk_loss l2_tap_ping_or_arp_across_tunnel triangle_full_mesh_ping relay_path_ping hole_punch_ping; do
+            for t in ping_across_yipd_tunnel ping_across_yipd_tunnel_under_loss arq_recovers_bulk_loss l2_tap_ping_or_arp_across_tunnel triangle_full_mesh_ping relay_path_ping hole_punch_ping discovery_dynamic_ping admission_rejects_uncertified discovery_survives_root_outage; do
               LOG="/tmp/netns-$mode-$t.log"
               if [ "$mode" = "uring" ]; then
                 echo "running $t with UringDriver (opt-in: YIP_USE_URING=1)"

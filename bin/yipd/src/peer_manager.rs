@@ -797,6 +797,27 @@ impl PeerManager {
     /// Which configured peer a TUN/TAP frame should go to, or `None` if it
     /// cannot be routed (ambiguous multi-peer destination). See the module
     /// doc for the L2/L3 routing rules.
+    ///
+    /// `L3Tun`'s single-peer fallback (`self.peers.len() == 1 => Some(0)`)
+    /// splits into two cases (2c/Task 7 fix):
+    /// - `ipv6_dst` returns `None` — not a recognizable mesh IPv6 packet at
+    ///   all (2a/2b's plain, non-mesh tunnel addressing, ARP, etc.). There is
+    ///   no `resolve` to try instead, so the sole-peer fallback applies
+    ///   unconditionally, exactly as before — this keeps every pure-2a/2b
+    ///   test (and any single-peer test that also happens to pass a
+    ///   `Membership` for unrelated reasons, e.g. cert-handshake tests using
+    ///   a non-IPv6 dummy TUN packet) byte-identical.
+    /// - `ipv6_dst` returns `Some(dst)` but `dst` doesn't match any known
+    ///   peer — a legitimate mesh address just not (yet) resolved. With
+    ///   membership enabled this must fall through to `on_tun`'s
+    ///   gossip-directory `resolve` fallback instead of being misrouted to
+    ///   whichever one peer happens to already be known (the common
+    ///   post-bootstrap state: just the seed root, before anyone else has
+    ///   been resolved) — otherwise every not-yet-discovered destination
+    ///   would be silently (and wrongly) routed to that one peer forever,
+    ///   and dynamic discovery could never engage. Without membership this
+    ///   case still falls back to the sole peer (byte-identical to 2a/2b:
+    ///   there is no resolve path to try instead there either).
     fn route_tun_index(&self, inner: &[u8]) -> Option<usize> {
         match self.mode {
             TunnelMode::L2Tap => {
@@ -806,18 +827,25 @@ impl PeerManager {
                     None
                 }
             }
-            TunnelMode::L3Tun => {
-                if let Some(dst) = ipv6_dst(inner) {
+            TunnelMode::L3Tun => match ipv6_dst(inner) {
+                Some(dst) => {
                     if let Some(&idx) = self.by_addr.get(&dst) {
                         return Some(idx);
                     }
+                    if self.membership.is_none() && self.peers.len() == 1 {
+                        Some(0)
+                    } else {
+                        None
+                    }
                 }
-                if self.peers.len() == 1 {
-                    Some(0)
-                } else {
-                    None
+                None => {
+                    if self.peers.len() == 1 {
+                        Some(0)
+                    } else {
+                        None
+                    }
                 }
-            }
+            },
         }
     }
 
@@ -2854,6 +2882,86 @@ mod tests {
         assert_eq!(out[0].dst, peer_ep);
         assert_eq!(out[0].bytes[0], PacketType::HandshakeInit as u8);
         assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    }
+
+    /// (a2) Regression (2c/Task 7): with exactly one already-admitted peer
+    /// (e.g. the seed root a mesh node bootstraps to), `on_tun` to a
+    /// DIFFERENT, not-yet-known mesh address must NOT be misrouted to that
+    /// lone peer by the 2a/2b "single configured peer" fallback in
+    /// `route_tun_index` — it must fall through to the membership `resolve`
+    /// path instead. Before the fix, `route_tun_index`'s
+    /// `self.peers.len() == 1 => Some(0)` fallback fired unconditionally
+    /// (membership-blind), so a mesh node holding just its root — exactly
+    /// the state every node is in right after bootstrap, before it has
+    /// resolved anyone else — would have every not-yet-discovered
+    /// destination silently routed to the root instead of resolved via
+    /// gossip, permanently breaking dynamic discovery whenever a node knew
+    /// only one peer.
+    #[test]
+    fn on_tun_single_known_peer_still_resolves_a_different_dst() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let root = generate_keypair();
+        let root_ep: SocketAddr = "198.51.100.1:51820".parse().unwrap();
+        let peer = generate_keypair();
+        let peer_ep: SocketAddr = "198.51.100.50:6000".parse().unwrap();
+
+        // The root's own cert isn't needed by this node's directory — only
+        // its pubkey + endpoint (via the signed `RootSet`, which
+        // `PeerManager::new` auto-admits).
+        let roots = RootSet {
+            roots: vec![(root.public, root_ep)],
+            version: 1,
+            ca_sig: [0u8; 64],
+        };
+        let own_sign = SigningKey::from_bytes(&[200u8; 32]);
+        let own_cert = mk_cert(&ca, local.public, own_sign.verifying_key().to_bytes());
+        let mut membership = Membership::new(
+            vec![ca.verifying_key().to_bytes()],
+            TEST_NET,
+            own_cert,
+            own_sign.to_bytes(),
+            roots,
+            vec!["10.0.0.1:51820".parse().unwrap()],
+        );
+        let rec = mk_record(&ca, 202, peer.public, vec![peer_ep], 1);
+        assert!(membership.ingest_record(rec, now_secs()));
+
+        // `PeerManager::new` auto-admits every root from the signed root set
+        // (always-admit bootstrap seed), so `pm.peers` starts with exactly
+        // one entry (the root) — the precondition this regression guards.
+        let mut pm = PeerManager::new(
+            local.private,
+            local.public,
+            &[],
+            TunnelMode::L3Tun,
+            None,
+            Some(membership),
+        );
+        assert_eq!(
+            pm.peers.len(),
+            1,
+            "precondition: exactly one known peer (the root)"
+        );
+        assert_eq!(pm.peers[0].pubkey, root.public);
+
+        // A TUN packet addressed to `peer` (a DIFFERENT node than the root)
+        // must resolve+admit `peer`, not be routed to the root.
+        let pkt = ipv6_pkt_to(node_addr(&peer.public));
+        let out = pm.on_tun(&pkt, 0).to_vec();
+
+        assert_eq!(pm.peers.len(), 2, "resolve+admit created a second peer");
+        assert_eq!(pm.peers[1].pubkey, peer.public);
+        assert_eq!(pm.peers[1].endpoint, Some(peer_ep));
+        assert_eq!(
+            out.len(),
+            1,
+            "a handshake Init toward the resolved peer's endpoint was emitted"
+        );
+        assert_eq!(
+            out[0].dst, peer_ep,
+            "must target the resolved peer, not the root"
+        );
     }
 
     /// (b) `handle_handshake_init` with a valid presented cert admits + replies;

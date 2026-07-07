@@ -197,6 +197,138 @@ fn relay_path_ping() {
     );
 }
 
+/// Locate the `yip-ca` debug binary the same way `yip_rendezvous_bin` locates
+/// `yip-rendezvous`: a different workspace package, so `CARGO_BIN_EXE_yip-ca`
+/// isn't populated for this (`yipd`) package's test binary on stable.
+fn yip_ca_bin() -> std::path::PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let workspace_root = std::path::Path::new(manifest_dir)
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root two levels up from CARGO_MANIFEST_DIR");
+    workspace_root.join("target/debug/yip-ca")
+}
+
+#[test]
+fn discovery_dynamic_ping() {
+    // Requires root: netns creation + TUN devices + a shared bridge underlay.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP discovery_dynamic_ping: needs root (run under sudo in CI)");
+        return;
+    }
+    let yip_ca = yip_ca_bin();
+    if !yip_ca.exists() {
+        eprintln!(
+            "SKIP discovery_dynamic_ping: yip-ca binary not found at {}; \
+             run `cargo build -p yip-ca` first",
+            yip_ca.display()
+        );
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-netns-discovery.sh");
+    let status = Command::new("bash")
+        .arg(script)
+        .arg(yipd)
+        .arg(&yip_ca)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "dynamic-discovery netns test failed (A did not discover+ping B via gossip, \
+         or A's config was not free of static knowledge of B)"
+    );
+}
+
+#[test]
+fn admission_rejects_uncertified() {
+    // Requires root: netns creation + TUN devices.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP admission_rejects_uncertified: needs root (run under sudo in CI)");
+        return;
+    }
+    let yip_ca = yip_ca_bin();
+    if !yip_ca.exists() {
+        eprintln!(
+            "SKIP admission_rejects_uncertified: yip-ca binary not found at {}; \
+             run `cargo build -p yip-ca` first",
+            yip_ca.display()
+        );
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/run-netns-admission-reject.sh"
+    );
+    let status = Command::new("bash")
+        .arg(script)
+        .arg(yipd)
+        .arg(&yip_ca)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "admission-reject netns test failed (an uncertified peer's handshake was \
+         unexpectedly admitted, or the harness itself errored)"
+    );
+}
+
+#[test]
+fn discovery_survives_root_outage() {
+    // Requires root: netns creation + TUN devices + a shared bridge underlay.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP discovery_survives_root_outage: needs root (run under sudo in CI)");
+        return;
+    }
+    let yip_ca = yip_ca_bin();
+    if !yip_ca.exists() {
+        eprintln!(
+            "SKIP discovery_survives_root_outage: yip-ca binary not found at {}; \
+             run `cargo build -p yip-ca` first",
+            yip_ca.display()
+        );
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/run-netns-root-outage.sh"
+    );
+    let status = Command::new("bash")
+        .arg(script)
+        .arg(yipd)
+        .arg(&yip_ca)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "root-outage netns test failed (A<->B connectivity did not survive the root's death, \
+         or the initial discovery ping never converged)"
+    );
+}
+
 #[test]
 fn hole_punch_ping() {
     // Requires root: netns creation + TUN devices + yip-rendezvous + NAT.

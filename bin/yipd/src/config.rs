@@ -302,11 +302,24 @@ impl Config {
             }
         }
 
-        // Peers list must not be empty
-        if peers.is_empty() {
+        // Peers list must not be empty, UNLESS full mesh config is present: a
+        // mesh node (2c) legitimately has zero statically-configured peers —
+        // it bootstraps via the signed root set and discovers everyone else
+        // (including a root acting purely as a seed, with no `[peer]` for it
+        // either) via gossip. `tunnel.rs` gates `Membership::new` on this same
+        // five-field condition (`ca_public` non-empty + `cert`/`roots`/
+        // `member_sign_private`/`network_id` all present), so this check is
+        // single-sourced with what actually enables mesh mode.
+        let mesh_mode = !ca_public.is_empty()
+            && cert.is_some()
+            && roots.is_some()
+            && member_sign_private.is_some()
+            && network_id.is_some();
+        if peers.is_empty() && !mesh_mode {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "no peers configured (use [peer] blocks or legacy peer_public/peer_endpoint)"
+                "no peers configured (use [peer] blocks or legacy peer_public/peer_endpoint, \
+                 or full mesh config to bootstrap via the root set)"
                     .to_string(),
             ));
         }
@@ -710,5 +723,84 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         let text = format!("{BASE_CFG}roots={}\n", path.display());
         assert!(Config::parse(&text).is_err());
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── zero-peer mesh mode (2c/Task 7) ────────────────────────────────
+    //
+    // A pure mesh node (2c) has no statically-configured `[peer]` at all —
+    // everyone it talks to (including a seed root) is reached via the signed
+    // root set + gossip, never a `[peer]` block. `Config::parse` must accept
+    // an empty peer list when the full mesh config (all five fields) is
+    // present, while still rejecting an empty peer list for a plain 2a/2b
+    // config (no way to reach anyone).
+
+    #[test]
+    fn zero_peers_with_full_mesh_config_parses() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use yip_membership::cert::{cert_signing_body, rootset_signing_body};
+
+        let ca = SigningKey::from_bytes(&[9u8; 32]);
+        let mut cert = Cert {
+            version: 1,
+            member_pubkey: [2u8; 32],
+            member_sign_pubkey: [3u8; 32],
+            network_id: [4u8; 16],
+            not_before: 0,
+            not_after: 1_000_000,
+            tags: vec![],
+            ca_sig: [0u8; 64],
+        };
+        cert.ca_sig = ca.sign(&cert_signing_body(&cert)).to_bytes();
+        let mut cert_bytes = Vec::new();
+        cert.encode(&mut cert_bytes);
+
+        let mut roots = RootSet {
+            roots: vec![],
+            version: 1,
+            ca_sig: [0u8; 64],
+        };
+        roots.ca_sig = ca.sign(&rootset_signing_body(&roots)).to_bytes();
+        let mut roots_bytes = Vec::new();
+        roots.encode(&mut roots_bytes);
+
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join("yipd_test_zero_peer_mesh_cert.hex");
+        let roots_path = dir.join("yipd_test_zero_peer_mesh_roots.hex");
+        std::fs::write(&cert_path, hex_encode_bytes(&cert_bytes)).unwrap();
+        std::fs::write(&roots_path, hex_encode_bytes(&roots_bytes)).unwrap();
+
+        let text = format!(
+            "device=yip0\n\
+             listen=0.0.0.0:51820\n\
+             local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             ca_public={}\n\
+             member_sign_private={}\n\
+             network_id={}\n\
+             cert={}\n\
+             roots={}\n",
+            hex_encode_bytes(&[0x11u8; 32]),
+            hex_encode_bytes(&[0x33u8; 32]),
+            hex_encode_bytes(&[0x44u8; 16]),
+            cert_path.display(),
+            roots_path.display(),
+        );
+        let cfg = Config::parse(&text).expect("zero-peer full-mesh config parses");
+        assert!(cfg.peers.is_empty());
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&roots_path);
+    }
+
+    #[test]
+    fn zero_peers_without_mesh_config_is_parse_error() {
+        let text = "\
+device=yip0
+listen=0.0.0.0:51820
+local_private=0000000000000000000000000000000000000000000000000000000000000001
+local_public=0000000000000000000000000000000000000000000000000000000000000002
+";
+        let err = Config::parse(text).unwrap_err();
+        assert!(err.to_string().contains("no peers configured"));
     }
 }
