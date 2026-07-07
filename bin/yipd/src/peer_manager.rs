@@ -3985,9 +3985,19 @@ mod tests {
         let out = pm.on_tun(&dummy_tun_pkt(), 0).to_vec();
         assert_eq!(out.len(), 1, "one lookup datagram is emitted");
         assert_eq!(out[0].dst, mock_server());
-        assert!(
-            yip_rendezvous::decode(&out[0].bytes).is_none(),
-            "the on-wire bytes must NOT decode as a plain rendezvous Message"
+        // The on-wire bytes must not be the plaintext rendezvous encoding.
+        // (A `decode(..).is_none()` check would be flaky: the obfuscated bytes
+        // are random, so they can occasionally parse as a Message by chance.)
+        let mut plaintext = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::Lookup {
+                node: node_id(&peer_kp.public),
+            },
+            &mut plaintext,
+        );
+        assert_ne!(
+            out[0].bytes, plaintext,
+            "the on-wire bytes must be obfuscated, not the plaintext rendezvous encoding"
         );
         let (ptype, body) =
             yip_obf::deobfuscate(&obf_key, &out[0].bytes).expect("wrapped under the network key");
