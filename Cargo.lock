@@ -1148,6 +1148,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "yip-ca"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "rand_core",
+ "yip-membership",
+]
+
+[[package]]
 name = "yip-crypto"
 version = "0.0.0"
 dependencies = [
