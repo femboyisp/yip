@@ -30,6 +30,13 @@ pub enum PacketType {
     Data = 2,
     /// Loss-feedback control packet (receiver → sender).
     Control = 3,
+    /// Membership anti-entropy gossip (2c). Carries a self-verifying
+    /// [`yip_membership::GossipMsg`] as a plain datagram: every `Record` is
+    /// CA→cert→record-sig chained and re-verified on ingest, so a forged or
+    /// injected record is rejected by `Membership::ingest_record`. In-session
+    /// ENCRYPTION of gossip (metadata privacy) is an explicit 2c non-goal,
+    /// deferred to the anonymity milestone.
+    Gossip = 4,
 }
 
 // ── established session ───────────────────────────────────────────────────────

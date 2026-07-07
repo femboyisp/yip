@@ -70,12 +70,38 @@ pub fn run(config: Config) -> io::Result<()> {
             Box::new(crate::rendezvous::ConfiguredServerRendezvous::new(addr))
                 as Box<dyn crate::rendezvous::Rendezvous>
         });
+    // Build the mesh membership directory (2c) only when the full mesh config is
+    // present (a trusted CA set, our cert, the signed root set, our record-
+    // signing key, and the network id). Absent any of these, membership is
+    // `None` and `PeerManager` is pure-2a/2b. `own_endpoints` seeds our own
+    // gossip record with our bind address.
+    let membership = match (
+        &config.cert,
+        &config.roots,
+        config.member_sign_private,
+        config.network_id,
+    ) {
+        (Some(cert), Some(roots), Some(sign_priv), Some(network_id))
+            if !config.ca_public.is_empty() =>
+        {
+            Some(crate::membership::Membership::new(
+                config.ca_public.clone(),
+                network_id,
+                cert.clone(),
+                sign_priv,
+                roots.clone(),
+                vec![config.listen],
+            ))
+        }
+        _ => None,
+    };
     let mut manager = PeerManager::new(
         config.local_private,
         config.local_public,
         &config.peers,
         mode,
         rendezvous,
+        membership,
     );
     let local_addr = manager.local_addr();
 
