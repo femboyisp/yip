@@ -377,7 +377,7 @@ impl PeerManager {
         now_ms: u64,
     ) -> Option<EgressDatagram> {
         let pubkey = self.peers[idx].pubkey;
-        let (hs, init_pkt) = match HandshakeState::start_initiator(&self.local_priv, &pubkey) {
+        let (hs, init_pkt) = match HandshakeState::start_initiator(&self.local_priv, &pubkey, &[]) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("peer_manager: failed to start handshake: {e}");
@@ -525,8 +525,8 @@ impl PeerManager {
     /// `[HandshakeInit]` from peer `idx`, reply and drain via the relay, and
     /// commit `PathKind::Relayed`.
     fn relayed_handshake_init(&mut self, idx: usize, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
-        let (established, resp_pkt, remote_static) =
-            match HandshakeState::start_responder(&self.local_priv, dg) {
+        let (established, resp_pkt, remote_static, _initiator_payload) =
+            match HandshakeState::start_responder(&self.local_priv, dg, &[]) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("peer_manager: relayed start_responder failed: {e}");
@@ -604,7 +604,7 @@ impl PeerManager {
             unreachable!("just matched Handshaking above");
         };
         match handshaking.hs.read_response(dg) {
-            Ok(established) => {
+            Ok((established, _responder_payload)) => {
                 let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
                 let placeholder = self.server_addr();
                 let mut dp = Box::new(DataPlane::new(
@@ -840,8 +840,8 @@ impl PeerManager {
         dg: &[u8],
         now_ms: u64,
     ) -> DispatchOut<'_> {
-        let (established, resp_pkt, remote_static) =
-            match HandshakeState::start_responder(&self.local_priv, dg) {
+        let (established, resp_pkt, remote_static, _initiator_payload) =
+            match HandshakeState::start_responder(&self.local_priv, dg, &[]) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("peer_manager: start_responder failed: {e}");
@@ -955,7 +955,7 @@ impl PeerManager {
         };
 
         match handshaking.hs.read_response(dg) {
-            Ok(established) => {
+            Ok((established, _responder_payload)) => {
                 let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
                 // `idx` was matched above via `p.endpoint == Some(src)`, so `src`
                 // is exactly this peer's endpoint.
@@ -1334,10 +1334,10 @@ mod tests {
         let init_kp = generate_keypair();
         let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
         let mut res = Handshake::responder(&resp_kp.private).unwrap();
-        let m1 = ini.write_message().unwrap();
-        res.read_message(&m1).unwrap();
-        let m2 = res.write_message().unwrap();
-        ini.read_message(&m2).unwrap();
+        let m1 = ini.write_message(&[]).unwrap();
+        let _ = res.read_message(&m1).unwrap();
+        let m2 = res.write_message(&[]).unwrap();
+        let _ = ini.read_message(&m2).unwrap();
         let cb = ini.channel_binding();
         let (auth_key, hp_key) = derive_wire_keys(&cb);
         let established = Established {
@@ -1496,7 +1496,7 @@ mod tests {
         // A valid HandshakeInit from a real, but unconfigured, key.
         let stranger = generate_keypair();
         let (_hs, init_pkt) =
-            HandshakeState::start_initiator(&stranger.private, &local_kp.public).unwrap();
+            HandshakeState::start_initiator(&stranger.private, &local_kp.public, &[]).unwrap();
 
         let src: SocketAddr = "203.0.113.5:5".parse().unwrap();
         match pm.on_udp(src, &init_pkt, 0) {
@@ -1618,7 +1618,8 @@ mod tests {
             PeerManager::new(kp_r.private, kp_r.public, &[cfg_i], TunnelMode::L3Tun, None);
 
         // The initiator's HandshakeInit (built out-of-band, as if received).
-        let (_hs, init_pkt) = HandshakeState::start_initiator(&kp_i.private, &kp_r.public).unwrap();
+        let (_hs, init_pkt) =
+            HandshakeState::start_initiator(&kp_i.private, &kp_r.public, &[]).unwrap();
 
         // First delivery establishes the responder session; capture its reply.
         let resp1 = resp_bytes(&pm_r.on_udp(ep_i, &init_pkt, 0));
@@ -2088,7 +2089,7 @@ mod tests {
         // A valid HandshakeInit from the peer, delivered THROUGH the relay
         // (RelayDeliver from the server, src = peer node).
         let (_hs, init_pkt) =
-            HandshakeState::start_initiator(&peer_kp.private, &local.public).unwrap();
+            HandshakeState::start_initiator(&peer_kp.private, &local.public, &[]).unwrap();
         let mut buf = Vec::new();
         yip_rendezvous::encode(
             &yip_rendezvous::Message::RelayDeliver {

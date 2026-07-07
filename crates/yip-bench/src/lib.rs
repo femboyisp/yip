@@ -7,10 +7,10 @@ pub fn established_pair() -> (Session, Session) {
     let ik = generate_keypair();
     let mut ini = Handshake::initiator(&ik.private, &rk.public).expect("init");
     let mut res = Handshake::responder(&rk.private).expect("resp");
-    let m1 = ini.write_message().expect("m1");
-    res.read_message(&m1).expect("read m1");
-    let m2 = res.write_message().expect("m2");
-    ini.read_message(&m2).expect("read m2");
+    let m1 = ini.write_message(&[]).expect("m1");
+    let _ = res.read_message(&m1).expect("read m1");
+    let m2 = res.write_message(&[]).expect("m2");
+    let _ = ini.read_message(&m2).expect("read m2");
     (
         ini.into_session().expect("a"),
         res.into_session().expect("b"),

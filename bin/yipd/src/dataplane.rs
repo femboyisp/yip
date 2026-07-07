@@ -634,10 +634,10 @@ mod tests {
         let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
         let mut res = Handshake::responder(&resp_kp.private).unwrap();
 
-        let m1 = ini.write_message().unwrap();
-        res.read_message(&m1).unwrap();
-        let m2 = res.write_message().unwrap();
-        ini.read_message(&m2).unwrap();
+        let m1 = ini.write_message(&[]).unwrap();
+        let _ = res.read_message(&m1).unwrap();
+        let m2 = res.write_message(&[]).unwrap();
+        let _ = ini.read_message(&m2).unwrap();
 
         assert!(ini.is_finished() && res.is_finished());
 
