@@ -147,6 +147,13 @@ network_id=${NETWORK_ID}
 cert=${certfile}
 roots=${ROOTS_FILE}
 EOF
+    # NOTE: an `[ ] && echo` one-liner here would make this the function's LAST
+    # command; when OBF_PSK is unset the test returns 1, and under `set -e` the
+    # `write_mesh_cfg` call aborts the whole script. Use an `if` (returns 0 when
+    # the condition is false) so the obf-off path stays byte-identical.
+    if [ -n "${OBF_PSK:-}" ]; then
+        echo "obf_psk=${OBF_PSK}" >> "$file"
+    fi
 }
 write_mesh_cfg "$CFG_A" "$PRIV_A" "$PUB_A" "$IP_A" "$CERT_A_FILE" "$SIGNPRIV_A"
 write_mesh_cfg "$CFG_B" "$PRIV_B" "$PUB_B" "$IP_B" "$CERT_B_FILE" "$SIGNPRIV_B"

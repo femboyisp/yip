@@ -101,6 +101,7 @@ rendezvous=${IP_T_A}:${RDV_PORT}
 [peer]
 public_key=${PUB_B}
 EOF
+[ -n "${OBF_PSK:-}" ] && echo "obf_psk=${OBF_PSK}" >> "$CFG_A"
 
 cat > "$CFG_B" <<EOF
 # yipPunchB
@@ -113,6 +114,7 @@ rendezvous=${IP_T_B}:${RDV_PORT}
 [peer]
 public_key=${PUB_A}
 EOF
+[ -n "${OBF_PSK:-}" ] && echo "obf_psk=${OBF_PSK}" >> "$CFG_B"
 
 # ── 3. create namespaces + point-to-point veths into T ────────────────────────
 echo "[setup] creating network namespaces"
@@ -160,8 +162,10 @@ ip netns exec "$NS_T" iptables -A FORWARD -i "$VETH_B_T" -o "$VETH_A_T" -j ACCEP
 
 # ── 4. start yip-rendezvous in T, bound on both subnets ───────────────────────
 LOG_RDV="$TMPDIR_TEST/rdv.log"
+RDV_ARGS=("0.0.0.0:${RDV_PORT}")
+[ -n "${OBF_PSK:-}" ] && RDV_ARGS+=(--obf-psk "${OBF_PSK}")
 echo "[start] starting yip-rendezvous in T on 0.0.0.0:${RDV_PORT}"
-ip netns exec "$NS_T" "$RDV" "0.0.0.0:${RDV_PORT}" >"$LOG_RDV" 2>&1 &
+ip netns exec "$NS_T" "$RDV" "${RDV_ARGS[@]}" >"$LOG_RDV" 2>&1 &
 PID_RDV=$!
 sleep 0.3
 

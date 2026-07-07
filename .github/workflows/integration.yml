@@ -139,7 +139,7 @@ jobs:
           echo "running netns tunnel tests under sudo: $BIN"
           # --exact so ping_across_yipd_tunnel does not also match _under_loss.
           for mode in poll uring; do
-            for t in ping_across_yipd_tunnel ping_across_yipd_tunnel_under_loss arq_recovers_bulk_loss l2_tap_ping_or_arp_across_tunnel triangle_full_mesh_ping relay_path_ping hole_punch_ping discovery_dynamic_ping admission_rejects_uncertified discovery_survives_root_outage; do
+            for t in ping_across_yipd_tunnel ping_across_yipd_tunnel_under_loss arq_recovers_bulk_loss l2_tap_ping_or_arp_across_tunnel triangle_full_mesh_ping relay_path_ping hole_punch_ping discovery_dynamic_ping admission_rejects_uncertified discovery_survives_root_outage obfuscated_ping obf_psk_mismatch_no_connection relay_path_ping_obfuscated hole_punch_ping_obfuscated discovery_dynamic_ping_obfuscated; do
               LOG="/tmp/netns-$mode-$t.log"
               if [ "$mode" = "uring" ]; then
                 echo "running $t with UringDriver (opt-in: YIP_USE_URING=1)"
