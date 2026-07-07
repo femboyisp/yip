@@ -6,9 +6,39 @@
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
-use yip_rendezvous::{decode, encode, RendezvousServer};
+use yip_rendezvous::{decode, encode, Message, RendezvousServer};
 
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Recover the inbound rendezvous `Message` from a received datagram.
+/// Obf on (`obf_key = Some`): deobfuscate the envelope, require the dedicated
+/// `yip_obf::RDV_TYPE`, then decode — a wrong key / wrong ptype / garbage
+/// datagram ⇒ `None` (fail-closed, no panic). Obf off: decode the plain bytes,
+/// byte-identical to the pre-Task-4 path.
+fn decode_inbound(obf_key: Option<&[u8; 16]>, dg: &[u8]) -> Option<Message> {
+    match obf_key {
+        Some(key) => yip_obf::deobfuscate(key, dg).and_then(|(pt, body)| {
+            if pt == yip_obf::RDV_TYPE {
+                decode(&body)
+            } else {
+                None
+            }
+        }),
+        None => decode(dg),
+    }
+}
+
+/// Serialize a reply for the wire. Obf on: wrap the encoded `Message` in an
+/// `obf_key`-keyed envelope under `yip_obf::RDV_TYPE` with random padding. Obf
+/// off: the plain encoding, byte-identical to before Task 4.
+fn wrap_reply(obf_key: Option<&[u8; 16]>, reply: &Message) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode(reply, &mut out);
+    match obf_key {
+        Some(key) => yip_obf::obfuscate(key, yip_obf::RDV_TYPE, &out, random_pad(OBF_PAD_MAX)),
+        None => out,
+    }
+}
 
 /// Maximum random padding (bytes) added to an obfuscated rendezvous-message
 /// envelope. Rendezvous messages are small control/relay datagrams, so a
@@ -116,7 +146,6 @@ fn main() -> std::io::Result<()> {
     let mut server = RendezvousServer::new(now_ms(base));
     let mut last_sweep = Instant::now();
     let mut rx = [0u8; 2048];
-    let mut out = Vec::new();
 
     loop {
         match sock.recv_from(&mut rx) {
@@ -124,27 +153,9 @@ fn main() -> std::io::Result<()> {
                 // Obf on: unwrap the rendezvous envelope first (wrong key /
                 // wrong ptype ⇒ drop, fail-closed, no panic). Obf off: decode
                 // the plain bytes exactly as before Task 4.
-                let decoded = match obf_key {
-                    Some(key) => yip_obf::deobfuscate(&key, &rx[..n]).and_then(|(pt, body)| {
-                        if pt == yip_obf::RDV_TYPE {
-                            decode(&body)
-                        } else {
-                            None
-                        }
-                    }),
-                    None => decode(&rx[..n]),
-                };
-                if let Some(msg) = decoded {
+                if let Some(msg) = decode_inbound(obf_key.as_ref(), &rx[..n]) {
                     for (dst, reply) in server.handle(src, msg, now_ms(base)) {
-                        out.clear();
-                        encode(&reply, &mut out);
-                        let wire = match obf_key {
-                            Some(key) => {
-                                let pad = random_pad(OBF_PAD_MAX);
-                                yip_obf::obfuscate(&key, yip_obf::RDV_TYPE, &out, pad)
-                            }
-                            None => out.clone(),
-                        };
+                        let wire = wrap_reply(obf_key.as_ref(), &reply);
                         let _ = sock.send_to(&wire, dst); // best-effort; drop on error
                     }
                 }
@@ -167,7 +178,72 @@ fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod obf_tests {
+    use super::{decode_inbound, wrap_reply};
     use yip_rendezvous::{encode, node_id, Message};
+
+    /// `wrap_reply` + `decode_inbound` round-trip a Message, obf ON: the wire
+    /// bytes are obfuscated (not the plain encoding) yet recover exactly.
+    #[test]
+    fn wrap_and_decode_round_trip_obf_on() {
+        let key = yip_obf::derive_key(&[3u8; 32]);
+        let msg = Message::Lookup {
+            node: node_id(&[8u8; 32]),
+        };
+        let mut plain = Vec::new();
+        encode(&msg, &mut plain);
+
+        let wire = wrap_reply(Some(&key), &msg);
+        assert_ne!(
+            wire, plain,
+            "obf-on wire bytes must not be the plain encoding"
+        );
+        assert_eq!(
+            decode_inbound(Some(&key), &wire),
+            Some(msg),
+            "obf-on round-trip recovers the Message"
+        );
+    }
+
+    /// Obf OFF: `wrap_reply` is the plain encoding and `decode_inbound` decodes
+    /// plain bytes — byte-identical to the pre-Task-4 path.
+    #[test]
+    fn wrap_and_decode_plain_obf_off() {
+        let msg = Message::Register {
+            node: node_id(&[4u8; 32]),
+        };
+        let mut plain = Vec::new();
+        encode(&msg, &mut plain);
+
+        assert_eq!(
+            wrap_reply(None, &msg),
+            plain,
+            "obf-off wire == plain encoding"
+        );
+        assert_eq!(decode_inbound(None, &plain), Some(msg));
+    }
+
+    /// Fail-closed: obf ON, a wrong key or a plain (unwrapped) datagram must
+    /// NOT decode (dropped, no panic).
+    #[test]
+    fn decode_inbound_fails_closed_on_wrong_key_and_plaintext() {
+        let key = yip_obf::derive_key(&[5u8; 32]);
+        let wrong = yip_obf::derive_key(&[6u8; 32]);
+        let msg = Message::Lookup {
+            node: node_id(&[9u8; 32]),
+        };
+        let wire = wrap_reply(Some(&key), &msg);
+        assert_ne!(
+            decode_inbound(Some(&wrong), &wire),
+            Some(msg.clone()),
+            "a wrong key must not recover the Message"
+        );
+        let mut plain = Vec::new();
+        encode(&msg, &mut plain);
+        // A plaintext datagram fed to the obf-on path is not a valid RDV
+        // envelope for this key ⇒ it must not recover the original Message
+        // (it unmasks to garbage under the key, then fails the RDV_TYPE/decode).
+        assert_ne!(decode_inbound(Some(&key), &plain), Some(msg));
+    }
 
     /// `obfuscate` a `Lookup`, `deobfuscate` + `Message::decode` recovers it
     /// exactly, under the dedicated `yip_obf::RDV_TYPE`.
