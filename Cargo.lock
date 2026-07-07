@@ -1205,6 +1205,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "yip-obf"
+version = "0.1.0"
+dependencies = [
+ "blake2",
+ "getrandom 0.2.17",
+ "siphasher",
+]
+
+[[package]]
 name = "yip-rendezvous"
 version = "0.1.0"
 dependencies = [
