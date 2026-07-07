@@ -98,6 +98,7 @@ rendezvous=${IP_R_A}:${RDV_PORT}
 [peer]
 public_key=${PUB_B}
 EOF
+[ -n "${OBF_PSK:-}" ] && echo "obf_psk=${OBF_PSK}" >> "$CFG_A"
 
 cat > "$CFG_B" <<EOF
 # yipRelB
@@ -110,6 +111,7 @@ rendezvous=${IP_R_B}:${RDV_PORT}
 [peer]
 public_key=${PUB_A}
 EOF
+[ -n "${OBF_PSK:-}" ] && echo "obf_psk=${OBF_PSK}" >> "$CFG_B"
 
 # ── 3. create namespaces + point-to-point veths into R ────────────────────────
 echo "[setup] creating network namespaces"
@@ -156,8 +158,10 @@ ip netns exec "$NS_R" sysctl -q -w net.ipv4.conf.all.forwarding=0
 
 # ── 4. start yip-rendezvous in R, bound on both subnets ───────────────────────
 LOG_RDV="$TMPDIR_TEST/rdv.log"
+RDV_ARGS=("0.0.0.0:${RDV_PORT}")
+[ -n "${OBF_PSK:-}" ] && RDV_ARGS+=(--obf-psk "${OBF_PSK}")
 echo "[start] starting yip-rendezvous in R on 0.0.0.0:${RDV_PORT}"
-ip netns exec "$NS_R" "$RDV" "0.0.0.0:${RDV_PORT}" >"$LOG_RDV" 2>&1 &
+ip netns exec "$NS_R" "$RDV" "${RDV_ARGS[@]}" >"$LOG_RDV" 2>&1 &
 PID_RDV=$!
 sleep 0.3
 

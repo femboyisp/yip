@@ -83,6 +83,13 @@ pub struct Membership {
     /// millisecond mark of the last digest we emitted, for `tick_digest`'s
     /// debounce.
     last_digest_ms: Option<u64>,
+    /// The digest spacing to apply the NEXT time `last_digest_ms` is checked
+    /// against `now_ms`. `GOSSIP_INTERVAL_MS` exactly when obfuscation is off
+    /// (byte-identical timing); re-rolled via
+    /// `crate::peer_manager::jitter_ms(GOSSIP_INTERVAL_MS)` after every digest
+    /// fire when `tick_digest`'s `obf_on` is true (3a) — stored and compared,
+    /// never re-derived per-tick.
+    digest_ms: u64,
 }
 
 /// Build and sign a `Record` for `cert`/`endpoints`/`seq` with the member's
@@ -133,6 +140,7 @@ impl Membership {
             own_node_id,
             own_cert: own_cert_stored,
             last_digest_ms: None,
+            digest_ms: GOSSIP_INTERVAL_MS,
         };
         m.insert_record(own_record);
         m
@@ -251,15 +259,23 @@ impl Membership {
 
     /// A debounced `Digest` of the whole local directory, to send to gossip
     /// partners. `now_ms` is MONOTONIC milliseconds — used purely to space
-    /// digests at least `GOSSIP_INTERVAL_MS` apart; it is never compared
-    /// against a cert's validity window.
-    pub fn tick_digest(&mut self, now_ms: u64) -> Option<GossipMsg> {
+    /// digests at least `GOSSIP_INTERVAL_MS` (jittered ±25% per fire when
+    /// `obf_on`, see `digest_ms`) apart; it is never compared against a
+    /// cert's validity window. `obf_on` is the caller's
+    /// `PeerManager::obf_key.is_some()`; when false `digest_ms` stays exactly
+    /// `GOSSIP_INTERVAL_MS` forever (byte-identical obf-off timing).
+    pub fn tick_digest(&mut self, now_ms: u64, obf_on: bool) -> Option<GossipMsg> {
         if let Some(last) = self.last_digest_ms {
-            if now_ms.saturating_sub(last) < GOSSIP_INTERVAL_MS {
+            if now_ms.saturating_sub(last) < self.digest_ms {
                 return None;
             }
         }
         self.last_digest_ms = Some(now_ms);
+        self.digest_ms = if obf_on {
+            crate::peer_manager::jitter_ms(GOSSIP_INTERVAL_MS)
+        } else {
+            GOSSIP_INTERVAL_MS
+        };
         let entries: Vec<(NodeId, u64)> = self
             .directory
             .iter()
@@ -594,9 +610,13 @@ mod tests {
         let secs = 500u64;
 
         // Round 1: both emit a digest of what they know (just themselves).
-        let da = a.tick_digest(now_ms).expect("first digest always fires");
+        let da = a
+            .tick_digest(now_ms, false)
+            .expect("first digest always fires");
         now_ms += GOSSIP_INTERVAL_MS;
-        let db = b.tick_digest(now_ms).expect("first digest always fires");
+        let db = b
+            .tick_digest(now_ms, false)
+            .expect("first digest always fires");
 
         // Each peer reacts to the other's digest with a PullRequest for
         // what it's missing.

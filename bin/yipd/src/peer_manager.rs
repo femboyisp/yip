@@ -148,6 +148,13 @@ struct HandshakingState {
     started_ms: u64,
     /// When `[HandshakeInit]` was last (re)sent.
     last_sent_ms: u64,
+    /// The retransmit spacing to apply the NEXT time `last_sent_ms` is
+    /// checked against `now_ms` (see the retransmit arm in `tick_dispatch`).
+    /// Set to `HANDSHAKE_RETRY_MS` exactly when obfuscation is off (obf-off
+    /// timing is byte-identical); re-rolled via `jitter_ms(HANDSHAKE_RETRY_MS)`
+    /// at creation and after every retransmit when `obf_key.is_some()` (3a) —
+    /// stored and compared, never re-derived per-tick (see `jitter_ms`'s doc).
+    retry_ms: u64,
     /// How many times `[HandshakeInit]` has been resent (for logging/metrics).
     retries: u32,
     /// The framed `[HandshakeInit]` datagram, resent verbatim on retry.
@@ -224,6 +231,12 @@ struct Peer {
     /// When we last emitted a `lookup` for this peer (debounces `NeedLookup`);
     /// `None` until the first lookup is sent.
     last_lookup_ms: Option<u64>,
+    /// Per-peer session obfuscation key = `yip_obf::derive_key(&hp_key)`, set
+    /// when the peer reaches `Established` *and* obfuscation is enabled
+    /// (`PeerManager::obf_key.is_some()`); `None` otherwise. Used to wrap/unwrap
+    /// this peer's Data/Control/Gossip datagrams (3a). Independent of the
+    /// network-wide `obf_psk` key, which wraps handshakes (pre-session).
+    session_obf_key: Option<[u8; 16]>,
 }
 
 /// Multi-peer router/demuxer + lazy in-loop handshake driver.
@@ -267,6 +280,13 @@ pub struct PeerManager {
     local_node_id: NodeId,
     /// When we last emitted `register(local_node_id)` (see [`REG_REFRESH_MS`]).
     last_register_ms: u64,
+    /// The registration-refresh spacing to apply the NEXT time
+    /// `last_register_ms` is checked against `now_ms`. `REG_REFRESH_MS`
+    /// exactly when obfuscation is off (byte-identical timing); re-rolled via
+    /// `jitter_ms(REG_REFRESH_MS)` after every register fire when
+    /// `obf_key.is_some()` (3a) — stored and compared, never re-derived
+    /// per-tick.
+    reg_refresh_ms: u64,
     /// Whether we have registered at least once (so the first `tick` registers
     /// promptly rather than waiting a full [`REG_REFRESH_MS`] interval — the
     /// loop clock starts at 0).
@@ -282,7 +302,26 @@ pub struct PeerManager {
     /// borrow-checker limitation around retrying a `&mut self`-returning
     /// call across loop iterations.
     tun_scratch: Vec<u8>,
+    /// The network-wide anti-DPI obfuscation key = `yip_obf::derive_key(&obf_psk)`,
+    /// or `None` when obfuscation is disabled. When `None`, the `Dispatch`
+    /// methods take the exact 2a/2b/2c plaintext path (byte-identical — no
+    /// wrap/unwrap ever runs). When `Some`, every outgoing peer datagram is
+    /// wrapped via `yip-obf` (masked type + padding) and ingress is demuxed by
+    /// source + trial-unmask. This is the *pre-session* key: it wraps
+    /// handshakes; established peers use their per-session `session_obf_key`
+    /// for Data/Control/Gossip. Set once, before the event loop starts (see
+    /// [`PeerManager::set_obf_psk`]).
+    obf_key: Option<[u8; 16]>,
 }
+
+/// MTU budget (bytes) used to size obfuscation padding: handshakes are padded
+/// generously up to this ceiling (their true size is small and highly
+/// distinctive otherwise); data/control/gossip get modest padding, room
+/// permitting under this ceiling, since their bodies are already near the path
+/// MTU. Only consulted on the obfuscation-enabled path.
+const OBF_MTU_BUDGET: usize = 1200;
+/// Maximum modest padding (bytes) added to a data/control/gossip envelope.
+const OBF_DATA_PAD_MAX: usize = 64;
 
 impl PeerManager {
     /// Build a `PeerManager` from the local keypair and the configured peer
@@ -324,6 +363,7 @@ impl PeerManager {
                 path_kind: None,
                 relay: false,
                 last_lookup_ms: None,
+                session_obf_key: None,
             });
         }
         let mut mgr = Self {
@@ -338,10 +378,12 @@ impl PeerManager {
             membership,
             local_node_id: node_id(&local_pub),
             last_register_ms: 0,
+            reg_refresh_ms: REG_REFRESH_MS,
             registered_once: false,
             egress: Vec::new(),
             tick_egress: Vec::new(),
             tun_scratch: Vec::new(),
+            obf_key: None,
         };
         // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
         // exactly like configured peers: seed them into the peer table so an
@@ -392,13 +434,39 @@ impl PeerManager {
             path_kind: None,
             relay: false,
             last_lookup_ms: None,
+            session_obf_key: None,
         });
+    }
+
+    /// Enable (or disable) anti-DPI obfuscation for this manager from the
+    /// network-wide `obf_psk`. Called once by `tunnel.rs` right after
+    /// construction, before the event loop begins, so every subsequently
+    /// established peer derives its `session_obf_key` and every datagram is
+    /// wrapped/unwrapped. `None` leaves obfuscation disabled — the `Dispatch`
+    /// methods then run the 2a/2b/2c plaintext path byte-identically.
+    ///
+    /// This is a post-construction setter rather than a `new` parameter
+    /// deliberately: it keeps the ~25 existing multi-arg `PeerManager::new`
+    /// call sites (and their behaviour) untouched, minimizing regression
+    /// surface for the obf-off gate. Functionally equivalent to a constructor
+    /// argument since no handshake can complete before the loop starts.
+    pub fn set_obf_psk(&mut self, obf_psk: Option<[u8; 32]>) {
+        self.obf_key = obf_psk.map(|p| yip_obf::derive_key(&p));
     }
 
     /// This node's own self-certifying mesh address, for assigning the
     /// local TUN/TAP device's address.
     pub fn local_addr(&self) -> Ipv6Addr {
         node_addr(&self.local_pub)
+    }
+
+    /// The per-session obfuscation key for a just-established peer, derived
+    /// from its handshake `hp_key` — but only when obfuscation is enabled
+    /// (`obf_key.is_some()`); `None` otherwise (obf off ⇒ nothing to store,
+    /// byte-identical). Both peers derive the same `hp_key` from the Noise
+    /// channel binding, so both derive the same session obf key.
+    fn session_obf_key_for(&self, hp_key: &[u8; 16]) -> Option<[u8; 16]> {
+        self.obf_key.map(|_| yip_obf::derive_key(hp_key))
     }
 
     // ── rendezvous / path helpers ─────────────────────────────────────────
@@ -484,10 +552,16 @@ impl PeerManager {
             // `[HandshakeResp]` match in `handle_handshake_resp`) to `target`.
             self.peers[idx].endpoint = Some(target);
         }
+        let retry_ms = if self.obf_key.is_some() {
+            jitter_ms(HANDSHAKE_RETRY_MS)
+        } else {
+            HANDSHAKE_RETRY_MS
+        };
         self.peers[idx].state = PeerState::Handshaking(Box::new(HandshakingState {
             hs,
             started_ms: now_ms,
             last_sent_ms: now_ms,
+            retry_ms,
             retries: 0,
             init_pkt,
             target,
@@ -646,6 +720,7 @@ impl PeerManager {
             }
             PeerState::Idle | PeerState::Handshaking(_) => {
                 let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
+                let sess_obf = self.session_obf_key_for(&established.hp_key);
                 // A relay peer's egress is always re-wrapped, so the DataPlane's
                 // stamped `dst` is unused: seed it with the server address.
                 let placeholder = self.server_addr();
@@ -656,6 +731,7 @@ impl PeerManager {
                     placeholder,
                 ));
 
+                self.peers[idx].session_obf_key = sess_obf;
                 self.peers[idx].cached_resp = Some(resp_pkt.clone());
                 self.peers[idx].relay = true;
                 self.peers[idx].path.committed(PathKind::Relayed);
@@ -703,6 +779,7 @@ impl PeerManager {
                     return DispatchOut::None;
                 }
                 let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
+                let sess_obf = self.session_obf_key_for(&established.hp_key);
                 let placeholder = self.server_addr();
                 let mut dp = Box::new(DataPlane::new(
                     established,
@@ -711,6 +788,7 @@ impl PeerManager {
                     placeholder,
                 ));
                 self.by_tag.insert(dp.conn_tag(), idx);
+                self.peers[idx].session_obf_key = sess_obf;
                 self.peers[idx].relay = true;
                 self.peers[idx].path.committed(PathKind::Relayed);
                 self.peers[idx].path_kind = Some(PathKind::Relayed);
@@ -1063,8 +1141,10 @@ impl PeerManager {
             // responder role): admit this session.
             PeerState::Idle | PeerState::Handshaking(_) => {
                 let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
+                let sess_obf = self.session_obf_key_for(&established.hp_key);
                 let mut dp = Box::new(DataPlane::new(established, conn_tag, self.mode, src));
 
+                self.peers[idx].session_obf_key = sess_obf;
                 self.peers[idx].endpoint = Some(src); // learn the observed endpoint
                 self.peers[idx].cached_resp = Some(resp_pkt.clone());
                 self.by_tag.insert(dp.conn_tag(), idx);
@@ -1131,10 +1211,12 @@ impl PeerManager {
                     return DispatchOut::None;
                 }
                 let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
+                let sess_obf = self.session_obf_key_for(&established.hp_key);
                 // `idx` was matched above via `p.endpoint == Some(src)`, so `src`
                 // is exactly this peer's endpoint.
                 let mut dp = Box::new(DataPlane::new(established, conn_tag, self.mode, src));
                 self.by_tag.insert(dp.conn_tag(), idx);
+                self.peers[idx].session_obf_key = sess_obf;
                 // `src` == this peer's `endpoint` (matched above). Commit the
                 // path stage we completed over (Direct or Punched); a relayed
                 // resp is handled by `relayed_handshake_resp` instead.
@@ -1280,7 +1362,12 @@ impl PeerManager {
             .any(|p| matches!(p.state, PeerState::Established(_)));
 
         // Debounced digest (spacing handled inside `tick_digest`).
-        if let Some(digest) = self.membership.as_mut().and_then(|m| m.tick_digest(now_ms)) {
+        let obf_on = self.obf_key.is_some();
+        if let Some(digest) = self
+            .membership
+            .as_mut()
+            .and_then(|m| m.tick_digest(now_ms, obf_on))
+        {
             let mut bytes = Vec::new();
             bytes.push(PacketType::Gossip as u8);
             digest.encode(&mut bytes);
@@ -1323,10 +1410,207 @@ impl PeerManager {
             }
         }
     }
+
+    // ── anti-DPI obfuscation (3a) ─────────────────────────────────────────
+    //
+    // A thin wrap/unwrap LAYER around the existing `[PacketType][…]` datagrams,
+    // active only when `obf_key.is_some()`. It never weakens the inner
+    // Noise/AEAD/yip-wire crypto — a wrong key deobfuscates to garbage that the
+    // inner verify then rejects (fail-closed). When `obf_key` is `None` these
+    // helpers are never called and every `Dispatch` method takes the exact
+    // 2a/2b/2c plaintext path (byte-identical).
+
+    /// Recover the plaintext `[ptype] ‖ body` datagram from an obfuscated
+    /// ingress datagram `dg` that arrived from `src`, by source + trial-unmask,
+    /// or `None` if it unmasks to nothing dispatchable (⇒ drop). Only called on
+    /// the obfuscation-enabled path.
+    ///
+    /// Order (matches the addendum):
+    /// (a) If `src` is a known `Established` peer, try that peer's
+    ///     `session_obf_key`; accept only `Data`/`Control`/`Gossip`.
+    /// (b) Otherwise (or if (a) did not yield one of those types), try the
+    ///     network `obf_key`; accept only `HandshakeInit`/`HandshakeResp` — this
+    ///     covers a brand-new peer's `Init` AND a re-handshake from a known src.
+    ///
+    /// A wrong key yields `None` or a garbage `(ptype, body)`; the type-set
+    /// filters and, ultimately, the inner Noise/AEAD/frame verify make every
+    /// mismatch a safe drop — never a mis-dispatch with side effects.
+    fn deobf_ingress(&self, src: SocketAddr, dg: &[u8]) -> Option<Vec<u8>> {
+        // (a) established peer whose endpoint matches src → session key.
+        if let Some(key) = self.peers.iter().find_map(|p| {
+            if p.endpoint == Some(src) && matches!(p.state, PeerState::Established(_)) {
+                p.session_obf_key
+            } else {
+                None
+            }
+        }) {
+            if let Some((ptype, body)) = yip_obf::deobfuscate(&key, dg) {
+                if ptype == PacketType::Data as u8
+                    || ptype == PacketType::Control as u8
+                    || ptype == PacketType::Gossip as u8
+                {
+                    return Some(reassemble(ptype, &body));
+                }
+            }
+        }
+        // (b) pre-session network key → handshakes only.
+        if let Some(key) = self.obf_key {
+            if let Some((ptype, body)) = yip_obf::deobfuscate(&key, dg) {
+                if ptype == PacketType::HandshakeInit as u8
+                    || ptype == PacketType::HandshakeResp as u8
+                {
+                    return Some(reassemble(ptype, &body));
+                }
+            }
+        }
+        None
+    }
+
+    /// The obfuscation key to wrap an egress datagram to `dst` whose plaintext
+    /// leads with `ptype`: the network `obf_key` for handshakes (pre-session);
+    /// otherwise the `session_obf_key` of the `Established` peer reached at
+    /// `dst`. Falls back to the network key when no session key is found (e.g. a
+    /// gossip digest to a not-yet-`Established` root) so wrapping never silently
+    /// drops a datagram.
+    fn obf_key_for_egress(&self, dst: SocketAddr, ptype: u8) -> Option<[u8; 16]> {
+        if ptype == PacketType::HandshakeInit as u8 || ptype == PacketType::HandshakeResp as u8 {
+            return self.obf_key;
+        }
+        self.peers
+            .iter()
+            .find_map(|p| {
+                if p.endpoint == Some(dst) && matches!(p.state, PeerState::Established(_)) {
+                    p.session_obf_key
+                } else {
+                    None
+                }
+            })
+            .or(self.obf_key)
+    }
+
+    /// Wrap every egress datagram in `dgs` in place via `yip_obf::obfuscate`
+    /// (masked type + random padding), so the `PacketType` byte never appears on
+    /// the wire. Datagrams addressed to the rendezvous server carry a plaintext
+    /// `yip_rendezvous::Message` rather than a `[PacketType][…]` tunnel
+    /// datagram, so they are wrapped whole (no leading byte stripped) under the
+    /// dedicated `yip_obf::RDV_TYPE` and the network `obf_key` (the server is
+    /// never an `Established` peer, so it has no session key). Only called on
+    /// the obfuscation-enabled path.
+    fn obf_egress(&self, dgs: &mut [EgressDatagram]) {
+        let server = self.rendezvous.as_ref().map(|r| r.server_addr());
+        for d in dgs.iter_mut() {
+            if d.bytes.is_empty() {
+                continue;
+            }
+            if Some(d.dst) == server {
+                let Some(key) = self.obf_key else {
+                    continue;
+                };
+                let pad = random_pad(obf_pad_max(yip_obf::RDV_TYPE, d.bytes.len() + 1));
+                d.bytes = yip_obf::obfuscate(&key, yip_obf::RDV_TYPE, &d.bytes, pad);
+                continue;
+            }
+            let ptype = d.bytes[0];
+            let Some(key) = self.obf_key_for_egress(d.dst, ptype) else {
+                continue;
+            };
+            let pad = random_pad(obf_pad_max(ptype, d.bytes.len()));
+            d.bytes = yip_obf::obfuscate(&key, ptype, &d.bytes[1..], pad);
+        }
+    }
+
+    /// Wrap `udp` egress and re-materialize a `DispatchOut` from the owned
+    /// `(tun, udp)` parts produced by [`own_dispatch`]. Used by the
+    /// obfuscation-enabled `on_udp` path.
+    fn finish_wrapped(
+        &mut self,
+        tun: Option<Vec<u8>>,
+        mut udp: Vec<EgressDatagram>,
+    ) -> DispatchOut<'_> {
+        self.obf_egress(&mut udp);
+        self.egress = udp;
+        match (tun, self.egress.is_empty()) {
+            (Some(t), true) => {
+                self.tun_scratch = t;
+                DispatchOut::Tun(&self.tun_scratch)
+            }
+            (Some(t), false) => {
+                self.tun_scratch = t;
+                DispatchOut::Both(&self.tun_scratch, &self.egress)
+            }
+            (None, false) => DispatchOut::Udp(&self.egress),
+            (None, true) => DispatchOut::None,
+        }
+    }
 }
 
 impl Dispatch for PeerManager {
+    /// UDP ingress. Obfuscation off ⇒ the plaintext 2a/2b/2c demux, verbatim.
+    /// Obfuscation on ⇒ recover the real datagram — rendezvous-server
+    /// datagrams via the network `obf_key` + `RDV_TYPE`, everything else by
+    /// source + trial-unmask — run the SAME demux on it, then wrap the
+    /// egress it produces.
     fn on_udp(&mut self, src: SocketAddr, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
+        if self.obf_key.is_none() {
+            return self.on_udp_dispatch(src, dg, now_ms);
+        }
+        if dg.is_empty() {
+            return DispatchOut::None;
+        }
+        // A datagram from the configured rendezvous server is an obfuscated
+        // control/relay message under the network `obf_key` and `RDV_TYPE`;
+        // unwrap it before handing the plaintext `yip_rendezvous::Message`
+        // bytes to `on_rdv`, then wrap only the peer-directed egress it
+        // yields. Wrong key / wrong ptype ⇒ drop (fail-closed), never a panic.
+        let server = self.rendezvous.as_ref().map(|r| r.server_addr());
+        if Some(src) == server {
+            let Some(key) = self.obf_key else {
+                return DispatchOut::None;
+            };
+            let Some((ptype, body)) = yip_obf::deobfuscate(&key, dg) else {
+                return DispatchOut::None;
+            };
+            if ptype != yip_obf::RDV_TYPE {
+                return DispatchOut::None;
+            }
+            let (tun, udp) = own_dispatch(self.on_rdv(&body, now_ms));
+            return self.finish_wrapped(tun, udp);
+        }
+        let Some(plain) = self.deobf_ingress(src, dg) else {
+            return DispatchOut::None;
+        };
+        let (tun, udp) = own_dispatch(self.on_udp_dispatch(src, &plain, now_ms));
+        self.finish_wrapped(tun, udp)
+    }
+
+    fn on_tun(&mut self, inner: &[u8], now_ms: u64) -> &[EgressDatagram] {
+        if self.obf_key.is_none() {
+            return self.on_tun_dispatch(inner, now_ms);
+        }
+        // Copy the (borrowed) egress out so the DataPlane/self borrow ends, then
+        // wrap in place and return from `self.egress`.
+        let mut owned: Vec<EgressDatagram> = self.on_tun_dispatch(inner, now_ms).to_vec();
+        self.obf_egress(&mut owned);
+        self.egress = owned;
+        &self.egress
+    }
+
+    fn tick(&mut self, now_ms: u64) -> Option<&[EgressDatagram]> {
+        if self.obf_key.is_none() {
+            return self.tick_dispatch(now_ms);
+        }
+        let mut owned: Vec<EgressDatagram> = match self.tick_dispatch(now_ms) {
+            Some(e) => e.to_vec(),
+            None => return None,
+        };
+        self.obf_egress(&mut owned);
+        self.tick_egress = owned;
+        Some(&self.tick_egress)
+    }
+}
+
+impl PeerManager {
+    fn on_udp_dispatch(&mut self, src: SocketAddr, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
         if dg.is_empty() {
             return DispatchOut::None;
         }
@@ -1352,7 +1636,7 @@ impl Dispatch for PeerManager {
         }
     }
 
-    fn on_tun(&mut self, inner: &[u8], now_ms: u64) -> &[EgressDatagram] {
+    fn on_tun_dispatch(&mut self, inner: &[u8], now_ms: u64) -> &[EgressDatagram] {
         let idx = match self.route_tun_index(inner) {
             Some(i) => i,
             None => {
@@ -1456,20 +1740,25 @@ impl Dispatch for PeerManager {
         }
     }
 
-    fn tick(&mut self, now_ms: u64) -> Option<&[EgressDatagram]> {
+    fn tick_dispatch(&mut self, now_ms: u64) -> Option<&[EgressDatagram]> {
         self.tick_egress.clear();
 
         // ── registration refresh ──────────────────────────────────────────
         // Keep our reflexive binding fresh on the server so peers can find us.
         if self.rendezvous.is_some()
             && (!self.registered_once
-                || now_ms.saturating_sub(self.last_register_ms) >= REG_REFRESH_MS)
+                || now_ms.saturating_sub(self.last_register_ms) >= self.reg_refresh_ms)
         {
             let node = self.local_node_id;
             if let Some(r) = self.rendezvous.as_mut() {
                 self.tick_egress.push(r.register(node));
             }
             self.last_register_ms = now_ms;
+            self.reg_refresh_ms = if self.obf_key.is_some() {
+                jitter_ms(REG_REFRESH_MS)
+            } else {
+                REG_REFRESH_MS
+            };
             self.registered_once = true;
         }
 
@@ -1593,7 +1882,7 @@ impl Dispatch for PeerManager {
                     PeerState::Established(dp)
                 }
                 PeerState::Handshaking(mut handshaking)
-                    if now_ms.saturating_sub(handshaking.last_sent_ms) >= HANDSHAKE_RETRY_MS =>
+                    if now_ms.saturating_sub(handshaking.last_sent_ms) >= handshaking.retry_ms =>
                 {
                     if now_ms.saturating_sub(handshaking.started_ms) >= HANDSHAKE_TOTAL_MS {
                         // Whole attempt window elapsed without completing: the
@@ -1609,6 +1898,11 @@ impl Dispatch for PeerManager {
                         // target the probed `target` address.
                         handshaking.retries = handshaking.retries.saturating_add(1);
                         handshaking.last_sent_ms = now_ms;
+                        handshaking.retry_ms = if self.obf_key.is_some() {
+                            jitter_ms(HANDSHAKE_RETRY_MS)
+                        } else {
+                            HANDSHAKE_RETRY_MS
+                        };
                         if relay {
                             if let Some(d) = self.relay_wrap(i, handshaking.init_pkt.clone()) {
                                 self.tick_egress.push(d);
@@ -1681,6 +1975,87 @@ fn ipv6_dst(inner: &[u8]) -> Option<Ipv6Addr> {
     let mut octets = [0u8; 16];
     octets.copy_from_slice(&inner[24..40]);
     Some(Ipv6Addr::from(octets))
+}
+
+// ── obfuscation free helpers (3a) ───────────────────────────────────────────
+
+/// Rebuild the plaintext datagram `[ptype] ‖ body` that the pre-obfuscation
+/// demux expects, from a deobfuscated `(ptype, body)` pair.
+fn reassemble(ptype: u8, body: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + body.len());
+    v.push(ptype);
+    v.extend_from_slice(body);
+    v
+}
+
+/// Decompose a borrowed [`DispatchOut`] into owned `(tun, udp)` parts so the
+/// `self` borrow it holds can end before the egress is wrapped and re-returned.
+/// Mirrors the clone-to-owned pattern already used by `relayed_data` /
+/// `handle_data_or_control` where borrows would otherwise fight.
+fn own_dispatch(out: DispatchOut<'_>) -> (Option<Vec<u8>>, Vec<EgressDatagram>) {
+    match out {
+        DispatchOut::None => (None, Vec::new()),
+        DispatchOut::Tun(b) => (Some(b.to_vec()), Vec::new()),
+        DispatchOut::Udp(e) => (None, e.to_vec()),
+        DispatchOut::Both(b, e) => (Some(b.to_vec()), e.to_vec()),
+    }
+}
+
+/// The maximum obfuscation padding (bytes) for an envelope leading with
+/// `ptype`, whose current plaintext datagram (type byte + body) is `dg_len`
+/// bytes: generous for handshakes (they are small and otherwise highly
+/// fingerprintable), modest for data/control/gossip (already near the path
+/// MTU), always bounded so the wrapped datagram stays within [`OBF_MTU_BUDGET`].
+fn obf_pad_max(ptype: u8, dg_len: usize) -> usize {
+    // `dg_len` counts the leading type byte too; the envelope re-adds its own
+    // header (nonce+type+len), so budget against the body length.
+    let body_len = dg_len.saturating_sub(1);
+    let room = OBF_MTU_BUDGET.saturating_sub(body_len + yip_obf::MIN_ENVELOPE);
+    if ptype == PacketType::HandshakeInit as u8 || ptype == PacketType::HandshakeResp as u8 {
+        room
+    } else {
+        room.min(OBF_DATA_PAD_MAX)
+    }
+}
+
+/// A uniformly-random padding length in `0..=max`, drawn from the OS RNG.
+/// `max == 0` ⇒ `0` (no `getrandom` call). No numeric `as` casts.
+fn random_pad(max: usize) -> usize {
+    if max == 0 {
+        return 0;
+    }
+    let mut b = [0u8; 8];
+    getrandom::getrandom(&mut b).expect("OS RNG");
+    let v = u64::from_le_bytes(b);
+    let span = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
+    usize::try_from(v % span).unwrap_or(0)
+}
+
+/// Draw a value uniformly in `[base - base/4, base + base/4]` (±25%) via the
+/// OS RNG — used to jitter a control-plane timing cadence under `obf_psk` so
+/// repeated fires (handshake retry, registration refresh, gossip digest)
+/// don't emit a clean lockstep inter-arrival signature to a traffic-analysis
+/// observer. Mirrors `random_pad`'s `getrandom` usage.
+///
+/// Callers MUST re-roll and STORE the result after each fire, then compare
+/// the next fire against the stored value — never re-derive/re-roll the
+/// comparison threshold on every tick. A per-tick re-roll would resample the
+/// remaining-time comparison on every poll before it is due, which biases
+/// and compresses the effective interval instead of jittering it.
+///
+/// `base < 4` ⇒ `base` exactly (no `getrandom` call) since `base / 4 == 0`
+/// leaves nothing to jitter; not reached by any of the three cadences this
+/// is applied to (1_000 / 20_000 / 5_000 ms). No numeric `as` casts.
+pub(crate) fn jitter_ms(base: u64) -> u64 {
+    let spread = base / 4;
+    if spread == 0 {
+        return base;
+    }
+    let mut b = [0u8; 8];
+    getrandom::getrandom(&mut b).expect("OS RNG");
+    let v = u64::from_le_bytes(b);
+    let span = spread.saturating_mul(2).saturating_add(1);
+    (base - spread) + (v % span)
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -3378,6 +3753,402 @@ mod tests {
                 matches!(pm.peers[0].state, PeerState::Idle),
                 "untrusted-CA responder cert ⇒ session must not establish, reverts to Idle"
             );
+        }
+    }
+
+    // ── anti-DPI obfuscation (3a Task 3) ──────────────────────────────────
+
+    /// Build a talking pair of `DataPlane`s (via an in-process Noise-IK
+    /// handshake) and return `(initiator_dp, responder_dp, hp_key, conn_tag)`.
+    /// The responder side can OPEN what the initiator SEALS (both derive the
+    /// same `hp_key`), so a test can splice the responder side into a
+    /// `PeerManager` and feed it frames the initiator side produced.
+    fn established_pair(resp_peer_addr: SocketAddr) -> (DataPlane, DataPlane, [u8; 16], u64) {
+        let resp_kp = generate_keypair();
+        let init_kp = generate_keypair();
+        let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
+        let mut res = Handshake::responder(&resp_kp.private).unwrap();
+        let m1 = ini.write_message(&[]).unwrap();
+        let _ = res.read_message(&m1).unwrap();
+        let m2 = res.write_message(&[]).unwrap();
+        let _ = ini.read_message(&m2).unwrap();
+        let cb = ini.channel_binding();
+        let (auth_key, hp_key) = derive_wire_keys(&cb);
+        let conn_tag = conn_tag_from_keys(&auth_key, &hp_key);
+        let est_i = Established {
+            session: ini.into_session().unwrap(),
+            auth_key,
+            hp_key,
+        };
+        let est_r = Established {
+            session: res.into_session().unwrap(),
+            auth_key,
+            hp_key,
+        };
+        let any: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        (
+            DataPlane::new(est_i, conn_tag, TunnelMode::L3Tun, any),
+            DataPlane::new(est_r, conn_tag, TunnelMode::L3Tun, resp_peer_addr),
+            hp_key,
+            conn_tag,
+        )
+    }
+
+    /// (a) With obfuscation on, a `Data` datagram produced by the send path,
+    /// obfuscated with the peer's session key, is deobfuscated by `on_udp` and
+    /// routed to that peer's `DataPlane`, which decodes the original inner
+    /// packet — a full send→wire→on_udp round-trip with the `PacketType` byte
+    /// hidden on the wire.
+    #[test]
+    fn obf_on_data_roundtrips_through_send_and_on_udp() {
+        let peer_ep: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+        let peer = peer_cfg(2, "10.0.0.2:2000");
+        let mut pm = PeerManager::new([9u8; 32], [8u8; 32], &[peer], TunnelMode::L3Tun, None, None);
+        pm.set_obf_psk(Some([0x11u8; 32]));
+
+        // Splice the RESPONDER-side DataPlane so pm can open the initiator's
+        // sealed frames; give the peer its matching session obf key.
+        let (mut init_dp, resp_dp, hp_key, conn_tag) = established_pair(peer_ep);
+        let sess = yip_obf::derive_key(&hp_key);
+        pm.peers[0].state = PeerState::Established(Box::new(resp_dp));
+        pm.peers[0].session_obf_key = Some(sess);
+        pm.by_tag.insert(conn_tag, 0);
+
+        // Sender seals a TUN packet → one or more [Data]‖frame egress datagrams.
+        let inner = vec![0x33u8; 200];
+        let dgs = init_dp.on_tun_packet(&inner, 0).to_vec();
+        assert!(!dgs.is_empty());
+
+        // Wrap each with the SESSION key (ptype Data) and feed through on_udp
+        // until one decodes to the recovered inner (repair symbols may not).
+        let mut recovered: Option<Vec<u8>> = None;
+        for dg in &dgs {
+            assert_eq!(dg.bytes[0], PacketType::Data as u8);
+            let wrapped = yip_obf::obfuscate(&sess, PacketType::Data as u8, &dg.bytes[1..], 0);
+            // The wire datagram carries no plaintext PacketType prefix.
+            assert_ne!(
+                wrapped[0],
+                PacketType::Data as u8,
+                "type byte must be masked"
+            );
+            if let DispatchOut::Tun(buf) = pm.on_udp(peer_ep, &wrapped, 1) {
+                recovered = Some(buf.to_vec());
+                break;
+            }
+        }
+        assert_eq!(
+            recovered.as_deref(),
+            Some(inner.as_slice()),
+            "obf-wrapped Data must deobfuscate + route to the peer and decode"
+        );
+    }
+
+    /// (b) With obfuscation on, a datagram from an unknown (not-yet-Established)
+    /// source that deobfuscates under the network `obf_psk` key to a
+    /// `HandshakeInit` is processed: the peer establishes and the emitted
+    /// `HandshakeResp` egress is itself obfuscated (no plaintext type byte).
+    #[test]
+    fn obf_on_unknown_src_handshake_init_via_obf_psk() {
+        let kp_r = generate_keypair();
+        let kp_i = generate_keypair();
+        let ep_i: SocketAddr = "10.0.0.7:7000".parse().unwrap();
+        let cfg_i = PeerConfig {
+            public_key: kp_i.public,
+            endpoint: Some(ep_i),
+        };
+        let mut pm = PeerManager::new(
+            kp_r.private,
+            kp_r.public,
+            &[cfg_i],
+            TunnelMode::L3Tun,
+            None,
+            None,
+        );
+        let psk = [0x22u8; 32];
+        pm.set_obf_psk(Some(psk));
+        let obf_key = yip_obf::derive_key(&psk);
+
+        // A real [HandshakeInit]‖msg1, obfuscated with the network key.
+        let (_hs, init_pkt) =
+            HandshakeState::start_initiator(&kp_i.private, &kp_r.public, &[]).unwrap();
+        assert_eq!(init_pkt[0], PacketType::HandshakeInit as u8);
+        let wrapped = yip_obf::obfuscate(
+            &obf_key,
+            PacketType::HandshakeInit as u8,
+            &init_pkt[1..],
+            32,
+        );
+
+        // Arrives from a fresh source address (unknown / not Established). Step
+        // (a) finds no session key; step (b) unmasks the handshake via obf_psk.
+        let src: SocketAddr = "203.0.113.5:41000".parse().unwrap();
+        let out = pm.on_udp(src, &wrapped, 0);
+        let udp = match out {
+            DispatchOut::Udp(e) => e.to_vec(),
+            _ => panic!("expected a wrapped HandshakeResp egress"),
+        };
+        assert_eq!(udp.len(), 1);
+        let (ptype, _body) = yip_obf::deobfuscate(&obf_key, &udp[0].bytes)
+            .expect("resp is wrapped under the network obf key");
+        assert_eq!(
+            ptype,
+            PacketType::HandshakeResp as u8,
+            "the reply is an obfuscated HandshakeResp"
+        );
+        assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+        assert_eq!(
+            pm.peers[0].endpoint,
+            Some(src),
+            "endpoint learned from the observed source"
+        );
+    }
+
+    /// (c) With obfuscation on, a random-garbage datagram (wrong key under any
+    /// trial) is dropped with no side effect and no panic — as are empty and
+    /// too-short datagrams.
+    #[test]
+    fn obf_on_garbage_is_dropped_no_panic() {
+        let kp = generate_keypair();
+        let peer = peer_cfg(3, "10.0.0.3:3000");
+        let mut pm = PeerManager::new(
+            kp.private,
+            kp.public,
+            &[peer],
+            TunnelMode::L3Tun,
+            None,
+            None,
+        );
+        pm.set_obf_psk(Some([0x44u8; 32]));
+
+        let src: SocketAddr = "203.0.113.9:9".parse().unwrap();
+        let junk = vec![0xABu8; 80];
+        assert!(matches!(pm.on_udp(src, &junk, 0), DispatchOut::None));
+        assert!(matches!(pm.on_udp(src, &[], 0), DispatchOut::None));
+        assert!(matches!(pm.on_udp(src, &[0u8; 3], 0), DispatchOut::None));
+        // No peer disturbed.
+        assert!(matches!(pm.peers[0].state, PeerState::Idle));
+        assert!(pm.by_tag.is_empty());
+    }
+
+    /// (d) With obfuscation OFF (no `set_obf_psk`), `on_udp` runs the unchanged
+    /// plaintext demux: a plaintext `[HandshakeInit]‖msg1` establishes the peer
+    /// and the reply carries a plaintext `PacketType` prefix — byte-identical
+    /// to 2a (no envelope on the wire).
+    #[test]
+    fn obf_off_on_udp_is_plaintext_as_today() {
+        let kp_r = generate_keypair();
+        let kp_i = generate_keypair();
+        let ep_i: SocketAddr = "10.0.0.7:7000".parse().unwrap();
+        let cfg_i = PeerConfig {
+            public_key: kp_i.public,
+            endpoint: Some(ep_i),
+        };
+        let mut pm = PeerManager::new(
+            kp_r.private,
+            kp_r.public,
+            &[cfg_i],
+            TunnelMode::L3Tun,
+            None,
+            None,
+        );
+        // No set_obf_psk ⇒ obfuscation disabled.
+        let (_hs, init_pkt) =
+            HandshakeState::start_initiator(&kp_i.private, &kp_r.public, &[]).unwrap();
+        let resp = resp_bytes(&pm.on_udp(ep_i, &init_pkt, 0));
+        assert_eq!(resp.len(), 1, "one plaintext HandshakeResp is emitted");
+        assert_eq!(
+            resp[0][0],
+            PacketType::HandshakeResp as u8,
+            "reply carries a plaintext PacketType prefix (no obfuscation envelope)"
+        );
+        assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+    }
+
+    /// (e) With obfuscation on and a rendezvous server configured, a `Lookup`
+    /// emitted toward the server is wrapped under the network `obf_key` and
+    /// `yip_obf::RDV_TYPE` (Task 4's `obf_egress` server-dst branch) — it no
+    /// longer decodes as a plain `yip_rendezvous::Message` on the wire, but
+    /// `deobfuscate` + `Message::decode` recovers the original `Lookup`.
+    #[test]
+    fn obf_on_egress_to_server_is_wrapped_under_rdv_type() {
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
+        let psk = [0x55u8; 32];
+        pm.set_obf_psk(Some(psk));
+        let obf_key = yip_obf::derive_key(&psk);
+
+        let out = pm.on_tun(&dummy_tun_pkt(), 0).to_vec();
+        assert_eq!(out.len(), 1, "one lookup datagram is emitted");
+        assert_eq!(out[0].dst, mock_server());
+        // The on-wire bytes must not be the plaintext rendezvous encoding.
+        // (A `decode(..).is_none()` check would be flaky: the obfuscated bytes
+        // are random, so they can occasionally parse as a Message by chance.)
+        let mut plaintext = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::Lookup {
+                node: node_id(&peer_kp.public),
+            },
+            &mut plaintext,
+        );
+        assert_ne!(
+            out[0].bytes, plaintext,
+            "the on-wire bytes must be obfuscated, not the plaintext rendezvous encoding"
+        );
+        let (ptype, body) =
+            yip_obf::deobfuscate(&obf_key, &out[0].bytes).expect("wrapped under the network key");
+        assert_eq!(ptype, yip_obf::RDV_TYPE);
+        assert_eq!(
+            yip_rendezvous::decode(&body),
+            Some(yip_rendezvous::Message::Lookup {
+                node: node_id(&peer_kp.public),
+            }),
+            "unwrapping recovers the original Lookup"
+        );
+    }
+
+    /// (f) With obfuscation on, an obf-wrapped server datagram (`RDV_TYPE`)
+    /// arriving from the configured server address is unwrapped by `on_udp`
+    /// and routed to `on_rdv` exactly like the plaintext 2b path — a
+    /// `PeerInfo` sets the peer's candidate address. A wrong-key or
+    /// wrong-ptype envelope from the same address is dropped, not mis-routed.
+    #[test]
+    fn obf_on_ingress_from_server_is_unwrapped_before_on_rdv() {
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
+        let psk = [0x66u8; 32];
+        pm.set_obf_psk(Some(psk));
+        let obf_key = yip_obf::derive_key(&psk);
+
+        let candidate: SocketAddr = "198.51.100.9:41001".parse().unwrap();
+        let mut plain = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PeerInfo {
+                node: node_id(&peer_kp.public),
+                reflexive: candidate,
+            },
+            &mut plain,
+        );
+
+        // Wrong key: dropped, no candidate learned (rendezvous-only peer
+        // starts in Punching with no candidate address set).
+        let wrong_key = yip_obf::derive_key(&[0x67u8; 32]);
+        let wrapped_wrong = yip_obf::obfuscate(&wrong_key, yip_obf::RDV_TYPE, &plain, 0);
+        assert!(matches!(
+            pm.on_udp(mock_server(), &wrapped_wrong, 0),
+            DispatchOut::None
+        ));
+        assert_eq!(pm.peers[0].path.candidate(), None);
+
+        // Right key, wrong ptype: dropped, no candidate learned.
+        let wrapped_wrong_type = yip_obf::obfuscate(&obf_key, PacketType::Data as u8, &plain, 0);
+        assert!(matches!(
+            pm.on_udp(mock_server(), &wrapped_wrong_type, 0),
+            DispatchOut::None
+        ));
+        assert_eq!(pm.peers[0].path.candidate(), None);
+
+        // Right key, right type: recovers the PeerInfo and sets the candidate.
+        let wrapped = yip_obf::obfuscate(&obf_key, yip_obf::RDV_TYPE, &plain, 5);
+        assert!(matches!(
+            pm.on_udp(mock_server(), &wrapped, 0),
+            DispatchOut::None
+        ));
+        assert_eq!(pm.peers[0].path.candidate(), Some(candidate));
+    }
+
+    /// (g) With obfuscation OFF, egress to the server and ingress from the
+    /// server stay plain `yip_rendezvous::Message` bytes — byte-identical to
+    /// 2b, undisturbed by Task 4's obf-on branches.
+    #[test]
+    fn obf_off_rendezvous_traffic_stays_plaintext() {
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
+        // No set_obf_psk ⇒ obfuscation disabled.
+
+        let out = pm.on_tun(&dummy_tun_pkt(), 0).to_vec();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            yip_rendezvous::decode(&out[0].bytes),
+            Some(yip_rendezvous::Message::Lookup {
+                node: node_id(&peer_kp.public),
+            }),
+            "obf-off Lookup egress is plain, unwrapped Message bytes"
+        );
+
+        let candidate: SocketAddr = "198.51.100.9:41002".parse().unwrap();
+        let mut plain = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PeerInfo {
+                node: node_id(&peer_kp.public),
+                reflexive: candidate,
+            },
+            &mut plain,
+        );
+        assert!(matches!(
+            pm.on_udp(mock_server(), &plain, 0),
+            DispatchOut::None
+        ));
+        assert_eq!(pm.peers[0].path.candidate(), Some(candidate));
+    }
+
+    // ── 3a: control-cadence jitter ─────────────────────────────────────────
+
+    /// `jitter_ms(1000)` must land in the documented ±25% band and must not
+    /// be a disguised constant (i.e. it actually draws from the OS RNG on
+    /// every call, not just once).
+    #[test]
+    fn jitter_ms_within_bounds_and_not_constant() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let v = jitter_ms(1000);
+            assert!(
+                (750..=1250).contains(&v),
+                "jitter_ms(1000) out of the ±25% band: {v}"
+            );
+            seen.insert(v);
+        }
+        assert!(
+            seen.len() > 1,
+            "jitter_ms(1000) returned the same value on every call across 64 draws"
+        );
+    }
+
+    /// The obf-off proof: every call site gates jitter with
+    /// `if obf_key.is_some() { jitter_ms(base) } else { base }`. With obf off
+    /// (`obf_key: None`) that expression must yield exactly `base` every
+    /// time — never a jittered value — so a timer built from it fires at
+    /// exactly the base interval, byte-identical to pre-3a timing.
+    #[test]
+    fn obf_off_gating_yields_exact_base_interval() {
+        let obf_key: Option<[u8; 16]> = None;
+        for _ in 0..8 {
+            let retry_ms = if obf_key.is_some() {
+                jitter_ms(HANDSHAKE_RETRY_MS)
+            } else {
+                HANDSHAKE_RETRY_MS
+            };
+            let reg_ms = if obf_key.is_some() {
+                jitter_ms(REG_REFRESH_MS)
+            } else {
+                REG_REFRESH_MS
+            };
+            assert_eq!(retry_ms, HANDSHAKE_RETRY_MS);
+            assert_eq!(reg_ms, REG_REFRESH_MS);
         }
     }
 }

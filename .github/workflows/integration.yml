@@ -139,7 +139,7 @@ jobs:
           echo "running netns tunnel tests under sudo: $BIN"
           # --exact so ping_across_yipd_tunnel does not also match _under_loss.
           for mode in poll uring; do
-            for t in ping_across_yipd_tunnel ping_across_yipd_tunnel_under_loss arq_recovers_bulk_loss l2_tap_ping_or_arp_across_tunnel triangle_full_mesh_ping relay_path_ping hole_punch_ping discovery_dynamic_ping admission_rejects_uncertified discovery_survives_root_outage; do
+            for t in ping_across_yipd_tunnel ping_across_yipd_tunnel_under_loss arq_recovers_bulk_loss l2_tap_ping_or_arp_across_tunnel triangle_full_mesh_ping relay_path_ping hole_punch_ping discovery_dynamic_ping admission_rejects_uncertified discovery_survives_root_outage obfuscated_ping obf_psk_mismatch_no_connection relay_path_ping_obfuscated hole_punch_ping_obfuscated discovery_dynamic_ping_obfuscated; do
               LOG="/tmp/netns-$mode-$t.log"
               if [ "$mode" = "uring" ]; then
                 echo "running $t with UringDriver (opt-in: YIP_USE_URING=1)"
@@ -156,3 +156,73 @@ jobs:
               fi
             done
           done
+
+  dpi-undetectability:
+    # The anti-DPI undetectability merge gate (3a Task 7): fails the build if
+    # a wire/obfuscation change reintroduces a DPI-recognizable fingerprint.
+    # Uses nDPI/nDPId's `ndpiReader` as the adversary, per CLAUDE.md's stated
+    # test methodology ("nDPI/nDPId are the test adversary and should be
+    # wired into CI to verify undetectability").
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install nDPI build dependencies
+        # libpcap-dev is required (ndpiReader reads/writes pcaps). json-c and
+        # gcrypt are optional (nDPI degrades gracefully without them, as
+        # confirmed by the local build under refrences/nDPI) but installed
+        # here anyway for full feature parity with the vendored dev build.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev libjson-c-dev libgcrypt20-dev autoconf automake libtool pkg-config gettext
+
+      # Pinned nDPI checkout: this SHA is the exact commit vendored locally at
+      # refrences/nDPI (git-ignored/local per CLAUDE.md, so CI can't just use
+      # the checked-out tree — it clones the same commit fresh). Pinning to a
+      # commit (rather than tracking a moving branch) keeps the oracle
+      # reproducible and stops an upstream nDPI change from silently altering
+      # detection behavior underneath this gate. Bump this SHA deliberately
+      # (and re-verify the assertions in bin/yipd/tests/run-ndpi-oracle.sh
+      # still hold against the new nDPI) when refreshing.
+      - name: Clone pinned nDPI
+        env:
+          NDPI_REF: 6dcb2622360edb28304d76b2f6a25984b706c618
+        run: |
+          git init /tmp/nDPI
+          git -C /tmp/nDPI remote add origin https://github.com/ntop/nDPI.git
+          git -C /tmp/nDPI fetch --depth 1 origin "$NDPI_REF"
+          git -C /tmp/nDPI checkout FETCH_HEAD
+
+      - name: Build ndpiReader
+        run: |
+          cd /tmp/nDPI
+          ./autogen.sh
+          ./configure
+          make -j"$(nproc)"
+          test -x example/ndpiReader || { echo "::error::ndpiReader did not build"; exit 1; }
+
+      - name: Build release yipd
+        run: cargo build --release -p yipd
+
+      - name: Run the nDPI undetectability oracle under sudo
+        run: |
+          sudo bash bin/yipd/tests/run-ndpi-oracle.sh \
+            "$(pwd)/target/release/yipd" \
+            /tmp/nDPI/example/ndpiReader | tee /tmp/ndpi-oracle.log
+          # Honesty guard: the oracle must have actually run its gates, not
+          # SKIPped (this job always runs as sudo and always builds
+          # ndpiReader above, so a SKIP here means the harness itself is
+          # broken, not that preconditions were legitimately absent).
+          if grep -q "^SKIP run-ndpi-oracle" /tmp/ndpi-oracle.log; then
+            echo "::error::nDPI oracle skipped — expected root + a built ndpiReader in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/ndpi-oracle.log; then
+            echo "::error::nDPI classified obfuscated yip traffic as a known protocol, or raised an Obfuscated Traffic risk — undetectability regression"
+            exit 1
+          fi
+          # NOTE: NDPI_SUSPICIOUS_ENTROPY ("Susp Entropy") firing is EXPECTED
+          # and NOT gated here — see run-ndpi-oracle.sh's header comment.
+          # High entropy is inherent to all encrypted/random payloads
+          # (WireGuard trips it too); suppressing it needs TLS/QUIC mimicry,
+          # which is milestone 3c, not 3a.

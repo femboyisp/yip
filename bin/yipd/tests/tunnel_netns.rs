@@ -329,6 +329,181 @@ fn discovery_survives_root_outage() {
     );
 }
 
+/// Fixed 64-hex test PSK shared by the obf-on netns tests (3a Task 6).
+const OBF_PSK: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+#[test]
+fn obfuscated_ping() {
+    // Only run as root (the script needs netns + TUN).
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP obfuscated_ping: needs root (run under sudo in CI)");
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-netns-tunnel.sh");
+    let status = Command::new("bash")
+        .arg(script)
+        .arg(yipd)
+        .env("OBF_PSK", OBF_PSK)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "netns tunnel ping with obf_psk set failed (obfuscation broke direct connectivity)"
+    );
+}
+
+#[test]
+fn obf_psk_mismatch_no_connection() {
+    // Only run as root (the script needs netns + TUN).
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP obf_psk_mismatch_no_connection: needs root (run under sudo in CI)");
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/run-netns-obf-mismatch.sh"
+    );
+    let status = Command::new("bash").arg(script).arg(yipd).status().unwrap();
+    assert!(
+        status.success(),
+        "obf_psk mismatch netns test failed (script itself errored, or the ping \
+         unexpectedly succeeded under mismatched PSKs)"
+    );
+}
+
+#[test]
+fn relay_path_ping_obfuscated() {
+    // Requires root: netns creation + TUN devices + yip-rendezvous.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP relay_path_ping_obfuscated: needs root (run under sudo in CI)");
+        return;
+    }
+    let rdv = yip_rendezvous_bin();
+    if !rdv.exists() {
+        eprintln!(
+            "SKIP relay_path_ping_obfuscated: yip-rendezvous binary not found at {}; \
+             run `cargo build -p yip-rendezvous-bin` first",
+            rdv.display()
+        );
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-netns-relay.sh");
+    let status = Command::new("bash")
+        .arg(script)
+        .arg(yipd)
+        .arg(&rdv)
+        .env("OBF_PSK", OBF_PSK)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "relay-path netns test with obf_psk set failed (ping did not succeed, or \
+         relay-forwarded stayed 0 — obfuscation broke rendezvous+relay)"
+    );
+}
+
+#[test]
+fn hole_punch_ping_obfuscated() {
+    // Requires root: netns creation + TUN devices + yip-rendezvous + NAT.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP hole_punch_ping_obfuscated: needs root (run under sudo in CI)");
+        return;
+    }
+    let rdv = yip_rendezvous_bin();
+    if !rdv.exists() {
+        eprintln!(
+            "SKIP hole_punch_ping_obfuscated: yip-rendezvous binary not found at {}; \
+             run `cargo build -p yip-rendezvous-bin` first",
+            rdv.display()
+        );
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-netns-punch.sh");
+    let status = Command::new("bash")
+        .arg(script)
+        .arg(yipd)
+        .arg(&rdv)
+        .env("OBF_PSK", OBF_PSK)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "hole-punch netns test with obf_psk set failed (ping did not succeed, or \
+         relay-forwarded was nonzero — obfuscation broke the punch path)"
+    );
+}
+
+#[test]
+fn discovery_dynamic_ping_obfuscated() {
+    // Requires root: netns creation + TUN devices + a shared bridge underlay.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP discovery_dynamic_ping_obfuscated: needs root (run under sudo in CI)");
+        return;
+    }
+    let yip_ca = yip_ca_bin();
+    if !yip_ca.exists() {
+        eprintln!(
+            "SKIP discovery_dynamic_ping_obfuscated: yip-ca binary not found at {}; \
+             run `cargo build -p yip-ca` first",
+            yip_ca.display()
+        );
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-netns-discovery.sh");
+    let status = Command::new("bash")
+        .arg(script)
+        .arg(yipd)
+        .arg(&yip_ca)
+        .env("OBF_PSK", OBF_PSK)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "dynamic-discovery netns test with obf_psk set failed (A did not discover+ping B \
+         via gossip — obfuscation broke gossip or the cert handshake)"
+    );
+}
+
 #[test]
 fn hole_punch_ping() {
     // Requires root: netns creation + TUN devices + yip-rendezvous + NAT.
@@ -363,5 +538,65 @@ fn hole_punch_ping() {
     assert!(
         status.success(),
         "hole-punch netns test failed (ping did not succeed, or relay-forwarded was nonzero)"
+    );
+}
+
+/// Locate the `ndpiReader` binary built from the vendored `refrences/nDPI`
+/// clone (see CLAUDE.md: `refrences/`, not `references/` — local,
+/// git-ignored reference material). Like `yip_rendezvous_bin`/`yip_ca_bin`,
+/// this lives outside the Cargo build graph entirely (it's a C project built
+/// via its own autogen/configure/make, not a Cargo package), so it is always
+/// located relative to the workspace root rather than via `CARGO_BIN_EXE_*`.
+fn ndpi_reader_bin() -> std::path::PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let workspace_root = std::path::Path::new(manifest_dir)
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root two levels up from CARGO_MANIFEST_DIR");
+    workspace_root.join("refrences/nDPI/example/ndpiReader")
+}
+
+#[test]
+fn dpi_undetectability() {
+    // The anti-DPI undetectability money test (3a Task 7): captures a real
+    // obfuscated yip exchange on a neutral port and asserts nDPI cannot
+    // classify it as a known VPN/proxy protocol and raises no
+    // NDPI_OBFUSCATED_TRAFFIC risk. See run-ndpi-oracle.sh for the full
+    // assertion set (including why NDPI_SUSPICIOUS_ENTROPY is reported, not
+    // gated — that's a documented 3c gap, not a 3a regression).
+    //
+    // Requires root: netns creation + TUN devices + tcpdump.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP dpi_undetectability: needs root (run under sudo in CI)");
+        return;
+    }
+    let ndpi = ndpi_reader_bin();
+    if !ndpi.exists() {
+        eprintln!(
+            "SKIP dpi_undetectability: ndpiReader binary not found at {}; \
+             build it from refrences/nDPI (autogen.sh && ./configure && make) first",
+            ndpi.display()
+        );
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-ndpi-oracle.sh");
+    let status = Command::new("bash")
+        .arg(script)
+        .arg(yipd)
+        .arg(&ndpi)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "nDPI undetectability oracle failed (obfuscated yip traffic was classified as a \
+         known VPN/proxy protocol, or an Obfuscated Traffic risk flag was raised)"
     );
 }

@@ -62,6 +62,11 @@ pub struct Config {
     /// The mesh network id (`network_id=<hex32>`), embedded in and checked
     /// against every cert/record.
     pub network_id: Option<[u8; 16]>,
+    /// Network-wide anti-DPI obfuscation shared secret (`obf_psk=<hex64>`).
+    /// Absent (`None`) means obfuscation is disabled for this node. Feeds
+    /// `yip_obf::derive_key` once Tasks 3/4 wire obfuscation into the wire
+    /// path; this task only parses it.
+    pub obf_psk: Option<[u8; 32]>,
 }
 
 // ── hex decode helper ─────────────────────────────────────────────────────────
@@ -220,6 +225,7 @@ impl Config {
         let mut roots: Option<RootSet> = None;
         let mut member_sign_private: Option<[u8; 32]> = None;
         let mut network_id: Option<[u8; 16]> = None;
+        let mut obf_psk: Option<[u8; 32]> = None;
 
         for line in text.lines() {
             let line = line.trim();
@@ -279,6 +285,7 @@ impl Config {
                 "roots" => roots = Some(load_roots_file(val)?),
                 "member_sign_private" => member_sign_private = Some(hex_to_32(val)?),
                 "network_id" => network_id = Some(hex_to_16(val)?),
+                "obf_psk" => obf_psk = Some(hex_to_32(val)?),
                 // Silently ignore unknown keys for forward-compatibility. The
                 // netns config files still contain `initiate=true|false` from
                 // before Task 5 removed the field; this is intentional so
@@ -352,6 +359,7 @@ impl Config {
             roots,
             member_sign_private,
             network_id,
+            obf_psk,
         })
     }
 }
@@ -886,6 +894,35 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
         let _ = std::fs::remove_file(&cert_path);
         let _ = std::fs::remove_file(&roots_path);
+    }
+
+    // ── obf_psk (3a Task 2) ─────────────────────────────────────────────
+
+    #[test]
+    fn parses_obf_psk_when_present() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    obf_psk=00000000000000000000000000000000000000000000000000000000000000ff\n";
+        let cfg = Config::parse(text).unwrap();
+        assert_eq!(
+            cfg.obf_psk,
+            Some({
+                let mut a = [0u8; 32];
+                a[31] = 0xff;
+                a
+            })
+        );
+    }
+
+    #[test]
+    fn obf_psk_absent_is_none() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n";
+        assert_eq!(Config::parse(text).unwrap().obf_psk, None);
     }
 
     #[test]
