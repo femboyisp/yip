@@ -540,3 +540,63 @@ fn hole_punch_ping() {
         "hole-punch netns test failed (ping did not succeed, or relay-forwarded was nonzero)"
     );
 }
+
+/// Locate the `ndpiReader` binary built from the vendored `refrences/nDPI`
+/// clone (see CLAUDE.md: `refrences/`, not `references/` — local,
+/// git-ignored reference material). Like `yip_rendezvous_bin`/`yip_ca_bin`,
+/// this lives outside the Cargo build graph entirely (it's a C project built
+/// via its own autogen/configure/make, not a Cargo package), so it is always
+/// located relative to the workspace root rather than via `CARGO_BIN_EXE_*`.
+fn ndpi_reader_bin() -> std::path::PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let workspace_root = std::path::Path::new(manifest_dir)
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root two levels up from CARGO_MANIFEST_DIR");
+    workspace_root.join("refrences/nDPI/example/ndpiReader")
+}
+
+#[test]
+fn dpi_undetectability() {
+    // The anti-DPI undetectability money test (3a Task 7): captures a real
+    // obfuscated yip exchange on a neutral port and asserts nDPI cannot
+    // classify it as a known VPN/proxy protocol and raises no
+    // NDPI_OBFUSCATED_TRAFFIC risk. See run-ndpi-oracle.sh for the full
+    // assertion set (including why NDPI_SUSPICIOUS_ENTROPY is reported, not
+    // gated — that's a documented 3c gap, not a 3a regression).
+    //
+    // Requires root: netns creation + TUN devices + tcpdump.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP dpi_undetectability: needs root (run under sudo in CI)");
+        return;
+    }
+    let ndpi = ndpi_reader_bin();
+    if !ndpi.exists() {
+        eprintln!(
+            "SKIP dpi_undetectability: ndpiReader binary not found at {}; \
+             build it from refrences/nDPI (autogen.sh && ./configure && make) first",
+            ndpi.display()
+        );
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-ndpi-oracle.sh");
+    let status = Command::new("bash")
+        .arg(script)
+        .arg(yipd)
+        .arg(&ndpi)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "nDPI undetectability oracle failed (obfuscated yip traffic was classified as a \
+         known VPN/proxy protocol, or an Obfuscated Traffic risk flag was raised)"
+    );
+}
