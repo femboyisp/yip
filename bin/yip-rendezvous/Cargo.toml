@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 yip-rendezvous = { path = "../../crates/yip-rendezvous" }
+yip-obf = { path = "../../crates/yip-obf" }
+getrandom = "0.2"
 
 [lints]
 workspace = true

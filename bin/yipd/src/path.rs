@@ -74,9 +74,12 @@ impl PathState {
         self.stage
     }
 
-    #[expect(
-        dead_code,
-        reason = "candidate getter surfaced for later milestones; PeerManager routes via endpoint"
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "candidate getter surfaced for later milestones and used by yipd's peer_manager obf-rendezvous tests (bin, non-test build); PeerManager itself routes via endpoint"
+        )
     )]
     pub fn candidate(&self) -> Option<SocketAddr> {
         match self.stage {

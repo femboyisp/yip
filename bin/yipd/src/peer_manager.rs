@@ -1464,13 +1464,24 @@ impl PeerManager {
 
     /// Wrap every egress datagram in `dgs` in place via `yip_obf::obfuscate`
     /// (masked type + random padding), so the `PacketType` byte never appears on
-    /// the wire. Datagrams addressed to the rendezvous server are left untouched
-    /// — rendezvous/relay obfuscation is Task 4. Only called on the
-    /// obfuscation-enabled path.
+    /// the wire. Datagrams addressed to the rendezvous server carry a plaintext
+    /// `yip_rendezvous::Message` rather than a `[PacketType][…]` tunnel
+    /// datagram, so they are wrapped whole (no leading byte stripped) under the
+    /// dedicated `yip_obf::RDV_TYPE` and the network `obf_key` (the server is
+    /// never an `Established` peer, so it has no session key). Only called on
+    /// the obfuscation-enabled path.
     fn obf_egress(&self, dgs: &mut [EgressDatagram]) {
         let server = self.rendezvous.as_ref().map(|r| r.server_addr());
         for d in dgs.iter_mut() {
-            if Some(d.dst) == server || d.bytes.is_empty() {
+            if d.bytes.is_empty() {
+                continue;
+            }
+            if Some(d.dst) == server {
+                let Some(key) = self.obf_key else {
+                    continue;
+                };
+                let pad = random_pad(obf_pad_max(yip_obf::RDV_TYPE, d.bytes.len() + 1));
+                d.bytes = yip_obf::obfuscate(&key, yip_obf::RDV_TYPE, &d.bytes, pad);
                 continue;
             }
             let ptype = d.bytes[0];
@@ -1509,9 +1520,10 @@ impl PeerManager {
 
 impl Dispatch for PeerManager {
     /// UDP ingress. Obfuscation off ⇒ the plaintext 2a/2b/2c demux, verbatim.
-    /// Obfuscation on ⇒ recover the real datagram by source + trial-unmask
-    /// (rendezvous-server datagrams stay plaintext — Task 4), run the SAME
-    /// demux on it, then wrap the egress it produces.
+    /// Obfuscation on ⇒ recover the real datagram — rendezvous-server
+    /// datagrams via the network `obf_key` + `RDV_TYPE`, everything else by
+    /// source + trial-unmask — run the SAME demux on it, then wrap the
+    /// egress it produces.
     fn on_udp(&mut self, src: SocketAddr, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
         if self.obf_key.is_none() {
             return self.on_udp_dispatch(src, dg, now_ms);
@@ -1519,12 +1531,23 @@ impl Dispatch for PeerManager {
         if dg.is_empty() {
             return DispatchOut::None;
         }
-        // A datagram from the configured rendezvous server is a plaintext
-        // control/relay message (its obfuscation is Task 4); dispatch it as-is,
-        // then wrap only the peer-directed egress it yields.
+        // A datagram from the configured rendezvous server is an obfuscated
+        // control/relay message under the network `obf_key` and `RDV_TYPE`;
+        // unwrap it before handing the plaintext `yip_rendezvous::Message`
+        // bytes to `on_rdv`, then wrap only the peer-directed egress it
+        // yields. Wrong key / wrong ptype ⇒ drop (fail-closed), never a panic.
         let server = self.rendezvous.as_ref().map(|r| r.server_addr());
         if Some(src) == server {
-            let (tun, udp) = own_dispatch(self.on_rdv(dg, now_ms));
+            let Some(key) = self.obf_key else {
+                return DispatchOut::None;
+            };
+            let Some((ptype, body)) = yip_obf::deobfuscate(&key, dg) else {
+                return DispatchOut::None;
+            };
+            if ptype != yip_obf::RDV_TYPE {
+                return DispatchOut::None;
+            }
+            let (tun, udp) = own_dispatch(self.on_rdv(&body, now_ms));
             return self.finish_wrapped(tun, udp);
         }
         let Some(plain) = self.deobf_ingress(src, dg) else {
@@ -3876,5 +3899,137 @@ mod tests {
             "reply carries a plaintext PacketType prefix (no obfuscation envelope)"
         );
         assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+    }
+
+    /// (e) With obfuscation on and a rendezvous server configured, a `Lookup`
+    /// emitted toward the server is wrapped under the network `obf_key` and
+    /// `yip_obf::RDV_TYPE` (Task 4's `obf_egress` server-dst branch) — it no
+    /// longer decodes as a plain `yip_rendezvous::Message` on the wire, but
+    /// `deobfuscate` + `Message::decode` recovers the original `Lookup`.
+    #[test]
+    fn obf_on_egress_to_server_is_wrapped_under_rdv_type() {
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
+        let psk = [0x55u8; 32];
+        pm.set_obf_psk(Some(psk));
+        let obf_key = yip_obf::derive_key(&psk);
+
+        let out = pm.on_tun(&dummy_tun_pkt(), 0).to_vec();
+        assert_eq!(out.len(), 1, "one lookup datagram is emitted");
+        assert_eq!(out[0].dst, mock_server());
+        assert!(
+            yip_rendezvous::decode(&out[0].bytes).is_none(),
+            "the on-wire bytes must NOT decode as a plain rendezvous Message"
+        );
+        let (ptype, body) =
+            yip_obf::deobfuscate(&obf_key, &out[0].bytes).expect("wrapped under the network key");
+        assert_eq!(ptype, yip_obf::RDV_TYPE);
+        assert_eq!(
+            yip_rendezvous::decode(&body),
+            Some(yip_rendezvous::Message::Lookup {
+                node: node_id(&peer_kp.public),
+            }),
+            "unwrapping recovers the original Lookup"
+        );
+    }
+
+    /// (f) With obfuscation on, an obf-wrapped server datagram (`RDV_TYPE`)
+    /// arriving from the configured server address is unwrapped by `on_udp`
+    /// and routed to `on_rdv` exactly like the plaintext 2b path — a
+    /// `PeerInfo` sets the peer's candidate address. A wrong-key or
+    /// wrong-ptype envelope from the same address is dropped, not mis-routed.
+    #[test]
+    fn obf_on_ingress_from_server_is_unwrapped_before_on_rdv() {
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
+        let psk = [0x66u8; 32];
+        pm.set_obf_psk(Some(psk));
+        let obf_key = yip_obf::derive_key(&psk);
+
+        let candidate: SocketAddr = "198.51.100.9:41001".parse().unwrap();
+        let mut plain = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PeerInfo {
+                node: node_id(&peer_kp.public),
+                reflexive: candidate,
+            },
+            &mut plain,
+        );
+
+        // Wrong key: dropped, no candidate learned (rendezvous-only peer
+        // starts in Punching with no candidate address set).
+        let wrong_key = yip_obf::derive_key(&[0x67u8; 32]);
+        let wrapped_wrong = yip_obf::obfuscate(&wrong_key, yip_obf::RDV_TYPE, &plain, 0);
+        assert!(matches!(
+            pm.on_udp(mock_server(), &wrapped_wrong, 0),
+            DispatchOut::None
+        ));
+        assert_eq!(pm.peers[0].path.candidate(), None);
+
+        // Right key, wrong ptype: dropped, no candidate learned.
+        let wrapped_wrong_type = yip_obf::obfuscate(&obf_key, PacketType::Data as u8, &plain, 0);
+        assert!(matches!(
+            pm.on_udp(mock_server(), &wrapped_wrong_type, 0),
+            DispatchOut::None
+        ));
+        assert_eq!(pm.peers[0].path.candidate(), None);
+
+        // Right key, right type: recovers the PeerInfo and sets the candidate.
+        let wrapped = yip_obf::obfuscate(&obf_key, yip_obf::RDV_TYPE, &plain, 5);
+        assert!(matches!(
+            pm.on_udp(mock_server(), &wrapped, 0),
+            DispatchOut::None
+        ));
+        assert_eq!(pm.peers[0].path.candidate(), Some(candidate));
+    }
+
+    /// (g) With obfuscation OFF, egress to the server and ingress from the
+    /// server stay plain `yip_rendezvous::Message` bytes — byte-identical to
+    /// 2b, undisturbed by Task 4's obf-on branches.
+    #[test]
+    fn obf_off_rendezvous_traffic_stays_plaintext() {
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
+        // No set_obf_psk ⇒ obfuscation disabled.
+
+        let out = pm.on_tun(&dummy_tun_pkt(), 0).to_vec();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            yip_rendezvous::decode(&out[0].bytes),
+            Some(yip_rendezvous::Message::Lookup {
+                node: node_id(&peer_kp.public),
+            }),
+            "obf-off Lookup egress is plain, unwrapped Message bytes"
+        );
+
+        let candidate: SocketAddr = "198.51.100.9:41002".parse().unwrap();
+        let mut plain = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PeerInfo {
+                node: node_id(&peer_kp.public),
+                reflexive: candidate,
+            },
+            &mut plain,
+        );
+        assert!(matches!(
+            pm.on_udp(mock_server(), &plain, 0),
+            DispatchOut::None
+        ));
+        assert_eq!(pm.peers[0].path.candidate(), Some(candidate));
     }
 }

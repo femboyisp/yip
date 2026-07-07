@@ -15,6 +15,12 @@ pub const NONCE_LEN: usize = 8;
 /// nonce(8) + type(1) + body_len(2) minimum.
 pub const MIN_ENVELOPE: usize = NONCE_LEN + 3;
 
+/// The obfuscation `ptype` for a rendezvous-protocol message (`yip_rendezvous::Message`
+/// bytes), distinct from `yipd`'s tunnel `PacketType` values (0..=4). Shared by the
+/// `yipd` rendezvous client and the `yip-rendezvous` server so both sides mask/unmask
+/// the rendezvous-message layer under the same type tag.
+pub const RDV_TYPE: u8 = 5;
+
 const DOMAIN: &[u8] = b"yip-obf-v1";
 
 /// Derive the 16-byte SipHash key from the network `obf_psk` (or any keying
