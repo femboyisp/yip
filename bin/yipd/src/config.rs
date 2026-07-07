@@ -324,6 +324,21 @@ impl Config {
             ));
         }
 
+        // A signed root set is only as trustworthy as its signature: verify
+        // `roots.ca_sig` against the configured `ca_public` set here, at
+        // config-load time, rather than trusting whatever `load_roots_file`
+        // decoded. `verify_rootset` returns `false` (and this rejects) both
+        // for a bad/foreign signature AND for an empty `ca_public` — a roots
+        // file with no CA to check it against is unsafe either way.
+        if let Some(r) = &roots {
+            if !r.verify_rootset(&ca_public) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "root set signature does not verify against any configured ca_public",
+                ));
+            }
+        }
+
         Ok(Config {
             local_private: local_private.ok_or_else(|| missing("local_private"))?,
             local_public: local_public.ok_or_else(|| missing("local_public"))?,
@@ -667,7 +682,11 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         std::fs::write(&cert_path, hex_encode_bytes(&cert_bytes)).unwrap();
         std::fs::write(&roots_path, hex_encode_bytes(&roots_bytes)).unwrap();
 
-        let ca_pub_1 = [0x11u8; 32];
+        // `ca_pub_1` must be the verifying key of the CA that actually signed
+        // `cert`/`roots` above, now that `Config::parse` verifies the root
+        // set's `ca_sig` against `ca_public` at load time. `ca_pub_2` is an
+        // unrelated second entry, kept to exercise the multi-CA list.
+        let ca_pub_1 = ca.verifying_key().to_bytes();
         let ca_pub_2 = [0x22u8; 32];
         let member_sign_priv = [0x33u8; 32];
         let network_id = [0x44u8; 16];
@@ -779,7 +798,10 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
              network_id={}\n\
              cert={}\n\
              roots={}\n",
-            hex_encode_bytes(&[0x11u8; 32]),
+            // `ca_public` must be the verifying key of the CA that signed
+            // `cert`/`roots` above (`ca`), now that `Config::parse` verifies
+            // the root set's `ca_sig` at load time.
+            hex_encode_bytes(&ca.verifying_key().to_bytes()),
             hex_encode_bytes(&[0x33u8; 32]),
             hex_encode_bytes(&[0x44u8; 16]),
             cert_path.display(),
@@ -787,6 +809,80 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         );
         let cfg = Config::parse(&text).expect("zero-peer full-mesh config parses");
         assert!(cfg.peers.is_empty());
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&roots_path);
+    }
+
+    // ── root set signature verification (2c Task 7 F1) ─────────────────
+    //
+    // The signed root set is only as trustworthy as its `ca_sig`: a tampered
+    // or wrong-CA roots file must be rejected at config-load time, not
+    // silently accepted (the spec's "signed root set is CA-signed" promise).
+
+    #[test]
+    fn roots_with_wrong_ca_is_parse_error() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use yip_membership::cert::{cert_signing_body, rootset_signing_body};
+
+        // `ca` signs the cert (and matches `ca_public`); `wrong_ca` signs the
+        // root set instead — a config whose roots file was swapped in from a
+        // different (or forged) CA.
+        let ca = SigningKey::from_bytes(&[9u8; 32]);
+        let wrong_ca = SigningKey::from_bytes(&[7u8; 32]);
+
+        let mut cert = Cert {
+            version: 1,
+            member_pubkey: [2u8; 32],
+            member_sign_pubkey: [3u8; 32],
+            network_id: [4u8; 16],
+            not_before: 0,
+            not_after: 1_000_000,
+            tags: vec![],
+            ca_sig: [0u8; 64],
+        };
+        cert.ca_sig = ca.sign(&cert_signing_body(&cert)).to_bytes();
+        let mut cert_bytes = Vec::new();
+        cert.encode(&mut cert_bytes);
+
+        let mut roots = RootSet {
+            roots: vec![],
+            version: 1,
+            ca_sig: [0u8; 64],
+        };
+        roots.ca_sig = wrong_ca.sign(&rootset_signing_body(&roots)).to_bytes();
+        let mut roots_bytes = Vec::new();
+        roots.encode(&mut roots_bytes);
+
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join("yipd_test_roots_wrong_ca_cert.hex");
+        let roots_path = dir.join("yipd_test_roots_wrong_ca_roots.hex");
+        std::fs::write(&cert_path, hex_encode_bytes(&cert_bytes)).unwrap();
+        std::fs::write(&roots_path, hex_encode_bytes(&roots_bytes)).unwrap();
+
+        let text = format!(
+            "device=yip0\n\
+             listen=0.0.0.0:51820\n\
+             local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             ca_public={}\n\
+             member_sign_private={}\n\
+             network_id={}\n\
+             cert={}\n\
+             roots={}\n",
+            // Only `ca`'s key is configured; the roots file was signed by
+            // `wrong_ca`, so verification must fail.
+            hex_encode_bytes(&ca.verifying_key().to_bytes()),
+            hex_encode_bytes(&[0x33u8; 32]),
+            hex_encode_bytes(&[0x44u8; 16]),
+            cert_path.display(),
+            roots_path.display(),
+        );
+        let err = Config::parse(&text).unwrap_err();
+        assert!(
+            err.to_string().contains("root set signature"),
+            "unexpected error: {err}"
+        );
 
         let _ = std::fs::remove_file(&cert_path);
         let _ = std::fs::remove_file(&roots_path);
