@@ -74,12 +74,14 @@ use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddr};
 
 use yip_io::poll::{Dispatch, DispatchOut, EgressDatagram};
+use yip_membership::{Cert, GossipMsg};
 use yip_rendezvous::{node_id, NodeId};
 
 use crate::addr::node_addr;
 use crate::config::PeerConfig;
 use crate::dataplane::{conn_tag_from_keys, DataPlane, Outcome};
 use crate::handshake::{HandshakeState, PacketType};
+use crate::membership::Membership;
 use crate::mode::TunnelMode;
 use crate::path::{PathAction, PathKind, PathStage, PathState};
 use crate::rendezvous::{RdvEvent, Rendezvous};
@@ -119,6 +121,20 @@ const LOOKUP_INTERVAL_MS: u64 = 1_000;
 /// peer during the `HANDSHAKE_TOTAL_MS` window; the oldest are dropped, like
 /// a small tail queue (WireGuard stages a single packet).
 const MAX_PENDING_TUN: usize = 16;
+
+/// Cap on the number of gossip partners a single `tick` fans a digest out to
+/// (bounded chattiness / anti-DoS): a small sample of Established peers plus
+/// the roots. `Membership::tick_digest` already debounces the digest itself.
+const MAX_GOSSIP_TARGETS: usize = 4;
+
+/// Cap on the number of `GossipMsg` replies emitted for one inbound gossip
+/// datagram. `Membership::on_gossip` already bounds each `Records` message to
+/// `MAX_GOSSIP_RECORDS_PER_REPLY` records (splitting a large `PullRequest`
+/// answer across multiple messages rather than one unboundedly large one), so
+/// this is a belt-and-suspenders ceiling on the number of such messages sent
+/// per inbound datagram (also caps `Digest`/`PullRequest` replies, which are
+/// always exactly one message).
+const MAX_GOSSIP_REPLIES: usize = 8;
 
 /// An initiator handshake in flight, awaiting `[HandshakeResp]`. Boxed by
 /// [`PeerState::Handshaking`] so that variant stays pointer-sized like
@@ -239,6 +255,13 @@ pub struct PeerManager {
     /// (direct-only) deployment. When `None`, `on_udp`/`on_tun`/`tick` never
     /// consult the path SM and behave byte-identically to 2a.
     rendezvous: Option<Box<dyn Rendezvous>>,
+    /// The mesh membership directory (2c), or `None` for a pure-2a/2b
+    /// deployment. When `None`, every membership branch is skipped and the
+    /// manager behaves byte-identically to 2a/2b: no cert is presented or
+    /// verified in the handshake, `on_tun` never resolves an unknown address,
+    /// and no gossip is emitted or ingested. A separate field from `peers`, so
+    /// a membership borrow can be split from a `peers` mutation.
+    membership: Option<Membership>,
     /// This node's own rendezvous node id (`node_id(local_pub)`), the `src`
     /// for `register`/`relay`.
     local_node_id: NodeId,
@@ -271,6 +294,7 @@ impl PeerManager {
         peers_cfg: &[PeerConfig],
         mode: TunnelMode,
         rendezvous: Option<Box<dyn Rendezvous>>,
+        membership: Option<Membership>,
     ) -> Self {
         let has_rendezvous = rendezvous.is_some();
         let mut peers = Vec::with_capacity(peers_cfg.len());
@@ -302,7 +326,7 @@ impl PeerManager {
                 last_lookup_ms: None,
             });
         }
-        Self {
+        let mut mgr = Self {
             local_priv,
             local_pub,
             mode,
@@ -311,13 +335,64 @@ impl PeerManager {
             by_addr,
             by_node,
             rendezvous,
+            membership,
             local_node_id: node_id(&local_pub),
             last_register_ms: 0,
             registered_once: false,
             egress: Vec::new(),
             tick_egress: Vec::new(),
             tun_scratch: Vec::new(),
+        };
+        // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
+        // exactly like configured peers: seed them into the peer table so an
+        // incoming handshake from a root is admitted and `tick` can bootstrap
+        // gossip against one. `admit_member` is idempotent (a root that is also
+        // a configured peer, or our own key, is a no-op).
+        let roots: Vec<([u8; 32], SocketAddr)> = mgr
+            .membership
+            .as_ref()
+            .map(|m| m.roots().to_vec())
+            .unwrap_or_default();
+        for (pubkey, addr) in roots {
+            mgr.admit_member(pubkey, vec![addr], 0);
         }
+        mgr
+    }
+
+    /// Runtime admission of a discovered member: push a fresh `Idle` [`Peer`]
+    /// (endpoint = first of `endpoints`; a `PathState` seeded from every
+    /// endpoint) and register it in `by_addr`/`by_node`. Idempotent — a no-op
+    /// if `pubkey` is already a peer (or is our own key). This is the peer-table
+    /// mutation the 2a/2b `PeerManager` lacked; the just-admitted peer is now
+    /// routable, so the existing lazy-handshake / path-escalation path brings it
+    /// up. Membership only ever supplies a *candidate*: the Noise handshake
+    /// still gates the session (anti-hijack).
+    fn admit_member(&mut self, pubkey: [u8; 32], endpoints: Vec<SocketAddr>, now_ms: u64) {
+        if pubkey == self.local_pub || self.peers.iter().any(|p| p.pubkey == pubkey) {
+            return;
+        }
+        let idx = self.peers.len();
+        let addr = node_addr(&pubkey);
+        let node = node_id(&pubkey);
+        let mut path = PathState::new(!endpoints.is_empty(), self.rendezvous.is_some(), now_ms);
+        for ep in &endpoints {
+            path.on_direct_addr(*ep);
+        }
+        self.by_addr.insert(addr, idx);
+        self.by_node.insert(node, idx);
+        self.peers.push(Peer {
+            pubkey,
+            addr,
+            endpoint: endpoints.first().copied(),
+            state: PeerState::Idle,
+            pending_tun: Vec::new(),
+            cached_resp: None,
+            node,
+            path,
+            path_kind: None,
+            relay: false,
+            last_lookup_ms: None,
+        });
     }
 
     /// This node's own self-certifying mesh address, for assigning the
@@ -377,13 +452,22 @@ impl PeerManager {
         now_ms: u64,
     ) -> Option<EgressDatagram> {
         let pubkey = self.peers[idx].pubkey;
-        let (hs, init_pkt) = match HandshakeState::start_initiator(&self.local_priv, &pubkey) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("peer_manager: failed to start handshake: {e}");
-                return None;
-            }
-        };
+        // Present our CA-signed membership cert as msg1's Noise payload so the
+        // responder can admit us by cert (2c). Empty when membership is None —
+        // byte-identical to 2a/2b.
+        let payload = self
+            .membership
+            .as_ref()
+            .map(Membership::own_cert_bytes)
+            .unwrap_or_default();
+        let (hs, init_pkt) =
+            match HandshakeState::start_initiator(&self.local_priv, &pubkey, &payload) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("peer_manager: failed to start handshake: {e}");
+                    return None;
+                }
+            };
         let dg = if via_relay {
             self.relay_wrap(idx, init_pkt.clone())?
         } else {
@@ -525,8 +609,17 @@ impl PeerManager {
     /// `[HandshakeInit]` from peer `idx`, reply and drain via the relay, and
     /// commit `PathKind::Relayed`.
     fn relayed_handshake_init(&mut self, idx: usize, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
-        let (established, resp_pkt, remote_static) =
-            match HandshakeState::start_responder(&self.local_priv, dg) {
+        // Present our cert in msg2 (2c mutual proof); empty when membership is
+        // None. The relayed peer was resolved via `by_node`, so it is already a
+        // configured/root/admitted peer (always-admit) — the `remote_static`
+        // pubkey match below is the admission check, as in 2b.
+        let resp_payload = self
+            .membership
+            .as_ref()
+            .map(Membership::own_cert_bytes)
+            .unwrap_or_default();
+        let (established, resp_pkt, remote_static, _initiator_payload) =
+            match HandshakeState::start_responder(&self.local_priv, dg, &resp_payload) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("peer_manager: relayed start_responder failed: {e}");
@@ -604,7 +697,11 @@ impl PeerManager {
             unreachable!("just matched Handshaking above");
         };
         match handshaking.hs.read_response(dg) {
-            Ok(established) => {
+            Ok((established, responder_payload)) => {
+                if !self.responder_cert_ok(&responder_payload, self.peers[idx].pubkey) {
+                    eprintln!("peer_manager: relayed responder cert rejected");
+                    return DispatchOut::None;
+                }
                 let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
                 let placeholder = self.server_addr();
                 let mut dp = Box::new(DataPlane::new(
@@ -700,6 +797,27 @@ impl PeerManager {
     /// Which configured peer a TUN/TAP frame should go to, or `None` if it
     /// cannot be routed (ambiguous multi-peer destination). See the module
     /// doc for the L2/L3 routing rules.
+    ///
+    /// `L3Tun`'s single-peer fallback (`self.peers.len() == 1 => Some(0)`)
+    /// splits into two cases (2c/Task 7 fix):
+    /// - `ipv6_dst` returns `None` — not a recognizable mesh IPv6 packet at
+    ///   all (2a/2b's plain, non-mesh tunnel addressing, ARP, etc.). There is
+    ///   no `resolve` to try instead, so the sole-peer fallback applies
+    ///   unconditionally, exactly as before — this keeps every pure-2a/2b
+    ///   test (and any single-peer test that also happens to pass a
+    ///   `Membership` for unrelated reasons, e.g. cert-handshake tests using
+    ///   a non-IPv6 dummy TUN packet) byte-identical.
+    /// - `ipv6_dst` returns `Some(dst)` but `dst` doesn't match any known
+    ///   peer — a legitimate mesh address just not (yet) resolved. With
+    ///   membership enabled this must fall through to `on_tun`'s
+    ///   gossip-directory `resolve` fallback instead of being misrouted to
+    ///   whichever one peer happens to already be known (the common
+    ///   post-bootstrap state: just the seed root, before anyone else has
+    ///   been resolved) — otherwise every not-yet-discovered destination
+    ///   would be silently (and wrongly) routed to that one peer forever,
+    ///   and dynamic discovery could never engage. Without membership this
+    ///   case still falls back to the sole peer (byte-identical to 2a/2b:
+    ///   there is no resolve path to try instead there either).
     fn route_tun_index(&self, inner: &[u8]) -> Option<usize> {
         match self.mode {
             TunnelMode::L2Tap => {
@@ -709,18 +827,25 @@ impl PeerManager {
                     None
                 }
             }
-            TunnelMode::L3Tun => {
-                if let Some(dst) = ipv6_dst(inner) {
+            TunnelMode::L3Tun => match ipv6_dst(inner) {
+                Some(dst) => {
                     if let Some(&idx) = self.by_addr.get(&dst) {
                         return Some(idx);
                     }
+                    if self.membership.is_none() && self.peers.len() == 1 {
+                        Some(0)
+                    } else {
+                        None
+                    }
                 }
-                if self.peers.len() == 1 {
-                    Some(0)
-                } else {
-                    None
+                None => {
+                    if self.peers.len() == 1 {
+                        Some(0)
+                    } else {
+                        None
+                    }
                 }
-            }
+            },
         }
     }
 
@@ -834,14 +959,33 @@ impl PeerManager {
     /// only if the recovered static key matches a *configured* peer, and on
     /// admission transition that peer to `Established` (learning its
     /// endpoint from `src`) and drain any buffered `pending_tun`.
+    /// Whether a responder's msg2 cert payload admits the peer whose static key
+    /// is `peer_pub`. With membership disabled the payload is ignored (returns
+    /// `true` — byte-identical to 2a/2b). With membership enabled the payload
+    /// must decode to a `Cert` that `verify_cert`s against `peer_pub` at the
+    /// current wall clock — mutual membership proof.
+    fn responder_cert_ok(&self, payload: &[u8], peer_pub: [u8; 32]) -> bool {
+        match self.membership.as_ref() {
+            None => true,
+            Some(m) => Cert::decode(payload)
+                .is_some_and(|cert| m.verify_cert(&cert, &peer_pub, now_secs())),
+        }
+    }
+
     fn handle_handshake_init(
         &mut self,
         src: SocketAddr,
         dg: &[u8],
         now_ms: u64,
     ) -> DispatchOut<'_> {
-        let (established, resp_pkt, remote_static) =
-            match HandshakeState::start_responder(&self.local_priv, dg) {
+        // Present our cert in msg2 (2c); empty when membership is None.
+        let resp_payload = self
+            .membership
+            .as_ref()
+            .map(Membership::own_cert_bytes)
+            .unwrap_or_default();
+        let (established, resp_pkt, remote_static, initiator_payload) =
+            match HandshakeState::start_responder(&self.local_priv, dg, &resp_payload) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("peer_manager: start_responder failed: {e}");
@@ -849,9 +993,32 @@ impl PeerManager {
                 }
             };
 
-        let Some(idx) = self.peers.iter().position(|p| p.pubkey == remote_static) else {
-            // Not a configured peer: drop, do not create a peer.
-            return DispatchOut::None;
+        // Admission: a configured/root/already-admitted peer (static-key match)
+        // OR — with membership enabled — the initiator presented a valid
+        // CA-signed cert covering its static key (`remote_static`). A cert-admit
+        // of a not-yet-known peer runs `admit_member` before completing. Neither
+        // path → drop with NO reply, PRE-session, exactly like 2a's allowlist
+        // drop. Membership only supplies a candidate; the Noise session that
+        // `start_responder` just built still gates admission (anti-hijack).
+        let idx = match self.peers.iter().position(|p| p.pubkey == remote_static) {
+            Some(i) => i,
+            None => {
+                let cert_admits = self.membership.as_ref().is_some_and(|m| {
+                    Cert::decode(&initiator_payload)
+                        .is_some_and(|cert| m.verify_cert(&cert, &remote_static, now_secs()))
+                });
+                if !cert_admits {
+                    // Not a configured peer and no valid cert: drop, no peer.
+                    return DispatchOut::None;
+                }
+                // Admit the cert-verified member (endpoint learned from `src`
+                // in the establish arm below). Cert carries no endpoints.
+                self.admit_member(remote_static, Vec::new(), now_ms);
+                match self.peers.iter().position(|p| p.pubkey == remote_static) {
+                    Some(i) => i,
+                    None => return DispatchOut::None,
+                }
+            }
         };
 
         // `start_responder` above drew a fresh Noise ephemeral, so `established`
@@ -955,7 +1122,14 @@ impl PeerManager {
         };
 
         match handshaking.hs.read_response(dg) {
-            Ok(established) => {
+            Ok((established, responder_payload)) => {
+                if !self.responder_cert_ok(&responder_payload, self.peers[idx].pubkey) {
+                    // Responder failed to prove membership: do not establish.
+                    // State was already reverted to `Idle`; `pending_tun` stays
+                    // queued for the next attempt.
+                    eprintln!("peer_manager: responder cert rejected");
+                    return DispatchOut::None;
+                }
                 let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
                 // `idx` was matched above via `p.endpoint == Some(src)`, so `src`
                 // is exactly this peer's endpoint.
@@ -996,6 +1170,159 @@ impl PeerManager {
             }
         }
     }
+
+    // ── membership gossip ─────────────────────────────────────────────────
+
+    /// Handle an inbound `[Gossip]` datagram from `src`: decode the
+    /// [`GossipMsg`], feed it to `Membership::on_gossip` (which verifies every
+    /// record's CA→cert→record-sig chain, so a forged/injected record is
+    /// rejected — no in-session encryption is needed for integrity), and send
+    /// any bounded reply back to `src` as `[Gossip ++ msg]` datagrams
+    /// (relay-wrapped iff `src` maps to a `Relayed` peer). Only called with
+    /// membership configured.
+    ///
+    /// Source-restricted to `Established` peers ONLY: gossip only ever
+    /// legitimately flows between admitted members (a joining node
+    /// cert-verifies into `Established` before it gossips), so a `src` that
+    /// does not match a currently `Established` peer's endpoint is dropped
+    /// before decoding, let alone before any per-record Ed25519 verify or
+    /// reply is produced. Without this, `src` is fully attacker-controlled
+    /// (UDP has no source authentication) and a spoofed `PullRequest` would
+    /// be an unauthenticated reflection/amplification primitive (a small
+    /// request naming known `node_id`s reflecting a much larger `Records`
+    /// reply at a forged victim address) plus an unbounded per-record-verify
+    /// CPU sink for inbound `Records`. Restricting to `Established` peers
+    /// bounds both costs to already-admitted members.
+    fn on_gossip(&mut self, src: SocketAddr, dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
+        let Some(peer_idx) = self
+            .peers
+            .iter()
+            .position(|p| p.endpoint == Some(src) && matches!(p.state, PeerState::Established(_)))
+        else {
+            return DispatchOut::None;
+        };
+        let Some(msg) = GossipMsg::decode(&dg[1..]) else {
+            return DispatchOut::None;
+        };
+        let replies = match self.membership.as_mut() {
+            Some(m) => m.on_gossip(msg, now_secs()),
+            None => return DispatchOut::None,
+        };
+        if replies.is_empty() {
+            return DispatchOut::None;
+        }
+        // Decide the return path: if `src` is reached via the relay, wrap
+        // replies through the server; otherwise reply direct to `src`. (The
+        // peer's committed egress is untouched — we only read its `relay`
+        // flag.)
+        let relay = self.peers[peer_idx].relay;
+        self.egress.clear();
+        for reply in replies.iter().take(MAX_GOSSIP_REPLIES) {
+            let mut bytes = Vec::new();
+            bytes.push(PacketType::Gossip as u8);
+            reply.encode(&mut bytes);
+            if relay {
+                if let Some(d) = self.relay_wrap(peer_idx, bytes) {
+                    self.egress.push(d);
+                }
+            } else {
+                self.egress.push(EgressDatagram {
+                    fate: 0,
+                    dst: src,
+                    bytes,
+                });
+            }
+        }
+        if self.egress.is_empty() {
+            DispatchOut::None
+        } else {
+            DispatchOut::Udp(&self.egress)
+        }
+    }
+
+    /// The gossip fan-out targets for a `tick` digest: a bounded sample of
+    /// Established peers (relay-wrapped when `Relayed`) plus the roots (direct).
+    /// Returns `(dst, relay_peer_idx)` — `Some(idx)` means relay-wrap through
+    /// the server for that peer.
+    fn gossip_targets(&self) -> Vec<(SocketAddr, Option<usize>)> {
+        let mut out: Vec<(SocketAddr, Option<usize>)> = Vec::new();
+        for (i, p) in self.peers.iter().enumerate() {
+            if out.len() >= MAX_GOSSIP_TARGETS {
+                return out;
+            }
+            if matches!(p.state, PeerState::Established(_)) {
+                if p.relay {
+                    out.push((self.server_addr(), Some(i)));
+                } else if let Some(ep) = p.endpoint {
+                    out.push((ep, None));
+                }
+            }
+        }
+        if let Some(m) = self.membership.as_ref() {
+            for (_, addr) in m.roots() {
+                if out.len() >= MAX_GOSSIP_TARGETS {
+                    break;
+                }
+                out.push((*addr, None));
+            }
+        }
+        out
+    }
+
+    /// Periodic gossip from `tick` (membership only): emit a debounced digest to
+    /// a bounded set of partners (roots + a sample of Established peers) and, if
+    /// no live session exists yet, bootstrap by handshaking to a root so gossip
+    /// can seed a fresh node. Pushes into `tick_egress`.
+    fn tick_gossip(&mut self, now_ms: u64) {
+        let have_established = self
+            .peers
+            .iter()
+            .any(|p| matches!(p.state, PeerState::Established(_)));
+
+        // Debounced digest (spacing handled inside `tick_digest`).
+        if let Some(digest) = self.membership.as_mut().and_then(|m| m.tick_digest(now_ms)) {
+            let mut bytes = Vec::new();
+            bytes.push(PacketType::Gossip as u8);
+            digest.encode(&mut bytes);
+            for (dst, relay_idx) in self.gossip_targets() {
+                match relay_idx {
+                    Some(i) => {
+                        if let Some(d) = self.relay_wrap(i, bytes.clone()) {
+                            self.tick_egress.push(d);
+                        }
+                    }
+                    None => self.tick_egress.push(EgressDatagram {
+                        fate: 0,
+                        dst,
+                        bytes: bytes.clone(),
+                    }),
+                }
+            }
+        }
+
+        // Bootstrap: with no Established peer yet, initiate a handshake to a
+        // root (always-admit) so a session — and gossip — can seed. One at a
+        // time; a root already Handshaking/Established is not re-probed.
+        if !have_established {
+            let root_addrs: Vec<SocketAddr> = self
+                .membership
+                .as_ref()
+                .map(|m| m.roots().iter().map(|(_, a)| *a).collect())
+                .unwrap_or_default();
+            for addr in root_addrs {
+                if let Some(i) = self
+                    .peers
+                    .iter()
+                    .position(|p| p.endpoint == Some(addr) && matches!(p.state, PeerState::Idle))
+                {
+                    if let Some(d) = self.begin_handshake(i, addr, false, now_ms) {
+                        self.tick_egress.push(d);
+                    }
+                    break;
+                }
+            }
+        }
+    }
 }
 
 impl Dispatch for PeerManager {
@@ -1015,14 +1342,43 @@ impl Dispatch for PeerManager {
             self.handle_handshake_init(src, dg, now_ms)
         } else if dg[0] == PacketType::HandshakeResp as u8 {
             self.handle_handshake_resp(src, dg, now_ms)
+        } else if self.membership.is_some() && dg[0] == PacketType::Gossip as u8 {
+            // Membership anti-entropy: a self-verifying gossip datagram. Only
+            // reached with membership configured — a pure-2a/2b deployment never
+            // sees `Gossip` traffic, so this branch is byte-identical there.
+            self.on_gossip(src, dg, now_ms)
         } else {
             self.handle_data_or_control(src, dg, now_ms)
         }
     }
 
     fn on_tun(&mut self, inner: &[u8], now_ms: u64) -> &[EgressDatagram] {
-        let Some(idx) = self.route_tun_index(inner) else {
-            return &[];
+        let idx = match self.route_tun_index(inner) {
+            Some(i) => i,
+            None => {
+                // No configured peer owns this inner dst. With membership
+                // enabled, try the gossip directory: an unknown mesh address may
+                // resolve to a member we can admit at runtime and then bring up
+                // via the normal lazy handshake. Without membership (or if the
+                // dst isn't a mesh address, or isn't in the directory), fall
+                // back to 2a/2b's drop — byte-identical.
+                let resolved = match (self.membership.as_ref(), ipv6_dst(inner)) {
+                    (Some(m), Some(dst)) => m.resolve(&dst),
+                    _ => None,
+                };
+                match resolved {
+                    Some(info) => {
+                        self.admit_member(info.pubkey, info.endpoints, now_ms);
+                        // The just-admitted peer registered `by_addr`, so this
+                        // now resolves to it; re-drive the normal path below.
+                        match self.route_tun_index(inner) {
+                            Some(i) => i,
+                            None => return &[],
+                        }
+                    }
+                    None => return &[],
+                }
+            }
         };
 
         // Each branch below is a syntactically separate `match`/`if`, rather
@@ -1286,6 +1642,12 @@ impl Dispatch for PeerManager {
             }
         }
 
+        // ── membership gossip ─────────────────────────────────────────────
+        // Skipped entirely without membership (pure-2a/2b `tick` is unchanged).
+        if self.membership.is_some() {
+            self.tick_gossip(now_ms);
+        }
+
         if self.tick_egress.is_empty() {
             None
         } else {
@@ -1298,6 +1660,20 @@ impl Dispatch for PeerManager {
 /// standard fixed IPv6 header), or `None` if `inner` is too short or its
 /// first nibble isn't `6` (IPv4, ARP, or a bare Ethernet frame in L2 mode
 /// all fail this check, which is intentional — see `route_tun_index`).
+/// Wall-clock UNIX seconds, for cert-validity checks (`not_before`/
+/// `not_after`, widened by the membership clock-skew tolerance). This is a
+/// **distinct** clock from the monotonic `now_ms` the event loop threads
+/// through `on_udp`/`on_tun`/`tick`: `now_ms` drives handshake/path timers and
+/// gossip debounce and must never be compared against a cert's validity
+/// window. A pre-1970 clock (impossible in practice) degrades to `0`, which
+/// simply fails every not-yet-valid cert closed — never panics.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn ipv6_dst(inner: &[u8]) -> Option<Ipv6Addr> {
     if inner.len() < 40 || inner[0] >> 4 != 6 {
         return None;
@@ -1334,10 +1710,10 @@ mod tests {
         let init_kp = generate_keypair();
         let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
         let mut res = Handshake::responder(&resp_kp.private).unwrap();
-        let m1 = ini.write_message().unwrap();
-        res.read_message(&m1).unwrap();
-        let m2 = res.write_message().unwrap();
-        ini.read_message(&m2).unwrap();
+        let m1 = ini.write_message(&[]).unwrap();
+        let _ = res.read_message(&m1).unwrap();
+        let m2 = res.write_message(&[]).unwrap();
+        let _ = ini.read_message(&m2).unwrap();
         let cb = ini.channel_binding();
         let (auth_key, hp_key) = derive_wire_keys(&cb);
         let established = Established {
@@ -1357,6 +1733,7 @@ mod tests {
             [8u8; 32],
             &[peer_a.clone(), peer_b.clone()],
             TunnelMode::L3Tun,
+            None,
             None,
         );
 
@@ -1378,6 +1755,7 @@ mod tests {
             &[peer_a.clone(), peer_b.clone()],
             TunnelMode::L3Tun,
             None,
+            None,
         );
         let addr_b = node_addr(&peer_b.public_key);
 
@@ -1394,7 +1772,14 @@ mod tests {
         // Mirrors the existing single-peer netns tests, which assign plain
         // IPv4 addresses to the TUN device (not the IPv6 mesh address).
         let peer_a = peer_cfg(1, "10.0.0.1:1000");
-        let pm = PeerManager::new([9u8; 32], [8u8; 32], &[peer_a], TunnelMode::L3Tun, None);
+        let pm = PeerManager::new(
+            [9u8; 32],
+            [8u8; 32],
+            &[peer_a],
+            TunnelMode::L3Tun,
+            None,
+            None,
+        );
 
         // A bare IPv4 packet: first nibble is 4, not 6.
         let inner = vec![0x45u8; 40];
@@ -1411,6 +1796,7 @@ mod tests {
             &[peer_a, peer_b],
             TunnelMode::L3Tun,
             None,
+            None,
         );
 
         let inner = vec![0x45u8; 40]; // IPv4, matches no by_addr entry
@@ -1420,7 +1806,14 @@ mod tests {
     #[test]
     fn route_tun_index_l2_single_peer_forwards_regardless_of_inner() {
         let peer_a = peer_cfg(1, "10.0.0.1:1000");
-        let pm = PeerManager::new([9u8; 32], [8u8; 32], &[peer_a], TunnelMode::L2Tap, None);
+        let pm = PeerManager::new(
+            [9u8; 32],
+            [8u8; 32],
+            &[peer_a],
+            TunnelMode::L2Tap,
+            None,
+            None,
+        );
 
         // An arbitrary Ethernet-looking frame; L2 mode ignores its contents
         // entirely and forwards to the sole configured peer.
@@ -1437,6 +1830,7 @@ mod tests {
             [8u8; 32],
             &[peer_a.clone(), peer_b.clone()],
             TunnelMode::L3Tun,
+            None,
             None,
         );
 
@@ -1491,12 +1885,13 @@ mod tests {
             &[peer_a],
             TunnelMode::L3Tun,
             None,
+            None,
         );
 
         // A valid HandshakeInit from a real, but unconfigured, key.
         let stranger = generate_keypair();
         let (_hs, init_pkt) =
-            HandshakeState::start_initiator(&stranger.private, &local_kp.public).unwrap();
+            HandshakeState::start_initiator(&stranger.private, &local_kp.public, &[]).unwrap();
 
         let src: SocketAddr = "203.0.113.5:5".parse().unwrap();
         match pm.on_udp(src, &init_pkt, 0) {
@@ -1509,7 +1904,7 @@ mod tests {
     #[test]
     fn local_addr_matches_node_addr_of_local_pub() {
         let local_pub = [42u8; 32];
-        let pm = PeerManager::new([1u8; 32], local_pub, &[], TunnelMode::L3Tun, None);
+        let pm = PeerManager::new([1u8; 32], local_pub, &[], TunnelMode::L3Tun, None, None);
         assert_eq!(pm.local_addr(), node_addr(&local_pub));
     }
 
@@ -1560,10 +1955,22 @@ mod tests {
             public_key: kp_a.public,
             endpoint: Some(ep_a),
         };
-        let mut pm_a =
-            PeerManager::new(kp_a.private, kp_a.public, &[cfg_b], TunnelMode::L3Tun, None);
-        let mut pm_b =
-            PeerManager::new(kp_b.private, kp_b.public, &[cfg_a], TunnelMode::L3Tun, None);
+        let mut pm_a = PeerManager::new(
+            kp_a.private,
+            kp_a.public,
+            &[cfg_b],
+            TunnelMode::L3Tun,
+            None,
+            None,
+        );
+        let mut pm_b = PeerManager::new(
+            kp_b.private,
+            kp_b.public,
+            &[cfg_a],
+            TunnelMode::L3Tun,
+            None,
+            None,
+        );
 
         // Each side sends a HandshakeInit (triggered by its own outbound TUN
         // traffic) before hearing from the other — the glare.
@@ -1614,11 +2021,18 @@ mod tests {
             public_key: kp_i.public,
             endpoint: Some(ep_i),
         };
-        let mut pm_r =
-            PeerManager::new(kp_r.private, kp_r.public, &[cfg_i], TunnelMode::L3Tun, None);
+        let mut pm_r = PeerManager::new(
+            kp_r.private,
+            kp_r.public,
+            &[cfg_i],
+            TunnelMode::L3Tun,
+            None,
+            None,
+        );
 
         // The initiator's HandshakeInit (built out-of-band, as if received).
-        let (_hs, init_pkt) = HandshakeState::start_initiator(&kp_i.private, &kp_r.public).unwrap();
+        let (_hs, init_pkt) =
+            HandshakeState::start_initiator(&kp_i.private, &kp_r.public, &[]).unwrap();
 
         // First delivery establishes the responder session; capture its reply.
         let resp1 = resp_bytes(&pm_r.on_udp(ep_i, &init_pkt, 0));
@@ -1654,6 +2068,7 @@ mod tests {
             kp_local.public,
             &[peer],
             TunnelMode::L3Tun,
+            None,
             None,
         );
 
@@ -1712,6 +2127,7 @@ mod tests {
             kp_local.public,
             &[peer],
             TunnelMode::L3Tun,
+            None,
             None,
         );
 
@@ -1813,6 +2229,7 @@ mod tests {
             peers,
             TunnelMode::L3Tun,
             Some(rdv),
+            None,
         );
         (pm, sent)
     }
@@ -1911,6 +2328,7 @@ mod tests {
             local.public,
             &[peer],
             TunnelMode::L3Tun,
+            None,
             None,
         );
 
@@ -2088,7 +2506,7 @@ mod tests {
         // A valid HandshakeInit from the peer, delivered THROUGH the relay
         // (RelayDeliver from the server, src = peer node).
         let (_hs, init_pkt) =
-            HandshakeState::start_initiator(&peer_kp.private, &local.public).unwrap();
+            HandshakeState::start_initiator(&peer_kp.private, &local.public, &[]).unwrap();
         let mut buf = Vec::new();
         yip_rendezvous::encode(
             &yip_rendezvous::Message::RelayDeliver {
@@ -2335,5 +2753,631 @@ mod tests {
             "endpoint re-stamped to the punch candidate"
         );
         assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    }
+
+    // ── membership wiring (mock Membership via an in-test CA + certs) ──────
+    //
+    // A `Membership` built from an in-test Ed25519 CA and certs whose validity
+    // window straddles the real wall clock (cert checks in `PeerManager` use
+    // `now_secs()`, not the loop's `now_ms`), so `verify_cert` accepts them
+    // when the daemon runs today.
+
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use yip_membership::cert::cert_signing_body;
+    use yip_membership::record::{record_signing_body, sign as record_sign};
+    use yip_membership::{Record, RootSet};
+
+    const TEST_NET: [u8; 16] = [7u8; 16];
+
+    fn test_ca() -> SigningKey {
+        SigningKey::from_bytes(&[42u8; 32])
+    }
+
+    /// A CA-signed cert covering `member_pubkey`, valid essentially forever so
+    /// the real wall clock (`now_secs()`) always falls inside the window.
+    fn mk_cert(ca: &SigningKey, member_pubkey: [u8; 32], member_sign_pub: [u8; 32]) -> Cert {
+        let mut c = Cert {
+            version: 1,
+            member_pubkey,
+            member_sign_pubkey: member_sign_pub,
+            network_id: TEST_NET,
+            not_before: 0,
+            not_after: u64::MAX,
+            tags: vec![],
+            ca_sig: [0u8; 64],
+        };
+        c.ca_sig = ca.sign(&cert_signing_body(&c)).to_bytes();
+        c
+    }
+
+    fn empty_roots() -> RootSet {
+        RootSet {
+            roots: vec![],
+            version: 0,
+            ca_sig: [0u8; 64],
+        }
+    }
+
+    /// A `Membership` for a node whose own data-plane key is `own_pub`, trusting
+    /// `ca`, on `TEST_NET`, with no roots.
+    fn membership_for(ca: &SigningKey, own_pub: [u8; 32]) -> Membership {
+        let ca_pub = ca.verifying_key().to_bytes();
+        let own_sign = SigningKey::from_bytes(&[200u8; 32]);
+        let own_cert = mk_cert(ca, own_pub, own_sign.verifying_key().to_bytes());
+        Membership::new(
+            vec![ca_pub],
+            TEST_NET,
+            own_cert,
+            own_sign.to_bytes(),
+            empty_roots(),
+            vec!["10.0.0.1:51820".parse().unwrap()],
+        )
+    }
+
+    /// A member-signed directory `Record` for `member_pub` at `endpoints`,
+    /// signed by `sign_key` (whose public key is embedded in the cert), CA
+    /// `ca`. When `ca` is untrusted by the verifier, the record is forged.
+    fn mk_record(
+        ca: &SigningKey,
+        sign_seed: u8,
+        member_pub: [u8; 32],
+        endpoints: Vec<SocketAddr>,
+        seq: u64,
+    ) -> Record {
+        let sign_key = SigningKey::from_bytes(&[sign_seed; 32]);
+        let cert = mk_cert(ca, member_pub, sign_key.verifying_key().to_bytes());
+        let mut r = Record {
+            node_id: yip_membership::node_id(&member_pub),
+            cert,
+            endpoints,
+            seq,
+            sig: [0u8; 64],
+        };
+        let body = record_signing_body(&r);
+        r.sig = record_sign(&body, &sign_key.to_bytes());
+        r
+    }
+
+    /// A minimal 40-byte IPv6 packet addressed to mesh address `dst`.
+    fn ipv6_pkt_to(dst: Ipv6Addr) -> Vec<u8> {
+        let mut inner = vec![0u8; 40];
+        inner[0] = 0x60;
+        inner[24..40].copy_from_slice(&dst.octets());
+        inner
+    }
+
+    /// (a) `on_tun` to an unknown mesh address that `resolve`s admits the peer
+    /// and emits a handshake `Init` toward its directory endpoint.
+    #[test]
+    fn on_tun_unknown_addr_resolves_admits_and_handshakes() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let peer = generate_keypair();
+        let peer_ep: SocketAddr = "198.51.100.50:6000".parse().unwrap();
+
+        let mut membership = membership_for(&ca, local.public);
+        let rec = mk_record(&ca, 201, peer.public, vec![peer_ep], 1);
+        assert!(membership.ingest_record(rec, now_secs()));
+
+        // No configured peers: the inner dst is unknown until resolved.
+        let mut pm = PeerManager::new(
+            local.private,
+            local.public,
+            &[],
+            TunnelMode::L3Tun,
+            None,
+            Some(membership),
+        );
+        assert!(pm.peers.is_empty());
+
+        let pkt = ipv6_pkt_to(node_addr(&peer.public));
+        let out = pm.on_tun(&pkt, 0).to_vec();
+
+        // The peer was admitted at runtime …
+        assert_eq!(pm.peers.len(), 1, "resolve+admit created one peer");
+        assert_eq!(pm.peers[0].pubkey, peer.public);
+        assert_eq!(pm.peers[0].endpoint, Some(peer_ep));
+        // … and a handshake Init was emitted toward its endpoint.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].dst, peer_ep);
+        assert_eq!(out[0].bytes[0], PacketType::HandshakeInit as u8);
+        assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    }
+
+    /// (a2) Regression (2c/Task 7): with exactly one already-admitted peer
+    /// (e.g. the seed root a mesh node bootstraps to), `on_tun` to a
+    /// DIFFERENT, not-yet-known mesh address must NOT be misrouted to that
+    /// lone peer by the 2a/2b "single configured peer" fallback in
+    /// `route_tun_index` — it must fall through to the membership `resolve`
+    /// path instead. Before the fix, `route_tun_index`'s
+    /// `self.peers.len() == 1 => Some(0)` fallback fired unconditionally
+    /// (membership-blind), so a mesh node holding just its root — exactly
+    /// the state every node is in right after bootstrap, before it has
+    /// resolved anyone else — would have every not-yet-discovered
+    /// destination silently routed to the root instead of resolved via
+    /// gossip, permanently breaking dynamic discovery whenever a node knew
+    /// only one peer.
+    #[test]
+    fn on_tun_single_known_peer_still_resolves_a_different_dst() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let root = generate_keypair();
+        let root_ep: SocketAddr = "198.51.100.1:51820".parse().unwrap();
+        let peer = generate_keypair();
+        let peer_ep: SocketAddr = "198.51.100.50:6000".parse().unwrap();
+
+        // The root's own cert isn't needed by this node's directory — only
+        // its pubkey + endpoint (via the signed `RootSet`, which
+        // `PeerManager::new` auto-admits).
+        let roots = RootSet {
+            roots: vec![(root.public, root_ep)],
+            version: 1,
+            ca_sig: [0u8; 64],
+        };
+        let own_sign = SigningKey::from_bytes(&[200u8; 32]);
+        let own_cert = mk_cert(&ca, local.public, own_sign.verifying_key().to_bytes());
+        let mut membership = Membership::new(
+            vec![ca.verifying_key().to_bytes()],
+            TEST_NET,
+            own_cert,
+            own_sign.to_bytes(),
+            roots,
+            vec!["10.0.0.1:51820".parse().unwrap()],
+        );
+        let rec = mk_record(&ca, 202, peer.public, vec![peer_ep], 1);
+        assert!(membership.ingest_record(rec, now_secs()));
+
+        // `PeerManager::new` auto-admits every root from the signed root set
+        // (always-admit bootstrap seed), so `pm.peers` starts with exactly
+        // one entry (the root) — the precondition this regression guards.
+        let mut pm = PeerManager::new(
+            local.private,
+            local.public,
+            &[],
+            TunnelMode::L3Tun,
+            None,
+            Some(membership),
+        );
+        assert_eq!(
+            pm.peers.len(),
+            1,
+            "precondition: exactly one known peer (the root)"
+        );
+        assert_eq!(pm.peers[0].pubkey, root.public);
+
+        // A TUN packet addressed to `peer` (a DIFFERENT node than the root)
+        // must resolve+admit `peer`, not be routed to the root.
+        let pkt = ipv6_pkt_to(node_addr(&peer.public));
+        let out = pm.on_tun(&pkt, 0).to_vec();
+
+        assert_eq!(pm.peers.len(), 2, "resolve+admit created a second peer");
+        assert_eq!(pm.peers[1].pubkey, peer.public);
+        assert_eq!(pm.peers[1].endpoint, Some(peer_ep));
+        assert_eq!(
+            out.len(),
+            1,
+            "a handshake Init toward the resolved peer's endpoint was emitted"
+        );
+        assert_eq!(
+            out[0].dst, peer_ep,
+            "must target the resolved peer, not the root"
+        );
+    }
+
+    /// (b) `handle_handshake_init` with a valid presented cert admits + replies;
+    /// with an absent or invalid cert (and not a configured peer) it drops with
+    /// no reply and no session.
+    #[test]
+    fn cert_in_handshake_admits_valid_rejects_invalid() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let src: SocketAddr = "203.0.113.5:5".parse().unwrap();
+
+        // ── valid cert → admitted + reply ──
+        {
+            let stranger = generate_keypair();
+            let mut pm = PeerManager::new(
+                local.private,
+                local.public,
+                &[],
+                TunnelMode::L3Tun,
+                None,
+                Some(membership_for(&ca, local.public)),
+            );
+            let stranger_sign = SigningKey::from_bytes(&[210u8; 32]);
+            let cert = mk_cert(
+                &ca,
+                stranger.public,
+                stranger_sign.verifying_key().to_bytes(),
+            );
+            let mut cert_bytes = Vec::new();
+            cert.encode(&mut cert_bytes);
+            let (_hs, init_pkt) =
+                HandshakeState::start_initiator(&stranger.private, &local.public, &cert_bytes)
+                    .unwrap();
+
+            let replies = resp_bytes(&pm.on_udp(src, &init_pkt, 0));
+            assert_eq!(replies.len(), 1, "a valid cert is admitted and replied to");
+            assert_eq!(pm.peers.len(), 1, "the cert-verified member was admitted");
+            assert_eq!(pm.peers[0].pubkey, stranger.public);
+            assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+            assert_eq!(pm.peers[0].endpoint, Some(src), "endpoint learned from src");
+        }
+
+        // ── absent cert → dropped, no peer ──
+        {
+            let stranger = generate_keypair();
+            let mut pm = PeerManager::new(
+                local.private,
+                local.public,
+                &[],
+                TunnelMode::L3Tun,
+                None,
+                Some(membership_for(&ca, local.public)),
+            );
+            let (_hs, init_pkt) =
+                HandshakeState::start_initiator(&stranger.private, &local.public, &[]).unwrap();
+            assert!(matches!(pm.on_udp(src, &init_pkt, 0), DispatchOut::None));
+            assert!(pm.peers.is_empty(), "no cert ⇒ no admission");
+            assert!(pm.by_tag.is_empty());
+        }
+
+        // ── cert from an untrusted CA → dropped, no peer ──
+        {
+            let stranger = generate_keypair();
+            let untrusted_ca = SigningKey::from_bytes(&[99u8; 32]);
+            let mut pm = PeerManager::new(
+                local.private,
+                local.public,
+                &[],
+                TunnelMode::L3Tun,
+                None,
+                Some(membership_for(&ca, local.public)),
+            );
+            let stranger_sign = SigningKey::from_bytes(&[211u8; 32]);
+            let bad_cert = mk_cert(
+                &untrusted_ca,
+                stranger.public,
+                stranger_sign.verifying_key().to_bytes(),
+            );
+            let mut cert_bytes = Vec::new();
+            bad_cert.encode(&mut cert_bytes);
+            let (_hs, init_pkt) =
+                HandshakeState::start_initiator(&stranger.private, &local.public, &cert_bytes)
+                    .unwrap();
+            assert!(matches!(pm.on_udp(src, &init_pkt, 0), DispatchOut::None));
+            assert!(pm.peers.is_empty(), "untrusted-CA cert ⇒ no admission");
+            assert!(pm.by_tag.is_empty());
+        }
+    }
+
+    /// (c) With NO membership configured, `on_tun` to an unknown mesh address is
+    /// dropped and a `HandshakeInit` from an unconfigured key (even one bearing
+    /// a cert) is not admitted — byte-identical to 2a/2b.
+    #[test]
+    fn no_membership_behaves_as_2a_2b() {
+        let ca = test_ca();
+        let local = generate_keypair();
+
+        // on_tun to an unknown mesh addr: dropped, no peer created.
+        let mut pm = PeerManager::new(
+            local.private,
+            local.public,
+            &[],
+            TunnelMode::L3Tun,
+            None,
+            None,
+        );
+        let unknown = generate_keypair();
+        let pkt = ipv6_pkt_to(node_addr(&unknown.public));
+        assert!(pm.on_tun(&pkt, 0).is_empty(), "unknown addr dropped");
+        assert!(pm.peers.is_empty(), "no resolve/admit without membership");
+
+        // A HandshakeInit bearing a valid cert from an unconfigured key: still
+        // dropped (no membership ⇒ only configured keys are admitted).
+        let stranger = generate_keypair();
+        let stranger_sign = SigningKey::from_bytes(&[212u8; 32]);
+        let cert = mk_cert(
+            &ca,
+            stranger.public,
+            stranger_sign.verifying_key().to_bytes(),
+        );
+        let mut cert_bytes = Vec::new();
+        cert.encode(&mut cert_bytes);
+        let (_hs, init_pkt) =
+            HandshakeState::start_initiator(&stranger.private, &local.public, &cert_bytes).unwrap();
+        let src: SocketAddr = "203.0.113.5:5".parse().unwrap();
+        assert!(matches!(pm.on_udp(src, &init_pkt, 0), DispatchOut::None));
+        assert!(pm.peers.is_empty());
+        assert!(pm.by_tag.is_empty());
+    }
+
+    /// (d) Anti-hijack: a gossip/resolve event never redirects an already
+    /// `Established` peer. A gossip `Records` frame advertising a DIFFERENT
+    /// endpoint for a live peer updates only the directory — the peer's
+    /// committed egress (endpoint, session) is untouched, and no peer is added.
+    #[test]
+    fn anti_hijack_established_peer_unmoved_by_gossip_and_resolve() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let peer = generate_keypair();
+        let committed_ep: SocketAddr = "10.0.0.2:51820".parse().unwrap();
+
+        let cfg = PeerConfig {
+            public_key: peer.public,
+            endpoint: Some(committed_ep),
+        };
+        let mut pm = PeerManager::new(
+            local.private,
+            local.public,
+            &[cfg],
+            TunnelMode::L3Tun,
+            None,
+            Some(membership_for(&ca, local.public)),
+        );
+
+        // Splice in a live Established session reaching `committed_ep`.
+        const TAG: u64 = 0x0a0b_0c0d_0e0f_1011;
+        pm.peers[0].state =
+            PeerState::Established(Box::new(fake_established_dataplane(TAG, committed_ep)));
+        pm.by_tag.insert(TAG, 0);
+        pm.peers[0].path_kind = Some(PathKind::Direct);
+
+        // A gossip Records frame advertising a DIFFERENT endpoint for `peer`.
+        // Gossip is source-restricted to `Established` peers (Task 6 fix), so
+        // this must arrive from `committed_ep` — the only Established peer's
+        // endpoint — for it to be processed at all.
+        let hijack_ep: SocketAddr = "198.51.100.9:40000".parse().unwrap();
+        let rec = mk_record(&ca, 213, peer.public, vec![hijack_ep], 9);
+        let mut dg = vec![PacketType::Gossip as u8];
+        GossipMsg::Records(vec![rec]).encode(&mut dg);
+        assert!(matches!(pm.on_udp(committed_ep, &dg, 0), DispatchOut::None));
+
+        // The directory learned the new endpoint …
+        assert_eq!(
+            pm.membership
+                .as_ref()
+                .unwrap()
+                .resolve(&node_addr(&peer.public))
+                .unwrap()
+                .endpoints,
+            vec![hijack_ep],
+        );
+        // … but the live peer is NOT redirected: same session, same endpoint,
+        // no relay, and no extra peer admitted (resolve/admit is idempotent).
+        assert_eq!(pm.peers.len(), 1);
+        assert_eq!(established_tag(&pm, 0), Some(TAG), "session unchanged");
+        assert_eq!(
+            pm.peers[0].endpoint,
+            Some(committed_ep),
+            "committed egress unchanged"
+        );
+        assert!(!pm.peers[0].relay);
+
+        // And a TUN packet to the peer still routes to the committed session
+        // (the resolve path is never consulted for a peer already in the table).
+        let pkt = ipv6_pkt_to(node_addr(&peer.public));
+        let _ = pm.on_tun(&pkt, 0);
+        assert_eq!(pm.peers.len(), 1, "no re-admit");
+        assert_eq!(pm.peers[0].endpoint, Some(committed_ep));
+    }
+
+    /// (e) A `PacketType::Gossip` datagram with a valid record ingests into the
+    /// directory (a subsequent `resolve` finds it); a forged record (untrusted
+    /// CA) does not. Gossip is source-restricted to `Established` peers (Task
+    /// 6 fix), so both datagrams are sent from a spliced-in Established
+    /// peer's endpoint — a joining node handshakes into `Established` before
+    /// it ever legitimately gossips.
+    #[test]
+    fn gossip_ingest_accepts_valid_rejects_forged() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let gossip_peer = generate_keypair();
+        let src: SocketAddr = "203.0.113.8:8".parse().unwrap();
+        let cfg = PeerConfig {
+            public_key: gossip_peer.public,
+            endpoint: Some(src),
+        };
+        let mut pm = PeerManager::new(
+            local.private,
+            local.public,
+            &[cfg],
+            TunnelMode::L3Tun,
+            None,
+            Some(membership_for(&ca, local.public)),
+        );
+        const TAG: u64 = 0x9988_7766_5544_3322;
+        pm.peers[0].state = PeerState::Established(Box::new(fake_established_dataplane(TAG, src)));
+        pm.by_tag.insert(TAG, 0);
+
+        // Valid record → ingested → resolvable.
+        let good = generate_keypair();
+        let good_ep: SocketAddr = "192.0.2.20:6666".parse().unwrap();
+        let good_rec = mk_record(&ca, 214, good.public, vec![good_ep], 3);
+        let mut dg = vec![PacketType::Gossip as u8];
+        GossipMsg::Records(vec![good_rec]).encode(&mut dg);
+        assert!(matches!(pm.on_udp(src, &dg, 0), DispatchOut::None));
+        assert_eq!(
+            pm.membership
+                .as_ref()
+                .unwrap()
+                .resolve(&node_addr(&good.public))
+                .map(|i| i.endpoints),
+            Some(vec![good_ep]),
+            "valid gossip record is ingested and resolvable"
+        );
+
+        // Forged record (untrusted CA) → not ingested → not resolvable.
+        let forged_ca = SigningKey::from_bytes(&[123u8; 32]);
+        let bad = generate_keypair();
+        let bad_rec = mk_record(
+            &forged_ca,
+            215,
+            bad.public,
+            vec!["192.0.2.30:7000".parse().unwrap()],
+            3,
+        );
+        let mut dg2 = vec![PacketType::Gossip as u8];
+        GossipMsg::Records(vec![bad_rec]).encode(&mut dg2);
+        assert!(matches!(pm.on_udp(src, &dg2, 0), DispatchOut::None));
+        assert!(
+            pm.membership
+                .as_ref()
+                .unwrap()
+                .resolve(&node_addr(&bad.public))
+                .is_none(),
+            "a forged record is rejected by ingest_record"
+        );
+    }
+
+    /// (f) Fix-pass (Task 6, Important): gossip is source-restricted to
+    /// `Established` peers. A `PacketType::Gossip` datagram from a `src` that
+    /// matches no currently `Established` peer's endpoint is dropped
+    /// outright — not decoded, not ingested into the directory, no reply —
+    /// which is what closes the unauthenticated reflection/amplification
+    /// vector (UDP `src` is otherwise fully attacker-controlled: a spoofed
+    /// `PullRequest` would reflect a `Records` reply at a forged victim, and
+    /// every inbound `Records` costs an unbounded number of Ed25519
+    /// verifies). The identical datagram from the Established peer's own
+    /// endpoint is accepted and ingested normally — legitimate gossip is
+    /// unaffected.
+    #[test]
+    fn gossip_from_non_established_src_is_dropped() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let peer = generate_keypair();
+        let peer_ep: SocketAddr = "10.0.0.3:51820".parse().unwrap();
+        let cfg = PeerConfig {
+            public_key: peer.public,
+            endpoint: Some(peer_ep),
+        };
+        let mut pm = PeerManager::new(
+            local.private,
+            local.public,
+            &[cfg],
+            TunnelMode::L3Tun,
+            None,
+            Some(membership_for(&ca, local.public)),
+        );
+        const TAG: u64 = 0x1357_9bdf_2468_ace0;
+        pm.peers[0].state =
+            PeerState::Established(Box::new(fake_established_dataplane(TAG, peer_ep)));
+        pm.by_tag.insert(TAG, 0);
+
+        let member = generate_keypair();
+        let member_ep: SocketAddr = "192.0.2.40:9000".parse().unwrap();
+        let rec = mk_record(&ca, 216, member.public, vec![member_ep], 1);
+        let mut dg = vec![PacketType::Gossip as u8];
+        GossipMsg::Records(vec![rec]).encode(&mut dg);
+
+        // A spoofed src matching no Established peer: dropped, not ingested.
+        let spoofed_src: SocketAddr = "203.0.113.200:4000".parse().unwrap();
+        assert!(matches!(pm.on_udp(spoofed_src, &dg, 0), DispatchOut::None));
+        assert!(
+            pm.membership
+                .as_ref()
+                .unwrap()
+                .resolve(&node_addr(&member.public))
+                .is_none(),
+            "gossip from a non-Established src must be dropped, not ingested"
+        );
+
+        // The identical datagram from the Established peer's own endpoint:
+        // accepted and ingested — legitimate gossip still works.
+        assert!(matches!(pm.on_udp(peer_ep, &dg, 0), DispatchOut::None));
+        assert_eq!(
+            pm.membership
+                .as_ref()
+                .unwrap()
+                .resolve(&node_addr(&member.public))
+                .map(|i| i.endpoints),
+            Some(vec![member_ep]),
+            "gossip from an Established peer's endpoint is ingested normally"
+        );
+    }
+
+    /// (g) Fix-pass (Task 6, Minor): mutual-proof rejection on the INITIATOR
+    /// side. With membership configured, a `[HandshakeResp]` whose msg2 cert
+    /// payload is absent or invalid must NOT establish the session — even
+    /// though the underlying Noise handshake completes cryptographically —
+    /// covering `handle_handshake_resp`'s `responder_cert_ok` guard.
+    /// Complements (b) `cert_in_handshake_admits_valid_rejects_invalid`,
+    /// which covers only the responder side of mutual proof.
+    #[test]
+    fn initiator_rejects_responder_with_bad_cert() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer_ep: SocketAddr = "10.0.0.4:51820".parse().unwrap();
+        let cfg = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: Some(peer_ep),
+        };
+
+        // ── absent cert in msg2 → rejected ──
+        {
+            let mut pm = PeerManager::new(
+                local.private,
+                local.public,
+                std::slice::from_ref(&cfg),
+                TunnelMode::L3Tun,
+                None,
+                Some(membership_for(&ca, local.public)),
+            );
+            let init_out = pm.on_tun(&dummy_tun_pkt(), 0).to_vec();
+            assert_eq!(init_out.len(), 1);
+            let init_pkt = init_out[0].bytes.clone();
+            assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+
+            // Out-of-band responder step with NO cert payload in msg2.
+            let (_established, resp_pkt, _remote_static, _initiator_payload) =
+                HandshakeState::start_responder(&peer_kp.private, &init_pkt, &[]).unwrap();
+
+            assert!(matches!(
+                pm.on_udp(peer_ep, &resp_pkt, 0),
+                DispatchOut::None
+            ));
+            assert!(
+                matches!(pm.peers[0].state, PeerState::Idle),
+                "no responder cert ⇒ session must not establish, reverts to Idle"
+            );
+        }
+
+        // ── invalid (untrusted-CA) cert in msg2 → rejected ──
+        {
+            let mut pm = PeerManager::new(
+                local.private,
+                local.public,
+                &[cfg],
+                TunnelMode::L3Tun,
+                None,
+                Some(membership_for(&ca, local.public)),
+            );
+            let init_out = pm.on_tun(&dummy_tun_pkt(), 0).to_vec();
+            let init_pkt = init_out[0].bytes.clone();
+
+            let untrusted_ca = SigningKey::from_bytes(&[77u8; 32]);
+            let peer_sign = SigningKey::from_bytes(&[78u8; 32]);
+            let bad_cert = mk_cert(
+                &untrusted_ca,
+                peer_kp.public,
+                peer_sign.verifying_key().to_bytes(),
+            );
+            let mut bad_cert_bytes = Vec::new();
+            bad_cert.encode(&mut bad_cert_bytes);
+
+            let (_established, resp_pkt, _remote_static, _initiator_payload) =
+                HandshakeState::start_responder(&peer_kp.private, &init_pkt, &bad_cert_bytes)
+                    .unwrap();
+
+            assert!(matches!(
+                pm.on_udp(peer_ep, &resp_pkt, 0),
+                DispatchOut::None
+            ));
+            assert!(
+                matches!(pm.peers[0].state, PeerState::Idle),
+                "untrusted-CA responder cert ⇒ session must not establish, reverts to Idle"
+            );
+        }
     }
 }

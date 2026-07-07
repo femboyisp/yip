@@ -126,23 +126,27 @@ impl Handshake {
         Ok(Handshake { inner })
     }
 
-    /// Produce the next (empty-payload) handshake message to send to the peer.
-    pub fn write_message(&mut self) -> Result<Vec<u8>, CryptoError> {
-        let mut buf = [0u8; 1024];
+    /// Produce the next handshake message to send to the peer, carrying
+    /// `payload` as the Noise app payload (encrypted per the pattern's
+    /// current handshake state — msg1 under `es`, msg2 fully).
+    pub fn write_message(&mut self, payload: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        let mut buf = [0u8; 4096];
         let n = self
             .inner
-            .write_message(&[], &mut buf)
+            .write_message(payload, &mut buf)
             .map_err(|_| CryptoError::Handshake)?;
         Ok(buf[..n].to_vec())
     }
 
-    /// Consume a handshake message received from the peer.
-    pub fn read_message(&mut self, msg: &[u8]) -> Result<(), CryptoError> {
-        let mut buf = [0u8; 1024];
-        self.inner
+    /// Consume a handshake message received from the peer, returning the
+    /// decrypted app payload it carried (empty if none was written).
+    pub fn read_message(&mut self, msg: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        let mut buf = [0u8; 4096];
+        let n = self
+            .inner
             .read_message(msg, &mut buf)
             .map_err(|_| CryptoError::Handshake)?;
-        Ok(())
+        Ok(buf[..n].to_vec())
     }
 
     /// Whether the handshake has completed and a session can be derived.
@@ -349,11 +353,45 @@ mod tests {
         let init_kp = generate_keypair();
         let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
         let mut res = Handshake::responder(&resp_kp.private).unwrap();
-        let m1 = ini.write_message().unwrap();
-        res.read_message(&m1).unwrap();
-        let m2 = res.write_message().unwrap();
-        ini.read_message(&m2).unwrap();
+        let m1 = ini.write_message(&[]).unwrap();
+        let _ = res.read_message(&m1).unwrap();
+        let m2 = res.write_message(&[]).unwrap();
+        let _ = ini.read_message(&m2).unwrap();
         (ini.into_session().unwrap(), res.into_session().unwrap())
+    }
+
+    #[test]
+    fn handshake_payload_round_trips_and_sessions_match() {
+        // msg1 carries an app payload (the initiator's cert, in 2c); msg2
+        // carries a different one (the responder's cert). Noise-IK encrypts
+        // both (msg1 under `es`, msg2 fully), so this also documents that
+        // certs never appear in cleartext on the wire.
+        let resp_kp = generate_keypair();
+        let init_kp = generate_keypair();
+        let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
+        let mut res = Handshake::responder(&resp_kp.private).unwrap();
+
+        let m1 = ini.write_message(b"cert-A").unwrap();
+        let got_a = res.read_message(&m1).unwrap();
+        assert_eq!(got_a, b"cert-A");
+
+        let m2 = res.write_message(b"cert-B").unwrap();
+        let got_b = ini.read_message(&m2).unwrap();
+        assert_eq!(got_b, b"cert-B");
+
+        // Both sides derive the same channel binding (proof the payloads
+        // didn't perturb the handshake transcript) before consuming into a
+        // transport-mode session, then prove the sessions actually talk.
+        assert_eq!(ini.channel_binding(), res.channel_binding());
+        let mut ini_session = ini.into_session().unwrap();
+        let mut res_session = res.into_session().unwrap();
+        let sealed = ini_session.seal(b"payload round-trip ok").unwrap();
+        assert_eq!(
+            res_session
+                .open(sealed.counter, &sealed.ciphertext)
+                .unwrap(),
+            b"payload round-trip ok"
+        );
     }
 
     #[test]
@@ -398,10 +436,10 @@ mod tests {
         let init_kp = generate_keypair();
         let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
         let mut res = Handshake::responder(&resp_kp.private).unwrap();
-        let m1 = ini.write_message().unwrap();
-        res.read_message(&m1).unwrap();
-        let m2 = res.write_message().unwrap();
-        ini.read_message(&m2).unwrap();
+        let m1 = ini.write_message(&[]).unwrap();
+        let _ = res.read_message(&m1).unwrap();
+        let m2 = res.write_message(&[]).unwrap();
+        let _ = ini.read_message(&m2).unwrap();
         assert!(ini.is_finished() && res.is_finished());
         assert_eq!(
             ini.channel_binding(),
@@ -419,10 +457,10 @@ mod tests {
         let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
         let mut res = Handshake::responder(&resp_kp.private).unwrap();
 
-        let msg1 = ini.write_message().unwrap();
-        res.read_message(&msg1).unwrap();
-        let msg2 = res.write_message().unwrap();
-        ini.read_message(&msg2).unwrap();
+        let msg1 = ini.write_message(&[]).unwrap();
+        let _ = res.read_message(&msg1).unwrap();
+        let msg2 = res.write_message(&[]).unwrap();
+        let _ = ini.read_message(&msg2).unwrap();
 
         assert!(ini.is_finished() && res.is_finished());
         // IK: the responder learns the initiator's static public key.

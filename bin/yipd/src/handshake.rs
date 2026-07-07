@@ -30,6 +30,13 @@ pub enum PacketType {
     Data = 2,
     /// Loss-feedback control packet (receiver → sender).
     Control = 3,
+    /// Membership anti-entropy gossip (2c). Carries a self-verifying
+    /// [`yip_membership::GossipMsg`] as a plain datagram: every `Record` is
+    /// CA→cert→record-sig chained and re-verified on ingest, so a forged or
+    /// injected record is rejected by `Membership::ingest_record`. In-session
+    /// ENCRYPTION of gossip (metadata privacy) is an explicit 2c non-goal,
+    /// deferred to the anonymity milestone.
+    Gossip = 4,
 }
 
 // ── established session ───────────────────────────────────────────────────────
@@ -89,7 +96,7 @@ pub fn run_initiator(
     let mut handshake = Handshake::initiator(local_priv, peer_pub).map_err(crypto_err)?;
 
     // Build the outgoing init message once; we may send it multiple times.
-    let msg1 = handshake.write_message().map_err(crypto_err)?;
+    let msg1 = handshake.write_message(&[]).map_err(crypto_err)?;
     let mut init_pkt = Vec::with_capacity(1 + msg1.len());
     init_pkt.push(PacketType::HandshakeInit as u8);
     init_pkt.extend_from_slice(&msg1);
@@ -123,7 +130,7 @@ pub fn run_initiator(
             continue;
         }
 
-        handshake.read_message(&pkt[1..]).map_err(crypto_err)?;
+        let _ = handshake.read_message(&pkt[1..]).map_err(crypto_err)?;
 
         // Capture channel binding BEFORE consuming the handshake.
         let cb = handshake.channel_binding();
@@ -171,9 +178,9 @@ pub fn run_responder(
     if pkt.is_empty() || pkt[0] != PacketType::HandshakeInit as u8 {
         return Err(io::Error::other("expected HandshakeInit packet"));
     }
-    handshake.read_message(&pkt[1..]).map_err(crypto_err)?;
+    let _ = handshake.read_message(&pkt[1..]).map_err(crypto_err)?;
 
-    let msg2 = handshake.write_message().map_err(crypto_err)?;
+    let msg2 = handshake.write_message(&[]).map_err(crypto_err)?;
     let mut resp_pkt = Vec::with_capacity(1 + msg2.len());
     resp_pkt.push(PacketType::HandshakeResp as u8);
     resp_pkt.extend_from_slice(&msg2);
@@ -207,6 +214,11 @@ pub struct HandshakeState {
     handshake: Handshake,
 }
 
+/// Return type of [`HandshakeState::start_responder`]: `(established session,
+/// framed [HandshakeResp] ++ msg2 bytes, initiator's recovered static public
+/// key, initiator's msg1 app payload — the 2c cert seam)`.
+type StartResponderResult = io::Result<(Established, Vec<u8>, [u8; 32], Vec<u8>)>;
+
 impl HandshakeState {
     /// Start the initiator role: build `[HandshakeInit] ++ msg1`.
     ///
@@ -215,10 +227,11 @@ impl HandshakeState {
     pub fn start_initiator(
         local_priv: &[u8; 32],
         peer_pub: &[u8; 32],
+        payload: &[u8],
     ) -> io::Result<(Self, Vec<u8>)> {
         let mut handshake = Handshake::initiator(local_priv, peer_pub).map_err(crypto_err)?;
 
-        let msg1 = handshake.write_message().map_err(crypto_err)?;
+        let msg1 = handshake.write_message(payload).map_err(crypto_err)?;
         let mut init_pkt = Vec::with_capacity(1 + msg1.len());
         init_pkt.push(PacketType::HandshakeInit as u8);
         init_pkt.extend_from_slice(&msg1);
@@ -230,8 +243,12 @@ impl HandshakeState {
     /// `[HandshakeInit] ++ msg1` from `init_pkt`, and return the
     /// `[HandshakeResp] ++ msg2` reply bytes, the completed [`Established`]
     /// session (Noise-IK completes for the responder as soon as it has read
-    /// msg1 and written msg2), and the initiator's recovered static public
-    /// key.
+    /// msg1 and written msg2), the initiator's recovered static public key,
+    /// and the app payload the initiator carried in msg1 (the 2c cert seam;
+    /// `Task 6` will populate/consume it — this task only plumbs it).
+    ///
+    /// `resp_payload` is written into msg2's Noise payload (the responder's
+    /// own cert in 2c; empty for now).
     ///
     /// The static key is required by `PeerManager`'s admission check: a
     /// `HandshakeInit` must only be admitted (and a peer transitioned to
@@ -243,15 +260,16 @@ impl HandshakeState {
     pub fn start_responder(
         local_priv: &[u8; 32],
         init_pkt: &[u8],
-    ) -> io::Result<(Established, Vec<u8>, [u8; 32])> {
+        resp_payload: &[u8],
+    ) -> StartResponderResult {
         let mut handshake = Handshake::responder(local_priv).map_err(crypto_err)?;
 
         if init_pkt.is_empty() || init_pkt[0] != PacketType::HandshakeInit as u8 {
             return Err(io::Error::other("expected HandshakeInit packet"));
         }
-        handshake.read_message(&init_pkt[1..]).map_err(crypto_err)?;
+        let initiator_payload = handshake.read_message(&init_pkt[1..]).map_err(crypto_err)?;
 
-        let msg2 = handshake.write_message().map_err(crypto_err)?;
+        let msg2 = handshake.write_message(resp_payload).map_err(crypto_err)?;
         let mut resp_pkt = Vec::with_capacity(1 + msg2.len());
         resp_pkt.push(PacketType::HandshakeResp as u8);
         resp_pkt.extend_from_slice(&msg2);
@@ -273,16 +291,19 @@ impl HandshakeState {
             },
             resp_pkt,
             remote_static,
+            initiator_payload,
         ))
     }
 
     /// Resume the initiator role: read `[HandshakeResp] ++ msg2` and
-    /// finalize into an [`Established`] session.
-    pub fn read_response(mut self, resp_pkt: &[u8]) -> io::Result<Established> {
+    /// finalize into an [`Established`] session, together with the app
+    /// payload the responder carried in msg2 (the 2c cert seam).
+    pub fn read_response(mut self, resp_pkt: &[u8]) -> io::Result<(Established, Vec<u8>)> {
         if resp_pkt.is_empty() || resp_pkt[0] != PacketType::HandshakeResp as u8 {
             return Err(io::Error::other("expected HandshakeResp packet"));
         }
-        self.handshake
+        let responder_payload = self
+            .handshake
             .read_message(&resp_pkt[1..])
             .map_err(crypto_err)?;
 
@@ -291,11 +312,14 @@ impl HandshakeState {
         let session = self.handshake.into_session().map_err(crypto_err)?;
         let (auth_key, hp_key) = derive_wire_keys(&cb);
 
-        Ok(Established {
-            session,
-            auth_key,
-            hp_key,
-        })
+        Ok((
+            Established {
+                session,
+                auth_key,
+                hp_key,
+            },
+            responder_payload,
+        ))
     }
 }
 
@@ -339,10 +363,10 @@ mod tests {
         let a = generate_keypair();
         let b = generate_keypair();
 
-        let (ha, init_pkt) = HandshakeState::start_initiator(&a.private, &b.public).unwrap();
-        let (b_est, resp_pkt, initiator_static) =
-            HandshakeState::start_responder(&b.private, &init_pkt).unwrap();
-        let a_est = ha.read_response(&resp_pkt).unwrap();
+        let (ha, init_pkt) = HandshakeState::start_initiator(&a.private, &b.public, &[]).unwrap();
+        let (b_est, resp_pkt, initiator_static, _initiator_payload) =
+            HandshakeState::start_responder(&b.private, &init_pkt, &[]).unwrap();
+        let (a_est, _responder_payload) = ha.read_response(&resp_pkt).unwrap();
 
         // Both derive the same channel binding (conn_tag inputs).
         assert_eq!(a_est.auth_key, b_est.auth_key);
