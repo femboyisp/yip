@@ -103,6 +103,9 @@ pub fn run(config: Config) -> io::Result<()> {
         rendezvous,
         membership,
     );
+    // Enable anti-DPI obfuscation (3a) when the network `obf_psk` is configured.
+    // `None` leaves the manager on the byte-identical 2a/2b/2c plaintext path.
+    manager.set_obf_psk(config.obf_psk);
     let local_addr = manager.local_addr();
 
     // ── create the tunnel device (TUN or TAP) ────────────────────────────────

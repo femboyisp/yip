@@ -13,7 +13,9 @@ yip-transport = { path = "../../crates/yip-transport" }
 yip-device = { path = "../../crates/yip-device" }
 yip-rendezvous = { path = "../../crates/yip-rendezvous" }
 yip-membership = { path = "../../crates/yip-membership" }
+yip-obf = { path = "../../crates/yip-obf" }
 blake2 = { workspace = true }
+getrandom = "0.2"
 
 [dev-dependencies]
 ed25519-dalek = { version = "2.1", default-features = false }
