@@ -320,4 +320,60 @@ mod tests {
             Err(CertError::BadSig)
         );
     }
+
+    #[test]
+    fn rootset_roundtrips() {
+        let ca = ca();
+        let root1_pk = [1u8; 32];
+        let root1_addr = "192.0.2.1:8080".parse::<SocketAddr>().unwrap();
+        let root2_pk = [2u8; 32];
+        let root2_addr = "[2001:db8::1]:9090".parse::<SocketAddr>().unwrap();
+        let mut rs = RootSet {
+            roots: vec![(root1_pk, root1_addr), (root2_pk, root2_addr)],
+            version: 42,
+            ca_sig: [0u8; 64],
+        };
+        let sig = ca.sign(&rootset_signing_body(&rs));
+        rs.ca_sig = sig.to_bytes();
+        let mut buf = Vec::new();
+        rs.encode(&mut buf);
+        assert_eq!(RootSet::decode(&buf), Some(rs));
+    }
+
+    #[test]
+    fn rootset_verifies_and_rejects_wrong_ca_and_tampering() {
+        let ca = ca();
+        let ca_pub = ca.verifying_key().to_bytes();
+        let root_pk = [3u8; 32];
+        let root_addr = "192.0.2.100:5000".parse::<SocketAddr>().unwrap();
+        let mut rs = RootSet {
+            roots: vec![(root_pk, root_addr)],
+            version: 7,
+            ca_sig: [0u8; 64],
+        };
+        let sig = ca.sign(&rootset_signing_body(&rs));
+        rs.ca_sig = sig.to_bytes();
+
+        // valid CA signs and verifies
+        assert!(rs.verify_rootset(&[ca_pub]));
+
+        // wrong CA rejects
+        let other_ca = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        assert!(!rs.verify_rootset(&[other_ca]));
+
+        // tampered version rejects
+        let mut tampered = rs.clone();
+        tampered.version = 999;
+        assert!(!tampered.verify_rootset(&[ca_pub]));
+
+        // tampered root pk rejects
+        let mut tampered = rs.clone();
+        tampered.roots[0].0 = [99u8; 32];
+        assert!(!tampered.verify_rootset(&[ca_pub]));
+
+        // tampered root addr rejects
+        let mut tampered = rs.clone();
+        tampered.roots[0].1 = "192.0.2.200:6000".parse::<SocketAddr>().unwrap();
+        assert!(!tampered.verify_rootset(&[ca_pub]));
+    }
 }
