@@ -242,11 +242,16 @@ FAIL=0
 
 # HARD gate (a): no flow classified as a known VPN/proxy protocol BY CONTENT.
 # On the neutral port the correct/expected classification is Unknown.
-if grep -qiE '\b(wireguard|openvpn|tor|proxy)\b' "$NDPI_OUT"; then
-    echo "[FAIL] gate (a): ndpiReader classified the obfuscated flow as a known VPN/proxy protocol"
+# Match named VPN protocols AND nDPI's VPN category tag `[cat: VPN/...]`, which
+# ndpiReader prints for ANY of the ~20 VPN-category master protocols (Tailscale,
+# Mullvad, Hamachi, libp2p, IPSec, ...) — several structurally close to yip's P2P
+# UDP shape and not covered by the named list. An Unknown flow (category 0) has
+# no `[cat: ...]` tag, so this never false-fails on obfuscated yip traffic.
+if grep -qiE '\b(wireguard|openvpn|tor|proxy)\b|\[cat: *vpn\b' "$NDPI_OUT"; then
+    echo "[FAIL] gate (a): ndpiReader classified the obfuscated flow as a known VPN/proxy protocol (name or [cat: VPN])"
     FAIL=1
 else
-    echo "[PASS] gate (a): no WireGuard/OpenVPN/Tor/proxy classification (flow is Unknown by content)"
+    echo "[PASS] gate (a): no WireGuard/OpenVPN/Tor/proxy/[cat: VPN] classification (flow is Unknown by content)"
 fi
 
 # HARD gate (b): no NDPI_OBFUSCATED_TRAFFIC risk ("Obfuscated Traffic").
