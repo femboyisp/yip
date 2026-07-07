@@ -148,6 +148,13 @@ struct HandshakingState {
     started_ms: u64,
     /// When `[HandshakeInit]` was last (re)sent.
     last_sent_ms: u64,
+    /// The retransmit spacing to apply the NEXT time `last_sent_ms` is
+    /// checked against `now_ms` (see the retransmit arm in `tick_dispatch`).
+    /// Set to `HANDSHAKE_RETRY_MS` exactly when obfuscation is off (obf-off
+    /// timing is byte-identical); re-rolled via `jitter_ms(HANDSHAKE_RETRY_MS)`
+    /// at creation and after every retransmit when `obf_key.is_some()` (3a) —
+    /// stored and compared, never re-derived per-tick (see `jitter_ms`'s doc).
+    retry_ms: u64,
     /// How many times `[HandshakeInit]` has been resent (for logging/metrics).
     retries: u32,
     /// The framed `[HandshakeInit]` datagram, resent verbatim on retry.
@@ -273,6 +280,13 @@ pub struct PeerManager {
     local_node_id: NodeId,
     /// When we last emitted `register(local_node_id)` (see [`REG_REFRESH_MS`]).
     last_register_ms: u64,
+    /// The registration-refresh spacing to apply the NEXT time
+    /// `last_register_ms` is checked against `now_ms`. `REG_REFRESH_MS`
+    /// exactly when obfuscation is off (byte-identical timing); re-rolled via
+    /// `jitter_ms(REG_REFRESH_MS)` after every register fire when
+    /// `obf_key.is_some()` (3a) — stored and compared, never re-derived
+    /// per-tick.
+    reg_refresh_ms: u64,
     /// Whether we have registered at least once (so the first `tick` registers
     /// promptly rather than waiting a full [`REG_REFRESH_MS`] interval — the
     /// loop clock starts at 0).
@@ -364,6 +378,7 @@ impl PeerManager {
             membership,
             local_node_id: node_id(&local_pub),
             last_register_ms: 0,
+            reg_refresh_ms: REG_REFRESH_MS,
             registered_once: false,
             egress: Vec::new(),
             tick_egress: Vec::new(),
@@ -537,10 +552,16 @@ impl PeerManager {
             // `[HandshakeResp]` match in `handle_handshake_resp`) to `target`.
             self.peers[idx].endpoint = Some(target);
         }
+        let retry_ms = if self.obf_key.is_some() {
+            jitter_ms(HANDSHAKE_RETRY_MS)
+        } else {
+            HANDSHAKE_RETRY_MS
+        };
         self.peers[idx].state = PeerState::Handshaking(Box::new(HandshakingState {
             hs,
             started_ms: now_ms,
             last_sent_ms: now_ms,
+            retry_ms,
             retries: 0,
             init_pkt,
             target,
@@ -1341,7 +1362,12 @@ impl PeerManager {
             .any(|p| matches!(p.state, PeerState::Established(_)));
 
         // Debounced digest (spacing handled inside `tick_digest`).
-        if let Some(digest) = self.membership.as_mut().and_then(|m| m.tick_digest(now_ms)) {
+        let obf_on = self.obf_key.is_some();
+        if let Some(digest) = self
+            .membership
+            .as_mut()
+            .and_then(|m| m.tick_digest(now_ms, obf_on))
+        {
             let mut bytes = Vec::new();
             bytes.push(PacketType::Gossip as u8);
             digest.encode(&mut bytes);
@@ -1721,13 +1747,18 @@ impl PeerManager {
         // Keep our reflexive binding fresh on the server so peers can find us.
         if self.rendezvous.is_some()
             && (!self.registered_once
-                || now_ms.saturating_sub(self.last_register_ms) >= REG_REFRESH_MS)
+                || now_ms.saturating_sub(self.last_register_ms) >= self.reg_refresh_ms)
         {
             let node = self.local_node_id;
             if let Some(r) = self.rendezvous.as_mut() {
                 self.tick_egress.push(r.register(node));
             }
             self.last_register_ms = now_ms;
+            self.reg_refresh_ms = if self.obf_key.is_some() {
+                jitter_ms(REG_REFRESH_MS)
+            } else {
+                REG_REFRESH_MS
+            };
             self.registered_once = true;
         }
 
@@ -1851,7 +1882,7 @@ impl PeerManager {
                     PeerState::Established(dp)
                 }
                 PeerState::Handshaking(mut handshaking)
-                    if now_ms.saturating_sub(handshaking.last_sent_ms) >= HANDSHAKE_RETRY_MS =>
+                    if now_ms.saturating_sub(handshaking.last_sent_ms) >= handshaking.retry_ms =>
                 {
                     if now_ms.saturating_sub(handshaking.started_ms) >= HANDSHAKE_TOTAL_MS {
                         // Whole attempt window elapsed without completing: the
@@ -1867,6 +1898,11 @@ impl PeerManager {
                         // target the probed `target` address.
                         handshaking.retries = handshaking.retries.saturating_add(1);
                         handshaking.last_sent_ms = now_ms;
+                        handshaking.retry_ms = if self.obf_key.is_some() {
+                            jitter_ms(HANDSHAKE_RETRY_MS)
+                        } else {
+                            HANDSHAKE_RETRY_MS
+                        };
                         if relay {
                             if let Some(d) = self.relay_wrap(i, handshaking.init_pkt.clone()) {
                                 self.tick_egress.push(d);
@@ -1993,6 +2029,33 @@ fn random_pad(max: usize) -> usize {
     let v = u64::from_le_bytes(b);
     let span = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
     usize::try_from(v % span).unwrap_or(0)
+}
+
+/// Draw a value uniformly in `[base - base/4, base + base/4]` (±25%) via the
+/// OS RNG — used to jitter a control-plane timing cadence under `obf_psk` so
+/// repeated fires (handshake retry, registration refresh, gossip digest)
+/// don't emit a clean lockstep inter-arrival signature to a traffic-analysis
+/// observer. Mirrors `random_pad`'s `getrandom` usage.
+///
+/// Callers MUST re-roll and STORE the result after each fire, then compare
+/// the next fire against the stored value — never re-derive/re-roll the
+/// comparison threshold on every tick. A per-tick re-roll would resample the
+/// remaining-time comparison on every poll before it is due, which biases
+/// and compresses the effective interval instead of jittering it.
+///
+/// `base < 4` ⇒ `base` exactly (no `getrandom` call) since `base / 4 == 0`
+/// leaves nothing to jitter; not reached by any of the three cadences this
+/// is applied to (1_000 / 20_000 / 5_000 ms). No numeric `as` casts.
+pub(crate) fn jitter_ms(base: u64) -> u64 {
+    let spread = base / 4;
+    if spread == 0 {
+        return base;
+    }
+    let mut b = [0u8; 8];
+    getrandom::getrandom(&mut b).expect("OS RNG");
+    let v = u64::from_le_bytes(b);
+    let span = spread.saturating_mul(2).saturating_add(1);
+    (base - spread) + (v % span)
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -4031,5 +4094,51 @@ mod tests {
             DispatchOut::None
         ));
         assert_eq!(pm.peers[0].path.candidate(), Some(candidate));
+    }
+
+    // ── 3a: control-cadence jitter ─────────────────────────────────────────
+
+    /// `jitter_ms(1000)` must land in the documented ±25% band and must not
+    /// be a disguised constant (i.e. it actually draws from the OS RNG on
+    /// every call, not just once).
+    #[test]
+    fn jitter_ms_within_bounds_and_not_constant() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let v = jitter_ms(1000);
+            assert!(
+                (750..=1250).contains(&v),
+                "jitter_ms(1000) out of the ±25% band: {v}"
+            );
+            seen.insert(v);
+        }
+        assert!(
+            seen.len() > 1,
+            "jitter_ms(1000) returned the same value on every call across 64 draws"
+        );
+    }
+
+    /// The obf-off proof: every call site gates jitter with
+    /// `if obf_key.is_some() { jitter_ms(base) } else { base }`. With obf off
+    /// (`obf_key: None`) that expression must yield exactly `base` every
+    /// time — never a jittered value — so a timer built from it fires at
+    /// exactly the base interval, byte-identical to pre-3a timing.
+    #[test]
+    fn obf_off_gating_yields_exact_base_interval() {
+        let obf_key: Option<[u8; 16]> = None;
+        for _ in 0..8 {
+            let retry_ms = if obf_key.is_some() {
+                jitter_ms(HANDSHAKE_RETRY_MS)
+            } else {
+                HANDSHAKE_RETRY_MS
+            };
+            let reg_ms = if obf_key.is_some() {
+                jitter_ms(REG_REFRESH_MS)
+            } else {
+                REG_REFRESH_MS
+            };
+            assert_eq!(retry_ms, HANDSHAKE_RETRY_MS);
+            assert_eq!(reg_ms, REG_REFRESH_MS);
+        }
     }
 }
