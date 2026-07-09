@@ -1724,9 +1724,9 @@ impl Dispatch for PeerManager {
         if self.obf_key.is_none() {
             return self.tick_dispatch(now_ms);
         }
-        let mut owned: Vec<EgressDatagram> = match self.tick_dispatch(now_ms) {
-            Some(e) => e.to_vec(),
-            None => return None,
+        let mut owned: Vec<EgressDatagram> = {
+            let e = self.tick_dispatch(now_ms)?;
+            e.to_vec()
         };
         self.obf_egress(&mut owned);
         self.tick_egress = owned;
