@@ -6,7 +6,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-raptorq = "2.0.0"
 yip-wire = { path = "../yip-wire" }
 
 [dev-dependencies]

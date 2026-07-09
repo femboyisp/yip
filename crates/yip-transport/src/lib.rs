@@ -145,7 +145,7 @@ impl Transport {
             .push(symbol)
     }
 
-    /// Generate fresh RaptorQ repair symbols for a previously-sent object,
+    /// Generate fresh FEC repair symbols for a previously-sent object,
     /// carrying the ORIGINAL `object_id` so the receiver's existing decoder
     /// can be topped up rather than starting a new one.
     ///
