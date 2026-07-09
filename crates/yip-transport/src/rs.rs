@@ -167,30 +167,4 @@ mod tests {
             }
         }
     }
-
-    /// Independent-implementation agreement: reed-solomon-erasure recovers the
-    /// same erasure scenarios (recovery success, not byte-identity — matrices differ).
-    #[test]
-    fn reed_solomon_erasure_oracle_agrees() {
-        use reed_solomon_erasure::galois_8::ReedSolomon;
-        let len = 32usize;
-        for (k, r) in [(2usize, 2usize), (3, 2), (4, 1)] {
-            let source: Vec<Vec<u8>> = (0..k)
-                .map(|s| shard(u8::try_from(s).unwrap() + 3, len))
-                .collect();
-            let rse = ReedSolomon::new(k, r).unwrap();
-            let mut shards: Vec<Vec<u8>> = source.clone();
-            shards.extend(std::iter::repeat_n(vec![0u8; len], r));
-            rse.encode(&mut shards).unwrap();
-            // erase the first source shard; reed-solomon-erasure must recover it
-            let mut opt: Vec<Option<Vec<u8>>> = shards.iter().cloned().map(Some).collect();
-            opt[0] = None;
-            rse.reconstruct(&mut opt).unwrap();
-            assert_eq!(
-                opt[0].as_ref().unwrap(),
-                &source[0],
-                "oracle recovers k={k} r={r}"
-            );
-        }
-    }
 }

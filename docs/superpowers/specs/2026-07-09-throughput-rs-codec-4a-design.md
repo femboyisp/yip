@@ -214,10 +214,11 @@ envelope (3a `obf_psk` / 3c.1 QUIC), so the change creates **no new DPI signatur
   reassembler reconstructs the original byte-for-byte. Exhaustive over erasure patterns —
   this *is* the MDS proof for yip's K/R range.
 - **Systematic no-loss test:** all K source shards → reconstruct with zero decode path taken.
-- **Independent cross-check:** `reed-solomon-erasure` as a **dev-dependency** — for the
-  *same* K, R, and erasure sets, confirm an independent RS implementation also recovers.
-  This is a **recovery-success agreement** check (not byte-identity — the generator matrices
-  differ).
+- **Independent cross-check (dropped):** an earlier revision used `reed-solomon-erasure` as
+  a dev-dependency oracle, but it transitively pulls the unmaintained `instant` crate
+  (RUSTSEC-2024-0384), which fails the repo's `cargo-deny` advisories gate. Removed — the
+  exhaustive K-of-(K+R) MDS property test above is a complete, self-contained proof for
+  yip's K/R range and needs no external oracle.
 - **DoS/malformed tests:** port the existing guard tests (zero/oversized `object_size`,
   out-of-range `symbol_index`, late/duplicate symbol, eviction-at-capacity) to the RS
   reassembler, plus new guards: `K == 0`/`K ≥ 255`, wrong codec tag, duplicate-index dedupe.
