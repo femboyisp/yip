@@ -1,5 +1,14 @@
 # Milestone 4a: Throughput — Plan-Cached FEC — Design Spec
 
+> **⚠️ SUPERSEDED (2026-07-09).** The de-risk spike proved plan-caching only reaches
+> ~12 µs (2.1×), not the assumed single-core multi-gigabit collapse: 96% of the residual
+> is the irreducible GF(256) solve over RaptorQ's K′=10 minimum-block padding, which no
+> implementation avoids. A four-track investigation found RaptorQ's ratelessness (the
+> reason for that padding) is never used by yip, and that small-K Reed–Solomon is ~15×
+> faster. This milestone is replaced by
+> [`2026-07-09-throughput-rs-codec-4a-design.md`](2026-07-09-throughput-rs-codec-4a-design.md)
+> (RS codec swap, Stage 1 of the FEC-codec campaign). Kept for the decision trail.
+
 **Status:** draft (under review)
 **Sub-project:** #4 (Throughput & Scalability), milestone 4a.
 

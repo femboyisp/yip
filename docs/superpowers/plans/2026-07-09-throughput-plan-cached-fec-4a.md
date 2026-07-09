@@ -1,5 +1,12 @@
 # Throughput 4a — Plan-Cached FEC Encoder Implementation Plan
 
+> **⚠️ SUPERSEDED (2026-07-09).** Task 1 (the de-risk spike) was executed and gated this
+> plan: plan-caching yields only ~2.1× (26→12 µs), not multi-gigabit — the residual is
+> RaptorQ's irreducible K′=10 padding cost. Superseded by the RS codec swap; see
+> [`../specs/2026-07-09-throughput-rs-codec-4a-design.md`](../specs/2026-07-09-throughput-rs-codec-4a-design.md).
+> Task 1's spike + findings are the durable output; Tasks 2–3 were not executed. Kept for
+> the decision trail.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Eliminate the ~26 µs-per-packet RaptorQ plan regeneration by caching `SourceBlockEncodingPlan` per `symbol_count` in `FecEncoder`, unlocking multi-gigabit single-core throughput while keeping every flow class's proactive repair ratio unchanged.
