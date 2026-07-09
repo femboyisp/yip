@@ -156,6 +156,18 @@ jobs:
               fi
             done
           done
+          # QUIC-mimicry tests (3c.1 Task 6): poll driver ONLY. run_quic
+          # ignores YIP_USE_URING (QUIC is poll-only in 3c.1), so these are
+          # deliberately not part of the poll/uring loop above.
+          for t in quic_tunnel_ping quic_ping_under_loss; do
+            LOG="/tmp/netns-quic-$t.log"
+            echo "running $t with default driver (PollDriver; QUIC ignores YIP_USE_URING)"
+            sudo -E "$BIN" "$t" --exact --nocapture --test-threads=1 2>&1 | tee "$LOG"
+            if grep -q "SKIP $t: needs root" "$LOG"; then
+              echo "::error::netns test $t skipped — runner is not root"
+              exit 1
+            fi
+          done
 
   dpi-undetectability:
     # The anti-DPI undetectability merge gate (3a Task 7): fails the build if

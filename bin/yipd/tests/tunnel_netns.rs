@@ -55,6 +55,58 @@ fn ping_across_yipd_tunnel_under_loss() {
 }
 
 #[test]
+fn quic_tunnel_ping() {
+    // Requires root: netns creation + TUN devices. QUIC is poll-only in 3c.1
+    // (run_quic ignores YIP_USE_URING), so — unlike ping_across_yipd_tunnel —
+    // this test is never exercised under the UringDriver in the netns CI
+    // matrix; see .github/workflows/integration.yml's separate poll-only loop.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP quic_tunnel_ping: needs root");
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-netns-quic.sh");
+    let status = Command::new("bash").arg(script).arg(yipd).status().unwrap();
+    assert!(
+        status.success(),
+        "netns QUIC tunnel ping failed (transport=quic did not connect end-to-end: \
+         outer QUIC handshake, inner yip Noise-IK handshake, or the DATAGRAM-frame pump)"
+    );
+}
+
+#[test]
+fn quic_ping_under_loss() {
+    // Requires root: netns creation + TUN device + tc netem. Poll-only, same
+    // reasoning as quic_tunnel_ping.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP quic_ping_under_loss: needs root");
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-netns-quic-loss.sh");
+    let status = Command::new("bash").arg(script).arg(yipd).status().unwrap();
+    assert!(
+        status.success(),
+        "netns QUIC tunnel ping under 10% loss failed (yip's FEC did not recover \
+         dropped QUIC DATAGRAM frames)"
+    );
+}
+
+#[test]
 fn l2_tap_ping_or_arp_across_tunnel() {
     let is_root = Command::new("id")
         .arg("-u")
