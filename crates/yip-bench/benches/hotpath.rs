@@ -45,7 +45,7 @@ fn bench_fec_and_classify(c: &mut Criterion) {
     let (mut a, _b) = established_pair();
     let inner = sample_inner(1300);
     let sealed = a.seal(&inner).unwrap();
-    let mut tx = Transport::new(vec![]);
+    let mut tx = Transport::new(vec![], 1200);
     c.bench_function("transport_encode_1300", |bn| {
         bn.iter(|| black_box(tx.encode(black_box(&sealed.ciphertext), black_box(&inner), false, 0)))
     });

@@ -163,17 +163,23 @@ impl DataPlane {
     ///
     /// `peer_addr` is this (single) peer's UDP endpoint; it is stamped as
     /// `dst` on every egress datagram this `DataPlane` produces.
+    ///
+    /// `symbol_size` is threaded straight into `Transport::new`, overriding
+    /// every flow class's default RaptorQ symbol size. Raw/obf mode passes
+    /// `1200` (byte-identical to the pre-3c.1 hardcode); QUIC mode (3c.1
+    /// Tasks 4/5) will pass a different value.
     pub fn new(
         established: Established,
         conn_tag: u64,
         mode: TunnelMode,
         peer_addr: SocketAddr,
         obf_on: bool,
+        symbol_size: u16,
     ) -> Self {
         let codec = Codec::new(established.auth_key, established.hp_key);
         Self {
             session: established.session,
-            transport: Transport::new(vec![]),
+            transport: Transport::new(vec![], symbol_size),
             codec,
             conn_tag,
             l2: matches!(mode, TunnelMode::L2Tap),
@@ -687,8 +693,22 @@ mod tests {
         let conn_tag = conn_tag_from_keys(&auth_key, &hp_key);
 
         (
-            DataPlane::new(est_i, conn_tag, mode, TEST_ADDR_B.parse().unwrap(), obf_on),
-            DataPlane::new(est_r, conn_tag, mode, TEST_ADDR_A.parse().unwrap(), obf_on),
+            DataPlane::new(
+                est_i,
+                conn_tag,
+                mode,
+                TEST_ADDR_B.parse().unwrap(),
+                obf_on,
+                1200,
+            ),
+            DataPlane::new(
+                est_r,
+                conn_tag,
+                mode,
+                TEST_ADDR_A.parse().unwrap(),
+                obf_on,
+                1200,
+            ),
         )
     }
 

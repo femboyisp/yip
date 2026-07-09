@@ -94,11 +94,18 @@ pub struct Transport {
     encoder: FecEncoder,
     controllers: [AdaptiveController; 3],
     reassemblers: HashMap<u8, FecReassembler>,
+    /// RaptorQ symbol size applied to every class's [`FlowParams`], overriding
+    /// the per-class default from `FlowClass::params()`. Raw/obf mode passes
+    /// `1200` (byte-identical to the pre-3c.1 hardcode); QUIC mode (Tasks 4/5)
+    /// will pass a different value.
+    symbol_size: u16,
 }
 
 impl Transport {
-    /// Build a transport with the given classifier policy rules.
-    pub fn new(rules: Vec<PolicyRule>) -> Self {
+    /// Build a transport with the given classifier policy rules and RaptorQ
+    /// `symbol_size`, applied to every class's [`FlowParams`] in place of the
+    /// per-class default from `FlowClass::params()`.
+    pub fn new(rules: Vec<PolicyRule>, symbol_size: u16) -> Self {
         Self {
             classifier: Classifier::new(rules),
             encoder: FecEncoder::new(),
@@ -108,7 +115,16 @@ impl Transport {
                 AdaptiveController::new_for(FlowClass::Default.params()),
             ],
             reassemblers: HashMap::new(),
+            symbol_size,
         }
+    }
+
+    /// `class`'s default [`FlowParams`], with `symbol_size` overridden by the
+    /// value this `Transport` was constructed with.
+    fn params_for(&self, class: FlowClass) -> FlowParams {
+        let mut params = class.params();
+        params.symbol_size = self.symbol_size;
+        params
     }
 
     /// Classify `inner`, then FEC-encode the sealed `ciphertext` for that class.
@@ -122,7 +138,7 @@ impl Transport {
         now_ms: u64,
     ) -> (FlowClass, Vec<Symbol>) {
         let class = self.classifier.classify(inner, l2, now_ms);
-        let params = class.params();
+        let params = self.params_for(class);
         let source = u32::try_from(ciphertext.len().div_ceil(usize::from(params.symbol_size)))
             .unwrap_or(u32::MAX)
             .max(1);
@@ -133,7 +149,7 @@ impl Transport {
 
     /// Feed a received symbol for `class`; returns the frame when its object decodes.
     pub fn decode(&mut self, symbol: &Symbol, class: FlowClass) -> Option<Vec<u8>> {
-        let params = class.params();
+        let params = self.params_for(class);
         let idx = u8::try_from(class_index(class)).expect("3 classes");
         self.reassemblers
             .entry(idx)
@@ -154,7 +170,7 @@ impl Transport {
         object_id: u16,
         extra_repair: u32,
     ) -> Vec<Symbol> {
-        let params = class.params();
+        let params = self.params_for(class);
         self.encoder
             .repair_with_id(ciphertext, params, object_id, extra_repair)
     }
@@ -184,8 +200,8 @@ mod tests {
 
     #[test]
     fn transport_encodes_classifies_and_decodes_through_loss() {
-        let mut tx = Transport::new(vec![]);
-        let mut rx = Transport::new(vec![]);
+        let mut tx = Transport::new(vec![], 1200);
+        let mut rx = Transport::new(vec![], 1200);
         // a "sealed ciphertext" blob + the inner packet used only for classification
         let ciphertext: Vec<u8> = (0..4000u32)
             .map(|i| u8::try_from(i % 251).unwrap())
@@ -211,7 +227,7 @@ mod tests {
 
     #[test]
     fn observe_loss_routes_to_correct_class_controller() {
-        let mut t = Transport::new(vec![]);
+        let mut t = Transport::new(vec![], 1200);
         // Feed heavy loss to Bulk class; Realtime and Default ratios should be unaffected
         let bulk_ratio_before = t.controllers[class_index(FlowClass::Bulk)].ratio();
         let realtime_ratio_before = t.controllers[class_index(FlowClass::Realtime)].ratio();
@@ -230,8 +246,8 @@ mod tests {
 
     #[test]
     fn decode_late_symbol_returns_none_after_completion() {
-        let mut tx = Transport::new(vec![]);
-        let mut rx = Transport::new(vec![]);
+        let mut tx = Transport::new(vec![], 1200);
+        let mut rx = Transport::new(vec![], 1200);
         let ciphertext: Vec<u8> = (0..1200u32)
             .map(|i| u8::try_from(i % 251).unwrap())
             .collect();
@@ -253,7 +269,7 @@ mod tests {
 
     #[test]
     fn retransmitted_repair_completes_a_missing_object() {
-        let mut tx = Transport::new(vec![]);
+        let mut tx = Transport::new(vec![], 1200);
         let ct = vec![0x33u8; 2400]; // 2 source symbols
         let (cls, syms) = tx.encode(&ct, &ct, false, 0);
         let oid = syms[0].object_id; // the original object's identity
@@ -261,7 +277,7 @@ mod tests {
                                      // (The class emits 3 symbols — 2 source + 1 proactive repair — so
                                      // skipping a single symbol would still leave enough to decode; feed
                                      // exactly one to guarantee the object is genuinely incomplete.)
-        let mut rx = Transport::new(vec![]);
+        let mut rx = Transport::new(vec![], 1200);
         let mut out = None;
         for s in syms.iter().take(1) {
             out = out.or(rx.decode(s, cls));
@@ -281,7 +297,7 @@ mod tests {
 
     #[test]
     fn classify_ipv6_ef_maps_to_realtime() {
-        let mut tx = Transport::new(vec![]);
+        let mut tx = Transport::new(vec![], 1200);
         let ciphertext = vec![0u8; 100];
         // Construct a minimal IPv6 packet with Traffic Class EF (DSCP 46)
         // IPv6 header: version(4b)=6, TC(8b)=0xB8 (DSCP 46 << 2), Flow(20b), ...
@@ -298,5 +314,31 @@ mod tests {
         inner[43] = 0x88; // port 5000
         let (class, _syms) = tx.encode(&ciphertext, &inner, false, 0);
         assert_eq!(class, FlowClass::Realtime);
+    }
+
+    // ── 3c.1 Task 2: parameterized symbol_size ──────────────────────────────
+
+    /// `Transport::new`'s `symbol_size` overrides every class's `FlowParams`,
+    /// replacing the per-class default from `FlowClass::params()`.
+    #[test]
+    fn transport_new_overrides_symbol_size_for_every_class() {
+        let t = Transport::new(vec![], 1150);
+        for class in [FlowClass::Realtime, FlowClass::Bulk, FlowClass::Default] {
+            assert_eq!(
+                t.params_for(class).symbol_size,
+                1150,
+                "{class:?} FlowParams.symbol_size must be overridden to the constructed value"
+            );
+        }
+    }
+
+    /// `Transport::new(vec![], 1200)` reproduces the pre-3c.1 hardcoded
+    /// default — the byte-identical raw/obf-mode invariant.
+    #[test]
+    fn transport_new_default_symbol_size_is_1200() {
+        let t = Transport::new(vec![], 1200);
+        for class in [FlowClass::Realtime, FlowClass::Bulk, FlowClass::Default] {
+            assert_eq!(t.params_for(class).symbol_size, 1200);
+        }
     }
 }
