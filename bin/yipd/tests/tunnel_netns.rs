@@ -629,3 +629,41 @@ fn dpi_undetectability() {
          known VPN/proxy protocol, or an Obfuscated Traffic risk flag was raised)"
     );
 }
+
+#[test]
+fn flowshape_not_obviously_constant() {
+    // Lightweight deterministic flow-shape structural check (3b Task 7,
+    // Deliverable 2/3) — NOT the nDPId -A ML harness. Packet-count analogue
+    // of 3a's `no_byte_position_is_constant`: for N independent obf-on
+    // sessions (fresh handshake each, both peers bootstrap-initiate and
+    // glare-resolve — see run-flowshape-check.sh's header comment), the
+    // handshake-phase datagram count (measured via inter-packet-gap cutoff,
+    // not by source address, since there is no fixed "initiator" role) must
+    // (a) exceed the junk-free baseline of 2 and (b) take more than one
+    // distinct value across sessions (the Jc in [JUNK_BURST_MIN,
+    // JUNK_BURST_MAX] junk burst on each side is redrawn per handshake, so
+    // the opener's cardinality is not obviously constant). See
+    // run-flowshape-check.sh for the full assertion set.
+    //
+    // Requires root: netns creation + TUN devices + tcpdump.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP flowshape_not_obviously_constant: needs root (run under sudo in CI)");
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-flowshape-check.sh");
+    let status = Command::new("bash").arg(script).arg(yipd).status().unwrap();
+    assert!(
+        status.success(),
+        "flow-shape structural check failed (obf-on handshake opener packet count was not \
+         >2, or was identical across independent sessions — the Jc junk burst is not \
+         reaching the wire as expected)"
+    );
+}
