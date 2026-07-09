@@ -19,6 +19,19 @@ getrandom = "0.2"
 
 [dev-dependencies]
 ed25519-dalek = { version = "2.1", default-features = false }
+# 3c.1 QUIC mimicry Task 1 spike (bin/yipd/examples/quic_spike.rs): sans-IO QUIC state machine
+# (NOT the `quinn` crate -- that pulls in tokio). `rustls-ring` pulls rustls 0.23 configured
+# with the ring crypto provider (matches `rustls`/`rcgen` below).
+# NOTE: currently example-only (dev-dependency, per cargo-shear); Task 4 moves this (and
+# `rustls`/`rcgen`/`bytes` below) to `[dependencies]` once `src/quic.rs` uses it for real.
+quinn-proto = { version = "0.11.16", default-features = false, features = ["rustls-ring"] }
+# Needed directly (not just via quinn-proto) to build the outer QUIC costume's rustls
+# ClientConfig/ServerConfig (accept-any-cert client verifier, throwaway server cert).
+rustls = { version = "0.23.41", default-features = false, features = ["ring", "std", "tls12"] }
+# Throwaway self-signed server cert for the outer QUIC costume (zero-auth by design; the inner
+# yip Noise-IK handshake is the real security -- see 3c.1 spec).
+rcgen = { version = "0.13.2", default-features = false, features = ["ring", "crypto"] }
+bytes = { version = "1", default-features = false }
 
 [lints]
 workspace = true
