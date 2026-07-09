@@ -17,6 +17,8 @@ pub use fec::{FecEncoder, FecReassembler, Symbol};
 
 pub mod gf256;
 
+pub mod rs;
+
 pub mod feedback;
 pub use feedback::{LossReport, MAX_NACK};
 

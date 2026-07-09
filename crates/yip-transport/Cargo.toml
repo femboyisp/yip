@@ -9,6 +9,9 @@ repository.workspace = true
 raptorq = "2.0.0"
 yip-wire = { path = "../yip-wire" }
 
+[dev-dependencies]
+reed-solomon-erasure = "6.0.0"
+
 [lints]
 workspace = true
 
