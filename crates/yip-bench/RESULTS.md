@@ -76,3 +76,29 @@ multi-core sharding to realize it end-to-end).
   the exhaustive MDS property test and `fec` round-trip unit tests), so all
   four legs of the correctness guarantee (field axioms, exhaustive MDS,
   fec round-trip, netns end-to-end) are now confirmed on this run.
+
+## QUIC-vs-raw benchmark (3c.1 Task 7)
+
+Generated: 2026-07-09 14:20:16 UTC
+
+`transport=quic` (real QUIC/TLS1.3 handshake + DATAGRAM-frame pump,
+wrapping the inner yip Noise-IK session — see bin/yipd/src/quic.rs) vs
+yip's default raw-UDP path. Same netns/veth harness as the driver A/B
+RTT test and the iperf3 throughput matrix; `ping -c 100 -i 0.02` for
+RTT, `iperf3 -t 8` for TCP throughput. This is NOT the obf_psk
+cover-traffic premium (3a/3b, a separate cost) — this isolates the QUIC
+mimicry premium alone.
+
+| transport | rtt_avg_ms | tcp_Mbit/s |
+|-----------|------------|------------|
+| raw       | 0.394      | 355        |
+| quic      | 0.438      | 266        |
+
+Honest framing: `transport=quic` is an **opt-in premium** for DPI
+resistance (see `bin/yipd/tests/run-quic-mimicry-oracle.sh` / the
+`quic_classified_as_quic` test for the payoff — a real nDPI
+classification flip to QUIC with no Susp Entropy risk). Raw UDP remains
+yip's low-latency default; the double-encryption/two-layer-handshake
+cost above is what QUIC mimicry spends to buy that payoff (the 3c.1
+Task 1 spike estimated ~1.68x CPU/packet for the QUIC path; the table
+above is the measured RTT/throughput consequence of that cost).

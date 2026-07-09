@@ -156,6 +156,18 @@ jobs:
               fi
             done
           done
+          # QUIC-mimicry tests (3c.1 Task 6): poll driver ONLY. run_quic
+          # ignores YIP_USE_URING (QUIC is poll-only in 3c.1), so these are
+          # deliberately not part of the poll/uring loop above.
+          for t in quic_tunnel_ping quic_ping_under_loss; do
+            LOG="/tmp/netns-quic-$t.log"
+            echo "running $t with default driver (PollDriver; QUIC ignores YIP_USE_URING)"
+            sudo -E "$BIN" "$t" --exact --nocapture --test-threads=1 2>&1 | tee "$LOG"
+            if grep -q "SKIP $t: needs root" "$LOG"; then
+              echo "::error::netns test $t skipped — runner is not root"
+              exit 1
+            fi
+          done
 
   dpi-undetectability:
     # The anti-DPI undetectability merge gate (3a Task 7): fails the build if
@@ -226,3 +238,31 @@ jobs:
           # High entropy is inherent to all encrypted/random payloads
           # (WireGuard trips it too); suppressing it needs TLS/QUIC mimicry,
           # which is milestone 3c, not 3a.
+
+      - name: Run the nDPI QUIC-classification oracle under sudo
+        # 3c.1 Task 7's headline flip: unlike the undetectability oracle above
+        # (proves yip is Unknown to nDPI), this proves a transport=quic yip
+        # flow is POSITIVELY classified as QUIC, with NO Susp Entropy risk —
+        # the concrete proof QUIC mimicry beats the entropy heuristic 3a/3b
+        # could only report on. See run-quic-mimicry-oracle.sh for the full
+        # assertion set.
+        run: |
+          sudo bash bin/yipd/tests/run-quic-mimicry-oracle.sh \
+            "$(pwd)/target/release/yipd" \
+            /tmp/nDPI/example/ndpiReader | tee /tmp/quic-ndpi-oracle.log
+          # Honesty guard, same reasoning as the undetectability oracle above:
+          # this job always runs as sudo and always builds ndpiReader, so a
+          # SKIP here means the harness itself is broken.
+          if grep -q "^SKIP run-quic-mimicry-oracle" /tmp/quic-ndpi-oracle.log; then
+            echo "::error::QUIC-classification oracle skipped — expected root + a built ndpiReader in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/quic-ndpi-oracle.log; then
+            echo "::error::nDPI did not classify yip-over-QUIC traffic as QUIC, or raised a Susp Entropy risk — 3c mimicry regression"
+            exit 1
+          fi
+          # NOTE: "Known Proto on Non Std Port" firing is EXPECTED and NOT
+          # gated here — see run-quic-mimicry-oracle.sh's header comment.
+          # It's the R8 port-plausibility follow-up (yip's default port isn't
+          # 443 yet), tracked for milestone 3d, not an entropy/obfuscation
+          # regression.

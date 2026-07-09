@@ -10,7 +10,7 @@ fn main() {
     let ciphertext = vec![0xCDu8; inner.len() + 16];
 
     // Egress: FEC encode (the suspected dominant cost).
-    let mut tx = Transport::new(vec![]);
+    let mut tx = Transport::new(vec![], 1200);
     let t = Instant::now();
     let mut nsym = 0usize;
     for _ in 0..iters {
@@ -20,7 +20,7 @@ fn main() {
     let enc_us = t.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
 
     // Ingress: FEC decode.
-    let mut rx = Transport::new(vec![]);
+    let mut rx = Transport::new(vec![], 1200);
     let t = Instant::now();
     let mut decoded = 0u32;
     for _ in 0..iters {

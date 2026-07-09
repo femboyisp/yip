@@ -336,6 +336,12 @@ pub struct PeerManager {
     /// hide it, and junk-in-the-clear would be worse than silence). Set once,
     /// before the event loop starts, via [`PeerManager::set_cover_traffic_ms`].
     cover_traffic_ms: Option<u64>,
+    /// RaptorQ symbol size passed to `DataPlane::new` at every establish site
+    /// (3c.1 Task 2). Defaults to `1200` — the pre-3c.1 hardcode, byte-identical
+    /// for raw/obf mode. QUIC mode (3c.1 Tasks 4/5) overrides it via
+    /// [`PeerManager::set_data_symbol_size`], set once before the event loop
+    /// starts, like `obf_key`/`cover_traffic_ms`.
+    data_symbol_size: u16,
 }
 
 /// MTU budget (bytes) used to size obfuscation padding: handshakes are padded
@@ -356,6 +362,10 @@ const JUNK_MAX_LEN: usize = 1024;
 /// relayed) (Task 3).
 const JUNK_BURST_MIN: u64 = 3;
 const JUNK_BURST_MAX: u64 = 12;
+/// Default RaptorQ symbol size passed to every `DataPlane` (3c.1 Task 2) —
+/// the pre-3c.1 hardcode, byte-identical for raw/obf mode. QUIC mode (3c.1
+/// Tasks 4/5) overrides it via [`PeerManager::set_data_symbol_size`].
+const DEFAULT_DATA_SYMBOL_SIZE: u16 = 1200;
 
 impl PeerManager {
     /// Build a `PeerManager` from the local keypair and the configured peer
@@ -422,6 +432,7 @@ impl PeerManager {
             obf_key: None,
             junk_rng: yip_obf::XorShift64::from_getrandom(),
             cover_traffic_ms: None,
+            data_symbol_size: DEFAULT_DATA_SYMBOL_SIZE,
         };
         // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
         // exactly like configured peers: seed them into the peer table so an
@@ -504,6 +515,14 @@ impl PeerManager {
     /// keeps the existing `PeerManager::new` call sites untouched.
     pub fn set_cover_traffic_ms(&mut self, cover_traffic_ms: Option<u64>) {
         self.cover_traffic_ms = cover_traffic_ms;
+    }
+
+    /// Set the RaptorQ symbol size passed to `DataPlane::new` at every
+    /// establish site (3c.1 Task 2). Defaults to `1200`; QUIC mode (3c.1 Task 4)
+    /// calls this with the QUIC-safe symbol size (see `quic::run_quic`) before
+    /// the event loop begins, like `set_obf_psk`/`set_cover_traffic_ms`.
+    pub fn set_data_symbol_size(&mut self, s: u16) {
+        self.data_symbol_size = s;
     }
 
     /// This node's own self-certifying mesh address, for assigning the
@@ -809,6 +828,7 @@ impl PeerManager {
                     self.mode,
                     placeholder,
                     self.obf_key.is_some(),
+                    self.data_symbol_size,
                 ));
 
                 self.peers[idx].session_obf_key = sess_obf;
@@ -867,6 +887,7 @@ impl PeerManager {
                     self.mode,
                     placeholder,
                     self.obf_key.is_some(),
+                    self.data_symbol_size,
                 ));
                 self.by_tag.insert(dp.conn_tag(), idx);
                 self.peers[idx].session_obf_key = sess_obf;
@@ -1235,6 +1256,7 @@ impl PeerManager {
                     self.mode,
                     src,
                     self.obf_key.is_some(),
+                    self.data_symbol_size,
                 ));
 
                 self.peers[idx].session_obf_key = sess_obf;
@@ -1313,6 +1335,7 @@ impl PeerManager {
                     self.mode,
                     src,
                     self.obf_key.is_some(),
+                    self.data_symbol_size,
                 ));
                 self.by_tag.insert(dp.conn_tag(), idx);
                 self.peers[idx].session_obf_key = sess_obf;
@@ -1724,10 +1747,7 @@ impl Dispatch for PeerManager {
         if self.obf_key.is_none() {
             return self.tick_dispatch(now_ms);
         }
-        let mut owned: Vec<EgressDatagram> = {
-            let e = self.tick_dispatch(now_ms)?;
-            e.to_vec()
-        };
+        let mut owned: Vec<EgressDatagram> = self.tick_dispatch(now_ms)?.to_vec();
         self.obf_egress(&mut owned);
         self.tick_egress = owned;
         Some(&self.tick_egress)
@@ -2267,7 +2287,14 @@ mod tests {
             auth_key,
             hp_key,
         };
-        DataPlane::new(established, conn_tag, TunnelMode::L3Tun, peer_addr, false)
+        DataPlane::new(
+            established,
+            conn_tag,
+            TunnelMode::L3Tun,
+            peer_addr,
+            false,
+            1200,
+        )
     }
 
     #[test]
@@ -2452,6 +2479,21 @@ mod tests {
         let local_pub = [42u8; 32];
         let pm = PeerManager::new([1u8; 32], local_pub, &[], TunnelMode::L3Tun, None, None);
         assert_eq!(pm.local_addr(), node_addr(&local_pub));
+    }
+
+    // ── 3c.1 Task 2: parameterized symbol_size ──────────────────────────────
+
+    /// `PeerManager::new` defaults `data_symbol_size` to `1200` — the pre-3c.1
+    /// hardcode, byte-identical for raw/obf mode — and `set_data_symbol_size`
+    /// overrides it (wired to `DataPlane::new` at every establish site; QUIC
+    /// mode plumbing lands in 3c.1 Tasks 4/5).
+    #[test]
+    fn data_symbol_size_defaults_to_1200_and_is_settable() {
+        let mut pm = PeerManager::new([1u8; 32], [2u8; 32], &[], TunnelMode::L3Tun, None, None);
+        assert_eq!(pm.data_symbol_size, DEFAULT_DATA_SYMBOL_SIZE);
+        assert_eq!(pm.data_symbol_size, 1200);
+        pm.set_data_symbol_size(1350);
+        assert_eq!(pm.data_symbol_size, 1350);
     }
 
     /// The `conn_tag` of a peer's Established session, or `None` if it is not
@@ -3958,8 +4000,15 @@ mod tests {
         };
         let any: SocketAddr = "0.0.0.0:0".parse().unwrap();
         (
-            DataPlane::new(est_i, conn_tag, TunnelMode::L3Tun, any, false),
-            DataPlane::new(est_r, conn_tag, TunnelMode::L3Tun, resp_peer_addr, false),
+            DataPlane::new(est_i, conn_tag, TunnelMode::L3Tun, any, false, 1200),
+            DataPlane::new(
+                est_r,
+                conn_tag,
+                TunnelMode::L3Tun,
+                resp_peer_addr,
+                false,
+                1200,
+            ),
             hp_key,
             conn_tag,
         )
