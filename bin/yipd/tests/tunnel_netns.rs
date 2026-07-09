@@ -361,6 +361,35 @@ fn obfuscated_ping() {
 }
 
 #[test]
+fn obfuscated_ping_with_cover() {
+    // Only run as root (the script needs netns + TUN).
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP obfuscated_ping_with_cover: needs root (run under sudo in CI)");
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-netns-tunnel.sh");
+    let status = Command::new("bash")
+        .arg(script)
+        .arg(yipd)
+        .env("OBF_PSK", OBF_PSK)
+        .env("COVER_MS", "200")
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "netns tunnel ping with obf_psk + cover_traffic_ms set failed (junk/cover broke direct connectivity)"
+    );
+}
+
+#[test]
 fn obf_psk_mismatch_no_connection() {
     // Only run as root (the script needs netns + TUN).
     let is_root = Command::new("id")
