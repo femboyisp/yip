@@ -140,12 +140,28 @@ pub fn run(config: Config) -> io::Result<()> {
     // ── run the selected event loop ───────────────────────────────────────────
     // `tun` and `sock` are kept alive on the stack here, so `tun_fd` and
     // `udp_fd` remain valid for the duration of the selected driver loop.
-    // Default to the epoll `PollDriver`: on measurement it is the faster path
-    // (lower tunnel RTT — the north-star metric) and is safe Rust. The
-    // `UringDriver` currently regresses RTT with no throughput upside and is the
-    // workspace's only `unsafe`, so it is opt-in via `YIP_USE_URING=1` for A/B
-    // work until it beats epoll (SQPOLL / working GSO batching) and re-benchmarks
-    // favourably. See crates/yip-bench/README.md "io_uring Phase B — driver A/B".
+    //
+    // QUIC-mimicry mode (`transport=quic`, 3c.1): drive the dedicated
+    // `run_quic` pump, which carries yip's UNCHANGED inner protocol inside QUIC
+    // DATAGRAM frames. It takes ownership of `sock` (recvfrom/sendto) and the
+    // raw `tun_fd`; the connection role for each peer is decided by static-key
+    // order inside `run_quic`. QUIC provides its own wire obfuscation, so
+    // `obf_psk`/`cover_traffic_ms` are rejected alongside it at config-parse.
+    if config.transport == crate::config::TransportMode::Quic {
+        let quic_peers: Vec<([u8; 32], std::net::SocketAddr)> = config
+            .peers
+            .iter()
+            .filter_map(|p| p.endpoint.map(|ep| (p.public_key, ep)))
+            .collect();
+        return crate::quic::run_quic(sock, tun_fd, &mut manager, config.local_public, &quic_peers);
+    }
+
+    // Raw-UDP mode. Default to the epoll `PollDriver`: on measurement it is the
+    // faster path (lower tunnel RTT — the north-star metric) and is safe Rust.
+    // The `UringDriver` currently regresses RTT with no throughput upside and is
+    // the workspace's only `unsafe`, so it is opt-in via `YIP_USE_URING=1` for
+    // A/B work until it beats epoll (SQPOLL / working GSO batching) and
+    // re-benchmarks favourably. See crates/yip-bench/README.md "io_uring Phase B".
     if std::env::var_os("YIP_USE_URING").is_some() && yip_io::uring::uring_available() {
         yip_io::uring::run_uring(udp_fd, tun_fd, &mut manager)
     } else {

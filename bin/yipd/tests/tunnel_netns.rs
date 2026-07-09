@@ -55,6 +55,58 @@ fn ping_across_yipd_tunnel_under_loss() {
 }
 
 #[test]
+fn quic_tunnel_ping() {
+    // Requires root: netns creation + TUN devices. QUIC is poll-only in 3c.1
+    // (run_quic ignores YIP_USE_URING), so — unlike ping_across_yipd_tunnel —
+    // this test is never exercised under the UringDriver in the netns CI
+    // matrix; see .github/workflows/integration.yml's separate poll-only loop.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP quic_tunnel_ping: needs root");
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-netns-quic.sh");
+    let status = Command::new("bash").arg(script).arg(yipd).status().unwrap();
+    assert!(
+        status.success(),
+        "netns QUIC tunnel ping failed (transport=quic did not connect end-to-end: \
+         outer QUIC handshake, inner yip Noise-IK handshake, or the DATAGRAM-frame pump)"
+    );
+}
+
+#[test]
+fn quic_ping_under_loss() {
+    // Requires root: netns creation + TUN device + tc netem. Poll-only, same
+    // reasoning as quic_tunnel_ping.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP quic_ping_under_loss: needs root");
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-netns-quic-loss.sh");
+    let status = Command::new("bash").arg(script).arg(yipd).status().unwrap();
+    assert!(
+        status.success(),
+        "netns QUIC tunnel ping under 10% loss failed (yip's FEC did not recover \
+         dropped QUIC DATAGRAM frames)"
+    );
+}
+
+#[test]
 fn l2_tap_ping_or_arp_across_tunnel() {
     let is_root = Command::new("id")
         .arg("-u")
@@ -627,6 +679,55 @@ fn dpi_undetectability() {
         status.success(),
         "nDPI undetectability oracle failed (obfuscated yip traffic was classified as a \
          known VPN/proxy protocol, or an Obfuscated Traffic risk flag was raised)"
+    );
+}
+
+#[test]
+fn quic_classified_as_quic() {
+    // The 3c.1 headline flip (Task 7): unlike `dpi_undetectability` (3a),
+    // which proves yip is `Unknown` to nDPI, this proves a `transport=quic`
+    // yip flow is POSITIVELY classified as QUIC — and that the
+    // `NDPI_SUSPICIOUS_ENTROPY` risk 3a/3b could only report on (never
+    // suppress) is actually absent. See run-quic-mimicry-oracle.sh for the
+    // full assertion set (including why `Known Proto on Non Std Port` is
+    // reported, not gated — that's the R8/3d port-plausibility follow-up).
+    //
+    // Requires root: netns creation + TUN devices + tcpdump.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP quic_classified_as_quic: needs root (run under sudo in CI)");
+        return;
+    }
+    let ndpi = ndpi_reader_bin();
+    if !ndpi.exists() {
+        eprintln!(
+            "SKIP quic_classified_as_quic: ndpiReader binary not found at {}; \
+             build it from refrences/nDPI (autogen.sh && ./configure && make) first",
+            ndpi.display()
+        );
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/run-quic-mimicry-oracle.sh"
+    );
+    let status = Command::new("bash")
+        .arg(script)
+        .arg(yipd)
+        .arg(&ndpi)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "nDPI QUIC-classification oracle failed (the flow was not classified as QUIC, or \
+         a Susp Entropy risk flag was raised — the 3c mimicry win regressed)"
     );
 }
 

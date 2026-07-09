@@ -16,12 +16,23 @@ yip-membership = { path = "../../crates/yip-membership" }
 yip-obf = { path = "../../crates/yip-obf" }
 blake2 = { workspace = true }
 getrandom = "0.2"
+# 3c.1 QUIC mimicry (bin/yipd/src/quic.rs): the sans-IO QUIC state machine
+# (NOT the `quinn` crate -- that pulls in tokio). `rustls-ring` pulls rustls 0.23 configured
+# with the ring crypto provider (matches `rustls`/`rcgen` below). Drives yip's unchanged inner
+# Noise-IK/FEC/AEAD protocol inside RFC 9221 DATAGRAM frames (the outer QUIC is a throwaway
+# costume; the inner yip handshake is the real security). Proven out by the Task-1 spike
+# (bin/yipd/examples/quic_spike.rs); Task 4 promoted these from dev-deps to real deps.
+quinn-proto = { version = "0.11.16", default-features = false, features = ["rustls-ring"] }
+# Needed directly (not just via quinn-proto) to build the outer QUIC costume's rustls
+# ClientConfig/ServerConfig (accept-any-cert client verifier, throwaway server cert).
+rustls = { version = "0.23.41", default-features = false, features = ["ring", "std", "tls12"] }
+# Throwaway self-signed server cert for the outer QUIC costume (zero-auth by design; the inner
+# yip Noise-IK handshake is the real security -- see 3c.1 spec).
+rcgen = { version = "0.13.2", default-features = false, features = ["ring", "crypto"] }
+bytes = { version = "1", default-features = false }
 
 [dev-dependencies]
 ed25519-dalek = { version = "2.1", default-features = false }
 
 [lints]
 workspace = true
-
-[package.metadata.cargo-shear]
-ignored = ["yip-io"]

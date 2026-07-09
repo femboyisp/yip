@@ -3,6 +3,7 @@
 //! contain `unsafe`; every `unsafe` block must carry a `// SAFETY:` comment.
 
 pub mod addr;
+pub mod epoll;
 pub mod poll;
 pub mod uring;
 
