@@ -595,21 +595,19 @@ impl PeerManager {
         // Direct-path junk burst (Task 3): obfuscation on, not relayed. The
         // relay path keeps its single-datagram shape — relay-path junk would
         // need a different (RelaySend) envelope and is out of scope here.
-        if !via_relay {
-            if let Some(network_key) = self.obf_key {
-                let jc = self.junk_rng.gen_range(JUNK_BURST_MIN, JUNK_BURST_MAX);
-                let jc = usize::try_from(jc).expect("JUNK_BURST_MAX fits usize");
-                let mut dgs = Vec::with_capacity(jc + 1);
-                for _ in 0..jc {
-                    dgs.push(EgressDatagram {
-                        fate: 0,
-                        dst: target,
-                        bytes: self.build_junk(&network_key),
-                    });
-                }
-                dgs.push(dg);
-                return Some(dgs);
+        if !via_relay && self.obf_key.is_some() {
+            let jc = self.junk_rng.gen_range(JUNK_BURST_MIN, JUNK_BURST_MAX);
+            let jc = usize::try_from(jc).expect("JUNK_BURST_MAX fits usize");
+            let mut dgs = Vec::with_capacity(jc + 1);
+            for _ in 0..jc {
+                dgs.push(EgressDatagram {
+                    fate: 0,
+                    dst: target,
+                    bytes: self.build_junk(),
+                });
             }
+            dgs.push(dg);
+            return Some(dgs);
         }
         Some(vec![dg])
     }
@@ -1517,21 +1515,24 @@ impl PeerManager {
         None
     }
 
-    /// Build a decoy/junk datagram: a throwaway body of random length in
-    /// `[JUNK_MIN_LEN, JUNK_MAX_LEN]`, filled from `junk_rng` (content is
-    /// irrelevant — masked by `obfuscate`), wrapped under `key` and
-    /// [`yip_obf::JUNK_TYPE`] with the usual data padding. The receiver
-    /// recovers `(JUNK_TYPE, _)` via `yip_obf::deobfuscate` and drops it (see
-    /// `deobf_ingress`) — junk never touches Noise/AEAD/session state. Only
-    /// meaningful on the obfuscation-enabled path (callers hold a key only
-    /// when `obf_key.is_some()`).
-    fn build_junk(&mut self, key: &[u8; 16]) -> Vec<u8> {
+    /// Build a plaintext JUNK decoy datagram `[JUNK_TYPE][random body]`. The
+    /// caller's `obf_egress` pass wraps it once (network key for a
+    /// handshake-burst dst, session key for an established-peer cover dst) —
+    /// do NOT pre-obfuscate here, or it would be double-wrapped. Body length
+    /// is random in `[JUNK_MIN_LEN, JUNK_MAX_LEN]`, drawn from `junk_rng`
+    /// (content is irrelevant — masked once `obf_egress` wraps it). The
+    /// receiver recovers `(JUNK_TYPE, _)` via a single `yip_obf::deobfuscate`
+    /// and drops it (see `deobf_ingress`) — junk never touches
+    /// Noise/AEAD/session state. Only meaningful on the obfuscation-enabled
+    /// path (`begin_handshake` only calls this when `obf_key.is_some()`).
+    fn build_junk(&mut self) -> Vec<u8> {
         let lo = u64::try_from(JUNK_MIN_LEN).expect("JUNK_MIN_LEN fits u64");
         let hi = u64::try_from(JUNK_MAX_LEN).expect("JUNK_MAX_LEN fits u64");
         let len = usize::try_from(self.junk_rng.gen_range(lo, hi)).expect("gen_range in usize");
-        let mut body = vec![0u8; len];
-        self.junk_rng.fill(&mut body);
-        yip_obf::obfuscate(key, yip_obf::JUNK_TYPE, &body, random_pad(OBF_DATA_PAD_MAX))
+        let mut out = vec![0u8; 1 + len];
+        out[0] = yip_obf::JUNK_TYPE;
+        self.junk_rng.fill(&mut out[1..]);
+        out
     }
 
     /// The obfuscation key to wrap an egress datagram to `dst` whose plaintext
@@ -3998,21 +3999,26 @@ mod tests {
         assert!(pm.by_tag.is_empty());
     }
 
-    /// (3b-a) `build_junk(key)` produces an envelope that `yip_obf::deobfuscate`
-    /// recovers as `(JUNK_TYPE, _)` under that same key — the builder and the
-    /// drop arm agree on the wire format.
+    /// (3b-a) `build_junk()` produces a PLAINTEXT `[JUNK_TYPE][body]`
+    /// datagram, `JUNK_MIN_LEN..=JUNK_MAX_LEN` bytes of body — it must NOT
+    /// pre-obfuscate, since the caller's `obf_egress` pass wraps it exactly
+    /// once (double-wrapping would defeat the JUNK_TYPE recognition on
+    /// ingress; see `single_wrap_...` below for the full round-trip).
     #[test]
     fn build_junk_roundtrips_to_junk_type() {
         let peer = peer_cfg(5, "10.0.0.5:5000");
         let mut pm = PeerManager::new([1u8; 32], [2u8; 32], &[peer], TunnelMode::L3Tun, None, None);
-        let key = [0x55u8; 16];
 
-        let dg = pm.build_junk(&key);
-        let (ptype, body) = yip_obf::deobfuscate(&key, &dg).expect("build_junk key round-trips");
-        assert_eq!(ptype, yip_obf::JUNK_TYPE);
+        let dg = pm.build_junk();
+        assert_eq!(
+            dg[0],
+            yip_obf::JUNK_TYPE,
+            "leading byte is the plaintext JUNK_TYPE"
+        );
+        let body_len = dg.len() - 1;
         assert!(
-            body.len() >= JUNK_MIN_LEN,
-            "recovered body includes the >= JUNK_MIN_LEN junk fill"
+            (JUNK_MIN_LEN..=JUNK_MAX_LEN).contains(&body_len),
+            "body length is within [JUNK_MIN_LEN, JUNK_MAX_LEN], got {body_len}"
         );
     }
 
@@ -4033,7 +4039,11 @@ mod tests {
         pm.peers[0].session_obf_key = Some(sess);
         pm.by_tag.insert(TAG, 0);
 
-        let junk = pm.build_junk(&sess);
+        // `build_junk()` itself is plaintext now (single-wrapped by
+        // `obf_egress` on the real egress path); reproduce that one wrap by
+        // hand here to get wire-format bytes for `on_udp`'s ingress test.
+        let plain = pm.build_junk();
+        let junk = yip_obf::obfuscate(&sess, yip_obf::JUNK_TYPE, &plain[1..], 0);
         let before_tag = pm.by_tag.get(&TAG).copied();
 
         let out = pm.on_udp(peer_ep, &junk, 0);
@@ -4062,7 +4072,10 @@ mod tests {
         pm.set_obf_psk(Some(psk));
         let obf_key = yip_obf::derive_key(&psk);
 
-        let junk = pm.build_junk(&obf_key);
+        // Same rationale as the session-keyed test above: `build_junk()` is
+        // plaintext, so wrap it once by hand to get wire-format bytes.
+        let plain = pm.build_junk();
+        let junk = yip_obf::obfuscate(&obf_key, yip_obf::JUNK_TYPE, &plain[1..], 0);
         let src: SocketAddr = "203.0.113.55:5555".parse().unwrap();
         assert!(matches!(pm.on_udp(src, &junk, 0), DispatchOut::None));
         assert!(matches!(pm.peers[0].state, PeerState::Idle));
@@ -4094,9 +4107,10 @@ mod tests {
 
     /// With obfuscation on and a direct (non-relay) handshake,
     /// `begin_handshake` returns `Jc ∈ [JUNK_BURST_MIN, JUNK_BURST_MAX]` junk
-    /// datagrams — each deobfuscating to `yip_obf::JUNK_TYPE` under the
-    /// network `obf_key` — followed by exactly one real `HandshakeInit`, all
-    /// addressed to `target`.
+    /// datagrams — each a PLAINTEXT `[JUNK_TYPE][body]` (obfuscation happens
+    /// one layer up, in `obf_egress`; see `single_wrap_...` below for the
+    /// wrapped round-trip) — followed by exactly one real `HandshakeInit`,
+    /// all addressed to `target`.
     #[test]
     fn begin_handshake_obf_on_direct_emits_junk_burst_then_init() {
         let peer = peer_cfg(9, "10.0.0.9:9000");
@@ -4110,7 +4124,6 @@ mod tests {
         );
         let psk = [0x99u8; 32];
         pm.set_obf_psk(Some(psk));
-        let network_key = yip_obf::derive_key(&psk);
         let target: SocketAddr = "203.0.113.9:9000".parse().unwrap();
 
         let dgs = pm
@@ -4131,9 +4144,11 @@ mod tests {
         let (junk, init) = dgs.split_at(dgs.len() - 1);
         assert!(!junk.is_empty(), "at least JUNK_BURST_MIN junk datagrams");
         for j in junk {
-            let (ptype, _body) = yip_obf::deobfuscate(&network_key, &j.bytes)
-                .expect("junk deobfuscates under the network key");
-            assert_eq!(ptype, yip_obf::JUNK_TYPE, "junk datagram carries JUNK_TYPE");
+            assert_eq!(
+                j.bytes[0],
+                yip_obf::JUNK_TYPE,
+                "junk datagram is plaintext [JUNK_TYPE][body] pre-obf_egress"
+            );
         }
         // The real Init is last, still the plaintext `[PacketType]‖msg1`
         // framing `begin_handshake` has always produced (wrapping under
@@ -4222,6 +4237,70 @@ mod tests {
         assert_eq!(dgs.len(), 1, "relay path never emits junk (Task 3 scope)");
         assert_eq!(dgs[0].dst, server);
         assert!(pm.peers[0].relay, "peer marked relay-routed");
+    }
+
+    /// End-to-end single-wrap proof — the actual bug this fix addresses.
+    /// Drives the real egress path (`on_tun` on an Idle peer, obf on), so
+    /// `begin_handshake`'s junk burst flows through the caller's `obf_egress`
+    /// pass exactly once, same as production. Before the fix, `build_junk`
+    /// pre-obfuscated its output and `obf_egress` wrapped it a *second* time,
+    /// so a single `deobfuscate` on the wire bytes recovered a garbage ptype
+    /// (the leading byte of the *inner* envelope's random nonce, not
+    /// `JUNK_TYPE`) — junk still got silently dropped, but via the generic
+    /// unrecognized-ptype path rather than the dedicated `JUNK_TYPE` arm.
+    /// Assert every datagram actually on the wire recovers under exactly one
+    /// `yip_obf::deobfuscate(&network_key, _)` call, that at least
+    /// `JUNK_BURST_MIN` of them decode to `JUNK_TYPE`, and exactly one
+    /// decodes to a non-empty `HandshakeInit`.
+    #[test]
+    fn junk_burst_is_single_wrapped_end_to_end() {
+        let peer = peer_cfg(12, "10.0.0.12:12000");
+        let mut pm = PeerManager::new(
+            [15u8; 32],
+            [16u8; 32],
+            &[peer],
+            TunnelMode::L3Tun,
+            None,
+            None,
+        );
+        let psk = [0xCCu8; 32];
+        pm.set_obf_psk(Some(psk));
+        let network_key = yip_obf::derive_key(&psk);
+
+        let wire = pm.on_tun(&dummy_tun_pkt(), 0).to_vec();
+        assert!(!wire.is_empty(), "the first TUN packet starts a handshake");
+
+        let mut junk_count = 0usize;
+        let mut init_count = 0usize;
+        for d in &wire {
+            assert!(
+                d.bytes.len() <= OBF_MTU_BUDGET,
+                "wrapped datagram must stay within OBF_MTU_BUDGET, got {}",
+                d.bytes.len()
+            );
+            let (ptype, body) = yip_obf::deobfuscate(&network_key, &d.bytes).expect(
+                "every emitted datagram must recover under a SINGLE deobfuscate \
+                 call — a double-wrap would leave the outer envelope's random \
+                 ptype/len/body inconsistent or simply wrong",
+            );
+            if ptype == yip_obf::JUNK_TYPE {
+                junk_count += 1;
+            } else if ptype == PacketType::HandshakeInit as u8 {
+                init_count += 1;
+                assert!(!body.is_empty(), "the real Init carries msg1 bytes");
+            } else {
+                panic!(
+                    "unexpected ptype {ptype} on the wire — this is exactly the \
+                     symptom of the double-wrap bug (single deobfuscate peeling \
+                     only the outer layer)"
+                );
+            }
+        }
+        assert!(
+            junk_count >= usize::try_from(JUNK_BURST_MIN).expect("fits usize"),
+            "at least JUNK_BURST_MIN junk datagrams, got {junk_count}"
+        );
+        assert_eq!(init_count, 1, "exactly one real HandshakeInit");
     }
 
     /// (d) With obfuscation OFF (no `set_obf_psk`), `on_udp` runs the unchanged
