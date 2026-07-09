@@ -67,6 +67,13 @@ pub struct Config {
     /// `yip_obf::derive_key` once Tasks 3/4 wire obfuscation into the wire
     /// path; this task only parses it.
     pub obf_psk: Option<[u8; 32]>,
+    /// Opt-in idle cover-traffic interval in milliseconds
+    /// (`cover_traffic_ms=<u64>`). Absent (`None`, the default) means no
+    /// cover traffic is emitted. Only meaningful when `obf_psk` is also
+    /// configured — `PeerManager` gates emission on both. A configured value
+    /// of `0` is rejected as invalid (there is no such thing as a zero-length
+    /// idle interval).
+    pub cover_traffic_ms: Option<u64>,
 }
 
 // ── hex decode helper ─────────────────────────────────────────────────────────
@@ -226,6 +233,7 @@ impl Config {
         let mut member_sign_private: Option<[u8; 32]> = None;
         let mut network_id: Option<[u8; 16]> = None;
         let mut obf_psk: Option<[u8; 32]> = None;
+        let mut cover_traffic_ms: Option<u64> = None;
 
         for line in text.lines() {
             let line = line.trim();
@@ -286,6 +294,18 @@ impl Config {
                 "member_sign_private" => member_sign_private = Some(hex_to_32(val)?),
                 "network_id" => network_id = Some(hex_to_16(val)?),
                 "obf_psk" => obf_psk = Some(hex_to_32(val)?),
+                "cover_traffic_ms" => {
+                    let ms = val
+                        .parse::<u64>()
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    if ms == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "cover_traffic_ms must be non-zero",
+                        ));
+                    }
+                    cover_traffic_ms = Some(ms);
+                }
                 // Silently ignore unknown keys for forward-compatibility. The
                 // netns config files still contain `initiate=true|false` from
                 // before Task 5 removed the field; this is intentional so
@@ -360,6 +380,7 @@ impl Config {
             member_sign_private,
             network_id,
             obf_psk,
+            cover_traffic_ms,
         })
     }
 }
@@ -923,6 +944,52 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
                     peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n";
         assert_eq!(Config::parse(text).unwrap().obf_psk, None);
+    }
+
+    // ── cover_traffic_ms (3b Task 4) ────────────────────────────────────
+
+    #[test]
+    fn parses_cover_traffic_ms_when_present() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    cover_traffic_ms=250\n";
+        let cfg = Config::parse(text).unwrap();
+        assert_eq!(cfg.cover_traffic_ms, Some(250));
+    }
+
+    #[test]
+    fn cover_traffic_ms_absent_is_none() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n";
+        assert_eq!(Config::parse(text).unwrap().cover_traffic_ms, None);
+    }
+
+    #[test]
+    fn cover_traffic_ms_zero_is_parse_error() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    cover_traffic_ms=0\n";
+        let err = Config::parse(text).unwrap_err();
+        assert!(
+            err.to_string().contains("non-zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn cover_traffic_ms_non_integer_is_parse_error() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    cover_traffic_ms=abc\n";
+        assert!(Config::parse(text).is_err());
     }
 
     #[test]

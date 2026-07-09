@@ -106,6 +106,9 @@ pub fn run(config: Config) -> io::Result<()> {
     // Enable anti-DPI obfuscation (3a) when the network `obf_psk` is configured.
     // `None` leaves the manager on the byte-identical 2a/2b/2c plaintext path.
     manager.set_obf_psk(config.obf_psk);
+    // Opt-in idle cover traffic (3b Task 4): a no-op unless obf is also on
+    // (`PeerManager::tick_dispatch` gates cover emission on both).
+    manager.set_cover_traffic_ms(config.cover_traffic_ms);
     let local_addr = manager.local_addr();
 
     // ── create the tunnel device (TUN or TAP) ────────────────────────────────

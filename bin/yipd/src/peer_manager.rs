@@ -237,6 +237,19 @@ struct Peer {
     /// this peer's Data/Control/Gossip datagrams (3a). Independent of the
     /// network-wide `obf_psk` key, which wraps handshakes (pre-session).
     session_obf_key: Option<[u8; 16]>,
+    /// Monotonic `now_ms` timestamp of the last REAL Data datagram sent to or
+    /// received from this peer (3b Task 4). Updated at the on_tun →
+    /// `DataPlane` data-egress site and the `Data`-ptype arm of the ingress
+    /// dispatch — never by control/gossip/junk. Defaults to `0`, so a
+    /// freshly-`Established` peer that has carried no real traffic yet reads
+    /// as idle immediately (cover starts right away, matching "the flow
+    /// never goes tellingly silent"). Drives the idle gate in `tick_dispatch`'s
+    /// cover-traffic emission; irrelevant when `cover_traffic_ms` is unset.
+    last_activity_ms: u64,
+    /// Monotonic `now_ms` timestamp of the last cover (junk) datagram emitted
+    /// to this peer (3b Task 4). Defaults to `0`. Bounds cover emission to at
+    /// most one datagram per peer per `cover_traffic_ms` interval.
+    last_cover_ms: u64,
 }
 
 /// Multi-peer router/demuxer + lazy in-loop handshake driver.
@@ -317,6 +330,12 @@ pub struct PeerManager {
     /// for any security decision (junk bytes are keystream-masked by
     /// `yip_obf::obfuscate`, so their content is irrelevant).
     junk_rng: yip_obf::XorShift64,
+    /// Opt-in idle cover-traffic interval (3b Task 4), or `None` to disable.
+    /// Only consulted when `obf_key.is_some()` — with obfuscation off, cover
+    /// traffic never fires regardless of this value (there is no wrapper to
+    /// hide it, and junk-in-the-clear would be worse than silence). Set once,
+    /// before the event loop starts, via [`PeerManager::set_cover_traffic_ms`].
+    cover_traffic_ms: Option<u64>,
 }
 
 /// MTU budget (bytes) used to size obfuscation padding: handshakes are padded
@@ -379,6 +398,8 @@ impl PeerManager {
                 relay: false,
                 last_lookup_ms: None,
                 session_obf_key: None,
+                last_activity_ms: 0,
+                last_cover_ms: 0,
             });
         }
         let mut mgr = Self {
@@ -400,6 +421,7 @@ impl PeerManager {
             tun_scratch: Vec::new(),
             obf_key: None,
             junk_rng: yip_obf::XorShift64::from_getrandom(),
+            cover_traffic_ms: None,
         };
         // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
         // exactly like configured peers: seed them into the peer table so an
@@ -451,6 +473,8 @@ impl PeerManager {
             relay: false,
             last_lookup_ms: None,
             session_obf_key: None,
+            last_activity_ms: 0,
+            last_cover_ms: 0,
         });
     }
 
@@ -468,6 +492,18 @@ impl PeerManager {
     /// argument since no handshake can complete before the loop starts.
     pub fn set_obf_psk(&mut self, obf_psk: Option<[u8; 32]>) {
         self.obf_key = obf_psk.map(|p| yip_obf::derive_key(&p));
+    }
+
+    /// Enable (or disable) opt-in idle cover traffic (3b Task 4) from the
+    /// configured `cover_traffic_ms`. Called once by `tunnel.rs` right after
+    /// `set_obf_psk`, before the event loop begins. `None` leaves cover
+    /// traffic disabled. Only takes effect when obfuscation is also enabled
+    /// (`obf_key.is_some()`) — see `tick_dispatch`'s cover-emission gate.
+    ///
+    /// A post-construction setter for the same reason as `set_obf_psk`: it
+    /// keeps the existing `PeerManager::new` call sites untouched.
+    pub fn set_cover_traffic_ms(&mut self, cover_traffic_ms: Option<u64>) {
+        self.cover_traffic_ms = cover_traffic_ms;
     }
 
     /// This node's own self-certifying mesh address, for assigning the
@@ -1014,6 +1050,12 @@ impl PeerManager {
         now_ms: u64,
     ) -> DispatchOut<'_> {
         if let Some(idx) = self.route_data(src, dg) {
+            // Real Data ingress for this peer (3b Task 4): only the `Data`
+            // ptype counts as activity, not `Control` (the loss-feedback
+            // packet also routes through here).
+            if dg[0] == PacketType::Data as u8 {
+                self.peers[idx].last_activity_ms = now_ms;
+            }
             return self.dispatch_established(idx, dg, now_ms);
         }
         // No address/tag match at all (e.g. the peer roamed) — try every
@@ -1742,6 +1784,10 @@ impl PeerManager {
         // other arm that also touches `self.peers[idx]`. Splitting into
         // independent statements gives each one its own borrow region.
         if matches!(self.peers[idx].state, PeerState::Established(_)) {
+            // Real Data egress for this peer (3b Task 4): mark it active so
+            // the idle-cover-traffic gate in `tick_dispatch` does not fire
+            // while real traffic is flowing.
+            self.peers[idx].last_activity_ms = now_ms;
             // A relay-reached peer's data-plane egress must be re-wrapped
             // through the server (dst = server); copy the bytes out first (the
             // DataPlane borrows `self.peers[idx]`) then wrap. A direct/punched
@@ -2009,6 +2055,40 @@ impl PeerManager {
         // Skipped entirely without membership (pure-2a/2b `tick` is unchanged).
         if self.membership.is_some() {
             self.tick_gossip(now_ms);
+        }
+
+        // ── idle cover traffic (3b Task 4) ──────────────────────────────────
+        // Opt-in decoy traffic: only when obfuscation is on AND a
+        // `cover_traffic_ms` interval is configured. For each `Established`
+        // peer with a known endpoint that has been idle (no real Data sent
+        // or received) for at least the interval, AND hasn't had a cover
+        // datagram emitted in at least the interval, push exactly one
+        // session-keyed junk datagram (`build_junk` is plaintext;
+        // `tick`/`obf_egress` wraps it once with that peer's session key,
+        // since `dst` is an `Established` peer's endpoint). Gated on
+        // `last_activity_ms` so this never races or delays real data —
+        // latency-free, idle-only, bounded to one datagram per peer per tick.
+        if let (true, Some(iv)) = (self.obf_key.is_some(), self.cover_traffic_ms) {
+            for i in 0..self.peers.len() {
+                if !matches!(self.peers[i].state, PeerState::Established(_)) {
+                    continue;
+                }
+                let Some(endpoint) = self.peers[i].endpoint else {
+                    continue;
+                };
+                if now_ms.saturating_sub(self.peers[i].last_activity_ms) < iv
+                    || now_ms.saturating_sub(self.peers[i].last_cover_ms) < iv
+                {
+                    continue;
+                }
+                let bytes = self.build_junk();
+                self.tick_egress.push(EgressDatagram {
+                    fate: 0,
+                    dst: endpoint,
+                    bytes,
+                });
+                self.peers[i].last_cover_ms = now_ms;
+            }
         }
 
         if self.tick_egress.is_empty() {
@@ -4523,5 +4603,125 @@ mod tests {
             assert_eq!(retry_ms, HANDSHAKE_RETRY_MS);
             assert_eq!(reg_ms, REG_REFRESH_MS);
         }
+    }
+
+    // ── 3b Task 4: idle cover traffic ───────────────────────────────────────
+
+    /// Build an obf-on `PeerManager` with a single `Established` peer whose
+    /// session obf key is known to the caller, ready to `tick`. Both
+    /// `last_activity_ms`/`last_cover_ms` start at their `Peer::new` default
+    /// (`0`) — "idle since the dawn of time" — so a caller only needs to
+    /// override whichever one it wants non-idle.
+    fn obf_on_established_peer_for_cover(
+        cover_traffic_ms: Option<u64>,
+        obf_on: bool,
+    ) -> (PeerManager, SocketAddr, [u8; 16]) {
+        const TAG: u64 = 0x1234_5678_9abc_def0;
+        let peer_ep: SocketAddr = "10.0.0.20:2020".parse().unwrap();
+        let peer = peer_cfg(20, "10.0.0.20:2020");
+        let mut pm = PeerManager::new(
+            [21u8; 32],
+            [22u8; 32],
+            &[peer],
+            TunnelMode::L3Tun,
+            None,
+            None,
+        );
+        if obf_on {
+            pm.set_obf_psk(Some([0xAAu8; 32]));
+        }
+        pm.set_cover_traffic_ms(cover_traffic_ms);
+
+        pm.peers[0].state =
+            PeerState::Established(Box::new(fake_established_dataplane(TAG, peer_ep)));
+        let sess = [0xBBu8; 16];
+        pm.peers[0].session_obf_key = Some(sess);
+        pm.by_tag.insert(TAG, 0);
+        (pm, peer_ep, sess)
+    }
+
+    /// `tick`'s call into each `Established` peer's own `DataPlane::tick`
+    /// (unrelated to cover traffic — it's the loss-feedback Control
+    /// cadence) fires its own periodic Control datagram once
+    /// `now_ms >= FEEDBACK_INTERVAL_MS` (30 ms in `dataplane.rs`, private to
+    /// that module). Every cover test below keeps `now_ms` under that
+    /// threshold so `tick_egress` contains only what THIS test is checking
+    /// — the cover datagram (or nothing) — never an incidental feedback
+    /// packet that would make an exact-count/`is_none` assertion flaky.
+    const COVER_TEST_NOW_MS: u64 = 20;
+
+    /// With obf on and `cover_traffic_ms = Some(iv)`, an `Established` peer
+    /// idle for `>= iv` gets exactly one cover datagram from `tick`,
+    /// addressed to its endpoint, that — after `tick`'s own `obf_egress`
+    /// wrap — deobfuscates to plaintext `JUNK_TYPE` under that peer's
+    /// session key (never the network `obf_key`, since junk cover to an
+    /// `Established` peer is session-keyed).
+    #[test]
+    fn tick_emits_one_cover_for_idle_established_peer() {
+        let (mut pm, peer_ep, sess) =
+            obf_on_established_peer_for_cover(Some(COVER_TEST_NOW_MS), true);
+
+        let out = pm
+            .tick(COVER_TEST_NOW_MS)
+            .expect("idle peer gets a cover datagram");
+        assert_eq!(out.len(), 1, "exactly one cover datagram");
+        assert_eq!(out[0].dst, peer_ep);
+        let (ptype, _body) = yip_obf::deobfuscate(&sess, &out[0].bytes)
+            .expect("cover is wrapped under the peer's session key");
+        assert_eq!(
+            ptype,
+            yip_obf::JUNK_TYPE,
+            "cover datagram deobfuscates to plaintext JUNK_TYPE"
+        );
+        assert_eq!(
+            pm.peers[0].last_cover_ms, COVER_TEST_NOW_MS,
+            "last_cover_ms updated so the next tick doesn't double-fire"
+        );
+    }
+
+    /// A peer with recent activity (`last_activity_ms == now_ms`) is NOT
+    /// idle — `tick` must emit no cover for it, proving cover never races or
+    /// delays real data.
+    #[test]
+    fn tick_emits_no_cover_for_active_peer() {
+        let (mut pm, _peer_ep, _sess) =
+            obf_on_established_peer_for_cover(Some(COVER_TEST_NOW_MS), true);
+        pm.peers[0].last_activity_ms = COVER_TEST_NOW_MS; // activity at "now"
+
+        let out = pm.tick(COVER_TEST_NOW_MS);
+        assert!(
+            out.is_none(),
+            "an active peer must not receive a cover datagram"
+        );
+    }
+
+    /// With `cover_traffic_ms = None` (the default — cover traffic not
+    /// configured), `tick` emits no cover even for an idle `Established`
+    /// peer with obf on.
+    #[test]
+    fn tick_emits_no_cover_when_cover_traffic_ms_unset() {
+        let (mut pm, _peer_ep, _sess) = obf_on_established_peer_for_cover(None, true);
+
+        let out = pm.tick(COVER_TEST_NOW_MS);
+        assert!(
+            out.is_none(),
+            "cover_traffic_ms absent ⇒ no cover, regardless of idle peers"
+        );
+    }
+
+    /// With obfuscation OFF (no `set_obf_psk`), `tick` emits no cover even
+    /// when `cover_traffic_ms` is configured — the byte-identical
+    /// no-regression invariant (obf off ⇒ tick behaves exactly as pre-3b).
+    #[test]
+    fn tick_emits_no_cover_when_obf_off() {
+        let (mut pm, _peer_ep, _sess) =
+            obf_on_established_peer_for_cover(Some(COVER_TEST_NOW_MS), false);
+        assert!(pm.obf_key.is_none());
+
+        let out = pm.tick(COVER_TEST_NOW_MS);
+        assert!(
+            out.is_none(),
+            "obf off ⇒ no cover, regardless of cover_traffic_ms"
+        );
     }
 }
