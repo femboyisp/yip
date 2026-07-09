@@ -11,6 +11,7 @@ yip-crypto = { path = "../yip-crypto" }
 
 [dev-dependencies]
 criterion = "0.5.1"
+raptorq = "2.0.0"
 yip-wire = { path = "../yip-wire" }
 yip-transport = { path = "../yip-transport" }
 

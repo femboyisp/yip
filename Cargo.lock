@@ -1157,6 +1157,7 @@ name = "yip-bench"
 version = "0.0.0"
 dependencies = [
  "criterion",
+ "raptorq",
  "yip-crypto",
  "yip-transport",
  "yip-wire",
