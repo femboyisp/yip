@@ -12,6 +12,7 @@ mod membership;
 mod mode;
 mod path;
 mod peer_manager;
+mod quic;
 mod rendezvous;
 mod tunnel;
 mod wire_glue;

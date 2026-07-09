@@ -518,13 +518,9 @@ impl PeerManager {
     }
 
     /// Set the RaptorQ symbol size passed to `DataPlane::new` at every
-    /// establish site (3c.1 Task 2). Defaults to `1200`; QUIC mode (3c.1
-    /// Tasks 4/5) will call this with a different value before the event
-    /// loop begins, like `set_obf_psk`/`set_cover_traffic_ms`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wired to QUIC-mode config in 3c.1 Tasks 4/5")
-    )]
+    /// establish site (3c.1 Task 2). Defaults to `1200`; QUIC mode (3c.1 Task 4)
+    /// calls this with the QUIC-safe symbol size (see `quic::run_quic`) before
+    /// the event loop begins, like `set_obf_psk`/`set_cover_traffic_ms`.
     pub fn set_data_symbol_size(&mut self, s: u16) {
         self.data_symbol_size = s;
     }
