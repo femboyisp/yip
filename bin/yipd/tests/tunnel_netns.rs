@@ -639,11 +639,15 @@ fn flowshape_not_obviously_constant() {
     // glare-resolve — see run-flowshape-check.sh's header comment), the
     // handshake-phase datagram count (measured via inter-packet-gap cutoff,
     // not by source address, since there is no fixed "initiator" role) must
-    // (a) exceed the junk-free baseline of 2 and (b) take more than one
-    // distinct value across sessions (the Jc in [JUNK_BURST_MIN,
-    // JUNK_BURST_MAX] junk burst on each side is redrawn per handshake, so
-    // the opener's cardinality is not obviously constant). See
-    // run-flowshape-check.sh for the full assertion set.
+    // (a) exceed 4 — strictly above the junk-free two-sided-glare baseline
+    // of 3 datagrams (Init(A) + Init(B) + Resp), which is what a junk-free
+    // handshake would already produce given both peers glare-initiate — and
+    // (b) take more than one distinct value across sessions (the Jc in
+    // [JUNK_BURST_MIN, JUNK_BURST_MAX] junk burst on each side is redrawn
+    // per handshake). Gate (b) is the primary non-vacuous proof of
+    // randomization: gate (a) alone only shows junk is present on top of
+    // the glare baseline. See run-flowshape-check.sh for the full
+    // assertion set and derivation.
     //
     // Requires root: netns creation + TUN devices + tcpdump.
     let is_root = Command::new("id")
@@ -663,7 +667,7 @@ fn flowshape_not_obviously_constant() {
     assert!(
         status.success(),
         "flow-shape structural check failed (obf-on handshake opener packet count was not \
-         >2, or was identical across independent sessions — the Jc junk burst is not \
+         >4, or was identical across independent sessions — the Jc junk burst is not \
          reaching the wire as expected)"
     );
 }

@@ -39,16 +39,32 @@
 #
 # Assertions (see CONTROLLER ADDENDUM, Deliverable 2, in
 # .superpowers/sdd/task-7-brief.md for the empirical basis):
-#   (a) HARD, per-session: the handshake-phase datagram count is > 2 (junk
-#       is present — a plain, non-obfuscated glare-free handshake opener
-#       would be a small constant; with two independent Jc >= 3 bursts
-#       colliding it is always far larger in practice).
+#   (a) HARD, per-session: the handshake-phase datagram count is > 4. This
+#       is NOT ">2 => junk present" — both peers glare-initiate (each
+#       self-initiates at bring-up; the loser's Init still reaches the wire
+#       before glare-resolution — see peer_manager.rs's `Glare:` comment),
+#       so a JUNK-FREE two-sided-glare handshake already puts Init(A) +
+#       Init(B) + Resp = 3 datagrams on the wire before data, and a >2
+#       threshold would pass even with junk disabled. 4 sits strictly above
+#       that junk-free glare baseline (with a +1 retransmit margin) and
+#       strictly below the observed junk-present minimum (~7-8, clipped
+#       down from the ~9 theoretical floor of 2*(JUNK_BURST_MIN+1)+1 by the
+#       leading-gap window occasionally swallowing the trailing Resp). So
+#       gate (a) shows the opener carries MORE datagrams than a junk-free
+#       glare handshake would — i.e. junk is present — without false-failing
+#       on Resp-clipping.
 #   (b) HARD, across sessions: the N counts are not all identical — i.e.
-#       take > 1 distinct value. This is NOT a claim of "provably
-#       unclassifiable" traffic; it only shows the handshake opener's
-#       packet cardinality is not obviously constant (both Jc bursts are
-#       redrawn per handshake), which is what would make packet-count-based
-#       fingerprinting of the opener unreliable.
+#       take > 1 distinct value. Gate (a) alone only proves junk is present
+#       on top of the glare baseline; it says nothing about whether that
+#       junk is randomized. Gate (b) is the primary non-vacuous proof that
+#       the Jc burst actually varies the opener's shape: if junk were
+#       disabled (or fixed-size), the handshake-phase count would be the
+#       same constant every session (2-sided glare always yields exactly 3
+#       junk-free datagrams), so gate (b) would fail. This is NOT a claim of
+#       "provably unclassifiable" traffic; it only shows the handshake
+#       opener's packet cardinality is not obviously constant (both Jc
+#       bursts are redrawn per handshake), which is what would make
+#       packet-count-based fingerprinting of the opener unreliable.
 set -euo pipefail
 
 YIPD="${1:?Usage: $0 <yipd-binary>}"
@@ -310,21 +326,31 @@ echo "[result] per-session handshake-phase counts: ${COUNTS[*]}"
 
 FAIL=0
 
-# HARD gate (a): junk present in every session — count > 2.
+# HARD gate (a): junk present in every session — count > 4. This threshold
+# sits strictly above the junk-free two-sided-glare baseline of 3 datagrams
+# (Init(A) + Init(B) + Resp, +1 retransmit margin) and strictly below the
+# observed junk-present minimum (~7-8), so it robustly distinguishes "junk
+# present" from "junk-free glare handshake" without false-failing on
+# occasional Resp-clipping. See the header comment for the full derivation.
 for idx in "${!COUNTS[@]}"; do
     c="${COUNTS[$idx]}"
     session_num=$((idx + 1))
-    if [ "$c" -le 2 ]; then
-        echo "[FAIL] gate (a): session $session_num count=$c is <= 2 — junk burst did not reach the wire"
+    if [ "$c" -le 4 ]; then
+        echo "[FAIL] gate (a): session $session_num count=$c is <= 4 — at or below the junk-free two-sided-glare baseline (3, +1 margin); junk burst did not reach the wire"
         FAIL=1
     fi
 done
 if [ "$FAIL" -eq 0 ]; then
-    echo "[PASS] gate (a): every session's handshake-phase count is > 2 (junk present)"
+    echo "[PASS] gate (a): every session's handshake-phase count is > 4 (above the junk-free two-sided-glare baseline of 3 — junk present)"
 fi
 
 # HARD gate (b): not obviously constant — the N counts take > 1 distinct
-# value (both sides' Jc in [3, 12] bursts are redrawn per handshake).
+# value (both sides' Jc in [3, 12] bursts are redrawn per handshake). This
+# is the primary non-vacuous proof of randomization: a junk-free (or
+# fixed-size-junk) two-sided-glare handshake would produce the SAME count
+# every session, so gate (b) is what would actually fail if junk were
+# disabled — gate (a) alone only proves "more than the glare baseline",
+# not "randomized".
 DISTINCT="$(printf '%s\n' "${COUNTS[@]}" | sort -u | wc -l)"
 if [ "$DISTINCT" -le 1 ]; then
     echo "[FAIL] gate (b): all $N sessions produced the identical handshake-phase count — handshake cardinality looks constant"
@@ -338,4 +364,4 @@ if [ "$FAIL" -ne 0 ]; then
     exit 1
 fi
 
-echo "[PASS] flow-shape structural check PASSED: obf-on handshake opener carries junk (>2 datagrams) and shows no obviously-constant handshake cardinality across independent sessions"
+echo "[PASS] flow-shape structural check PASSED: obf-on handshake opener carries more datagrams than a junk-free two-sided-glare handshake (>4, gate a) and shows no obviously-constant handshake cardinality across independent sessions (gate b, the primary proof of randomization)"
