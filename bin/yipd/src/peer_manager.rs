@@ -808,6 +808,7 @@ impl PeerManager {
                     conn_tag,
                     self.mode,
                     placeholder,
+                    self.obf_key.is_some(),
                 ));
 
                 self.peers[idx].session_obf_key = sess_obf;
@@ -865,6 +866,7 @@ impl PeerManager {
                     conn_tag,
                     self.mode,
                     placeholder,
+                    self.obf_key.is_some(),
                 ));
                 self.by_tag.insert(dp.conn_tag(), idx);
                 self.peers[idx].session_obf_key = sess_obf;
@@ -1227,7 +1229,13 @@ impl PeerManager {
             PeerState::Idle | PeerState::Handshaking(_) => {
                 let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
                 let sess_obf = self.session_obf_key_for(&established.hp_key);
-                let mut dp = Box::new(DataPlane::new(established, conn_tag, self.mode, src));
+                let mut dp = Box::new(DataPlane::new(
+                    established,
+                    conn_tag,
+                    self.mode,
+                    src,
+                    self.obf_key.is_some(),
+                ));
 
                 self.peers[idx].session_obf_key = sess_obf;
                 self.peers[idx].endpoint = Some(src); // learn the observed endpoint
@@ -1299,7 +1307,13 @@ impl PeerManager {
                 let sess_obf = self.session_obf_key_for(&established.hp_key);
                 // `idx` was matched above via `p.endpoint == Some(src)`, so `src`
                 // is exactly this peer's endpoint.
-                let mut dp = Box::new(DataPlane::new(established, conn_tag, self.mode, src));
+                let mut dp = Box::new(DataPlane::new(
+                    established,
+                    conn_tag,
+                    self.mode,
+                    src,
+                    self.obf_key.is_some(),
+                ));
                 self.by_tag.insert(dp.conn_tag(), idx);
                 self.peers[idx].session_obf_key = sess_obf;
                 // `src` == this peer's `endpoint` (matched above). Commit the
@@ -2253,7 +2267,7 @@ mod tests {
             auth_key,
             hp_key,
         };
-        DataPlane::new(established, conn_tag, TunnelMode::L3Tun, peer_addr)
+        DataPlane::new(established, conn_tag, TunnelMode::L3Tun, peer_addr, false)
     }
 
     #[test]
@@ -3944,8 +3958,8 @@ mod tests {
         };
         let any: SocketAddr = "0.0.0.0:0".parse().unwrap();
         (
-            DataPlane::new(est_i, conn_tag, TunnelMode::L3Tun, any),
-            DataPlane::new(est_r, conn_tag, TunnelMode::L3Tun, resp_peer_addr),
+            DataPlane::new(est_i, conn_tag, TunnelMode::L3Tun, any, false),
+            DataPlane::new(est_r, conn_tag, TunnelMode::L3Tun, resp_peer_addr, false),
             hp_key,
             conn_tag,
         )
