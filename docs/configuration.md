@@ -1,150 +1,183 @@
-# Configuration
+# yip configuration reference
 
-Runtime configuration for the `yipd` daemon: the config-file format, the environment
-variables that select the I/O driver, and the command-line flags. This is the single
-reference for everything `yipd` reads at startup — it is otherwise scattered across
-`bin/yipd/src/` and the bench harness in `crates/yip-bench/`.
+Complete reference for the `yipd` daemon: config file keys, CLI flags, the
+helper binaries (`yip-ca`, `yip-rendezvous`), and environment variables. For
+guided walkthroughs (first tunnel, mesh setup, obfuscation) see the
+[user guide](user-guide.md). A fully-annotated starter config lives at
+[`example.config`](../example.config).
 
-`yipd` today runs a **static multi-peer data plane**: one config file per node, each
-listing one or more peers, with keys and endpoints agreed out of band. The remaining
-control plane (discovery, NAT traversal, relay) arrives in later sub-project #2
-milestones. There is **no `initiate` flag**: the handshake is lazy and in-loop
-(WireGuard-style) — whichever side has traffic for a peer first sends the
-`[HandshakeInit]`, and simultaneous initiation is resolved deterministically.
+> **Config format.** `yipd` parses a line-based `key=value` format (one pair
+> per line; `#` comments; blank lines ignored; whitespace trimmed; unknown keys
+> silently ignored). A first-class TOML config (`[[peer]]` array-of-tables,
+> quoted values) is a planned milestone — until then, use the format below.
 
-Each node has a **self-certifying mesh address** derived from its public key
-(`fd00::/8`); print it with `yipd --addr <pubkey-hex>`. Assign that `/128` to the node's
-TUN device and route the mesh prefix over it so inner packets addressed to a peer's mesh
-address are tunnelled to that peer.
+---
 
-## Invocation
+## `yipd` config keys
 
-```sh
-yipd <config-file>       # run a tunnel from a config file
-yipd --genkey            # generate an X25519 keypair and exit
-yipd --addr <pubkey-hex> # print the mesh address (node_addr) for a public key and exit
-yipd --version           # print "yipd <version>" and exit
-```
+### Core (required)
 
-## Config file
-
-The config file is a simple `key=value` text format — one pair per line. Blank lines
-and lines beginning with `#` are ignored, and whitespace around keys and values is
-trimmed. All three 32-byte keys are **hex-encoded (exactly 64 hex digits)**. Unknown
-keys are silently ignored for forward-compatibility.
-
-Generate a keypair with `yipd --genkey`; it prints `private=<hex>` and `public=<hex>`.
-
-### Node keys
-
-| Key | Required | Value | Meaning |
-|---|---|---|---|
-| `local_private` | yes | 64 hex digits | This node's X25519 private key. Feeds the Noise-IK handshake. |
-| `local_public` | yes | 64 hex digits | This node's X25519 public key. Determines this node's mesh address (`yipd --addr`); the data path itself reads `local_private`. |
-| `listen` | yes | `IP:port` socket address | Local UDP address to bind (e.g. `0.0.0.0:51820`). |
-| `device` | yes | string | TUN/TAP device name to create (e.g. `yip0`). |
-| `device_kind` | no | `tun` \| `tap` | Tunnel mode. `tun` = L3 IP tunnel, `tap` = L2 Ethernet bridging. **Defaults to `tun`** when the key is absent. An unrecognized value is a startup error. |
-
-### Peers
-
-List each remote peer in a `[peer]` block. Repeat the block once per peer:
-
-| Key | Required | Value | Meaning |
-|---|---|---|---|
-| `public_key` | yes | 64 hex digits | The peer's X25519 public key. Also determines the peer's mesh address you route to (`yipd --addr`). |
-| `endpoint` | yes | `IP:port` socket address | The peer's UDP endpoint, used to send it the first handshake message. The actual source address is (re)learned from the peer's own handshake datagram. |
-
-**Legacy single-peer form:** for a one-peer node you may instead use the flat keys
-`peer_public=<hex>` and `peer_endpoint=<IP:port>` (no `[peer]` header); they fold into a
-single peer entry. The `[peer]` block form is required for two or more peers.
-
-A missing required key, malformed line (no `=`), bad hex, unparseable socket address,
-or invalid `device_kind` all cause `yipd` to exit with a parse error. Unknown keys are
-ignored (so a leftover `initiate=` from an older config is harmless).
-
-### Example
-
-Two nodes, A and B, peered with each other. There is no initiator/responder role — the
-first side with traffic brings the tunnel up. Keys are illustrative — generate real ones
-with `yipd --genkey`, and compute each node's mesh address with `yipd --addr <public>`.
-
-`yipA.conf`:
-
-```ini
-# Node A
-local_private=0000000000000000000000000000000000000000000000000000000000000001
-local_public=0000000000000000000000000000000000000000000000000000000000000002
-listen=10.0.0.1:51820
-device=yip0
-device_kind=tun
-
-[peer]
-public_key=00000000000000000000000000000000000000000000000000000000000000bb
-endpoint=10.0.0.2:51820
-```
-
-`yipB.conf`:
-
-```ini
-# Node B
-local_private=00000000000000000000000000000000000000000000000000000000000000aa
-local_public=00000000000000000000000000000000000000000000000000000000000000bb
-listen=10.0.0.2:51820
-device=yip0
-device_kind=tun
-
-[peer]
-public_key=0000000000000000000000000000000000000000000000000000000000000002
-endpoint=10.0.0.1:51820
-```
-
-Then assign each node its own mesh address and route the mesh prefix over the tunnel,
-e.g. on A: `ip -6 addr add $(yipd --addr 0000…0002)/128 dev yip0` and
-`ip -6 route add fd00::/8 dev yip0`. A third node C is added by giving A and B a second
-`[peer]` block for C (and C a config listing both A and B).
-
-## Environment variables
-
-Both variables select the `yip-io` event-loop driver. They are **presence-based** —
-`yipd` checks only whether the variable is *set* (any value, including empty, counts as
-on); it does not parse `1` vs `0`. To disable, leave the variable unset. Neither is
-required; the defaults give the safe, fast path.
-
-| Variable | Default | Effect |
+| Key | Value | Notes |
 |---|---|---|
-| `YIP_USE_URING` | unset (off) | Opt into the `io_uring` `UringDriver` instead of the default epoll `PollDriver`. Falls back to epoll if io_uring is unavailable at runtime. The default epoll driver is the faster path on current measurements (lower tunnel RTT, the north-star metric) and is safe Rust; the io_uring driver is the workspace's only `unsafe` and is opt-in for A/B work until it beats epoll and re-benchmarks favourably. |
-| `YIP_URING_BUSYPOLL` | unset (off) | Busy-poll the io_uring completion queue before blocking — a "burn CPU for latency" knob (yip's north star), off by default. Only takes effect together with `YIP_USE_URING`. Spinning is **adaptive**: it spins only while an exchange is active and backs off to a blocking wait on an idle tunnel, so it does not burn CPU when there is no traffic. |
+| `local_private` | 64 hex chars (32 bytes) | This node's X25519 private key. **Secret.** Generate with `yipd --genkey`. |
+| `local_public` | 64 hex chars (32 bytes) | This node's X25519 public key. Determines this node's self-certifying mesh address (`yipd --addr`). |
+| `listen` | `IP:port` | Local UDP bind address (`0.0.0.0:51820` for all interfaces). |
+| `device` | string | TUN/TAP device name to create, e.g. `yip0`. |
+| `device_kind` | `tun` \| `tap` | `tun` (L3/IP, default) or `tap` (L2/Ethernet). Any other value is an error. |
 
-```sh
-# default: epoll PollDriver
-yipd yipA.conf
+Missing any of `local_private`, `local_public`, `listen`, `device` is a fatal
+config error.
 
-# opt into io_uring
-YIP_USE_URING=1 yipd yipA.conf
+### Peers (static peer list)
 
-# io_uring with adaptive busy-poll (lowest measured RTT)
-YIP_USE_URING=1 YIP_URING_BUSYPOLL=1 yipd yipA.conf
+Each peer is a `[peer]` block:
+
+```
+[peer]
+public_key=<64 hex>          # required: the peer's X25519 public key
+endpoint=<IP:port>           # optional: omit for a rendezvous/relay-only peer
 ```
 
-Driver A/B RTT numbers live in
-[`crates/yip-bench/README.md`](../crates/yip-bench/README.md) ("io_uring driver A/B —
-RTT").
+- `public_key` is **required** in a block; a block with an `endpoint` but no
+  `public_key` is an error.
+- `endpoint` is **optional** — a peer with no endpoint is reachable only via a
+  rendezvous server / relay (see below), not by a direct probe.
+- Repeat `[peer]` for each peer.
 
-> Historical note: an earlier `YIP_FORCE_POLL` variable existed when io_uring was the
-> default and epoll was the opt-in fallback. The default has since flipped — epoll is
-> now the default and io_uring is opt-in via `YIP_USE_URING` — so `YIP_FORCE_POLL` no
-> longer exists.
+**Legacy single-peer form** (still supported, used only if there are *no*
+`[peer]` blocks): `peer_public=<64hex>` + `peer_endpoint=<IP:port>`.
 
-## CLI flags
+The peer list may be **empty only in mesh mode** (all five mesh keys set,
+below); otherwise an empty peer list is an error.
 
-`yipd` takes a single positional argument (the config-file path) or one flag. There are
-no other flags.
+### Rendezvous + NAT traversal (optional)
 
-| Argument | Effect |
+| Key | Value | Notes |
+|---|---|---|
+| `rendezvous` | `IP:port` | Address of a `yip-rendezvous` server. Enables lazy **Direct → UDP hole-punch → Relay** bring-up for peers behind NAT. |
+
+### Mesh / decentralized discovery (optional)
+
+A node is a valid mesh member iff it holds a CA-signed cert. Setting **all
+five** of these keys puts the node in *mesh mode*, where it may carry no
+`[peer]` blocks and discover peers via the signed root set + gossip.
+
+| Key | Value | Notes |
+|---|---|---|
+| `ca_public` | 64 hex chars (32 bytes) | Trusted CA Ed25519 public key. **Repeatable** — one line per CA. |
+| `cert` | file path | File containing this node's CA-signed cert (hex, from `yip-ca sign-cert`). |
+| `roots` | file path | File containing the CA-signed root set (hex, from `yip-ca sign-roots`). Its signature is **verified against `ca_public` at load time**; a bad signature is a fatal error. |
+| `member_sign_private` | 64 hex chars (32 bytes) | This node's **Ed25519** record-signing private key (distinct from `local_private`). **Secret.** |
+| `network_id` | **32 hex chars (16 bytes)** | Mesh network id. Note the length is **half** that of the other hex keys. |
+
+*Mesh mode* is exactly: `ca_public` non-empty **and** `cert`, `roots`,
+`member_sign_private`, `network_id` all set.
+
+### Anti-DPI obfuscation (optional, opt-in)
+
+| Key | Value | Notes |
+|---|---|---|
+| `obf_psk` | 64 hex chars (32 bytes) | Network-wide obfuscation shared secret. When set, every datagram is wrapped so the wire is indistinguishable from random UDP. **All nodes and the rendezvous server must share the same value.** Absent ⇒ byte-identical to the non-obfuscated wire format. |
+
+See the [user guide](user-guide.md#anti-dpi-obfuscation) for the security model.
+
+### Hex-length quick reference
+
+- **64 hex (32 bytes):** `local_private`, `local_public`, `public_key`,
+  `peer_public`, `ca_public`, `member_sign_private`, `obf_psk`.
+- **32 hex (16 bytes):** `network_id`.
+- `cert` / `roots` are **file paths**, not inline hex.
+
+---
+
+## `yipd` CLI
+
+```
+yipd <config-file>          Run the daemon with the given config.
+yipd --genkey               Generate an X25519 keypair. Prints:
+                              private=<64 hex>
+                              public=<64 hex>
+yipd --addr <pubkey-hex>    Print the self-certifying mesh address (IPv6) for
+                            a 64-hex public key.
+yipd --version | -V         Print the version and exit.
+```
+
+There is no `--help`; running with no arguments prints the usage above.
+
+---
+
+## `yip-rendezvous` CLI
+
+The standalone rendezvous + blind-relay server (no TUN, no tunnel keys).
+
+```
+yip-rendezvous <listen-addr>                 e.g. yip-rendezvous 0.0.0.0:51821
+yip-rendezvous <listen-addr> --obf-psk <hex64>   obfuscated networks (must match
+                                                 the nodes' obf_psk)
+yip-rendezvous --version | -V
+```
+
+It logs `relay-forwarded=<N>` to stderr every 5 s (how many datagrams the blind
+relay has forwarded — 0 means everything went direct/hole-punched).
+
+---
+
+## `yip-ca` CLI (offline certificate authority)
+
+A one-shot **offline** tool. Its signing key should never live on an
+internet-facing node. Errors exit with code 2.
+
+```
+yip-ca genkey
+    Mint a CA Ed25519 keypair. Prints:
+      ca_private=<64 hex>
+      ca_public=<64 hex>
+
+yip-ca sign-cert --member <hex64> --member-sign <hex64> \
+                 --network <hex32> --days <N> [--ca-private <hex64>]
+    Issue a membership cert (valid <N> days). Prints one hex line (the cert)
+    to stdout — save it to the file named by the node's `cert=` key.
+      --member       the member's X25519 public key (its `local_public`)
+      --member-sign  the member's Ed25519 record-signing public key
+      --network      the 16-byte network id (32 hex)
+    If --ca-private is omitted, the CA private key hex is read from stdin.
+
+yip-ca sign-roots --roots <file> --version <N> [--ca-private <hex64>]
+    Sign a root set. Prints one hex line (the root set) to stdout — save it to
+    the file named by each node's `roots=` key.
+      --roots    path to a roots-input file (see below)
+      --version  the root set version number (u64)
+```
+
+`genkey`'s output can be piped straight into `sign-cert`/`sign-roots` when
+`--ca-private` is omitted:
+
+```sh
+yip-ca genkey | yip-ca sign-cert --member <hex64> --member-sign <hex64> \
+                                 --network <hex32> --days 30 > node.cert
+```
+
+**Roots-input file** (for `sign-roots`): plain text, one root per line,
+two whitespace-separated columns — the root's public key and its underlay
+address. `#` comments and blank lines are skipped. IPv6 uses the bracket form:
+
+```
+4444...4444 192.0.2.1:51820
+5555...5555 [2001:db8::1]:51820
+```
+
+---
+
+## Environment variables (I/O driver)
+
+The data loop runs on one of two `yip-io` drivers, selected at runtime:
+
+| Variable | Effect |
 |---|---|
-| `<config-file>` | Load the config file and run the tunnel. |
-| `--genkey` | Generate an X25519 keypair, print `private=<hex>` / `public=<hex>` to stdout, and exit. |
-| `--addr <pubkey-hex>` | Print the self-certifying mesh address (`node_addr`, in `fd00::/8`) derived from a 64-hex-digit public key, and exit. |
-| `--version`, `-V` | Print `yipd <version>` and exit. |
+| *(unset)* | **`PollDriver` (epoll)** — the default. Fastest simple path, works everywhere. |
+| `YIP_USE_URING=1` | Opt-in single-ring **`io_uring` `UringDriver`**. Falls back to `PollDriver` at runtime on kernels that reject multishot recv (e.g. 6.12). |
+| `YIP_USE_URING=1 YIP_URING_BUSYPOLL=1` | Adaptive busy-poll: spins the completion queue to cut RTT **below** epoll — only worth it on **bare metal with a dedicated core** and a recent kernel. |
 
-Running `yipd` with no argument prints a usage message and exits with an error.
+Measured tunnel RTT: poll ≈ 0.37 ms, io_uring blocking ≈ 0.41 ms,
+io_uring + busy-poll ≈ 0.30 ms (best). Use the default everywhere; reach for
+busy-poll only on a dedicated-core, recent-kernel host.

@@ -7,10 +7,15 @@ streaming, and for L2 IXP-style offloading with forward-error-correction autocor
 also serving as a general-purpose L2/L3 mesh VPN. Censorship-resistance, traffic-analysis defense,
 and anonymity are opt-in dials layered on top, not always-on costs.
 
-> **Status:** sub-project #1 (the core data plane + FEC transport) is **complete** — a working
-> encrypted FEC VPN tunnel, ping-tested across network namespaces, with benchmarks showing its FEC
-> recovers packet loss that plain WireGuard passes through. The control plane, anti-DPI, and
-> hardening sub-projects are next. See [Roadmap](#roadmap).
+> **Status:** the data plane (#1), the full control plane (#2: multi-peer + self-certifying
+> addresses, rendezvous/NAT-traversal/relay, decentralized CA-gated mesh discovery), and the first
+> anti-DPI milestone (#3a: opt-in `obf_psk` obfuscation, proven undetectable to nDPI in CI) are
+> **complete and merged** — a working, encrypted, loss-recovering, obfuscatable mesh VPN, all
+> ping-tested across network namespaces on both I/O drivers. Traffic-analysis defense and hardening
+> are next. See [Roadmap](#roadmap).
+>
+> **New here?** Read the [user guide](docs/user-guide.md) and copy
+> [`example.config`](example.config).
 
 ## Goals
 
@@ -36,8 +41,8 @@ shipped independently:
 | # | Sub-project | What it adds |
 |---|---|---|
 | **1** | **Core data plane + FEC transport** *(complete)* | Encrypted L2+L3 tunnel between peers over an adaptive RaptorQ-FEC UDP transport on a kernel-bypass-ready I/O layer. |
-| 2 | Control plane | Decentralized discovery (DHT/gossip), self-certifying key-derived addresses, NAT traversal, relay fallback. |
-| 3 | Anti-DPI / obfuscation | Pluggable obfuscating link layer (AmneziaWG recipe, optional REALITY TLS-mimicry); nDPI in CI. |
+| **2** | **Control plane** *(complete)* | Multi-peer routing + self-certifying key-derived addresses, rendezvous + UDP hole-punching + blind relay, and decentralized CA-gated gossip discovery (private membership mesh). |
+| **3** | Anti-DPI / obfuscation *(3a done)* | Opt-in `obf_psk` obfuscation — no fixed bytes/sizes/type-discriminator, control-timer jitter, nDPI-proven Unknown *(done)*. Junk/decoy packets, REALITY TLS-mimicry, pluggable transports *(next)*. |
 | 4 | Traffic-analysis defense | DAITA-style padding/timing; optional per-flow onion routing (Arti crates). |
 | 5 | Hardening / multi-platform | macOS/Windows, optional AF_XDP/kernel-module relay tier, management UX. |
 
@@ -93,23 +98,34 @@ tunnel, proven by pinging across it between two daemons in separate network name
   for WG) for a ~0.2 ms RTT premium, and under loss yip's scp throughput holds while WireGuard's TCP
   collapses (~6× yip at 5–10 % loss). See [`crates/yip-bench/README.md`](crates/yip-bench/README.md)
   for the full results.
-- [ ] **Next** — control plane (decentralized discovery, NAT traversal, relay fallback); then
-  anti-DPI / obfuscation, DAITA/anonymity, and hardening sub-projects.
+- [x] **#2 Control plane** — multi-peer routing + self-certifying key-derived addresses (2a);
+  rendezvous + UDP hole-punching + blind relay (2b); decentralized CA-gated gossip discovery /
+  private membership mesh (2c). All merged, netns money-tests on both drivers.
+- [x] **#3a Anti-DPI (kill fixed bytes)** — opt-in `obf_psk` obfuscation: a keyed envelope wraps
+  every datagram (masked type + random padding, no fixed byte/size), control-timer jitter, and an
+  nDPI CI oracle proving obfuscated traffic classifies as `Unknown`. Merged.
+- [ ] **Next** — #3b junk/decoy packets + traffic-shaping, #3c TLS/QUIC mimicry (REALITY), #3d
+  pluggable transports; then traffic-analysis defense (#4) and hardening (#5).
+
+Guides: [user guide](docs/user-guide.md) · [configuration reference](docs/configuration.md) ·
+[testing & benchmarking](docs/testing-and-benchmarking.md) · [`example.config`](example.config).
 
 ## Building
 
 Requires a recent stable Rust toolchain (Linux).
 
-`yipd` tunnel mode is selected in config via `device_kind=tun|tap` (`tun` by
-default). Full configuration reference (config keys, environment variables, CLI flags):
-[`docs/configuration.md`](docs/configuration.md).
-
 ```sh
-cargo build --workspace      # build everything
-cargo test  --workspace      # run the test suite
+cargo build --release --workspace   # yipd, yip-ca, yip-rendezvous + all crates
+cargo test  --workspace             # run the test suite
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
+
+To run a tunnel, copy [`example.config`](example.config), fill in keys
+(`yipd --genkey`), and `sudo yipd your.config` — the [user guide](docs/user-guide.md) walks through
+a two-node tunnel, mesh mode, NAT traversal, and enabling obfuscation. The full config/CLI/env
+reference is [`docs/configuration.md`](docs/configuration.md); how to test and benchmark is
+[`docs/testing-and-benchmarking.md`](docs/testing-and-benchmarking.md).
 
 CI additionally runs `cargo-shear` (unused deps), `cargo-deny` (licenses + advisories),
 `cargo-llvm-cov` (≥90 % line coverage on logic crates), `cargo-mutants`, and `cargo-fuzz`.
