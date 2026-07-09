@@ -69,14 +69,25 @@ Systematic RS over the GF(256) core. For an object of `object_size` bytes:
    symbol zero-padded to the boundary).
 2. `R = min(repair_count, 255 − K)` repair symbols (the clamp is the GF(256) codeword
    bound; never binding at yip's per-packet K, documented for the future coalesced case).
-3. Generate repair:
-   - **`R == 1` fast path:** repair = XOR of the K source symbols (the all-ones Cauchy
-     row; recovers any single erasure). This is yip's dominant proactive case.
-   - **`R ≥ 2`:** `repair_j[b] = Σ_i C[j][i] · source_i[b]` over GF(256), where `C` is the
-     `R×K` **Cauchy** submatrix (see below).
+3. Generate repair with **one consistent generator** for all R: repair symbol at
+   `symbol_index = K + m` (`m = 0..R−1`) is `repair_m[b] = Σ_i C[m][i] · source_i[b]` over
+   GF(256), where `C` is the `R×K` **Cauchy** matrix. Repair row `m` depends only on
+   `(K, m)` — never on R — so a given repair index always means the same linear
+   combination regardless of how many repair symbols were emitted. **This consistency is
+   load-bearing:** the decoder derives K from `object_size` and reconstructs the row for
+   each *received* repair index directly, without needing to know R (R is not on the wire).
 4. Emit `K + R` `Symbol`s: source symbols at `symbol_index` `0..K−1` (raw data —
    **systematic**, so a no-loss receiver does zero decode work), repair symbols at
    `K..K+R−1`.
+
+> **On the XOR micro-opt (deferred).** For R=1 a plain XOR parity encodes in ~0.06 µs vs
+> ~0.77 µs for the general Cauchy path — but XOR is the *all-ones* row, which is **not**
+> Cauchy row 0, so using it for R=1 while using Cauchy for R≥2 would make repair index K
+> ambiguous to the decoder. Since FEC at 0.77 µs is already far below the AEAD floor
+> (~2 µs) — i.e. no longer the bottleneck — 4a uses the single consistent Cauchy generator
+> and does **not** special-case R=1. A future micro-opt could adopt a RAID-6-style
+> all-ones-P + Vandermonde-Q generator (MDS for R≤2, XOR-fast for the P symbol) if ever
+> warranted; out of scope for 4a.
 
 `repair_with_id(object_id, extra_repair)` (the ARQ retransmit path) generates *additional*
 repair symbols at higher `symbol_index` values for a previously-sent object, capped so
