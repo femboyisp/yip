@@ -56,8 +56,9 @@ A small, safe, table-based GF(256) engine — the reusable foundation:
 - Public ops: `add(a,b) = a ^ b`; `mul(a,b)` via log/antilog; `mul_slice_into(dst, src, c)`
   = multiply-accumulate `dst[i] ^= mul(src[i], c)` (the symbol-wise MAC used by both
   RS repair generation and the decoder).
-- `#![forbid(unsafe_code)]`-clean (no SIMD in 4a; a future SIMD path can live in a leaf
-  crate if profiling ever demands it — not needed to hit multi-gigabit, per the model).
+- The new `gf256.rs` carries its own `#![forbid(unsafe_code)]` (no SIMD in 4a; a future SIMD
+  path can live in a leaf crate if profiling ever demands it — not needed to hit
+  multi-gigabit, per the model).
 
 Tables are built once at first use (`std::sync::OnceLock`), not per encode.
 
@@ -67,8 +68,11 @@ Systematic RS over the GF(256) core. For an object of `object_size` bytes:
 
 1. `K = ceil(object_size / symbol_size)` source symbols of `symbol_size` bytes (final
    symbol zero-padded to the boundary).
-2. `R = min(repair_count, 255 − K)` repair symbols (the clamp is the GF(256) codeword
-   bound; never binding at yip's per-packet K, documented for the future coalesced case).
+2. **Reject** `K == 0` (empty ciphertext — impossible for a sealed AEAD frame, but guarded)
+   and `K ≥ 255` (no room for a repair symbol in GF(256); unreachable at `symbol_size` 1200
+   where `K ≤ ceil(256 KiB / 1200) = 219`, but guards a future smaller `symbol_size`). Then
+   `R = min(repair_count, 255 − K)` repair symbols (the clamp is the GF(256) codeword bound;
+   never binding at yip's per-packet `K`, documented for the future coalesced case).
 3. Generate repair with **one consistent generator** for all R: repair symbol at
    `symbol_index = K + m` (`m = 0..R−1`) is `repair_m[b] = Σ_i C[m][i] · source_i[b]` over
    GF(256), where `C` is the `R×K` **Cauchy** matrix. Repair row `m` depends only on
@@ -89,9 +93,15 @@ Systematic RS over the GF(256) core. For an object of `object_size` bytes:
 > all-ones-P + Vandermonde-Q generator (MDS for R≤2, XOR-fast for the P symbol) if ever
 > warranted; out of scope for 4a.
 
-`repair_with_id(object_id, extra_repair)` (the ARQ retransmit path) generates *additional*
-repair symbols at higher `symbol_index` values for a previously-sent object, capped so
-total shards ≤ 255.
+`repair_with_id(object_id, extra_repair)` (the ARQ retransmit path) **re-encodes the whole
+object** under the given `object_id`: it emits all `K` source symbols (indices `0..K−1`)
+plus `extra_repair` repair symbols (indices `K..K+extra_repair−1`), using the **same Cauchy
+rows** as proactive `encode`, clamped so `K + extra_repair ≤ 255`. This preserves the
+existing contract — a receiver that got *zero* original symbols reconstructs from the ARQ
+batch alone — and needs **no per-object repair-count state**: repair row `m` is a pure
+function of `(K, m)`, so re-emitting indices `K..` reproduces byte-identical repair symbols.
+The decoder is **index-idempotent** (a repair index it already holds is dropped as a
+duplicate), so overlap between the proactive and ARQ batches is harmless.
 
 **Generator = Cauchy, not Vandermonde.** The load-bearing property is **MDS**: any K of the
 K+R shards must decode. A Cauchy matrix over GF(256) guarantees every K×K submatrix is
@@ -99,6 +109,24 @@ invertible by construction (Vandermonde can be singular for some K/index combina
 The systematic generator is conceptually `[ I_K ; C ]` (identity rows = source, Cauchy
 rows = repair). The `R×K` Cauchy matrix is cached per `K` (working set is K=1–3; bounded
 at 64 entries like the prior plan cache, cleared on overflow).
+
+### 3.2.1 Normative Cauchy generator (RS v1)
+
+Codec tag `0x01` **binds this exact construction** — every conforming implementation MUST
+produce identical repair symbols, or the wire meaning is undefined. Over GF(256) (poly
+`0x11D`):
+
+- Source-column elements: `y_i = i` for `i ∈ 0..K−1`.
+- Repair-row elements: `x_m = K + m` for `m ∈ 0..R−1`.
+- Cauchy entry: `C[m][i] = inv(x_m ⊕ y_i)`, where `⊕` is GF(256) addition (XOR) and `inv`
+  is the GF(256) multiplicative inverse.
+- `repair_m[b] = Σ_{i=0}^{K−1} C[m][i] · source_i[b]` for each byte `b`.
+- Source rows are identity (systematic): source symbol `i` is emitted verbatim at
+  `symbol_index = i`; repair symbol `m` at `symbol_index = K + m`.
+
+The sets `{y_i} = {0..K−1}` and `{x_m} = {K..K+R−1}` are disjoint and distinct (guaranteed
+by `K + R ≤ 255`), so every `x_m ⊕ y_i ≠ 0` and every K×K submatrix of `[ I_K ; C ]` is
+invertible — the code is **MDS**. Repair row `m` depends only on `(K, m)`, never on R.
 
 ### 3.3 Reassembler (`FecReassembler`, rewritten)
 
@@ -113,10 +141,14 @@ at 64 entries like the prior plan cache, cleared on overflow).
 - Return the reconstructed object exactly once; later/duplicate symbols for a completed
   object return `None`.
 
-**DoS guards (preserved from the RaptorQ reassembler):**
-- reject `object_size == 0` or `object_size > MAX_OBJECT_SIZE` (256 KiB);
-- reject `symbol_index ≥ 255` (out of the GF(256) codeword range — the analogue of the
-  current SBN-bounds guard);
+**DoS guards (preserved from the RaptorQ reassembler, plus RS-specific bounds):**
+- reject `object_size == 0` or `object_size > MAX_OBJECT_SIZE` (256 KiB), and the derived
+  `K == 0` or `K ≥ 255`;
+- reject a wrong codec tag (`payload_id[0] ≠ 0x01`) and `symbol_index ≥ 255` (out of the
+  GF(256) codeword range — the analogue of the current SBN-bounds guard);
+- **dedupe by `symbol_index`** (a repeated index is ignored, not buffered) and **decode and
+  free as soon as `K` distinct shards arrive**, so at most `K` shards are ever buffered per
+  object — an attacker cannot inflate storage beyond one object's `K`;
 - bound objects-in-flight with oldest-object eviction (`max_objects`);
 - never panic on any attacker-supplied field — return `None`.
 
@@ -128,13 +160,16 @@ at 64 entries like the prior plan cache, cleared on overflow).
 - `Symbol { object_id: u16, object_size: u32, payload_id: [u8;4], data: Vec<u8> }` — struct
   shape unchanged; `payload_id` semantics change (§6).
 
-`Transport::encode`/`decode`/`repair_object` and `AdaptiveController` are unchanged: the
-`repair_count → R` derivation is identical; only the encoder clamps `R ≤ 255 − K`.
+`Transport::encode`/`decode`/`repair_object` and `AdaptiveController` are
+**behavior-preserving**: the `repair_count → R` derivation is identical and only the encoder
+clamps `R ≤ 255 − K`. Doc comments that still reference "RaptorQ" are updated to "FEC repair
+symbols" (§8).
 
 ## 5. Invariants
 
 1. **MDS correctness:** any K of the K+R emitted shards reconstruct the object
-   byte-for-byte, for every K∈{1,2,3,8} and R∈{1,2,4} exercised by tests.
+   byte-for-byte, for every K∈{1,2,3,8} and R∈{1,2,4} exercised by tests (the per-packet
+   MTU path is K≈1–3; K=8 stresses the future coalesced-object path).
 2. **Systematic:** with no loss, the decoder does zero field arithmetic (source symbols
    are the raw data); output equals the original ciphertext exactly.
 3. **No behavior/policy change:** all flow-class repair ratios (Realtime 0.15, Default
@@ -146,18 +181,23 @@ at 64 entries like the prior plan cache, cleared on overflow).
 ## 6. Wire framing
 
 The `yip-wire::Frame` structure is **unchanged**. Only the meaning of the opaque
-`payload_id: [u8;4]` changes, plus a codec tag:
+`payload_id: [u8;4]` changes, plus a codec tag. Layout is
+**`[tag:u8][index:u16 big-endian][reserved:u8]`** (byte 0 = tag, bytes 1–2 = index, byte 3
+reserved):
 
 - `payload_id[0] = codec_tag` — `0x01` = "RS v1". Turns the RaptorQ→RS interop break into
   an explicit, detectable mismatch, and pre-slots RLC as `0x02`.
-- `payload_id[1..3] = symbol_index: u16` (big-endian) — the shard position: `0..K−1`
+- `payload_id[1..=2] = symbol_index: u16` (big-endian) — the shard position: `0..K−1`
   source, `K..K+R−1` repair.
 - `payload_id[3]` = reserved (0) — headroom for RLC window metadata later.
-- `object_size` continues to ride in the frame payload prefix (`wire_glue.rs`) and yields
+- `object_size` continues to ride in the frame payload prefix and yields
   `K = ceil(object_size / symbol_size)`; `object_id`, `flags`, `counter` unchanged.
 
-`wire_glue.rs::symbol_to_frame`/`frame_to_symbol` change only to pack/parse the codec tag
-and `symbol_index` in `payload_id` (the `Symbol` fields they read are otherwise the same).
+**Responsibility split (`wire_glue.rs` is unchanged):** `FecEncoder` *packs* `payload_id`
+= `[0x01, idx_hi, idx_lo, 0]` when it emits a `Symbol`; `FecReassembler` *validates* the
+codec tag and *parses* `symbol_index` on receive. `wire_glue.rs::symbol_to_frame` /
+`frame_to_symbol` already pass `Symbol.payload_id` through the `Frame` verbatim and need no
+change.
 
 **Interop:** wire-incompatible with RaptorQ peers. Fails **safe** — an RS decoder rejects a
 non-`0x01` codec tag rather than misdecoding. Acceptable under yip's pre-release
@@ -175,14 +215,15 @@ envelope (3a `obf_psk` / 3c.1 QUIC), so the change creates **no new DPI signatur
   this *is* the MDS proof for yip's K/R range.
 - **Systematic no-loss test:** all K source shards → reconstruct with zero decode path taken.
 - **Independent cross-check:** `reed-solomon-erasure` as a **dev-dependency** — for the
-  same erasure scenarios, confirm an independent RS implementation also recovers (a
-  property-level agreement check on our understanding; byte-level identity is not expected,
-  as the generator matrices differ).
+  *same* K, R, and erasure sets, confirm an independent RS implementation also recovers.
+  This is a **recovery-success agreement** check (not byte-identity — the generator matrices
+  differ).
 - **DoS/malformed tests:** port the existing guard tests (zero/oversized `object_size`,
   out-of-range `symbol_index`, late/duplicate symbol, eviction-at-capacity) to the RS
-  reassembler.
-- **`wire_glue` round-trip:** `symbol_to_frame`→`frame_to_symbol` preserves codec tag,
-  `symbol_index`, `object_size`, class, counter.
+  reassembler, plus new guards: `K == 0`/`K ≥ 255`, wrong codec tag, duplicate-index dedupe.
+- **`payload_id` pack/parse test:** `FecEncoder` packs `[0x01, idx_hi, idx_lo, 0]`;
+  `FecReassembler` round-trips the `symbol_index` and rejects a non-`0x01` tag. (`wire_glue`
+  is unchanged, so no new wire_glue test is required.)
 - **Benchmarks:** `hotpath::transport_encode_1300` and `pipeline_profile` → encode <1 µs;
   record before/after + single-core multi-gigabit projection in `crates/yip-bench/RESULTS.md`.
 - **No-regression (end-to-end gate):** netns loss paths `run-netns-tunnel-loss.sh` (FEC
@@ -198,13 +239,27 @@ envelope (3a `obf_psk` / 3c.1 QUIC), so the change creates **no new DPI signatur
 - **Rewrite:** `crates/yip-transport/src/fec.rs` (`FecEncoder`, `FecReassembler`, `Symbol`
   framing; RaptorQ-specific code removed; new unit tests replacing the RaptorQ ones).
 - **Modify:** `crates/yip-transport/src/lib.rs` (register `gf256` module; `pub mod`);
-  `bin/yipd/src/wire_glue.rs` (codec tag + `symbol_index` in `payload_id`);
   `crates/yip-transport/Cargo.toml` (drop `raptorq` runtime dep; add `reed-solomon-erasure`
-  dev-dep); `crates/yip-bench` benches/examples that reference RaptorQ; `RESULTS.md`.
-- **Untouched:** `yip-wire::Frame` structure, `control.rs` logic, the QUIC path,
-  `AdaptiveController`.
+  dev-dep); `crates/yip-bench` benches/examples/`Cargo.toml` that reference `raptorq`;
+  `RESULTS.md`. Update FEC doc comments that say "RaptorQ" (incl. `Transport::repair_object`)
+  to "FEC repair symbols" (behavior-preserving).
+- **Untouched:** `bin/yipd/src/wire_glue.rs` (passes `payload_id` through verbatim — packing
+  and validation live in `FecEncoder`/`FecReassembler`); `yip-wire::Frame` structure;
+  `control.rs` logic; the QUIC path; `AdaptiveController`.
 - **Housekeeping:** the superseded plan-cache spec/plan get a "superseded" banner; the
   `plan_cache_spike.rs` throwaway example is removed.
+
+**Milestone numbering.** The throughput sub-project keeps `4a` = RS codec, `4b` = I/O
+batching, `4c` = multi-core sharding. The FEC-codec campaign stages beyond RS —
+sliding-window RLC (Stage 2), RLNC recoding (Stage 3) — are their own milestones on that
+track and do **not** renumber `4b`/`4c`. (4a is simultaneously throughput-lever #1 and
+codec-campaign Stage 1.)
+
+**Follow-up doc debt (not 4a code, tracked separately):** `CLAUDE.md`, `README.md`, and
+`docs/research` still name RaptorQ as the FEC primary; a follow-up doc pass must update them
+so future work doesn't reintroduce RaptorQ. The RaptorQ-centric FEC object-batching design
+note becomes "unnecessary for CPU after RS, still relevant to the small-K bandwidth floor
+that Stage 2 RLC addresses."
 
 **Out of scope (later milestones):** sliding-window RLC (Stage 2), RLNC recoding (Stage 3),
 I/O batching (4b), multi-core sharding (4c), AEAD acceleration.
