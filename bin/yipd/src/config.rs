@@ -16,6 +16,19 @@ use std::net::SocketAddr;
 use crate::mode::TunnelMode;
 use yip_membership::{Cert, RootSet};
 
+/// Wire transport selected via `transport=quic|raw|udp` (absent ⇒ `RawUdp`).
+///
+/// Named `TransportMode` (not `Transport`) to avoid clashing with
+/// `yip_transport::Transport`, the FEC engine. Nothing consumes
+/// `TransportMode::Quic` yet — Task 5 wires the run-loop selection; this task
+/// only parses and validates it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransportMode {
+    #[default]
+    RawUdp,
+    Quic,
+}
+
 /// Configuration for a single remote peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerConfig {
@@ -74,6 +87,11 @@ pub struct Config {
     /// of `0` is rejected as invalid (there is no such thing as a zero-length
     /// idle interval).
     pub cover_traffic_ms: Option<u64>,
+    /// Wire transport (`transport=quic|raw|udp`, absent ⇒ `RawUdp`).
+    /// Mutually exclusive with `obf_psk`/`cover_traffic_ms` — QUIC provides
+    /// its own wire obfuscation. Nothing consumes `TransportMode::Quic` yet;
+    /// this task only parses and validates it.
+    pub transport: TransportMode,
 }
 
 // ── hex decode helper ─────────────────────────────────────────────────────────
@@ -234,6 +252,7 @@ impl Config {
         let mut network_id: Option<[u8; 16]> = None;
         let mut obf_psk: Option<[u8; 32]> = None;
         let mut cover_traffic_ms: Option<u64> = None;
+        let mut transport = TransportMode::default();
 
         for line in text.lines() {
             let line = line.trim();
@@ -306,6 +325,18 @@ impl Config {
                     }
                     cover_traffic_ms = Some(ms);
                 }
+                "transport" => {
+                    transport = match val {
+                        "quic" => TransportMode::Quic,
+                        "raw" | "udp" => TransportMode::RawUdp,
+                        other => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("unknown transport: {other}"),
+                            ));
+                        }
+                    }
+                }
                 // Silently ignore unknown keys for forward-compatibility. The
                 // netns config files still contain `initiate=true|false` from
                 // before Task 5 removed the field; this is intentional so
@@ -366,6 +397,18 @@ impl Config {
             }
         }
 
+        // `transport=quic` provides its own wire obfuscation, so the
+        // obf/cover-traffic knobs (which assume the raw-UDP path) don't
+        // apply — reject the combination rather than silently ignoring one
+        // side.
+        if transport == TransportMode::Quic && (obf_psk.is_some() || cover_traffic_ms.is_some()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transport=quic is mutually exclusive with obf_psk / cover_traffic_ms \
+                 (QUIC provides its own wire obfuscation)",
+            ));
+        }
+
         Ok(Config {
             local_private: local_private.ok_or_else(|| missing("local_private"))?,
             local_public: local_public.ok_or_else(|| missing("local_public"))?,
@@ -381,6 +424,7 @@ impl Config {
             network_id,
             obf_psk,
             cover_traffic_ms,
+            transport,
         })
     }
 }
@@ -990,6 +1034,103 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
                     peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     cover_traffic_ms=abc\n";
         assert!(Config::parse(text).is_err());
+    }
+
+    // ── transport (3c.1 Task 3) ──────────────────────────────────────────
+
+    #[test]
+    fn parses_transport_quic_when_present() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    transport=quic\n";
+        let cfg = Config::parse(text).unwrap();
+        assert_eq!(cfg.transport, TransportMode::Quic);
+    }
+
+    #[test]
+    fn transport_absent_defaults_to_raw_udp() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n";
+        let cfg = Config::parse(text).unwrap();
+        assert_eq!(cfg.transport, TransportMode::RawUdp);
+    }
+
+    #[test]
+    fn transport_raw_and_udp_aliases_parse_to_raw_udp() {
+        for val in ["raw", "udp"] {
+            let text = format!(
+                "device=yip0\nlisten=0.0.0.0:51820\n\
+                 local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                 local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                 peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                 transport={val}\n"
+            );
+            let cfg = Config::parse(&text).unwrap();
+            assert_eq!(cfg.transport, TransportMode::RawUdp, "transport={val}");
+        }
+    }
+
+    #[test]
+    fn transport_unknown_value_is_parse_error() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    transport=bogus\n";
+        let err = Config::parse(text).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown transport"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn transport_quic_with_obf_psk_is_parse_error() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    transport=quic\n\
+                    obf_psk=00000000000000000000000000000000000000000000000000000000000000ff\n";
+        let err = Config::parse(text).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn transport_quic_with_cover_traffic_ms_is_parse_error() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    transport=quic\n\
+                    cover_traffic_ms=200\n";
+        let err = Config::parse(text).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn transport_quic_alone_parses_ok() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    transport=quic\n";
+        let cfg = Config::parse(text).unwrap();
+        assert_eq!(cfg.transport, TransportMode::Quic);
+        assert_eq!(cfg.obf_psk, None);
+        assert_eq!(cfg.cover_traffic_ms, None);
     }
 
     #[test]
