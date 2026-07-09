@@ -2059,18 +2059,26 @@ impl PeerManager {
 
         // ── idle cover traffic (3b Task 4) ──────────────────────────────────
         // Opt-in decoy traffic: only when obfuscation is on AND a
-        // `cover_traffic_ms` interval is configured. For each `Established`
-        // peer with a known endpoint that has been idle (no real Data sent
-        // or received) for at least the interval, AND hasn't had a cover
-        // datagram emitted in at least the interval, push exactly one
-        // session-keyed junk datagram (`build_junk` is plaintext;
-        // `tick`/`obf_egress` wraps it once with that peer's session key,
-        // since `dst` is an `Established` peer's endpoint). Gated on
-        // `last_activity_ms` so this never races or delays real data —
-        // latency-free, idle-only, bounded to one datagram per peer per tick.
+        // `cover_traffic_ms` interval is configured. For each direct
+        // (non-relay) `Established` peer with a known endpoint that has been
+        // idle (no real Data sent or received) for at least the interval,
+        // AND hasn't had a cover datagram emitted in at least the interval,
+        // push exactly one session-keyed junk datagram (`build_junk` is
+        // plaintext; `tick`/`obf_egress` wraps it once with that peer's
+        // session key, since `dst` is an `Established` peer's endpoint).
+        // Gated on `last_activity_ms` so this never races or delays real
+        // data — latency-free, idle-only, bounded to one datagram per peer
+        // per tick. A relay-reached peer (`relay == true`) is skipped: its
+        // `endpoint` is a stale/candidate direct address left over from
+        // before the passive `relayed_handshake_*` path took over (see the
+        // real-Data egress arm above, which likewise checks `!relay`) —
+        // firing cover at it would leak junk to an unrelated address and
+        // miss the peer entirely. Relay-path cover is out of scope for 3b
+        // (mirrors Task 3's handshake junk, which is direct-path-only).
         if let (true, Some(iv)) = (self.obf_key.is_some(), self.cover_traffic_ms) {
             for i in 0..self.peers.len() {
-                if !matches!(self.peers[i].state, PeerState::Established(_)) {
+                if !matches!(self.peers[i].state, PeerState::Established(_)) || self.peers[i].relay
+                {
                     continue;
                 }
                 let Some(endpoint) = self.peers[i].endpoint else {
@@ -4722,6 +4730,28 @@ mod tests {
         assert!(
             out.is_none(),
             "obf off ⇒ no cover, regardless of cover_traffic_ms"
+        );
+    }
+
+    /// A relay-reached peer (`relay == true`, mirroring how
+    /// `relayed_handshake_init`/`relayed_handshake_resp` leave a peer: session
+    /// established but `endpoint` still holding the stale/candidate direct
+    /// address from before relay took over) must NOT receive a cover
+    /// datagram from `tick`, even with obf on, `cover_traffic_ms` set, and
+    /// the peer idle — contrast with `tick_emits_one_cover_for_idle_established_peer`,
+    /// whose otherwise-identical direct peer (`relay == false`) still gets
+    /// one. Firing cover at a relay peer's stale `endpoint` would leak junk
+    /// to an unrelated address and never reach the actual peer.
+    #[test]
+    fn tick_emits_no_cover_for_relay_peer() {
+        let (mut pm, _peer_ep, _sess) =
+            obf_on_established_peer_for_cover(Some(COVER_TEST_NOW_MS), true);
+        pm.peers[0].relay = true;
+
+        let out = pm.tick(COVER_TEST_NOW_MS);
+        assert!(
+            out.is_none(),
+            "a relay-reached peer must not receive a cover datagram, even when idle"
         );
     }
 }
