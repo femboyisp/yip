@@ -71,12 +71,14 @@ use crate::peer_manager::PeerManager;
 
 // ── tunables shared with the Task-1 spike (proven; do NOT re-derive) ──────────
 
-/// Per-packet QUIC framing budget subtracted from `max_datagram_size` when
-/// picking the FEC symbol size: short header + connection id + packet number +
-/// DATAGRAM frame type/length + AEAD tag. The Task-1 spike measured 38 bytes on
-/// a settled path (`upper_bound 1452 − max_datagram_size 1414`); 28 is a
-/// deliberately tighter *reserve* so the computed symbol size stays strictly
-/// inside the datagram budget even as the packet-number length fluctuates.
+/// Reserve subtracted from `max_datagram_size` when picking the FEC symbol size.
+/// NOTE: `max_datagram_size` is already the *application* datagram budget — QUIC's
+/// own per-packet overhead (short header, connection id, packet number, DATAGRAM
+/// frame type/length, AEAD tag) is already subtracted by quinn. This reserve must
+/// therefore cover **yip's own wire framing** that rides inside the DATAGRAM
+/// payload: `yip_wire::HEADER_LEN (15) + TAG_LEN (8) = 23` bytes. 28 leaves a
+/// small margin above that 23. **Do not tighten below 23** or a full-size yip
+/// datagram would exceed the datagram budget and be rejected (`SendDatagramError::TooLarge`).
 const QUIC_YIP_OVERHEAD: usize = 28;
 
 /// The raw-UDP-path symbol size (`1200`) is the ceiling; QUIC never uses a
