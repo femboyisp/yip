@@ -66,6 +66,7 @@ device=${TUN_DEV}
 initiate=false
 EOF
 [ -n "${OBF_PSK:-}" ] && echo "obf_psk=${OBF_PSK}" >> "$CFG_A"
+[ -n "${COVER_MS:-}" ] && echo "cover_traffic_ms=${COVER_MS}" >> "$CFG_A"
 
 cat > "$CFG_B" <<EOF
 # yipB — initiator
@@ -78,6 +79,7 @@ device=${TUN_DEV}
 initiate=true
 EOF
 [ -n "${OBF_PSK:-}" ] && echo "obf_psk=${OBF_PSK}" >> "$CFG_B"
+[ -n "${COVER_MS:-}" ] && echo "cover_traffic_ms=${COVER_MS}" >> "$CFG_B"
 
 # ── 3. create namespaces and veth pair ────────────────────────────────────────
 echo "[setup] creating network namespaces"

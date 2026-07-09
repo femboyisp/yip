@@ -361,6 +361,35 @@ fn obfuscated_ping() {
 }
 
 #[test]
+fn obfuscated_ping_with_cover() {
+    // Only run as root (the script needs netns + TUN).
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP obfuscated_ping_with_cover: needs root (run under sudo in CI)");
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-netns-tunnel.sh");
+    let status = Command::new("bash")
+        .arg(script)
+        .arg(yipd)
+        .env("OBF_PSK", OBF_PSK)
+        .env("COVER_MS", "200")
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "netns tunnel ping with obf_psk + cover_traffic_ms set failed (junk/cover broke direct connectivity)"
+    );
+}
+
+#[test]
 fn obf_psk_mismatch_no_connection() {
     // Only run as root (the script needs netns + TUN).
     let is_root = Command::new("id")
@@ -598,5 +627,47 @@ fn dpi_undetectability() {
         status.success(),
         "nDPI undetectability oracle failed (obfuscated yip traffic was classified as a \
          known VPN/proxy protocol, or an Obfuscated Traffic risk flag was raised)"
+    );
+}
+
+#[test]
+fn flowshape_not_obviously_constant() {
+    // Lightweight deterministic flow-shape structural check (3b Task 7,
+    // Deliverable 2/3) — NOT the nDPId -A ML harness. Packet-count analogue
+    // of 3a's `no_byte_position_is_constant`: for N independent obf-on
+    // sessions (fresh handshake each, both peers bootstrap-initiate and
+    // glare-resolve — see run-flowshape-check.sh's header comment), the
+    // handshake-phase datagram count (measured via inter-packet-gap cutoff,
+    // not by source address, since there is no fixed "initiator" role) must
+    // (a) exceed 4 — strictly above the junk-free two-sided-glare baseline
+    // of 3 datagrams (Init(A) + Init(B) + Resp), which is what a junk-free
+    // handshake would already produce given both peers glare-initiate — and
+    // (b) take more than one distinct value across sessions (the Jc in
+    // [JUNK_BURST_MIN, JUNK_BURST_MAX] junk burst on each side is redrawn
+    // per handshake). Gate (b) is the primary non-vacuous proof of
+    // randomization: gate (a) alone only shows junk is present on top of
+    // the glare baseline. See run-flowshape-check.sh for the full
+    // assertion set and derivation.
+    //
+    // Requires root: netns creation + TUN devices + tcpdump.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP flowshape_not_obviously_constant: needs root (run under sudo in CI)");
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-flowshape-check.sh");
+    let status = Command::new("bash").arg(script).arg(yipd).status().unwrap();
+    assert!(
+        status.success(),
+        "flow-shape structural check failed (obf-on handshake opener packet count was not \
+         >4, or was identical across independent sessions — the Jc junk burst is not \
+         reaching the wire as expected)"
     );
 }

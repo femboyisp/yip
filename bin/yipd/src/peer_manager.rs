@@ -237,6 +237,19 @@ struct Peer {
     /// this peer's Data/Control/Gossip datagrams (3a). Independent of the
     /// network-wide `obf_psk` key, which wraps handshakes (pre-session).
     session_obf_key: Option<[u8; 16]>,
+    /// Monotonic `now_ms` timestamp of the last REAL Data datagram sent to or
+    /// received from this peer (3b Task 4). Updated at the on_tun →
+    /// `DataPlane` data-egress site and the `Data`-ptype arm of the ingress
+    /// dispatch — never by control/gossip/junk. Defaults to `0`, so a
+    /// freshly-`Established` peer that has carried no real traffic yet reads
+    /// as idle immediately (cover starts right away, matching "the flow
+    /// never goes tellingly silent"). Drives the idle gate in `tick_dispatch`'s
+    /// cover-traffic emission; irrelevant when `cover_traffic_ms` is unset.
+    last_activity_ms: u64,
+    /// Monotonic `now_ms` timestamp of the last cover (junk) datagram emitted
+    /// to this peer (3b Task 4). Defaults to `0`. Bounds cover emission to at
+    /// most one datagram per peer per `cover_traffic_ms` interval.
+    last_cover_ms: u64,
 }
 
 /// Multi-peer router/demuxer + lazy in-loop handshake driver.
@@ -312,6 +325,17 @@ pub struct PeerManager {
     /// for Data/Control/Gossip. Set once, before the event loop starts (see
     /// [`PeerManager::set_obf_psk`]).
     obf_key: Option<[u8; 16]>,
+    /// Fast userspace PRNG for junk-datagram sizing/content (3b) — see
+    /// [`PeerManager::build_junk`]. Seeded once from the OS RNG; never used
+    /// for any security decision (junk bytes are keystream-masked by
+    /// `yip_obf::obfuscate`, so their content is irrelevant).
+    junk_rng: yip_obf::XorShift64,
+    /// Opt-in idle cover-traffic interval (3b Task 4), or `None` to disable.
+    /// Only consulted when `obf_key.is_some()` — with obfuscation off, cover
+    /// traffic never fires regardless of this value (there is no wrapper to
+    /// hide it, and junk-in-the-clear would be worse than silence). Set once,
+    /// before the event loop starts, via [`PeerManager::set_cover_traffic_ms`].
+    cover_traffic_ms: Option<u64>,
 }
 
 /// MTU budget (bytes) used to size obfuscation padding: handshakes are padded
@@ -322,6 +346,16 @@ pub struct PeerManager {
 const OBF_MTU_BUDGET: usize = 1200;
 /// Maximum modest padding (bytes) added to a data/control/gossip envelope.
 const OBF_DATA_PAD_MAX: usize = 64;
+/// Minimum/maximum length (bytes) of a junk datagram's throwaway body, drawn
+/// uniformly by [`PeerManager::build_junk`]. Content is irrelevant (masked by
+/// `obfuscate`); the range just varies the on-wire size like real traffic.
+const JUNK_MIN_LEN: usize = 64;
+const JUNK_MAX_LEN: usize = 1024;
+/// Minimum/maximum number of junk datagrams in a single decoy burst, drawn by
+/// `begin_handshake` when obfuscation is on and the handshake is direct (not
+/// relayed) (Task 3).
+const JUNK_BURST_MIN: u64 = 3;
+const JUNK_BURST_MAX: u64 = 12;
 
 impl PeerManager {
     /// Build a `PeerManager` from the local keypair and the configured peer
@@ -364,6 +398,8 @@ impl PeerManager {
                 relay: false,
                 last_lookup_ms: None,
                 session_obf_key: None,
+                last_activity_ms: 0,
+                last_cover_ms: 0,
             });
         }
         let mut mgr = Self {
@@ -384,6 +420,8 @@ impl PeerManager {
             tick_egress: Vec::new(),
             tun_scratch: Vec::new(),
             obf_key: None,
+            junk_rng: yip_obf::XorShift64::from_getrandom(),
+            cover_traffic_ms: None,
         };
         // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
         // exactly like configured peers: seed them into the peer table so an
@@ -435,6 +473,8 @@ impl PeerManager {
             relay: false,
             last_lookup_ms: None,
             session_obf_key: None,
+            last_activity_ms: 0,
+            last_cover_ms: 0,
         });
     }
 
@@ -452,6 +492,18 @@ impl PeerManager {
     /// argument since no handshake can complete before the loop starts.
     pub fn set_obf_psk(&mut self, obf_psk: Option<[u8; 32]>) {
         self.obf_key = obf_psk.map(|p| yip_obf::derive_key(&p));
+    }
+
+    /// Enable (or disable) opt-in idle cover traffic (3b Task 4) from the
+    /// configured `cover_traffic_ms`. Called once by `tunnel.rs` right after
+    /// `set_obf_psk`, before the event loop begins. `None` leaves cover
+    /// traffic disabled. Only takes effect when obfuscation is also enabled
+    /// (`obf_key.is_some()`) — see `tick_dispatch`'s cover-emission gate.
+    ///
+    /// A post-construction setter for the same reason as `set_obf_psk`: it
+    /// keeps the existing `PeerManager::new` call sites untouched.
+    pub fn set_cover_traffic_ms(&mut self, cover_traffic_ms: Option<u64>) {
+        self.cover_traffic_ms = cover_traffic_ms;
     }
 
     /// This node's own self-certifying mesh address, for assigning the
@@ -506,9 +558,19 @@ impl PeerManager {
     }
 
     /// Start a fresh initiator handshake toward `target` for peer `idx`,
-    /// returning the framed egress datagram to send (relay-wrapped when
-    /// `via_relay`). Transitions the peer to `Handshaking`. Returns `None`
-    /// (leaving the peer as it was) if the Noise step or the relay wrap fails.
+    /// returning the framed egress datagram(s) to send (relay-wrapped when
+    /// `via_relay`), the real `HandshakeInit` always last. Transitions the
+    /// peer to `Handshaking`. Returns `None` (leaving the peer as it was) if
+    /// the Noise step or the relay wrap fails.
+    ///
+    /// When obfuscation is on (`obf_key.is_some()`) and the handshake is
+    /// direct (`!via_relay`), the Init is preceded by a burst of `Jc ∈
+    /// [JUNK_BURST_MIN, JUNK_BURST_MAX]` junk datagrams (`build_junk`) to the
+    /// same `target`, so the flow no longer opens with a countable "2
+    /// packets then data" — junk never touches Noise/session state. Relay-path
+    /// junk is out of scope (Task 3) — the relay path always returns exactly
+    /// one datagram. With `obf_key: None` this returns exactly one datagram
+    /// (the Init), byte-identical to pre-Task-3 behavior.
     ///
     /// The caller is responsible for only invoking this on a peer that is not
     /// already `Handshaking`/`Established`.
@@ -518,7 +580,7 @@ impl PeerManager {
         target: SocketAddr,
         via_relay: bool,
         now_ms: u64,
-    ) -> Option<EgressDatagram> {
+    ) -> Option<Vec<EgressDatagram>> {
         let pubkey = self.peers[idx].pubkey;
         // Present our CA-signed membership cert as msg1's Noise payload so the
         // responder can admit us by cert (2c). Empty when membership is None —
@@ -566,7 +628,24 @@ impl PeerManager {
             init_pkt,
             target,
         }));
-        Some(dg)
+        // Direct-path junk burst (Task 3): obfuscation on, not relayed. The
+        // relay path keeps its single-datagram shape — relay-path junk would
+        // need a different (RelaySend) envelope and is out of scope here.
+        if !via_relay && self.obf_key.is_some() {
+            let jc = self.junk_rng.gen_range(JUNK_BURST_MIN, JUNK_BURST_MAX);
+            let jc = usize::try_from(jc).expect("JUNK_BURST_MAX fits usize");
+            let mut dgs = Vec::with_capacity(jc + 1);
+            for _ in 0..jc {
+                dgs.push(EgressDatagram {
+                    fate: 0,
+                    dst: target,
+                    bytes: self.build_junk(),
+                });
+            }
+            dgs.push(dg);
+            return Some(dgs);
+        }
+        Some(vec![dg])
     }
 
     /// Emit a `lookup(peer_node)` for peer `idx`, debounced to at most one per
@@ -591,14 +670,14 @@ impl PeerManager {
     fn drive_path_idle(&mut self, idx: usize, now_ms: u64) {
         match self.peers[idx].path.advance(now_ms) {
             PathAction::Probe(addr) => {
-                if let Some(dg) = self.begin_handshake(idx, addr, false, now_ms) {
-                    self.tick_egress.push(dg);
+                if let Some(dgs) = self.begin_handshake(idx, addr, false, now_ms) {
+                    self.tick_egress.extend(dgs);
                 }
             }
             PathAction::Relay => {
                 let server = self.server_addr();
-                if let Some(dg) = self.begin_handshake(idx, server, true, now_ms) {
-                    self.tick_egress.push(dg);
+                if let Some(dgs) = self.begin_handshake(idx, server, true, now_ms) {
+                    self.tick_egress.extend(dgs);
                 }
             }
             PathAction::NeedLookup => {
@@ -637,9 +716,9 @@ impl PeerManager {
                         // two NATs punch simultaneously — but only if we are not
                         // already probing (keep the in-flight ephemeral).
                         if matches!(self.peers[idx].state, PeerState::Idle) {
-                            if let Some(dg) = self.begin_handshake(idx, addr, false, now_ms) {
+                            if let Some(dgs) = self.begin_handshake(idx, addr, false, now_ms) {
                                 self.egress.clear();
-                                self.egress.push(dg);
+                                self.egress.extend(dgs);
                                 return DispatchOut::Udp(&self.egress);
                             }
                         }
@@ -729,6 +808,7 @@ impl PeerManager {
                     conn_tag,
                     self.mode,
                     placeholder,
+                    self.obf_key.is_some(),
                 ));
 
                 self.peers[idx].session_obf_key = sess_obf;
@@ -786,6 +866,7 @@ impl PeerManager {
                     conn_tag,
                     self.mode,
                     placeholder,
+                    self.obf_key.is_some(),
                 ));
                 self.by_tag.insert(dp.conn_tag(), idx);
                 self.peers[idx].session_obf_key = sess_obf;
@@ -971,6 +1052,12 @@ impl PeerManager {
         now_ms: u64,
     ) -> DispatchOut<'_> {
         if let Some(idx) = self.route_data(src, dg) {
+            // Real Data ingress for this peer (3b Task 4): only the `Data`
+            // ptype counts as activity, not `Control` (the loss-feedback
+            // packet also routes through here).
+            if dg[0] == PacketType::Data as u8 {
+                self.peers[idx].last_activity_ms = now_ms;
+            }
             return self.dispatch_established(idx, dg, now_ms);
         }
         // No address/tag match at all (e.g. the peer roamed) — try every
@@ -1142,7 +1229,13 @@ impl PeerManager {
             PeerState::Idle | PeerState::Handshaking(_) => {
                 let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
                 let sess_obf = self.session_obf_key_for(&established.hp_key);
-                let mut dp = Box::new(DataPlane::new(established, conn_tag, self.mode, src));
+                let mut dp = Box::new(DataPlane::new(
+                    established,
+                    conn_tag,
+                    self.mode,
+                    src,
+                    self.obf_key.is_some(),
+                ));
 
                 self.peers[idx].session_obf_key = sess_obf;
                 self.peers[idx].endpoint = Some(src); // learn the observed endpoint
@@ -1214,7 +1307,13 @@ impl PeerManager {
                 let sess_obf = self.session_obf_key_for(&established.hp_key);
                 // `idx` was matched above via `p.endpoint == Some(src)`, so `src`
                 // is exactly this peer's endpoint.
-                let mut dp = Box::new(DataPlane::new(established, conn_tag, self.mode, src));
+                let mut dp = Box::new(DataPlane::new(
+                    established,
+                    conn_tag,
+                    self.mode,
+                    src,
+                    self.obf_key.is_some(),
+                ));
                 self.by_tag.insert(dp.conn_tag(), idx);
                 self.peers[idx].session_obf_key = sess_obf;
                 // `src` == this peer's `endpoint` (matched above). Commit the
@@ -1402,8 +1501,8 @@ impl PeerManager {
                     .iter()
                     .position(|p| p.endpoint == Some(addr) && matches!(p.state, PeerState::Idle))
                 {
-                    if let Some(d) = self.begin_handshake(i, addr, false, now_ms) {
-                        self.tick_egress.push(d);
+                    if let Some(dgs) = self.begin_handshake(i, addr, false, now_ms) {
+                        self.tick_egress.extend(dgs);
                     }
                     break;
                 }
@@ -1445,6 +1544,9 @@ impl PeerManager {
             }
         }) {
             if let Some((ptype, body)) = yip_obf::deobfuscate(&key, dg) {
+                if ptype == yip_obf::JUNK_TYPE {
+                    return None; // idle-cover decoy: inert, dropped, no fall-through
+                }
                 if ptype == PacketType::Data as u8
                     || ptype == PacketType::Control as u8
                     || ptype == PacketType::Gossip as u8
@@ -1456,6 +1558,9 @@ impl PeerManager {
         // (b) pre-session network key → handshakes only.
         if let Some(key) = self.obf_key {
             if let Some((ptype, body)) = yip_obf::deobfuscate(&key, dg) {
+                if ptype == yip_obf::JUNK_TYPE {
+                    return None; // idle-cover decoy: inert, dropped, no fall-through
+                }
                 if ptype == PacketType::HandshakeInit as u8
                     || ptype == PacketType::HandshakeResp as u8
                 {
@@ -1464,6 +1569,26 @@ impl PeerManager {
             }
         }
         None
+    }
+
+    /// Build a plaintext JUNK decoy datagram `[JUNK_TYPE][random body]`. The
+    /// caller's `obf_egress` pass wraps it once (network key for a
+    /// handshake-burst dst, session key for an established-peer cover dst) —
+    /// do NOT pre-obfuscate here, or it would be double-wrapped. Body length
+    /// is random in `[JUNK_MIN_LEN, JUNK_MAX_LEN]`, drawn from `junk_rng`
+    /// (content is irrelevant — masked once `obf_egress` wraps it). The
+    /// receiver recovers `(JUNK_TYPE, _)` via a single `yip_obf::deobfuscate`
+    /// and drops it (see `deobf_ingress`) — junk never touches
+    /// Noise/AEAD/session state. Only meaningful on the obfuscation-enabled
+    /// path (`begin_handshake` only calls this when `obf_key.is_some()`).
+    fn build_junk(&mut self) -> Vec<u8> {
+        let lo = u64::try_from(JUNK_MIN_LEN).expect("JUNK_MIN_LEN fits u64");
+        let hi = u64::try_from(JUNK_MAX_LEN).expect("JUNK_MAX_LEN fits u64");
+        let len = usize::try_from(self.junk_rng.gen_range(lo, hi)).expect("gen_range in usize");
+        let mut out = vec![0u8; 1 + len];
+        out[0] = yip_obf::JUNK_TYPE;
+        self.junk_rng.fill(&mut out[1..]);
+        out
     }
 
     /// The obfuscation key to wrap an egress datagram to `dst` whose plaintext
@@ -1673,6 +1798,10 @@ impl PeerManager {
         // other arm that also touches `self.peers[idx]`. Splitting into
         // independent statements gives each one its own borrow region.
         if matches!(self.peers[idx].state, PeerState::Established(_)) {
+            // Real Data egress for this peer (3b Task 4): mark it active so
+            // the idle-cover-traffic gate in `tick_dispatch` does not fire
+            // while real traffic is flowing.
+            self.peers[idx].last_activity_ms = now_ms;
             // A relay-reached peer's data-plane egress must be re-wrapped
             // through the server (dst = server); copy the bytes out first (the
             // DataPlane borrows `self.peers[idx]`) then wrap. A direct/punched
@@ -1721,19 +1850,19 @@ impl PeerManager {
                 None => PathAction::Idle,
             }
         };
-        let dg = match action {
+        let dgs = match action {
             PathAction::Probe(addr) => self.begin_handshake(idx, addr, false, now_ms),
             PathAction::Relay => {
                 let server = self.server_addr();
                 self.begin_handshake(idx, server, true, now_ms)
             }
-            PathAction::NeedLookup => self.maybe_lookup(idx, now_ms),
+            PathAction::NeedLookup => self.maybe_lookup(idx, now_ms).map(|d| vec![d]),
             PathAction::Idle | PathAction::Failed => None,
         };
-        match dg {
-            Some(d) => {
+        match dgs {
+            Some(dgs) => {
                 self.egress.clear();
-                self.egress.push(d);
+                self.egress.extend(dgs);
                 &self.egress
             }
             None => &[],
@@ -1811,8 +1940,8 @@ impl PeerManager {
                         // a nicer recovery, but is out of 2b scope.)
                         self.peers[i].endpoint = None;
                         let server = self.server_addr();
-                        if let Some(dg) = self.begin_handshake(i, server, true, now_ms) {
-                            self.tick_egress.push(dg);
+                        if let Some(dgs) = self.begin_handshake(i, server, true, now_ms) {
+                            self.tick_egress.extend(dgs);
                         }
                         continue;
                     }
@@ -1820,8 +1949,8 @@ impl PeerManager {
                         // The SM chose a *different* candidate: re-target by
                         // abandoning the current attempt and probing `addr`.
                         self.peers[i].state = PeerState::Idle;
-                        if let Some(dg) = self.begin_handshake(i, addr, false, now_ms) {
-                            self.tick_egress.push(dg);
+                        if let Some(dgs) = self.begin_handshake(i, addr, false, now_ms) {
+                            self.tick_egress.extend(dgs);
                         }
                         continue;
                     }
@@ -1940,6 +2069,48 @@ impl PeerManager {
         // Skipped entirely without membership (pure-2a/2b `tick` is unchanged).
         if self.membership.is_some() {
             self.tick_gossip(now_ms);
+        }
+
+        // ── idle cover traffic (3b Task 4) ──────────────────────────────────
+        // Opt-in decoy traffic: only when obfuscation is on AND a
+        // `cover_traffic_ms` interval is configured. For each direct
+        // (non-relay) `Established` peer with a known endpoint that has been
+        // idle (no real Data sent or received) for at least the interval,
+        // AND hasn't had a cover datagram emitted in at least the interval,
+        // push exactly one session-keyed junk datagram (`build_junk` is
+        // plaintext; `tick`/`obf_egress` wraps it once with that peer's
+        // session key, since `dst` is an `Established` peer's endpoint).
+        // Gated on `last_activity_ms` so this never races or delays real
+        // data — latency-free, idle-only, bounded to one datagram per peer
+        // per tick. A relay-reached peer (`relay == true`) is skipped: its
+        // `endpoint` is a stale/candidate direct address left over from
+        // before the passive `relayed_handshake_*` path took over (see the
+        // real-Data egress arm above, which likewise checks `!relay`) —
+        // firing cover at it would leak junk to an unrelated address and
+        // miss the peer entirely. Relay-path cover is out of scope for 3b
+        // (mirrors Task 3's handshake junk, which is direct-path-only).
+        if let (true, Some(iv)) = (self.obf_key.is_some(), self.cover_traffic_ms) {
+            for i in 0..self.peers.len() {
+                if !matches!(self.peers[i].state, PeerState::Established(_)) || self.peers[i].relay
+                {
+                    continue;
+                }
+                let Some(endpoint) = self.peers[i].endpoint else {
+                    continue;
+                };
+                if now_ms.saturating_sub(self.peers[i].last_activity_ms) < iv
+                    || now_ms.saturating_sub(self.peers[i].last_cover_ms) < iv
+                {
+                    continue;
+                }
+                let bytes = self.build_junk();
+                self.tick_egress.push(EgressDatagram {
+                    fate: 0,
+                    dst: endpoint,
+                    bytes,
+                });
+                self.peers[i].last_cover_ms = now_ms;
+            }
         }
 
         if self.tick_egress.is_empty() {
@@ -2096,7 +2267,7 @@ mod tests {
             auth_key,
             hp_key,
         };
-        DataPlane::new(established, conn_tag, TunnelMode::L3Tun, peer_addr)
+        DataPlane::new(established, conn_tag, TunnelMode::L3Tun, peer_addr, false)
     }
 
     #[test]
@@ -3787,8 +3958,8 @@ mod tests {
         };
         let any: SocketAddr = "0.0.0.0:0".parse().unwrap();
         (
-            DataPlane::new(est_i, conn_tag, TunnelMode::L3Tun, any),
-            DataPlane::new(est_r, conn_tag, TunnelMode::L3Tun, resp_peer_addr),
+            DataPlane::new(est_i, conn_tag, TunnelMode::L3Tun, any, false),
+            DataPlane::new(est_r, conn_tag, TunnelMode::L3Tun, resp_peer_addr, false),
             hp_key,
             conn_tag,
         )
@@ -3928,6 +4099,310 @@ mod tests {
         // No peer disturbed.
         assert!(matches!(pm.peers[0].state, PeerState::Idle));
         assert!(pm.by_tag.is_empty());
+    }
+
+    /// (3b-a) `build_junk()` produces a PLAINTEXT `[JUNK_TYPE][body]`
+    /// datagram, `JUNK_MIN_LEN..=JUNK_MAX_LEN` bytes of body — it must NOT
+    /// pre-obfuscate, since the caller's `obf_egress` pass wraps it exactly
+    /// once (double-wrapping would defeat the JUNK_TYPE recognition on
+    /// ingress; see `single_wrap_...` below for the full round-trip).
+    #[test]
+    fn build_junk_roundtrips_to_junk_type() {
+        let peer = peer_cfg(5, "10.0.0.5:5000");
+        let mut pm = PeerManager::new([1u8; 32], [2u8; 32], &[peer], TunnelMode::L3Tun, None, None);
+
+        let dg = pm.build_junk();
+        assert_eq!(
+            dg[0],
+            yip_obf::JUNK_TYPE,
+            "leading byte is the plaintext JUNK_TYPE"
+        );
+        let body_len = dg.len() - 1;
+        assert!(
+            (JUNK_MIN_LEN..=JUNK_MAX_LEN).contains(&body_len),
+            "body length is within [JUNK_MIN_LEN, JUNK_MAX_LEN], got {body_len}"
+        );
+    }
+
+    /// (3b-b) With obfuscation on, a junk datagram sent from an `Established`
+    /// peer's source (session-keyed) is silently dropped by `on_udp`: no
+    /// egress, and the peer's session state is left completely untouched.
+    #[test]
+    fn obf_on_session_keyed_junk_is_dropped_state_unchanged() {
+        const TAG: u64 = 0xABCD_EF01;
+        let peer_ep: SocketAddr = "10.0.0.6:6000".parse().unwrap();
+        let peer = peer_cfg(6, "10.0.0.6:6000");
+        let mut pm = PeerManager::new([3u8; 32], [4u8; 32], &[peer], TunnelMode::L3Tun, None, None);
+        pm.set_obf_psk(Some([0x66u8; 32]));
+
+        pm.peers[0].state =
+            PeerState::Established(Box::new(fake_established_dataplane(TAG, peer_ep)));
+        let sess = [0x77u8; 16];
+        pm.peers[0].session_obf_key = Some(sess);
+        pm.by_tag.insert(TAG, 0);
+
+        // `build_junk()` itself is plaintext now (single-wrapped by
+        // `obf_egress` on the real egress path); reproduce that one wrap by
+        // hand here to get wire-format bytes for `on_udp`'s ingress test.
+        let plain = pm.build_junk();
+        let junk = yip_obf::obfuscate(&sess, yip_obf::JUNK_TYPE, &plain[1..], 0);
+        let before_tag = pm.by_tag.get(&TAG).copied();
+
+        let out = pm.on_udp(peer_ep, &junk, 0);
+        assert!(
+            matches!(out, DispatchOut::None),
+            "session-keyed junk must be dropped, not dispatched"
+        );
+        assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+        assert_eq!(
+            pm.peers[0].session_obf_key,
+            Some(sess),
+            "session obf key untouched by a dropped junk datagram"
+        );
+        assert_eq!(pm.by_tag.get(&TAG).copied(), before_tag, "by_tag untouched");
+    }
+
+    /// (3b-c) With obfuscation on, a junk datagram from an entirely unknown
+    /// source (no `Established` peer at that address, so it can only unmask
+    /// under the network `obf_key`) is dropped with no panic and no peer
+    /// admitted.
+    #[test]
+    fn obf_on_network_keyed_junk_from_unknown_src_is_dropped_no_panic() {
+        let peer = peer_cfg(7, "10.0.0.7:7000");
+        let mut pm = PeerManager::new([5u8; 32], [6u8; 32], &[peer], TunnelMode::L3Tun, None, None);
+        let psk = [0x88u8; 32];
+        pm.set_obf_psk(Some(psk));
+        let obf_key = yip_obf::derive_key(&psk);
+
+        // Same rationale as the session-keyed test above: `build_junk()` is
+        // plaintext, so wrap it once by hand to get wire-format bytes.
+        let plain = pm.build_junk();
+        let junk = yip_obf::obfuscate(&obf_key, yip_obf::JUNK_TYPE, &plain[1..], 0);
+        let src: SocketAddr = "203.0.113.55:5555".parse().unwrap();
+        assert!(matches!(pm.on_udp(src, &junk, 0), DispatchOut::None));
+        assert!(matches!(pm.peers[0].state, PeerState::Idle));
+        assert!(pm.by_tag.is_empty());
+    }
+
+    /// (3b-d) With obfuscation OFF (`obf_key: None`), the `JUNK_TYPE` drop arm
+    /// lives entirely inside `deobf_ingress`, which is never reached — a
+    /// junk-shaped datagram (leading byte == `JUNK_TYPE`, which is not a
+    /// recognized plaintext `PacketType`) takes the exact unchanged 2a/2b/2c
+    /// plaintext path (falls into `handle_data_or_control`, finds no matching
+    /// peer, drops with no panic) rather than being specially recognized.
+    #[test]
+    fn obf_off_junk_shaped_datagram_takes_unchanged_plaintext_path() {
+        let peer = peer_cfg(8, "10.0.0.8:8000");
+        let mut pm = PeerManager::new([7u8; 32], [8u8; 32], &[peer], TunnelMode::L3Tun, None, None);
+        // No set_obf_psk ⇒ obf_key is None ⇒ deobf_ingress/build_junk's JUNK
+        // handling is never consulted.
+        assert!(pm.obf_key.is_none());
+
+        let mut dg = vec![yip_obf::JUNK_TYPE];
+        dg.extend_from_slice(&[0u8; 16]);
+        let src: SocketAddr = "203.0.113.66:6666".parse().unwrap();
+        assert!(matches!(pm.on_udp(src, &dg, 0), DispatchOut::None));
+        assert!(matches!(pm.peers[0].state, PeerState::Idle));
+    }
+
+    // ── Task 3: handshake junk burst ────────────────────────────────────────
+
+    /// With obfuscation on and a direct (non-relay) handshake,
+    /// `begin_handshake` returns `Jc ∈ [JUNK_BURST_MIN, JUNK_BURST_MAX]` junk
+    /// datagrams — each a PLAINTEXT `[JUNK_TYPE][body]` (obfuscation happens
+    /// one layer up, in `obf_egress`; see `single_wrap_...` below for the
+    /// wrapped round-trip) — followed by exactly one real `HandshakeInit`,
+    /// all addressed to `target`.
+    #[test]
+    fn begin_handshake_obf_on_direct_emits_junk_burst_then_init() {
+        let peer = peer_cfg(9, "10.0.0.9:9000");
+        let mut pm = PeerManager::new(
+            [9u8; 32],
+            [10u8; 32],
+            &[peer],
+            TunnelMode::L3Tun,
+            None,
+            None,
+        );
+        let psk = [0x99u8; 32];
+        pm.set_obf_psk(Some(psk));
+        let target: SocketAddr = "203.0.113.9:9000".parse().unwrap();
+
+        let dgs = pm
+            .begin_handshake(0, target, false, 0)
+            .expect("handshake starts");
+
+        let min_len = 1 + usize::try_from(JUNK_BURST_MIN).expect("fits usize");
+        let max_len = 1 + usize::try_from(JUNK_BURST_MAX).expect("fits usize");
+        assert!(
+            (min_len..=max_len).contains(&dgs.len()),
+            "expected 1 Init + [JUNK_BURST_MIN, JUNK_BURST_MAX] junk, got {} datagrams",
+            dgs.len()
+        );
+        for d in &dgs {
+            assert_eq!(d.dst, target, "every datagram targets `target`");
+        }
+
+        let (junk, init) = dgs.split_at(dgs.len() - 1);
+        assert!(!junk.is_empty(), "at least JUNK_BURST_MIN junk datagrams");
+        for j in junk {
+            assert_eq!(
+                j.bytes[0],
+                yip_obf::JUNK_TYPE,
+                "junk datagram is plaintext [JUNK_TYPE][body] pre-obf_egress"
+            );
+        }
+        // The real Init is last, still the plaintext `[PacketType]‖msg1`
+        // framing `begin_handshake` has always produced (wrapping under
+        // obfuscation happens one layer up, in `obf_egress`).
+        assert_eq!(init.len(), 1, "exactly one real Init");
+        assert_eq!(init[0].bytes[0], PacketType::HandshakeInit as u8);
+        assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    }
+
+    /// Across many `begin_handshake` calls (obf on, direct), the junk count
+    /// `Jc` varies — proving the burst size is actually drawn from
+    /// `junk_rng` each time rather than a disguised constant.
+    #[test]
+    fn begin_handshake_obf_on_direct_junk_count_varies() {
+        let peer = peer_cfg(10, "10.0.0.10:10000");
+        let mut pm = PeerManager::new(
+            [11u8; 32],
+            [12u8; 32],
+            &[peer],
+            TunnelMode::L3Tun,
+            None,
+            None,
+        );
+        pm.set_obf_psk(Some([0xAAu8; 32]));
+        let target: SocketAddr = "203.0.113.10:10000".parse().unwrap();
+
+        let mut counts = std::collections::HashSet::new();
+        for _ in 0..64 {
+            // Reset to Idle so begin_handshake can restart the peer each call.
+            pm.peers[0].state = PeerState::Idle;
+            let dgs = pm
+                .begin_handshake(0, target, false, 0)
+                .expect("handshake starts");
+            counts.insert(dgs.len() - 1); // junk count, excluding the trailing Init
+        }
+        assert!(
+            counts.len() > 1,
+            "junk count must vary across 64 calls, saw only {counts:?}"
+        );
+    }
+
+    /// With obfuscation OFF, `begin_handshake` on the direct path returns
+    /// exactly one datagram (the Init) — no junk, byte-identical to
+    /// pre-Task-3 behavior.
+    #[test]
+    fn begin_handshake_obf_off_direct_emits_init_only() {
+        let peer = peer_cfg(11, "10.0.0.11:11000");
+        let mut pm = PeerManager::new(
+            [13u8; 32],
+            [14u8; 32],
+            &[peer],
+            TunnelMode::L3Tun,
+            None,
+            None,
+        );
+        assert!(pm.obf_key.is_none());
+        let target: SocketAddr = "203.0.113.11:11000".parse().unwrap();
+
+        let dgs = pm
+            .begin_handshake(0, target, false, 0)
+            .expect("handshake starts");
+        assert_eq!(dgs.len(), 1, "no junk when obf is off");
+        assert_eq!(dgs[0].dst, target);
+        assert_eq!(dgs[0].bytes[0], PacketType::HandshakeInit as u8);
+    }
+
+    /// Scope guard: even with obfuscation on, the RELAY handshake path
+    /// (`via_relay: true`) returns exactly one datagram — no junk. Relay-path
+    /// junk needs a different (`RelaySend`) envelope and is out of scope for
+    /// Task 3 (noted as future work).
+    #[test]
+    fn begin_handshake_obf_on_relay_emits_wrapped_init_only_no_junk() {
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
+        pm.set_obf_psk(Some([0xBBu8; 32]));
+
+        let server = mock_server();
+        let dgs = pm
+            .begin_handshake(0, server, true, 0)
+            .expect("relay handshake starts");
+        assert_eq!(dgs.len(), 1, "relay path never emits junk (Task 3 scope)");
+        assert_eq!(dgs[0].dst, server);
+        assert!(pm.peers[0].relay, "peer marked relay-routed");
+    }
+
+    /// End-to-end single-wrap proof — the actual bug this fix addresses.
+    /// Drives the real egress path (`on_tun` on an Idle peer, obf on), so
+    /// `begin_handshake`'s junk burst flows through the caller's `obf_egress`
+    /// pass exactly once, same as production. Before the fix, `build_junk`
+    /// pre-obfuscated its output and `obf_egress` wrapped it a *second* time,
+    /// so a single `deobfuscate` on the wire bytes recovered a garbage ptype
+    /// (the leading byte of the *inner* envelope's random nonce, not
+    /// `JUNK_TYPE`) — junk still got silently dropped, but via the generic
+    /// unrecognized-ptype path rather than the dedicated `JUNK_TYPE` arm.
+    /// Assert every datagram actually on the wire recovers under exactly one
+    /// `yip_obf::deobfuscate(&network_key, _)` call, that at least
+    /// `JUNK_BURST_MIN` of them decode to `JUNK_TYPE`, and exactly one
+    /// decodes to a non-empty `HandshakeInit`.
+    #[test]
+    fn junk_burst_is_single_wrapped_end_to_end() {
+        let peer = peer_cfg(12, "10.0.0.12:12000");
+        let mut pm = PeerManager::new(
+            [15u8; 32],
+            [16u8; 32],
+            &[peer],
+            TunnelMode::L3Tun,
+            None,
+            None,
+        );
+        let psk = [0xCCu8; 32];
+        pm.set_obf_psk(Some(psk));
+        let network_key = yip_obf::derive_key(&psk);
+
+        let wire = pm.on_tun(&dummy_tun_pkt(), 0).to_vec();
+        assert!(!wire.is_empty(), "the first TUN packet starts a handshake");
+
+        let mut junk_count = 0usize;
+        let mut init_count = 0usize;
+        for d in &wire {
+            assert!(
+                d.bytes.len() <= OBF_MTU_BUDGET,
+                "wrapped datagram must stay within OBF_MTU_BUDGET, got {}",
+                d.bytes.len()
+            );
+            let (ptype, body) = yip_obf::deobfuscate(&network_key, &d.bytes).expect(
+                "every emitted datagram must recover under a SINGLE deobfuscate \
+                 call — a double-wrap would leave the outer envelope's random \
+                 ptype/len/body inconsistent or simply wrong",
+            );
+            if ptype == yip_obf::JUNK_TYPE {
+                junk_count += 1;
+            } else if ptype == PacketType::HandshakeInit as u8 {
+                init_count += 1;
+                assert!(!body.is_empty(), "the real Init carries msg1 bytes");
+            } else {
+                panic!(
+                    "unexpected ptype {ptype} on the wire — this is exactly the \
+                     symptom of the double-wrap bug (single deobfuscate peeling \
+                     only the outer layer)"
+                );
+            }
+        }
+        assert!(
+            junk_count >= usize::try_from(JUNK_BURST_MIN).expect("fits usize"),
+            "at least JUNK_BURST_MIN junk datagrams, got {junk_count}"
+        );
+        assert_eq!(init_count, 1, "exactly one real HandshakeInit");
     }
 
     /// (d) With obfuscation OFF (no `set_obf_psk`), `on_udp` runs the unchanged
@@ -4150,5 +4625,147 @@ mod tests {
             assert_eq!(retry_ms, HANDSHAKE_RETRY_MS);
             assert_eq!(reg_ms, REG_REFRESH_MS);
         }
+    }
+
+    // ── 3b Task 4: idle cover traffic ───────────────────────────────────────
+
+    /// Build an obf-on `PeerManager` with a single `Established` peer whose
+    /// session obf key is known to the caller, ready to `tick`. Both
+    /// `last_activity_ms`/`last_cover_ms` start at their `Peer::new` default
+    /// (`0`) — "idle since the dawn of time" — so a caller only needs to
+    /// override whichever one it wants non-idle.
+    fn obf_on_established_peer_for_cover(
+        cover_traffic_ms: Option<u64>,
+        obf_on: bool,
+    ) -> (PeerManager, SocketAddr, [u8; 16]) {
+        const TAG: u64 = 0x1234_5678_9abc_def0;
+        let peer_ep: SocketAddr = "10.0.0.20:2020".parse().unwrap();
+        let peer = peer_cfg(20, "10.0.0.20:2020");
+        let mut pm = PeerManager::new(
+            [21u8; 32],
+            [22u8; 32],
+            &[peer],
+            TunnelMode::L3Tun,
+            None,
+            None,
+        );
+        if obf_on {
+            pm.set_obf_psk(Some([0xAAu8; 32]));
+        }
+        pm.set_cover_traffic_ms(cover_traffic_ms);
+
+        pm.peers[0].state =
+            PeerState::Established(Box::new(fake_established_dataplane(TAG, peer_ep)));
+        let sess = [0xBBu8; 16];
+        pm.peers[0].session_obf_key = Some(sess);
+        pm.by_tag.insert(TAG, 0);
+        (pm, peer_ep, sess)
+    }
+
+    /// `tick`'s call into each `Established` peer's own `DataPlane::tick`
+    /// (unrelated to cover traffic — it's the loss-feedback Control
+    /// cadence) fires its own periodic Control datagram once
+    /// `now_ms >= FEEDBACK_INTERVAL_MS` (30 ms in `dataplane.rs`, private to
+    /// that module). Every cover test below keeps `now_ms` under that
+    /// threshold so `tick_egress` contains only what THIS test is checking
+    /// — the cover datagram (or nothing) — never an incidental feedback
+    /// packet that would make an exact-count/`is_none` assertion flaky.
+    const COVER_TEST_NOW_MS: u64 = 20;
+
+    /// With obf on and `cover_traffic_ms = Some(iv)`, an `Established` peer
+    /// idle for `>= iv` gets exactly one cover datagram from `tick`,
+    /// addressed to its endpoint, that — after `tick`'s own `obf_egress`
+    /// wrap — deobfuscates to plaintext `JUNK_TYPE` under that peer's
+    /// session key (never the network `obf_key`, since junk cover to an
+    /// `Established` peer is session-keyed).
+    #[test]
+    fn tick_emits_one_cover_for_idle_established_peer() {
+        let (mut pm, peer_ep, sess) =
+            obf_on_established_peer_for_cover(Some(COVER_TEST_NOW_MS), true);
+
+        let out = pm
+            .tick(COVER_TEST_NOW_MS)
+            .expect("idle peer gets a cover datagram");
+        assert_eq!(out.len(), 1, "exactly one cover datagram");
+        assert_eq!(out[0].dst, peer_ep);
+        let (ptype, _body) = yip_obf::deobfuscate(&sess, &out[0].bytes)
+            .expect("cover is wrapped under the peer's session key");
+        assert_eq!(
+            ptype,
+            yip_obf::JUNK_TYPE,
+            "cover datagram deobfuscates to plaintext JUNK_TYPE"
+        );
+        assert_eq!(
+            pm.peers[0].last_cover_ms, COVER_TEST_NOW_MS,
+            "last_cover_ms updated so the next tick doesn't double-fire"
+        );
+    }
+
+    /// A peer with recent activity (`last_activity_ms == now_ms`) is NOT
+    /// idle — `tick` must emit no cover for it, proving cover never races or
+    /// delays real data.
+    #[test]
+    fn tick_emits_no_cover_for_active_peer() {
+        let (mut pm, _peer_ep, _sess) =
+            obf_on_established_peer_for_cover(Some(COVER_TEST_NOW_MS), true);
+        pm.peers[0].last_activity_ms = COVER_TEST_NOW_MS; // activity at "now"
+
+        let out = pm.tick(COVER_TEST_NOW_MS);
+        assert!(
+            out.is_none(),
+            "an active peer must not receive a cover datagram"
+        );
+    }
+
+    /// With `cover_traffic_ms = None` (the default — cover traffic not
+    /// configured), `tick` emits no cover even for an idle `Established`
+    /// peer with obf on.
+    #[test]
+    fn tick_emits_no_cover_when_cover_traffic_ms_unset() {
+        let (mut pm, _peer_ep, _sess) = obf_on_established_peer_for_cover(None, true);
+
+        let out = pm.tick(COVER_TEST_NOW_MS);
+        assert!(
+            out.is_none(),
+            "cover_traffic_ms absent ⇒ no cover, regardless of idle peers"
+        );
+    }
+
+    /// With obfuscation OFF (no `set_obf_psk`), `tick` emits no cover even
+    /// when `cover_traffic_ms` is configured — the byte-identical
+    /// no-regression invariant (obf off ⇒ tick behaves exactly as pre-3b).
+    #[test]
+    fn tick_emits_no_cover_when_obf_off() {
+        let (mut pm, _peer_ep, _sess) =
+            obf_on_established_peer_for_cover(Some(COVER_TEST_NOW_MS), false);
+        assert!(pm.obf_key.is_none());
+
+        let out = pm.tick(COVER_TEST_NOW_MS);
+        assert!(
+            out.is_none(),
+            "obf off ⇒ no cover, regardless of cover_traffic_ms"
+        );
+    }
+
+    /// A relay-reached peer (`relay == true`, mirroring how
+    /// `relayed_handshake_init`/`relayed_handshake_resp` leave a peer: session
+    /// established but `endpoint` still holding the stale/candidate direct
+    /// address from before relay took over) must NOT receive a cover
+    /// datagram from `tick`, even with obf on, `cover_traffic_ms` set, and
+    /// the peer idle — contrast with `tick_emits_one_cover_for_idle_established_peer`,
+    /// whose otherwise-identical direct peer (`relay == false`) still gets
+    /// one. Firing cover at a relay peer's stale `endpoint` would leak junk
+    /// to an unrelated address and never reach the actual peer.
+    #[test]
+    fn tick_emits_no_cover_for_relay_peer() {
+        let (mut pm, _peer_ep, _sess) =
+            obf_on_established_peer_for_cover(Some(COVER_TEST_NOW_MS), true);
+        pm.peers[0].relay = true;
+
+        let out = pm.tick(COVER_TEST_NOW_MS);
+        assert!(
+            out.is_none(),
+            "a relay-reached peer must not receive a cover datagram, even when idle"
+        );
     }
 }

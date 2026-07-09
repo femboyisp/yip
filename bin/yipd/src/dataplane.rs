@@ -131,6 +131,13 @@ pub struct DataPlane {
     last_feedback_ms: u64,
     last_log_ms: u64,
     last_sweep_ms: u64,
+    /// Whether obfuscation is on for this session (`PeerManager::obf_key.is_some()`
+    /// at construction). Gates whether the feedback cadence is jittered (3b Task 5).
+    obf_on: bool,
+    /// Current feedback emission interval, in ms. Starts at `FEEDBACK_INTERVAL_MS`
+    /// and is re-rolled after each emission: jittered ±25% when `obf_on`, held at
+    /// the constant otherwise (3a's stored-jittered-interval pattern, e.g. `retry_ms`).
+    feedback_interval_ms: u64,
     /// Count of ARQ retransmits emitted (for observability / periodic log).
     arq_retx_count: u64,
 
@@ -161,6 +168,7 @@ impl DataPlane {
         conn_tag: u64,
         mode: TunnelMode,
         peer_addr: SocketAddr,
+        obf_on: bool,
     ) -> Self {
         let codec = Codec::new(established.auth_key, established.hp_key);
         Self {
@@ -177,6 +185,8 @@ impl DataPlane {
             last_feedback_ms: 0,
             last_log_ms: 0,
             last_sweep_ms: 0,
+            obf_on,
+            feedback_interval_ms: FEEDBACK_INTERVAL_MS,
             arq_retx_count: 0,
             egress_scratch: Vec::new(),
             inner_scratch: Vec::new(),
@@ -500,10 +510,19 @@ impl DataPlane {
         }
 
         // ── periodic feedback emission ─────────────────────────────────────────
-        if now_ms.saturating_sub(self.last_feedback_ms) < FEEDBACK_INTERVAL_MS {
+        if now_ms.saturating_sub(self.last_feedback_ms) < self.feedback_interval_ms {
             return None;
         }
         self.last_feedback_ms = now_ms;
+        // Re-roll the interval for the NEXT emission (3a's stored-jittered-interval
+        // pattern, e.g. `retry_ms`): ±25% when obf is on, held exactly at the
+        // constant when off — this only reshuffles WHEN the report is emitted,
+        // never a data packet, and the bound (23-37 ms) keeps ARQ feedback timely.
+        self.feedback_interval_ms = if self.obf_on {
+            crate::peer_manager::jitter_ms(FEEDBACK_INTERVAL_MS)
+        } else {
+            FEEDBACK_INTERVAL_MS
+        };
 
         // Build the report from the current detector state.
         let report = self.detector.report(now_ms);
@@ -626,7 +645,11 @@ mod tests {
     /// running a full in-process Noise-IK handshake. `a`'s `peer_addr` is
     /// [`TEST_ADDR_B`] and `b`'s is [`TEST_ADDR_A`] — distinct, so tests can
     /// assert that each stamps the *other*'s address as `dst`.
-    fn dataplane_pair(mode: TunnelMode) -> (DataPlane, DataPlane) {
+    ///
+    /// `obf_on` is threaded straight into `DataPlane::new` for both peers —
+    /// most tests want `false` (the byte-identical, obf-off invariant); the
+    /// feedback-jitter tests (3b Task 5) pass `true`.
+    fn dataplane_pair(mode: TunnelMode, obf_on: bool) -> (DataPlane, DataPlane) {
         let resp_kp = generate_keypair();
         let init_kp = generate_keypair();
 
@@ -664,8 +687,8 @@ mod tests {
         let conn_tag = conn_tag_from_keys(&auth_key, &hp_key);
 
         (
-            DataPlane::new(est_i, conn_tag, mode, TEST_ADDR_B.parse().unwrap()),
-            DataPlane::new(est_r, conn_tag, mode, TEST_ADDR_A.parse().unwrap()),
+            DataPlane::new(est_i, conn_tag, mode, TEST_ADDR_B.parse().unwrap(), obf_on),
+            DataPlane::new(est_r, conn_tag, mode, TEST_ADDR_A.parse().unwrap(), obf_on),
         )
     }
 
@@ -673,7 +696,7 @@ mod tests {
     /// and the recovered inner bytes equal the original.
     #[test]
     fn on_tun_packet_produces_decodable_egress() {
-        let (mut a, mut b) = dataplane_pair(TunnelMode::L3Tun);
+        let (mut a, mut b) = dataplane_pair(TunnelMode::L3Tun, false);
         let inner = vec![0x11u8; 200];
         let dgrams = a.on_tun_packet(&inner, 0).to_vec();
 
@@ -722,7 +745,7 @@ mod tests {
     /// Bulk traffic) emits ARQ retransmit datagrams.
     #[test]
     fn control_packet_drives_observe_loss_and_arq() {
-        let (mut a, mut b) = dataplane_pair(TunnelMode::L3Tun);
+        let (mut a, mut b) = dataplane_pair(TunnelMode::L3Tun, false);
         // A sends 3 objects; drop the middle datagram so B sees a gap.
         let d0 = a.on_tun_packet(&[0u8; 100], 0).to_vec();
         let _d1 = a.on_tun_packet(&[1u8; 100], 0).to_vec(); // dropped
@@ -751,7 +774,7 @@ mod tests {
     /// A forged Control packet must fail authentication and produce no side-effects.
     #[test]
     fn forged_control_packet_is_rejected() {
-        let (mut a, _b) = dataplane_pair(TunnelMode::L3Tun);
+        let (mut a, _b) = dataplane_pair(TunnelMode::L3Tun, false);
         let mut forged = vec![PacketType::Control as u8];
         forged.extend_from_slice(&7u64.to_be_bytes());
         forged.extend_from_slice(&[0xAB; 32]); // garbage ciphertext
@@ -772,7 +795,7 @@ mod tests {
         l2_inner[36] = 0x13;
         l2_inner[37] = 0x88; // dport 5000
 
-        let (mut tun_dp, _) = dataplane_pair(TunnelMode::L3Tun);
+        let (mut tun_dp, _) = dataplane_pair(TunnelMode::L3Tun, false);
         tun_dp.on_tun_packet(&l2_inner, 0);
         let tun_counter = *tun_dp
             .sent_log
@@ -785,7 +808,7 @@ mod tests {
             "TUN mode passes l2=false and keeps Ethernet payload as Default"
         );
 
-        let (mut tap_dp, _) = dataplane_pair(TunnelMode::L2Tap);
+        let (mut tap_dp, _) = dataplane_pair(TunnelMode::L2Tap, false);
         tap_dp.on_tun_packet(&l2_inner, 0);
         let tap_counter = *tap_dp
             .sent_log
@@ -796,6 +819,60 @@ mod tests {
             tap_dp.sent_log.get(tap_counter),
             Some(FlowClass::Realtime),
             "TAP mode passes l2=true and classifies inner IPv4 DSCP EF"
+        );
+    }
+
+    // ── 3b Task 5: feedback-cadence jitter ──────────────────────────────────
+
+    /// With obf on, the feedback emission interval is re-rolled after every
+    /// emission and takes more than one distinct value, always within
+    /// `jitter_ms`'s ±25% band for base 30 (i.e. `[23, 37]`).
+    #[test]
+    fn feedback_interval_jitters_when_obf_on() {
+        let (_a, mut b) = dataplane_pair(TunnelMode::L3Tun, true);
+        let mut seen = std::collections::HashSet::new();
+        let mut now_ms = 0u64;
+        while seen.len() < 3 && now_ms < 2_000 {
+            now_ms += 1;
+            if b.tick(now_ms).is_some() {
+                let interval = b.feedback_interval_ms;
+                assert!(
+                    (23..=37).contains(&interval),
+                    "feedback_interval_ms out of the ±25% band for base 30: {interval}"
+                );
+                seen.insert(interval);
+            }
+        }
+        assert!(
+            seen.len() > 1,
+            "obf-on feedback_interval_ms must take more than one distinct value \
+             across emissions, got {seen:?}"
+        );
+    }
+
+    /// With obf off, the feedback emission interval stays exactly
+    /// `FEEDBACK_INTERVAL_MS` (30) forever — the byte-identical, obf-off
+    /// invariant that the existing feedback tests (e.g.
+    /// `control_packet_drives_observe_loss_and_arq`, which drives `tick` at
+    /// the 30 ms cadence via `dataplane_pair(.., false)`) already exercise.
+    #[test]
+    fn feedback_interval_stays_exact_when_obf_off() {
+        let (_a, mut b) = dataplane_pair(TunnelMode::L3Tun, false);
+        let mut now_ms = 0u64;
+        let mut emissions = 0;
+        while emissions < 5 && now_ms < 500 {
+            now_ms += 1;
+            if b.tick(now_ms).is_some() {
+                assert_eq!(
+                    b.feedback_interval_ms, FEEDBACK_INTERVAL_MS,
+                    "obf-off feedback_interval_ms must stay exactly the constant"
+                );
+                emissions += 1;
+            }
+        }
+        assert_eq!(
+            emissions, 5,
+            "expected 5 obf-off feedback emissions at the exact 30 ms cadence"
         );
     }
 }

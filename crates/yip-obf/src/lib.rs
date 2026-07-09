@@ -21,6 +21,59 @@ pub const MIN_ENVELOPE: usize = NONCE_LEN + 3;
 /// the rendezvous-message layer under the same type tag.
 pub const RDV_TYPE: u8 = 5;
 
+/// Decoy/junk datagram type (3b). A datagram wrapped under this ptype carries
+/// no real data; the receiver drops it silently. Distinct from the tunnel
+/// `PacketType` values (0..=4) and `RDV_TYPE` (5).
+pub const JUNK_TYPE: u8 = 6;
+
+/// A fast, non-cryptographic xorshift64* PRNG for junk bodies/lengths/counts.
+/// Seeded once from the OS RNG; thereafter pure userspace (no syscall per
+/// draw). NOT for any security decision — junk bytes are keystream-masked by
+/// `obfuscate`, so their content is irrelevant to indistinguishability.
+pub struct XorShift64 {
+    state: u64,
+}
+
+impl XorShift64 {
+    pub fn from_getrandom() -> Self {
+        let mut seed = [0u8; 8];
+        getrandom::getrandom(&mut seed).expect("OS RNG");
+        // xorshift64* must never have a zero state.
+        let s = u64::from_le_bytes(seed) | 1;
+        Self { state: s }
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        // xorshift64* (Marsaglia / Vigna).
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// Uniform-ish value in `lo..=hi_inclusive`; returns `lo` if the range is
+    /// empty/degenerate. Modulo bias is irrelevant for junk sizing.
+    pub fn gen_range(&mut self, lo: u64, hi_inclusive: u64) -> u64 {
+        if lo >= hi_inclusive {
+            return lo;
+        }
+        let span = hi_inclusive - lo + 1;
+        lo + (self.next_u64() % span)
+    }
+
+    pub fn fill(&mut self, buf: &mut [u8]) {
+        let mut i = 0;
+        while i < buf.len() {
+            let bytes = self.next_u64().to_le_bytes();
+            let n = core::cmp::min(8, buf.len() - i);
+            buf[i..i + n].copy_from_slice(&bytes[..n]);
+            i += n;
+        }
+    }
+}
+
 const DOMAIN: &[u8] = b"yip-obf-v1";
 
 /// Derive the 16-byte SipHash key from the network `obf_psk` (or any keying
@@ -161,5 +214,49 @@ mod tests {
         assert!(b.len() > a.len());
         assert_eq!(deobfuscate(&key, &a).unwrap().1, b"x");
         assert_eq!(deobfuscate(&key, &b).unwrap().1, b"x");
+    }
+
+    #[test]
+    fn junk_type_is_distinct_from_other_ptypes() {
+        // 0..=4 are yipd PacketType, 5 is RDV_TYPE.
+        assert_eq!(JUNK_TYPE, 6);
+        assert_ne!(JUNK_TYPE, RDV_TYPE);
+    }
+
+    #[test]
+    fn xorshift_gen_range_stays_in_bounds_and_varies() {
+        let mut r = XorShift64::from_getrandom();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let v = r.gen_range(3, 12);
+            assert!((3..=12).contains(&v), "in range");
+            seen.insert(v);
+        }
+        assert!(seen.len() > 3, "gen_range must actually vary, got {seen:?}");
+        // degenerate range returns lo
+        assert_eq!(r.gen_range(7, 7), 7);
+        assert_eq!(r.gen_range(9, 4), 9);
+    }
+
+    #[test]
+    fn xorshift_fill_produces_varied_bytes() {
+        let mut r = XorShift64::from_getrandom();
+        let mut a = [0u8; 64];
+        let mut b = [0u8; 64];
+        r.fill(&mut a);
+        r.fill(&mut b);
+        assert_ne!(a, b, "consecutive fills differ");
+        assert!(a.iter().any(|&x| x != 0), "not all-zero");
+    }
+
+    #[test]
+    fn junk_datagram_deobfuscates_to_junk_type() {
+        let key = derive_key(b"net");
+        let mut r = XorShift64::from_getrandom();
+        let mut body = [0u8; 128];
+        r.fill(&mut body);
+        let dg = obfuscate(&key, JUNK_TYPE, &body, 7);
+        let (pt, _b) = deobfuscate(&key, &dg).expect("round-trips");
+        assert_eq!(pt, JUNK_TYPE);
     }
 }
