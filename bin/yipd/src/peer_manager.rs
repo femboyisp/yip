@@ -312,6 +312,11 @@ pub struct PeerManager {
     /// for Data/Control/Gossip. Set once, before the event loop starts (see
     /// [`PeerManager::set_obf_psk`]).
     obf_key: Option<[u8; 16]>,
+    /// Fast userspace PRNG for junk-datagram sizing/content (3b) — see
+    /// [`PeerManager::build_junk`]. Seeded once from the OS RNG; never used
+    /// for any security decision (junk bytes are keystream-masked by
+    /// `yip_obf::obfuscate`, so their content is irrelevant).
+    junk_rng: yip_obf::XorShift64,
 }
 
 /// MTU budget (bytes) used to size obfuscation padding: handshakes are padded
@@ -322,6 +327,17 @@ pub struct PeerManager {
 const OBF_MTU_BUDGET: usize = 1200;
 /// Maximum modest padding (bytes) added to a data/control/gossip envelope.
 const OBF_DATA_PAD_MAX: usize = 64;
+/// Minimum/maximum length (bytes) of a junk datagram's throwaway body, drawn
+/// uniformly by [`PeerManager::build_junk`]. Content is irrelevant (masked by
+/// `obfuscate`); the range just varies the on-wire size like real traffic.
+const JUNK_MIN_LEN: usize = 64;
+const JUNK_MAX_LEN: usize = 1024;
+/// Minimum/maximum number of junk datagrams in a single decoy burst (Tasks
+/// 3/4 — not consumed yet by Task 2).
+#[expect(dead_code, reason = "consumed by Task 3/4's junk-burst scheduler")]
+const JUNK_BURST_MIN: u64 = 3;
+#[expect(dead_code, reason = "consumed by Task 3/4's junk-burst scheduler")]
+const JUNK_BURST_MAX: u64 = 12;
 
 impl PeerManager {
     /// Build a `PeerManager` from the local keypair and the configured peer
@@ -384,6 +400,7 @@ impl PeerManager {
             tick_egress: Vec::new(),
             tun_scratch: Vec::new(),
             obf_key: None,
+            junk_rng: yip_obf::XorShift64::from_getrandom(),
         };
         // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
         // exactly like configured peers: seed them into the peer table so an
@@ -1445,6 +1462,9 @@ impl PeerManager {
             }
         }) {
             if let Some((ptype, body)) = yip_obf::deobfuscate(&key, dg) {
+                if ptype == yip_obf::JUNK_TYPE {
+                    return None; // idle-cover decoy: inert, dropped, no fall-through
+                }
                 if ptype == PacketType::Data as u8
                     || ptype == PacketType::Control as u8
                     || ptype == PacketType::Gossip as u8
@@ -1456,6 +1476,9 @@ impl PeerManager {
         // (b) pre-session network key → handshakes only.
         if let Some(key) = self.obf_key {
             if let Some((ptype, body)) = yip_obf::deobfuscate(&key, dg) {
+                if ptype == yip_obf::JUNK_TYPE {
+                    return None; // idle-cover decoy: inert, dropped, no fall-through
+                }
                 if ptype == PacketType::HandshakeInit as u8
                     || ptype == PacketType::HandshakeResp as u8
                 {
@@ -1464,6 +1487,30 @@ impl PeerManager {
             }
         }
         None
+    }
+
+    /// Build a decoy/junk datagram: a throwaway body of random length in
+    /// `[JUNK_MIN_LEN, JUNK_MAX_LEN]`, filled from `junk_rng` (content is
+    /// irrelevant — masked by `obfuscate`), wrapped under `key` and
+    /// [`yip_obf::JUNK_TYPE`] with the usual data padding. The receiver
+    /// recovers `(JUNK_TYPE, _)` via `yip_obf::deobfuscate` and drops it (see
+    /// `deobf_ingress`) — junk never touches Noise/AEAD/session state. Only
+    /// meaningful on the obfuscation-enabled path (callers hold a key only
+    /// when `obf_key.is_some()`).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Task 2 builds the primitive; Task 3/4's junk-emission scheduler is the first production caller (unit tests are the only caller today)"
+        )
+    )]
+    fn build_junk(&mut self, key: &[u8; 16]) -> Vec<u8> {
+        let lo = u64::try_from(JUNK_MIN_LEN).expect("JUNK_MIN_LEN fits u64");
+        let hi = u64::try_from(JUNK_MAX_LEN).expect("JUNK_MAX_LEN fits u64");
+        let len = usize::try_from(self.junk_rng.gen_range(lo, hi)).expect("gen_range in usize");
+        let mut body = vec![0u8; len];
+        self.junk_rng.fill(&mut body);
+        yip_obf::obfuscate(key, yip_obf::JUNK_TYPE, &body, random_pad(OBF_DATA_PAD_MAX))
     }
 
     /// The obfuscation key to wrap an egress datagram to `dst` whose plaintext
@@ -3928,6 +3975,98 @@ mod tests {
         // No peer disturbed.
         assert!(matches!(pm.peers[0].state, PeerState::Idle));
         assert!(pm.by_tag.is_empty());
+    }
+
+    /// (3b-a) `build_junk(key)` produces an envelope that `yip_obf::deobfuscate`
+    /// recovers as `(JUNK_TYPE, _)` under that same key — the builder and the
+    /// drop arm agree on the wire format.
+    #[test]
+    fn build_junk_roundtrips_to_junk_type() {
+        let peer = peer_cfg(5, "10.0.0.5:5000");
+        let mut pm = PeerManager::new([1u8; 32], [2u8; 32], &[peer], TunnelMode::L3Tun, None, None);
+        let key = [0x55u8; 16];
+
+        let dg = pm.build_junk(&key);
+        let (ptype, body) = yip_obf::deobfuscate(&key, &dg).expect("build_junk key round-trips");
+        assert_eq!(ptype, yip_obf::JUNK_TYPE);
+        assert!(
+            body.len() >= JUNK_MIN_LEN,
+            "recovered body includes the >= JUNK_MIN_LEN junk fill"
+        );
+    }
+
+    /// (3b-b) With obfuscation on, a junk datagram sent from an `Established`
+    /// peer's source (session-keyed) is silently dropped by `on_udp`: no
+    /// egress, and the peer's session state is left completely untouched.
+    #[test]
+    fn obf_on_session_keyed_junk_is_dropped_state_unchanged() {
+        const TAG: u64 = 0xABCD_EF01;
+        let peer_ep: SocketAddr = "10.0.0.6:6000".parse().unwrap();
+        let peer = peer_cfg(6, "10.0.0.6:6000");
+        let mut pm = PeerManager::new([3u8; 32], [4u8; 32], &[peer], TunnelMode::L3Tun, None, None);
+        pm.set_obf_psk(Some([0x66u8; 32]));
+
+        pm.peers[0].state =
+            PeerState::Established(Box::new(fake_established_dataplane(TAG, peer_ep)));
+        let sess = [0x77u8; 16];
+        pm.peers[0].session_obf_key = Some(sess);
+        pm.by_tag.insert(TAG, 0);
+
+        let junk = pm.build_junk(&sess);
+        let before_tag = pm.by_tag.get(&TAG).copied();
+
+        let out = pm.on_udp(peer_ep, &junk, 0);
+        assert!(
+            matches!(out, DispatchOut::None),
+            "session-keyed junk must be dropped, not dispatched"
+        );
+        assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+        assert_eq!(
+            pm.peers[0].session_obf_key,
+            Some(sess),
+            "session obf key untouched by a dropped junk datagram"
+        );
+        assert_eq!(pm.by_tag.get(&TAG).copied(), before_tag, "by_tag untouched");
+    }
+
+    /// (3b-c) With obfuscation on, a junk datagram from an entirely unknown
+    /// source (no `Established` peer at that address, so it can only unmask
+    /// under the network `obf_key`) is dropped with no panic and no peer
+    /// admitted.
+    #[test]
+    fn obf_on_network_keyed_junk_from_unknown_src_is_dropped_no_panic() {
+        let peer = peer_cfg(7, "10.0.0.7:7000");
+        let mut pm = PeerManager::new([5u8; 32], [6u8; 32], &[peer], TunnelMode::L3Tun, None, None);
+        let psk = [0x88u8; 32];
+        pm.set_obf_psk(Some(psk));
+        let obf_key = yip_obf::derive_key(&psk);
+
+        let junk = pm.build_junk(&obf_key);
+        let src: SocketAddr = "203.0.113.55:5555".parse().unwrap();
+        assert!(matches!(pm.on_udp(src, &junk, 0), DispatchOut::None));
+        assert!(matches!(pm.peers[0].state, PeerState::Idle));
+        assert!(pm.by_tag.is_empty());
+    }
+
+    /// (3b-d) With obfuscation OFF (`obf_key: None`), the `JUNK_TYPE` drop arm
+    /// lives entirely inside `deobf_ingress`, which is never reached — a
+    /// junk-shaped datagram (leading byte == `JUNK_TYPE`, which is not a
+    /// recognized plaintext `PacketType`) takes the exact unchanged 2a/2b/2c
+    /// plaintext path (falls into `handle_data_or_control`, finds no matching
+    /// peer, drops with no panic) rather than being specially recognized.
+    #[test]
+    fn obf_off_junk_shaped_datagram_takes_unchanged_plaintext_path() {
+        let peer = peer_cfg(8, "10.0.0.8:8000");
+        let mut pm = PeerManager::new([7u8; 32], [8u8; 32], &[peer], TunnelMode::L3Tun, None, None);
+        // No set_obf_psk ⇒ obf_key is None ⇒ deobf_ingress/build_junk's JUNK
+        // handling is never consulted.
+        assert!(pm.obf_key.is_none());
+
+        let mut dg = vec![yip_obf::JUNK_TYPE];
+        dg.extend_from_slice(&[0u8; 16]);
+        let src: SocketAddr = "203.0.113.66:6666".parse().unwrap();
+        assert!(matches!(pm.on_udp(src, &dg, 0), DispatchOut::None));
+        assert!(matches!(pm.peers[0].state, PeerState::Idle));
     }
 
     /// (d) With obfuscation OFF (no `set_obf_psk`), `on_udp` runs the unchanged
