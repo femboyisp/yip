@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::os::fd::RawFd;
 use std::time::Instant;
 
-use crate::{sockaddr_to_std, std_to_sockaddr, MAX_WIRE_DATAGRAM};
+use crate::{sockaddr_to_std, std_to_sockaddr, MAX_DATAGRAM_BATCH, MAX_WIRE_DATAGRAM};
 
 /// A single-threaded data-plane dispatch interface.
 ///
@@ -271,6 +271,171 @@ fn send_to_udp(udp_fd: RawFd, dg: &EgressDatagram) -> io::Result<()> {
         return Err(e);
     }
     Ok(())
+}
+
+/// Send up to `datagrams.len().min(MAX_DATAGRAM_BATCH)` datagrams in one
+/// `sendmmsg(2)`, each to its own [`EgressDatagram::dst`]. Returns the count the
+/// kernel accepted (may be fewer; the caller loops the remainder).
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "wired into the drain loop in Task 2 of the batched-UDP-I/O milestone"
+    )
+)]
+fn send_mmsg(udp_fd: RawFd, datagrams: &[EgressDatagram]) -> io::Result<usize> {
+    if datagrams.is_empty() {
+        return Ok(0);
+    }
+    let count = datagrams.len().min(MAX_DATAGRAM_BATCH);
+
+    // Parallel per-datagram arrays; all live on this stack frame until sendmmsg
+    // returns, so the pointers stored in `msgs` stay valid across the syscall.
+    // SAFETY: `sockaddr_storage` is plain-old-data; an all-zero value is a valid
+    // (unspecified) initial state that we fully overwrite per datagram below.
+    let mut storages: [libc::sockaddr_storage; MAX_DATAGRAM_BATCH] = unsafe { std::mem::zeroed() };
+    let mut addrlens = [0 as libc::socklen_t; MAX_DATAGRAM_BATCH];
+    let mut iovecs = [libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 0,
+    }; MAX_DATAGRAM_BATCH];
+    let mut msgs = [libc::mmsghdr {
+        msg_hdr: libc::msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: std::ptr::null_mut(),
+            msg_iovlen: 0,
+            msg_control: std::ptr::null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+        },
+        msg_len: 0,
+    }; MAX_DATAGRAM_BATCH];
+
+    for (i, dg) in datagrams[..count].iter().enumerate() {
+        let (storage, addr_len) = std_to_sockaddr(dg.dst);
+        storages[i] = storage;
+        addrlens[i] = addr_len;
+        // SAFETY: cast a shared slice to *mut c_void for the iovec ABI; sendmmsg
+        // only reads through iov_base. `dg.bytes` outlives the syscall (borrowed
+        // for this fn).
+        iovecs[i].iov_base = dg.bytes.as_ptr().cast_mut().cast::<libc::c_void>();
+        iovecs[i].iov_len = dg.bytes.len();
+        msgs[i].msg_hdr.msg_iov = &raw mut iovecs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+        msgs[i].msg_hdr.msg_name = std::ptr::from_mut(&mut storages[i]).cast::<libc::c_void>();
+        msgs[i].msg_hdr.msg_namelen = addrlens[i];
+    }
+
+    // SAFETY: `msgs[..count]` is fully initialised; each msg_iov/msg_name points
+    // into `iovecs`/`storages` on this frame, valid until sendmmsg returns.
+    // MSG_NOSIGNAL suppresses SIGPIPE on a closed peer.
+    let ret = unsafe {
+        libc::sendmmsg(
+            udp_fd,
+            msgs.as_mut_ptr(),
+            u32::try_from(count).expect("count ≤ 64 fits u32"),
+            libc::MSG_NOSIGNAL,
+        )
+    };
+    if ret < 0 {
+        let e = io::Error::last_os_error();
+        let raw = e.raw_os_error().unwrap_or(0);
+        // Transient full send buffer: report 0 sent (caller drops this burst's tail).
+        if raw == libc::EWOULDBLOCK || raw == libc::EAGAIN || raw == libc::ENOBUFS {
+            return Ok(0);
+        }
+        return Err(e);
+    }
+    Ok(usize::try_from(ret).expect("non-negative sendmmsg return fits usize"))
+}
+
+/// Non-blocking `recvmmsg(2)`: drain up to `bufs.len().min(MAX_DATAGRAM_BATCH)`
+/// queued datagrams in one syscall, writing each datagram's byte count into
+/// `lens` and source address into `srcs`. Returns the count received (0 if the
+/// socket is momentarily empty). Requires a non-blocking `udp_fd`.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "wired into the drain loop in Task 2 of the batched-UDP-I/O milestone"
+    )
+)]
+fn recv_mmsg(
+    udp_fd: RawFd,
+    bufs: &mut [[u8; MAX_WIRE_DATAGRAM]],
+    lens: &mut [usize],
+    srcs: &mut [SocketAddr],
+) -> io::Result<usize> {
+    let count = bufs
+        .len()
+        .min(lens.len())
+        .min(srcs.len())
+        .min(MAX_DATAGRAM_BATCH);
+    if count == 0 {
+        return Ok(0);
+    }
+    // SAFETY: all-zero sockaddr_storage is a valid initial out-buffer that
+    // recvmmsg fills; we read it back only for the datagrams it reports received.
+    let mut storages: [libc::sockaddr_storage; MAX_DATAGRAM_BATCH] = unsafe { std::mem::zeroed() };
+    let addrlens = [libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>())
+        .expect("size fits socklen_t"); MAX_DATAGRAM_BATCH];
+    let mut iovecs = [libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 0,
+    }; MAX_DATAGRAM_BATCH];
+    let mut msgs = [libc::mmsghdr {
+        msg_hdr: libc::msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: std::ptr::null_mut(),
+            msg_iovlen: 0,
+            msg_control: std::ptr::null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+        },
+        msg_len: 0,
+    }; MAX_DATAGRAM_BATCH];
+
+    for i in 0..count {
+        // SAFETY: each iov_base/msg_name points to a distinct element of
+        // `bufs`/`storages` on this frame — no aliasing — valid until recvmmsg returns.
+        iovecs[i].iov_base = bufs[i].as_mut_ptr().cast::<libc::c_void>();
+        iovecs[i].iov_len = MAX_WIRE_DATAGRAM;
+        msgs[i].msg_hdr.msg_iov = &raw mut iovecs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+        msgs[i].msg_hdr.msg_name = std::ptr::from_mut(&mut storages[i]).cast::<libc::c_void>();
+        msgs[i].msg_hdr.msg_namelen = addrlens[i];
+    }
+
+    // SAFETY: `msgs[..count]` fully initialised; msg_iov/msg_name point into
+    // distinct `bufs`/`storages` elements. MSG_DONTWAIT: non-blocking (the fd is
+    // epoll-ready); null timeout. On empty socket, returns EWOULDBLOCK → Ok(0).
+    let ret = unsafe {
+        libc::recvmmsg(
+            udp_fd,
+            msgs.as_mut_ptr(),
+            u32::try_from(count).expect("count ≤ 64 fits u32"),
+            libc::MSG_DONTWAIT,
+            std::ptr::null_mut(),
+        )
+    };
+    if ret < 0 {
+        let e = io::Error::last_os_error();
+        let raw = e.raw_os_error().unwrap_or(0);
+        if raw == libc::EWOULDBLOCK || raw == libc::EAGAIN {
+            return Ok(0);
+        }
+        return Err(e);
+    }
+    let received = usize::try_from(ret).expect("non-negative recvmmsg return fits usize");
+    for i in 0..received {
+        lens[i] = usize::try_from(msgs[i].msg_len).expect("msg_len fits usize");
+        // recvmmsg writes the actual namelen back into each msg_hdr.
+        srcs[i] = sockaddr_to_std(&storages[i], msgs[i].msg_hdr.msg_namelen)
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+    }
+    Ok(received)
 }
 
 // ── public entry point ────────────────────────────────────────────────────────
@@ -567,5 +732,89 @@ mod tests {
             .recv(&mut recv_buf)
             .expect("forwarded datagram must arrive on peer socket");
         assert_eq!(&recv_buf[..n], b"forwarded");
+    }
+
+    #[test]
+    fn send_mmsg_delivers_each_datagram_to_its_own_dst() {
+        use std::net::UdpSocket;
+        // Two receiver sockets on distinct ports; one sender.
+        let rx_a = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rx_b = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx_a.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        rx_b.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dst_a = rx_a.local_addr().unwrap();
+        let dst_b = rx_b.local_addr().unwrap();
+
+        let batch = [
+            EgressDatagram {
+                fate: 0,
+                dst: dst_a,
+                bytes: b"to-a-1".to_vec(),
+            },
+            EgressDatagram {
+                fate: 0,
+                dst: dst_b,
+                bytes: b"to-b".to_vec(),
+            },
+            EgressDatagram {
+                fate: 0,
+                dst: dst_a,
+                bytes: b"to-a-2".to_vec(),
+            },
+        ];
+        let mut sent = 0;
+        while sent < batch.len() {
+            sent += send_mmsg(tx.as_raw_fd(), &batch[sent..]).unwrap();
+        }
+        assert_eq!(sent, 3);
+
+        let mut buf = [0u8; 64];
+        // rx_a receives two datagrams (order preserved within a dst).
+        let (n1, _) = rx_a.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n1], b"to-a-1");
+        let (n2, _) = rx_a.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n2], b"to-a-2");
+        // rx_b receives its one.
+        let (n3, _) = rx_b.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n3], b"to-b");
+    }
+
+    #[test]
+    fn recv_mmsg_returns_bytes_and_source_per_datagram() {
+        use std::net::UdpSocket;
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        let tx_addr = tx.local_addr().unwrap();
+        tx.send_to(b"hello", rx_addr).unwrap();
+        tx.send_to(b"world!!", rx_addr).unwrap();
+        // Give the datagrams time to queue, then drain non-blocking.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let mut bufs = [[0u8; MAX_WIRE_DATAGRAM]; 4];
+        let mut lens = [0usize; 4];
+        let mut srcs = [std::net::SocketAddr::from(([0, 0, 0, 0], 0)); 4];
+        let n = recv_mmsg(rx.as_raw_fd(), &mut bufs, &mut lens, &mut srcs).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(&bufs[0][..lens[0]], b"hello");
+        assert_eq!(&bufs[1][..lens[1]], b"world!!");
+        assert_eq!(srcs[0], tx_addr);
+        assert_eq!(srcs[1], tx_addr);
+    }
+
+    #[test]
+    fn recv_mmsg_returns_zero_when_nothing_queued() {
+        use std::net::UdpSocket;
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut bufs = [[0u8; MAX_WIRE_DATAGRAM]; 4];
+        let mut lens = [0usize; 4];
+        let mut srcs = [std::net::SocketAddr::from(([0, 0, 0, 0], 0)); 4];
+        assert_eq!(
+            recv_mmsg(rx.as_raw_fd(), &mut bufs, &mut lens, &mut srcs).unwrap(),
+            0
+        );
     }
 }
