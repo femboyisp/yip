@@ -270,6 +270,44 @@ impl Session {
             .map_err(|_| CryptoError::Decrypt)?;
         Ok(plain.to_vec())
     }
+
+    /// Seal into a caller-owned reusable buffer (no per-call allocation).
+    pub fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> Result<u64, CryptoError> {
+        let counter = self.send_counter;
+        out.clear();
+        out.extend_from_slice(plaintext);
+        self.send_key
+            .seal_in_place_append_tag(noise_nonce(counter), Aad::empty(), out)
+            .map_err(|_| CryptoError::Decrypt)?;
+        self.send_counter = self
+            .send_counter
+            .checked_add(1)
+            .ok_or(CryptoError::Decrypt)?;
+        Ok(counter)
+    }
+
+    /// Open into a caller-owned reusable buffer (no per-call allocation).
+    pub fn open_into(
+        &mut self,
+        counter: u64,
+        ciphertext: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), CryptoError> {
+        if !self.replay.check_and_set(counter) {
+            return Err(CryptoError::Replay);
+        }
+        out.clear();
+        out.extend_from_slice(ciphertext);
+        let n = {
+            let plain = self
+                .recv_key
+                .open_in_place(noise_nonce(counter), Aad::empty(), out)
+                .map_err(|_| CryptoError::Decrypt)?;
+            plain.len()
+        };
+        out.truncate(n);
+        Ok(())
+    }
 }
 
 /// Test-only helper: drive a full initiator/responder handshake to completion
@@ -676,5 +714,15 @@ mod tests {
                 "initiator opens what the responder sealed at counter {ctr}"
             );
         }
+    }
+
+    #[test]
+    fn seal_into_matches_seal_and_opens() {
+        let (mut a, mut b) = crate::test_session_pair();
+        let mut sbuf = Vec::new();
+        let ctr = a.seal_into(b"reuse me", &mut sbuf).unwrap();
+        let mut obuf = Vec::new();
+        b.open_into(ctr, &sbuf, &mut obuf).unwrap();
+        assert_eq!(obuf, b"reuse me");
     }
 }
