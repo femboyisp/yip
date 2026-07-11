@@ -299,3 +299,24 @@ per the design model is I/O dropping from ~1–3 µs/packet (per-packet syscall)
 and AEAD (~0.63 µs) levers this targets ~7 Gbit/s single-core on the target VPS.
 A clean iperf measurement is left as a follow-up (fix or replace the
 iperf-compare harness).
+
+## 4a GSO spike — UDP_SEGMENT vs plain sendmmsg on virtio (decision gate)
+
+Throwaway send-path microbenchmark (`gso_spike.c`, not committed) run on a real
+target box: `root@45.61.149.155` (1-core AMD EPYC, virtio, kernel 6.12), blasting
+1200-byte UDP to `144.172.98.216:9999` over the public path, 4 s × 3 runs each.
+Metric = **datagrams sent per CPU-second** (getrusage utime+stime), which isolates
+send-path CPU cost independent of the network's throughput ceiling.
+
+| mode  | datagrams/CPU-s (median) | cpu_s for ~0.6–0.7M datagrams |
+|-------|--------------------------|-------------------------------|
+| plain sendmmsg (32/batch) | ~181,000 | ~3.3 s |
+| gso  (1 sendmsg + UDP_SEGMENT, 32×1200) | ~462,000 | ~1.55 s |
+
+**Ratio ≈ 2.6× datagrams per CPU-second in favour of GSO** — GSO sent *more*
+datagrams (~725k vs ~600k) in *half* the CPU. Well above the 1.3× decision gate.
+
+**Verdict: PROCEED.** `UDP_SEGMENT` more than halves send-path CPU per datagram on
+these virtio boxes, so wiring it into the poll path (Tasks 1–5) is justified. This
+directly corroborates the earlier kernel-stack profiling that pinned `__sys_sendmmsg`
+as the dominant single-core cost.
