@@ -13,13 +13,6 @@ yip-crypto = { path = "../yip-crypto" }
 criterion = "0.5.1"
 yip-wire = { path = "../yip-wire" }
 yip-transport = { path = "../yip-transport" }
-# Spike-only (crates/yip-bench/examples/aead_spike.rs): prove ring's ChaCha20-Poly1305
-# reproduces snow's transport ciphertext byte-for-byte using snow's extracted split keys,
-# and measure the speedup. `risky-raw-split` unlocks
-# `snow::HandshakeState::dangerously_get_raw_split()`, the only documented way to pull
-# the raw transport keys out of snow 0.10. Both deps are throwaway for this de-risk spike.
-ring = "0.17.14"
-snow = { version = "0.10.0", features = ["risky-raw-split"] }
 
 [[bench]]
 name = "hotpath"
