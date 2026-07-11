@@ -89,8 +89,11 @@ impl FecEncoder {
 
     /// Re-encode `ciphertext` under an EXPLICIT `object_id` (ARQ retransmit),
     /// returning all K source symbols + `extra_repair` repair symbols at indices
-    /// K..K+extra_repair-1 — the same Cauchy rows as `encode`, so a receiver that
-    /// got zero original symbols can reconstruct from this batch alone.
+    /// K..K+extra_repair-1. Both `encode` and `repair_with_id` select the scheme
+    /// via `build` from `(params.arq, r)`: an ARQ (retransmit-eligible) class
+    /// always uses Cauchy, regardless of `r`, so a retransmit batch stays
+    /// scheme-compatible with the original send and a receiver that got zero
+    /// original symbols can reconstruct from this batch alone.
     pub fn repair_with_id(
         &mut self,
         ciphertext: &[u8],
@@ -122,7 +125,11 @@ impl FecEncoder {
             .min(max_repair);
 
         let source = split_source(ciphertext, k, sym);
-        let scheme = rs::Scheme::for_repair(r);
+        let scheme = if !params.arq && (r == 1 || r == 2) {
+            rs::Scheme::Pq
+        } else {
+            rs::Scheme::Cauchy
+        };
         let scheme_u8 = scheme.to_u8();
         let mut out = Vec::with_capacity(k + r);
         for (i, shard) in source.iter().enumerate() {
@@ -361,6 +368,45 @@ mod tests {
             out.as_deref(),
             Some(ct.as_slice()),
             "ARQ batch alone reconstructs"
+        );
+    }
+
+    #[test]
+    fn arq_retransmit_recovers_after_partial_original_send() {
+        // Bulk = ARQ class → both original send and RETX_EXTRA_REPAIR=4 retransmit
+        // must use Cauchy, so the retransmit batch is accepted and decodes.
+        let params = FlowClass::Bulk.params();
+        assert!(params.arq, "Bulk is the ARQ class");
+        let ct: Vec<u8> = (0..2400u32)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect(); // K=2
+        let mut enc = FecEncoder::new();
+        let original = enc.encode(&ct, params, 1); // R=1
+        assert!(
+            original
+                .iter()
+                .all(|s| s.payload_id[3] == crate::rs::SCHEME_CAUCHY),
+            "ARQ class original send uses Cauchy"
+        );
+        let oid = original[0].object_id;
+        // Receiver gets only ONE shard of the original — not enough to decode.
+        let mut re = FecReassembler::new(params.symbol_size, 64);
+        assert_eq!(re.push(&original[0]), None);
+        // ARQ retransmit with the production constant (4). Must be Cauchy and accepted.
+        let retx = enc.repair_with_id(&ct, params, oid, 4);
+        assert!(
+            retx.iter()
+                .all(|s| s.payload_id[3] == crate::rs::SCHEME_CAUCHY),
+            "ARQ retransmit uses Cauchy"
+        );
+        let mut out = None;
+        for s in &retx {
+            out = out.or(re.push(s));
+        }
+        assert_eq!(
+            out.as_deref(),
+            Some(ct.as_slice()),
+            "retransmit batch reconstructs the object"
         );
     }
 

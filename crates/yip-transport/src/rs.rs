@@ -36,17 +36,6 @@ impl Scheme {
             _ => None,
         }
     }
-
-    /// The scheme the encoder uses for `r` repair symbols: P+Q for 1<=r<=2, Cauchy
-    /// otherwise (r>=3, and r==0 where no repair row exists and Cauchy is the
-    /// neutral/default tag).
-    pub fn for_repair(r: usize) -> Scheme {
-        if r == 1 || r == 2 {
-            Scheme::Pq
-        } else {
-            Scheme::Cauchy
-        }
-    }
 }
 
 /// The K generator coefficients for repair row `m` under `scheme`.
@@ -234,9 +223,6 @@ mod tests {
         assert_eq!(Scheme::from_u8(SCHEME_PQ), Some(Scheme::Pq));
         assert_eq!(Scheme::from_u8(9), None);
         assert_eq!(Scheme::Pq.to_u8(), SCHEME_PQ);
-        assert_eq!(Scheme::for_repair(1), Scheme::Pq);
-        assert_eq!(Scheme::for_repair(2), Scheme::Pq);
-        assert_eq!(Scheme::for_repair(3), Scheme::Cauchy);
     }
 
     /// Every k-subset of the k+r shards must reconstruct, for the scheme yip uses at that R.
