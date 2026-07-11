@@ -97,100 +97,62 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     }
 }
 
-/// Drain all pending datagrams from `udp_fd` (non-blocking) and call
-/// `d.on_udp` for each, forwarding the outcome to TUN/UDP as appropriate.
-fn drain_udp(udp_fd: RawFd, tun_fd: RawFd, d: &mut impl Dispatch, now_ms: u64) -> io::Result<()> {
-    let mut buf = [0u8; MAX_WIRE_DATAGRAM];
+/// Drain pending datagrams from `udp_fd` with `recvmmsg`, dispatching each and
+/// forwarding the outcome. Loops until the socket is empty (recv_mmsg returns 0).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "batch buffers are owned by run_poll and threaded through explicitly rather than \
+              bundled into a struct, to keep the hot-path buffers' aliasing/lifetimes obvious"
+)]
+fn drain_udp(
+    udp_fd: RawFd,
+    tun_fd: RawFd,
+    d: &mut impl Dispatch,
+    now_ms: u64,
+    bufs: &mut [[u8; MAX_WIRE_DATAGRAM]; MAX_DATAGRAM_BATCH],
+    lens: &mut [usize; MAX_DATAGRAM_BATCH],
+    srcs: &mut [SocketAddr; MAX_DATAGRAM_BATCH],
+    tx: &mut Vec<EgressDatagram>,
+) -> io::Result<()> {
     loop {
-        // SAFETY: `storage` is a valid, suitably-sized/aligned stack buffer for
-        // any sockaddr the kernel writes back into it (see `sockaddr_storage`'s
-        // definition). `addr_len` is initialized to its capacity, as `recvfrom`
-        // requires on entry.
-        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-        let mut addr_len = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>())
-            .expect("size_of::<sockaddr_storage>() fits socklen_t");
-
-        // SAFETY: `buf` is a valid stack buffer of length MAX_WIRE_DATAGRAM.
-        // `recvfrom` with MSG_DONTWAIT is a non-blocking receive into that
-        // buffer; `storage`/`addr_len` are valid out-parameters for the
-        // sender's address as described above. `udp_fd` is a valid UDP
-        // socket fd supplied by the caller (unconnected — the seam is
-        // addressed, not connected).
-        let n = unsafe {
-            libc::recvfrom(
-                udp_fd,
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-                libc::MSG_DONTWAIT,
-                std::ptr::from_mut(&mut storage).cast::<libc::sockaddr>(),
-                &raw mut addr_len,
-            )
-        };
-
-        if n < 0 {
-            let e = io::Error::last_os_error();
-            let raw = e.raw_os_error().unwrap_or(0);
-            if raw == libc::EWOULDBLOCK || raw == libc::EAGAIN {
-                // Fd fully drained — normal exit condition.
-                break;
-            }
-            if raw == libc::EINTR {
-                // Signal interrupted the syscall; retry.
-                continue;
-            }
-            return Err(e);
-        }
+        let n = recv_mmsg(udp_fd, bufs, lens, srcs)?;
         if n == 0 {
-            // No data available (treat as drained).
-            break;
+            break; // socket drained
         }
-
-        let src = match sockaddr_to_std(&storage, addr_len) {
-            Ok(addr) => addr,
-            Err(e) => {
-                eprintln!("poll: dropping datagram with unparseable source address: {e}");
-                continue;
-            }
-        };
-
-        let dg = &buf[..usize::try_from(n).expect("non-negative recv return fits usize")];
-
-        // Dispatch and forward the result.  The borrow of `d` from `on_udp`
-        // (inside `DispatchOut`) is dropped at the end of the match arm.
-        match d.on_udp(src, dg, now_ms) {
-            DispatchOut::None => {}
-            DispatchOut::Tun(inner) => {
-                send_to_tun(tun_fd, inner);
-            }
-            DispatchOut::Udp(pkts) => {
-                for pkt in pkts {
-                    send_to_udp(udp_fd, pkt)?;
+        for i in 0..n {
+            let dg = &bufs[i][..lens[i]];
+            match d.on_udp(srcs[i], dg, now_ms) {
+                DispatchOut::None => {}
+                DispatchOut::Tun(inner) => send_to_tun(tun_fd, inner),
+                DispatchOut::Udp(pkts) => tx.extend(pkts.iter().cloned()),
+                DispatchOut::Both(inner, pkts) => {
+                    send_to_tun(tun_fd, inner);
+                    tx.extend(pkts.iter().cloned());
                 }
             }
-            DispatchOut::Both(inner, pkts) => {
-                send_to_tun(tun_fd, inner);
-                for pkt in pkts {
-                    send_to_udp(udp_fd, pkt)?;
-                }
-            }
+        }
+        flush_tx(udp_fd, tx)?; // send any UDP replies for this recv burst
+        if n < MAX_DATAGRAM_BATCH {
+            break; // partial batch → socket drained
         }
     }
     Ok(())
 }
 
-/// Drain all pending frames from `tun_fd` (non-blocking) and call
-/// `d.on_tun` for each, sending the resulting datagrams on `udp_fd`.
-fn drain_tun(tun_fd: RawFd, udp_fd: RawFd, d: &mut impl Dispatch, now_ms: u64) -> io::Result<()> {
-    // TUN frames are at most the kernel's MTU (default 1500 bytes for an IP
-    // TUN device), but MAX_WIRE_DATAGRAM (2 KiB) comfortably covers any
-    // standard MTU plus a small margin.
+/// Drain pending TUN frames, accumulating each frame's egress datagrams into `tx`
+/// and flushing them with `send_mmsg` (chunked at the batch cap).
+fn drain_tun(
+    tun_fd: RawFd,
+    udp_fd: RawFd,
+    d: &mut impl Dispatch,
+    now_ms: u64,
+    tx: &mut Vec<EgressDatagram>,
+) -> io::Result<()> {
     let mut buf = [0u8; MAX_WIRE_DATAGRAM];
     loop {
-        // SAFETY: `buf` is a valid stack buffer.  `tun_fd` is a valid TUN
-        // device fd (bidirectional: reads pull kernel-injected IP frames).
-        // We call `read` instead of `recv` because TUN is not a socket.
+        // SAFETY: `buf` is a valid stack buffer; `tun_fd` is a valid non-blocking
+        // TUN fd. TUN is not a socket, so we `read` rather than `recv`.
         let n = unsafe { libc::read(tun_fd, buf.as_mut_ptr().cast(), buf.len()) };
-
         if n < 0 {
             let e = io::Error::last_os_error();
             let raw = e.raw_os_error().unwrap_or(0);
@@ -205,15 +167,29 @@ fn drain_tun(tun_fd: RawFd, udp_fd: RawFd, d: &mut impl Dispatch, now_ms: u64) -
         if n == 0 {
             break;
         }
-
         let inner = &buf[..usize::try_from(n).expect("non-negative read return fits usize")];
-        // Clone the packet slices so we don't hold an immutable borrow on `d`
-        // while calling the mutable send_to_udp.
-        let pkts_owned: Vec<EgressDatagram> = d.on_tun(inner, now_ms).to_vec();
-        for pkt in &pkts_owned {
-            send_to_udp(udp_fd, pkt)?;
+        tx.extend(d.on_tun(inner, now_ms).iter().cloned());
+        if tx.len() >= MAX_DATAGRAM_BATCH {
+            flush_tx(udp_fd, tx)?;
         }
     }
+    flush_tx(udp_fd, tx)?; // send the burst's remaining egress
+    Ok(())
+}
+
+/// Send everything queued in `tx` via `send_mmsg` (looping over partial sends and
+/// batch-cap chunks), then clear it. A momentarily-full send buffer drops the tail
+/// (same acceptable single-packet loss as the old per-datagram `send_to_udp`).
+fn flush_tx(udp_fd: RawFd, tx: &mut Vec<EgressDatagram>) -> io::Result<()> {
+    let mut sent = 0;
+    while sent < tx.len() {
+        let n = send_mmsg(udp_fd, &tx[sent..])?;
+        if n == 0 {
+            break; // send buffer full — drop the rest of this burst
+        }
+        sent += n;
+    }
+    tx.clear();
     Ok(())
 }
 
@@ -234,55 +210,9 @@ fn send_to_tun(tun_fd: RawFd, buf: &[u8]) {
     }
 }
 
-/// Send one datagram on the UDP socket, to its own [`EgressDatagram::dst`].
-///
-/// Transient errors (`EWOULDBLOCK`, `EAGAIN`, `ENOBUFS`) cause the datagram to
-/// be silently dropped — the UDP socket send buffer is momentarily full and this
-/// single packet loss is acceptable.  All other errors (e.g. `EBADF`) propagate
-/// so that a closed or invalid socket terminates the event loop.
-#[inline]
-fn send_to_udp(udp_fd: RawFd, dg: &EgressDatagram) -> io::Result<()> {
-    let (storage, addr_len) = std_to_sockaddr(dg.dst);
-    let buf = &dg.bytes;
-    // SAFETY: `buf` is a valid slice.  `udp_fd` is a valid UDP socket fd
-    // (unconnected — the seam is addressed).  `storage`/`addr_len` describe a
-    // valid destination sockaddr built by `std_to_sockaddr`. MSG_NOSIGNAL
-    // suppresses SIGPIPE if the peer has closed.
-    let rc = unsafe {
-        libc::sendto(
-            udp_fd,
-            buf.as_ptr().cast(),
-            buf.len(),
-            libc::MSG_NOSIGNAL,
-            std::ptr::from_ref(&storage).cast::<libc::sockaddr>(),
-            addr_len,
-        )
-    };
-    if rc < 0 {
-        let e = io::Error::last_os_error();
-        // EWOULDBLOCK == EAGAIN on Linux; list both for portability.
-        // ENOBUFS means the socket send buffer is exhausted — drop the packet
-        // rather than tearing down the tunnel.
-        let raw = e.raw_os_error().unwrap_or(0);
-        if raw == libc::EAGAIN || raw == libc::EWOULDBLOCK || raw == libc::ENOBUFS {
-            eprintln!("poll: udp send dropped ({e})");
-            return Ok(());
-        }
-        return Err(e);
-    }
-    Ok(())
-}
-
 /// Send up to `datagrams.len().min(MAX_DATAGRAM_BATCH)` datagrams in one
 /// `sendmmsg(2)`, each to its own [`EgressDatagram::dst`]. Returns the count the
 /// kernel accepted (may be fewer; the caller loops the remainder).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into the drain loop in Task 2 of the batched-UDP-I/O milestone"
-    )
-)]
 fn send_mmsg(udp_fd: RawFd, datagrams: &[EgressDatagram]) -> io::Result<usize> {
     if datagrams.is_empty() {
         return Ok(0);
@@ -354,13 +284,6 @@ fn send_mmsg(udp_fd: RawFd, datagrams: &[EgressDatagram]) -> io::Result<usize> {
 /// queued datagrams in one syscall, writing each datagram's byte count into
 /// `lens` and source address into `srcs`. Returns the count received (0 if the
 /// socket is momentarily empty). Requires a non-blocking `udp_fd`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into the drain loop in Task 2 of the batched-UDP-I/O milestone"
-    )
-)]
 fn recv_mmsg(
     udp_fd: RawFd,
     bufs: &mut [[u8; MAX_WIRE_DATAGRAM]],
@@ -448,7 +371,7 @@ fn recv_mmsg(
 ///
 /// The function returns when:
 /// - `drain_udp` or `drain_tun` returns a fatal I/O error, OR
-/// - `send_to_udp` returns a fatal I/O error (e.g. socket closed).
+/// - `flush_tx` (via `send_mmsg`) returns a fatal I/O error (e.g. socket closed).
 pub fn run_poll<D: Dispatch>(udp_fd: RawFd, tun_fd: RawFd, d: &mut D) -> io::Result<()> {
     set_nonblocking(udp_fd)?;
     set_nonblocking(tun_fd)?;
@@ -494,6 +417,12 @@ pub fn run_poll<D: Dispatch>(udp_fd: RawFd, tun_fd: RawFd, d: &mut D) -> io::Res
     // only have 2 fds registered.
     let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
 
+    // Reusable batch buffers (one allocation for the loop's lifetime).
+    let mut rx_bufs = Box::new([[0u8; MAX_WIRE_DATAGRAM]; MAX_DATAGRAM_BATCH]);
+    let mut rx_lens = [0usize; MAX_DATAGRAM_BATCH];
+    let mut rx_srcs = [SocketAddr::from(([0, 0, 0, 0], 0)); MAX_DATAGRAM_BATCH];
+    let mut tx_batch: Vec<EgressDatagram> = Vec::with_capacity(MAX_DATAGRAM_BATCH);
+
     loop {
         // SAFETY: `epoll_fd` is a valid epoll fd.  `events` is a valid
         // stack-allocated array; we pass its length as `maxevents`.
@@ -523,13 +452,22 @@ pub fn run_poll<D: Dispatch>(udp_fd: RawFd, tun_fd: RawFd, d: &mut D) -> io::Res
         for ev in &events[..usize::try_from(nfds).expect("non-negative nfds fits usize")] {
             let ready_fd = ev.u64 as RawFd;
             if ready_fd == udp_fd {
-                if let Err(e) = drain_udp(udp_fd, tun_fd, d, now_ms) {
+                if let Err(e) = drain_udp(
+                    udp_fd,
+                    tun_fd,
+                    d,
+                    now_ms,
+                    &mut rx_bufs,
+                    &mut rx_lens,
+                    &mut rx_srcs,
+                    &mut tx_batch,
+                ) {
                     // SAFETY: `epoll_fd` is valid.
                     unsafe { libc::close(epoll_fd) };
                     return Err(e);
                 }
             } else if ready_fd == tun_fd {
-                if let Err(e) = drain_tun(tun_fd, udp_fd, d, now_ms) {
+                if let Err(e) = drain_tun(tun_fd, udp_fd, d, now_ms, &mut tx_batch) {
                     // SAFETY: `epoll_fd` is valid.
                     unsafe { libc::close(epoll_fd) };
                     return Err(e);
@@ -539,12 +477,11 @@ pub fn run_poll<D: Dispatch>(udp_fd: RawFd, tun_fd: RawFd, d: &mut D) -> io::Res
 
         // Always tick — even on timeout with no events.
         if let Some(pkts) = d.tick(now_ms) {
-            for pkt in pkts {
-                if let Err(e) = send_to_udp(udp_fd, pkt) {
-                    // SAFETY: `epoll_fd` is valid.
-                    unsafe { libc::close(epoll_fd) };
-                    return Err(e);
-                }
+            tx_batch.extend(pkts.iter().cloned());
+            if let Err(e) = flush_tx(udp_fd, &mut tx_batch) {
+                // SAFETY: `epoll_fd` is valid.
+                unsafe { libc::close(epoll_fd) };
+                return Err(e);
             }
         }
     }
@@ -615,7 +552,21 @@ mod tests {
         let null_fd = devnull.as_raw_fd();
 
         let mut d = CountDispatch::new();
-        drain_udp(b.as_raw_fd(), null_fd, &mut d, 0).unwrap();
+        let mut bufs = Box::new([[0u8; MAX_WIRE_DATAGRAM]; MAX_DATAGRAM_BATCH]);
+        let mut lens = [0usize; MAX_DATAGRAM_BATCH];
+        let mut srcs = [std::net::SocketAddr::from(([0, 0, 0, 0], 0)); MAX_DATAGRAM_BATCH];
+        let mut tx = Vec::new();
+        drain_udp(
+            b.as_raw_fd(),
+            null_fd,
+            &mut d,
+            0,
+            &mut bufs,
+            &mut lens,
+            &mut srcs,
+            &mut tx,
+        )
+        .unwrap();
 
         assert_eq!(d.call_count, 1, "on_udp must be called exactly once");
         assert_eq!(d.received[0], b"hello from drain_udp test");
@@ -641,7 +592,21 @@ mod tests {
         let null_fd = devnull.as_raw_fd();
 
         let mut d = CountDispatch::new();
-        drain_udp(b.as_raw_fd(), null_fd, &mut d, 0).unwrap();
+        let mut bufs = Box::new([[0u8; MAX_WIRE_DATAGRAM]; MAX_DATAGRAM_BATCH]);
+        let mut lens = [0usize; MAX_DATAGRAM_BATCH];
+        let mut srcs = [std::net::SocketAddr::from(([0, 0, 0, 0], 0)); MAX_DATAGRAM_BATCH];
+        let mut tx = Vec::new();
+        drain_udp(
+            b.as_raw_fd(),
+            null_fd,
+            &mut d,
+            0,
+            &mut bufs,
+            &mut lens,
+            &mut srcs,
+            &mut tx,
+        )
+        .unwrap();
 
         assert_eq!(d.call_count, 3);
     }
@@ -657,8 +622,8 @@ mod tests {
     /// A [`Dispatch`] whose `on_udp` returns `DispatchOut::Udp` — i.e. it
     /// reflects the received datagram back out on the UDP socket (to the
     /// datagram's own source address), optionally replacing its payload.
-    /// This exercises the forwarding arm and `send_to_udp` end-to-end via
-    /// `drain_udp`.
+    /// This exercises the forwarding arm and `flush_tx`/`send_mmsg` end-to-end
+    /// via `drain_udp`.
     struct ForwardDispatch {
         /// Payload to send back.  Cloned once per `on_udp` call.
         reply: Vec<u8>,
@@ -697,8 +662,8 @@ mod tests {
 
     /// Verify that `drain_udp` honours `DispatchOut::Udp`: a datagram arriving
     /// on socket `b` causes `on_udp` to return `DispatchOut::Udp`, whose
-    /// payload is forwarded by `send_to_udp` and received on the peer socket
-    /// `a`.
+    /// payload is forwarded by `flush_tx`/`send_mmsg` and received on the peer
+    /// socket `a`.
     #[test]
     fn drain_udp_forwards_dispatch_out_udp_to_peer() {
         // Two connected loopback sockets: a ↔ b.
@@ -724,7 +689,21 @@ mod tests {
 
         // `ForwardDispatch` will reply with "forwarded" for each received dg.
         let mut d = ForwardDispatch::new(b"forwarded".as_slice());
-        drain_udp(b.as_raw_fd(), null_fd, &mut d, 0).unwrap();
+        let mut bufs = Box::new([[0u8; MAX_WIRE_DATAGRAM]; MAX_DATAGRAM_BATCH]);
+        let mut lens = [0usize; MAX_DATAGRAM_BATCH];
+        let mut srcs = [std::net::SocketAddr::from(([0, 0, 0, 0], 0)); MAX_DATAGRAM_BATCH];
+        let mut tx = Vec::new();
+        drain_udp(
+            b.as_raw_fd(),
+            null_fd,
+            &mut d,
+            0,
+            &mut bufs,
+            &mut lens,
+            &mut srcs,
+            &mut tx,
+        )
+        .unwrap();
 
         // The forwarded datagram must now be readable on `a`.
         let mut recv_buf = [0u8; 64];
