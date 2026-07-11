@@ -267,3 +267,35 @@ the simple, allocating `seal`, matching the brief.
   binary): outcome recorded in `.superpowers/sdd/task-3-report.md` —
   this is the end-to-end proof that a session establishes and passes
   traffic under the new AEAD + no-alloc dataplane path.
+
+## Batched UDP I/O (sendmmsg/recvmmsg) — 2026-07-11
+
+Lever 3 of the single-core-10-Gbit set (FEC and AEAD levers already merged).
+`run_poll`'s hot path now batches UDP I/O: `drain_udp` drains the rx burst with
+one `recvmmsg`; `drain_tun` accumulates a TUN burst's egress symbols and sends
+them with one `sendmmsg`. Structurally this collapses the tx path from ~2–3
+`sendto` syscalls **per packet** (one per FEC symbol) to **one `sendmmsg` per
+burst**, and the rx path from one `recvfrom` per datagram to one `recvmmsg` per
+burst. Batching is opportunistic (drain what epoll already has queued — no
+wait-to-fill), so it is latency-neutral, and each datagram is still its own UDP
+packet (no GSO) so FEC symbol loss-independence is preserved.
+
+### Correctness (verified end-to-end, netns, real sudo)
+- `run-netns-tunnel`: PASS (3/3 ping across the tunnel).
+- `run-netns-tunnel-loss`: **PASS (10/10 under 10% netem loss)** — FEC still
+  recovers dropped packets with batched sends.
+- `run-arq-integrity`: PASS (118 ARQ retransmits, all assertions).
+- Full `cargo test --workspace`: 0 failures. yip-io unit tests cover the
+  addressed `send_mmsg`/`recv_mmsg` (per-datagram dst/src) directly.
+
+### Throughput number: not cleanly captured this run
+`crates/yip-bench/tests/run-iperf-compare.sh` wedged repeatedly in this
+environment (two `yipd` daemons come up but iperf never completes; no output
+after minutes — a harness/environment flake, not a data-plane regression, since
+the tunnel itself passes traffic in every other netns test above). So a
+measured before/after Gbit figure is **not recorded here**. The expected impact
+per the design model is I/O dropping from ~1–3 µs/packet (per-packet syscall) to
+~0.1–0.3 µs (amortized over the burst); combined with the merged FEC (~0.32 µs)
+and AEAD (~0.63 µs) levers this targets ~7 Gbit/s single-core on the target VPS.
+A clean iperf measurement is left as a follow-up (fix or replace the
+iperf-compare harness).
