@@ -1396,6 +1396,8 @@ name = "yip-bench"
 version = "0.0.0"
 dependencies = [
  "criterion",
+ "ring",
+ "snow",
  "yip-crypto",
  "yip-transport",
  "yip-wire",
