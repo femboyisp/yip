@@ -1,7 +1,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
 use yip_bench::{established_pair, sample_inner};
-use yip_transport::Transport;
+use yip_transport::{FecEncoder, FlowClass, Transport};
 use yip_wire::{Codec, Frame, WireCodec};
 
 fn bench_aead(c: &mut Criterion) {
@@ -51,6 +51,19 @@ fn bench_fec_and_classify(c: &mut Criterion) {
     });
     // classify alone is exercised inside encode; a dedicated classify bench can call a public
     // classify path if exposed, else this encode bench covers it.
+
+    // Isolate the P+Q codec cost directly (Transport can't force R=2 on a packet-sized
+    // object). K=3 object; repair=1 = P (pure XOR), repair=2 = P+Q.
+    let fec_params = FlowClass::Default.params();
+    let fec_ct = vec![0xCDu8; 3600]; // K = 3
+    c.bench_function("fec_encode_r1_p", |bn| {
+        let mut enc = FecEncoder::new();
+        bn.iter(|| black_box(enc.encode(black_box(&fec_ct), black_box(fec_params), 1)))
+    });
+    c.bench_function("fec_encode_r2_pq", |bn| {
+        let mut enc = FecEncoder::new();
+        bn.iter(|| black_box(enc.encode(black_box(&fec_ct), black_box(fec_params), 2)))
+    });
 }
 
 criterion_group!(benches, bench_aead, bench_wire, bench_fec_and_classify);

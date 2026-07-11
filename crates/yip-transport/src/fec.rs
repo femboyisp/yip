@@ -1,7 +1,8 @@
 //! Systematic Reed–Solomon FEC (RS-v1, spec §3.2.1) for the transport. Encrypt-
 //! then-FEC: one sealed ciphertext frame is the object, split into K source
-//! symbols of `symbol_size` (last zero-padded) plus R Cauchy repair symbols.
-//! Each `Symbol` carries a codec-tagged `payload_id = [0x01, idx_hi, idx_lo, 0]`.
+//! symbols of `symbol_size` (last zero-padded) plus R repair symbols generated
+//! under a `rs::Scheme` (P+Q for R<=2, Cauchy for R>=3). Each `Symbol` carries a
+//! codec-tagged `payload_id = [0x01, idx_hi, idx_lo, scheme]`.
 #![forbid(unsafe_code)]
 
 use crate::rs;
@@ -21,24 +22,26 @@ pub struct Symbol {
     pub object_id: u16,
     /// The object's original ciphertext byte count (yields K = ceil(size/symbol_size)).
     pub object_size: u32,
-    /// `[codec_tag, symbol_index_hi, symbol_index_lo, reserved]`.
+    /// `[codec_tag, symbol_index_hi, symbol_index_lo, scheme]`.
     pub payload_id: [u8; 4],
     /// The symbol bytes (exactly `symbol_size`).
     pub data: Vec<u8>,
 }
 
-/// Pack `[0x01, idx_be_hi, idx_be_lo, 0]`.
-fn pack_payload_id(symbol_index: u16) -> [u8; 4] {
+/// Pack `[0x01, idx_be_hi, idx_be_lo, scheme]`.
+fn pack_payload_id(symbol_index: u16, scheme: u8) -> [u8; 4] {
     let idx = symbol_index.to_be_bytes();
-    [CODEC_RS_V1, idx[0], idx[1], 0]
+    [CODEC_RS_V1, idx[0], idx[1], scheme]
 }
 
-/// Return `symbol_index` if the codec tag is RS-v1, else `None`.
-fn parse_payload_id(payload_id: &[u8; 4]) -> Option<u16> {
+/// Return `(symbol_index, scheme)` if the codec tag is RS-v1 and the scheme id is
+/// known, else `None`.
+fn parse_payload_id(payload_id: &[u8; 4]) -> Option<(u16, rs::Scheme)> {
     if payload_id[0] != CODEC_RS_V1 {
         return None;
     }
-    Some(u16::from_be_bytes([payload_id[1], payload_id[2]]))
+    let scheme = rs::Scheme::from_u8(payload_id[3])?;
+    Some((u16::from_be_bytes([payload_id[1], payload_id[2]]), scheme))
 }
 
 /// Number of source symbols for an object of `object_size` at `symbol_size`.
@@ -86,8 +89,11 @@ impl FecEncoder {
 
     /// Re-encode `ciphertext` under an EXPLICIT `object_id` (ARQ retransmit),
     /// returning all K source symbols + `extra_repair` repair symbols at indices
-    /// K..K+extra_repair-1 — the same Cauchy rows as `encode`, so a receiver that
-    /// got zero original symbols can reconstruct from this batch alone.
+    /// K..K+extra_repair-1. Both `encode` and `repair_with_id` select the scheme
+    /// via `build` from `(params.arq, r)`: an ARQ (retransmit-eligible) class
+    /// always uses Cauchy, regardless of `r`, so a retransmit batch stays
+    /// scheme-compatible with the original send and a receiver that got zero
+    /// original symbols can reconstruct from this batch alone.
     pub fn repair_with_id(
         &mut self,
         ciphertext: &[u8],
@@ -119,22 +125,31 @@ impl FecEncoder {
             .min(max_repair);
 
         let source = split_source(ciphertext, k, sym);
+        let scheme = if !params.arq && (r == 1 || r == 2) {
+            rs::Scheme::Pq
+        } else {
+            rs::Scheme::Cauchy
+        };
+        let scheme_u8 = scheme.to_u8();
         let mut out = Vec::with_capacity(k + r);
         for (i, shard) in source.iter().enumerate() {
             out.push(Symbol {
                 object_id,
                 object_size,
-                payload_id: pack_payload_id(u16::try_from(i).expect("i < 255")),
+                payload_id: pack_payload_id(u16::try_from(i).expect("i < 255"), scheme_u8),
                 data: shard.clone(),
             });
         }
         if r > 0 {
-            for (m, rep) in rs::encode_repair(&source, r).into_iter().enumerate() {
+            for (m, rep) in rs::encode_repair(&source, r, scheme)
+                .into_iter()
+                .enumerate()
+            {
                 let idx = u16::try_from(k + m).expect("k+m < 255");
                 out.push(Symbol {
                     object_id,
                     object_size,
-                    payload_id: pack_payload_id(idx),
+                    payload_id: pack_payload_id(idx, scheme_u8),
                     data: rep,
                 });
             }
@@ -147,6 +162,7 @@ struct ObjState {
     /// Received shards keyed by symbol_index (deduped).
     shards: HashMap<u16, Vec<u8>>,
     k: usize,
+    scheme: rs::Scheme,
     done: bool,
 }
 
@@ -183,7 +199,7 @@ impl FecReassembler {
         if symbol.object_size == 0 || symbol.object_size > MAX_OBJECT_SIZE {
             return None;
         }
-        let symbol_index = parse_payload_id(&symbol.payload_id)?; // wrong codec tag → None
+        let (symbol_index, scheme) = parse_payload_id(&symbol.payload_id)?; // bad tag/scheme → None
         if usize::from(symbol_index) >= 255 {
             return None;
         }
@@ -192,6 +208,10 @@ impl FecReassembler {
         }
         let k = source_count(symbol.object_size, self.symbol_size);
         if k == 0 || k >= 255 {
+            return None;
+        }
+        // Ingest guard: a P+Q repair row m>=2 (index >= K+2) is invalid.
+        if scheme == rs::Scheme::Pq && usize::from(symbol_index) >= k + 2 {
             return None;
         }
 
@@ -206,6 +226,7 @@ impl FecReassembler {
                 ObjState {
                     shards: HashMap::new(),
                     k,
+                    scheme,
                     done: false,
                 },
             );
@@ -214,6 +235,10 @@ impl FecReassembler {
         let state = self.objects.get_mut(&symbol.object_id)?;
         if state.done {
             return None; // late/duplicate for an already-decoded object
+        }
+        // Reject a symbol whose scheme disagrees with the block's (confusion guard).
+        if state.scheme != scheme {
+            return None;
         }
         // Dedupe by index; only store what we don't have.
         state
@@ -231,7 +256,12 @@ impl FecReassembler {
             .iter()
             .map(|(&idx, d)| (idx, d.as_slice()))
             .collect();
-        let sources = rs::decode_source(state.k, usize::from(self.symbol_size), &received)?;
+        let sources = rs::decode_source(
+            state.k,
+            usize::from(self.symbol_size),
+            &received,
+            state.scheme,
+        )?;
         state.done = true;
 
         // Concatenate source shards and trim to the original object_size.
@@ -270,7 +300,7 @@ mod tests {
         assert_eq!(syms.len(), 5);
         let idx: Vec<u16> = syms
             .iter()
-            .map(|s| parse_payload_id(&s.payload_id).unwrap())
+            .map(|s| parse_payload_id(&s.payload_id).unwrap().0)
             .collect();
         assert_eq!(idx, vec![0, 1, 2, 3, 4]);
         assert!(syms
@@ -341,13 +371,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn arq_retransmit_recovers_after_partial_original_send() {
+        // Bulk = ARQ class → both original send and RETX_EXTRA_REPAIR=4 retransmit
+        // must use Cauchy, so the retransmit batch is accepted and decodes.
+        let params = FlowClass::Bulk.params();
+        assert!(params.arq, "Bulk is the ARQ class");
+        let ct: Vec<u8> = (0..2400u32)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect(); // K=2
+        let mut enc = FecEncoder::new();
+        let original = enc.encode(&ct, params, 1); // R=1
+        assert!(
+            original
+                .iter()
+                .all(|s| s.payload_id[3] == crate::rs::SCHEME_CAUCHY),
+            "ARQ class original send uses Cauchy"
+        );
+        let oid = original[0].object_id;
+        // Receiver gets only ONE shard of the original — not enough to decode.
+        let mut re = FecReassembler::new(params.symbol_size, 64);
+        assert_eq!(re.push(&original[0]), None);
+        // ARQ retransmit with the production constant (4). Must be Cauchy and accepted.
+        let retx = enc.repair_with_id(&ct, params, oid, 4);
+        assert!(
+            retx.iter()
+                .all(|s| s.payload_id[3] == crate::rs::SCHEME_CAUCHY),
+            "ARQ retransmit uses Cauchy"
+        );
+        let mut out = None;
+        for s in &retx {
+            out = out.or(re.push(s));
+        }
+        assert_eq!(
+            out.as_deref(),
+            Some(ct.as_slice()),
+            "retransmit batch reconstructs the object"
+        );
+    }
+
     // --- Guard / DoS tests ---
 
     fn sym(object_size: u32, index: u16, sym_size: usize) -> Symbol {
         Symbol {
             object_id: 0,
             object_size,
-            payload_id: pack_payload_id(index),
+            payload_id: pack_payload_id(index, crate::rs::SCHEME_CAUCHY),
             data: vec![0u8; sym_size],
         }
     }
@@ -431,5 +500,86 @@ mod tests {
             got_b.as_deref(),
             Some(&b"second object payload contents here!"[..])
         );
+    }
+
+    #[test]
+    fn r1_uses_pq_scheme_in_payload_id() {
+        let params = FlowClass::Default.params(); // ratio 0.10 → R=1 at K=2
+        let ct = vec![0x11u8; 2400]; // K=2
+        let mut enc = FecEncoder::new();
+        let syms = enc.encode(&ct, params, 1);
+        // scheme byte (payload_id[3]) is SCHEME_PQ on every symbol
+        assert!(syms.iter().all(|s| s.payload_id[3] == crate::rs::SCHEME_PQ));
+    }
+
+    #[test]
+    fn r3_uses_cauchy_scheme() {
+        let params = FlowClass::Bulk.params();
+        let ct = vec![0x22u8; 3600]; // K=3
+        let mut enc = FecEncoder::new();
+        let syms = enc.encode(&ct, params, 3);
+        assert!(syms
+            .iter()
+            .all(|s| s.payload_id[3] == crate::rs::SCHEME_CAUCHY));
+    }
+
+    #[test]
+    fn r1_pq_block_roundtrips_through_erasure() {
+        let params = FlowClass::Default.params();
+        let ct: Vec<u8> = (0..3600u32)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect(); // K=3
+        let mut enc = FecEncoder::new();
+        let syms = enc.encode(&ct, params, 1); // K=3, R=1 (P), 4 symbols
+        let mut re = FecReassembler::new(params.symbol_size, 64);
+        let mut out = None;
+        // drop one source symbol; the P repair recovers it
+        for (i, s) in syms.iter().enumerate() {
+            if i == 1 {
+                continue;
+            }
+            out = out.or(re.push(s));
+        }
+        assert_eq!(out.as_deref(), Some(ct.as_slice()));
+    }
+
+    #[test]
+    fn r2_pq_block_recovers_two_losses() {
+        let params = FlowClass::Realtime.params();
+        let ct: Vec<u8> = (0..4800u32)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect(); // K=4
+        let mut enc = FecEncoder::new();
+        let syms = enc.encode(&ct, params, 2); // K=4, R=2 (P+Q), 6 symbols
+        let mut re = FecReassembler::new(params.symbol_size, 64);
+        let mut out = None;
+        for (i, s) in syms.iter().enumerate() {
+            if i == 0 || i == 2 {
+                continue; // drop two sources
+            }
+            out = out.or(re.push(s));
+        }
+        assert_eq!(out.as_deref(), Some(ct.as_slice()));
+    }
+
+    #[test]
+    fn reassembler_rejects_pq_repair_index_out_of_range() {
+        let params = FlowClass::Default.params();
+        let ct = vec![0x33u8; 2400]; // K=2
+        let mut enc = FecEncoder::new();
+        let syms = enc.encode(&ct, params, 1); // K=2, R=1, PQ
+        let mut re = FecReassembler::new(params.symbol_size, 64);
+        // Craft a PQ symbol at index K+2 (=4) — an invalid P/Q row — must be rejected.
+        let mut bad = syms[0].clone();
+        bad.payload_id = pack_payload_id(4, crate::rs::SCHEME_PQ);
+        assert_eq!(re.push(&bad), None);
+    }
+
+    #[test]
+    fn reassembler_rejects_unknown_scheme() {
+        let mut re = FecReassembler::new(1200, 64);
+        let mut s = sym(2400, 0, 1200);
+        s.payload_id[3] = 9; // unknown scheme id
+        assert_eq!(re.push(&s), None);
     }
 }
