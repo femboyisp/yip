@@ -2,7 +2,16 @@
 //! on the `snow` Noise Protocol Framework. Establishing a [`Session`] requires
 //! completing an IK [`Handshake`]; the session then seals/opens inner frames
 //! with explicit per-frame nonces and a sliding anti-replay window.
+//!
+//! `snow` drives the Noise handshake only. Once the handshake completes, the two
+//! secret transport keys are extracted via snow's `dangerously_get_raw_split()`
+//! (the same HKDF-derived bytes snow's own `split()` uses internally) and handed
+//! to `ring`'s asm ChaCha20-Poly1305 for the data-plane hot path, keyed with the
+//! Noise nonce convention (4 zero bytes ++ 8-byte little-endian counter). This is
+//! byte-identical to snow's own transport state but faster.
 #![forbid(unsafe_code)]
+
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 
 /// The Noise parameter set: IK pattern, X25519, ChaCha20-Poly1305, BLAKE2s.
 pub(crate) const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
@@ -173,17 +182,35 @@ impl Handshake {
     }
 
     /// Convert a completed handshake into an AEAD [`Session`].
-    pub fn into_session(self) -> Result<Session, CryptoError> {
-        let transport = self
-            .inner
-            .into_stateless_transport_mode()
-            .map_err(|_| CryptoError::Handshake)?;
+    ///
+    /// Extracts the two secret Noise transport keys via snow's raw split and
+    /// builds `ring` AEAD keys from them directly; snow's own transport state is
+    /// not used for the data plane. Per snow's split convention, element 0 of
+    /// the pair is the initiator's send key (= responder's receive key) and
+    /// element 1 is the responder's send key (= initiator's receive key), so
+    /// the mapping below is role-dependent.
+    pub fn into_session(mut self) -> Result<Session, CryptoError> {
+        let is_initiator = self.inner.is_initiator();
+        let (k0, k1) = self.inner.dangerously_get_raw_split();
+        let (k_send, k_recv) = if is_initiator { (k0, k1) } else { (k1, k0) };
+        let send =
+            UnboundKey::new(&CHACHA20_POLY1305, &k_send).map_err(|_| CryptoError::Handshake)?;
+        let recv =
+            UnboundKey::new(&CHACHA20_POLY1305, &k_recv).map_err(|_| CryptoError::Handshake)?;
         Ok(Session {
-            transport,
+            send_key: LessSafeKey::new(send),
+            recv_key: LessSafeKey::new(recv),
             send_counter: 0,
             replay: ReplayWindow::new(),
         })
     }
+}
+
+/// Noise ChaChaPoly nonce: 4 zero bytes ++ 8-byte little-endian counter.
+fn noise_nonce(counter: u64) -> Nonce {
+    let mut n = [0u8; 12];
+    n[4..].copy_from_slice(&counter.to_le_bytes());
+    Nonce::assume_unique_for_key(n)
 }
 
 /// A sealed frame: the AEAD ciphertext plus the explicit nonce it was sealed
@@ -198,8 +225,12 @@ pub struct Sealed {
 
 /// An established AEAD session. Seals outgoing frames under a monotonic counter
 /// and opens incoming frames out of order, rejecting replays.
+///
+/// Uses `ring`'s ChaCha20-Poly1305 keyed by the Noise Split() transport keys
+/// (see [`Handshake::into_session`]) rather than snow's own transport state.
 pub struct Session {
-    transport: snow::StatelessTransportState,
+    send_key: LessSafeKey,
+    recv_key: LessSafeKey,
     send_counter: u64,
     replay: ReplayWindow,
 }
@@ -208,12 +239,10 @@ impl Session {
     /// Seal one inner frame, assigning it the next send counter.
     pub fn seal(&mut self, plaintext: &[u8]) -> Result<Sealed, CryptoError> {
         let counter = self.send_counter;
-        let mut buf = vec![0u8; plaintext.len() + 16];
-        let n = self
-            .transport
-            .write_message(counter, plaintext, &mut buf)
+        let mut buf = plaintext.to_vec();
+        self.send_key
+            .seal_in_place_append_tag(noise_nonce(counter), Aad::empty(), &mut buf)
             .map_err(|_| CryptoError::Decrypt)?;
-        buf.truncate(n);
         self.send_counter = self
             .send_counter
             .checked_add(1)
@@ -234,14 +263,66 @@ impl Session {
         if !self.replay.check_and_set(counter) {
             return Err(CryptoError::Replay);
         }
-        let mut buf = vec![0u8; ciphertext.len()];
-        let n = self
-            .transport
-            .read_message(counter, ciphertext, &mut buf)
+        let mut buf = ciphertext.to_vec();
+        let plain = self
+            .recv_key
+            .open_in_place(noise_nonce(counter), Aad::empty(), &mut buf)
             .map_err(|_| CryptoError::Decrypt)?;
-        buf.truncate(n);
-        Ok(buf)
+        Ok(plain.to_vec())
     }
+
+    /// Seal into a caller-owned reusable buffer (no per-call allocation).
+    pub fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> Result<u64, CryptoError> {
+        let counter = self.send_counter;
+        out.clear();
+        out.extend_from_slice(plaintext);
+        self.send_key
+            .seal_in_place_append_tag(noise_nonce(counter), Aad::empty(), out)
+            .map_err(|_| CryptoError::Decrypt)?;
+        self.send_counter = self
+            .send_counter
+            .checked_add(1)
+            .ok_or(CryptoError::Decrypt)?;
+        Ok(counter)
+    }
+
+    /// Open into a caller-owned reusable buffer (no per-call allocation).
+    pub fn open_into(
+        &mut self,
+        counter: u64,
+        ciphertext: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), CryptoError> {
+        if !self.replay.check_and_set(counter) {
+            return Err(CryptoError::Replay);
+        }
+        out.clear();
+        out.extend_from_slice(ciphertext);
+        let n = {
+            let plain = self
+                .recv_key
+                .open_in_place(noise_nonce(counter), Aad::empty(), out)
+                .map_err(|_| CryptoError::Decrypt)?;
+            plain.len()
+        };
+        out.truncate(n);
+        Ok(())
+    }
+}
+
+/// Test-only helper: drive a full initiator/responder handshake to completion
+/// and return the two established sessions. Mirrors `yip_bench::established_pair`.
+#[cfg(test)]
+pub(crate) fn test_session_pair() -> (Session, Session) {
+    let resp_kp = generate_keypair();
+    let init_kp = generate_keypair();
+    let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
+    let mut res = Handshake::responder(&resp_kp.private).unwrap();
+    let m1 = ini.write_message(&[]).unwrap();
+    let _ = res.read_message(&m1).unwrap();
+    let m2 = res.write_message(&[]).unwrap();
+    let _ = ini.read_message(&m2).unwrap();
+    (ini.into_session().unwrap(), res.into_session().unwrap())
 }
 
 #[cfg(test)]
@@ -347,19 +428,6 @@ mod tests {
         );
     }
 
-    // Helper: run a full handshake and return (initiator_session, responder_session).
-    fn established_pair() -> (Session, Session) {
-        let resp_kp = generate_keypair();
-        let init_kp = generate_keypair();
-        let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
-        let mut res = Handshake::responder(&resp_kp.private).unwrap();
-        let m1 = ini.write_message(&[]).unwrap();
-        let _ = res.read_message(&m1).unwrap();
-        let m2 = res.write_message(&[]).unwrap();
-        let _ = ini.read_message(&m2).unwrap();
-        (ini.into_session().unwrap(), res.into_session().unwrap())
-    }
-
     #[test]
     fn handshake_payload_round_trips_and_sessions_match() {
         // msg1 carries an app payload (the initiator's cert, in 2c); msg2
@@ -396,7 +464,7 @@ mod tests {
 
     #[test]
     fn session_seals_and_opens_roundtrip() {
-        let (mut a, mut b) = established_pair();
+        let (mut a, mut b) = test_session_pair();
         let s = a.seal(b"inner packet").unwrap();
         assert_eq!(s.counter, 0, "first counter is 0");
         assert_eq!(b.open(s.counter, &s.ciphertext).unwrap(), b"inner packet");
@@ -404,7 +472,7 @@ mod tests {
 
     #[test]
     fn session_opens_out_of_order() {
-        let (mut a, mut b) = established_pair();
+        let (mut a, mut b) = test_session_pair();
         let s0 = a.seal(b"zero").unwrap();
         let s1 = a.seal(b"one").unwrap();
         assert_eq!(s1.counter, 1);
@@ -415,7 +483,7 @@ mod tests {
 
     #[test]
     fn session_rejects_replay() {
-        let (mut a, mut b) = established_pair();
+        let (mut a, mut b) = test_session_pair();
         let s = a.seal(b"x").unwrap();
         assert!(b.open(s.counter, &s.ciphertext).is_ok());
         assert_eq!(b.open(s.counter, &s.ciphertext), Err(CryptoError::Replay));
@@ -423,7 +491,7 @@ mod tests {
 
     #[test]
     fn session_rejects_tampered_ciphertext() {
-        let (mut a, mut b) = established_pair();
+        let (mut a, mut b) = test_session_pair();
         let s = a.seal(b"y").unwrap();
         let mut bad = s.ciphertext.clone();
         bad[0] ^= 0x01;
@@ -465,5 +533,196 @@ mod tests {
         assert!(ini.is_finished() && res.is_finished());
         // IK: the responder learns the initiator's static public key.
         assert_eq!(res.remote_static(), Some(init_kp.public));
+    }
+
+    #[test]
+    fn seal_is_byte_identical_across_a_reference_session() {
+        // Two independently-built sessions from the same handshake produce the same
+        // keystream for the same counter+plaintext; a receiver opens what a sender seals.
+        let (mut a, mut b) = crate::test_session_pair();
+        for ctr in 0u64..8 {
+            let s = a.seal(&[0x5Au8; 64]).unwrap();
+            assert_eq!(s.counter, ctr);
+            assert_eq!(b.open(s.counter, &s.ciphertext).unwrap(), vec![0x5Au8; 64]);
+        }
+    }
+
+    #[test]
+    fn open_rejects_tampered_ciphertext() {
+        let (mut a, mut b) = crate::test_session_pair();
+        let s = a.seal(b"secret").unwrap();
+        let mut bad = s.ciphertext.clone();
+        bad[0] ^= 1;
+        assert_eq!(b.open(s.counter, &bad), Err(CryptoError::Decrypt));
+    }
+
+    #[test]
+    fn open_rejects_replay_and_opens_out_of_order() {
+        let (mut a, mut b) = crate::test_session_pair();
+        let s0 = a.seal(b"zero").unwrap();
+        let s1 = a.seal(b"one").unwrap();
+        assert_eq!(b.open(s1.counter, &s1.ciphertext).unwrap(), b"one"); // out of order
+        assert_eq!(b.open(s0.counter, &s0.ciphertext).unwrap(), b"zero");
+        assert_eq!(b.open(s1.counter, &s1.ciphertext), Err(CryptoError::Replay));
+        // replay
+    }
+
+    /// Durable KAT (spec §5): the production `Session`'s `ring` ChaCha20-Poly1305
+    /// output must be byte-for-byte identical to snow's own transport AEAD, for
+    /// both handshake directions and several counters. This is the regression
+    /// guard for `Handshake::into_session`'s role-dependent key mapping and for
+    /// `noise_nonce`'s counter encoding: a swapped send/recv mapping or a
+    /// big-endian (or otherwise wrong) nonce would still round-trip internally
+    /// (seal/open use the same buggy convention on both sides) but would no
+    /// longer match snow's genuine output, which this test would catch.
+    ///
+    /// `yip_crypto::Handshake` doesn't expose its inner `snow::HandshakeState`
+    /// (nor the raw split keys) through its public API, and snow's
+    /// `into_stateless_transport_mode()` / `into_session()` each consume the
+    /// `HandshakeState` they're called on, so a single completed handshake can't
+    /// yield both a production `Session` *and* a snow reference transport for
+    /// the same peer. Instead we drive two independent, byte-identical
+    /// handshakes side by side: snow's `fixed_ephemeral_key_for_testing_only`
+    /// pins each peer's ephemeral key so the production `Handshake` (built by
+    /// hand here, using the same private `inner` field the rest of this module
+    /// uses) and a bare `snow::HandshakeState` reference derive the exact same
+    /// transport keys from the exact same static+ephemeral inputs. The lockstep
+    /// message-equality asserts below confirm the two handshakes really are
+    /// identical, not just similarly configured.
+    #[test]
+    fn session_seal_is_byte_identical_to_snow_write_message_both_directions() {
+        let resp_kp = generate_keypair();
+        let init_kp = generate_keypair();
+
+        // Fixed (not secret) ephemeral scalars: same value reused by both the
+        // production handshake and the snow reference handshake below, so the
+        // two derive identical transport keys. X25519 clamps any 32 bytes into
+        // a valid scalar, so the exact value doesn't matter.
+        let e_init = [0x11u8; 32];
+        let e_resp = [0x22u8; 32];
+
+        let build_initiator = |e: &[u8]| {
+            snow::Builder::new(NOISE_PARAMS.parse().unwrap())
+                .local_private_key(&init_kp.private)
+                .unwrap()
+                .remote_public_key(&resp_kp.public)
+                .unwrap()
+                .fixed_ephemeral_key_for_testing_only(e)
+                .build_initiator()
+                .unwrap()
+        };
+        let build_responder = |e: &[u8]| {
+            snow::Builder::new(NOISE_PARAMS.parse().unwrap())
+                .local_private_key(&resp_kp.private)
+                .unwrap()
+                .fixed_ephemeral_key_for_testing_only(e)
+                .build_responder()
+                .unwrap()
+        };
+
+        // --- Production side: real `Handshake`s, hand-built here (same-crate
+        // access to the private `inner` field) so the fixed ephemerals apply. ---
+        let mut ini = Handshake {
+            inner: build_initiator(&e_init),
+        };
+        let mut res = Handshake {
+            inner: build_responder(&e_resp),
+        };
+        let m1 = ini.write_message(&[]).unwrap();
+        let _ = res.read_message(&m1).unwrap();
+        let m2 = res.write_message(&[]).unwrap();
+        let _ = ini.read_message(&m2).unwrap();
+        assert!(ini.is_finished() && res.is_finished());
+
+        // --- Reference side: independent raw snow HandshakeStates, same
+        // static + fixed-ephemeral inputs, driven through the same two
+        // messages in lockstep. ---
+        let mut snow_ini = build_initiator(&e_init);
+        let mut snow_res = build_responder(&e_resp);
+        let mut buf = [0u8; 4096];
+        let n = snow_ini.write_message(&[], &mut buf).unwrap();
+        let snow_m1 = buf[..n].to_vec();
+        assert_eq!(snow_m1, m1, "lockstep: reference msg1 == production msg1");
+        let n = snow_res.read_message(&snow_m1, &mut buf).unwrap();
+        let _ = &buf[..n];
+        let n = snow_res.write_message(&[], &mut buf).unwrap();
+        let snow_m2 = buf[..n].to_vec();
+        assert_eq!(snow_m2, m2, "lockstep: reference msg2 == production msg2");
+        let n = snow_ini.read_message(&snow_m2, &mut buf).unwrap();
+        let _ = &buf[..n];
+        assert!(snow_ini.is_handshake_finished() && snow_res.is_handshake_finished());
+
+        // Sanity: both independently-driven handshakes derive the identical
+        // Noise split keys before either is consumed below.
+        assert_eq!(
+            ini.inner.dangerously_get_raw_split(),
+            snow_ini.dangerously_get_raw_split(),
+            "production and reference derive identical split keys"
+        );
+
+        // Convert: production side through the real `into_session()` (the
+        // code path under test); reference side through snow's own
+        // `into_stateless_transport_mode()` (snow's genuine transport AEAD).
+        let mut ini_session = ini.into_session().unwrap();
+        let mut res_session = res.into_session().unwrap();
+        let snow_ini_ref = snow_ini.into_stateless_transport_mode().unwrap();
+        let snow_res_ref = snow_res.into_stateless_transport_mode().unwrap();
+
+        let plaintext: Vec<u8> = (0u8..200).collect();
+
+        // initiator -> responder: production seal byte-identical to snow's
+        // write_message (initiator role), and the responder session opens it.
+        for ctr in 0u64..=4 {
+            let sealed = ini_session.seal(&plaintext).unwrap();
+            assert_eq!(sealed.counter, ctr);
+            let mut snow_out = vec![0u8; plaintext.len() + 16];
+            let n = snow_ini_ref
+                .write_message(ctr, &plaintext, &mut snow_out)
+                .unwrap();
+            snow_out.truncate(n);
+            assert_eq!(
+                sealed.ciphertext, snow_out,
+                "initiator->responder ciphertext byte-identical to snow at counter {ctr}"
+            );
+            assert_eq!(
+                res_session
+                    .open(sealed.counter, &sealed.ciphertext)
+                    .unwrap(),
+                plaintext,
+                "responder opens what the initiator sealed at counter {ctr}"
+            );
+        }
+
+        // responder -> initiator: the symmetric case.
+        for ctr in 0u64..=4 {
+            let sealed = res_session.seal(&plaintext).unwrap();
+            assert_eq!(sealed.counter, ctr);
+            let mut snow_out = vec![0u8; plaintext.len() + 16];
+            let n = snow_res_ref
+                .write_message(ctr, &plaintext, &mut snow_out)
+                .unwrap();
+            snow_out.truncate(n);
+            assert_eq!(
+                sealed.ciphertext, snow_out,
+                "responder->initiator ciphertext byte-identical to snow at counter {ctr}"
+            );
+            assert_eq!(
+                ini_session
+                    .open(sealed.counter, &sealed.ciphertext)
+                    .unwrap(),
+                plaintext,
+                "initiator opens what the responder sealed at counter {ctr}"
+            );
+        }
+    }
+
+    #[test]
+    fn seal_into_matches_seal_and_opens() {
+        let (mut a, mut b) = crate::test_session_pair();
+        let mut sbuf = Vec::new();
+        let ctr = a.seal_into(b"reuse me", &mut sbuf).unwrap();
+        let mut obuf = Vec::new();
+        b.open_into(ctr, &sbuf, &mut obuf).unwrap();
+        assert_eq!(obuf, b"reuse me");
     }
 }

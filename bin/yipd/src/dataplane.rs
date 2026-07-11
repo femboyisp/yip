@@ -152,6 +152,12 @@ pub struct DataPlane {
     /// Reused scratch holding exactly one entry: the sealed feedback Control
     /// packet built by `tick`, addressed to `peer_addr`.
     tick_scratch: Vec<yip_io::poll::EgressDatagram>,
+    /// Reused scratch for the tx hot-path AEAD seal (`Session::seal_into`):
+    /// avoids a per-packet allocation in `seal` itself. Its contents are
+    /// moved (not cloned) into `retx` when a packet is buffered for ARQ, so
+    /// this only amortizes across calls that don't hit the retx path (still
+    /// cleared+refilled every call otherwise).
+    seal_buf: Vec<u8>,
 }
 
 impl DataPlane {
@@ -198,6 +204,7 @@ impl DataPlane {
             inner_scratch: Vec::new(),
             retx_scratch: Vec::new(),
             tick_scratch: Vec::new(),
+            seal_buf: Vec::new(),
         }
     }
 
@@ -228,24 +235,27 @@ impl DataPlane {
             }
         }
 
-        // ── 1. Seal ───────────────────────────────────────────────────────────
-        let sealed = match self.session.seal(inner) {
-            Ok(s) => s,
+        // ── 1. Seal (no-alloc: writes into the reused `seal_buf`) ──────────────
+        let counter = match self.session.seal_into(inner, &mut self.seal_buf) {
+            Ok(c) => c,
             Err(_) => return &self.egress_scratch,
         };
 
         // ── 2. FEC-encode ─────────────────────────────────────────────────────
         let (class, symbols) = self
             .transport
-            .encode(&sealed.ciphertext, inner, self.l2, now_ms);
+            .encode(&self.seal_buf, inner, self.l2, now_ms);
 
         // ── 3. Auxiliary bookkeeping ──────────────────────────────────────────
-        self.sent_log.insert(sealed.counter, class);
+        self.sent_log.insert(counter, class);
 
         if let Some(oid) = symbols.first().map(|s| s.object_id) {
+            // Move (not clone) the sealed ciphertext into the retx buffer:
+            // `seal_buf` is about to be cleared and refilled on the next call
+            // anyway, so retx taking ownership here costs no extra copy.
             self.retx.put(
-                sealed.counter,
-                sealed.ciphertext.clone(),
+                counter,
+                std::mem::take(&mut self.seal_buf),
                 class,
                 oid,
                 now_ms,
@@ -265,7 +275,7 @@ impl DataPlane {
         }
 
         for (slot, sym) in self.egress_scratch[..n_syms].iter_mut().zip(symbols.iter()) {
-            let frame = wire_glue::symbol_to_frame(self.conn_tag, sym, sealed.counter, class);
+            let frame = wire_glue::symbol_to_frame(self.conn_tag, sym, counter, class);
             let dg = self.codec.frame(&frame);
             // `fate` = the RaptorQ object id: all symbols of one object (source +
             // its repair) share it, so a GSO driver keeps them in separate skbs.

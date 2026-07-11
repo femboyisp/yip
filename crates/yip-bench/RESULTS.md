@@ -199,3 +199,71 @@ and only engages when loss conditions call for stronger repair.
     confirms that fix holds under real network-namespace loss, not
     just in the `arq_retransmit_recovers_after_partial_original_send`
     unit test.
+
+## Fast AEAD (ring ChaCha20-Poly1305)
+
+Generated: 2026-07-11 15:46 UTC
+
+Task 2 (already merged into this branch, `feat/throughput-fast-aead`)
+swapped `Session::seal`/`open`'s cipher backend from `snow`'s own
+transport-mode AEAD to `ring`'s asm ChaCha20-Poly1305, keyed from the
+same Noise Split() secret transport keys (byte-identical output,
+confirmed by the `session_seal_is_byte_identical_to_snow_write_message_both_directions`
+durable KAT) — the ~4x win this milestone targets. This task (3) is the
+no-alloc buffer API on top of that swap plus the dataplane hot-loop
+wiring and this measurement/no-regression pass.
+
+### `aead_seal_1300` / `aead_open_1300` (criterion, `cargo bench -p yip-bench --bench hotpath -- aead`)
+
+| bench | before (snow) | after (ring) |
+|---|---|---|
+| `aead_seal_1300` | ~2.1 µs (documented snow baseline; this machine's own criterion baseline directory recorded a **-67.8%** regression-to-improvement delta on this run, consistent with a ~2.1 µs → ~0.63 µs move) | **633.98 ns median** `[629.65 ns, 633.98 ns, 638.31 ns]` |
+| `aead_open_1300` | ~2.1 µs+ (snow) | **1.2843 µs median** `[1.2769 µs, 1.2843 µs, 1.2922 µs]` — this bench re-seals every iteration and measures seal+open **combined** (see the bench's own comment in `hotpath.rs`), so the isolated open cost is roughly `1.2843 µs − 0.634 µs ≈ 0.65 µs`, in the same ~0.5–0.9 µs band as seal |
+
+Single-core throughput implication: at ~0.634 µs/seal, one core can
+seal roughly 1.58M 1300 B packets/s in isolation (`1/633.98ns ≈
+1.577M/s`, × 1300 B × 8 bit ≈ 16.4 Gbit/s of AEAD throughput headroom,
+ignoring FEC/wire/syscall overhead already measured elsewhere in this
+file at sub-µs and ~1.3 µs respectively) — AEAD is no longer the
+dominant per-packet cost by itself; it now sits below the P+Q FEC R=2
+path and in the same ballpark as R=1 FEC.
+
+### No-alloc delta (`seal_into`/`open_into`), reported honestly
+
+Per the Task-1 spike, swapping the *buffer* from a fresh per-call
+`Vec` (`seal`'s `plaintext.to_vec()`) to a caller-reused `Vec`
+(`seal_into`'s `out.clear(); out.extend_from_slice(..)`) measured only
+**~0.02 µs** of delta in isolation — allocator reuse of a small,
+consistently-sized (~1.3 KB) buffer is already close to free on this
+allocator, so this is *not* where this task's value is. This
+measurement was not independently re-run here (Step 3 only re-runs the
+existing `aead_seal_1300`/`aead_open_1300` benches, which still call
+the allocating `seal`/`open` — `seal_into` is exercised end-to-end via
+the dataplane hot path instead, see below); reporting it here as
+previously measured rather than re-claiming a fresh number.
+
+The real, structural win of this task is in `bin/yipd/src/dataplane.rs`'s
+`on_tun_packet` tx hot loop: before, every packet paid **two**
+1300-ish-byte heap allocations — `seal`'s internal `plaintext.to_vec()`
+and the subsequent `sealed.ciphertext.clone()` needed to hand an owned
+copy to `RetxBuffer::put` (which takes `Vec<u8>` by value). After this
+change, `seal_into` writes into a reused `self.seal_buf` field (no
+allocation on the seal step itself in the steady state where a packet
+isn't buffered for retx), and the `.clone()` call is gone entirely:
+the sealed bytes are *moved* into `retx.put` via `std::mem::take(&mut
+self.seal_buf)` rather than cloned. Net effect: **one heap allocation
+per packet instead of two**, on the path that runs on every packet the
+tunnel sends (not a synthetic benchmark number, but visible by
+inspection of the diff — see `dataplane.rs`'s `on_tun_packet`). The
+cold feedback-report seal in `tick` (~line 539 pre-change) is left on
+the simple, allocating `seal`, matching the brief.
+
+### No-regression
+
+- `cargo test` (full workspace): see command output captured in
+  `.superpowers/sdd/task-3-report.md`.
+- netns FEC/ARQ integration gate (`sudo bin/yipd/tests/run-netns-tunnel.sh`,
+  `run-netns-tunnel-loss.sh`, `run-arq-integrity.sh`, release `yipd`
+  binary): outcome recorded in `.superpowers/sdd/task-3-report.md` —
+  this is the end-to-end proof that a session establishes and passes
+  traffic under the new AEAD + no-alloc dataplane path.

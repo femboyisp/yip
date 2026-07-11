@@ -1414,6 +1414,7 @@ dependencies = [
 name = "yip-crypto"
 version = "0.0.0"
 dependencies = [
+ "ring",
  "snow",
  "thiserror",
 ]
