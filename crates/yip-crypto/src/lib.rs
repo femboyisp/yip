@@ -528,4 +528,153 @@ mod tests {
         assert_eq!(b.open(s1.counter, &s1.ciphertext), Err(CryptoError::Replay));
         // replay
     }
+
+    /// Durable KAT (spec §5): the production `Session`'s `ring` ChaCha20-Poly1305
+    /// output must be byte-for-byte identical to snow's own transport AEAD, for
+    /// both handshake directions and several counters. This is the regression
+    /// guard for `Handshake::into_session`'s role-dependent key mapping and for
+    /// `noise_nonce`'s counter encoding: a swapped send/recv mapping or a
+    /// big-endian (or otherwise wrong) nonce would still round-trip internally
+    /// (seal/open use the same buggy convention on both sides) but would no
+    /// longer match snow's genuine output, which this test would catch.
+    ///
+    /// `yip_crypto::Handshake` doesn't expose its inner `snow::HandshakeState`
+    /// (nor the raw split keys) through its public API, and snow's
+    /// `into_stateless_transport_mode()` / `into_session()` each consume the
+    /// `HandshakeState` they're called on, so a single completed handshake can't
+    /// yield both a production `Session` *and* a snow reference transport for
+    /// the same peer. Instead we drive two independent, byte-identical
+    /// handshakes side by side: snow's `fixed_ephemeral_key_for_testing_only`
+    /// pins each peer's ephemeral key so the production `Handshake` (built by
+    /// hand here, using the same private `inner` field the rest of this module
+    /// uses) and a bare `snow::HandshakeState` reference derive the exact same
+    /// transport keys from the exact same static+ephemeral inputs. The lockstep
+    /// message-equality asserts below confirm the two handshakes really are
+    /// identical, not just similarly configured.
+    #[test]
+    fn session_seal_is_byte_identical_to_snow_write_message_both_directions() {
+        let resp_kp = generate_keypair();
+        let init_kp = generate_keypair();
+
+        // Fixed (not secret) ephemeral scalars: same value reused by both the
+        // production handshake and the snow reference handshake below, so the
+        // two derive identical transport keys. X25519 clamps any 32 bytes into
+        // a valid scalar, so the exact value doesn't matter.
+        let e_init = [0x11u8; 32];
+        let e_resp = [0x22u8; 32];
+
+        let build_initiator = |e: &[u8]| {
+            snow::Builder::new(NOISE_PARAMS.parse().unwrap())
+                .local_private_key(&init_kp.private)
+                .unwrap()
+                .remote_public_key(&resp_kp.public)
+                .unwrap()
+                .fixed_ephemeral_key_for_testing_only(e)
+                .build_initiator()
+                .unwrap()
+        };
+        let build_responder = |e: &[u8]| {
+            snow::Builder::new(NOISE_PARAMS.parse().unwrap())
+                .local_private_key(&resp_kp.private)
+                .unwrap()
+                .fixed_ephemeral_key_for_testing_only(e)
+                .build_responder()
+                .unwrap()
+        };
+
+        // --- Production side: real `Handshake`s, hand-built here (same-crate
+        // access to the private `inner` field) so the fixed ephemerals apply. ---
+        let mut ini = Handshake {
+            inner: build_initiator(&e_init),
+        };
+        let mut res = Handshake {
+            inner: build_responder(&e_resp),
+        };
+        let m1 = ini.write_message(&[]).unwrap();
+        let _ = res.read_message(&m1).unwrap();
+        let m2 = res.write_message(&[]).unwrap();
+        let _ = ini.read_message(&m2).unwrap();
+        assert!(ini.is_finished() && res.is_finished());
+
+        // --- Reference side: independent raw snow HandshakeStates, same
+        // static + fixed-ephemeral inputs, driven through the same two
+        // messages in lockstep. ---
+        let mut snow_ini = build_initiator(&e_init);
+        let mut snow_res = build_responder(&e_resp);
+        let mut buf = [0u8; 4096];
+        let n = snow_ini.write_message(&[], &mut buf).unwrap();
+        let snow_m1 = buf[..n].to_vec();
+        assert_eq!(snow_m1, m1, "lockstep: reference msg1 == production msg1");
+        let n = snow_res.read_message(&snow_m1, &mut buf).unwrap();
+        let _ = &buf[..n];
+        let n = snow_res.write_message(&[], &mut buf).unwrap();
+        let snow_m2 = buf[..n].to_vec();
+        assert_eq!(snow_m2, m2, "lockstep: reference msg2 == production msg2");
+        let n = snow_ini.read_message(&snow_m2, &mut buf).unwrap();
+        let _ = &buf[..n];
+        assert!(snow_ini.is_handshake_finished() && snow_res.is_handshake_finished());
+
+        // Sanity: both independently-driven handshakes derive the identical
+        // Noise split keys before either is consumed below.
+        assert_eq!(
+            ini.inner.dangerously_get_raw_split(),
+            snow_ini.dangerously_get_raw_split(),
+            "production and reference derive identical split keys"
+        );
+
+        // Convert: production side through the real `into_session()` (the
+        // code path under test); reference side through snow's own
+        // `into_stateless_transport_mode()` (snow's genuine transport AEAD).
+        let mut ini_session = ini.into_session().unwrap();
+        let mut res_session = res.into_session().unwrap();
+        let snow_ini_ref = snow_ini.into_stateless_transport_mode().unwrap();
+        let snow_res_ref = snow_res.into_stateless_transport_mode().unwrap();
+
+        let plaintext: Vec<u8> = (0u8..200).collect();
+
+        // initiator -> responder: production seal byte-identical to snow's
+        // write_message (initiator role), and the responder session opens it.
+        for ctr in 0u64..=4 {
+            let sealed = ini_session.seal(&plaintext).unwrap();
+            assert_eq!(sealed.counter, ctr);
+            let mut snow_out = vec![0u8; plaintext.len() + 16];
+            let n = snow_ini_ref
+                .write_message(ctr, &plaintext, &mut snow_out)
+                .unwrap();
+            snow_out.truncate(n);
+            assert_eq!(
+                sealed.ciphertext, snow_out,
+                "initiator->responder ciphertext byte-identical to snow at counter {ctr}"
+            );
+            assert_eq!(
+                res_session
+                    .open(sealed.counter, &sealed.ciphertext)
+                    .unwrap(),
+                plaintext,
+                "responder opens what the initiator sealed at counter {ctr}"
+            );
+        }
+
+        // responder -> initiator: the symmetric case.
+        for ctr in 0u64..=4 {
+            let sealed = res_session.seal(&plaintext).unwrap();
+            assert_eq!(sealed.counter, ctr);
+            let mut snow_out = vec![0u8; plaintext.len() + 16];
+            let n = snow_res_ref
+                .write_message(ctr, &plaintext, &mut snow_out)
+                .unwrap();
+            snow_out.truncate(n);
+            assert_eq!(
+                sealed.ciphertext, snow_out,
+                "responder->initiator ciphertext byte-identical to snow at counter {ctr}"
+            );
+            assert_eq!(
+                ini_session
+                    .open(sealed.counter, &sealed.ciphertext)
+                    .unwrap(),
+                plaintext,
+                "initiator opens what the responder sealed at counter {ctr}"
+            );
+        }
+    }
 }
