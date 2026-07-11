@@ -42,11 +42,6 @@ const MAX_WIRE_DATAGRAM_U32: u32 = 2048;
 const RING_BUFS_U16: u16 = 256;
 const MAX_GSO_DATAGRAMS: usize = MAX_DATAGRAM_BATCH;
 const MAX_GSO_PAYLOAD: usize = MAX_WIRE_DATAGRAM * MAX_GSO_DATAGRAMS;
-const MAX_UDP_PAYLOAD: usize = 65_507;
-/// Max datagrams coalesced into one `UDP_SEGMENT` send. No longer a correctness
-/// guard (that is `can_coalesce_gso_tagged`, which forbids same-FEC-object
-/// datagrams sharing a skb) — purely a throughput/blast-radius knob. See #17.
-const MAX_GSO_SEGMENTS_PER_SEND: usize = 32;
 /// Cap on egress datagrams staged for GSO within one `poll_once`, bounding the
 /// dedup pass in `flush_pending_gso`.
 const MAX_PENDING_GSO_DATAGRAMS: usize = 512;
@@ -588,28 +583,7 @@ impl UringDriver {
     /// This is the single correctness choke point for GSO+FEC(+addressing)
     /// safety.
     fn can_coalesce_gso_tagged(datagrams: &[EgressDatagram]) -> Option<u16> {
-        if datagrams.len() < 2 {
-            return None;
-        }
-        let first = datagrams.first()?;
-        let first_len = first.bytes.len();
-        if first_len == 0 {
-            return None;
-        }
-        let segment_size = u16::try_from(first_len).ok()?;
-        let first_dst = first.dst;
-        for (i, dg) in datagrams.iter().enumerate() {
-            if dg.bytes.len() != first_len {
-                return None;
-            }
-            if dg.dst != first_dst {
-                return None;
-            }
-            if datagrams[..i].iter().any(|prior| prior.fate == dg.fate) {
-                return None;
-            }
-        }
-        Some(segment_size)
+        crate::gso::can_coalesce(datagrams)
     }
 
     /// GSO-send a batch of fate-tagged, addressed datagrams. Only coalesces
@@ -691,12 +665,7 @@ impl UringDriver {
     }
 
     fn max_gso_datagrams_for_segment(segment_size: u16) -> usize {
-        let segment_len = usize::from(segment_size);
-        if segment_len == 0 {
-            return 1;
-        }
-        let mtu_cap = MAX_UDP_PAYLOAD / segment_len;
-        mtu_cap.clamp(1, MAX_GSO_SEGMENTS_PER_SEND.min(MAX_GSO_DATAGRAMS))
+        crate::gso::max_gso_run_len(segment_size, MAX_GSO_DATAGRAMS)
     }
 
     fn queue_udp_gso<T: AsRef<[u8]>>(

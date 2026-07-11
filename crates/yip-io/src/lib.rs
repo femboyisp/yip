@@ -4,6 +4,7 @@
 
 pub mod addr;
 pub mod epoll;
+pub(crate) mod gso;
 pub mod poll;
 pub mod uring;
 
