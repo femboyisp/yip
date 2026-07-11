@@ -34,7 +34,8 @@ costless in bytes — the only cost that mattered was CPU, which P+Q removes.
 Two generator **schemes**, selected by R, both systematic (`[ I_K ; generator ]`) over
 GF(256) (poly 0x11D, generator element 2 — the shipped `gf256`):
 
-- **`SCHEME_PQ` (id `1`), used when R ≤ 2:**
+- **`SCHEME_PQ` (id `1`), used for non-ARQ classes at R ∈ {1,2}** (see §4 for why ARQ
+  classes stay on Cauchy):
   - Repair row `m = 0` (symbol_index `K`) — **P**: `coef_i = 1` for all `i` (the XOR of all
     K sources). Pure XORs, no GF multiplies.
   - Repair row `m = 1` (symbol_index `K+1`) — **Q**: `coef_i = 2^i` (the RAID-6 syndrome;
@@ -65,8 +66,22 @@ rs::repair_row(scheme, k, m) -> Vec<u8>   // K coefficients for repair row m
 
 ## 4. Scheme selection & wire framing
 
-- **Encoder** chooses the scheme per block: `R ≤ 2 → SCHEME_PQ`, `R ≥ 3 → SCHEME_CAUCHY`.
-  (yip's per-packet R is almost always 1; R≥3 is rare heavy-loss.)
+- **Encoder** chooses the scheme per block: **`SCHEME_PQ` when the flow class is non-ARQ
+  (`params.arq == false`) and R ∈ {1,2}; `SCHEME_CAUCHY` otherwise** (any ARQ class, R=0, or
+  R ≥ 3). yip's per-packet R on the non-ARQ classes (Realtime 0.15, Default 0.10) is almost
+  always 1, so P+Q is the common path exactly where proactive repair is always on.
+- **ARQ cross-call invariant (why scheme keys on `params.arq`, not just R):** the ARQ
+  retransmit path (`repair_with_id` / `Transport::repair_object`) re-encodes the *same*
+  `object_id` in a **separate** `build()` call with a *different* repair count
+  (`RETX_EXTRA_REPAIR = 4`). All symbols of one `object_id` — original send **and** every
+  retransmit — MUST use the same generator, or the reassembler (which locks a block to the
+  scheme of its first-received symbol) rejects the mismatched batch and the object never
+  decodes. Choosing the scheme from the per-call R would make an original R=1 send (`Pq`) and
+  its R=4 retransmit (`Cauchy`) disagree — silently defeating ARQ. Keying on the **stable**
+  `params.arq` flag fixes this: **every ARQ-eligible class always uses Cauchy** (so original
+  and retransmit agree), and non-ARQ classes (which are encoded exactly once per `object_id`,
+  never retransmitted) get the P+Q fast path. `Pq` is capped at R≤2 by construction (only P,Q
+  rows exist), so an ARQ object that could grow past R=2 must be Cauchy anyway.
 - The scheme id is packed into **`payload_id[3]`** (the byte 4a reserved) on **every** symbol
   of the block — source and repair — so the decoder can read it from any received symbol.
   `payload_id` layout becomes `[codec_tag=0x01][symbol_index:u16 BE][scheme:u8]`.
@@ -106,7 +121,9 @@ rs::repair_row(scheme, k, m) -> Vec<u8>   // K coefficients for repair row m
 2. **R=1 repair is a pure XOR** (no GF multiply on the encode hot path).
 3. **Scheme is a pure function of `(scheme_id, K, m)`** and never depends on R.
 4. **No behavior/policy change:** flow-class ratios and the controller are unchanged; the
-   scheme is chosen solely from the resulting R.
+   scheme is chosen from `(params.arq, R)` — ARQ classes always Cauchy, non-ARQ classes P+Q
+   at R∈{1,2} (§4). **ARQ recovery must still work end-to-end** (a partial original send +
+   an `RETX_EXTRA_REPAIR` retransmit reconstructs the object).
 5. **No panics on malformed input;** a `SCHEME_PQ` repair with `m ≥ 2`, a wrong codec tag, or
    an unknown scheme id is rejected (`None`). All existing DoS guards hold.
 6. **`#![forbid(unsafe_code)]`** holds; `gf256` untouched.
