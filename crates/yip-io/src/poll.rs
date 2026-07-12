@@ -318,7 +318,9 @@ fn send_gso_payload(
     // SAFETY: `CMSG_SPACE` is a pure size computation; no pointer deref.
     let cmsg_space = usize::try_from(unsafe { libc::CMSG_SPACE(GSO_CONTROL_PAYLOAD_LEN) })
         .expect("cmsg space fits usize");
-    debug_assert!(cmsg_space <= control.len());
+    if cmsg_space > control.len() {
+        return Err(io::Error::other("GSO control buffer too small"));
+    }
     msg.msg_controllen = cmsg_space;
 
     // SAFETY: `msg` points to valid in-frame iovec/control storage; we write
