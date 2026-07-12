@@ -361,3 +361,28 @@ handling do not benefit, so the integrated gain is diluted. TCP single-/parallel
 stream numbers over this 23.5 ms, high-loss path are window/loss-collapsed noise
 and are not reported. Correctness (netns 10% loss + ARQ, both drivers) was verified
 separately; FEC per-symbol loss-independence is preserved by the fate-safe grouping.
+
+## 4b TUN-offload spike — vnet-hdr GSO write vs per-packet (decision gate + confirmed constants)
+
+Throwaway probe (`tun_gso_spike.c`, not committed) on `root@45.61.149.155` (1-core AMD EPYC,
+virtio, kernel 6.12): open a TUN with `IFF_TUN|IFF_NO_PI|IFF_VNET_HDR` + `TUNSETOFFLOAD`, write
+1400-byte TCP segments two ways, 4 s × 3.
+
+- `info`: **`IFF_VNET_HDR` ok; `TUNSETOFFLOAD(CSUM|TSO4|TSO6)` accepted; `sizeof(virtio_net_hdr)=10`.**
+
+| write mode | segments / CPU-second (median) |
+|------------|-------------------------------:|
+| per-packet (`GSO_NONE`, one write per segment) | ~378,000 |
+| coalesced GSO (one write per 44 segments) | ~5,250,000 |
+
+**Ratio ≈ 13.8× segments per CPU-second in favour of GSO writes.** Well above the gate. The
+coalesced GSO `write()` **succeeded (no `EINVAL`)**, which confirms the `virtio_net_hdr` layout
+the 4b coalescer depends on: **10-byte header, host byte order, `gso_type=GSO_TCPV4(1)`,
+`flags=F_NEEDS_CSUM(1)`, `csum_start = ip_hdr_len` (20 for no-options IPv4), `csum_offset = 16`
+(TCP checksum), `hdr_len = ip_hdr_len + tcp_hdr_len` (40), `gso_size = MSS`.** The kernel
+segments the frame and computes per-segment L4 checksums.
+
+**Verdict: PROCEED.** vnet-hdr GSO writes cut the per-segment TUN-write CPU ~14× on the target
+kernel — directly attacking the ~20% receiver `tun_chr_write_iter` cost. (End-to-end gain will
+be smaller: the write is ~20% of receiver CPU and only bulk-TCP coalesces.) Constants confirmed
+for Tasks 1/3/4.
