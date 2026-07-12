@@ -192,6 +192,37 @@ pub(crate) fn tcp_checksum(pkt: &mut [u8], ip_hdr_len: usize) {
     pkt[tcp_off + 16..tcp_off + 18].copy_from_slice(&ck.to_be_bytes());
 }
 
+/// Complete a partial (`F_NEEDS_CSUM`) L4 checksum in `pkt` (an L3 packet) as
+/// delivered by a vnet_hdr TUN read. The 16-bit field at `csum_start +
+/// csum_offset` holds the pseudo-header partial sum; the final checksum is the
+/// one's-complement of the folded internet-checksum sum over `pkt[csum_start..]`
+/// (which includes that partial field). A computed 0 on a UDP packet (proto 17)
+/// is transmitted as `0xFFFF` per RFC 768. Malformed offsets are left untouched.
+fn complete_partial_csum(pkt: &mut [u8], csum_start: usize, csum_offset: usize) {
+    let field = csum_start + csum_offset;
+    if csum_start >= pkt.len() || field + 2 > pkt.len() {
+        return;
+    }
+    let region = &pkt[csum_start..];
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < region.len() {
+        sum += u32::from(u16::from_be_bytes([region[i], region[i + 1]]));
+        i += 2;
+    }
+    if i < region.len() {
+        sum += u32::from(u16::from(region[i]) << 8);
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    let mut ck = !u16::try_from(sum & 0xFFFF).expect("folded sum fits u16");
+    if ck == 0 && pkt.get(9) == Some(&17) {
+        ck = 0xFFFF; // UDP: 0 means "no checksum", the real zero is 0xFFFF
+    }
+    pkt[field..field + 2].copy_from_slice(&ck.to_be_bytes());
+}
+
 pub(crate) fn split_gro(
     frame: &[u8],
     out: &mut Vec<u8>,
@@ -206,6 +237,23 @@ pub(crate) fn split_gro(
     if h.gso_type == GSO_NONE || h.gso_size == 0 {
         let start = out.len();
         out.extend_from_slice(body);
+        // A vnet_hdr read with F_NEEDS_CSUM carries an *incomplete* L4 checksum
+        // (the kernel offloaded it): the 16-bit field at csum_start+csum_offset
+        // holds the pseudo-header partial. We complete it here, because this
+        // packet is about to be encrypted and shipped over the wire — the far
+        // end writes it back to its TUN as a plain (F_NEEDS_CSUM=0) frame and its
+        // kernel/apps expect a valid checksum. Without this, large offloaded
+        // packets (e.g. bulk transfers) arrive with a bad checksum and are
+        // silently dropped, while tiny packets the kernel checksums in full
+        // (e.g. pings) pass — the classic vnet_hdr read-side gotcha.
+        if (h.flags & F_NEEDS_CSUM) != 0 {
+            let len = out.len() - start;
+            complete_partial_csum(
+                &mut out[start..start + len],
+                usize::from(h.csum_start),
+                usize::from(h.csum_offset),
+            );
+        }
         offsets.push((start, body.len()));
         return true;
     }
@@ -392,6 +440,68 @@ impl Coalescer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Internet-checksum fold of a 16-bit word sum over `data`.
+    fn csum16(data: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        let mut i = 0;
+        while i + 1 < data.len() {
+            sum += u32::from(u16::from_be_bytes([data[i], data[i + 1]]));
+            i += 2;
+        }
+        if i < data.len() {
+            sum += u32::from(u16::from(data[i]) << 8);
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        u16::try_from(sum & 0xFFFF).unwrap()
+    }
+
+    #[test]
+    fn complete_partial_csum_matches_full_udp_checksum() {
+        // IPv4(20) + UDP(8) + payload, csum_start=20, csum_offset=6.
+        let payload = [0x11u8, 0x22, 0x33, 0x44, 0x55];
+        let udp_len = 8 + payload.len();
+        let total = 20 + udp_len;
+        let mut p = vec![0u8; total];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&u16::try_from(total).unwrap().to_be_bytes());
+        p[8] = 64;
+        p[9] = 17; // UDP
+        p[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        p[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        p[20..22].copy_from_slice(&1111u16.to_be_bytes()); // sport
+        p[22..24].copy_from_slice(&2222u16.to_be_bytes()); // dport
+        p[24..26].copy_from_slice(&u16::try_from(udp_len).unwrap().to_be_bytes());
+        p[28..].copy_from_slice(&payload);
+
+        // Pseudo-header 16-bit sum: src + dst + proto + udp_len.
+        let mut pseudo = vec![0u8; 12];
+        pseudo[..4].copy_from_slice(&[10, 0, 0, 1]);
+        pseudo[4..8].copy_from_slice(&[10, 0, 0, 2]);
+        pseudo[9] = 17;
+        pseudo[10..12].copy_from_slice(&u16::try_from(udp_len).unwrap().to_be_bytes());
+        let pseudo_sum = csum16(&pseudo);
+
+        // Reference full UDP checksum (field zeroed): ~fold(pseudo + L4-with-zero-field).
+        let good = !{
+            let mut s = u32::from(pseudo_sum) + u32::from(csum16(&p[20..]));
+            while (s >> 16) != 0 {
+                s = (s & 0xFFFF) + (s >> 16);
+            }
+            u16::try_from(s & 0xFFFF).unwrap()
+        };
+
+        // Kernel delivers F_NEEDS_CSUM with the field pre-seeded to the pseudo sum.
+        p[20 + 6..20 + 8].copy_from_slice(&pseudo_sum.to_be_bytes());
+        complete_partial_csum(&mut p, 20, 6);
+        let completed = u16::from_be_bytes([p[26], p[27]]);
+        assert_eq!(
+            completed, good,
+            "completed checksum must equal the full UDP checksum"
+        );
+    }
 
     fn mk_tcp(
         src: [u8; 4],
