@@ -14,6 +14,13 @@ use std::time::Instant;
 
 use crate::{sockaddr_to_std, std_to_sockaddr, MAX_DATAGRAM_BATCH, MAX_WIRE_DATAGRAM};
 
+/// `UDP_SEGMENT` cmsg payload is a single `u16` (the segment size).
+#[cfg_attr(not(test), expect(dead_code, reason = "wired into flush_tx in Task 3"))]
+const GSO_CONTROL_PAYLOAD_LEN: u32 = 2;
+/// Control-message scratch space for one `UDP_SEGMENT` cmsg.
+#[cfg_attr(not(test), expect(dead_code, reason = "wired into flush_tx in Task 3"))]
+const GSO_CONTROL_SPACE: usize = 64;
+
 /// A single-threaded data-plane dispatch interface.
 ///
 /// Implementors hold all mutable state (AEAD session, FEC transport, codec,
@@ -278,6 +285,88 @@ fn send_mmsg(udp_fd: RawFd, datagrams: &[EgressDatagram]) -> io::Result<usize> {
         return Err(e);
     }
     Ok(usize::try_from(ret).expect("non-negative sendmmsg return fits usize"))
+}
+
+/// Send an already-assembled `payload` (N × `segment_size` bytes) as ONE
+/// `sendmsg` with a `UDP_SEGMENT` cmsg to `dst`. `Ok(true)`: accepted, or a
+/// transient full send buffer dropped it (acceptable single-burst loss, as in
+/// `send_mmsg`). `Ok(false)`: GSO unsupported (`EIO`/`EINVAL`) — caller latches
+/// GSO off and plain-sends the run.
+#[cfg_attr(not(test), expect(dead_code, reason = "wired into flush_tx in Task 3"))]
+fn send_gso_payload(
+    udp_fd: RawFd,
+    payload: &[u8],
+    segment_size: u16,
+    dst: SocketAddr,
+) -> io::Result<bool> {
+    let (mut storage, addr_len) = std_to_sockaddr(dst);
+    let mut iov = libc::iovec {
+        // SAFETY: cast a shared slice to *mut for the iovec ABI; sendmsg only
+        // reads through iov_base. `payload` outlives the syscall.
+        iov_base: payload.as_ptr().cast_mut().cast::<libc::c_void>(),
+        iov_len: payload.len(),
+    };
+    let mut control = [0u8; GSO_CONTROL_SPACE];
+    // SAFETY: msghdr is plain-old-data; zeroed is a valid initial state we fully
+    // populate below before the syscall.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_name = std::ptr::from_mut(&mut storage).cast::<libc::c_void>();
+    msg.msg_namelen = addr_len;
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast::<libc::c_void>();
+    // SAFETY: `CMSG_SPACE` is a pure size computation; no pointer deref.
+    let cmsg_space = usize::try_from(unsafe { libc::CMSG_SPACE(GSO_CONTROL_PAYLOAD_LEN) })
+        .expect("cmsg space fits usize");
+    debug_assert!(cmsg_space <= control.len());
+    msg.msg_controllen = cmsg_space;
+
+    // SAFETY: `msg` points to valid in-frame iovec/control storage; we write
+    // exactly one SOL_UDP/UDP_SEGMENT cmsg (a u16 segment size) into `control`.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
+        if cmsg.is_null() {
+            return Err(io::Error::other("missing first cmsg header"));
+        }
+        (*cmsg).cmsg_level = libc::SOL_UDP;
+        (*cmsg).cmsg_type = libc::UDP_SEGMENT;
+        (*cmsg).cmsg_len =
+            usize::try_from(libc::CMSG_LEN(GSO_CONTROL_PAYLOAD_LEN)).expect("cmsg len fits usize");
+        let seg_ptr = libc::CMSG_DATA(cmsg).cast::<u16>();
+        *seg_ptr = segment_size;
+    }
+
+    // SAFETY: `msg` is fully initialised; its iov/name/control point into this
+    // frame's storage, valid until sendmsg returns. MSG_NOSIGNAL suppresses SIGPIPE.
+    let ret = unsafe { libc::sendmsg(udp_fd, &raw const msg, libc::MSG_NOSIGNAL) };
+    if ret < 0 {
+        let e = io::Error::last_os_error();
+        let raw = e.raw_os_error().unwrap_or(0);
+        if raw == libc::EWOULDBLOCK || raw == libc::EAGAIN || raw == libc::ENOBUFS {
+            return Ok(true); // transient full buffer: drop this run (acceptable)
+        }
+        if raw == libc::EIO || raw == libc::EINVAL {
+            return Ok(false); // GSO unsupported → caller latches off + plain-sends
+        }
+        return Err(e);
+    }
+    Ok(true)
+}
+
+/// Assemble `run`'s payloads into `payload` (reused) and GSO-send them.
+#[cfg_attr(not(test), expect(dead_code, reason = "wired into flush_tx in Task 3"))]
+fn send_gso(
+    udp_fd: RawFd,
+    run: &[EgressDatagram],
+    segment_size: u16,
+    dst: SocketAddr,
+    payload: &mut Vec<u8>,
+) -> io::Result<bool> {
+    payload.clear();
+    for dg in run {
+        payload.extend_from_slice(&dg.bytes);
+    }
+    send_gso_payload(udp_fd, payload, segment_size, dst)
 }
 
 /// Non-blocking `recvmmsg(2)`: drain up to `bufs.len().min(MAX_DATAGRAM_BATCH)`
@@ -795,5 +884,46 @@ mod tests {
             recv_mmsg(rx.as_raw_fd(), &mut bufs, &mut lens, &mut srcs).unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn send_gso_delivers_each_segment_when_supported() {
+        use std::net::UdpSocket;
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_nonblocking(true).unwrap();
+
+        let run = vec![
+            EgressDatagram {
+                fate: 1,
+                dst: rx_addr,
+                bytes: vec![0xAA; 1000],
+            },
+            EgressDatagram {
+                fate: 2,
+                dst: rx_addr,
+                bytes: vec![0xBB; 1000],
+            },
+            EgressDatagram {
+                fate: 3,
+                dst: rx_addr,
+                bytes: vec![0xCC; 1000],
+            },
+        ];
+        let mut payload = Vec::new();
+        let accepted =
+            send_gso(tx.as_raw_fd(), &run, 1000, rx_addr, &mut payload).expect("send_gso");
+        if !accepted {
+            return; // kernel lacks UDP_SEGMENT here — nothing to assert.
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut got = Vec::new();
+        let mut buf = [0u8; 2048];
+        while let Ok((n, _)) = rx.recv_from(&mut buf) {
+            got.push(buf[..n].to_vec());
+        }
+        assert_eq!(got.len(), 3, "GSO must segment into 3 separate datagrams");
+        assert!(got.iter().all(|d| d.len() == 1000));
     }
 }
