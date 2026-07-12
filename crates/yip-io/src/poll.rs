@@ -104,11 +104,18 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
 
 /// Drain pending datagrams from `udp_fd` with `recvmmsg`, dispatching each and
 /// forwarding the outcome. Loops until the socket is empty (recv_mmsg returns 0).
+///
+/// When `vnet_hdr` is set (kernel GSO/GRO offload active on the TUN fd),
+/// decoded inner packets destined for TUN are pushed through `coalescer`
+/// instead of written straight through: same-flow contiguous TCP segments
+/// merge into one GSO super-frame, flushed once the whole UDP socket has been
+/// drained for this call (not per recv burst) so a burst of same-flow packets
+/// coalesces maximally. `!vnet_hdr` is byte-for-byte today's plain-write path.
 #[expect(
     clippy::too_many_arguments,
-    reason = "batch buffers (and the GSO scratch, gso) are owned by run_poll and threaded \
-              through explicitly rather than bundled into a struct, to keep the hot-path \
-              buffers' aliasing/lifetimes obvious"
+    reason = "batch buffers (the GSO scratch `gso`, and the TUN-offload `vnet_hdr`/`coalescer` \
+              state) are owned by run_poll and threaded through explicitly rather than bundled \
+              into a struct, to keep the hot-path buffers' aliasing/lifetimes obvious"
 )]
 fn drain_udp(
     udp_fd: RawFd,
@@ -120,6 +127,8 @@ fn drain_udp(
     srcs: &mut [SocketAddr; MAX_DATAGRAM_BATCH],
     tx: &mut Vec<EgressDatagram>,
     gso: &mut GsoScratch,
+    vnet_hdr: bool,
+    coalescer: &mut crate::tun_offload::Coalescer,
 ) -> io::Result<()> {
     loop {
         let n = recv_mmsg(udp_fd, bufs, lens, srcs)?;
@@ -130,10 +139,10 @@ fn drain_udp(
             let dg = &bufs[i][..lens[i]];
             match d.on_udp(srcs[i], dg, now_ms) {
                 DispatchOut::None => {}
-                DispatchOut::Tun(inner) => send_to_tun(tun_fd, inner),
+                DispatchOut::Tun(inner) => write_to_tun(tun_fd, inner, vnet_hdr, coalescer),
                 DispatchOut::Udp(pkts) => tx.extend(pkts.iter().cloned()),
                 DispatchOut::Both(inner, pkts) => {
-                    send_to_tun(tun_fd, inner);
+                    write_to_tun(tun_fd, inner, vnet_hdr, coalescer);
                     tx.extend(pkts.iter().cloned());
                 }
             }
@@ -143,11 +152,52 @@ fn drain_udp(
             break; // partial batch → socket drained
         }
     }
+    if vnet_hdr {
+        if let Some(frame) = coalescer.flush() {
+            send_to_tun(tun_fd, frame);
+        }
+    }
     Ok(())
+}
+
+/// Write a decoded inner packet destined for TUN. With `vnet_hdr` active,
+/// route it through `coalescer` (which may hold it pending a same-flow
+/// contiguous follow-up, or return a just-flushed super-frame to write now);
+/// otherwise write it straight through, unchanged from today's behaviour.
+#[inline]
+fn write_to_tun(
+    tun_fd: RawFd,
+    inner: &[u8],
+    vnet_hdr: bool,
+    coalescer: &mut crate::tun_offload::Coalescer,
+) {
+    if vnet_hdr {
+        if let Some(frame) = coalescer.push(inner) {
+            send_to_tun(tun_fd, frame);
+        }
+    } else {
+        send_to_tun(tun_fd, inner);
+    }
 }
 
 /// Drain pending TUN frames, accumulating each frame's egress datagrams into `tx`
 /// and flushing them with `send_mmsg` (chunked at the batch cap).
+///
+/// When `vnet_hdr` is set (kernel GSO/GRO offload active on the TUN fd), each
+/// read may be a kernel-GRO'd super-frame prefixed with a `virtio_net_hdr`;
+/// `split_gro` splits it into `split_out`/`split_offs` and each resulting MTU
+/// packet is fed to `d.on_tun` individually, exactly as the non-offload path
+/// feeds one packet per read. A read that fails to parse as valid vnet_hdr
+/// framing falls back to feeding the frame body (post-prefix) as-is. `buf` is
+/// the (possibly GSO-sized) reusable read buffer owned by `run_poll`.
+/// `!vnet_hdr` is byte-for-byte today's plain-read path.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "batch buffers (the GSO scratch `gso`, the reusable read buffer `buf`, and the \
+              TUN-offload `vnet_hdr`/split scratch) are owned by run_poll and threaded through \
+              explicitly rather than bundled into a struct, to keep the hot-path buffers' \
+              aliasing/lifetimes obvious"
+)]
 fn drain_tun(
     tun_fd: RawFd,
     udp_fd: RawFd,
@@ -155,11 +205,14 @@ fn drain_tun(
     now_ms: u64,
     tx: &mut Vec<EgressDatagram>,
     gso: &mut GsoScratch,
+    vnet_hdr: bool,
+    buf: &mut [u8],
+    split_out: &mut Vec<u8>,
+    split_offs: &mut Vec<(usize, usize)>,
 ) -> io::Result<()> {
-    let mut buf = [0u8; MAX_WIRE_DATAGRAM];
     loop {
-        // SAFETY: `buf` is a valid stack buffer; `tun_fd` is a valid non-blocking
-        // TUN fd. TUN is not a socket, so we `read` rather than `recv`.
+        // SAFETY: `buf` is a valid caller-owned buffer; `tun_fd` is a valid
+        // non-blocking TUN fd. TUN is not a socket, so we `read` rather than `recv`.
         let n = unsafe { libc::read(tun_fd, buf.as_mut_ptr().cast(), buf.len()) };
         if n < 0 {
             let e = io::Error::last_os_error();
@@ -175,10 +228,31 @@ fn drain_tun(
         if n == 0 {
             break;
         }
-        let inner = &buf[..usize::try_from(n).expect("non-negative read return fits usize")];
-        tx.extend(d.on_tun(inner, now_ms).iter().cloned());
-        if tx.len() >= MAX_DATAGRAM_BATCH {
-            flush_tx(udp_fd, tx, gso)?;
+        let n = usize::try_from(n).expect("non-negative read return fits usize");
+        if vnet_hdr {
+            if crate::tun_offload::split_gro(&buf[..n], split_out, split_offs) {
+                for &(s, l) in split_offs.iter() {
+                    tx.extend(d.on_tun(&split_out[s..s + l], now_ms).iter().cloned());
+                    if tx.len() >= MAX_DATAGRAM_BATCH {
+                        flush_tx(udp_fd, tx, gso)?;
+                    }
+                }
+            } else if let Some(body) = buf.get(crate::tun_offload::VNET_HDR_LEN..n) {
+                // Unparseable vnet_hdr framing (e.g. GSO_NONE with a non-IPv4/TCP
+                // body, or any other read that isn't a segmentable TCP run):
+                // feed the frame body as a single packet, same as the plain path.
+                tx.extend(d.on_tun(body, now_ms).iter().cloned());
+                if tx.len() >= MAX_DATAGRAM_BATCH {
+                    flush_tx(udp_fd, tx, gso)?;
+                }
+            }
+            // else: read shorter than the vnet_hdr prefix itself — drop it.
+        } else {
+            let inner = &buf[..n];
+            tx.extend(d.on_tun(inner, now_ms).iter().cloned());
+            if tx.len() >= MAX_DATAGRAM_BATCH {
+                flush_tx(udp_fd, tx, gso)?;
+            }
         }
     }
     flush_tx(udp_fd, tx, gso)?; // send the burst's remaining egress
@@ -561,7 +635,17 @@ fn recv_mmsg(
 /// The function returns when:
 /// - `drain_udp` or `drain_tun` returns a fatal I/O error, OR
 /// - `flush_tx` (via `send_mmsg`) returns a fatal I/O error (e.g. socket closed).
-pub fn run_poll<D: Dispatch>(udp_fd: RawFd, tun_fd: RawFd, d: &mut D) -> io::Result<()> {
+///
+/// `vnet_hdr` must reflect whether `tun_fd` was actually opened with
+/// `IFF_VNET_HDR` + kernel GSO/GRO offload (`TunTap::vnet_hdr_len().is_some()`
+/// — see `yip-device`); passing `true` for a plain fd corrupts every TUN
+/// read/write with a bogus `virtio_net_hdr` prefix.
+pub fn run_poll<D: Dispatch>(
+    udp_fd: RawFd,
+    tun_fd: RawFd,
+    vnet_hdr: bool,
+    d: &mut D,
+) -> io::Result<()> {
     set_nonblocking(udp_fd)?;
     set_nonblocking(tun_fd)?;
 
@@ -613,6 +697,24 @@ pub fn run_poll<D: Dispatch>(udp_fd: RawFd, tun_fd: RawFd, d: &mut D) -> io::Res
     let mut tx_batch: Vec<EgressDatagram> = Vec::with_capacity(MAX_DATAGRAM_BATCH);
     let mut gso = GsoScratch::new();
 
+    // TUN-offload state (active only when `vnet_hdr`): `coalescer` merges
+    // decrypted packets into GSO super-frames on write; `split_out`/
+    // `split_offs` are the per-read scratch for splitting a kernel-GRO'd read
+    // into individual MTU packets. `tun_buf` is sized to hold a whole GSO
+    // super-frame (`VNET_HDR_LEN + MAX_GSO_PAYLOAD`) when offload is active,
+    // or `MAX_WIRE_DATAGRAM` — identical to today's stack buffer — otherwise.
+    let mut coalescer = crate::tun_offload::Coalescer::new();
+    let mut split_out: Vec<u8> = Vec::new();
+    let mut split_offs: Vec<(usize, usize)> = Vec::new();
+    let mut tun_buf = vec![
+        0u8;
+        if vnet_hdr {
+            crate::tun_offload::VNET_HDR_LEN + crate::tun_offload::MAX_GSO_PAYLOAD
+        } else {
+            MAX_WIRE_DATAGRAM
+        }
+    ];
+
     loop {
         // SAFETY: `epoll_fd` is a valid epoll fd.  `events` is a valid
         // stack-allocated array; we pass its length as `maxevents`.
@@ -652,13 +754,26 @@ pub fn run_poll<D: Dispatch>(udp_fd: RawFd, tun_fd: RawFd, d: &mut D) -> io::Res
                     &mut rx_srcs,
                     &mut tx_batch,
                     &mut gso,
+                    vnet_hdr,
+                    &mut coalescer,
                 ) {
                     // SAFETY: `epoll_fd` is valid.
                     unsafe { libc::close(epoll_fd) };
                     return Err(e);
                 }
             } else if ready_fd == tun_fd {
-                if let Err(e) = drain_tun(tun_fd, udp_fd, d, now_ms, &mut tx_batch, &mut gso) {
+                if let Err(e) = drain_tun(
+                    tun_fd,
+                    udp_fd,
+                    d,
+                    now_ms,
+                    &mut tx_batch,
+                    &mut gso,
+                    vnet_hdr,
+                    &mut tun_buf,
+                    &mut split_out,
+                    &mut split_offs,
+                ) {
                     // SAFETY: `epoll_fd` is valid.
                     unsafe { libc::close(epoll_fd) };
                     return Err(e);
@@ -748,6 +863,7 @@ mod tests {
         let mut srcs = [std::net::SocketAddr::from(([0, 0, 0, 0], 0)); MAX_DATAGRAM_BATCH];
         let mut tx = Vec::new();
         let mut gso = GsoScratch::new();
+        let mut coalescer = crate::tun_offload::Coalescer::new();
         drain_udp(
             b.as_raw_fd(),
             null_fd,
@@ -758,6 +874,8 @@ mod tests {
             &mut srcs,
             &mut tx,
             &mut gso,
+            false,
+            &mut coalescer,
         )
         .unwrap();
 
@@ -790,6 +908,7 @@ mod tests {
         let mut srcs = [std::net::SocketAddr::from(([0, 0, 0, 0], 0)); MAX_DATAGRAM_BATCH];
         let mut tx = Vec::new();
         let mut gso = GsoScratch::new();
+        let mut coalescer = crate::tun_offload::Coalescer::new();
         drain_udp(
             b.as_raw_fd(),
             null_fd,
@@ -800,6 +919,8 @@ mod tests {
             &mut srcs,
             &mut tx,
             &mut gso,
+            false,
+            &mut coalescer,
         )
         .unwrap();
 
@@ -889,6 +1010,7 @@ mod tests {
         let mut srcs = [std::net::SocketAddr::from(([0, 0, 0, 0], 0)); MAX_DATAGRAM_BATCH];
         let mut tx = Vec::new();
         let mut gso = GsoScratch::new();
+        let mut coalescer = crate::tun_offload::Coalescer::new();
         drain_udp(
             b.as_raw_fd(),
             null_fd,
@@ -899,6 +1021,8 @@ mod tests {
             &mut srcs,
             &mut tx,
             &mut gso,
+            false,
+            &mut coalescer,
         )
         .unwrap();
 

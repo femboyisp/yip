@@ -1,46 +1,30 @@
 //! Local TUN `virtio_net_hdr` (GSO/GRO) framing + the RX coalescer / TX splitter.
 //! Purely local to the yipd↔kernel-TUN boundary — never touches the wire.
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the poll TUN path in Task 5")
-)]
 pub(crate) const VNET_HDR_LEN: usize = 10;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the poll TUN path in Task 5")
-)]
 pub(crate) const GSO_NONE: u8 = 0;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the poll TUN path in Task 5")
-)]
 pub(crate) const GSO_TCPV4: u8 = 1;
 #[expect(
     dead_code,
-    reason = "wired into the poll TUN path in Task 5; not exercised by this task's tests"
+    reason = "virtio_net_hdr gso_type value for a future IPv6 TSO coalescer/splitter; the \
+              Task 5 Coalescer/split_gro only handle IPv4 TCP GSO"
 )]
 pub(crate) const GSO_TCPV6: u8 = 4;
 #[expect(
     dead_code,
-    reason = "wired into the poll TUN path in Task 5; not exercised by this task's tests"
+    reason = "virtio_net_hdr gso_type value for a future UDP GSO coalescer/splitter; the \
+              Task 5 Coalescer/split_gro only handle IPv4 TCP GSO"
 )]
 pub(crate) const GSO_UDP_L4: u8 = 5;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the poll TUN path in Task 5")
-)]
 pub(crate) const F_NEEDS_CSUM: u8 = 1;
 #[expect(
     dead_code,
-    reason = "wired into the poll TUN path in Task 5; not exercised by this task's tests"
+    reason = "virtio_net_hdr flags bit set by a kernel GRO read whose checksum is already \
+              verified; the Task 5 split_gro path recomputes checksums itself and never reads \
+              this flag"
 )]
 pub(crate) const F_DATA_VALID: u8 = 2;
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the poll TUN path in Task 5")
-)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct VnetHdr {
     pub flags: u8,
@@ -51,10 +35,6 @@ pub(crate) struct VnetHdr {
     pub csum_offset: u16,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the poll TUN path in Task 5")
-)]
 pub(crate) fn read_vnet_hdr(buf: &[u8]) -> Option<VnetHdr> {
     if buf.len() < VNET_HDR_LEN {
         return None;
@@ -70,10 +50,6 @@ pub(crate) fn read_vnet_hdr(buf: &[u8]) -> Option<VnetHdr> {
     })
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the poll TUN path in Task 5")
-)]
 pub(crate) fn write_vnet_hdr(h: &VnetHdr, out: &mut [u8]) {
     assert!(out.len() >= VNET_HDR_LEN);
     out[0] = h.flags;
@@ -84,31 +60,11 @@ pub(crate) fn write_vnet_hdr(h: &VnetHdr, out: &mut [u8]) {
     out[8..10].copy_from_slice(&h.csum_offset.to_ne_bytes());
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the coalescer/splitter in Tasks 3-4")
-)]
 pub(crate) const TCP_FLAG_FIN: u8 = 0x01;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the coalescer/splitter in Tasks 3-4")
-)]
 pub(crate) const TCP_FLAG_RST: u8 = 0x04;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the coalescer/splitter in Tasks 3-4")
-)]
 pub(crate) const TCP_FLAG_PSH: u8 = 0x08;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the coalescer/splitter in Tasks 3-4")
-)]
 pub(crate) const TCP_FLAG_URG: u8 = 0x20;
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the coalescer/splitter in Tasks 3-4")
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FlowKey {
     pub src: [u8; 4],
@@ -117,12 +73,16 @@ pub(crate) struct FlowKey {
     pub dport: u16,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the coalescer/splitter in Tasks 3-4")
-)]
 pub(crate) struct Ipv4Tcp<'a> {
     pub ip_hdr_len: usize,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "read only by parse_ipv4_tcp_extracts_fields; split_gro/Coalescer derive \
+                      the segment header length from payload_off instead"
+        )
+    )]
     pub tcp_hdr_len: usize,
     pub total_len: usize,
     pub key: FlowKey,
@@ -133,10 +93,6 @@ pub(crate) struct Ipv4Tcp<'a> {
     pub bytes: &'a [u8],
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the coalescer/splitter in Tasks 3-4")
-)]
 pub(crate) fn parse_ipv4_tcp(pkt: &[u8]) -> Option<Ipv4Tcp<'_>> {
     if pkt.len() < 20 || (pkt[0] >> 4) != 4 {
         return None;
@@ -188,10 +144,6 @@ pub(crate) fn parse_ipv4_tcp(pkt: &[u8]) -> Option<Ipv4Tcp<'_>> {
     })
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the coalescer/splitter in Tasks 3-4")
-)]
 pub(crate) fn ipv4_checksum(hdr: &mut [u8]) {
     hdr[10] = 0;
     hdr[11] = 0;
@@ -211,10 +163,6 @@ pub(crate) fn ipv4_checksum(hdr: &mut [u8]) {
     hdr[10..12].copy_from_slice(&ck.to_be_bytes());
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into poll drain_tun in Task 5")
-)]
 pub(crate) fn tcp_checksum(pkt: &mut [u8], ip_hdr_len: usize) {
     let total = pkt.len();
     let tcp_off = ip_hdr_len;
@@ -244,10 +192,6 @@ pub(crate) fn tcp_checksum(pkt: &mut [u8], ip_hdr_len: usize) {
     pkt[tcp_off + 16..tcp_off + 18].copy_from_slice(&ck.to_be_bytes());
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into poll drain_tun in Task 5")
-)]
 pub(crate) fn split_gro(
     frame: &[u8],
     out: &mut Vec<u8>,
@@ -298,10 +242,6 @@ pub(crate) fn split_gro(
 pub(crate) const MAX_GSO_SEGMENTS: usize = 64;
 pub(crate) const MAX_GSO_PAYLOAD: usize = 65_535;
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into poll drain_udp in Task 5")
-)]
 pub(crate) struct Coalescer {
     pending: Vec<u8>, // [vnet_hdr | ip+tcp hdr | payloads]; empty ⇒ nothing pending
     out: Vec<u8>,     // holds a flushed frame for the returned borrow
@@ -316,10 +256,6 @@ pub(crate) struct Coalescer {
     segs: usize,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into poll drain_udp in Task 5")
-)]
 impl Coalescer {
     pub(crate) fn new() -> Self {
         Self {
