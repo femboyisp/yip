@@ -6,9 +6,9 @@
     expect(dead_code, reason = "wired into the poll TUN path in Task 5")
 )]
 pub(crate) const VNET_HDR_LEN: usize = 10;
-#[expect(
-    dead_code,
-    reason = "wired into the poll TUN path in Task 5; not exercised by this task's tests"
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into the poll TUN path in Task 5")
 )]
 pub(crate) const GSO_NONE: u8 = 0;
 #[cfg_attr(
@@ -84,14 +84,14 @@ pub(crate) fn write_vnet_hdr(h: &VnetHdr, out: &mut [u8]) {
     out[8..10].copy_from_slice(&h.csum_offset.to_ne_bytes());
 }
 
-#[expect(
-    dead_code,
-    reason = "used by the coalescer in Task 3; not exercised by this task's tests"
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the coalescer/splitter in Tasks 3-4")
 )]
 pub(crate) const TCP_FLAG_FIN: u8 = 0x01;
-#[expect(
-    dead_code,
-    reason = "used by the coalescer in Task 3; not exercised by this task's tests"
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the coalescer/splitter in Tasks 3-4")
 )]
 pub(crate) const TCP_FLAG_RST: u8 = 0x04;
 #[cfg_attr(
@@ -99,9 +99,9 @@ pub(crate) const TCP_FLAG_RST: u8 = 0x04;
     expect(dead_code, reason = "used by the coalescer/splitter in Tasks 3-4")
 )]
 pub(crate) const TCP_FLAG_PSH: u8 = 0x08;
-#[expect(
-    dead_code,
-    reason = "used by the coalescer in Task 3; not exercised by this task's tests"
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the coalescer/splitter in Tasks 3-4")
 )]
 pub(crate) const TCP_FLAG_URG: u8 = 0x20;
 
@@ -124,13 +124,6 @@ pub(crate) struct FlowKey {
 pub(crate) struct Ipv4Tcp<'a> {
     pub ip_hdr_len: usize,
     pub tcp_hdr_len: usize,
-    #[cfg_attr(
-        test,
-        expect(
-            dead_code,
-            reason = "used by the coalescer/splitter in Tasks 3-4; not read by this task's tests"
-        )
-    )]
     pub total_len: usize,
     pub key: FlowKey,
     pub seq: u32,
@@ -216,6 +209,164 @@ pub(crate) fn ipv4_checksum(hdr: &mut [u8]) {
     }
     let ck = !u16::try_from(sum & 0xFFFF).expect("folded sum fits u16");
     hdr[10..12].copy_from_slice(&ck.to_be_bytes());
+}
+
+pub(crate) const MAX_GSO_SEGMENTS: usize = 64;
+pub(crate) const MAX_GSO_PAYLOAD: usize = 65_535;
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into poll drain_udp in Task 5")
+)]
+pub(crate) struct Coalescer {
+    pending: Vec<u8>, // [vnet_hdr | ip+tcp hdr | payloads]; empty ⇒ nothing pending
+    out: Vec<u8>,     // holds a flushed frame for the returned borrow
+    has_pending: bool,
+    is_tcp_run: bool, // false ⇒ pending is a GSO_NONE singleton
+    sealed: bool,     // pending cannot be extended (PSH/FIN/non-TCP/no-payload)
+    key: FlowKey,
+    next_seq: u32,
+    gso_size: u16,
+    ip_hdr_len: usize,
+    l3_hdr_len: usize, // ip_hdr_len + tcp_hdr_len (payload offset within the L3 packet)
+    segs: usize,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into poll drain_udp in Task 5")
+)]
+impl Coalescer {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: Vec::with_capacity(MAX_GSO_PAYLOAD + 64),
+            out: Vec::with_capacity(MAX_GSO_PAYLOAD + 64),
+            has_pending: false,
+            is_tcp_run: false,
+            sealed: false,
+            key: FlowKey {
+                src: [0; 4],
+                dst: [0; 4],
+                sport: 0,
+                dport: 0,
+            },
+            next_seq: 0,
+            gso_size: 0,
+            ip_hdr_len: 0,
+            l3_hdr_len: 0,
+            segs: 0,
+        }
+    }
+
+    /// Finalize the pending run into `self.out` and return the borrow (or None).
+    fn take_pending(&mut self) -> Option<&[u8]> {
+        if !self.has_pending {
+            return None;
+        }
+        if self.is_tcp_run {
+            // patch IP total-length + IP checksum, then set the vnet_hdr.
+            let ip = VNET_HDR_LEN;
+            let l3_len = self.pending.len() - VNET_HDR_LEN;
+            let total = u16::try_from(l3_len).unwrap_or(u16::MAX);
+            self.pending[ip + 2..ip + 4].copy_from_slice(&total.to_be_bytes());
+            ipv4_checksum(&mut self.pending[ip..ip + self.ip_hdr_len]);
+            let h = VnetHdr {
+                flags: F_NEEDS_CSUM,
+                gso_type: GSO_TCPV4,
+                hdr_len: u16::try_from(self.l3_hdr_len).unwrap_or(0),
+                gso_size: self.gso_size,
+                csum_start: u16::try_from(self.ip_hdr_len).unwrap_or(0), // L4 offset within L3 frame
+                csum_offset: 16,                                         // TCP checksum offset
+            };
+            write_vnet_hdr(&h, &mut self.pending[..VNET_HDR_LEN]);
+        }
+        // (non-TCP singleton already has its GSO_NONE vnet_hdr written at start_singleton)
+        std::mem::swap(&mut self.pending, &mut self.out);
+        self.pending.clear();
+        self.has_pending = false;
+        Some(&self.out)
+    }
+
+    fn start_tcp_run(&mut self, x: &Ipv4Tcp<'_>, sealed: bool) {
+        self.pending.clear();
+        self.pending.resize(VNET_HDR_LEN, 0);
+        self.pending.extend_from_slice(&x.bytes[..x.total_len]); // full first L3 packet
+        self.has_pending = true;
+        self.is_tcp_run = true;
+        self.sealed = sealed;
+        self.key = x.key;
+        self.ip_hdr_len = x.ip_hdr_len;
+        self.l3_hdr_len = x.payload_off;
+        self.gso_size = u16::try_from(x.payload_len).unwrap_or(0);
+        self.next_seq = x
+            .seq
+            .wrapping_add(u32::try_from(x.payload_len).unwrap_or(0));
+        self.segs = 1;
+    }
+
+    fn start_singleton(&mut self, pkt: &[u8]) {
+        self.pending.clear();
+        self.pending.resize(VNET_HDR_LEN, 0);
+        write_vnet_hdr(
+            &VnetHdr {
+                gso_type: GSO_NONE,
+                ..VnetHdr::default()
+            },
+            &mut self.pending,
+        );
+        self.pending.extend_from_slice(pkt);
+        self.has_pending = true;
+        self.is_tcp_run = false;
+        self.sealed = true;
+    }
+
+    pub(crate) fn push(&mut self, pkt: &[u8]) -> Option<&[u8]> {
+        let parsed = parse_ipv4_tcp(pkt);
+        // Can this packet extend the current (open, tcp) pending run?
+        if self.has_pending && self.is_tcp_run && !self.sealed {
+            if let Some(x) = &parsed {
+                let cont = x.payload_len > 0
+                    && (x.flags & (TCP_FLAG_PSH | TCP_FLAG_FIN | TCP_FLAG_RST | TCP_FLAG_URG)) == 0
+                    && x.key == self.key
+                    && x.seq == self.next_seq
+                    && x.payload_off == self.l3_hdr_len
+                    && self.segs < MAX_GSO_SEGMENTS
+                    && (self.pending.len() - VNET_HDR_LEN - self.l3_hdr_len) + x.payload_len
+                        <= MAX_GSO_PAYLOAD;
+                if cont {
+                    self.pending
+                        .extend_from_slice(&x.bytes[x.payload_off..x.payload_off + x.payload_len]);
+                    self.next_seq = self
+                        .next_seq
+                        .wrapping_add(u32::try_from(x.payload_len).unwrap_or(0));
+                    self.segs += 1;
+                    return None;
+                }
+            }
+        }
+        // Cannot extend: flush the pending run (if any), then start a new one from `pkt`.
+        // Buffer the flushed frame's bytes so we can start the new run before returning it.
+        let flushed: Option<Vec<u8>> = self.take_pending().map(<[u8]>::to_vec);
+        match &parsed {
+            Some(x) if x.payload_len > 0 => {
+                let sealed =
+                    (x.flags & (TCP_FLAG_PSH | TCP_FLAG_FIN | TCP_FLAG_RST | TCP_FLAG_URG)) != 0;
+                self.start_tcp_run(x, sealed);
+            }
+            _ => self.start_singleton(pkt),
+        }
+        match flushed {
+            Some(f) => {
+                self.out = f;
+                Some(&self.out)
+            }
+            None => None,
+        }
+    }
+
+    pub(crate) fn flush(&mut self) -> Option<&[u8]> {
+        self.take_pending()
+    }
 }
 
 #[cfg(test)]
@@ -331,5 +482,77 @@ mod tests {
     #[test]
     fn read_vnet_hdr_rejects_short() {
         assert!(read_vnet_hdr(&[0u8; VNET_HDR_LEN - 1]).is_none());
+    }
+
+    // Helper: run a sequence of packets through a Coalescer, collecting every emitted frame
+    // (both push-flushes and the final flush), returned as owned Vecs.
+    fn run_coalescer(pkts: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let mut c = Coalescer::new();
+        let mut out = Vec::new();
+        for p in pkts {
+            if let Some(f) = c.push(p) {
+                out.push(f.to_vec());
+            }
+        }
+        if let Some(f) = c.flush() {
+            out.push(f.to_vec());
+        }
+        out
+    }
+
+    #[test]
+    fn coalesces_contiguous_same_flow() {
+        // three 100-byte segments, seq 0,100,200 — must merge into ONE super-frame.
+        let p0 = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 0, 0, &[0xAA; 100]);
+        let p1 = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 100, 0, &[0xBB; 100]);
+        let p2 = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 200, 0, &[0xCC; 100]);
+        let out = run_coalescer(&[p0, p1, p2]);
+        assert_eq!(out.len(), 1, "one coalesced super-frame");
+        let h = read_vnet_hdr(&out[0]).unwrap();
+        assert_eq!(h.gso_type, GSO_TCPV4);
+        assert_eq!(h.gso_size, 100);
+        // super-frame payload = 300 bytes after vnet_hdr + IP(20) + TCP(20)
+        assert_eq!(out[0].len(), VNET_HDR_LEN + 20 + 20 + 300);
+    }
+
+    #[test]
+    fn flushes_on_seq_gap() {
+        let p0 = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 0, 0, &[0; 100]);
+        let gap = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 500, 0, &[0; 100]); // non-contiguous
+        assert_eq!(run_coalescer(&[p0, gap]).len(), 2);
+    }
+
+    #[test]
+    fn flushes_on_flow_change() {
+        let a = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 0, 0, &[0; 100]);
+        let b = mk_tcp([10, 0, 0, 1], [10, 0, 0, 3], 9, 80, 0, 0, &[0; 100]); // different dst
+        assert_eq!(run_coalescer(&[a, b]).len(), 2);
+    }
+
+    #[test]
+    fn psh_and_fin_force_immediate_flush() {
+        let p0 = mk_tcp(
+            [10, 0, 0, 1],
+            [10, 0, 0, 2],
+            9,
+            80,
+            0,
+            TCP_FLAG_PSH,
+            &[0; 100],
+        );
+        let p1 = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 100, 0, &[0; 100]);
+        // p0 has PSH → emitted immediately as its own frame; p1 starts a new run flushed at end.
+        assert_eq!(run_coalescer(&[p0, p1]).len(), 2);
+    }
+
+    #[test]
+    fn non_tcp_is_singleton_passthrough() {
+        let mut udp = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 0, 0, &[0; 100]);
+        udp[9] = 17;
+        let out = run_coalescer(&[udp.clone()]);
+        assert_eq!(out.len(), 1);
+        // singleton: gso_type NONE, body == original packet bytes exactly
+        assert_eq!(read_vnet_hdr(&out[0]).unwrap().gso_type, GSO_NONE);
+        assert_eq!(&out[0][VNET_HDR_LEN..], &udp[..]);
     }
 }
