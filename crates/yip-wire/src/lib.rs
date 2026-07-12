@@ -14,7 +14,7 @@ pub struct Frame {
     pub conn_tag: u64,
     /// Which pipelined FEC object this symbol belongs to.
     pub object_id: u16,
-    /// RaptorQ payload identifier (SBN + ESI), opaque to the wire layer.
+    /// FEC payload identifier (Reed–Solomon codec tag + symbol index), opaque to the wire layer.
     pub payload_id: [u8; 4],
     /// Symbol kind / control bits (source/repair, feedback, ARQ).
     pub flags: u8,

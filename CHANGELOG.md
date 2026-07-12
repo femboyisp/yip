@@ -41,6 +41,15 @@ All notable changes to this project are documented here, following
   (`RetxBuffer`), plus `Transport::repair_object`.
 
 ### Changed
+- **Relicensed from MPL-2.0 to AGPL-3.0-or-later**, copyright FEMBOY CYBER NETWORKS
+  LLC. The AGPL network-use clause (§13) means anyone running a modified `yip` as a
+  network service must offer their users the corresponding source — privacy
+  infrastructure stays open. (Closes #53.)
+- README rewritten with the project identity ("🦊 what does the fox say? — nothing a
+  DPI firewall can hear") and a "Silicon Slopes Paradox" section on Utah SB 73 and
+  the EFF's coverage; corrected the lingering "RaptorQ" references to Reed–Solomon
+  across README, `CLAUDE.md`, and `yip-transport`/`yip-wire` doc comments (the codec
+  was swapped in #50). Repo description + topics added.
 - TUN vnet-header GSO/GRO offload on the **poll** hot path (throughput lever 4b):
   the TUN device is opened with `IFF_VNET_HDR` + `TUNSETOFFLOAD` (gated on the poll
   driver — `uring` and QUIC keep a plain TUN), so yipd batches its own TUN I/O.
@@ -83,6 +92,25 @@ All notable changes to this project are documented here, following
   because recv/TUN/conntrack/IRQ costs do not benefit from send-side GSO). netns
   10 %-loss + ARQ recovery verified under both drivers. `unsafe` stays confined to
   `yip-io`. See `crates/yip-bench/RESULTS.md` ("4a send-side GSO").
+- Batched UDP I/O on the poll hot path (throughput lever): `run_poll` drains the
+  UDP socket with one `recvmmsg` per burst and sends each TUN burst's egress with
+  one addressed `sendmmsg` (per-datagram `dst`/`src`), collapsing ~2–3 `sendto`s
+  per packet into one syscall per burst. Opportunistic and latency-neutral (batches
+  only what epoll already queued). (PR #54.)
+- Fast data-plane AEAD (throughput lever): `yip-crypto::Session` seal/open moved
+  from snow's RustCrypto ChaCha20-Poly1305 to **`ring`** ChaCha20-Poly1305, keyed by
+  snow's secret `Split()` transport keys and Noise's nonce so the output is
+  **byte-identical to the previous wire** — **~2.1 µs → 0.6 µs** per packet. Same
+  256-bit ChaCha20-Poly1305 cipher; snow is now handshake-only. A durable
+  byte-identity KAT guards the equivalence. (PR #52.)
+- **FEC codec swapped from RaptorQ to a small-K systematic Reed–Solomon codec**
+  (throughput lever): a hand-rolled GF(256) Cauchy RS-v1 codec replaces the
+  `raptorq` crate — **encode ~26 µs → ~1.33 µs**. RaptorQ's K′=10 minimum-block
+  padding taxed every small packet with ~10 symbols of work, the price of a
+  ratelessness yip never uses (`observe_loss` clamps the repair ratio ≤ 1.0). New
+  `yip-transport` modules `gf256` + `rs` (exhaustive MDS proof); `raptorq` dropped
+  from the dependency tree. Wire `payload_id` now carries a codec tag; `yip-wire`
+  framing unchanged. (PR #50.)
 - io_uring graceful fallback (issue #25): `run_uring` now falls back to the
   `PollDriver` on any `UringDriver` failure (init or runtime) instead of killing
   the tunnel. Found on a clean Debian 13 (kernel 6.12) box: io_uring's multishot
