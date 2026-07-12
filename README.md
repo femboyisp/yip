@@ -71,7 +71,10 @@ VMs across kernels, the conclusion is:
   send path batches datagrams with `sendmmsg` and coalesces same-peer, same-length, distinct-FEC-object
   bursts into `UDP_SEGMENT` (GSO) sends — measured **+25–31 % single-core UDP throughput** on 1-core
   virtio VPSes — while keeping each FEC object to at most one datagram per GSO skb so loss-recovery is
-  preserved (see [`crates/yip-bench/RESULTS.md`](crates/yip-bench/RESULTS.md)).
+  preserved. It also opens the TUN with `IFF_VNET_HDR` GSO/GRO offload, splitting kernel-GRO'd reads
+  and coalescing same-flow TCP writes into super-frames to cut per-packet TUN-device cost (a purely
+  local optimization — no wire/FEC change; it falls back to plain per-packet I/O where unsupported).
+  See [`crates/yip-bench/RESULTS.md`](crates/yip-bench/RESULTS.md).
 - **The io_uring `UringDriver` is opt-in** (`YIP_USE_URING=1`) and is the workspace's only `unsafe`.
   It carries an optional **adaptive busy-poll** mode (`YIP_URING_BUSYPOLL=1`) that spins the
   completion queue to cut RTT **below** epoll — but only on **bare metal with a dedicated core per

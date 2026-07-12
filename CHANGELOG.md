@@ -41,6 +41,28 @@ All notable changes to this project are documented here, following
   (`RetxBuffer`), plus `Transport::repair_object`.
 
 ### Changed
+- TUN vnet-header GSO/GRO offload on the **poll** hot path (throughput lever 4b):
+  the TUN device is opened with `IFF_VNET_HDR` + `TUNSETOFFLOAD` (gated on the poll
+  driver — `uring` and QUIC keep a plain TUN), so yipd batches its own TUN I/O.
+  On **read**, a kernel-GRO'd super-frame is software-segmented back into MTU
+  packets (`split_gro`); on **write**, consecutive same-flow TCP segments are
+  merged by a userspace-GRO **coalescer** into one GSO super-frame the kernel
+  re-segments — collapsing many per-packet `tun_chr_write_iter` traversals into
+  one. The coalescing is **entirely local to the yipd↔kernel-TUN boundary: no
+  wire-format, FEC, AEAD, or replay change** (each wire datagram stays one
+  encrypted MTU packet); non-coalescible traffic (UDP, pings, flow changes) passes
+  through as singletons at zero cost, and an unsupported kernel falls back to plain
+  per-packet TUN I/O. A new `crates/yip-io/src/tun_offload.rs` holds the
+  `virtio_net_hdr` codec, the coalescer, the splitter, and the partial-checksum
+  completion for `F_NEEDS_CSUM` reads (the kernel offloads L4 checksums on large
+  reads — completing them before encrypt is load-bearing, or the far end drops the
+  packets). `unsafe` stays confined to `yip-io`/`yip-device`. **Real-hardware A/B
+  (two 1-core AMD EPYC virtio VPSes, bulk TCP): receiver `tun_chr_write_iter`
+  19.0% → 14.6%** — the mechanism cuts the targeted TUN-write cost, though
+  end-to-end throughput on that 24 ms-RTT / same-core-`iperf` path is RTT/window-
+  capped rather than TUN-CPU-bound, so the full win lands on low-RTT / high-
+  throughput single flows. netns ping / 10%-loss / ARQ pass under both drivers;
+  TCP-in-tunnel data verified intact. See `crates/yip-bench/RESULTS.md`.
 - Send-side UDP GSO on the **poll** hot path (throughput lever 4a): `run_poll`'s
   `flush_tx` now partitions its egress batch into fate-safe runs (same
   destination, same length, pairwise-distinct FEC `fate`) and sends each run as
