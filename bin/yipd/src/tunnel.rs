@@ -112,11 +112,21 @@ pub fn run(config: Config) -> io::Result<()> {
     let local_addr = manager.local_addr();
 
     // ── create the tunnel device (TUN or TAP) ────────────────────────────────
+    // The driver decision is made *before* opening the device: the poll
+    // driver wants IFF_VNET_HDR + kernel GSO/GRO offload on the TUN fd (Task
+    // 5); the uring driver (and the poll fallback inside it), and QUIC-mimicry
+    // mode (whose `run_quic` pump has no vnet_hdr framing support), always
+    // want a plain fd. `TunTap::create` degrades `want_vnet_hdr` gracefully —
+    // if the kernel/driver doesn't support it, `tun.vnet_hdr_len()` comes
+    // back `None` and `run_poll` below runs the byte-identical plain path.
     let device_kind = match mode {
         TunnelMode::L3Tun => DeviceKind::Tun,
         TunnelMode::L2Tap => DeviceKind::Tap,
     };
-    let tun = TunTap::create(&config.device, device_kind).map_err(io::Error::other)?;
+    let use_uring = std::env::var_os("YIP_USE_URING").is_some() && yip_io::uring::uring_available();
+    let want_vnet_hdr = !use_uring && config.transport != crate::config::TransportMode::Quic;
+    let tun =
+        TunTap::create(&config.device, device_kind, want_vnet_hdr).map_err(io::Error::other)?;
 
     // Assign this node's self-certifying mesh address and route the mesh
     // prefix over the device. Best-effort: shelling out to `ip` (no unsafe,
@@ -162,10 +172,10 @@ pub fn run(config: Config) -> io::Result<()> {
     // the workspace's only `unsafe`, so it is opt-in via `YIP_USE_URING=1` for
     // A/B work until it beats epoll (SQPOLL / working GSO batching) and
     // re-benchmarks favourably. See crates/yip-bench/README.md "io_uring Phase B".
-    if std::env::var_os("YIP_USE_URING").is_some() && yip_io::uring::uring_available() {
+    if use_uring {
         yip_io::uring::run_uring(udp_fd, tun_fd, &mut manager)
     } else {
-        yip_io::poll::run_poll(udp_fd, tun_fd, &mut manager)
+        yip_io::poll::run_poll(udp_fd, tun_fd, tun.vnet_hdr_len().is_some(), &mut manager)
     }
 }
 

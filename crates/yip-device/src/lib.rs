@@ -9,8 +9,20 @@ const TUN_PATH: &str = "/dev/net/tun";
 const IFF_TUN: libc::c_short = 0x0001;
 const IFF_TAP: libc::c_short = 0x0002;
 const IFF_NO_PI: libc::c_short = 0x1000;
+/// Prefix every TUN read/write with a `virtio_net_hdr` (GSO/GRO framing).
+const IFF_VNET_HDR: libc::c_short = 0x4000;
 // _IOW('T', 202, int) on Linux.
 const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
+// _IOW('T', 208, unsigned int) on Linux.
+const TUNSETOFFLOAD: libc::c_ulong = 0x4004_54d0;
+const TUN_F_CSUM: libc::c_uint = 0x01;
+const TUN_F_TSO4: libc::c_uint = 0x02;
+const TUN_F_TSO6: libc::c_uint = 0x04;
+
+/// Length (bytes) of the `virtio_net_hdr` prefix on every TUN read/write when
+/// [`TunTap::vnet_hdr_len`] is `Some`. Kept as its own constant (rather than
+/// depending on `yip-io`) so `yip-device` has no dependency on `yip-io`.
+pub const VNET_HDR_LEN: usize = 10;
 
 /// Errors creating or configuring a tunnel device.
 #[derive(Debug, thiserror::Error)]
@@ -102,35 +114,149 @@ fn bring_up(ifname: &[u8; libc::IFNAMSIZ]) -> Result<(), DeviceError> {
     }
 }
 
+// struct ifreq: name[IFNAMSIZ] then a union; we only set ifr_flags.
+#[repr(C)]
+struct IfReq {
+    name: [u8; libc::IFNAMSIZ],
+    flags: libc::c_short,
+    _pad: [u8; 22],
+}
+
 /// A TUN (L3) or TAP (L2) tunnel device.
 pub struct TunTap {
     file: std::fs::File,
     kind: DeviceKind,
     name: String,
+    /// `Some(VNET_HDR_LEN)` iff `IFF_VNET_HDR` framing + kernel GSO/GRO
+    /// offload are both active on this fd; `None` for a plain device.
+    vnet_hdr_len: Option<usize>,
 }
 
 impl TunTap {
     /// Create a tunnel device of `kind` named `name`. Requires `CAP_NET_ADMIN`.
-    pub fn create(name: &str, kind: DeviceKind) -> Result<TunTap, DeviceError> {
+    ///
+    /// When `want_vnet_hdr` is set, first attempts to open with `IFF_VNET_HDR`
+    /// framing and kernel GSO/GRO offload (`TUNSETOFFLOAD`) enabled. If the
+    /// kernel or driver doesn't support one of the two, this falls back
+    /// transparently to a plain device (no vnet_hdr framing) with a fresh fd
+    /// — see [`TunTap::vnet_hdr_len`] to check which mode was actually
+    /// negotiated.
+    pub fn create(
+        name: &str,
+        kind: DeviceKind,
+        want_vnet_hdr: bool,
+    ) -> Result<TunTap, DeviceError> {
         let ifname = encode_ifname(name)?;
+
+        if want_vnet_hdr {
+            if let Some(tun) = Self::open_with_offload(name, kind, &ifname)? {
+                return Ok(tun);
+            }
+        }
+
+        Self::open_plain(name, kind, &ifname)
+    }
+
+    /// Attempt to open `name` with `IFF_VNET_HDR` framing and kernel GSO/GRO
+    /// offload (`TUNSETOFFLOAD`) enabled. Returns `Ok(Some(_))` only when
+    /// `TUNSETIFF` (with `IFF_VNET_HDR`) *and* `TUNSETOFFLOAD` both succeed;
+    /// `Ok(None)` on any unsupported step (the freshly-opened fd is dropped/
+    /// closed here), so the caller falls back to [`Self::open_plain`] with a
+    /// fresh fd — clean framing, no half-enabled state. A hard I/O failure
+    /// that would fail identically on the plain path (e.g. `/dev/net/tun`
+    /// cannot be opened at all) is propagated as `Err`.
+    fn open_with_offload(
+        name: &str,
+        kind: DeviceKind,
+        ifname: &[u8; libc::IFNAMSIZ],
+    ) -> Result<Option<TunTap>, DeviceError> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(TUN_PATH)?;
 
-        // struct ifreq: name[IFNAMSIZ] then a union; we only set ifr_flags.
-        #[repr(C)]
-        struct IfReq {
-            name: [u8; libc::IFNAMSIZ],
-            flags: libc::c_short,
-            _pad: [u8; 22],
-        }
         let type_flag = match kind {
             DeviceKind::Tun => IFF_TUN,
             DeviceKind::Tap => IFF_TAP,
         };
         let mut req = IfReq {
-            name: ifname,
+            name: *ifname,
+            flags: type_flag | IFF_NO_PI | IFF_VNET_HDR,
+            _pad: [0; 22],
+        };
+
+        // SAFETY: `req` is a correctly-sized, properly-initialized `ifreq` for
+        // TUNSETIFF; the fd is a freshly-opened /dev/net/tun. The kernel reads
+        // `req` and writes back the resolved name into the same buffer, which
+        // we own exclusively here.
+        let rc = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETIFF, &raw mut req) };
+        if rc != 0 {
+            // Driver rejected IFF_VNET_HDR (or the type/name flags altogether).
+            // `file` drops here, closing the fd; caller reopens plain.
+            return Ok(None);
+        }
+
+        // SAFETY: `file`'s fd is the freshly-opened tun on which TUNSETIFF
+        // (with IFF_VNET_HDR) just succeeded. TUNSETOFFLOAD takes its flags
+        // as an integer argument passed by value — no pointer, no aliasing.
+        let full = unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                TUNSETOFFLOAD,
+                libc::c_ulong::from(TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6),
+            )
+        };
+        if full == 0 {
+            bring_up(ifname)?;
+            return Ok(Some(TunTap {
+                file,
+                kind,
+                name: name.to_owned(),
+                vnet_hdr_len: Some(VNET_HDR_LEN),
+            }));
+        }
+
+        // SAFETY: same rationale as the previous TUNSETOFFLOAD call.
+        let csum_only = unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                TUNSETOFFLOAD,
+                libc::c_ulong::from(TUN_F_CSUM),
+            )
+        };
+        if csum_only == 0 {
+            bring_up(ifname)?;
+            return Ok(Some(TunTap {
+                file,
+                kind,
+                name: name.to_owned(),
+                vnet_hdr_len: Some(VNET_HDR_LEN),
+            }));
+        }
+
+        // Neither offload attempt was accepted: the fd has vnet_hdr framing
+        // but no GSO/GRO — not a state we run with. `file` drops here
+        // (closing the fd); the caller reopens plain.
+        Ok(None)
+    }
+
+    /// Open `name` without `IFF_VNET_HDR` framing (today's plain TUN/TAP path).
+    fn open_plain(
+        name: &str,
+        kind: DeviceKind,
+        ifname: &[u8; libc::IFNAMSIZ],
+    ) -> Result<TunTap, DeviceError> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(TUN_PATH)?;
+
+        let type_flag = match kind {
+            DeviceKind::Tun => IFF_TUN,
+            DeviceKind::Tap => IFF_TAP,
+        };
+        let mut req = IfReq {
+            name: *ifname,
             flags: type_flag | IFF_NO_PI,
             _pad: [0; 22],
         };
@@ -144,18 +270,26 @@ impl TunTap {
         }
 
         // Bring the interface up so that reads and writes work immediately.
-        bring_up(&ifname)?;
+        bring_up(ifname)?;
 
         Ok(TunTap {
             file,
             kind,
             name: name.to_owned(),
+            vnet_hdr_len: None,
         })
     }
 
     /// The interface name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The `virtio_net_hdr` prefix length (bytes) on every TUN read/write
+    /// when kernel GSO/GRO offload is active, or `None` for a plain device
+    /// (see [`TunTap::create`]'s `want_vnet_hdr` parameter).
+    pub fn vnet_hdr_len(&self) -> Option<usize> {
+        self.vnet_hdr_len
     }
 
     /// Return the raw file descriptor for this TUN/TAP device.
@@ -281,7 +415,9 @@ mod tests {
 
     /// Returns true if we can create tunnel devices (root / CAP_NET_ADMIN).
     fn can_create_devices() -> bool {
-        TunTap::create("yipcap0", DeviceKind::Tun).map(drop).is_ok()
+        TunTap::create("yipcap0", DeviceKind::Tun, false)
+            .map(drop)
+            .is_ok()
     }
 
     #[test]
@@ -290,7 +426,7 @@ mod tests {
             eprintln!("SKIP tun_create_roundtrips_a_write: needs CAP_NET_ADMIN (run under sudo)");
             return;
         }
-        let mut dev = TunTap::create("yiptun0", DeviceKind::Tun).unwrap();
+        let mut dev = TunTap::create("yiptun0", DeviceKind::Tun, false).unwrap();
         assert_eq!(dev.kind(), DeviceKind::Tun);
         assert_eq!(dev.name(), "yiptun0");
         // Writing a minimal IPv4 packet to the device must not error (kernel accepts the inject).
@@ -307,7 +443,7 @@ mod tests {
             eprintln!("SKIP tap_create_reports_l2_kind: needs CAP_NET_ADMIN (run under sudo)");
             return;
         }
-        let dev = TunTap::create("yiptap0", DeviceKind::Tap).unwrap();
+        let dev = TunTap::create("yiptap0", DeviceKind::Tap, false).unwrap();
         assert_eq!(dev.kind(), DeviceKind::Tap);
         assert_eq!(dev.name(), "yiptap0");
     }
@@ -318,12 +454,28 @@ mod tests {
             eprintln!("SKIP split_yields_independent_reader_writer: needs CAP_NET_ADMIN");
             return;
         }
-        let dev = TunTap::create("yipsplit0", DeviceKind::Tun).unwrap();
+        let dev = TunTap::create("yipsplit0", DeviceKind::Tun, false).unwrap();
         let (_reader, mut writer) = dev.split().unwrap();
         // the writer half can still inject a frame
         let pkt = [
             0x45u8, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 10, 9, 9, 1, 10, 9, 9, 2,
         ];
         assert_eq!(writer.write_frame(&pkt).unwrap(), pkt.len());
+    }
+
+    #[test]
+    fn plain_create_reports_no_vnet_hdr() {
+        if !can_create_devices() {
+            eprintln!(
+                "SKIP plain_create_reports_no_vnet_hdr: needs CAP_NET_ADMIN (run under sudo)"
+            );
+            return;
+        }
+        let dev = TunTap::create("yipvnh0", DeviceKind::Tun, false).unwrap();
+        assert_eq!(
+            dev.vnet_hdr_len(),
+            None,
+            "want_vnet_hdr=false must never activate vnet_hdr framing"
+        );
     }
 }

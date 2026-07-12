@@ -1201,6 +1201,10 @@ impl UringDriver {
 }
 
 /// Run the io_uring loop forever for production use.
+///
+/// The `tun_fd` here is always a plain device (`yipd` only opts into
+/// `IFF_VNET_HDR`/GSO offload for the poll driver — see `bin/yipd/src/
+/// tunnel.rs`), so every PollDriver fallback below passes `vnet_hdr = false`.
 pub fn run_uring<D: Dispatch>(udp_fd: RawFd, tun_fd: RawFd, d: &mut D) -> io::Result<()> {
     // Fall back to the PollDriver on ANY UringDriver failure (init or runtime)
     // rather than killing the tunnel. The DataPlane state lives in `d` and the
@@ -1212,14 +1216,14 @@ pub fn run_uring<D: Dispatch>(udp_fd: RawFd, tun_fd: RawFd, d: &mut D) -> io::Re
         Ok(driver) => driver,
         Err(e) => {
             eprintln!("uring: init failed ({e}); falling back to PollDriver");
-            return crate::poll::run_poll(udp_fd, tun_fd, d);
+            return crate::poll::run_poll(udp_fd, tun_fd, false, d);
         }
     };
     loop {
         if let Err(e) = driver.poll_once(d) {
             eprintln!("uring: fatal driver error ({e}); falling back to PollDriver");
             drop(driver);
-            return crate::poll::run_poll(udp_fd, tun_fd, d);
+            return crate::poll::run_poll(udp_fd, tun_fd, false, d);
         }
     }
 }
