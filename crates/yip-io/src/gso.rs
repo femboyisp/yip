@@ -48,10 +48,6 @@ pub(crate) fn max_gso_run_len(segment_size: u16, hard_cap: usize) -> usize {
 /// One fate-safe run: indices into the partitioned slice, plus the common
 /// segment size (the shared byte length, or 0 for a non-coalescable singleton).
 /// A run with `members.len() >= 2` is GSO-coalescable; length 1 sends plain.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the poll send path in Task 3")
-)]
 pub(crate) struct GsoRun {
     pub segment_size: u16,
     pub members: Vec<usize>,
@@ -64,10 +60,6 @@ pub(crate) struct GsoRun {
 /// the next pass. A zero-length or > `u16` datagram forms its own `segment_size 0`
 /// singleton. Reuses `out` (cleared first). Exactly one run is emitted per pass,
 /// so the loop always makes progress and terminates.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the poll send path in Task 3")
-)]
 pub(crate) fn partition_fate_safe(dgs: &[EgressDatagram], hard_cap: usize, out: &mut Vec<GsoRun>) {
     out.clear();
     let mut remaining: Vec<usize> = (0..dgs.len()).collect();
