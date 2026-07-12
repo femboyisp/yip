@@ -211,6 +211,90 @@ pub(crate) fn ipv4_checksum(hdr: &mut [u8]) {
     hdr[10..12].copy_from_slice(&ck.to_be_bytes());
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into poll drain_tun in Task 5")
+)]
+pub(crate) fn tcp_checksum(pkt: &mut [u8], ip_hdr_len: usize) {
+    let total = pkt.len();
+    let tcp_off = ip_hdr_len;
+    // zero the checksum field
+    pkt[tcp_off + 16] = 0;
+    pkt[tcp_off + 17] = 0;
+    let tcp_len = total - tcp_off;
+    let mut sum: u32 = 0;
+    // pseudo-header: src(4)+dst(4)+zero+proto(6)+tcp_len
+    for i in (12..20).step_by(2) {
+        sum += u32::from(u16::from_be_bytes([pkt[i], pkt[i + 1]]));
+    }
+    sum += u32::from(6u16);
+    sum += u32::try_from(tcp_len).expect("tcp_len fits u32") & 0xFFFF;
+    for c in pkt[tcp_off..total].chunks(2) {
+        let w = if c.len() == 2 {
+            u16::from_be_bytes([c[0], c[1]])
+        } else {
+            u16::from(c[0]) << 8
+        };
+        sum += u32::from(w);
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    let ck = !u16::try_from(sum & 0xFFFF).expect("folded fits u16");
+    pkt[tcp_off + 16..tcp_off + 18].copy_from_slice(&ck.to_be_bytes());
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into poll drain_tun in Task 5")
+)]
+pub(crate) fn split_gro(
+    frame: &[u8],
+    out: &mut Vec<u8>,
+    offsets: &mut Vec<(usize, usize)>,
+) -> bool {
+    out.clear();
+    offsets.clear();
+    let Some(h) = read_vnet_hdr(frame) else {
+        return false;
+    };
+    let body = &frame[VNET_HDR_LEN..];
+    if h.gso_type == GSO_NONE || h.gso_size == 0 {
+        let start = out.len();
+        out.extend_from_slice(body);
+        offsets.push((start, body.len()));
+        return true;
+    }
+    let Some(x) = parse_ipv4_tcp(body) else {
+        return false;
+    };
+    let seg = usize::from(h.gso_size);
+    let hdr = x.payload_off; // ip_hdr_len + tcp_hdr_len
+    let payload = &body[x.payload_off..x.payload_off + x.payload_len];
+    let mut seq = x.seq;
+    let mut ip_id = u16::from_be_bytes([body[4], body[5]]);
+    let mut off = 0usize;
+    while off < payload.len() {
+        let n = seg.min(payload.len() - off);
+        let start = out.len();
+        out.extend_from_slice(&body[..hdr]); // clone IP+TCP header
+        out.extend_from_slice(&payload[off..off + n]);
+        let s = &mut out[start..start + hdr + n];
+        // patch IP total-length, IP ID, TCP seq; recompute both checksums
+        let total = u16::try_from(hdr + n).expect("segment fits u16");
+        s[2..4].copy_from_slice(&total.to_be_bytes());
+        s[4..6].copy_from_slice(&ip_id.to_be_bytes());
+        s[x.ip_hdr_len + 4..x.ip_hdr_len + 8].copy_from_slice(&seq.to_be_bytes());
+        ipv4_checksum(&mut s[..x.ip_hdr_len]);
+        tcp_checksum(s, x.ip_hdr_len);
+        offsets.push((start, hdr + n));
+        seq = seq.wrapping_add(u32::try_from(n).expect("n fits u32"));
+        ip_id = ip_id.wrapping_add(1);
+        off += n;
+    }
+    true
+}
+
 pub(crate) const MAX_GSO_SEGMENTS: usize = 64;
 pub(crate) const MAX_GSO_PAYLOAD: usize = 65_535;
 
@@ -554,5 +638,124 @@ mod tests {
         // singleton: gso_type NONE, body == original packet bytes exactly
         assert_eq!(read_vnet_hdr(&out[0]).unwrap().gso_type, GSO_NONE);
         assert_eq!(&out[0][VNET_HDR_LEN..], &udp[..]);
+    }
+
+    #[test]
+    fn split_none_passthrough() {
+        let pkt = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 0, TCP_FLAG_PSH, b"hi");
+        let mut frame = vec![0u8; VNET_HDR_LEN];
+        write_vnet_hdr(
+            &VnetHdr {
+                gso_type: GSO_NONE,
+                ..Default::default()
+            },
+            &mut frame,
+        );
+        frame.extend_from_slice(&pkt);
+        let (mut out, mut offs) = (Vec::new(), Vec::new());
+        assert!(split_gro(&frame, &mut out, &mut offs));
+        assert_eq!(offs.len(), 1);
+        assert_eq!(&out[offs[0].0..offs[0].0 + offs[0].1], &pkt[..]);
+    }
+
+    #[test]
+    fn split_gro_segments_and_checksums() {
+        // one super-frame: gso_size=100, 250 bytes payload → segments of 100,100,50.
+        let mut big = mk_tcp(
+            [10, 0, 0, 1],
+            [10, 0, 0, 2],
+            9,
+            80,
+            1000,
+            0,
+            &vec![0xEE; 250],
+        );
+        // fix IP total-length already set by mk_tcp; build the framed input:
+        let mut frame = vec![0u8; VNET_HDR_LEN];
+        write_vnet_hdr(
+            &VnetHdr {
+                flags: F_NEEDS_CSUM,
+                gso_type: GSO_TCPV4,
+                hdr_len: 40,
+                gso_size: 100,
+                csum_start: 20,
+                csum_offset: 16,
+            },
+            &mut frame,
+        );
+        frame.extend_from_slice(&big);
+        let (mut out, mut offs) = (Vec::new(), Vec::new());
+        assert!(split_gro(&frame, &mut out, &mut offs));
+        assert_eq!(offs.len(), 3);
+        // each segment parses as valid IPv4/TCP with the right seq + payload size
+        let sizes = [100usize, 100, 50];
+        let mut expect_seq = 1000u32;
+        for (i, &(s, l)) in offs.iter().enumerate() {
+            let seg = &out[s..s + l];
+            let x = parse_ipv4_tcp(seg).expect("valid segment");
+            assert_eq!(x.payload_len, sizes[i]);
+            assert_eq!(x.seq, expect_seq);
+            expect_seq += u32::try_from(sizes[i]).unwrap();
+            // IP checksum valid (header folds to 0xFFFF)
+            let sum: u32 = seg[..20]
+                .chunks(2)
+                .map(|c| u32::from(u16::from_be_bytes([c[0], c[1]])))
+                .sum();
+            assert_eq!(
+                u16::try_from((sum & 0xFFFF) + (sum >> 16)).expect("folded sum fits u16"),
+                0xFFFF
+            );
+        }
+        let _ = &mut big;
+    }
+
+    #[test]
+    fn split_then_coalesce_roundtrip() {
+        // Distinct (non-constant) bytes so any off-by-one/duplication bug is caught.
+        let payload: Vec<u8> = (0..250usize)
+            .map(|i| u8::try_from(i % 256).expect("fits u8"))
+            .collect();
+        let big = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 1000, 0, &payload);
+        let mut frame = vec![0u8; VNET_HDR_LEN];
+        write_vnet_hdr(
+            &VnetHdr {
+                flags: F_NEEDS_CSUM,
+                gso_type: GSO_TCPV4,
+                hdr_len: 40,
+                gso_size: 100,
+                csum_start: 20,
+                csum_offset: 16,
+            },
+            &mut frame,
+        );
+        frame.extend_from_slice(&big);
+
+        let (mut out, mut offs) = (Vec::new(), Vec::new());
+        assert!(split_gro(&frame, &mut out, &mut offs));
+        assert_eq!(offs.len(), 3, "100,100,50-byte segments");
+
+        // Feed each split segment (a raw IP/TCP packet, no vnet_hdr) through the Coalescer,
+        // exactly as the poll RX path would after receiving them off the wire.
+        let mut c = Coalescer::new();
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        for &(s, l) in &offs {
+            let seg = &out[s..s + l];
+            if let Some(f) = c.push(seg) {
+                frames.push(f.to_vec());
+            }
+        }
+        if let Some(f) = c.flush() {
+            frames.push(f.to_vec());
+        }
+
+        // Reassemble the coalesced TCP payload bytes and compare to the original, byte-exact.
+        let mut coalesced_payload = Vec::new();
+        for f in &frames {
+            let body = &f[VNET_HDR_LEN..];
+            let x = parse_ipv4_tcp(body).expect("valid coalesced frame");
+            coalesced_payload
+                .extend_from_slice(&body[x.payload_off..x.payload_off + x.payload_len]);
+        }
+        assert_eq!(coalesced_payload, payload);
     }
 }
