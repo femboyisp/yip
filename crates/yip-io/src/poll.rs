@@ -236,7 +236,7 @@ fn flush_tx(udp_fd: RawFd, tx: &mut Vec<EgressDatagram>, gso: &mut GsoScratch) -
     let runs = std::mem::take(&mut gso.runs);
     let mut outcome = Ok(());
     for run in &runs {
-        if run.members.len() >= 2 && run.segment_size > 0 {
+        if gso.enabled && run.members.len() >= 2 && run.segment_size > 0 {
             let dst = tx[run.members[0]].dst;
             match send_gso_indexed(
                 udp_fd,
