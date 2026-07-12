@@ -41,6 +41,26 @@ All notable changes to this project are documented here, following
   (`RetxBuffer`), plus `Transport::repair_object`.
 
 ### Changed
+- Send-side UDP GSO on the **poll** hot path (throughput lever 4a): `run_poll`'s
+  `flush_tx` now partitions its egress batch into fate-safe runs (same
+  destination, same length, pairwise-distinct FEC `fate`) and sends each run as
+  one `sendmsg` with a `UDP_SEGMENT` control message, instead of one `sendmmsg`
+  datagram-per-packet. The fate-safe grouping rule is factored into a shared
+  `yip-io::gso` module (`can_coalesce` / `partition_fate_safe` /
+  `max_gso_run_len`); the `UringDriver` GSO path now delegates to it, so both
+  drivers enforce **at most one datagram per FEC object per skb** from one
+  definition — a dropped GSO super-skb costs each object at most one symbol, so
+  FEC per-symbol loss-independence is preserved. Opportunistic and
+  latency-neutral (coalesces only what a burst already queued; a lone datagram
+  still sends plain). Falls back to plain `send_mmsg` for singletons and, after
+  latching a per-`run_poll` "GSO unavailable" flag, whenever the kernel reports
+  `UDP_SEGMENT` unsupported (`EIO`/`EINVAL`). Wire-identical; no cipher/handshake/
+  wire-format change. **Real-hardware A/B (two 1-core AMD EPYC virtio VPSes):
+  +25–31 % end-to-end UDP throughput at equal single-core CPU** (a decision-gate
+  spike measured a 2.6× send-path CPU reduction; the end-to-end gain is smaller
+  because recv/TUN/conntrack/IRQ costs do not benefit from send-side GSO). netns
+  10 %-loss + ARQ recovery verified under both drivers. `unsafe` stays confined to
+  `yip-io`. See `crates/yip-bench/RESULTS.md` ("4a send-side GSO").
 - io_uring graceful fallback (issue #25): `run_uring` now falls back to the
   `PollDriver` on any `UringDriver` failure (init or runtime) instead of killing
   the tunnel. Found on a clean Debian 13 (kernel 6.12) box: io_uring's multishot
