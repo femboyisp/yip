@@ -14,6 +14,11 @@ use std::time::Instant;
 
 use crate::{sockaddr_to_std, std_to_sockaddr, MAX_DATAGRAM_BATCH, MAX_WIRE_DATAGRAM};
 
+/// `UDP_SEGMENT` cmsg payload is a single `u16` (the segment size).
+const GSO_CONTROL_PAYLOAD_LEN: u32 = 2;
+/// Control-message scratch space for one `UDP_SEGMENT` cmsg.
+const GSO_CONTROL_SPACE: usize = 64;
+
 /// A single-threaded data-plane dispatch interface.
 ///
 /// Implementors hold all mutable state (AEAD session, FEC transport, codec,
@@ -101,8 +106,9 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
 /// forwarding the outcome. Loops until the socket is empty (recv_mmsg returns 0).
 #[expect(
     clippy::too_many_arguments,
-    reason = "batch buffers are owned by run_poll and threaded through explicitly rather than \
-              bundled into a struct, to keep the hot-path buffers' aliasing/lifetimes obvious"
+    reason = "batch buffers (and the GSO scratch, gso) are owned by run_poll and threaded \
+              through explicitly rather than bundled into a struct, to keep the hot-path \
+              buffers' aliasing/lifetimes obvious"
 )]
 fn drain_udp(
     udp_fd: RawFd,
@@ -113,6 +119,7 @@ fn drain_udp(
     lens: &mut [usize; MAX_DATAGRAM_BATCH],
     srcs: &mut [SocketAddr; MAX_DATAGRAM_BATCH],
     tx: &mut Vec<EgressDatagram>,
+    gso: &mut GsoScratch,
 ) -> io::Result<()> {
     loop {
         let n = recv_mmsg(udp_fd, bufs, lens, srcs)?;
@@ -131,7 +138,7 @@ fn drain_udp(
                 }
             }
         }
-        flush_tx(udp_fd, tx)?; // send any UDP replies for this recv burst
+        flush_tx(udp_fd, tx, gso)?; // send any UDP replies for this recv burst
         if n < MAX_DATAGRAM_BATCH {
             break; // partial batch → socket drained
         }
@@ -147,6 +154,7 @@ fn drain_tun(
     d: &mut impl Dispatch,
     now_ms: u64,
     tx: &mut Vec<EgressDatagram>,
+    gso: &mut GsoScratch,
 ) -> io::Result<()> {
     let mut buf = [0u8; MAX_WIRE_DATAGRAM];
     loop {
@@ -170,27 +178,101 @@ fn drain_tun(
         let inner = &buf[..usize::try_from(n).expect("non-negative read return fits usize")];
         tx.extend(d.on_tun(inner, now_ms).iter().cloned());
         if tx.len() >= MAX_DATAGRAM_BATCH {
-            flush_tx(udp_fd, tx)?;
+            flush_tx(udp_fd, tx, gso)?;
         }
     }
-    flush_tx(udp_fd, tx)?; // send the burst's remaining egress
+    flush_tx(udp_fd, tx, gso)?; // send the burst's remaining egress
     Ok(())
 }
 
-/// Send everything queued in `tx` via `send_mmsg` (looping over partial sends and
-/// batch-cap chunks), then clear it. A momentarily-full send buffer drops the tail
-/// (same acceptable single-packet loss as the old per-datagram `send_to_udp`).
-fn flush_tx(udp_fd: RawFd, tx: &mut Vec<EgressDatagram>) -> io::Result<()> {
+/// Reusable scratch + latched capability for GSO sends on the poll path.
+struct GsoScratch {
+    /// Latched to `false` the first time a GSO send reports the feature
+    /// unsupported (`EIO`/`EINVAL`); thereafter `flush_tx` uses plain sends only.
+    enabled: bool,
+    runs: Vec<crate::gso::GsoRun>,
+    payload: Vec<u8>,
+}
+
+impl GsoScratch {
+    fn new() -> Self {
+        Self {
+            enabled: true,
+            runs: Vec::with_capacity(MAX_DATAGRAM_BATCH),
+            payload: Vec::with_capacity(MAX_WIRE_DATAGRAM * crate::gso::MAX_GSO_SEGMENTS_PER_SEND),
+        }
+    }
+}
+
+/// Plain-send `run` via `send_mmsg` (looping partial sends). A momentarily-full
+/// send buffer drops the remainder of the run (same acceptable single-burst loss
+/// as the old per-datagram send).
+fn send_run_plain(udp_fd: RawFd, run: &[EgressDatagram]) -> io::Result<()> {
     let mut sent = 0;
-    while sent < tx.len() {
-        let n = send_mmsg(udp_fd, &tx[sent..])?;
+    while sent < run.len() {
+        let n = send_mmsg(udp_fd, &run[sent..])?;
         if n == 0 {
-            break; // send buffer full — drop the rest of this burst
+            break;
         }
         sent += n;
     }
-    tx.clear();
     Ok(())
+}
+
+/// Send everything queued in `tx`, then clear it. With GSO enabled, partitions
+/// `tx` into fate-safe runs and sends each run of ≥2 as one `UDP_SEGMENT` send
+/// (falling back to plain sends for singletons and, after latching GSO off, on
+/// any "unsupported" result). Wire-identical to plain `send_mmsg`; the datagram
+/// bytes, sizes, count, and destinations on the wire are unchanged.
+fn flush_tx(udp_fd: RawFd, tx: &mut Vec<EgressDatagram>, gso: &mut GsoScratch) -> io::Result<()> {
+    if !gso.enabled {
+        let r = send_run_plain(udp_fd, tx);
+        tx.clear();
+        return r;
+    }
+    crate::gso::partition_fate_safe(tx, MAX_DATAGRAM_BATCH, &mut gso.runs);
+    // Detach the runs scratch so we can borrow `gso.payload`/`gso.enabled` mutably
+    // while iterating (the runs hold only indices into `tx`); restore it after.
+    let runs = std::mem::take(&mut gso.runs);
+    let mut outcome = Ok(());
+    for run in &runs {
+        if gso.enabled && run.members.len() >= 2 && run.segment_size > 0 {
+            let dst = tx[run.members[0]].dst;
+            match send_gso_indexed(
+                udp_fd,
+                tx,
+                &run.members,
+                run.segment_size,
+                dst,
+                &mut gso.payload,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    gso.enabled = false; // latch: GSO unsupported here
+                    for &i in &run.members {
+                        if let Err(e) = send_run_plain(udp_fd, std::slice::from_ref(&tx[i])) {
+                            outcome = Err(e);
+                            break;
+                        }
+                    }
+                }
+                Err(e) => outcome = Err(e),
+            }
+        } else {
+            for &i in &run.members {
+                if let Err(e) = send_run_plain(udp_fd, std::slice::from_ref(&tx[i])) {
+                    outcome = Err(e);
+                    break;
+                }
+            }
+        }
+        if outcome.is_err() {
+            break;
+        }
+    }
+    gso.runs = runs; // restore the reusable scratch allocation
+    tx.clear();
+    outcome
 }
 
 /// Write one packet to the TUN device.
@@ -278,6 +360,113 @@ fn send_mmsg(udp_fd: RawFd, datagrams: &[EgressDatagram]) -> io::Result<usize> {
         return Err(e);
     }
     Ok(usize::try_from(ret).expect("non-negative sendmmsg return fits usize"))
+}
+
+/// Send an already-assembled `payload` (N × `segment_size` bytes) as ONE
+/// `sendmsg` with a `UDP_SEGMENT` cmsg to `dst`. `Ok(true)`: accepted, or a
+/// transient full send buffer dropped it (acceptable single-burst loss, as in
+/// `send_mmsg`). `Ok(false)`: GSO unsupported (`EIO`/`EINVAL`) — caller latches
+/// GSO off and plain-sends the run.
+fn send_gso_payload(
+    udp_fd: RawFd,
+    payload: &[u8],
+    segment_size: u16,
+    dst: SocketAddr,
+) -> io::Result<bool> {
+    let (mut storage, addr_len) = std_to_sockaddr(dst);
+    let mut iov = libc::iovec {
+        // SAFETY: cast a shared slice to *mut for the iovec ABI; sendmsg only
+        // reads through iov_base. `payload` outlives the syscall.
+        iov_base: payload.as_ptr().cast_mut().cast::<libc::c_void>(),
+        iov_len: payload.len(),
+    };
+    let mut control = [0u8; GSO_CONTROL_SPACE];
+    // SAFETY: msghdr is plain-old-data; zeroed is a valid initial state we fully
+    // populate below before the syscall.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_name = std::ptr::from_mut(&mut storage).cast::<libc::c_void>();
+    msg.msg_namelen = addr_len;
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast::<libc::c_void>();
+    // SAFETY: `CMSG_SPACE` is a pure size computation; no pointer deref.
+    let cmsg_space = usize::try_from(unsafe { libc::CMSG_SPACE(GSO_CONTROL_PAYLOAD_LEN) })
+        .expect("cmsg space fits usize");
+    if cmsg_space > control.len() {
+        return Err(io::Error::other("GSO control buffer too small"));
+    }
+    msg.msg_controllen = cmsg_space;
+
+    // SAFETY: `msg` points to valid in-frame iovec/control storage; we write
+    // exactly one SOL_UDP/UDP_SEGMENT cmsg (a u16 segment size) into `control`.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
+        if cmsg.is_null() {
+            return Err(io::Error::other("missing first cmsg header"));
+        }
+        (*cmsg).cmsg_level = libc::SOL_UDP;
+        (*cmsg).cmsg_type = libc::UDP_SEGMENT;
+        (*cmsg).cmsg_len =
+            usize::try_from(libc::CMSG_LEN(GSO_CONTROL_PAYLOAD_LEN)).expect("cmsg len fits usize");
+        let seg_ptr = libc::CMSG_DATA(cmsg).cast::<u16>();
+        *seg_ptr = segment_size;
+    }
+
+    // SAFETY: `msg` is fully initialised; its iov/name/control point into this
+    // frame's storage, valid until sendmsg returns. MSG_NOSIGNAL suppresses SIGPIPE.
+    let ret = unsafe { libc::sendmsg(udp_fd, &raw const msg, libc::MSG_NOSIGNAL) };
+    if ret < 0 {
+        let e = io::Error::last_os_error();
+        let raw = e.raw_os_error().unwrap_or(0);
+        if raw == libc::EWOULDBLOCK || raw == libc::EAGAIN || raw == libc::ENOBUFS {
+            return Ok(true); // transient full buffer: drop this run (acceptable)
+        }
+        if raw == libc::EIO || raw == libc::EINVAL {
+            return Ok(false); // GSO unsupported → caller latches off + plain-sends
+        }
+        return Err(e);
+    }
+    Ok(true)
+}
+
+/// Assemble `run`'s payloads into `payload` (reused) and GSO-send them.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "run-slice wrapper kept for its own unit test; flush_tx uses \
+                  send_gso_indexed to avoid copying the run out of the egress batch"
+    )
+)]
+fn send_gso(
+    udp_fd: RawFd,
+    run: &[EgressDatagram],
+    segment_size: u16,
+    dst: SocketAddr,
+    payload: &mut Vec<u8>,
+) -> io::Result<bool> {
+    payload.clear();
+    for dg in run {
+        payload.extend_from_slice(&dg.bytes);
+    }
+    send_gso_payload(udp_fd, payload, segment_size, dst)
+}
+
+/// Like `send_gso`, but reads the run's datagrams from `tx` by `indices`
+/// (avoids copying the run out of the egress batch).
+fn send_gso_indexed(
+    udp_fd: RawFd,
+    tx: &[EgressDatagram],
+    indices: &[usize],
+    segment_size: u16,
+    dst: SocketAddr,
+    payload: &mut Vec<u8>,
+) -> io::Result<bool> {
+    payload.clear();
+    for &i in indices {
+        payload.extend_from_slice(&tx[i].bytes);
+    }
+    send_gso_payload(udp_fd, payload, segment_size, dst)
 }
 
 /// Non-blocking `recvmmsg(2)`: drain up to `bufs.len().min(MAX_DATAGRAM_BATCH)`
@@ -422,6 +611,7 @@ pub fn run_poll<D: Dispatch>(udp_fd: RawFd, tun_fd: RawFd, d: &mut D) -> io::Res
     let mut rx_lens = [0usize; MAX_DATAGRAM_BATCH];
     let mut rx_srcs = [SocketAddr::from(([0, 0, 0, 0], 0)); MAX_DATAGRAM_BATCH];
     let mut tx_batch: Vec<EgressDatagram> = Vec::with_capacity(MAX_DATAGRAM_BATCH);
+    let mut gso = GsoScratch::new();
 
     loop {
         // SAFETY: `epoll_fd` is a valid epoll fd.  `events` is a valid
@@ -461,13 +651,14 @@ pub fn run_poll<D: Dispatch>(udp_fd: RawFd, tun_fd: RawFd, d: &mut D) -> io::Res
                     &mut rx_lens,
                     &mut rx_srcs,
                     &mut tx_batch,
+                    &mut gso,
                 ) {
                     // SAFETY: `epoll_fd` is valid.
                     unsafe { libc::close(epoll_fd) };
                     return Err(e);
                 }
             } else if ready_fd == tun_fd {
-                if let Err(e) = drain_tun(tun_fd, udp_fd, d, now_ms, &mut tx_batch) {
+                if let Err(e) = drain_tun(tun_fd, udp_fd, d, now_ms, &mut tx_batch, &mut gso) {
                     // SAFETY: `epoll_fd` is valid.
                     unsafe { libc::close(epoll_fd) };
                     return Err(e);
@@ -478,7 +669,7 @@ pub fn run_poll<D: Dispatch>(udp_fd: RawFd, tun_fd: RawFd, d: &mut D) -> io::Res
         // Always tick — even on timeout with no events.
         if let Some(pkts) = d.tick(now_ms) {
             tx_batch.extend(pkts.iter().cloned());
-            if let Err(e) = flush_tx(udp_fd, &mut tx_batch) {
+            if let Err(e) = flush_tx(udp_fd, &mut tx_batch, &mut gso) {
                 // SAFETY: `epoll_fd` is valid.
                 unsafe { libc::close(epoll_fd) };
                 return Err(e);
@@ -556,6 +747,7 @@ mod tests {
         let mut lens = [0usize; MAX_DATAGRAM_BATCH];
         let mut srcs = [std::net::SocketAddr::from(([0, 0, 0, 0], 0)); MAX_DATAGRAM_BATCH];
         let mut tx = Vec::new();
+        let mut gso = GsoScratch::new();
         drain_udp(
             b.as_raw_fd(),
             null_fd,
@@ -565,6 +757,7 @@ mod tests {
             &mut lens,
             &mut srcs,
             &mut tx,
+            &mut gso,
         )
         .unwrap();
 
@@ -596,6 +789,7 @@ mod tests {
         let mut lens = [0usize; MAX_DATAGRAM_BATCH];
         let mut srcs = [std::net::SocketAddr::from(([0, 0, 0, 0], 0)); MAX_DATAGRAM_BATCH];
         let mut tx = Vec::new();
+        let mut gso = GsoScratch::new();
         drain_udp(
             b.as_raw_fd(),
             null_fd,
@@ -605,6 +799,7 @@ mod tests {
             &mut lens,
             &mut srcs,
             &mut tx,
+            &mut gso,
         )
         .unwrap();
 
@@ -693,6 +888,7 @@ mod tests {
         let mut lens = [0usize; MAX_DATAGRAM_BATCH];
         let mut srcs = [std::net::SocketAddr::from(([0, 0, 0, 0], 0)); MAX_DATAGRAM_BATCH];
         let mut tx = Vec::new();
+        let mut gso = GsoScratch::new();
         drain_udp(
             b.as_raw_fd(),
             null_fd,
@@ -702,6 +898,7 @@ mod tests {
             &mut lens,
             &mut srcs,
             &mut tx,
+            &mut gso,
         )
         .unwrap();
 
@@ -794,6 +991,81 @@ mod tests {
         assert_eq!(
             recv_mmsg(rx.as_raw_fd(), &mut bufs, &mut lens, &mut srcs).unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn send_gso_delivers_each_segment_when_supported() {
+        use std::net::UdpSocket;
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_nonblocking(true).unwrap();
+
+        let run = vec![
+            EgressDatagram {
+                fate: 1,
+                dst: rx_addr,
+                bytes: vec![0xAA; 1000],
+            },
+            EgressDatagram {
+                fate: 2,
+                dst: rx_addr,
+                bytes: vec![0xBB; 1000],
+            },
+            EgressDatagram {
+                fate: 3,
+                dst: rx_addr,
+                bytes: vec![0xCC; 1000],
+            },
+        ];
+        let mut payload = Vec::new();
+        let accepted =
+            send_gso(tx.as_raw_fd(), &run, 1000, rx_addr, &mut payload).expect("send_gso");
+        if !accepted {
+            return; // kernel lacks UDP_SEGMENT here — nothing to assert.
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut got = Vec::new();
+        let mut buf = [0u8; 2048];
+        while let Ok((n, _)) = rx.recv_from(&mut buf) {
+            got.push(buf[..n].to_vec());
+        }
+        assert_eq!(got.len(), 3, "GSO must segment into 3 separate datagrams");
+        assert!(got.iter().all(|d| d.len() == 1000));
+    }
+
+    #[test]
+    fn flush_tx_delivers_all_datagrams_gso_or_fallback() {
+        use std::net::UdpSocket;
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        let tx_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_nonblocking(true).unwrap();
+
+        // fates [1,2,3,1]: one 3-run (0,1,2) + a deferred singleton (3).
+        let mut tx: Vec<EgressDatagram> = [1u16, 2, 3, 1]
+            .iter()
+            .map(|&f| EgressDatagram {
+                fate: f,
+                dst: rx_addr,
+                bytes: vec![f as u8; 1000],
+            })
+            .collect();
+        let mut gso = GsoScratch::new();
+        flush_tx(tx_sock.as_raw_fd(), &mut tx, &mut gso).expect("flush_tx");
+        assert!(tx.is_empty(), "flush_tx must drain tx");
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut count = 0;
+        let mut buf = [0u8; 2048];
+        while let Ok((n, _)) = rx.recv_from(&mut buf) {
+            assert_eq!(n, 1000);
+            count += 1;
+        }
+        assert_eq!(
+            count, 4,
+            "all four datagrams must arrive (GSO or plain fallback)"
         );
     }
 }

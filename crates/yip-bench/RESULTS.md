@@ -299,3 +299,65 @@ per the design model is I/O dropping from ~1–3 µs/packet (per-packet syscall)
 and AEAD (~0.63 µs) levers this targets ~7 Gbit/s single-core on the target VPS.
 A clean iperf measurement is left as a follow-up (fix or replace the
 iperf-compare harness).
+
+## 4a GSO spike — UDP_SEGMENT vs plain sendmmsg on virtio (decision gate)
+
+Throwaway send-path microbenchmark (`gso_spike.c`, not committed) run on a real
+target box: `root@45.61.149.155` (1-core AMD EPYC, virtio, kernel 6.12), blasting
+1200-byte UDP to `144.172.98.216:9999` over the public path, 4 s × 3 runs each.
+Metric = **datagrams sent per CPU-second** (getrusage utime+stime), which isolates
+send-path CPU cost independent of the network's throughput ceiling.
+
+| mode  | datagrams/CPU-s (median) | cpu_s for ~0.6–0.7M datagrams |
+|-------|--------------------------|-------------------------------|
+| plain sendmmsg (32/batch) | ~181,000 | ~3.3 s |
+| gso  (1 sendmsg + UDP_SEGMENT, 32×1200) | ~462,000 | ~1.55 s |
+
+**Ratio ≈ 2.6× datagrams per CPU-second in favour of GSO** — GSO sent *more*
+datagrams (~725k vs ~600k) in *half* the CPU. Well above the 1.3× decision gate.
+
+**Verdict: PROCEED.** `UDP_SEGMENT` more than halves send-path CPU per datagram on
+these virtio boxes, so wiring it into the poll path (Tasks 1–5) is justified. This
+directly corroborates the earlier kernel-stack profiling that pinned `__sys_sendmmsg`
+as the dominant single-core cost.
+
+## 4a send-side GSO (poll path) — real-hardware before/after
+
+A/B on two 1-core AMD EPYC / 967 MB virtio VPSes (Y1 `45.61.149.155`, Y2
+`144.172.98.216`, 23.5 ms apart), same-session back-to-back so network conditions
+cancel in the delta. Baseline binary = main `e030a39` (#54 batched I/O, **no GSO**);
+4a binary = this branch (GSO on the poll send path). UDP, 1200-byte payloads, yip0
+MTU 1380. Sender-side (`Y1`) yipd CPU sampled via `/proc/<pid>/stat` delta.
+
+**Direct** (iperf on Y1↔Y2 over the tunnel — sender core shared with iperf, so the
+same confounder applies to both columns and cancels in the delta):
+
+| UDP target | baseline delivered | 4a delivered | Y1 yipd CPU (both) |
+|-----------:|-------------------:|-------------:|:-------------------|
+| 300 Mbit/s | 195 | **240** | 71% |
+| 600 Mbit/s | 179 | **255** | 64% |
+| 1 Gbit/s   | 174 | **227** | ~56% |
+
+Peak delivered **195 → 255 Mbit/s (+31%)** at identical sender CPU.
+
+**Isolated** (4-box NAT chain `ny → Y1 ═yip═ Y2 → lv`; the yip gateways' cores do
+only forwarding — the real deployment shape; note the double-MASQUERADE conntrack
+adds per-packet kernel cost that partly masks the send-syscall savings):
+
+| UDP target | baseline delivered | 4a delivered | Y1 ingress yipd CPU |
+|-----------:|-------------------:|-------------:|:--------------------|
+| 300 Mbit/s | 91  | **154** | ~90% |
+| 600 Mbit/s | 157 | **196** | ~95% (pegged) |
+| 1 Gbit/s   | 97  | **193** | ~93% |
+
+Peak **157 → 196 Mbit/s (+25%)** at ~equal (near-pegged) CPU; larger at lower-loss
+operating points.
+
+**Interpretation.** GSO delivers a consistent **~+25–31% end-to-end throughput at
+equal single-core CPU** on the target hardware. This is smaller than the spike's
+2.6× *send-path* CPU win (see "4a GSO spike") because send-side GSO only amortizes
+the transmit-stack cost — the receive path, TUN I/O, NAT conntrack, and interrupt
+handling do not benefit, so the integrated gain is diluted. TCP single-/parallel-
+stream numbers over this 23.5 ms, high-loss path are window/loss-collapsed noise
+and are not reported. Correctness (netns 10% loss + ARQ, both drivers) was verified
+separately; FEC per-symbol loss-independence is preserved by the fate-safe grouping.
