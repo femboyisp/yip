@@ -111,6 +111,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install BoringSSL build deps (cmake)
+        # The TLS-mimicry transport (3c.2) links the `boring` crate, whose
+        # build compiles BoringSSL and therefore requires cmake + a C/C++
+        # toolchain. ubuntu-latest ships these, but install cmake explicitly so
+        # the yipd build below cannot fail on a runner-image change.
+        run: sudo apt-get update && sudo apt-get install -y cmake
       - name: Build and run yipd netns tunnel tests under sudo
         run: |
           # Filter for the tunnel_netns test binary specifically: a --no-run build
@@ -156,12 +162,13 @@ jobs:
               fi
             done
           done
-          # QUIC-mimicry tests (3c.1 Task 6): poll driver ONLY. run_quic
-          # ignores YIP_USE_URING (QUIC is poll-only in 3c.1), so these are
-          # deliberately not part of the poll/uring loop above.
-          for t in quic_tunnel_ping quic_ping_under_loss; do
+          # QUIC-mimicry (3c.1 Task 6) and TLS-mimicry (3c.2 Task 6) tests: poll
+          # driver ONLY. run_quic and run_tls both ignore YIP_USE_URING (each is
+          # its own poll-style pump), so these are deliberately not part of the
+          # poll/uring loop above.
+          for t in quic_tunnel_ping quic_ping_under_loss tls_tunnel_ping; do
             LOG="/tmp/netns-quic-$t.log"
-            echo "running $t with default driver (PollDriver; QUIC ignores YIP_USE_URING)"
+            echo "running $t with default driver (PollDriver; mimicry pumps ignore YIP_USE_URING)"
             sudo -E "$BIN" "$t" --exact --nocapture --test-threads=1 2>&1 | tee "$LOG"
             if grep -q "SKIP $t: needs root" "$LOG"; then
               echo "::error::netns test $t skipped — runner is not root"
@@ -186,7 +193,9 @@ jobs:
         # here anyway for full feature parity with the vendored dev build.
         run: |
           sudo apt-get update
-          sudo apt-get install -y libpcap-dev libjson-c-dev libgcrypt20-dev autoconf automake libtool pkg-config gettext
+          # cmake: required to build the `boring` crate (BoringSSL) that the
+          # transport=tls oracle's release yipd links (3c.2).
+          sudo apt-get install -y libpcap-dev libjson-c-dev libgcrypt20-dev autoconf automake libtool pkg-config gettext cmake
 
       # Pinned nDPI checkout: this SHA is the exact commit vendored locally at
       # refrences/nDPI (git-ignored/local per CLAUDE.md, so CI can't just use
@@ -266,3 +275,31 @@ jobs:
           # It's the R8 port-plausibility follow-up (yip's default port isn't
           # 443 yet), tracked for milestone 3d, not an entropy/obfuscation
           # regression.
+
+      - name: Run the nDPI TLS-classification oracle under sudo
+        # 3c.2 Task 6's headline: a transport=tls yip flow is POSITIVELY
+        # classified by nDPI as TLS with the configured SNI and a browser-shaped
+        # JA4, with NO VPN / Obfuscated / Susp Entropy risk — the TCP sibling of
+        # the QUIC oracle above. See run-tls-mimicry-oracle.sh for the full
+        # assertion set (browser/JA4 tag and Known-Proto-on-Non-Std-Port are
+        # reported, not gated).
+        run: |
+          sudo bash bin/yipd/tests/run-tls-mimicry-oracle.sh \
+            "$(pwd)/target/release/yipd" \
+            /tmp/nDPI/example/ndpiReader | tee /tmp/tls-ndpi-oracle.log
+          # Honesty guard, same reasoning as the oracles above: this job always
+          # runs as sudo and always builds ndpiReader, so a SKIP means the
+          # harness itself is broken.
+          if grep -q "^SKIP run-tls-mimicry-oracle" /tmp/tls-ndpi-oracle.log; then
+            echo "::error::TLS-classification oracle skipped — expected root + a built ndpiReader in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/tls-ndpi-oracle.log; then
+            echo "::error::nDPI did not classify yip-over-TLS traffic as TLS with the configured SNI, or raised a VPN/Obfuscated/Susp-Entropy risk — 3c.2 mimicry regression"
+            exit 1
+          fi
+          # NOTE: "Known Proto on Non Std Port" and "Mismatching Protocol with
+          # server IP address" firing are EXPECTED and NOT gated here — see
+          # run-tls-mimicry-oracle.sh's header. The former is the R8/3d
+          # port-plausibility follow-up; the latter is inherent to a P2P TLS
+          # costume whose SNI (a real site) never matches the peer's IP.
