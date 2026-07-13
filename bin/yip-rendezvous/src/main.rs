@@ -210,6 +210,7 @@ mod obf_tests {
     fn wrap_and_decode_plain_obf_off() {
         let msg = Message::Register {
             node: node_id(&[4u8; 32]),
+            counter: 1,
         };
         let mut plain = Vec::new();
         encode(&msg, &mut plain);

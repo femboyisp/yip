@@ -95,7 +95,7 @@ impl RendezvousServer {
             return Vec::new();
         }
         match msg {
-            Message::Register { node } => {
+            Message::Register { node, counter: _ } => {
                 if self.regs.len() >= MAX_REGISTRATIONS && !self.regs.contains_key(&node) {
                     return Vec::new(); // at capacity; refuse new ids (existing refresh ok)
                 }
@@ -182,7 +182,14 @@ mod tests {
         let a = node_id(&[1u8; 32]);
         let _b = node_id(&[2u8; 32]); // documents which peer looks A up; id itself unused
                                       // A registers from its observed reflexive addr.
-        let out = s.handle(addr("198.51.100.7:41000"), Message::Register { node: a }, 0);
+        let out = s.handle(
+            addr("198.51.100.7:41000"),
+            Message::Register {
+                node: a,
+                counter: 1,
+            },
+            0,
+        );
         assert!(out.is_empty(), "register produces no reply");
         // B looks up A: gets A's reflexive via PeerInfo, and A gets a PunchHint
         // carrying B's reflexive.
@@ -209,7 +216,14 @@ mod tests {
     fn ttl_expiry_evicts_registration() {
         let mut s = RendezvousServer::new(0);
         let a = node_id(&[1u8; 32]);
-        s.handle(addr("198.51.100.7:41000"), Message::Register { node: a }, 0);
+        s.handle(
+            addr("198.51.100.7:41000"),
+            Message::Register {
+                node: a,
+                counter: 1,
+            },
+            0,
+        );
         s.sweep(REG_TTL_MS + 1);
         let out = s.handle(
             addr("203.0.113.9:52000"),
@@ -224,8 +238,15 @@ mod tests {
         let mut s = RendezvousServer::new(0);
         let a = node_id(&[1u8; 32]);
         let b = node_id(&[2u8; 32]);
-        s.handle(addr("198.51.100.7:41000"), Message::Register { node: a }, 0); // A registered
-                                                                                // B relays a payload to A -> A gets RelayDeliver{src=B, payload}.
+        s.handle(
+            addr("198.51.100.7:41000"),
+            Message::Register {
+                node: a,
+                counter: 1,
+            },
+            0,
+        ); // A registered
+           // B relays a payload to A -> A gets RelayDeliver{src=B, payload}.
         let out = s.handle(
             addr("203.0.113.9:52000"),
             Message::RelaySend {

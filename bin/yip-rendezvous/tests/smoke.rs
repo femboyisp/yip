@@ -30,7 +30,13 @@ fn register_lookup_relay_over_udp() {
 
     // A registers.
     let mut buf = Vec::new();
-    encode(&Message::Register { node: a_id }, &mut buf);
+    encode(
+        &Message::Register {
+            node: a_id,
+            counter: 1,
+        },
+        &mut buf,
+    );
     a.send_to(&buf, listen).unwrap();
     std::thread::sleep(Duration::from_millis(100));
 
@@ -136,7 +142,13 @@ fn register_lookup_relay_over_udp_with_obf_psk() {
     };
 
     // A registers.
-    send_wrapped(&a, &Message::Register { node: a_id });
+    send_wrapped(
+        &a,
+        &Message::Register {
+            node: a_id,
+            counter: 1,
+        },
+    );
     std::thread::sleep(Duration::from_millis(100));
 
     // B looks up A -> expects PeerInfo(A, A's reflexive addr).

@@ -2757,7 +2757,8 @@ mod tests {
 
     impl Rendezvous for MockRdv {
         fn register(&mut self, node: NodeId) -> EgressDatagram {
-            self.to_server(yip_rendezvous::Message::Register { node })
+            // counter bumped per-registration in 3c.4; 0 is accepted as first-seen
+            self.to_server(yip_rendezvous::Message::Register { node, counter: 0 })
         }
         fn lookup(&mut self, node: NodeId) -> EgressDatagram {
             self.to_server(yip_rendezvous::Message::Lookup { node })
