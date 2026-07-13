@@ -159,7 +159,8 @@ async fn run_udp(
     let now_ms =
         |base: Instant| -> u64 { u64::try_from(base.elapsed().as_millis()).unwrap_or(u64::MAX) };
     let mut rx = [0u8; 2048];
-    let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
+    let mut sweep =
+        tokio::time::interval_at(tokio::time::Instant::now() + SWEEP_INTERVAL, SWEEP_INTERVAL);
     loop {
         tokio::select! {
             r = sock.recv_from(&mut rx) => {
