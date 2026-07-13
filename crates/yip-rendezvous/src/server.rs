@@ -23,6 +23,7 @@ pub const MAX_MSGS_PER_WINDOW: usize = 64;
 struct Reg {
     addr: SocketAddr,
     expiry_ms: u64,
+    last_counter: u64,
 }
 
 struct Rate {
@@ -48,6 +49,12 @@ impl RendezvousServer {
 
     pub fn forwarded_count(&self) -> u64 {
         self.forwarded
+    }
+
+    /// True iff `node` has a live (unexpired) registration. Used by the TLS
+    /// front to distinguish an upgraded tunnel client from a decoy request.
+    pub fn is_registered(&self, node: &NodeId, now_ms: u64) -> bool {
+        self.regs.get(node).is_some_and(|r| r.expiry_ms > now_ms)
     }
 
     /// True iff `src` is within its per-window budget (and records the hit).
@@ -95,7 +102,15 @@ impl RendezvousServer {
             return Vec::new();
         }
         match msg {
-            Message::Register { node, counter: _ } => {
+            Message::Register { node, counter } => {
+                // Reject a stale/replayed registration: the counter must be
+                // strictly greater than the last accepted one for this node.
+                // (An unknown node is first-seen and always accepted.)
+                if let Some(existing) = self.regs.get(&node) {
+                    if existing.expiry_ms > now_ms && counter <= existing.last_counter {
+                        return Vec::new();
+                    }
+                }
                 if self.regs.len() >= MAX_REGISTRATIONS && !self.regs.contains_key(&node) {
                     return Vec::new(); // at capacity; refuse new ids (existing refresh ok)
                 }
@@ -104,6 +119,7 @@ impl RendezvousServer {
                     Reg {
                         addr: src,
                         expiry_ms: now_ms.saturating_add(REG_TTL_MS),
+                        last_counter: counter,
                     },
                 );
                 Vec::new()
@@ -315,6 +331,53 @@ mod tests {
         }
         assert_eq!(s.rates.len(), 2_000);
         assert!(s.rates.len() <= MAX_RATE_ENTRIES);
+    }
+
+    #[test]
+    fn register_rejects_stale_or_equal_counter() {
+        let mut s = RendezvousServer::new(0);
+        let n = node_id(&[1u8; 32]);
+        let a = addr("10.0.0.1:41000");
+        // First registration at counter 5 is accepted.
+        s.handle(
+            a,
+            Message::Register {
+                node: n,
+                counter: 5,
+            },
+            0,
+        );
+        assert!(s.is_registered(&n, 0), "counter 5 accepted");
+        // Replay at counter 5 is rejected: a Lookup still resolves to the
+        // ORIGINAL addr, proving the stale Register did not overwrite it.
+        let a2 = addr("10.0.0.2:41000");
+        s.handle(
+            a2,
+            Message::Register {
+                node: n,
+                counter: 5,
+            },
+            1,
+        );
+        let out = s.handle(a, Message::Lookup { node: n }, 2);
+        match &out[0].1 {
+            Message::PeerInfo { reflexive, .. } => assert_eq!(*reflexive, a),
+            other => panic!("expected PeerInfo, got {other:?}"),
+        }
+        // A greater counter is accepted and updates the addr.
+        s.handle(
+            a2,
+            Message::Register {
+                node: n,
+                counter: 6,
+            },
+            3,
+        );
+        let out = s.handle(a, Message::Lookup { node: n }, 4);
+        match &out[0].1 {
+            Message::PeerInfo { reflexive, .. } => assert_eq!(*reflexive, a2),
+            other => panic!("expected PeerInfo, got {other:?}"),
+        }
     }
 
     #[test]
