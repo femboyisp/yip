@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 mod conn;
+mod conn_tunnel;
 mod tls_front;
 
 use std::net::SocketAddr;
@@ -47,15 +48,6 @@ fn wrap_reply(obf_key: Option<&[u8; 16]>, reply: &Message) -> Vec<u8> {
 }
 
 /// Frame a rendezvous Message for the TLS byte-stream: `[u16 BE len][obf env]`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by conn::classify_first_frame, itself unreachable from main() until \
-                  Task 6's handle_connection calls it; both are exercised directly by \
-                  classify_first_frame's unit tests (3c.3 Task 5)"
-    )
-)]
 pub(crate) fn frame_obf(obf_key: &[u8; 16], msg: &Message) -> Vec<u8> {
     let mut plain = Vec::new();
     encode(msg, &mut plain);

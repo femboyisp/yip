@@ -4,31 +4,18 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
 use yip_rendezvous::{decode, Message, NodeId, RendezvousServer};
 
 use crate::tls_front::TlsFrontCfg;
 
 /// Largest first-frame we will buffer before deciding (a rendezvous Register is
 /// tiny; anything larger is a decoy request). Matches yipd's TLS frame cap.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by classify_first_frame's unit tests (3c.3 Task 5); wired into the live \
-                  trial-read in Task 6's handle_connection"
-    )
-)]
 const MAX_FIRST_FRAME: usize = 2048;
 
 /// Result of inspecting a connection's first framed message.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by classify_first_frame's unit tests (3c.3 Task 5); wired into the live \
-                  upgrade/decoy routing by Task 6's handle_connection"
-    )
-)]
 pub enum Classify {
     /// A valid, fresh Register from a client that knows `obf_psk`. `reply` is
     /// the framed obfuscated response to write back before entering the pump.
@@ -40,14 +27,6 @@ pub enum Classify {
 /// Pure classification of the first frame. De-frames `[u16 len][obf env]`,
 /// deobfuscates with `obf_key` (requiring RDV_TYPE), decodes, and accepts only
 /// a fresh `Register` (monotonic counter enforced by `server.handle`).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unit-tested by conn::tests (3c.3 Task 5); wired into the live TLS-front \
-                  trial-read by Task 6's handle_connection"
-    )
-)]
 pub fn classify_first_frame(
     buf: &[u8],
     obf_key: &[u8; 16],
@@ -89,17 +68,101 @@ pub fn classify_first_frame(
     Classify::Upgrade { node, reply }
 }
 
-/// TEMPORARY stub: Task 6 fills this in with the trial-read + Register/decoy
-/// routing that drives `classify_first_frame` above.
-#[expect(
-    clippy::unused_async,
-    reason = "TEMPORARY stub (Task 4); Task 6 fills this in with the trial-read + \
-              Register/decoy routing, which awaits on the TLS stream"
-)]
+/// Short budget to decide tunnel-vs-decoy. NOT a connection lifetime: on the
+/// decoy path we hand the stream to the backend and let ITS idle timeout
+/// govern, so this classification window is never an observable close signature.
+const CLASSIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Trial-read the first frame off a freshly-TLS-terminated connection and
+/// route it: a fresh obfuscated Register upgrades to the relay tunnel;
+/// anything else (a censor probe, a browser, garbage, silence) is
+/// transparently reverse-proxied to the decoy backend, so the relay looks
+/// like an ordinary web server to everyone but a real yip client.
 pub async fn handle_connection(
-    _s: tokio_boring::SslStream<tokio::net::TcpStream>,
-    _cfg: Arc<TlsFrontCfg>,
+    mut stream: tokio_boring::SslStream<TcpStream>,
+    cfg: Arc<TlsFrontCfg>,
 ) {
+    let now_ms = u64::try_from(cfg.base.elapsed().as_millis()).unwrap_or(u64::MAX);
+    // The relay is blind to the real TCP peer identity; use a fixed synthetic
+    // src for state-machine rate-limiting/registration keying on this path.
+    let src: SocketAddr = "0.0.0.0:0".parse().expect("valid addr");
+
+    let mut buf = Vec::new();
+    let decision = read_and_classify(&mut stream, &cfg, &mut buf, src, now_ms).await;
+
+    match decision {
+        Some(Classify::Upgrade { node, reply }) => {
+            if stream.write_all(&reply).await.is_err() {
+                return;
+            }
+            super::conn_tunnel::run_tunnel(stream, cfg, node).await;
+        }
+        _ => into_decoy(stream, &cfg, buf).await,
+    }
+}
+
+/// Read the first frame (up to CLASSIFY_TIMEOUT) and classify it. Returns
+/// `None` on idle-timeout/read-error (caller treats as decoy). All bytes read
+/// are accumulated in `buf` so they can be replayed to the decoy.
+async fn read_and_classify(
+    stream: &mut tokio_boring::SslStream<TcpStream>,
+    cfg: &TlsFrontCfg,
+    buf: &mut Vec<u8>,
+    src: SocketAddr,
+    now_ms: u64,
+) -> Option<Classify> {
+    let deadline = tokio::time::sleep(CLASSIFY_TIMEOUT);
+    tokio::pin!(deadline);
+    let mut chunk = [0u8; 2048];
+    loop {
+        // Enough to read the length prefix and the full framed body?
+        if buf.len() >= 2 {
+            let len = usize::from(u16::from_be_bytes([buf[0], buf[1]]));
+            if len > 0 && len <= MAX_FIRST_FRAME && buf.len() >= 2 + len {
+                let mut server = cfg.server.lock().await;
+                return Some(classify_first_frame(
+                    buf,
+                    &cfg.obf_key,
+                    &mut server,
+                    src,
+                    now_ms,
+                ));
+            }
+            if len == 0 || len > MAX_FIRST_FRAME {
+                return Some(Classify::Decoy); // implausible length ⇒ decoy now
+            }
+        }
+        tokio::select! {
+            _ = &mut deadline => return None, // idle ⇒ decoy (empty/partial buf)
+            r = stream.read(&mut chunk) => match r {
+                Ok(0) => return Some(Classify::Decoy), // peer closed
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => return Some(Classify::Decoy),
+            },
+        }
+    }
+}
+
+/// Proxy this connection to the decoy backend: replay the buffered bytes, then
+/// splice bidirectionally. The decoy's own behavior/timing governs from here.
+async fn into_decoy(
+    mut stream: tokio_boring::SslStream<TcpStream>,
+    cfg: &TlsFrontCfg,
+    buffered: Vec<u8>,
+) {
+    let Some(decoy_addr) = cfg.decoy else {
+        // No decoy configured: minimal static fallback (documented weaker path).
+        let page = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 40\r\nConnection: close\r\n\r\n<!doctype html><title>OK</title><p>OK</p>";
+        let _ = stream.write_all(page).await;
+        return;
+    };
+    let Ok(mut backend) = TcpStream::connect(decoy_addr).await else {
+        return;
+    };
+    if !buffered.is_empty() && backend.write_all(&buffered).await.is_err() {
+        return;
+    }
+    let _ = tokio::io::copy_bidirectional(&mut stream, &mut backend).await;
 }
 
 #[cfg(test)]
@@ -177,6 +240,64 @@ mod tests {
             classify_first_frame(&frame, &key, &mut s, src, 1),
             Classify::Decoy
         ));
+    }
+
+    /// End-to-end: a censor probe (`GET / HTTP/1.1`) hitting the real TLS front
+    /// must be transparently reverse-proxied to the decoy backend — proving
+    /// the "Trojan front" behavior, not just that `classify_first_frame`
+    /// returns `Decoy` in isolation.
+    #[tokio::test]
+    async fn probe_is_proxied_to_decoy() {
+        // Stub decoy: accept one connection, read whatever the probe sent, and
+        // reply as an ordinary web server would.
+        let decoy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let decoy_addr = decoy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _peer) = decoy_listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+                .await
+                .unwrap();
+        });
+
+        let dir = std::env::temp_dir().join(format!("yip-rdv-conn-decoy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key) = crate::tls_front::write_self_signed(&dir);
+        let acceptor = std::sync::Arc::new(crate::tls_front::build_acceptor(&cert, &key).unwrap());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let cfg = Arc::new(TlsFrontCfg {
+            server: Arc::new(tokio::sync::Mutex::new(RendezvousServer::new(0))),
+            obf_key: yip_obf::derive_key(&[4u8; 32]),
+            decoy: Some(decoy_addr),
+            base: std::time::Instant::now(),
+        });
+        tokio::spawn(crate::tls_front::run_tls_front(listener, acceptor, cfg));
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let connector = crate::tls_front::build_test_client_connector();
+        let config = connector.configure().unwrap();
+        let mut client = tokio_boring::connect(config, "relay.test", tcp)
+            .await
+            .expect("client TLS handshake completes");
+
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: relay.test\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut got = Vec::new();
+        // The decoy backend closes after writing its reply, so read-to-end
+        // completes once the proxied response has been relayed back.
+        client.read_to_end(&mut got).await.unwrap();
+        let got = String::from_utf8_lossy(&got);
+        assert!(
+            got.contains("200 OK") && got.contains("hi"),
+            "probe must be transparently proxied to the decoy backend, got: {got:?}"
+        );
     }
 
     #[test]

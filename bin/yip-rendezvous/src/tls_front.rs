@@ -10,11 +10,6 @@ use boring::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use tokio::sync::Mutex;
 use yip_rendezvous::RendezvousServer;
 
-#[expect(
-    dead_code,
-    reason = "fields consumed by the Task 6 handle_connection (trial-read + Register/decoy \
-              routing); the Task 4 conn::handle_connection stub does not touch them yet"
-)]
 pub struct TlsFrontCfg {
     pub server: Arc<Mutex<RendezvousServer>>,
     pub obf_key: [u8; 16],
@@ -60,21 +55,37 @@ pub async fn run_tls_front(
     }
 }
 
+/// Write a throwaway self-signed cert/key PEM pair for `relay.test` into
+/// `dir`, returning `(cert_path, key_path)`. Shared by `tls_front`'s and
+/// `conn`'s tests (both need a real cert to hand `build_acceptor`/
+/// `run_tls_front`).
+#[cfg(test)]
+pub(crate) fn write_self_signed(dir: &std::path::Path) -> (String, String) {
+    let cert = rcgen::generate_simple_self_signed(vec!["relay.test".into()]).unwrap();
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    (
+        cert_path.to_str().unwrap().to_owned(),
+        key_path.to_str().unwrap().to_owned(),
+    )
+}
+
+/// Accept-any-cert client connector, mirroring `yipd`'s
+/// `build_client_connector` (zero-auth outer TLS by design — see module docs
+/// on `TlsFrontCfg`/`run_tls_front`; the inner yip framing is the real
+/// security). Shared by `tls_front`'s and `conn`'s tests.
+#[cfg(test)]
+pub(crate) fn build_test_client_connector() -> boring::ssl::SslConnector {
+    let mut builder = boring::ssl::SslConnector::builder(SslMethod::tls()).unwrap();
+    builder.set_verify(boring::ssl::SslVerifyMode::NONE);
+    builder.build()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn write_self_signed(dir: &std::path::Path) -> (String, String) {
-        let cert = rcgen::generate_simple_self_signed(vec!["relay.test".into()]).unwrap();
-        let cert_path = dir.join("cert.pem");
-        let key_path = dir.join("key.pem");
-        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
-        (
-            cert_path.to_str().unwrap().to_owned(),
-            key_path.to_str().unwrap().to_owned(),
-        )
-    }
 
     #[test]
     fn build_acceptor_from_pem_succeeds() {
@@ -82,16 +93,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (cert, key) = write_self_signed(&dir);
         assert!(build_acceptor(&cert, &key).is_ok());
-    }
-
-    /// Accept-any-cert client connector, mirroring `yipd`'s
-    /// `build_client_connector` (zero-auth outer TLS by design — see module
-    /// docs on `TlsFrontCfg`/`run_tls_front`; the inner yip handshake, added
-    /// in Task 5/6, is the real security).
-    fn build_test_client_connector() -> boring::ssl::SslConnector {
-        let mut builder = boring::ssl::SslConnector::builder(SslMethod::tls()).unwrap();
-        builder.set_verify(boring::ssl::SslVerifyMode::NONE);
-        builder.build()
     }
 
     /// End-to-end localhost smoke test: `run_tls_front` accepts a real TCP
