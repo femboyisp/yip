@@ -57,13 +57,35 @@ impl ReplayWindow {
         }
     }
 
-    /// Accept `counter` if fresh, recording it; reject replays and too-old counters.
-    fn check_and_set(&mut self, counter: u64) -> bool {
+    /// Would `counter` be accepted right now? Read-only — does **not** mutate the
+    /// window. On the receive path this gates AEAD verification cheaply, and the
+    /// slot is only committed (via [`commit`](Self::commit)) once the frame
+    /// authenticates, so a forged counter cannot advance the window.
+    fn check(&self, counter: u64) -> bool {
+        if !self.started {
+            return true;
+        }
+        if counter > self.latest {
+            true
+        } else {
+            let diff = self.latest - counter;
+            if diff >= REPLAY_WINDOW_BITS {
+                return false; // too old
+            }
+            self.bitmap & (1u64 << diff) == 0 // false ⇒ already seen (replay)
+        }
+    }
+
+    /// Record `counter` as seen, advancing the window. The caller MUST have
+    /// confirmed acceptance via [`check`](Self::check) first (and, on the
+    /// receive path, AEAD verification); `counter` is therefore never too-old
+    /// here, so the in-window shift is always in range.
+    fn commit(&mut self, counter: u64) {
         if !self.started {
             self.started = true;
             self.latest = counter;
             self.bitmap = 1;
-            return true;
+            return;
         }
         if counter > self.latest {
             let shift = counter - self.latest;
@@ -73,18 +95,24 @@ impl ReplayWindow {
                 (self.bitmap << shift) | 1
             };
             self.latest = counter;
-            true
         } else {
             let diff = self.latest - counter;
-            if diff >= REPLAY_WINDOW_BITS {
-                return false; // too old
-            }
-            let bit = 1u64 << diff;
-            if self.bitmap & bit != 0 {
-                return false; // replay
-            }
-            self.bitmap |= bit;
+            self.bitmap |= 1u64 << diff;
+        }
+    }
+
+    /// Atomic check-and-set: accept `counter` if fresh, recording it. The receive
+    /// path deliberately does **not** use this — it splits into
+    /// [`check`](Self::check) → AEAD → [`commit`](Self::commit) so a forged frame
+    /// cannot advance the window before it authenticates. Retained as a compact
+    /// way to exercise the sliding-window math directly in unit tests.
+    #[cfg(test)]
+    fn check_and_set(&mut self, counter: u64) -> bool {
+        if self.check(counter) {
+            self.commit(counter);
             true
+        } else {
+            false
         }
     }
 }
@@ -255,12 +283,13 @@ impl Session {
 
     /// Open one inner frame received under explicit `counter`, enforcing replay protection.
     ///
-    /// Note: the replay window slot is marked before AEAD verification, matching WireGuard's
-    /// behaviour. A forged counter that fails AEAD still consumes a window slot, but forged
-    /// frames cannot be opened. A stricter "only mark on AEAD success" variant is a possible
-    /// later refinement.
+    /// The replay window is checked read-only *before* AEAD, then committed only
+    /// *after* the frame authenticates (matching WireGuard, which advances its
+    /// window post-decrypt). This ordering prevents a forged frame carrying an
+    /// arbitrary counter from advancing the window and starving legitimate
+    /// packets — an off-path DoS the mark-before-auth ordering was open to.
     pub fn open(&mut self, counter: u64, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        if !self.replay.check_and_set(counter) {
+        if !self.replay.check(counter) {
             return Err(CryptoError::Replay);
         }
         let mut buf = ciphertext.to_vec();
@@ -268,6 +297,7 @@ impl Session {
             .recv_key
             .open_in_place(noise_nonce(counter), Aad::empty(), &mut buf)
             .map_err(|_| CryptoError::Decrypt)?;
+        self.replay.commit(counter);
         Ok(plain.to_vec())
     }
 
@@ -293,7 +323,7 @@ impl Session {
         ciphertext: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<(), CryptoError> {
-        if !self.replay.check_and_set(counter) {
+        if !self.replay.check(counter) {
             return Err(CryptoError::Replay);
         }
         out.clear();
@@ -305,6 +335,7 @@ impl Session {
                 .map_err(|_| CryptoError::Decrypt)?;
             plain.len()
         };
+        self.replay.commit(counter);
         out.truncate(n);
         Ok(())
     }
@@ -496,6 +527,62 @@ mod tests {
         let mut bad = s.ciphertext.clone();
         bad[0] ^= 0x01;
         assert_eq!(b.open(s.counter, &bad), Err(CryptoError::Decrypt));
+    }
+
+    /// A forged frame carrying a large counter but garbage ciphertext must fail
+    /// AEAD *without* advancing the anti-replay window. Otherwise an off-path
+    /// attacker who injects one such frame slides `latest` far forward, so every
+    /// subsequent legitimate packet is rejected as "too old" — a session-killing
+    /// DoS. The window slot must only be committed after AEAD verification.
+    #[test]
+    fn forged_frame_does_not_advance_replay_window() {
+        let (mut a, mut b) = test_session_pair();
+        let s0 = a.seal(b"zero").unwrap();
+        let s1 = a.seal(b"one").unwrap();
+
+        // Establish the receive window with a legitimate frame.
+        assert_eq!(b.open(s0.counter, &s0.ciphertext).unwrap(), b"zero");
+
+        // Off-path attacker injects a forged frame at a far-future counter.
+        let garbage = vec![0u8; s0.ciphertext.len()];
+        assert_eq!(
+            b.open(1_000_000, &garbage),
+            Err(CryptoError::Decrypt),
+            "forged frame fails AEAD"
+        );
+
+        // The forged frame must not have moved the window: the next legitimate
+        // in-flight frame still opens.
+        assert_eq!(
+            b.open(s1.counter, &s1.ciphertext).unwrap(),
+            b"one",
+            "legit frame still opens after forged far-future injection"
+        );
+    }
+
+    /// Same invariant on the alloc-free `open_into` path.
+    #[test]
+    fn forged_frame_does_not_advance_replay_window_open_into() {
+        let (mut a, mut b) = test_session_pair();
+        let s0 = a.seal(b"zero").unwrap();
+        let s1 = a.seal(b"one").unwrap();
+        let mut out = Vec::new();
+
+        b.open_into(s0.counter, &s0.ciphertext, &mut out).unwrap();
+        assert_eq!(out, b"zero");
+
+        let garbage = vec![0u8; s0.ciphertext.len()];
+        assert_eq!(
+            b.open_into(1_000_000, &garbage, &mut out),
+            Err(CryptoError::Decrypt),
+            "forged frame fails AEAD"
+        );
+
+        b.open_into(s1.counter, &s1.ciphertext, &mut out).unwrap();
+        assert_eq!(
+            out, b"one",
+            "legit frame still opens after forged injection"
+        );
     }
 
     #[test]
