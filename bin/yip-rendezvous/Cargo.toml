@@ -13,6 +13,7 @@ path = "src/main.rs"
 yip-rendezvous = { path = "../../crates/yip-rendezvous" }
 yip-obf = { path = "../../crates/yip-obf" }
 getrandom = "0.2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
 
 [lints]
 workspace = true

@@ -3,8 +3,10 @@
 //! read-timeout cadence. No TUN, no tunnel keys, no unsafe.
 #![forbid(unsafe_code)]
 
-use std::net::UdpSocket;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use tokio::sync::Mutex;
 
 use yip_rendezvous::{decode, encode, Message, RendezvousServer};
 
@@ -90,7 +92,8 @@ fn usage_exit() -> ! {
     std::process::exit(2);
 }
 
-fn main() -> std::io::Result<()> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> std::io::Result<()> {
     let mut args = std::env::args();
     let _prog = args.next();
 
@@ -133,45 +136,56 @@ fn main() -> std::io::Result<()> {
     // was not given (plain rendezvous path, byte-identical to before Task 4).
     let obf_key: Option<[u8; 16]> = obf_psk.map(|psk| yip_obf::derive_key(&psk));
 
-    let sock = UdpSocket::bind(&listen)?;
-    sock.set_read_timeout(Some(SWEEP_INTERVAL))?;
-    eprintln!("yip-rendezvous listening on {listen}");
-
     // Millisecond clock from a monotonic base (Instant), so `now_ms` never goes
     // backwards and needs no wall clock.
     let base = Instant::now();
+    let server = Arc::new(Mutex::new(RendezvousServer::new(0)));
+
+    let sock = tokio::net::UdpSocket::bind(&listen).await?;
+    eprintln!("yip-rendezvous listening on {listen} (udp)");
+
+    run_udp(sock, Arc::clone(&server), obf_key, base).await
+}
+
+/// The UDP rendezvous task: recover a Message, drive the shared state machine,
+/// send replies. Sweeps on a 5 s interval. Behavior-identical to the previous
+/// blocking loop.
+async fn run_udp(
+    sock: tokio::net::UdpSocket,
+    server: Arc<Mutex<RendezvousServer>>,
+    obf_key: Option<[u8; 16]>,
+    base: Instant,
+) -> std::io::Result<()> {
     let now_ms =
         |base: Instant| -> u64 { u64::try_from(base.elapsed().as_millis()).unwrap_or(u64::MAX) };
-
-    let mut server = RendezvousServer::new(now_ms(base));
-    let mut last_sweep = Instant::now();
     let mut rx = [0u8; 2048];
-
+    let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
     loop {
-        match sock.recv_from(&mut rx) {
-            Ok((n, src)) => {
+        tokio::select! {
+            r = sock.recv_from(&mut rx) => {
+                let (n, src) = r?;
                 // Obf on: unwrap the rendezvous envelope first (wrong key /
                 // wrong ptype ⇒ drop, fail-closed, no panic). Obf off: decode
                 // the plain bytes exactly as before Task 4.
                 if let Some(msg) = decode_inbound(obf_key.as_ref(), &rx[..n]) {
-                    for (dst, reply) in server.handle(src, msg, now_ms(base)) {
+                    let replies = {
+                        let mut s = server.lock().await;
+                        s.handle(src, msg, now_ms(base))
+                    };
+                    for (dst, reply) in replies {
                         let wire = wrap_reply(obf_key.as_ref(), &reply);
-                        let _ = sock.send_to(&wire, dst); // best-effort; drop on error
+                        let _ = sock.send_to(&wire, dst).await; // best-effort; drop on error
                     }
                 }
             }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => return Err(e),
-        }
-        if last_sweep.elapsed() >= SWEEP_INTERVAL {
-            server.sweep(now_ms(base));
-            last_sweep = Instant::now();
-            // Lets the netns money tests (and operators) grep stderr for the
-            // final relay-forward count to assert *which path* carried
-            // traffic, without needing any extra IPC/metrics surface.
-            eprintln!("relay-forwarded={}", server.forwarded_count());
+            _ = sweep.tick() => {
+                let mut s = server.lock().await;
+                s.sweep(now_ms(base));
+                // Lets the netns money tests (and operators) grep stderr for the
+                // final relay-forward count to assert *which path* carried
+                // traffic, without needing any extra IPC/metrics surface.
+                eprintln!("relay-forwarded={}", s.forwarded_count());
+            }
         }
     }
 }
