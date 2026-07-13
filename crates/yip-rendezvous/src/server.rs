@@ -91,6 +91,38 @@ impl RendezvousServer {
             .retain(|_, r| now_ms.saturating_sub(r.window_start_ms) < RATE_WINDOW_MS);
     }
 
+    /// Register `node` iff the message is fresh: a first-seen/expired node, or a
+    /// counter strictly greater than the last accepted for a currently-live
+    /// registration. Returns true iff THIS call accepted it (fresh insert or a
+    /// counter-advancing refresh); false if rejected as stale/replayed or refused
+    /// at capacity. This is the discriminator's source of truth — no inference
+    /// from expiry timestamps.
+    pub fn register_if_fresh(
+        &mut self,
+        node: NodeId,
+        counter: u64,
+        src: SocketAddr,
+        now_ms: u64,
+    ) -> bool {
+        if let Some(existing) = self.regs.get(&node) {
+            if existing.expiry_ms > now_ms && counter <= existing.last_counter {
+                return false; // stale / replay
+            }
+        }
+        if self.regs.len() >= MAX_REGISTRATIONS && !self.regs.contains_key(&node) {
+            return false; // at capacity; refuse a brand-new id
+        }
+        self.regs.insert(
+            node,
+            Reg {
+                addr: src,
+                expiry_ms: now_ms.saturating_add(REG_TTL_MS),
+                last_counter: counter,
+            },
+        );
+        true
+    }
+
     /// Process one received message; return datagrams to send as `(dst, msg)`.
     pub fn handle(
         &mut self,
@@ -103,25 +135,7 @@ impl RendezvousServer {
         }
         match msg {
             Message::Register { node, counter } => {
-                // Reject a stale/replayed registration: the counter must be
-                // strictly greater than the last accepted one for this node.
-                // (An unknown node is first-seen and always accepted.)
-                if let Some(existing) = self.regs.get(&node) {
-                    if existing.expiry_ms > now_ms && counter <= existing.last_counter {
-                        return Vec::new();
-                    }
-                }
-                if self.regs.len() >= MAX_REGISTRATIONS && !self.regs.contains_key(&node) {
-                    return Vec::new(); // at capacity; refuse new ids (existing refresh ok)
-                }
-                self.regs.insert(
-                    node,
-                    Reg {
-                        addr: src,
-                        expiry_ms: now_ms.saturating_add(REG_TTL_MS),
-                        last_counter: counter,
-                    },
-                );
+                self.register_if_fresh(node, counter, src, now_ms);
                 Vec::new()
             }
             Message::Lookup { node } => match self.regs.get(&node) {
@@ -378,6 +392,65 @@ mod tests {
             Message::PeerInfo { reflexive, .. } => assert_eq!(*reflexive, a2),
             other => panic!("expected PeerInfo, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn register_if_fresh_rejects_stale_and_same_counter() {
+        let mut s = RendezvousServer::new(0);
+        let n = node_id(&[1u8; 32]);
+        let a = addr("10.0.0.1:41000");
+        // First-seen node: always accepted.
+        assert!(s.register_if_fresh(n, 5, a, 0), "first-seen node accepted");
+        // Equal counter: rejected as a replay, even at the SAME now_ms.
+        assert!(
+            !s.register_if_fresh(n, 5, a, 0),
+            "equal counter at same now_ms is a replay"
+        );
+        // Lower counter: rejected as stale.
+        assert!(!s.register_if_fresh(n, 4, a, 1), "lower counter is stale");
+        // Strictly higher counter: accepted as a fresh refresh.
+        assert!(
+            s.register_if_fresh(n, 6, a, 2),
+            "higher counter advances the registration"
+        );
+    }
+
+    #[test]
+    fn register_if_fresh_refuses_new_node_at_capacity() {
+        let mut s = RendezvousServer::new(0);
+        for i in 0..MAX_REGISTRATIONS {
+            let idx = u32::try_from(i).expect("index fits u32");
+            let mut id = [0u8; 32];
+            id[..4].copy_from_slice(&idx.to_be_bytes());
+            let node = node_id(&id);
+            assert!(
+                s.register_if_fresh(node, 1, synth_addr(idx), 0),
+                "filling to capacity must accept each distinct node"
+            );
+        }
+        assert_eq!(s.regs.len(), MAX_REGISTRATIONS);
+
+        // A brand-new node arriving while at capacity must be refused.
+        let new_node = node_id(&[0xffu8; 32]);
+        assert!(
+            !s.register_if_fresh(new_node, 1, addr("198.51.100.50:9000"), 0),
+            "new node over capacity must be refused"
+        );
+        assert_eq!(
+            s.regs.len(),
+            MAX_REGISTRATIONS,
+            "map must not grow past the cap"
+        );
+
+        // An already-registered node's counter-advancing refresh must still
+        // succeed while the table is at capacity.
+        let mut existing_id = [0u8; 32];
+        existing_id[..4].copy_from_slice(&0u32.to_be_bytes());
+        let existing_node = node_id(&existing_id);
+        assert!(
+            s.register_if_fresh(existing_node, 2, synth_addr(0), 0),
+            "existing node's refresh must still succeed at capacity"
+        );
     }
 
     #[test]

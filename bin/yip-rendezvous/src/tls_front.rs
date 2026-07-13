@@ -12,7 +12,7 @@ use yip_rendezvous::RendezvousServer;
 
 #[expect(
     dead_code,
-    reason = "fields consumed by the Task 5/6 handle_connection (trial-read + Register/decoy \
+    reason = "fields consumed by the Task 6 handle_connection (trial-read + Register/decoy \
               routing); the Task 4 conn::handle_connection stub does not touch them yet"
 )]
 pub struct TlsFrontCfg {

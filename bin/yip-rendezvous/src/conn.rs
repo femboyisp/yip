@@ -4,7 +4,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use yip_rendezvous::server::REG_TTL_MS;
 use yip_rendezvous::{decode, Message, NodeId, RendezvousServer};
 
 use crate::tls_front::TlsFrontCfg;
@@ -78,19 +77,10 @@ pub fn classify_first_frame(
     let Some(Message::Register { node, counter }) = decode(&body) else {
         return Classify::Decoy;
     };
-    // Apply via the state machine, which enforces monotonic freshness. A
-    // stale/replayed counter (or an at-capacity table) leaves the node's
-    // existing registration untouched rather than bumping it, so a plain
-    // `is_registered(node, now_ms)` re-check is not enough: a node that was
-    // *already* validly registered before this call would still read as
-    // registered afterward even though this specific frame was rejected.
-    // Distinguish "accepted just now" from "already valid" by probing just
-    // below the expiry a *fresh* accept would set (`now_ms + REG_TTL_MS`):
-    // only a registration whose expiry was actually bumped this call clears
-    // that bar, since any older accept's expiry is strictly lower.
-    server.handle(src, Message::Register { node, counter }, now_ms);
-    let probe_ms = now_ms.saturating_add(REG_TTL_MS).saturating_sub(1);
-    if !server.is_registered(&node, probe_ms) {
+    // The state machine reports whether THIS Register was accepted (fresh
+    // insert / counter advance). A stale replay — even one in the same
+    // millisecond — or a first-seen node at capacity returns false ⇒ decoy.
+    if !server.register_if_fresh(node, counter, src, now_ms) {
         return Classify::Decoy;
     }
     // Build the framed obfuscated ack (an empty-payload Register echo is
@@ -185,6 +175,28 @@ mod tests {
         // Replaying the identical frame (counter 7) must now be a decoy.
         assert!(matches!(
             classify_first_frame(&frame, &key, &mut s, src, 1),
+            Classify::Decoy
+        ));
+    }
+
+    #[test]
+    fn same_ms_replay_is_decoy() {
+        // A censor capturing a Register and replaying it within the SAME
+        // millisecond must not be waved through as a tunnel client: the
+        // discriminator must not rely on expiry-timestamp inference, which
+        // cannot distinguish "accepted just now" from "already live" when
+        // both accepts land on the same now_ms.
+        let key = yip_obf::derive_key(&[4u8; 32]);
+        let node = node_id(&[1u8; 32]);
+        let mut s = RendezvousServer::new(0);
+        let src = "127.0.0.1:9".parse().unwrap();
+        let frame = framed_register(&key, node, 7);
+        assert!(matches!(
+            classify_first_frame(&frame, &key, &mut s, src, 100),
+            Classify::Upgrade { .. }
+        ));
+        assert!(matches!(
+            classify_first_frame(&frame, &key, &mut s, src, 100),
             Classify::Decoy
         ));
     }
