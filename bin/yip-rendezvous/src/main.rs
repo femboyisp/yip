@@ -46,6 +46,27 @@ fn wrap_reply(obf_key: Option<&[u8; 16]>, reply: &Message) -> Vec<u8> {
     }
 }
 
+/// Frame a rendezvous Message for the TLS byte-stream: `[u16 BE len][obf env]`.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by conn::classify_first_frame, itself unreachable from main() until \
+                  Task 6's handle_connection calls it; both are exercised directly by \
+                  classify_first_frame's unit tests (3c.3 Task 5)"
+    )
+)]
+pub(crate) fn frame_obf(obf_key: &[u8; 16], msg: &Message) -> Vec<u8> {
+    let mut plain = Vec::new();
+    encode(msg, &mut plain);
+    let env = yip_obf::obfuscate(obf_key, yip_obf::RDV_TYPE, &plain, random_pad(OBF_PAD_MAX));
+    let mut out = Vec::with_capacity(2 + env.len());
+    let len = u16::try_from(env.len()).unwrap_or(u16::MAX);
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(&env);
+    out
+}
+
 /// Maximum random padding (bytes) added to an obfuscated rendezvous-message
 /// envelope. Rendezvous messages are small control/relay datagrams, so a
 /// modest cap (mirrors `yipd`'s `OBF_DATA_PAD_MAX`) is enough to break any
