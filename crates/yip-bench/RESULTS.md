@@ -441,3 +441,20 @@ ecosystem (rquest). That is a heavy C dependency + more integration (raw SSL API
 bidirectional tunnel, both client and server sides). DECISION NEEDED: (a) accept the
 rustls costume (protocol-clean, JA4 = rustls-fingerprintable) — simplest; or (b) commit
 to `boring` for a true Chrome-parrot JA4 — matches the requirement, heavy.
+
+### 3c.2 spike (cont.): BoringSSL viability — the chosen path
+
+Extended the spike to `boring` 4.22 (BoringSSL bindings), same loopback+ndpiReader method:
+- **Builds** — but requires **cmake** (was missing on the Void dev box; `xbps-install cmake`
+  fixed it) plus a BoringSSL compile (~19 s here). This is a **new hard build dependency for
+  the whole project + CI** (cmake + the BoringSSL compile), vs yip's current pure-Rust+ring build.
+- **JA4 = `t13d1712h2_5b57614c22b0_ef7df7f74e48`** by default (17 ciphers, 12 extensions,
+  **GREASE present**) — already browser-*shaped* (unlike rustls's `t13d1011h2`, no GREASE), and
+  **configurable** to Chrome's exact `t13d1516h2` (BoringSSL exposes the cipher/extension/sigalg/
+  GREASE control the impersonation crates use). Still classifies `TLS.Apple`/`Web`/`Safe`.
+
+**Gate = PASS on boring** (viable + tunable to a real Chrome parrot). **Accepted caveats for the
+3c.2 build:** (1) cmake + BoringSSL become required to build yipd (CI job + contributors); (2) the
+`run_tls` pump uses boring's raw SSL API (both client + server sides) rather than rustls; (3) the
+exact current-Chrome recipe must be sourced/maintained (fingerprint drift) — lean on a maintained
+recipe. Decision (user): **commit to boring** for a true Chrome JA4.
