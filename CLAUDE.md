@@ -9,7 +9,8 @@ in Rust**. The original full brief lives in `projectref.md` (local, git-ignored)
 properties:
 
 - NAT hole-punching (rendezvous + UDP hole-punching; relay fallback)
-- RaptorQ forward error correction (rateless FEC) for lossy links
+- Forward error correction for lossy links (originally RaptorQ; **swapped in #50 for a small-K
+  systematic Reed–Solomon codec** over GF(256) — ~20× cheaper encode, no ratelessness tax)
 - L2 data plane (TAP-based bridging / L2 VPN) **and** L3 tunneling (TUN)
 - Post-quantum encryption at high performance / low latency, with key rotation
 - Elimination of DPI-detectable network signatures (anti-DPI / censorship resistance)
@@ -51,7 +52,9 @@ These are starting positions (see `docs/research/00-overview.md` for full reason
   WireGuard fork and must be built. Lean toward a control/data split (OmniNervous) with decentralized
   discovery (Yggdrasil-style DHT/tree or gossip) and an optional signed root set for bootstrap.
 - **Addresses:** self-certifying, derived from the public key (no address authority).
-- **Transport:** RaptorQ FEC primary (`raptorq` crate), thin ARQ for residual loss; pluggable,
+- **Transport:** small-K systematic **Reed–Solomon** FEC primary (`yip-transport::rs`, GF(256)
+  Cauchy; RaptorQ was the original plan, dropped in #50 — its K′=10 min-block padding taxed every
+  small packet for a ratelessness yip never uses), thin ARQ for residual loss; pluggable,
   obfuscatable link layer (plain UDP / TCP-in-UDP mimicry / TLS-mimicry / relay).
 - **Crypto:** 256-bit AEAD data plane (ChaCha20-Poly1305 baseline) + **Rosenpass-style hybrid PQ
   handshake** (Classic McEliece + ML-KEM) feeding a PSK; ~120 s rekey.

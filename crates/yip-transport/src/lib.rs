@@ -1,4 +1,4 @@
-//! Adaptive RaptorQ-FEC transport: per-flow classification, the adaptive
+//! Adaptive Reed–Solomon-FEC transport: per-flow classification, the adaptive
 //! redundancy controller, and thin ARQ. Implemented across M5; this
 //! milestone fixes the public surface and the flow taxonomy.
 #![forbid(unsafe_code)]
@@ -46,7 +46,7 @@ pub enum FlowClass {
 /// Per-class FEC parameters.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FlowParams {
-    /// RaptorQ symbol size for this class (fixed, so it need not be signaled per packet).
+    /// Reed–Solomon symbol size for this class (fixed, so it need not be signaled per packet).
     pub symbol_size: u16,
     /// Initial proactive repair fraction (the controller adjusts from here).
     pub initial_repair_ratio: f32,
@@ -98,7 +98,7 @@ pub struct Transport {
     encoder: FecEncoder,
     controllers: [AdaptiveController; 3],
     reassemblers: HashMap<u8, FecReassembler>,
-    /// RaptorQ symbol size applied to every class's [`FlowParams`], overriding
+    /// Reed–Solomon symbol size applied to every class's [`FlowParams`], overriding
     /// the per-class default from `FlowClass::params()`. Raw/obf mode passes
     /// `1200` (byte-identical to the pre-3c.1 hardcode); QUIC mode (Tasks 4/5)
     /// will pass a different value.
@@ -106,7 +106,7 @@ pub struct Transport {
 }
 
 impl Transport {
-    /// Build a transport with the given classifier policy rules and RaptorQ
+    /// Build a transport with the given classifier policy rules and Reed–Solomon
     /// `symbol_size`, applied to every class's [`FlowParams`] in place of the
     /// per-class default from `FlowClass::params()`.
     pub fn new(rules: Vec<PolicyRule>, symbol_size: u16) -> Self {
