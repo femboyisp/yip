@@ -151,9 +151,17 @@ const WOULD_BLOCK_RETRY_MS: i32 = 20;
 /// QUIC's dynamic `poll_timeout`, so this is a plain constant.
 const TICK_MS: i32 = 10;
 
-/// Client-role reconnect backoff: starts at 100 ms, doubles, caps at ~5 s.
+/// Reconnect / re-accept backoff: starts at 100 ms, doubles, caps at ~5 s.
 const INITIAL_BACKOFF_MS: u64 = 100;
 const MAX_BACKOFF_MS: u64 = 5_000;
+
+/// Maximum wall-clock a single TLS handshake may take before it is abandoned.
+/// Without this bound a peer that opens a TCP connection and then stalls (never
+/// sending its next handshake flight) would pin `run_tls`'s single connection
+/// slot indefinitely — an off-path, zero-crypto DoS, since the outer TLS is
+/// zero-auth and `run_tls` serves one connection at a time. On timeout the
+/// connection is dropped and the server re-accepts (or the client re-dials).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// ALPN protocols offered (client) / accepted (server), RFC 7301 wire format
 /// (one-byte length prefix per protocol name): `h2` then `http/1.1`, matching
@@ -221,6 +229,7 @@ fn ssl_error_to_io(e: boring::ssl::Error) -> io::Error {
 fn drive_handshake<S>(
     mut result: Result<SslStream<S>, HandshakeError<S>>,
     poller: &Epoll,
+    deadline: Instant,
 ) -> io::Result<SslStream<S>>
 where
     S: io::Read + io::Write,
@@ -236,6 +245,12 @@ where
                 )));
             }
             Err(HandshakeError::WouldBlock(mid)) => {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "tls handshake did not complete within HANDSHAKE_TIMEOUT",
+                    ));
+                }
                 poller.wait(WOULD_BLOCK_RETRY_MS)?;
                 mid.handshake()
             }
@@ -403,10 +418,15 @@ fn connect_and_handshake(
     tun_fd: RawFd,
 ) -> io::Result<(SslStream<TcpStream>, Epoll)> {
     let tcp = TcpStream::connect(peer_endpoint)?;
+    // Disable Nagle: the pump issues many small ssl_writes (ticks, keepalives,
+    // small inner datagrams); Nagle+delayed-ACK would add up to ~40 ms latency
+    // per small write, gratuitously so on a latency-sensitive VPN.
+    tcp.set_nodelay(true)?;
     let tcp_fd = tcp.as_raw_fd();
     let poller = Epoll::new(tcp_fd, tun_fd)?;
     let connector = build_client_connector()?;
-    let stream = drive_handshake(connector.connect(tls_sni, tcp), &poller)?;
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    let stream = drive_handshake(connector.connect(tls_sni, tcp), &poller, deadline)?;
     Ok((stream, poller))
 }
 
@@ -429,10 +449,15 @@ fn accept_and_handshake(
              {expected_peer}; proceeding (inner Noise-IK is the real authentication)"
         );
     }
+    // Disable Nagle (see connect_and_handshake) — same low-latency rationale.
+    tcp.set_nodelay(true)?;
     let tcp_fd = tcp.as_raw_fd();
     let poller = Epoll::new(tcp_fd, tun_fd)?;
     let acceptor = build_server_acceptor(tls_sni)?;
-    let stream = drive_handshake(acceptor.accept(tcp), &poller)?;
+    // Bound the handshake: a peer that connects then stalls must not pin this
+    // (single) connection slot forever — on timeout we drop and re-accept.
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    let stream = drive_handshake(acceptor.accept(tcp), &poller, deadline)?;
     Ok((stream, poller))
 }
 
@@ -576,11 +601,16 @@ pub(crate) fn run_tls(
         let (stream, poller) = match attempt {
             Ok(pair) => pair,
             Err(e) => {
+                // Back off on failure for BOTH roles. The server previously
+                // retried `accept()` with zero delay, so a peer that connects
+                // and immediately RSTs / sends a bad ClientHello (or fails the
+                // handshake deadline) could spin this loop at unbounded rate,
+                // burning CPU and flooding stderr. Backoff resets on the next
+                // successful connection, so a legitimate peer arriving after one
+                // failed attempt waits at most INITIAL_BACKOFF_MS.
                 eprintln!("tls: {role:?} connection setup failed: {e}");
-                if role == Role::Client {
-                    std::thread::sleep(Duration::from_millis(backoff_ms));
-                    backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
-                }
+                std::thread::sleep(Duration::from_millis(backoff_ms));
+                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
                 continue;
             }
         };
@@ -728,6 +758,51 @@ mod tests {
         let mut reader = FrameReader::default();
         let got = blocking_read_one(&mut stream, &mut reader);
         assert_eq!(got, b"pong-from-server");
+
+        server.join().expect("server thread panicked");
+    }
+
+    /// A peer that accepts the TCP connection but never speaks TLS must not pin
+    /// the handshake open forever: `drive_handshake` must abandon it at its
+    /// deadline so `run_tls` can reconnect / re-accept. This is the regression
+    /// guard for the single-connection accept-DoS — an idle connect cannot hold
+    /// the one connection slot indefinitely.
+    #[test]
+    fn drive_handshake_times_out_against_a_silent_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local_addr");
+        // Accept and then stay silent (never send a ServerHello) well past the
+        // client's short test deadline.
+        let server = std::thread::spawn(move || {
+            let (_tcp, _from) = listener.accept().expect("accept");
+            std::thread::sleep(Duration::from_secs(2));
+        });
+
+        let connector = build_client_connector().expect("client connector");
+        let tcp = TcpStream::connect(addr).expect("connect");
+        let tcp_fd = tcp.as_raw_fd();
+        // Epoll::new needs a second fd (the pump watches TUN there); a bound
+        // UdpSocket supplies a valid, never-ready fd without any `unsafe`.
+        let dummy = std::net::UdpSocket::bind("127.0.0.1:0").expect("dummy socket");
+        let poller = Epoll::new(tcp_fd, dummy.as_raw_fd()).expect("epoll");
+
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let res = drive_handshake(connector.connect("example.test", tcp), &poller, deadline);
+
+        assert!(
+            res.is_err(),
+            "handshake against a silent peer must fail, not hang"
+        );
+        let err = res.err().unwrap();
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::TimedOut,
+            "silent-peer handshake must fail with TimedOut, got: {err}"
+        );
+        assert!(
+            Instant::now() >= deadline,
+            "must have waited until the deadline before giving up"
+        );
 
         server.join().expect("server thread panicked");
     }
