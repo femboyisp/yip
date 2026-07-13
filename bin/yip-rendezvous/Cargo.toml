@@ -14,6 +14,17 @@ yip-rendezvous = { path = "../../crates/yip-rendezvous" }
 yip-obf = { path = "../../crates/yip-obf" }
 getrandom = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
+# 3c.3 TCP/TLS Trojan front: real-cert TLS termination on the rendezvous
+# binary (nginx-like config), matching `yipd`'s 3c.2 TLS-mimicry costume.
+# tokio/boring/tokio-boring are scoped to THIS binary only.
+boring = "4.22.0"
+tokio-boring = "4.22.0"
+
+[dev-dependencies]
+# "pem" is required in addition to the brief's ["ring", "crypto"]: the test
+# helper writes PEM (cert.pem() / key_pair.serialize_pem()) for
+# set_certificate_chain_file/set_private_key_file, which take PEM files.
+rcgen = { version = "0.13.2", default-features = false, features = ["ring", "crypto", "pem"] }
 
 [lints]
 workspace = true

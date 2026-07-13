@@ -65,6 +65,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -811,6 +817,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pem"
+version = "3.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
+dependencies = [
+ "base64",
+ "serde_core",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -996,6 +1012,7 @@ version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
 dependencies = [
+ "pem",
  "ring",
  "rustls-pki-types",
  "time",
@@ -1334,6 +1351,17 @@ dependencies = [
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tokio-boring"
+version = "4.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7b5955a3dc76ca07e3401e07d35f98c968e28f1a6126b552a51fa4bccd75528"
+dependencies = [
+ "boring",
+ "boring-sys",
+ "tokio",
 ]
 
 [[package]]
@@ -1697,8 +1725,11 @@ dependencies = [
 name = "yip-rendezvous-bin"
 version = "0.1.0"
 dependencies = [
+ "boring",
  "getrandom 0.2.17",
+ "rcgen",
  "tokio",
+ "tokio-boring",
  "yip-obf",
  "yip-rendezvous",
 ]

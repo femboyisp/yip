@@ -3,6 +3,10 @@
 //! read-timeout cadence. No TUN, no tunnel keys, no unsafe.
 #![forbid(unsafe_code)]
 
+mod conn;
+mod tls_front;
+
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -88,7 +92,11 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
 }
 
 fn usage_exit() -> ! {
-    eprintln!("usage: yip-rendezvous <listen-addr> [--obf-psk <hex64>]   e.g. 0.0.0.0:51821");
+    eprintln!(
+        "usage: yip-rendezvous <listen-addr> [--obf-psk <hex64>] \
+         [--listen-tcp <addr> --tls-cert <path> --tls-key <path> [--decoy <addr>]]\n\
+         e.g. 0.0.0.0:51821"
+    );
     std::process::exit(2);
 }
 
@@ -103,6 +111,11 @@ async fn main() -> std::io::Result<()> {
     // (expecting `yip_obf::RDV_TYPE`) before `Message::decode`, and every
     // reply is obfuscated before `send_to`.
     let mut obf_psk: Option<[u8; 32]> = None;
+    // TCP/TLS Trojan front (3c.3), all opt-in via `--listen-tcp`.
+    let mut listen_tcp: Option<String> = None;
+    let mut tls_cert: Option<String> = None;
+    let mut tls_key: Option<String> = None;
+    let mut decoy: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -123,6 +136,34 @@ async fn main() -> std::io::Result<()> {
                     }
                 }
             }
+            "--listen-tcp" => {
+                let Some(v) = args.next() else {
+                    eprintln!("--listen-tcp requires an address argument");
+                    std::process::exit(2);
+                };
+                listen_tcp = Some(v);
+            }
+            "--tls-cert" => {
+                let Some(v) = args.next() else {
+                    eprintln!("--tls-cert requires a path argument");
+                    std::process::exit(2);
+                };
+                tls_cert = Some(v);
+            }
+            "--tls-key" => {
+                let Some(v) = args.next() else {
+                    eprintln!("--tls-key requires a path argument");
+                    std::process::exit(2);
+                };
+                tls_key = Some(v);
+            }
+            "--decoy" => {
+                let Some(v) = args.next() else {
+                    eprintln!("--decoy requires an address argument");
+                    std::process::exit(2);
+                };
+                decoy = Some(v);
+            }
             _ if listen.is_none() => listen = Some(arg),
             other => {
                 eprintln!("unexpected argument: {other}");
@@ -135,6 +176,16 @@ async fn main() -> std::io::Result<()> {
     // The derived rendezvous-layer obfuscation key, or `None` when `--obf-psk`
     // was not given (plain rendezvous path, byte-identical to before Task 4).
     let obf_key: Option<[u8; 16]> = obf_psk.map(|psk| yip_obf::derive_key(&psk));
+    let decoy_addr: Option<SocketAddr> = match decoy {
+        Some(ref d) => match d.parse() {
+            Ok(a) => Some(a),
+            Err(e) => {
+                eprintln!("invalid --decoy address: {e}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
 
     // Millisecond clock from a monotonic base (Instant), so `now_ms` never goes
     // backwards and needs no wall clock.
@@ -143,6 +194,32 @@ async fn main() -> std::io::Result<()> {
 
     let sock = tokio::net::UdpSocket::bind(&listen).await?;
     eprintln!("yip-rendezvous listening on {listen} (udp)");
+
+    // TLS Trojan front (3c.3): opt-in via --listen-tcp. Requires --tls-cert,
+    // --tls-key, and (as the discriminator) --obf-psk.
+    if let Some(tcp_addr) = listen_tcp {
+        let (Some(cert), Some(key)) = (tls_cert.as_deref(), tls_key.as_deref()) else {
+            eprintln!("--listen-tcp requires --tls-cert and --tls-key");
+            std::process::exit(2);
+        };
+        let Some(obf_key) = obf_key else {
+            eprintln!("--listen-tcp requires --obf-psk (it is the tunnel discriminator)");
+            std::process::exit(2);
+        };
+        let acceptor = Arc::new(tls_front::build_acceptor(cert, key).unwrap_or_else(|e| {
+            eprintln!("tls cert/key error: {e}");
+            std::process::exit(2);
+        }));
+        let tcp = tokio::net::TcpListener::bind(&tcp_addr).await?;
+        eprintln!("yip-rendezvous TLS front listening on {tcp_addr} (tcp)");
+        let cfg = Arc::new(tls_front::TlsFrontCfg {
+            server: Arc::clone(&server),
+            obf_key,
+            decoy: decoy_addr,
+            base,
+        });
+        tokio::spawn(tls_front::run_tls_front(tcp, acceptor, cfg));
+    }
 
     run_udp(sock, Arc::clone(&server), obf_key, base).await
 }
