@@ -16,18 +16,25 @@ use std::net::SocketAddr;
 use crate::mode::TunnelMode;
 use yip_membership::{Cert, RootSet};
 
-/// Wire transport selected via `transport=quic|raw|udp` (absent ⇒ `RawUdp`).
+/// Wire transport selected via `transport=quic|tls|raw|udp` (absent ⇒
+/// `RawUdp`).
 ///
 /// Named `TransportMode` (not `Transport`) to avoid clashing with
 /// `yip_transport::Transport`, the FEC engine. Nothing consumes
-/// `TransportMode::Quic` yet — Task 5 wires the run-loop selection; this task
-/// only parses and validates it.
+/// `TransportMode::Quic`/`TransportMode::Tls` yet — later tasks wire the
+/// run-loop selection; this task only parses and validates it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TransportMode {
     #[default]
     RawUdp,
     Quic,
+    Tls,
 }
+
+/// Default SNI presented by `transport=tls` when `tls_sni` is not
+/// configured — a widely-fronted, unremarkable domain chosen so a mimicry
+/// handshake doesn't stand out with a blank or bespoke SNI.
+pub const DEFAULT_TLS_SNI: &str = "www.apple.com";
 
 /// Configuration for a single remote peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,11 +94,15 @@ pub struct Config {
     /// of `0` is rejected as invalid (there is no such thing as a zero-length
     /// idle interval).
     pub cover_traffic_ms: Option<u64>,
-    /// Wire transport (`transport=quic|raw|udp`, absent ⇒ `RawUdp`).
-    /// Mutually exclusive with `obf_psk`/`cover_traffic_ms` — QUIC provides
-    /// its own wire obfuscation. Nothing consumes `TransportMode::Quic` yet;
-    /// this task only parses and validates it.
+    /// Wire transport (`transport=quic|tls|raw|udp`, absent ⇒ `RawUdp`).
+    /// Mutually exclusive with `obf_psk`/`cover_traffic_ms` — QUIC and TLS
+    /// mimicry each provide their own wire obfuscation. Nothing consumes
+    /// `TransportMode::Quic`/`TransportMode::Tls` yet; this task only parses
+    /// and validates it.
     pub transport: TransportMode,
+    /// TLS SNI presented by `transport=tls` (`tls_sni=<domain>`), defaulting
+    /// to [`DEFAULT_TLS_SNI`] when absent. Ignored for other transports.
+    pub tls_sni: String,
 }
 
 // ── hex decode helper ─────────────────────────────────────────────────────────
@@ -253,6 +264,7 @@ impl Config {
         let mut obf_psk: Option<[u8; 32]> = None;
         let mut cover_traffic_ms: Option<u64> = None;
         let mut transport = TransportMode::default();
+        let mut tls_sni: Option<String> = None;
 
         for line in text.lines() {
             let line = line.trim();
@@ -328,6 +340,7 @@ impl Config {
                 "transport" => {
                     transport = match val {
                         "quic" => TransportMode::Quic,
+                        "tls" => TransportMode::Tls,
                         "raw" | "udp" => TransportMode::RawUdp,
                         other => {
                             return Err(io::Error::new(
@@ -337,6 +350,7 @@ impl Config {
                         }
                     }
                 }
+                "tls_sni" => tls_sni = Some(val.to_owned()),
                 // Silently ignore unknown keys for forward-compatibility. The
                 // netns config files still contain `initiate=true|false` from
                 // before Task 5 removed the field; this is intentional so
@@ -397,16 +411,24 @@ impl Config {
             }
         }
 
-        // `transport=quic` provides its own wire obfuscation, so the
-        // obf/cover-traffic knobs (which assume the raw-UDP path) don't
-        // apply — reject the combination rather than silently ignoring one
-        // side.
-        if transport == TransportMode::Quic && (obf_psk.is_some() || cover_traffic_ms.is_some()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "transport=quic is mutually exclusive with obf_psk / cover_traffic_ms \
-                 (QUIC provides its own wire obfuscation)",
-            ));
+        // `transport=quic`/`transport=tls` each provide their own wire
+        // obfuscation, so the obf/cover-traffic knobs (which assume the
+        // raw-UDP path) don't apply — reject the combination rather than
+        // silently ignoring one side.
+        if matches!(transport, TransportMode::Quic | TransportMode::Tls)
+            && (obf_psk.is_some() || cover_traffic_ms.is_some())
+        {
+            return Err(match transport {
+                TransportMode::Tls => io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "transport=tls is mutually exclusive with obf_psk/cover_traffic_ms",
+                ),
+                _ => io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "transport=quic is mutually exclusive with obf_psk / cover_traffic_ms \
+                     (QUIC provides its own wire obfuscation)",
+                ),
+            });
         }
 
         Ok(Config {
@@ -425,6 +447,7 @@ impl Config {
             obf_psk,
             cover_traffic_ms,
             transport,
+            tls_sni: tls_sni.unwrap_or_else(|| DEFAULT_TLS_SNI.to_owned()),
         })
     }
 }
@@ -1129,6 +1152,77 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
                     transport=quic\n";
         let cfg = Config::parse(text).unwrap();
         assert_eq!(cfg.transport, TransportMode::Quic);
+        assert_eq!(cfg.obf_psk, None);
+        assert_eq!(cfg.cover_traffic_ms, None);
+    }
+
+    // ── transport=tls (3c.2 Task 1) ──────────────────────────────────────
+
+    #[test]
+    fn parses_transport_tls_with_sni() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    transport=tls\ntls_sni=www.apple.com\n";
+        let cfg = Config::parse(text).unwrap();
+        assert_eq!(cfg.transport, TransportMode::Tls);
+        assert_eq!(cfg.tls_sni, "www.apple.com");
+    }
+
+    #[test]
+    fn transport_tls_default_sni_when_absent() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    transport=tls\n";
+        let cfg = Config::parse(text).unwrap();
+        assert_eq!(cfg.transport, TransportMode::Tls);
+        assert_eq!(cfg.tls_sni, DEFAULT_TLS_SNI);
+    }
+
+    #[test]
+    fn transport_tls_with_obf_psk_is_parse_error() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    transport=tls\n\
+                    obf_psk=00000000000000000000000000000000000000000000000000000000000000ff\n";
+        let err = Config::parse(text).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("transport=tls") && err.to_string().contains("obf_psk"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn transport_tls_with_cover_traffic_ms_is_parse_error() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    transport=tls\n\
+                    cover_traffic_ms=200\n";
+        let err = Config::parse(text).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn transport_tls_alone_parses_ok() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    transport=tls\n";
+        let cfg = Config::parse(text).unwrap();
+        assert_eq!(cfg.transport, TransportMode::Tls);
         assert_eq!(cfg.obf_psk, None);
         assert_eq!(cfg.cover_traffic_ms, None);
     }
