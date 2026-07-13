@@ -14,6 +14,7 @@ mod path;
 mod peer_manager;
 mod quic;
 mod rendezvous;
+mod tls;
 mod tunnel;
 mod wire_glue;
 
