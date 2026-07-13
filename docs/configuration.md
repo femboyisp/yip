@@ -81,6 +81,25 @@ five** of these keys puts the node in *mesh mode*, where it may carry no
 
 See the [user guide](user-guide.md#anti-dpi-obfuscation) for the security model.
 
+### Transport mode (optional)
+
+By default yip runs its inner protocol directly over UDP. Two optional
+**mimicry transports** carry the *unchanged* inner protocol (Noise-IK, FEC,
+AEAD) inside a real, standard-looking wire protocol so DPI classifies the
+traffic as something innocuous. Both connect to the **configured** peer
+endpoint (no discovery/hole-punch on these paths) and are **mutually exclusive
+with `obf_psk`** — the mimicry layer *is* the obfuscation, so double-wrapping is
+rejected at config load.
+
+| Key | Value | Notes |
+|---|---|---|
+| `transport` | `raw` (or `udp`), `quic`, `tls` | Selects the wire transport. Absent ⇒ `raw` (the default low-latency UDP path — byte-identical to pre-mimicry yip). |
+| `tls_sni` | domain string | SNI + self-signed cert name presented by the `tls` costume. Default `www.apple.com`. Only meaningful when `transport=tls`. |
+
+- **`raw` / `udp` (default):** inner protocol directly over UDP. Lowest latency; the FEC/loss-recovery path. Use this unless a network blocks it.
+- **`quic` (3c.1):** inner protocol inside a real QUIC connection (RFC 9221 DATAGRAM frames); classifies as QUIC/HTTP-3. Survives networks that permit UDP/443 but fingerprint raw UDP.
+- **`tls` (3c.2):** inner protocol inside a real TLS 1.3 connection over **TCP/443** with a browser-parrot ClientHello; classifies as ordinary browser HTTPS. This is an **opt-in last-resort** path for networks that block UDP entirely (so both `raw` and `quic` fail): TCP means head-of-line blocking and yip's FEC gives no benefit over an already-reliable stream, so it trades yip's latency/loss-recovery identity for reachability. The outer TLS is **zero-auth** (it defeats classification, not an *active probe* that checks whether a real site answers — that is the relay-tier REALITY milestone, 3c.3).
+
 ### Hex-length quick reference
 
 - **64 hex (32 bytes):** `local_private`, `local_public`, `public_key`,

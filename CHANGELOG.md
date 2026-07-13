@@ -6,6 +6,20 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- TLS-over-TCP mimicry transport (`transport=tls`, anti-DPI milestone 3c.2):
+  carries the **unchanged** inner yip protocol (Noise-IK, FEC, AEAD) inside a
+  real TLS 1.3 connection over TCP/443 with a **browser-parrot ClientHello**
+  (BoringSSL via the `boring` crate, GREASE-enabled — a Chrome-shaped JA3/JA4,
+  not a Rust-TLS fingerprint), so yip survives UDP-blocked networks and
+  classifies as ordinary browser HTTPS. Datagrams are framed length-prefixed
+  over the TLS byte-stream; the client/server role is a deterministic
+  static-key tiebreak; teardown reconnects with backoff. Opt-in **last-resort**
+  path (TCP head-of-line blocking, no FEC benefit — trades yip's latency
+  identity for reachability); **mutually exclusive with `obf_psk`**; the
+  default raw-UDP path and the `quic` costume are unchanged. New config keys
+  `transport=tls` and `tls_sni` (default `www.apple.com`). **New build
+  dependency: `cmake` + a BoringSSL compile** (required whenever `yipd` is
+  built).
 - L2 TAP tunnel mode in `yipd`: config now supports `device_kind=tap` for
   Ethernet (L2) tunnel interfaces; `device_kind=tun` remains the default for
   IP (L3) mode.

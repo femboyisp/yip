@@ -166,6 +166,28 @@ pub fn run(config: Config) -> io::Result<()> {
         return crate::quic::run_quic(sock, tun_fd, &mut manager, config.local_public, &quic_peers);
     }
 
+    // TLS-mimicry mode (`transport=tls`, 3c.2): drive the dedicated `run_tls`
+    // pump, which carries yip's UNCHANGED inner protocol length-prefixed over
+    // a BoringSSL TLS-over-TCP byte-stream. It opens its own TCP socket(s)
+    // (client-dials or server-`accept`s per `connection_role`) and the raw
+    // `tun_fd`; `sock` (the UDP socket bound above) goes unused on this path,
+    // same as the QUIC path above.
+    if config.transport == crate::config::TransportMode::Tls {
+        let tls_peers: Vec<([u8; 32], std::net::SocketAddr)> = config
+            .peers
+            .iter()
+            .filter_map(|p| p.endpoint.map(|ep| (p.public_key, ep)))
+            .collect();
+        return crate::tls::run_tls(
+            tun_fd,
+            &mut manager,
+            config.local_public,
+            &tls_peers,
+            config.listen,
+            &config.tls_sni,
+        );
+    }
+
     // Raw-UDP mode. Default to the epoll `PollDriver`: on measurement it is the
     // faster path (lower tunnel RTT — the north-star metric) and is safe Rust.
     // The `UringDriver` currently regresses RTT with no throughput upside and is

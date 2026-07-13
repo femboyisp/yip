@@ -107,6 +107,36 @@ fn quic_ping_under_loss() {
 }
 
 #[test]
+fn tls_tunnel_ping() {
+    // Requires root: netns creation + TUN devices. Like QUIC (3c.1), the TLS
+    // costume (3c.2) is its own poll-style pump and ignores YIP_USE_URING, so
+    // it is not exercised under the UringDriver in the netns CI matrix. Two
+    // sequential handshakes (outer TLS 1.3 over TCP, then inner yip Noise-IK
+    // over the length-prefix-framed byte-stream) must complete before traffic
+    // flows; the script's ping budget is sized for that warm-up.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP tls_tunnel_ping: needs root");
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-netns-tls.sh");
+    let status = Command::new("bash").arg(script).arg(yipd).status().unwrap();
+    assert!(
+        status.success(),
+        "netns TLS tunnel test failed (transport=tls did not connect end-to-end: \
+         outer TLS handshake, inner yip Noise-IK handshake, the length-prefix framing \
+         pump, or the full-MTU integrity sweep)"
+    );
+}
+
+#[test]
 fn l2_tap_ping_or_arp_across_tunnel() {
     let is_root = Command::new("id")
         .arg("-u")
@@ -728,6 +758,55 @@ fn quic_classified_as_quic() {
         status.success(),
         "nDPI QUIC-classification oracle failed (the flow was not classified as QUIC, or \
          a Susp Entropy risk flag was raised — the 3c mimicry win regressed)"
+    );
+}
+
+#[test]
+fn tls_classified_as_tls() {
+    // The 3c.2 headline (Task 6): a `transport=tls` yip flow is POSITIVELY
+    // classified by nDPI as TLS with the configured SNI (www.apple.com) and a
+    // browser-shaped JA4 — not a VPN, not Unknown, no Susp Entropy /
+    // Obfuscated Traffic risk. See run-tls-mimicry-oracle.sh for the full
+    // assertion set (including why the browser/JA4 tag and Known-Proto-on-Non-
+    // Std-Port are reported, not gated — JA4-DB drift and the R8/3d
+    // port-plausibility follow-up respectively).
+    //
+    // Requires root: netns creation + TUN devices + tcpdump.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP tls_classified_as_tls: needs root (run under sudo in CI)");
+        return;
+    }
+    let ndpi = ndpi_reader_bin();
+    if !ndpi.exists() {
+        eprintln!(
+            "SKIP tls_classified_as_tls: ndpiReader binary not found at {}; \
+             build it from refrences/nDPI (autogen.sh && ./configure && make) first",
+            ndpi.display()
+        );
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/run-tls-mimicry-oracle.sh"
+    );
+    let status = Command::new("bash")
+        .arg(script)
+        .arg(yipd)
+        .arg(&ndpi)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "nDPI TLS-classification oracle failed (the flow was not classified as TLS with the \
+         configured SNI, or a VPN/Obfuscated/Susp-Entropy risk fired — the 3c.2 mimicry win regressed)"
     );
 }
 

@@ -30,6 +30,16 @@ rustls = { version = "0.23.41", default-features = false, features = ["ring", "s
 # yip Noise-IK handshake is the real security -- see 3c.1 spec).
 rcgen = { version = "0.13.2", default-features = false, features = ["ring", "crypto"] }
 bytes = { version = "1", default-features = false }
+# 3c.2 TLS mimicry (bin/yipd/src/tls.rs): BoringSSL bindings for a GREASE-enabled
+# browser-parrot ClientHello -- rustls has no GREASE support, so it cannot produce
+# a browser-shaped JA3/JA4 no matter how its cipher/extension list is coaxed (see
+# the Task-0 spike, crates/yip-bench/RESULTS.md "3c.2 spike"). `boring-sys` vendors
+# and compiles BoringSSL (requires cmake + a C/C++ toolchain) -- a new hard build
+# dependency for yipd + CI, accepted per the spike's decision record. Drives yip's
+# unchanged inner Noise-IK/FEC/AEAD protocol inside a real TLS 1.3 byte-stream over
+# TCP (the outer TLS is a throwaway zero-auth costume; the inner yip handshake is
+# the real security).
+boring = "4.22.0"
 
 [dev-dependencies]
 ed25519-dalek = { version = "2.1", default-features = false }
