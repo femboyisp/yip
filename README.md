@@ -3,11 +3,10 @@
 **An invisible, low-latency, high-performance P2P mesh-network VPN tunnel, written in Rust.**
 
 ```
-       /\___/\
-      /  o   o  \      "What does the fox say?"
-     (    ="=    )     ...nothing a DPI firewall can hear.
-      \  ~~~~~  /
-       \_______/
+
+      "What does the fox say?"
+          ...nothing a DPI firewall can hear.
+
 ```
 
 `yip` is a stealthy, ultra-fast L2/L3 mesh VPN built for *insane* low latency on direct
