@@ -532,11 +532,6 @@ fn pump(
 ///
 /// `manager` is driven UNCHANGED — it runs the inner yip Noise-IK/FEC/AEAD
 /// protocol inside the TLS byte-stream.
-#[expect(
-    dead_code,
-    reason = "wired to tunnel.rs's transport=tls dispatch in Task 6 (not yet implemented); \
-              exercised directly by bin/yipd/tests/ once that lands"
-)]
 pub(crate) fn run_tls(
     tun_fd: RawFd,
     manager: &mut PeerManager,
