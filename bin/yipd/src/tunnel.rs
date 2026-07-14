@@ -66,9 +66,14 @@ pub fn run(config: Config) -> io::Result<()> {
     // A configured rendezvous server enables lazy Direct→Punch→Relay peer
     // bring-up; with none, `PeerManager` is pure-2a (direct endpoints only).
     let rendezvous: Option<Box<dyn crate::rendezvous::Rendezvous>> =
-        config.rendezvous.map(|addr| {
-            Box::new(crate::rendezvous::ConfiguredServerRendezvous::new(addr))
-                as Box<dyn crate::rendezvous::Rendezvous>
+        config.rendezvous.map(|rdv| match rdv {
+            crate::config::Rendezvous::Udp(addr) => {
+                Box::new(crate::rendezvous::ConfiguredServerRendezvous::new(addr))
+                    as Box<dyn crate::rendezvous::Rendezvous>
+            }
+            crate::config::Rendezvous::Tls { .. } => {
+                todo!("3c.4 Task 6 wires the TLS relay dispatch")
+            }
         });
     // Build the mesh membership directory (2c) only when the full mesh config is
     // present (a trusted CA set, our cert, the signed root set, our record-
