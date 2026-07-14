@@ -334,3 +334,30 @@ jobs:
             echo "::error::an active probe was not served the decoy, or the relay hard-closed an idle connection at its classification timeout — 3c.3 probe-resistance regression"
             exit 1
           fi
+
+      - name: Run the relay-over-TLS money test under sudo
+        # The 3c.4 headline money test: two UDP-blocked yipd peers tunnel to
+        # each other THROUGH the 3c.3 TLS relay — `rendezvous=tls://host:port`
+        # + `obf_psk` dials the relay over browser-parrot TLS, registers, and
+        # the relay blindly forwards ALL peer traffic. See
+        # run-netns-relay-tls.sh for the full topology and assertion set
+        # (ping success, relay-forwarded>0, TCP-carried with zero UDP
+        # crossing the peer<->relay link). Release yipd (already built above
+        # for the mimicry oracles) is required — the inner Noise/FEC
+        # handshake+dataplane needs release for reasonable speed; the debug
+        # yip-rendezvous-bin built above is sufficient for the relay side.
+        run: |
+          sudo bash bin/yipd/tests/run-netns-relay-tls.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/relay-tls-money-test.log
+          # Honesty guard, same reasoning as the oracles above: this job
+          # always runs as sudo and always builds both binaries, so a SKIP
+          # here means the harness itself is broken.
+          if grep -q "^SKIP run-netns-relay-tls" /tmp/relay-tls-money-test.log; then
+            echo "::error::relay-over-TLS money test skipped — expected root + built yipd/yip-rendezvous binaries in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/relay-tls-money-test.log; then
+            echo "::error::two UDP-blocked peers failed to tunnel via the TLS relay (ping failed, relay-forwarded stayed 0, or the peer<->relay link was not TCP-only) — 3c.4 relay-dial regression"
+            exit 1
+          fi
