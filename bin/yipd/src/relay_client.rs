@@ -1,8 +1,8 @@
 //! The 3c.4 TLS relay-dial client: a dedicated thread holds one browser-parrot
 //! TLS connection to the relay, sends the obfuscated monotonic `Register`
 //! (first-on-connect + keepalive), and pipes obf-wrapped RelaySend/RelayDeliver
-//! envelopes to/from the data plane over a UnixStream socketpair. No tokio; all
-//! TLS via 3c.2's `crate::tls` client primitives.
+//! envelopes to/from the data plane over a `SOCK_DGRAM` `UnixDatagram`
+//! socketpair. No tokio; all TLS via 3c.2's `crate::tls` client primitives.
 //!
 //! # Register-first invariant
 //!
@@ -17,16 +17,25 @@
 //! One [`yip_io::epoll::Epoll`] watches two fds: the TLS/TCP socket (reused as
 //! `Ready.udp`, mirroring `crate::tls`'s pump — the name is just "first
 //! watched fd") and the socketpair end to the data plane (`Ready.tun`,
-//! "second watched fd"). Both directions carry already-obfuscated envelope
-//! bytes verbatim — this module only re-frames them (`[u16 BE
-//! len]`-prefixed, `crate::tls::frame_datagram`/`FrameReader`) between the
-//! TLS byte-stream and the socketpair; it never touches obfuscation or the
-//! rendezvous `Message` codec except to build `Register` itself.
+//! "second watched fd"). The socketpair is a `SOCK_DGRAM` `UnixDatagram`, not
+//! a `UnixStream`: one `send` is one already-obfuscated envelope and one
+//! `recv` reproduces it whole — datagram boundaries stand in for framing, so
+//! there is no `[u16 len]` prefix on this side (unlike the TLS byte-stream
+//! side, which still needs `crate::tls::frame_datagram`/`FrameReader` since
+//! TLS has no message boundaries of its own). This is deliberate (3c.4 final
+//! review FIX 1/FIX 3): a `SOCK_STREAM` socketpair cannot atomically drop a
+//! message under backpressure (a short write desyncs the framing forever), so
+//! the old stream socketpair either had to block the data-plane thread or
+//! kill the whole process on a full buffer. `SOCK_DGRAM` `send` is atomic —
+//! it either enqueues the whole envelope or fails with `WouldBlock`/an error,
+//! never a partial write — so backpressure can be handled the same
+//! best-effort way as a real dropped UDP packet: see [`send_socketpair`].
 use std::io;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::net::UnixStream;
-use std::time::{Duration, Instant};
+use std::os::unix::net::UnixDatagram;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use boring::ssl::SslStream;
 
@@ -45,11 +54,43 @@ use crate::tls::{
 /// expires this connection out from under an idle tunnel.
 const REG_KEEPALIVE_MS: u64 = 30_000;
 
-/// Per-boot monotonic Register counter (starts at 1; the relay's freshness gate
-/// requires strictly-greater).
-#[derive(Default)]
+/// Per-boot monotonic Register counter. The relay's freshness gate requires
+/// each `Register` for a given node to carry a counter strictly greater than
+/// the last one it saw, and it remembers that last-seen value for up to the
+/// 60 s `tls_seen` TTL (see `crates/yip-relay`'s freshness gate).
+///
+/// A counter that always started at 0 (bumped to 1 on the first `Register`)
+/// would lock a restarted node out for up to that whole 60 s window: the
+/// relay's remembered `last_counter` from the previous boot is still fresh,
+/// and a fresh process starting back at 1 is *not* strictly greater than
+/// whatever the previous boot had already reached (3c.4 final review FIX 2).
+/// [`Counter::seeded_now`] avoids that by seeding from wall-clock time
+/// instead of 0: as long as real time has moved forward since the previous
+/// boot (true for any restart that isn't instantaneous), the new seed is
+/// already greater than any counter value the previous boot could have sent,
+/// so the very first `Register` after a restart is accepted immediately.
+///
+/// Residual edge case: a backward wall-clock/NTP step between the previous
+/// boot and this one, landing within the relay's 60 s freshness window,
+/// could still produce a seed the relay rejects as stale — briefly
+/// reproducing the old lockout. This is strictly better than before (where
+/// *every* restart within 60 s hit it, not just ones coinciding with a
+/// backward clock step) and is accepted as-is.
 pub(crate) struct Counter(u64);
 impl Counter {
+    /// Seed from the current wall-clock time (whole seconds since the Unix
+    /// epoch) rather than 0 — see the type doc for why. Falls back to a seed
+    /// of 0 if the clock reads before the epoch (a broken/unset clock);
+    /// `next()` still produces a valid, if not restart-safe, sequence in
+    /// that degenerate case.
+    pub(crate) fn seeded_now() -> Self {
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Counter(seed)
+    }
+
     pub(crate) fn next(&mut self) -> u64 {
         self.0 += 1;
         self.0
@@ -69,7 +110,7 @@ pub(crate) fn build_register(obf_key: &[u8; 16], node: NodeId, counter: u64) -> 
 // ── public entry point ─────────────────────────────────────────────────────
 
 /// Spawn the relay-dial client thread. It owns `sock` (one end of a
-/// `UnixStream::pair()`, the other end wired to the data plane) and the TLS
+/// `UnixDatagram::pair()`, the other end wired to the data plane) and the TLS
 /// connection to the relay at `host:port` (SNI = `sni`), and runs forever:
 /// connect → handshake → **Register first** → pump → on any error, back off
 /// and reconnect.
@@ -79,7 +120,7 @@ pub(crate) fn spawn(
     sni: String,
     obf_key: [u8; 16],
     self_node: NodeId,
-    sock: UnixStream,
+    sock: UnixDatagram,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || run(&host, port, &sni, &obf_key, self_node, sock))
 }
@@ -87,14 +128,24 @@ pub(crate) fn spawn(
 /// The reconnect-with-backoff loop. Only returns if `sock` can no longer be
 /// made non-blocking (an unrecoverable local setup failure) — otherwise runs
 /// until the process exits.
-fn run(host: &str, port: u16, sni: &str, obf_key: &[u8; 16], self_node: NodeId, sock: UnixStream) {
+fn run(
+    host: &str,
+    port: u16,
+    sni: &str,
+    obf_key: &[u8; 16],
+    self_node: NodeId,
+    sock: UnixDatagram,
+) {
     if let Err(e) = sock.set_nonblocking(true) {
         eprintln!("relay_client: could not set socketpair non-blocking, thread exiting: {e}");
         return;
     }
     let sock_fd = sock.as_raw_fd();
 
-    let mut counter = Counter::default();
+    // Seeded from wall-clock time, not 0 — see `Counter::seeded_now`'s doc
+    // (3c.4 final review FIX 2: avoids a restart lockout against the relay's
+    // freshness gate).
+    let mut counter = Counter::seeded_now();
     let mut backoff_ms = INITIAL_BACKOFF_MS;
 
     loop {
@@ -133,7 +184,7 @@ fn run(host: &str, port: u16, sni: &str, obf_key: &[u8; 16], self_node: NodeId, 
         if let Err(e) = pump(
             &mut stream,
             &poller,
-            sock_fd,
+            &sock,
             obf_key,
             self_node,
             &mut counter,
@@ -145,65 +196,89 @@ fn run(host: &str, port: u16, sni: &str, obf_key: &[u8; 16], self_node: NodeId, 
     }
 }
 
-/// Write a whole framed message to the socketpair, or fail. `sock` is a
-/// `SOCK_STREAM` `UnixStream`, so a non-blocking `write()` can return a SHORT
-/// COUNT (n < len) when the send buffer is partially full; silently
-/// discarding the short count would truncate the `[u16 len]`-framed envelope
-/// and permanently desync the receiver's `FrameReader`. A partial write
-/// cannot be unwound, so on persistent backpressure this returns `Err` → the
-/// caller tears the TLS connection down and reconnects (fresh `FrameReader`s
-/// both sides).
-fn write_all_socketpair(sock_fd: RawFd, buf: &[u8]) -> io::Result<()> {
-    let mut off = 0;
-    let mut spins = 0u32;
-    const MAX_SPINS: u32 = 10_000;
-    while off < buf.len() {
-        match write_fd(sock_fd, &buf[off..]) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "socketpair write returned 0",
-                ))
-            }
-            Ok(n) => {
-                off += n;
-                spins = 0;
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                spins += 1;
-                if spins > MAX_SPINS {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "socketpair backpressure: giving up frame",
-                    ));
-                }
-                std::thread::yield_now();
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
+// ── socketpair I/O (SOCK_DGRAM: atomic send, no framing) ───────────────────
+
+/// Rate-limits the "socketpair backpressure, dropping a datagram" log so
+/// sustained backpressure (e.g. a wedged/slow peer thread) cannot itself
+/// become a performance problem by logging on every dropped envelope.
+static LAST_DROP_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+fn now_wall_clock_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
-/// Drain every complete frame currently buffered in `sock_reader`, calling
-/// `emit` on each datagram. Fails closed and symmetric with the TLS-read
-/// side: `FrameReader::next` does NOT drain the bad bytes on a malformed
-/// frame, so ignoring the error and continuing would leave the same error
-/// recurring forever (a permanently wedged direction). Returning `Err`
-/// instead propagates out of `pump`, tearing the connection down so the
-/// caller reconnects with a fresh `FrameReader`.
+/// Log the "dropping a datagram" debug line at most once per second.
+fn log_socketpair_drop_rate_limited() {
+    let now_ms = now_wall_clock_ms();
+    let last = LAST_DROP_LOG_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last) >= 1_000
+        && LAST_DROP_LOG_MS
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        eprintln!("relay_client: socketpair backpressure, dropping a datagram");
+    }
+}
+
+/// Best-effort atomic send of one already-obfuscated envelope to the
+/// socketpair (3c.4 final review FIX 1). `sock` is `SOCK_DGRAM`, so `send`
+/// either enqueues the WHOLE datagram or fails — never a partial write —
+/// which is what makes it safe to just drop on backpressure instead of
+/// spinning or erroring out: this transport is already best-effort,
+/// UDP-equivalent, never a reliability layer. `env` is always far under
+/// `yip_io::MAX_WIRE_DATAGRAM` (this module's envelopes), well inside any
+/// `SOCK_DGRAM` size limit, so size is never the reason a send fails.
 ///
-/// Factored out of `pump`'s socketpair→TLS branch so the decode/fail-closed
-/// logic is unit-testable without a live TLS connection.
-fn drain_socketpair_frames(
-    sock_reader: &mut FrameReader,
+/// - `WouldBlock` (the socketpair's own send buffer is full): the datagram is
+///   dropped (rate-limited debug log) and this returns `Ok(())` — backpressure
+///   must never block or kill the data-plane thread.
+/// - Any other error (the peer end of the pair is gone — observed on this
+///   platform as `ConnectionRefused`/`NotConnected`/`BrokenPipe` depending on
+///   exactly how the peer went away) is NOT recoverable here and propagates,
+///   so the caller (`pump` or `run_relay_tls`) tears its loop down
+///   fail-closed rather than silently talking to nobody forever.
+fn send_socketpair(sock: &UnixDatagram, env: &[u8]) -> io::Result<()> {
+    match sock.send(env) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            log_socketpair_drop_rate_limited();
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Drain every datagram currently available on `sock` (non-blocking),
+/// calling `emit` on each one's bytes. One `recv` is exactly one envelope a
+/// peer `send_socketpair`'d — `SOCK_DGRAM` datagram boundaries stand in for
+/// the old `[u16 len]` stream framing, so there is no reassembly here.
+///
+/// 3c.4 final review FIX 3: `Ok(0)` (an empty datagram — this module never
+/// sends one, so it can only mean something is wrong) and any error other
+/// than `WouldBlock`/`Interrupted` are treated as "the peer end of this
+/// socketpair is gone" and returned as `Err`, tearing the caller's loop down
+/// fail-closed. This matters most on the data-plane side (`run_relay_tls`):
+/// if the relay thread has died, this is how the data plane notices and
+/// exits instead of carrying on as if the relay were still reachable.
+fn drain_socketpair(
+    sock: &UnixDatagram,
+    buf: &mut [u8],
     mut emit: impl FnMut(&[u8]) -> io::Result<()>,
 ) -> io::Result<()> {
     loop {
-        match sock_reader.next() {
-            Ok(Some(dg)) => emit(&dg)?,
-            Ok(None) => return Ok(()),
+        match sock.recv(buf) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "socketpair: received a zero-length datagram (peer gone?)",
+                ));
+            }
+            Ok(n) => emit(&buf[..n])?,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
         }
     }
@@ -220,20 +295,20 @@ fn resolve(host: &str, port: u16) -> io::Result<SocketAddr> {
     })
 }
 
-/// Drive one live TLS connection: pipe obf-wrapped envelope bytes verbatim
-/// between the TLS stream and the socketpair, and re-send `Register` every
-/// [`REG_KEEPALIVE_MS`]. Returns on any TLS/TCP/framing error (fail-closed;
-/// the caller reconnects) or propagates a fatal `Epoll` error via `?`.
+/// Drive one live TLS connection: pipe obf-wrapped envelope bytes between the
+/// TLS stream and the socketpair, and re-send `Register` every
+/// [`REG_KEEPALIVE_MS`]. Returns on any TLS/TCP/framing error, or on a
+/// socketpair send/recv error other than backpressure (fail-closed; the
+/// caller reconnects), or propagates a fatal `Epoll` error via `?`.
 fn pump(
     stream: &mut SslStream<TcpStream>,
     poller: &Epoll,
-    sock_fd: RawFd,
+    sock: &UnixDatagram,
     obf_key: &[u8; 16],
     self_node: NodeId,
     counter: &mut Counter,
 ) -> io::Result<()> {
     let mut tls_reader = FrameReader::default();
-    let mut sock_reader = FrameReader::default();
     let mut tls_read_buf = [0u8; TLS_FRAME_MAX];
     let mut sock_read_buf = [0u8; TLS_FRAME_MAX];
     let mut reframe_buf: Vec<u8> = Vec::new();
@@ -247,41 +322,27 @@ fn pump(
     loop {
         let ready = poller.wait(wait_ms)?;
 
-        // TLS-readable: drain plaintext, de-frame, pipe each frame — an obf'd
-        // RelayDeliver envelope — to the socketpair, best-effort (a full
-        // socketpair buffer just drops the frame; this transport is already
-        // best-effort UDP-equivalent, never a reliability layer).
+        // TLS-readable: drain plaintext, de-frame (the TLS side is still a
+        // byte stream, so it still needs `[u16 len]` framing), and hand each
+        // de-framed obf'd RelayDeliver envelope to the data plane as ONE
+        // datagram send — best-effort, see `send_socketpair`.
         if ready.udp {
             drain_tls_read(stream, &mut tls_reader, &mut tls_read_buf)?;
             loop {
                 match tls_reader.next() {
-                    Ok(Some(dg)) => {
-                        reframe_buf.clear();
-                        frame_datagram(&dg, &mut reframe_buf)?;
-                        write_all_socketpair(sock_fd, &reframe_buf)?;
-                    }
+                    Ok(Some(dg)) => send_socketpair(sock, &dg)?,
                     Ok(None) => break,
                     Err(e) => return Err(e),
                 }
             }
         }
 
-        // Socketpair-readable: read the data plane's already-obf'd
-        // `RelaySend` envelopes (framed the same `[u16 len]` way) and write
-        // each one, re-framed, to the TLS stream.
+        // Socketpair-readable: each `recv` is one already-obf'd `RelaySend`
+        // envelope from the data plane (no framing on this side — datagram
+        // boundaries ARE the framing); re-frame it for the TLS byte stream
+        // and write it out.
         if ready.tun {
-            loop {
-                match read_fd(sock_fd, &mut sock_read_buf) {
-                    Ok(0) => break,
-                    Ok(n) => sock_reader.push(&sock_read_buf[..n]),
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => {
-                        eprintln!("relay_client: socketpair read error: {e}");
-                        break;
-                    }
-                }
-            }
-            drain_socketpair_frames(&mut sock_reader, |dg| {
+            drain_socketpair(sock, &mut sock_read_buf, |dg| {
                 reframe_buf.clear();
                 frame_datagram(dg, &mut reframe_buf)?;
                 write_all_tls(stream, poller, &reframe_buf)
@@ -326,23 +387,16 @@ fn write_tun(tun_fd: RawFd, inner: &[u8]) {
     }
 }
 
-/// Frame each of `egress`'s datagrams (`[u16 BE len]`-prefixed, mirroring the
-/// TLS-side framing) and write it to the socketpair via
-/// [`write_all_socketpair`] — the SAME fail-closed framed write the relay
-/// thread's own [`pump`] uses on its socketpair-read side, so persistent
-/// backpressure surfaces as an `Err` here too rather than silently wedging.
+/// Send each of `egress`'s datagrams to the socketpair via
+/// [`send_socketpair`] — the SAME best-effort atomic send the relay thread's
+/// own [`pump`] uses on its socketpair-write side, so ordinary backpressure
+/// drops silently here too instead of blocking or killing this loop.
 /// `e.dst` is ignored: every egress datagram on this path is relay-destined,
 /// so there is exactly one place to send it — the relay thread on the other
 /// end of the socketpair.
-fn send_egress_to_relay_thread(
-    sock_fd: RawFd,
-    egress: &[EgressDatagram],
-    frame_buf: &mut Vec<u8>,
-) -> io::Result<()> {
+fn send_egress_to_relay_thread(sock: &UnixDatagram, egress: &[EgressDatagram]) -> io::Result<()> {
     for d in egress {
-        frame_buf.clear();
-        frame_datagram(&d.bytes, frame_buf)?;
-        write_all_socketpair(sock_fd, frame_buf)?;
+        send_socketpair(sock, &d.bytes)?;
     }
     Ok(())
 }
@@ -357,30 +411,34 @@ fn send_egress_to_relay_thread(
 /// All egress `PeerManager` produces here is already an obf'd RelaySend
 /// envelope addressed (by `EgressDatagram::dst`, ignored) at the relay — see
 /// [`crate::rendezvous::TlsRelayRendezvous`], which builds every
-/// rendezvous-facing datagram against `relay_addr`. Everything read off `sock`
-/// is an obf'd `RelayDeliver` envelope the relay thread already validated
-/// on-wire (it terminates the real TLS connection); a malformed *frame*
-/// (bad `[u16 len]` prefix) at this layer is nonetheless treated as fatal —
-/// this loop does not itself reconnect (the relay thread already owns
-/// reconnect-with-backoff for the TLS leg), so there is nothing safe to do but
-/// tear down and let the caller (`tunnel::run`) propagate the fatal error.
+/// rendezvous-facing datagram against `relay_addr`. Everything read off
+/// `sock` is one obf'd `RelayDeliver` envelope per datagram (no framing — see
+/// the module doc for why `sock` is `SOCK_DGRAM`) the relay thread already
+/// validated on-wire (it terminates the real TLS connection).
 ///
-/// Only returns on a fatal I/O error (an `Epoll`/socketpair/TUN failure, or a
-/// malformed inbound frame).
+/// Only returns on a fatal I/O error: an `Epoll`/TUN failure, or a socketpair
+/// send/recv indicating the relay thread's end of the pair is gone (3c.4
+/// final review FIX 3 — see [`drain_socketpair`]/[`send_socketpair`]). This
+/// loop does not itself reconnect (the relay thread already owns
+/// reconnect-with-backoff for the TLS leg), so there is nothing safe to do on
+/// a fatal error but tear down and let the caller (`tunnel::run`) propagate
+/// it — which, since `yipd` has no process supervisor of its own yet, means
+/// the whole process exits. That is intentional here (fail-closed on the
+/// relay thread dying) and distinct from ordinary per-datagram backpressure,
+/// which never reaches this far — it is dropped silently inside
+/// `send_socketpair`.
 pub(crate) fn run_relay_tls(
     tun_fd: RawFd,
     manager: &mut PeerManager,
     relay_addr: SocketAddr,
-    sock: UnixStream,
+    sock: UnixDatagram,
 ) -> io::Result<()> {
     sock.set_nonblocking(true)?;
     let sock_fd = sock.as_raw_fd();
     let poller = Epoll::new(sock_fd, tun_fd)?;
 
-    let mut reader = FrameReader::default();
     let mut sock_read_buf = [0u8; TLS_FRAME_MAX];
     let mut tun_read_buf = [0u8; TLS_FRAME_MAX];
-    let mut frame_buf: Vec<u8> = Vec::new();
     let start = Instant::now();
 
     loop {
@@ -388,33 +446,15 @@ pub(crate) fn run_relay_tls(
         let now_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         // 1. Socketpair-readable: inbound obf'd RelayDeliver envelopes from
-        //    the relay thread → de-frame → `PeerManager::on_udp`.
+        //    the relay thread, one per datagram → `PeerManager::on_udp`.
         if ready.udp {
-            loop {
-                match read_fd(sock_fd, &mut sock_read_buf) {
-                    Ok(0) => break,
-                    Ok(n) => reader.push(&sock_read_buf[..n]),
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e),
+            drain_socketpair(&sock, &mut sock_read_buf, |env| {
+                let (tun, egress) = owned_out(manager.on_udp(relay_addr, env, now_ms));
+                if let Some(inner) = tun {
+                    write_tun(tun_fd, &inner);
                 }
-            }
-            loop {
-                match reader.next() {
-                    Ok(Some(env)) => {
-                        let (tun, egress) = owned_out(manager.on_udp(relay_addr, &env, now_ms));
-                        if let Some(inner) = tun {
-                            write_tun(tun_fd, &inner);
-                        }
-                        send_egress_to_relay_thread(sock_fd, &egress, &mut frame_buf)?;
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        eprintln!("relay_tls: malformed inbound frame, tearing down: {e}");
-                        return Err(e);
-                    }
-                }
-            }
+                send_egress_to_relay_thread(&sock, &egress)
+            })?;
         }
 
         // 2. TUN-readable: `PeerManager::on_tun` → relay-bound egress.
@@ -424,7 +464,7 @@ pub(crate) fn run_relay_tls(
                     Ok(0) => break,
                     Ok(n) => {
                         let egress = manager.on_tun(&tun_read_buf[..n], now_ms).to_vec();
-                        send_egress_to_relay_thread(sock_fd, &egress, &mut frame_buf)?;
+                        send_egress_to_relay_thread(&sock, &egress)?;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -438,7 +478,7 @@ pub(crate) fn run_relay_tls(
 
         // 3. Cadence tick (feedback / keepalive / handshake retry / cover).
         if let Some(egress) = manager.tick(now_ms).map(<[EgressDatagram]>::to_vec) {
-            send_egress_to_relay_thread(sock_fd, &egress, &mut frame_buf)?;
+            send_egress_to_relay_thread(&sock, &egress)?;
         }
     }
 }
@@ -446,7 +486,6 @@ pub(crate) fn run_relay_tls(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
     use std::net::TcpListener;
 
     #[test]
@@ -466,44 +505,126 @@ mod tests {
         );
     }
 
+    /// 3c.4 final review FIX 2: the counter must be seeded from wall-clock
+    /// time (definitely > 0, since we are not testing this in 1970), and
+    /// still increase by exactly 1 on every `next()` from wherever it was
+    /// seeded — the "monotonic from 1" guarantee becomes "monotonic from the
+    /// seed".
     #[test]
-    fn counter_is_monotonic_from_one() {
-        let mut c = Counter::default();
-        assert_eq!(c.next(), 1);
-        assert_eq!(c.next(), 2);
-        assert_eq!(c.next(), 3);
+    fn counter_is_monotonic_from_seed() {
+        let mut c = Counter::seeded_now();
+        let first = c.next();
+        assert!(
+            first > 0,
+            "a wall-clock-seeded counter's first value must be well past 0"
+        );
+        assert_eq!(c.next(), first + 1);
+        assert_eq!(c.next(), first + 2);
     }
 
-    /// `FrameReader::next` rejects a zero length prefix as a malformed frame,
-    /// and — critically — does NOT drain the offending bytes, so the same
-    /// error would recur forever if the caller just logged and kept polling.
-    /// `drain_socketpair_frames` (factored out of `pump`'s socketpair→TLS
-    /// branch) must fail closed here: return `Err` rather than swallow it, so
-    /// `pump` tears the connection down and the caller reconnects with a
-    /// fresh `FrameReader` on both sides. This is the socketpair-side
-    /// sibling of the TLS-read side, which already failed closed on a
-    /// malformed frame before this fix.
+    /// 3c.4 final review FIX 1: on ordinary backpressure (the socketpair's
+    /// send buffer is full) `send_socketpair` must drop the datagram and
+    /// return `Ok(())` — never `Err`, since a `SOCK_STREAM` socketpair's
+    /// inability to atomically drop a partial write was exactly what used to
+    /// kill the whole `yipd` process here. `SOCK_DGRAM`'s `send` is atomic
+    /// (whole datagram or nothing), which is what makes the silent-drop safe.
     #[test]
-    fn malformed_socketpair_frame_tears_down() {
-        let mut reader = FrameReader::default();
-        // A `[u16 len]` header of 0 is rejected by `FrameReader::next` as a
-        // bad frame length (zero-length frames are invalid).
-        reader.push(&[0x00, 0x00]);
+    fn send_socketpair_drops_silently_on_backpressure() {
+        let (a, b) = UnixDatagram::pair().expect("socketpair");
+        a.set_nonblocking(true).expect("nonblocking");
+        // Fill the kernel send buffer until a send would block, without ever
+        // draining `b` — this reproduces sustained backpressure.
+        let mut filled = false;
+        for _ in 0..200_000 {
+            match a.send(&[0u8; 64]) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    filled = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected error while filling the socketpair buffer: {e}"),
+            }
+        }
+        assert!(filled, "expected the socketpair's send buffer to fill");
 
+        // The buffer is now full: `send_socketpair` must swallow the
+        // WouldBlock and return Ok, not propagate an Err.
+        send_socketpair(&a, b"one datagram too many")
+            .expect("backpressure must be dropped silently, not returned as an error");
+        drop(b);
+    }
+
+    /// 3c.4 final review FIX 1 (the other half): any socketpair send error
+    /// that is NOT backpressure — observed here via the peer end being
+    /// dropped, which this platform reports as a real error
+    /// (`ConnectionRefused`/`NotConnected`/`BrokenPipe` depending on timing)
+    /// rather than `WouldBlock` — must propagate as `Err` so the caller
+    /// (`pump`/`run_relay_tls`) tears its loop down instead of silently
+    /// talking to a socketpair nobody is listening on anymore.
+    #[test]
+    fn send_socketpair_propagates_a_real_error_when_the_peer_is_gone() {
+        let (a, b) = UnixDatagram::pair().expect("socketpair");
+        a.set_nonblocking(true).expect("nonblocking");
+        drop(b);
+
+        let err = send_socketpair(&a, b"nobody is listening")
+            .expect_err("sending to a socketpair whose peer end was dropped must be an error");
+        assert_ne!(
+            err.kind(),
+            io::ErrorKind::WouldBlock,
+            "a peer-gone error must be distinguishable from ordinary backpressure \
+             (backpressure is dropped silently; peer-gone must tear the loop down)"
+        );
+    }
+
+    /// 3c.4 final review FIX 3: `drain_socketpair` must fail closed on a
+    /// zero-length datagram (this module's envelopes are never empty, so one
+    /// arriving can only mean something is wrong) rather than treat it as an
+    /// ordinary empty read and keep polling — see the function's doc comment
+    /// for why this matters most on the data-plane side (`run_relay_tls`
+    /// noticing the relay thread died).
+    #[test]
+    fn drain_socketpair_fails_closed_on_empty_datagram() {
+        let (a, b) = UnixDatagram::pair().expect("socketpair");
+        b.set_nonblocking(true).expect("nonblocking");
+        a.send(&[]).expect("send an empty datagram");
+
+        let mut buf = [0u8; 64];
         let mut emitted = Vec::new();
-        let result = drain_socketpair_frames(&mut reader, |dg| {
+        let result = drain_socketpair(&b, &mut buf, |dg| {
             emitted.push(dg.to_vec());
             Ok(())
         });
 
         assert!(
             result.is_err(),
-            "a malformed frame must tear the pump down (Err), not be silently dropped"
+            "a zero-length datagram must tear the loop down (Err), not be silently ignored"
         );
         assert!(
             emitted.is_empty(),
-            "no frame should have been emitted before the malformed one was hit"
+            "the empty datagram itself must never reach `emit`"
         );
+    }
+
+    /// `drain_socketpair`'s ordinary path: multiple real datagrams are each
+    /// delivered to `emit` exactly once, in order, with no framing/buffering
+    /// needed (datagram boundaries alone separate them).
+    #[test]
+    fn drain_socketpair_emits_each_real_datagram() {
+        let (a, b) = UnixDatagram::pair().expect("socketpair");
+        b.set_nonblocking(true).expect("nonblocking");
+        a.send(b"first").expect("send first");
+        a.send(b"second").expect("send second");
+
+        let mut buf = [0u8; 64];
+        let mut emitted = Vec::new();
+        drain_socketpair(&b, &mut buf, |dg| {
+            emitted.push(dg.to_vec());
+            Ok(())
+        })
+        .expect("two well-formed datagrams must not error");
+
+        assert_eq!(emitted, vec![b"first".to_vec(), b"second".to_vec()]);
     }
 
     /// Read one complete `[u16 len]`-framed datagram from a *blocking* TLS
@@ -538,11 +659,12 @@ mod tests {
     /// server, (2) sends `Register` as the very first frame (the relay
     /// classifies on-first-frame — a `RelaySend` written first would get
     /// this connection served the decoy), and (3) pipes an inbound
-    /// obf'd `RelayDeliver` frame from the TLS stream through, verbatim,
-    /// to the data-plane side of the socketpair.
+    /// obf'd `RelayDeliver` frame from the TLS stream through, as one
+    /// datagram, to the data-plane side of the (now `SOCK_DGRAM`)
+    /// socketpair.
     ///
     /// Bounded so a hang fails loudly rather than blocking `cargo test`
-    /// forever: the socketpair read on the data-plane end carries a 5 s
+    /// forever: the socketpair recv on the data-plane end carries a 5 s
     /// `read_timeout`, so a stuck client thread surfaces as a panicking
     /// `expect`, not an indefinite wait.
     #[test]
@@ -561,20 +683,24 @@ mod tests {
             let mut stream = acceptor.accept(tcp).expect("server handshake");
 
             // The FIRST frame this stub relay reads MUST be a fresh Register
-            // — that is the whole point of the Register-first invariant.
+            // — that is the whole point of the Register-first invariant. The
+            // counter is now wall-clock-seeded (FIX 2), so only its shape
+            // (a Register for the right node, with a positive counter) is
+            // checked, not an exact value.
             let mut reader = FrameReader::default();
             let env = blocking_read_one_tls(&mut stream, &mut reader);
             let (ptype, body) =
                 yip_obf::deobfuscate(&obf_key, &env).expect("deobfuscate register envelope");
             assert_eq!(ptype, yip_obf::RDV_TYPE);
-            assert_eq!(
-                yip_rendezvous::decode(&body),
-                Some(yip_rendezvous::Message::Register {
-                    node: self_node,
-                    counter: 1,
-                }),
-                "first frame from the client must be a fresh Register(counter=1)"
-            );
+            match yip_rendezvous::decode(&body) {
+                Some(yip_rendezvous::Message::Register { node, counter }) => {
+                    assert_eq!(node, self_node);
+                    assert!(counter > 0, "seeded counter must be positive");
+                }
+                other => {
+                    panic!("first frame from the client must be a fresh Register, got {other:?}")
+                }
+            }
 
             // Reply with an obf'd RelayDeliver carrying b"pong".
             let mut plain = Vec::new();
@@ -596,7 +722,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(300));
         });
 
-        let (test_end, client_sock) = UnixStream::pair().expect("socketpair");
+        let (test_end, client_sock) = UnixDatagram::pair().expect("socketpair");
         test_end
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("set read timeout on test end");
@@ -610,23 +736,17 @@ mod tests {
             client_sock,
         );
 
-        // Read the framed RelayDeliver piped through to the data-plane side
-        // of the socketpair, bounded by test_end's 5 s read_timeout.
-        let mut reader = FrameReader::default();
-        let mut chunk = [0u8; 4096];
-        let dg = loop {
-            if let Some(dg) = reader.next().expect("well-formed frame from relay_client") {
-                break dg;
-            }
-            let n = (&test_end)
-                .read(&mut chunk)
-                .expect("read from data-plane end of the socketpair");
-            assert!(n > 0, "socketpair closed before a full frame arrived");
-            reader.push(&chunk[..n]);
-        };
+        // Recv the RelayDeliver envelope piped through to the data-plane
+        // side of the socketpair as ONE datagram (no framing on this side),
+        // bounded by test_end's 5 s read_timeout.
+        let mut buf = [0u8; 4096];
+        let n = test_end
+            .recv(&mut buf)
+            .expect("recv from data-plane end of the socketpair");
+        let dg = &buf[..n];
 
         let (ptype, body) =
-            yip_obf::deobfuscate(&obf_key, &dg).expect("deobfuscate relay-deliver envelope");
+            yip_obf::deobfuscate(&obf_key, dg).expect("deobfuscate relay-deliver envelope");
         assert_eq!(ptype, yip_obf::RDV_TYPE);
         assert_eq!(
             yip_rendezvous::decode(&body),

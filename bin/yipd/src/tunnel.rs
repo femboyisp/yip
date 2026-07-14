@@ -32,7 +32,7 @@
 use std::io;
 use std::net::{ToSocketAddrs, UdpSocket};
 use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::UnixDatagram;
 use std::process::Command;
 
 use yip_device::{DeviceKind, TunTap};
@@ -224,14 +224,21 @@ pub fn run(config: Config) -> io::Result<()> {
     // mode). A dedicated thread (`relay_client::spawn`) owns the one
     // browser-parrot TLS connection to the relay and speaks obf'd
     // Register/RelaySend/RelayDeliver envelopes over it; this thread and
-    // `run_relay_tls` communicate over a `UnixStream::pair()` socketpair,
-    // each direction carrying the SAME `[u16 BE len]`-framed, already-obf'd
-    // envelope bytes `crate::tls`'s framing uses. `sock` (the UDP socket
-    // bound above) goes unused on this path, same as the QUIC/TLS paths
-    // above — UDP is exactly what this path exists to avoid. The poll
-    // driver is forced (not `YIP_USE_URING`-gated): `run_relay_tls` is a
-    // dedicated `Epoll`-based pump, structurally the same class of loop as
-    // `run_quic`/`run_tls`, not `yip_io::uring`/`yip_io::poll::run_poll`.
+    // `run_relay_tls` communicate over a `SOCK_DGRAM` `UnixDatagram::pair()`
+    // socketpair — one `send` is one already-obf'd envelope and one `recv`
+    // reproduces it whole (datagram boundaries, not `crate::tls`'s `[u16 BE
+    // len]` stream framing, which only the TLS byte-stream leg still needs).
+    // This is deliberate (3c.4 final review): a `SOCK_STREAM` socketpair
+    // cannot atomically drop a message under backpressure, so it either
+    // blocked the data-plane thread or killed the whole process on a full
+    // buffer; `SOCK_DGRAM`'s atomic `send` lets backpressure be handled the
+    // same best-effort way as a dropped UDP packet — see
+    // `relay_client::send_socketpair`. `sock` (the UDP socket bound above)
+    // goes unused on this path, same as the QUIC/TLS paths above — UDP is
+    // exactly what this path exists to avoid. The poll driver is forced (not
+    // `YIP_USE_URING`-gated): `run_relay_tls` is a dedicated `Epoll`-based
+    // pump, structurally the same class of loop as `run_quic`/`run_tls`, not
+    // `yip_io::uring`/`yip_io::poll::run_poll`.
     if let Some((host, port, relay_addr)) = relay_tls {
         let obf_key = yip_obf::derive_key(
             config
@@ -240,7 +247,7 @@ pub fn run(config: Config) -> io::Result<()> {
                 .expect("rendezvous=tls:// requires obf_psk (enforced at config load)"),
         );
         let self_node = yip_rendezvous::node_id(&config.local_public);
-        let (relay_thread_sock, data_plane_sock) = UnixStream::pair()?;
+        let (relay_thread_sock, data_plane_sock) = UnixDatagram::pair()?;
         let sni = host.clone();
         crate::relay_client::spawn(host, port, sni, obf_key, self_node, relay_thread_sock);
         return crate::relay_client::run_relay_tls(

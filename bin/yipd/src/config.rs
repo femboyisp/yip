@@ -210,6 +210,46 @@ fn hex_nibble(b: u8) -> io::Result<u8> {
     }
 }
 
+// ── tls:// rendezvous host:port split ───────────────────────────────────────
+
+/// Split a `tls://`-stripped rendezvous value into `(host, port_str)`.
+///
+/// The common case — a DNS hostname (the intended SNI-decoy model) or a bare
+/// IPv4 literal — has exactly one `:`, so `rsplit_once(':')` alone handles
+/// it. A bracketed IPv6 literal (`tls://[::1]:443`, `tls://[2001:db8::1]:443`)
+/// has multiple `:` characters *inside* the address, which `rsplit_once(':')`
+/// would mis-split on the address's own last colon rather than the one
+/// separating it from the port (3c.4 final review FIX 4) — so a leading `[`
+/// is handled as its own case, splitting on the closing `]` instead. The
+/// returned `host` has brackets stripped: `to_socket_addrs`'s `(&str, u16)`
+/// impl parses a bare IPv6 literal like `::1` directly (no brackets needed),
+/// so keeping the brackets in `host` would make every later resolution fail.
+fn parse_tls_rendezvous_host_port(rest: &str) -> io::Result<(String, &str)> {
+    if let Some(after_bracket) = rest.strip_prefix('[') {
+        let (host, tail) = after_bracket.split_once(']').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tls:// rendezvous has an unterminated IPv6 literal (missing ']')",
+            )
+        })?;
+        let port_str = tail.strip_prefix(':').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tls:// rendezvous IPv6 literal must be followed by :port",
+            )
+        })?;
+        Ok((host.to_owned(), port_str))
+    } else {
+        let (host, port_str) = rest.rsplit_once(':').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tls:// rendezvous must be tls://host:port",
+            )
+        })?;
+        Ok((host.to_owned(), port_str))
+    }
+}
+
 // ── missing key helper ────────────────────────────────────────────────────────
 
 fn missing(key: &str) -> io::Error {
@@ -325,19 +365,11 @@ impl Config {
                 "device_kind" => device_kind = TunnelMode::parse_device_kind(val)?,
                 "rendezvous" => {
                     rendezvous = Some(if let Some(rest) = val.strip_prefix("tls://") {
-                        let (host, port_str) = rest.rsplit_once(':').ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "tls:// rendezvous must be tls://host:port",
-                            )
-                        })?;
+                        let (host, port_str) = parse_tls_rendezvous_host_port(rest)?;
                         let port = port_str.parse::<u16>().map_err(|e| {
                             io::Error::new(io::ErrorKind::InvalidData, e.to_string())
                         })?;
-                        Rendezvous::Tls {
-                            host: host.to_owned(),
-                            port,
-                        }
+                        Rendezvous::Tls { host, port }
                     } else {
                         Rendezvous::Udp(val.parse::<SocketAddr>().map_err(|e| {
                             io::Error::new(io::ErrorKind::InvalidData, e.to_string())
@@ -770,6 +802,40 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
             cfg.rendezvous,
             Some(Rendezvous::Tls { ref host, port }) if host == "relay.example.com" && port == 443
         ));
+    }
+
+    // 3c.4 final review FIX 4: `tls://[ipv6]:port` must parse, with brackets
+    // stripped from `host` (so downstream `to_socket_addrs` resolution
+    // doesn't choke on them — `Ipv6Addr::from_str` wants a bare literal).
+    #[test]
+    fn parses_tls_rendezvous_ipv6_literal() {
+        let cfg = Config::parse(
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             listen=0.0.0.0:51820\ndevice=yip0\n\
+             obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
+             rendezvous=tls://[2001:db8::1]:443\n\
+             [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            cfg.rendezvous,
+            Some(Rendezvous::Tls { ref host, port }) if host == "2001:db8::1" && port == 443
+        ));
+    }
+
+    #[test]
+    fn tls_rendezvous_ipv6_literal_missing_close_bracket_is_error() {
+        let err = Config::parse(
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             listen=0.0.0.0:51820\ndevice=yip0\n\
+             obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
+             rendezvous=tls://[2001:db8::1:443\n\
+             [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
