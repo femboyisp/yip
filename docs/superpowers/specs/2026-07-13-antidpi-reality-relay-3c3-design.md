@@ -156,13 +156,16 @@ On a valid fresh `Register`:
 - Process the `Register` and send a framed, obfuscated reply
   (`[u16 len][obf envelope]`) back over the TLS stream.
 - Enter the frame loop: read `[u16 len][obf Message]` frames; on
-  `RelaySend { dst, payload }`, look up `dst`'s active registration — which may be
-  a **UDP source address** (UDP-connected peer) *or* **another TCP/TLS writer
-  channel** (TLS-connected peer) — and forward as `RelayDeliver` over whichever
-  transport that peer is on. The realistic hostile-network path is
-  **TLS-client-A ↔ relay ↔ TLS-client-B**, both over 443; UDP↔TLS bridging is
-  supported for mixed reachability.
-- On close/error, evict the `NodeId`'s TCP/TLS registration.
+  `RelaySend { dst, payload }`, look up `dst`'s **TLS writer channel** and
+  forward a framed `RelayDeliver` to it. The delivery is **best-effort**: on a
+  full destination channel the frame is dropped (the inner Noise/ARQ recovers),
+  never awaited — awaiting a full channel would let two mutually-relaying peers
+  wedge each other. The realistic hostile-network path is
+  **TLS-client-A ↔ relay ↔ TLS-client-B**, both over 443. **UDP↔TLS bridging is
+  out of scope** (deferred): a TLS-front peer's freshness state is kept separate
+  from the UDP `regs` map (see below), so a TLS peer is not UDP-discoverable and
+  a UDP `RelaySend` to a TLS-only peer is not bridged in 3c.3.
+- On close/error, evict the `NodeId`'s TLS writer-channel registration.
 
 ### 4.6 `Register` freshness field (wire addition)
 
@@ -216,13 +219,23 @@ decoy — so 3c.4 must implement this exactly.
 
 ## 6. Security & threat model
 
-1. **Probe-resistance == `obf_psk` secrecy.** A prober without `obf_psk` cannot
-   forge a `Register`, so it is always routed to the decoy and sees a real
-   website. If `obf_psk` **leaks**, a prober can forge a `Register` and unmask the
-   relay. This is the same boundary as all of 3a (compromise ⇒ fingerprintable,
-   not decryptable) and the same shape as REALITY's server-side `ShortId` secret.
-   The durable fix is **signed registrations (#37)**; cross-referenced, not solved
-   here.
+1. **Probe-resistance == `obf_psk` secrecy — with a probabilistic caveat.** A
+   prober without `obf_psk` is routed to the decoy and sees a real website. If
+   `obf_psk` **leaks**, a prober can forge a `Register` and unmask the relay —
+   the same boundary as all of 3a (compromise ⇒ fingerprintable, not decryptable)
+   and the same shape as REALITY's server-side `ShortId` secret.
+   **Honest caveat (final-review finding, tracked as #64):** the `yip-obf`
+   envelope is an *unauthenticated* keystream XOR (SipHash-CTR, not an AEAD), so
+   the discriminator is not a MAC — it is a structural match on the recovered
+   bytes (`ptype == RDV_TYPE`, `Register` tag, a plausible length), only ~16–21
+   effective bits. A *blind* prober (no `obf_psk`) therefore forges a false
+   `Upgrade` with probability ≈ 2⁻²¹ **per connection** — and each attempt costs
+   a full real-cert TLS handshake, so unmasking a relay this way needs on the
+   order of a million handshakes and yields only "this endpoint answered
+   non-decoy once." Practically expensive, but it means probe-resistance against
+   a blind forger is *probabilistic*, not absolute. Authenticated discrimination
+   (a MAC over the first frame, naturally provided by **signed registrations,
+   #37**) is the durable fix; #64 tracks the honest-accounting/hardening.
 2. **Replay horizon = registration TTL (`REG_TTL_MS` = 60 s).** The monotonic
    counter (§4.6) rejects a replayed `Register` — but the per-`NodeId` counter
    lives in soft state, so once a `NodeId` is swept (60 s idle) its last counter
