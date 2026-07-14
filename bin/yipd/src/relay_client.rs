@@ -152,6 +152,70 @@ fn run(host: &str, port: u16, sni: &str, obf_key: &[u8; 16], self_node: NodeId, 
     }
 }
 
+/// Write a whole framed message to the socketpair, or fail. `sock` is a
+/// `SOCK_STREAM` `UnixStream`, so a non-blocking `write()` can return a SHORT
+/// COUNT (n < len) when the send buffer is partially full; silently
+/// discarding the short count would truncate the `[u16 len]`-framed envelope
+/// and permanently desync the receiver's `FrameReader`. A partial write
+/// cannot be unwound, so on persistent backpressure this returns `Err` → the
+/// caller tears the TLS connection down and reconnects (fresh `FrameReader`s
+/// both sides).
+fn write_all_socketpair(sock_fd: RawFd, buf: &[u8]) -> io::Result<()> {
+    let mut off = 0;
+    let mut spins = 0u32;
+    const MAX_SPINS: u32 = 10_000;
+    while off < buf.len() {
+        match write_fd(sock_fd, &buf[off..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "socketpair write returned 0",
+                ))
+            }
+            Ok(n) => {
+                off += n;
+                spins = 0;
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                spins += 1;
+                if spins > MAX_SPINS {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "socketpair backpressure: giving up frame",
+                    ));
+                }
+                std::thread::yield_now();
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Drain every complete frame currently buffered in `sock_reader`, calling
+/// `emit` on each datagram. Fails closed and symmetric with the TLS-read
+/// side: `FrameReader::next` does NOT drain the bad bytes on a malformed
+/// frame, so ignoring the error and continuing would leave the same error
+/// recurring forever (a permanently wedged direction). Returning `Err`
+/// instead propagates out of `pump`, tearing the connection down so the
+/// caller reconnects with a fresh `FrameReader`.
+///
+/// Factored out of `pump`'s socketpair→TLS branch so the decode/fail-closed
+/// logic is unit-testable without a live TLS connection.
+fn drain_socketpair_frames(
+    sock_reader: &mut FrameReader,
+    mut emit: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    loop {
+        match sock_reader.next() {
+            Ok(Some(dg)) => emit(&dg)?,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Resolve `host:port` to one `SocketAddr` (re-resolved on every connect
 /// attempt so a relay IP change is picked up on the next reconnect).
 fn resolve(host: &str, port: u16) -> io::Result<SocketAddr> {
@@ -201,13 +265,7 @@ fn pump(
                     Ok(Some(dg)) => {
                         reframe_buf.clear();
                         frame_datagram(&dg, &mut reframe_buf)?;
-                        match write_fd(sock_fd, &reframe_buf) {
-                            Ok(_) => {}
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                            Err(e) => {
-                                eprintln!("relay_client: socketpair write error (dropped): {e}");
-                            }
-                        }
+                        write_all_socketpair(sock_fd, &reframe_buf)?;
                     }
                     Ok(None) => break,
                     Err(e) => return Err(e),
@@ -230,20 +288,11 @@ fn pump(
                     }
                 }
             }
-            loop {
-                match sock_reader.next() {
-                    Ok(Some(dg)) => {
-                        reframe_buf.clear();
-                        frame_datagram(&dg, &mut reframe_buf)?;
-                        write_all_tls(stream, poller, &reframe_buf)?;
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        eprintln!("relay_client: malformed socketpair frame, dropping: {e}");
-                        break;
-                    }
-                }
-            }
+            drain_socketpair_frames(&mut sock_reader, |dg| {
+                reframe_buf.clear();
+                frame_datagram(dg, &mut reframe_buf)?;
+                write_all_tls(stream, poller, &reframe_buf)
+            })?;
         }
 
         if last_reg.elapsed() >= Duration::from_millis(REG_KEEPALIVE_MS) {
@@ -283,6 +332,38 @@ mod tests {
         assert_eq!(c.next(), 1);
         assert_eq!(c.next(), 2);
         assert_eq!(c.next(), 3);
+    }
+
+    /// `FrameReader::next` rejects a zero length prefix as a malformed frame,
+    /// and — critically — does NOT drain the offending bytes, so the same
+    /// error would recur forever if the caller just logged and kept polling.
+    /// `drain_socketpair_frames` (factored out of `pump`'s socketpair→TLS
+    /// branch) must fail closed here: return `Err` rather than swallow it, so
+    /// `pump` tears the connection down and the caller reconnects with a
+    /// fresh `FrameReader` on both sides. This is the socketpair-side
+    /// sibling of the TLS-read side, which already failed closed on a
+    /// malformed frame before this fix.
+    #[test]
+    fn malformed_socketpair_frame_tears_down() {
+        let mut reader = FrameReader::default();
+        // A `[u16 len]` header of 0 is rejected by `FrameReader::next` as a
+        // bad frame length (zero-length frames are invalid).
+        reader.push(&[0x00, 0x00]);
+
+        let mut emitted = Vec::new();
+        let result = drain_socketpair_frames(&mut reader, |dg| {
+            emitted.push(dg.to_vec());
+            Ok(())
+        });
+
+        assert!(
+            result.is_err(),
+            "a malformed frame must tear the pump down (Err), not be silently dropped"
+        );
+        assert!(
+            emitted.is_empty(),
+            "no frame should have been emitted before the malformed one was hit"
+        );
     }
 
     /// Read one complete `[u16 len]`-framed datagram from a *blocking* TLS
