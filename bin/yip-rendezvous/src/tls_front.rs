@@ -15,6 +15,14 @@ pub struct TlsFrontCfg {
     pub obf_key: [u8; 16],
     pub decoy: Option<SocketAddr>,
     pub base: Instant,
+    /// Delivery channels for TLS-connected relay peers, keyed by `NodeId`.
+    /// Registered by `conn_tunnel::run_tunnel` on upgrade and removed on
+    /// disconnect; `RelaySend { dst }` routes here when `dst` is TLS-connected.
+    pub routes: Arc<
+        Mutex<
+            std::collections::HashMap<yip_rendezvous::NodeId, tokio::sync::mpsc::Sender<Vec<u8>>>,
+        >,
+    >,
 }
 
 /// Build a server TLS acceptor from PEM cert-chain + key files, configured to
@@ -115,6 +123,7 @@ mod tests {
             obf_key: [0u8; 16],
             decoy: None,
             base: Instant::now(),
+            routes: Arc::new(Mutex::new(std::collections::HashMap::new())),
         });
         tokio::spawn(run_tls_front(listener, acceptor, cfg));
 

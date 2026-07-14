@@ -95,7 +95,17 @@ pub async fn handle_connection(
             if stream.write_all(&reply).await.is_err() {
                 return;
             }
-            super::conn_tunnel::run_tunnel(stream, cfg, node).await;
+            // Hand any bytes read past the first frame to the tunnel
+            // (pipelined frames in the same TLS read must not be lost). The
+            // first frame's length prefix is buf[0..2]; it consumed
+            // 2+len bytes.
+            let consumed = 2 + usize::from(u16::from_be_bytes([buf[0], buf[1]]));
+            let prefix = if buf.len() > consumed {
+                buf.split_off(consumed)
+            } else {
+                Vec::new()
+            };
+            super::conn_tunnel::run_tunnel(stream, cfg, node, prefix).await;
         }
         _ => into_decoy(stream, &cfg, buf).await,
     }
@@ -274,6 +284,7 @@ mod tests {
             obf_key: yip_obf::derive_key(&[4u8; 32]),
             decoy: Some(decoy_addr),
             base: std::time::Instant::now(),
+            routes: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         });
         tokio::spawn(crate::tls_front::run_tls_front(listener, acceptor, cfg));
 

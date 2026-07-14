@@ -230,6 +230,7 @@ async fn main() -> std::io::Result<()> {
             obf_key,
             decoy: decoy_addr,
             base,
+            routes: Arc::new(Mutex::new(std::collections::HashMap::new())),
         });
         tokio::spawn(tls_front::run_tls_front(tcp, acceptor, cfg));
     }
