@@ -31,8 +31,10 @@ use std::time::{Duration, Instant};
 use boring::ssl::SslStream;
 
 use yip_io::epoll::{read_fd, write_fd, Epoll};
+use yip_io::poll::{Dispatch, DispatchOut, EgressDatagram};
 use yip_rendezvous::{encode, Message, NodeId};
 
+use crate::peer_manager::PeerManager;
 use crate::tls::{
     connect_and_handshake, drain_tls_read, frame_datagram, write_all_tls, FrameReader,
     INITIAL_BACKOFF_MS, MAX_BACKOFF_MS, TLS_FRAME_MAX,
@@ -71,15 +73,6 @@ pub(crate) fn build_register(obf_key: &[u8; 16], node: NodeId, counter: u64) -> 
 /// connection to the relay at `host:port` (SNI = `sni`), and runs forever:
 /// connect → handshake → **Register first** → pump → on any error, back off
 /// and reconnect.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into tunnel.rs's rendezvous::Tls dispatch in 3c.4 Task 6 \
-                  (currently a todo!() there); exercised directly by this module's \
-                  own integration test until then"
-    )
-)]
 pub(crate) fn spawn(
     host: String,
     port: u16,
@@ -299,6 +292,153 @@ fn pump(
             let reg = build_register(obf_key, self_node, counter.next());
             write_all_tls(stream, poller, &reg)?;
             last_reg = Instant::now();
+        }
+    }
+}
+
+// ── data-plane end (3c.4 Task 6) ────────────────────────────────────────────
+
+/// Fixed per-iteration pump cadence for [`run_relay_tls`]: `PeerManager::tick`
+/// must fire at least every 10 ms, mirroring `crate::tls::run_tls`'s `TICK_MS`
+/// (private to that module, so duplicated here — the same small-constant
+/// duplication `tls.rs`/`quic.rs` already use for their own per-module
+/// helpers rather than growing `pub(crate)` surface for one constant).
+const TICK_MS: i32 = 10;
+
+/// Take a `PeerManager` UDP outcome as owned data, decoupling it from the
+/// manager borrow. Duplicated from `crate::tls`'s private `owned_out` (same
+/// per-module small-helper duplication as `TICK_MS` above).
+fn owned_out(out: DispatchOut<'_>) -> (Option<Vec<u8>>, Vec<EgressDatagram>) {
+    match out {
+        DispatchOut::None => (None, Vec::new()),
+        DispatchOut::Tun(inner) => (Some(inner.to_vec()), Vec::new()),
+        DispatchOut::Udp(dgs) => (None, dgs.to_vec()),
+        DispatchOut::Both(inner, dgs) => (Some(inner.to_vec()), dgs.to_vec()),
+    }
+}
+
+/// Write a decoded inner frame to the TUN device (best-effort: a single failed
+/// write is logged and swallowed rather than tearing down the loop).
+/// Duplicated from `crate::tls`'s private `write_tun`.
+fn write_tun(tun_fd: RawFd, inner: &[u8]) {
+    if let Err(e) = write_fd(tun_fd, inner) {
+        eprintln!("relay_tls: tun write error: {e}");
+    }
+}
+
+/// Frame each of `egress`'s datagrams (`[u16 BE len]`-prefixed, mirroring the
+/// TLS-side framing) and write it to the socketpair via
+/// [`write_all_socketpair`] — the SAME fail-closed framed write the relay
+/// thread's own [`pump`] uses on its socketpair-read side, so persistent
+/// backpressure surfaces as an `Err` here too rather than silently wedging.
+/// `e.dst` is ignored: every egress datagram on this path is relay-destined,
+/// so there is exactly one place to send it — the relay thread on the other
+/// end of the socketpair.
+fn send_egress_to_relay_thread(
+    sock_fd: RawFd,
+    egress: &[EgressDatagram],
+    frame_buf: &mut Vec<u8>,
+) -> io::Result<()> {
+    for d in egress {
+        frame_buf.clear();
+        frame_datagram(&d.bytes, frame_buf)?;
+        write_all_socketpair(sock_fd, frame_buf)?;
+    }
+    Ok(())
+}
+
+/// The data-plane end of the 3c.4 TLS relay-dial path: drives [`PeerManager`]
+/// over the socketpair to [`spawn`]'s relay thread instead of a UDP socket.
+/// Mirrors `crate::tls::run_tls`'s pump ordering (readable-side → de-frame →
+/// `PeerManager::on_udp`; TUN-readable → `PeerManager::on_tun`; fixed
+/// [`TICK_MS`] cadence tick) with the two [`Epoll`]-watched fds being `sock`
+/// (`Ready.udp`) and `tun_fd` (`Ready.tun`) rather than a UDP socket and TUN.
+///
+/// All egress `PeerManager` produces here is already an obf'd RelaySend
+/// envelope addressed (by `EgressDatagram::dst`, ignored) at the relay — see
+/// [`crate::rendezvous::TlsRelayRendezvous`], which builds every
+/// rendezvous-facing datagram against `relay_addr`. Everything read off `sock`
+/// is an obf'd `RelayDeliver` envelope the relay thread already validated
+/// on-wire (it terminates the real TLS connection); a malformed *frame*
+/// (bad `[u16 len]` prefix) at this layer is nonetheless treated as fatal —
+/// this loop does not itself reconnect (the relay thread already owns
+/// reconnect-with-backoff for the TLS leg), so there is nothing safe to do but
+/// tear down and let the caller (`tunnel::run`) propagate the fatal error.
+///
+/// Only returns on a fatal I/O error (an `Epoll`/socketpair/TUN failure, or a
+/// malformed inbound frame).
+pub(crate) fn run_relay_tls(
+    tun_fd: RawFd,
+    manager: &mut PeerManager,
+    relay_addr: SocketAddr,
+    sock: UnixStream,
+) -> io::Result<()> {
+    sock.set_nonblocking(true)?;
+    let sock_fd = sock.as_raw_fd();
+    let poller = Epoll::new(sock_fd, tun_fd)?;
+
+    let mut reader = FrameReader::default();
+    let mut sock_read_buf = [0u8; TLS_FRAME_MAX];
+    let mut tun_read_buf = [0u8; TLS_FRAME_MAX];
+    let mut frame_buf: Vec<u8> = Vec::new();
+    let start = Instant::now();
+
+    loop {
+        let ready = poller.wait(TICK_MS)?;
+        let now_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        // 1. Socketpair-readable: inbound obf'd RelayDeliver envelopes from
+        //    the relay thread → de-frame → `PeerManager::on_udp`.
+        if ready.udp {
+            loop {
+                match read_fd(sock_fd, &mut sock_read_buf) {
+                    Ok(0) => break,
+                    Ok(n) => reader.push(&sock_read_buf[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            loop {
+                match reader.next() {
+                    Ok(Some(env)) => {
+                        let (tun, egress) = owned_out(manager.on_udp(relay_addr, &env, now_ms));
+                        if let Some(inner) = tun {
+                            write_tun(tun_fd, &inner);
+                        }
+                        send_egress_to_relay_thread(sock_fd, &egress, &mut frame_buf)?;
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        eprintln!("relay_tls: malformed inbound frame, tearing down: {e}");
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        // 2. TUN-readable: `PeerManager::on_tun` → relay-bound egress.
+        if ready.tun {
+            loop {
+                match read_fd(tun_fd, &mut tun_read_buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let egress = manager.on_tun(&tun_read_buf[..n], now_ms).to_vec();
+                        send_egress_to_relay_thread(sock_fd, &egress, &mut frame_buf)?;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        eprintln!("relay_tls: tun read error: {e}");
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 3. Cadence tick (feedback / keepalive / handshake retry / cover).
+        if let Some(egress) = manager.tick(now_ms).map(<[EgressDatagram]>::to_vec) {
+            send_egress_to_relay_thread(sock_fd, &egress, &mut frame_buf)?;
         }
     }
 }

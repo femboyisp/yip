@@ -104,18 +104,10 @@ impl Rendezvous for ConfiguredServerRendezvous {
 /// The 3c.4 relay-dial client's `Rendezvous` view: `Register` is owned by the
 /// relay thread (so `register` is `None`), and `relay`/`parse` behave exactly
 /// like the UDP impl but addressed at the relay's routing-key `SocketAddr`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into PeerManager in a later 3c.4 task")
-)]
 pub struct TlsRelayRendezvous {
     relay_addr: SocketAddr,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into PeerManager in a later 3c.4 task")
-)]
 impl TlsRelayRendezvous {
     pub fn new(relay_addr: SocketAddr) -> Self {
         Self { relay_addr }

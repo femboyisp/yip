@@ -30,8 +30,9 @@
 //! 30 ms feedback interval.
 
 use std::io;
-use std::net::UdpSocket;
+use std::net::{ToSocketAddrs, UdpSocket};
 use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::process::Command;
 
 use yip_device::{DeviceKind, TunTap};
@@ -65,16 +66,37 @@ pub fn run(config: Config) -> io::Result<()> {
     let mode = config.device_kind;
     // A configured rendezvous server enables lazy Direct→Punch→Relay peer
     // bring-up; with none, `PeerManager` is pure-2a (direct endpoints only).
-    let rendezvous: Option<Box<dyn crate::rendezvous::Rendezvous>> =
-        config.rendezvous.map(|rdv| match rdv {
-            crate::config::Rendezvous::Udp(addr) => {
-                Box::new(crate::rendezvous::ConfiguredServerRendezvous::new(addr))
-                    as Box<dyn crate::rendezvous::Rendezvous>
-            }
-            crate::config::Rendezvous::Tls { .. } => {
-                todo!("3c.4 Task 6 wires the TLS relay dispatch")
-            }
-        });
+    //
+    // `Rendezvous::Tls { host, port }` (3c.4, rendezvous=tls://) resolves
+    // `host:port` to a routing-key `SocketAddr` up front and builds
+    // `TlsRelayRendezvous` against it; `relay_tls` carries `(host, port,
+    // relay_addr)` forward to the transport dispatch below, which uses it to
+    // spawn `relay_client::spawn` and enter `relay_client::run_relay_tls`
+    // instead of a UDP-socket driver.
+    let mut relay_tls: Option<(String, u16, std::net::SocketAddr)> = None;
+    let rendezvous: Option<Box<dyn crate::rendezvous::Rendezvous>> = match &config.rendezvous {
+        None => None,
+        Some(crate::config::Rendezvous::Udp(addr)) => Some(Box::new(
+            crate::rendezvous::ConfiguredServerRendezvous::new(*addr),
+        )
+            as Box<dyn crate::rendezvous::Rendezvous>),
+        Some(crate::config::Rendezvous::Tls { host, port }) => {
+            let relay_addr = (host.as_str(), *port)
+                .to_socket_addrs()?
+                .next()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("rendezvous relay {host}:{port} resolved to no addresses"),
+                    )
+                })?;
+            relay_tls = Some((host.clone(), *port, relay_addr));
+            Some(
+                Box::new(crate::rendezvous::TlsRelayRendezvous::new(relay_addr))
+                    as Box<dyn crate::rendezvous::Rendezvous>,
+            )
+        }
+    };
     // Build the mesh membership directory (2c) only when the full mesh config is
     // present (a trusted CA set, our cert, the signed root set, our record-
     // signing key, and the network id). Absent any of these, membership is
@@ -102,10 +124,7 @@ pub fn run(config: Config) -> io::Result<()> {
     };
     // `relay_only` (rendezvous=tls://, 3c.4) starts every peer straight in
     // Relaying and skips Direct/UDP-punch, since UDP is blocked on that path.
-    // Task 6 wires the TLS relay dispatch itself (currently `todo!()` above);
-    // until then this always takes the UDP-path `false`, byte-identical to
-    // pre-3c.4 behavior.
-    let relay_only = false;
+    let relay_only = relay_tls.is_some();
     let mut manager = PeerManager::new(
         config.local_private,
         config.local_public,
@@ -197,6 +216,38 @@ pub fn run(config: Config) -> io::Result<()> {
             &tls_peers,
             config.listen,
             &config.tls_sni,
+        );
+    }
+
+    // TLS relay-dial (`rendezvous=tls://`, 3c.4): straight-to-relay, no
+    // Direct/UDP-punch (`relay_only` above already put `manager` in that
+    // mode). A dedicated thread (`relay_client::spawn`) owns the one
+    // browser-parrot TLS connection to the relay and speaks obf'd
+    // Register/RelaySend/RelayDeliver envelopes over it; this thread and
+    // `run_relay_tls` communicate over a `UnixStream::pair()` socketpair,
+    // each direction carrying the SAME `[u16 BE len]`-framed, already-obf'd
+    // envelope bytes `crate::tls`'s framing uses. `sock` (the UDP socket
+    // bound above) goes unused on this path, same as the QUIC/TLS paths
+    // above — UDP is exactly what this path exists to avoid. The poll
+    // driver is forced (not `YIP_USE_URING`-gated): `run_relay_tls` is a
+    // dedicated `Epoll`-based pump, structurally the same class of loop as
+    // `run_quic`/`run_tls`, not `yip_io::uring`/`yip_io::poll::run_poll`.
+    if let Some((host, port, relay_addr)) = relay_tls {
+        let obf_key = yip_obf::derive_key(
+            config
+                .obf_psk
+                .as_ref()
+                .expect("rendezvous=tls:// requires obf_psk (enforced at config load)"),
+        );
+        let self_node = yip_rendezvous::node_id(&config.local_public);
+        let (relay_thread_sock, data_plane_sock) = UnixStream::pair()?;
+        let sni = host.clone();
+        crate::relay_client::spawn(host, port, sni, obf_key, self_node, relay_thread_sock);
+        return crate::relay_client::run_relay_tls(
+            tun_fd,
+            &mut manager,
+            relay_addr,
+            data_plane_sock,
         );
     }
 
