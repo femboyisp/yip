@@ -100,6 +100,12 @@ pub fn run(config: Config) -> io::Result<()> {
         }
         _ => None,
     };
+    // `relay_only` (rendezvous=tls://, 3c.4) starts every peer straight in
+    // Relaying and skips Direct/UDP-punch, since UDP is blocked on that path.
+    // Task 6 wires the TLS relay dispatch itself (currently `todo!()` above);
+    // until then this always takes the UDP-path `false`, byte-identical to
+    // pre-3c.4 behavior.
+    let relay_only = false;
     let mut manager = PeerManager::new(
         config.local_private,
         config.local_public,
@@ -107,6 +113,7 @@ pub fn run(config: Config) -> io::Result<()> {
         mode,
         rendezvous,
         membership,
+        relay_only,
     );
     // Enable anti-DPI obfuscation (3a) when the network `obf_psk` is configured.
     // `None` leaves the manager on the byte-identical 2a/2b/2c plaintext path.

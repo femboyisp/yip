@@ -342,6 +342,14 @@ pub struct PeerManager {
     /// [`PeerManager::set_data_symbol_size`], set once before the event loop
     /// starts, like `obf_key`/`cover_traffic_ms`.
     data_symbol_size: u16,
+    /// When `true`, every `PathState` (initial peers at construction, and
+    /// members admitted later via `admit_member`) is created via
+    /// `PathState::relay_only` instead of `PathState::new` — the
+    /// `rendezvous=tls://` client (3c.4), where UDP (hence Direct and
+    /// hole-punch) is blocked. Set once at construction from the
+    /// `PeerManager::new` parameter of the same name; `false` reproduces the
+    /// UDP-path Direct→Punch→Relay escalation byte-identically.
+    relay_only: bool,
 }
 
 /// MTU budget (bytes) used to size obfuscation padding: handshakes are padded
@@ -378,6 +386,7 @@ impl PeerManager {
         mode: TunnelMode,
         rendezvous: Option<Box<dyn Rendezvous>>,
         membership: Option<Membership>,
+        relay_only: bool,
     ) -> Self {
         let has_rendezvous = rendezvous.is_some();
         let mut peers = Vec::with_capacity(peers_cfg.len());
@@ -391,7 +400,14 @@ impl PeerManager {
             // A peer with a configured endpoint starts in the Direct stage with
             // that endpoint seeded; a rendezvous-only peer starts in Punching
             // (if a server is configured) or Failed. See `PathState::new`.
-            let mut path = PathState::new(p.endpoint.is_some(), has_rendezvous, 0);
+            // `relay_only` (rendezvous=tls://, 3c.4) instead starts every peer
+            // straight in Relaying — UDP is blocked there, so Direct/Punch would
+            // just waste ~8 s failing.
+            let mut path = if relay_only {
+                PathState::relay_only(0)
+            } else {
+                PathState::new(p.endpoint.is_some(), has_rendezvous, 0)
+            };
             if let Some(ep) = p.endpoint {
                 path.on_direct_addr(ep);
             }
@@ -433,6 +449,7 @@ impl PeerManager {
             junk_rng: yip_obf::XorShift64::from_getrandom(),
             cover_traffic_ms: None,
             data_symbol_size: DEFAULT_DATA_SYMBOL_SIZE,
+            relay_only,
         };
         // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
         // exactly like configured peers: seed them into the peer table so an
@@ -465,7 +482,11 @@ impl PeerManager {
         let idx = self.peers.len();
         let addr = node_addr(&pubkey);
         let node = node_id(&pubkey);
-        let mut path = PathState::new(!endpoints.is_empty(), self.rendezvous.is_some(), now_ms);
+        let mut path = if self.relay_only {
+            PathState::relay_only(now_ms)
+        } else {
+            PathState::new(!endpoints.is_empty(), self.rendezvous.is_some(), now_ms)
+        };
         for ep in &endpoints {
             path.on_direct_addr(*ep);
         }
@@ -2310,6 +2331,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             None,
+            false,
         );
 
         let addr_a = node_addr(&peer_a.public_key);
@@ -2331,6 +2353,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             None,
+            false,
         );
         let addr_b = node_addr(&peer_b.public_key);
 
@@ -2354,6 +2377,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             None,
+            false,
         );
 
         // A bare IPv4 packet: first nibble is 4, not 6.
@@ -2372,6 +2396,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             None,
+            false,
         );
 
         let inner = vec![0x45u8; 40]; // IPv4, matches no by_addr entry
@@ -2388,6 +2413,7 @@ mod tests {
             TunnelMode::L2Tap,
             None,
             None,
+            false,
         );
 
         // An arbitrary Ethernet-looking frame; L2 mode ignores its contents
@@ -2407,6 +2433,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             None,
+            false,
         );
 
         // by_addr maps each peer's node_addr to its index.
@@ -2461,6 +2488,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             None,
+            false,
         );
 
         // A valid HandshakeInit from a real, but unconfigured, key.
@@ -2479,7 +2507,15 @@ mod tests {
     #[test]
     fn local_addr_matches_node_addr_of_local_pub() {
         let local_pub = [42u8; 32];
-        let pm = PeerManager::new([1u8; 32], local_pub, &[], TunnelMode::L3Tun, None, None);
+        let pm = PeerManager::new(
+            [1u8; 32],
+            local_pub,
+            &[],
+            TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
         assert_eq!(pm.local_addr(), node_addr(&local_pub));
     }
 
@@ -2491,7 +2527,15 @@ mod tests {
     /// mode plumbing lands in 3c.1 Tasks 4/5).
     #[test]
     fn data_symbol_size_defaults_to_1200_and_is_settable() {
-        let mut pm = PeerManager::new([1u8; 32], [2u8; 32], &[], TunnelMode::L3Tun, None, None);
+        let mut pm = PeerManager::new(
+            [1u8; 32],
+            [2u8; 32],
+            &[],
+            TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
         assert_eq!(pm.data_symbol_size, DEFAULT_DATA_SYMBOL_SIZE);
         assert_eq!(pm.data_symbol_size, 1200);
         pm.set_data_symbol_size(1350);
@@ -2552,6 +2596,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             None,
+            false,
         );
         let mut pm_b = PeerManager::new(
             kp_b.private,
@@ -2560,6 +2605,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             None,
+            false,
         );
 
         // Each side sends a HandshakeInit (triggered by its own outbound TUN
@@ -2618,6 +2664,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             None,
+            false,
         );
 
         // The initiator's HandshakeInit (built out-of-band, as if received).
@@ -2660,6 +2707,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             None,
+            false,
         );
 
         // Kick off a lazy handshake with an outbound TUN packet.
@@ -2719,6 +2767,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             None,
+            false,
         );
 
         // Stream far more packets than the cap while the peer is Handshaking.
@@ -2821,6 +2870,7 @@ mod tests {
             TunnelMode::L3Tun,
             Some(rdv),
             None,
+            false,
         );
         (pm, sent)
     }
@@ -2921,6 +2971,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             None,
+            false,
         );
 
         let out = pm.on_tun(&dummy_tun_pkt(), 0).to_vec();
@@ -3458,6 +3509,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             Some(membership),
+            false,
         );
         assert!(pm.peers.is_empty());
 
@@ -3528,6 +3580,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             Some(membership),
+            false,
         );
         assert_eq!(
             pm.peers.len(),
@@ -3574,6 +3627,7 @@ mod tests {
                 TunnelMode::L3Tun,
                 None,
                 Some(membership_for(&ca, local.public)),
+                false,
             );
             let stranger_sign = SigningKey::from_bytes(&[210u8; 32]);
             let cert = mk_cert(
@@ -3605,6 +3659,7 @@ mod tests {
                 TunnelMode::L3Tun,
                 None,
                 Some(membership_for(&ca, local.public)),
+                false,
             );
             let (_hs, init_pkt) =
                 HandshakeState::start_initiator(&stranger.private, &local.public, &[]).unwrap();
@@ -3624,6 +3679,7 @@ mod tests {
                 TunnelMode::L3Tun,
                 None,
                 Some(membership_for(&ca, local.public)),
+                false,
             );
             let stranger_sign = SigningKey::from_bytes(&[211u8; 32]);
             let bad_cert = mk_cert(
@@ -3658,6 +3714,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             None,
+            false,
         );
         let unknown = generate_keypair();
         let pkt = ipv6_pkt_to(node_addr(&unknown.public));
@@ -3705,6 +3762,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             Some(membership_for(&ca, local.public)),
+            false,
         );
 
         // Splice in a live Established session reaching `committed_ep`.
@@ -3776,6 +3834,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             Some(membership_for(&ca, local.public)),
+            false,
         );
         const TAG: u64 = 0x9988_7766_5544_3322;
         pm.peers[0].state = PeerState::Established(Box::new(fake_established_dataplane(TAG, src)));
@@ -3849,6 +3908,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             Some(membership_for(&ca, local.public)),
+            false,
         );
         const TAG: u64 = 0x1357_9bdf_2468_ace0;
         pm.peers[0].state =
@@ -3914,6 +3974,7 @@ mod tests {
                 TunnelMode::L3Tun,
                 None,
                 Some(membership_for(&ca, local.public)),
+                false,
             );
             let init_out = pm.on_tun(&dummy_tun_pkt(), 0).to_vec();
             assert_eq!(init_out.len(), 1);
@@ -3943,6 +4004,7 @@ mod tests {
                 TunnelMode::L3Tun,
                 None,
                 Some(membership_for(&ca, local.public)),
+                false,
             );
             let init_out = pm.on_tun(&dummy_tun_pkt(), 0).to_vec();
             let init_pkt = init_out[0].bytes.clone();
@@ -4026,7 +4088,15 @@ mod tests {
     fn obf_on_data_roundtrips_through_send_and_on_udp() {
         let peer_ep: SocketAddr = "10.0.0.2:2000".parse().unwrap();
         let peer = peer_cfg(2, "10.0.0.2:2000");
-        let mut pm = PeerManager::new([9u8; 32], [8u8; 32], &[peer], TunnelMode::L3Tun, None, None);
+        let mut pm = PeerManager::new(
+            [9u8; 32],
+            [8u8; 32],
+            &[peer],
+            TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
         pm.set_obf_psk(Some([0x11u8; 32]));
 
         // Splice the RESPONDER-side DataPlane so pm can open the initiator's
@@ -4086,6 +4156,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             None,
+            false,
         );
         let psk = [0x22u8; 32];
         pm.set_obf_psk(Some(psk));
@@ -4140,6 +4211,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             None,
+            false,
         );
         pm.set_obf_psk(Some([0x44u8; 32]));
 
@@ -4161,7 +4233,15 @@ mod tests {
     #[test]
     fn build_junk_roundtrips_to_junk_type() {
         let peer = peer_cfg(5, "10.0.0.5:5000");
-        let mut pm = PeerManager::new([1u8; 32], [2u8; 32], &[peer], TunnelMode::L3Tun, None, None);
+        let mut pm = PeerManager::new(
+            [1u8; 32],
+            [2u8; 32],
+            &[peer],
+            TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
 
         let dg = pm.build_junk();
         assert_eq!(
@@ -4184,7 +4264,15 @@ mod tests {
         const TAG: u64 = 0xABCD_EF01;
         let peer_ep: SocketAddr = "10.0.0.6:6000".parse().unwrap();
         let peer = peer_cfg(6, "10.0.0.6:6000");
-        let mut pm = PeerManager::new([3u8; 32], [4u8; 32], &[peer], TunnelMode::L3Tun, None, None);
+        let mut pm = PeerManager::new(
+            [3u8; 32],
+            [4u8; 32],
+            &[peer],
+            TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
         pm.set_obf_psk(Some([0x66u8; 32]));
 
         pm.peers[0].state =
@@ -4221,7 +4309,15 @@ mod tests {
     #[test]
     fn obf_on_network_keyed_junk_from_unknown_src_is_dropped_no_panic() {
         let peer = peer_cfg(7, "10.0.0.7:7000");
-        let mut pm = PeerManager::new([5u8; 32], [6u8; 32], &[peer], TunnelMode::L3Tun, None, None);
+        let mut pm = PeerManager::new(
+            [5u8; 32],
+            [6u8; 32],
+            &[peer],
+            TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
         let psk = [0x88u8; 32];
         pm.set_obf_psk(Some(psk));
         let obf_key = yip_obf::derive_key(&psk);
@@ -4245,7 +4341,15 @@ mod tests {
     #[test]
     fn obf_off_junk_shaped_datagram_takes_unchanged_plaintext_path() {
         let peer = peer_cfg(8, "10.0.0.8:8000");
-        let mut pm = PeerManager::new([7u8; 32], [8u8; 32], &[peer], TunnelMode::L3Tun, None, None);
+        let mut pm = PeerManager::new(
+            [7u8; 32],
+            [8u8; 32],
+            &[peer],
+            TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
         // No set_obf_psk ⇒ obf_key is None ⇒ deobf_ingress/build_junk's JUNK
         // handling is never consulted.
         assert!(pm.obf_key.is_none());
@@ -4275,6 +4379,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             None,
+            false,
         );
         let psk = [0x99u8; 32];
         pm.set_obf_psk(Some(psk));
@@ -4325,6 +4430,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             None,
+            false,
         );
         pm.set_obf_psk(Some([0xAAu8; 32]));
         let target: SocketAddr = "203.0.113.10:10000".parse().unwrap();
@@ -4357,6 +4463,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             None,
+            false,
         );
         assert!(pm.obf_key.is_none());
         let target: SocketAddr = "203.0.113.11:11000".parse().unwrap();
@@ -4416,6 +4523,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             None,
+            false,
         );
         let psk = [0xCCu8; 32];
         pm.set_obf_psk(Some(psk));
@@ -4477,6 +4585,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             None,
+            false,
         );
         // No set_obf_psk ⇒ obfuscation disabled.
         let (_hs, init_pkt) =
@@ -4700,6 +4809,7 @@ mod tests {
             TunnelMode::L3Tun,
             None,
             None,
+            false,
         );
         if obf_on {
             pm.set_obf_psk(Some([0xAAu8; 32]));

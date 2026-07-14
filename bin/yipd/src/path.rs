@@ -48,6 +48,7 @@ pub struct PathState {
     stage_started_ms: u64,
     committed: bool,
     looked_up: bool,
+    relay_only: bool,
 }
 
 impl PathState {
@@ -67,7 +68,19 @@ impl PathState {
             stage_started_ms: now_ms,
             committed: false,
             looked_up: false,
+            relay_only: false,
         }
+    }
+
+    /// A path that goes straight to Relay and never attempts Direct/UDP-punch —
+    /// used by the `rendezvous=tls://` client (3c.4), where UDP (hence Direct
+    /// and hole-punch) is blocked, so relaying from the first packet is correct
+    /// and avoids the ~8 s of failing Direct/Punch windows.
+    pub fn relay_only(now_ms: u64) -> Self {
+        let mut s = Self::new(false, true, now_ms);
+        s.enter(PathStage::Relaying, now_ms);
+        s.relay_only = true;
+        s
     }
 
     pub fn stage(&self) -> PathStage {
@@ -111,6 +124,9 @@ impl PathState {
     }
 
     pub fn advance(&mut self, now_ms: u64) -> PathAction {
+        if self.relay_only {
+            return PathAction::Relay;
+        }
         if self.committed {
             return PathAction::Idle;
         }
@@ -244,6 +260,24 @@ mod tests {
         p.reset(1000);
         assert!(matches!(p.advance(1000), PathAction::Probe(x) if x == a("10.0.0.2:51820")));
         assert_eq!(p.stage(), PathStage::Direct);
+    }
+
+    #[test]
+    fn relay_only_starts_and_stays_in_relay() {
+        let mut p = PathState::relay_only(0);
+        assert_eq!(
+            p.stage(),
+            PathStage::Relaying,
+            "relay-only starts in Relaying"
+        );
+        for t in [1_000, 5_000, 30_000, 120_000] {
+            assert_eq!(
+                p.advance(t),
+                PathAction::Relay,
+                "relay-only stays Relay (t={t})"
+            );
+            assert_eq!(p.stage(), PathStage::Relaying);
+        }
     }
 
     #[test]
