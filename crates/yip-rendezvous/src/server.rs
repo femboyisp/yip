@@ -514,6 +514,71 @@ mod tests {
         );
     }
 
+    /// The TLS freshness gate rejects a stale/equal counter and accepts a
+    /// strictly-greater one (mirrors the UDP-path freshness, on `tls_seen`).
+    #[test]
+    fn register_if_fresh_tls_rejects_stale_and_accepts_advance() {
+        let mut s = RendezvousServer::new(0);
+        let n = node_id(&[2u8; 32]);
+        assert!(s.register_if_fresh_tls(n, 5, 0), "first-seen accepted");
+        assert!(
+            !s.register_if_fresh_tls(n, 5, 1),
+            "equal counter rejected (replay)"
+        );
+        assert!(!s.register_if_fresh_tls(n, 3, 1), "lower counter rejected");
+        assert!(
+            s.register_if_fresh_tls(n, 6, 1),
+            "strictly-greater counter accepted"
+        );
+    }
+
+    /// `handle` returns nothing for messages the server only ever *sends*
+    /// (client-bound), never receives.
+    #[test]
+    fn handle_ignores_server_bound_only_messages() {
+        let mut s = RendezvousServer::new(0);
+        let n = node_id(&[3u8; 32]);
+        let a = addr("10.0.0.9:40000");
+        assert!(
+            s.handle(
+                a,
+                Message::RelayDeliver {
+                    src: n,
+                    payload: vec![1, 2, 3]
+                },
+                0
+            )
+            .is_empty(),
+            "RelayDeliver is server->client only"
+        );
+        assert!(
+            s.handle(a, Message::NotFound { node: n }, 0).is_empty(),
+            "NotFound is server->client only"
+        );
+    }
+
+    /// A source's per-window message budget resets once `RATE_WINDOW_MS` has
+    /// elapsed: a `Lookup` dropped while the window is full flows again after.
+    #[test]
+    fn rate_window_resets_after_interval() {
+        let mut s = RendezvousServer::new(0);
+        let a = addr("10.0.0.5:40000");
+        let n = node_id(&[4u8; 32]);
+        // Exhaust the window at t=0 (Lookups return NotFound but still count).
+        for _ in 0..MAX_MSGS_PER_WINDOW {
+            s.handle(a, Message::Lookup { node: n }, 0);
+        }
+        assert!(
+            s.handle(a, Message::Lookup { node: n }, 0).is_empty(),
+            "over budget within the window ⇒ dropped"
+        );
+        assert!(
+            !s.handle(a, Message::Lookup { node: n }, RATE_WINDOW_MS)
+                .is_empty(),
+            "window reset after RATE_WINDOW_MS ⇒ reply flows again"
+        );
+    }
+
     #[test]
     fn rate_capacity_guard_blocks_new_source_but_services_existing() {
         let mut s = RendezvousServer::new(0);

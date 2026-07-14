@@ -207,6 +207,17 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_invalid_address_family() {
+        // A PeerInfo whose address family byte is neither 4 nor 6 must be
+        // rejected (fail-closed), not misparsed.
+        let mut buf = vec![Tag::PeerInfo as u8];
+        buf.extend_from_slice(&[7u8; 16]); // node
+        buf.push(99); // invalid family (valid are 4 / 6)
+        buf.extend_from_slice(&[0u8; 4]);
+        assert_eq!(decode(&buf), None);
+    }
+
+    #[test]
     fn all_messages_roundtrip() {
         let n = [1u8; 16];
         let v4: SocketAddr = "203.0.113.9:5000".parse().unwrap();
