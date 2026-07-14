@@ -130,14 +130,63 @@ There is no `--help`; running with no arguments prints the usage above.
 The standalone rendezvous + blind-relay server (no TUN, no tunnel keys).
 
 ```
-yip-rendezvous <listen-addr>                 e.g. yip-rendezvous 0.0.0.0:51821
-yip-rendezvous <listen-addr> --obf-psk <hex64>   obfuscated networks (must match
-                                                 the nodes' obf_psk)
+yip-rendezvous <listen-addr> [--obf-psk <hex64>]
+yip-rendezvous <listen-addr> --obf-psk <hex64> \
+               --listen-tcp <addr> --tls-cert <path> --tls-key <path> [--decoy <addr>]
 yip-rendezvous --version | -V
 ```
 
+- `<listen-addr>` — UDP bind address, e.g. `0.0.0.0:51821`.
+- `--obf-psk <hex64>` — obfuscated networks (must match the nodes' `obf_psk`).
+
 It logs `relay-forwarded=<N>` to stderr every 5 s (how many datagrams the blind
 relay has forwarded — 0 means everything went direct/hole-punched).
+
+### TLS Trojan front (`--listen-tcp`, anti-DPI milestone 3c.3)
+
+By default `yip-rendezvous` is UDP-only. `--listen-tcp` opts it into a second,
+**real** TLS 1.3 listener — a Trojan-style front that survives an *active*
+probe (a censor connecting to the relay itself and checking whether a real
+site answers), which the `transport=tls` peer-data costume (3c.2) does not.
+
+| Flag | Value | Notes |
+|---|---|---|
+| `--listen-tcp <addr>` | e.g. `0.0.0.0:443` | Enables the TLS front. Absent ⇒ UDP-only, unchanged. |
+| `--tls-cert <path>` | PEM chain | The real domain's cert chain (e.g. Let's Encrypt `fullchain.pem`), for a domain that genuinely resolves to this host. |
+| `--tls-key <path>` | PEM key | The matching private key (`privkey.pem`). |
+| `--decoy <addr>` | e.g. `127.0.0.1:8080` | A real local website to reverse-proxy non-tunnel connections to. Absent ⇒ a bundled minimal static `200 OK` page — a weaker fallback (a page that never changes is itself a tell). |
+
+`--obf-psk` is **required** with `--listen-tcp` — it is the tunnel
+discriminator (see threat model below), not merely the datagram-obfuscation
+key.
+
+The relay terminates the real TLS 1.3 connection with the real cert, then
+trial-reads the first framed application message. A fresh, `obf_psk`-obfuscated
+`Register` (carrying a monotonic `counter`, checked against the last counter
+seen for that node) upgrades the connection to a relay tunnel; anything else —
+an HTTP probe, a scanner, a plain browser, garbage bytes, or silence — is
+transparently reverse-proxied to the decoy backend. A prober who does not hold
+`obf_psk` therefore sees only an ordinary HTTPS site.
+
+On the `yipd` side, a `rendezvous` value of the form `tls://host:443` is
+reserved to mean "dial this relay's TLS front" (as opposed to the plain
+`IP:port` UDP form). **The client dialer that speaks this scheme ships in
+milestone 3c.4** — it is not implemented yet.
+
+**Threat model.** Probe-resistance is **exactly as strong as `obf_psk`
+secrecy**: without it, a prober can never forge a valid `Register` and is
+always routed to the decoy. If the network-wide `obf_psk` leaks, a prober can
+forge a `Register` and unmask the relay — the same trust boundary as the rest
+of 3a (compromise makes the relay fingerprintable, not the tunnel's traffic
+decryptable; the relay is still blind to inner tunnel plaintext either way).
+The durable fix is **signed registrations (issue #37)**, not yet built. The
+monotonic-counter replay check is bounded by the registration TTL (60 s):
+once a node's soft state is swept, its last counter is forgotten and a
+captured envelope could in principle be replayed again — defense-in-depth
+against a leaked/defector-held capture, not the primary probe defense (a
+passive on-path censor cannot capture the `Register` at all, since it rides
+inside TLS). There is also a known, tracked timing-parity gap for a fully
+silent connection on the decoy handoff path (**issue #63**), not yet closed.
 
 ---
 
