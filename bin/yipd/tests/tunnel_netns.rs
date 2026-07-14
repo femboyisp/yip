@@ -811,6 +811,50 @@ fn tls_classified_as_tls() {
 }
 
 #[test]
+fn reality_probe_serves_decoy() {
+    // The 3c.3 headline money test: an active prober (curl, garbage bytes
+    // over TLS, an idle connection) dialing the relay's TLS Trojan front
+    // must see only the decoy site — never rendezvous/tunnel behavior — and
+    // the relay must not hard-close a connection at its internal ~3s
+    // classification timeout (that would itself be a relay-shaped timing
+    // signature). See run-netns-reality-probe.sh for the full assertion set
+    // (including the #63 follow-up: sub-second decoy-connect timing parity
+    // for a fully-silent connection is a known, tracked gap, not gated here).
+    //
+    // Requires root: netns creation.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP reality_probe_serves_decoy: needs root (run under sudo in CI)");
+        return;
+    }
+    let rdv = yip_rendezvous_bin();
+    if !rdv.exists() {
+        eprintln!(
+            "SKIP reality_probe_serves_decoy: yip-rendezvous binary not found at {}; \
+             run `cargo build -p yip-rendezvous-bin` first",
+            rdv.display()
+        );
+        return;
+    }
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/run-netns-reality-probe.sh"
+    );
+    let status = Command::new("bash").arg(script).arg(&rdv).status().unwrap();
+    assert!(
+        status.success(),
+        "probe-resistance oracle failed (an active probe was not served the decoy, or the \
+         relay hard-closed an idle connection at its ~3s classification timeout)"
+    );
+}
+
+#[test]
 fn flowshape_not_obviously_constant() {
     // Lightweight deterministic flow-shape structural check (3b Task 7,
     // Deliverable 2/3) — NOT the nDPId -A ML harness. Packet-count analogue

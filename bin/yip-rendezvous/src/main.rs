@@ -3,8 +3,15 @@
 //! read-timeout cadence. No TUN, no tunnel keys, no unsafe.
 #![forbid(unsafe_code)]
 
-use std::net::UdpSocket;
+mod conn;
+mod conn_tunnel;
+mod tls_front;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use tokio::sync::Mutex;
 
 use yip_rendezvous::{decode, encode, Message, RendezvousServer};
 
@@ -38,6 +45,24 @@ fn wrap_reply(obf_key: Option<&[u8; 16]>, reply: &Message) -> Vec<u8> {
         Some(key) => yip_obf::obfuscate(key, yip_obf::RDV_TYPE, &out, random_pad(OBF_PAD_MAX)),
         None => out,
     }
+}
+
+/// Largest length-prefixed TLS-front frame (a Register during classification,
+/// or any framed message once upgraded onto the relay tunnel) that will ever
+/// be accepted. Shared by `conn`'s classifier and `conn_tunnel::drain_frames`
+/// so the two paths' caps can never desync (M8).
+pub(crate) const TLS_FRAME_CAP: usize = 2048;
+
+/// Frame a rendezvous Message for the TLS byte-stream: `[u16 BE len][obf env]`.
+pub(crate) fn frame_obf(obf_key: &[u8; 16], msg: &Message) -> Vec<u8> {
+    let mut plain = Vec::new();
+    encode(msg, &mut plain);
+    let env = yip_obf::obfuscate(obf_key, yip_obf::RDV_TYPE, &plain, random_pad(OBF_PAD_MAX));
+    let mut out = Vec::with_capacity(2 + env.len());
+    let len = u16::try_from(env.len()).unwrap_or(u16::MAX);
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(&env);
+    out
 }
 
 /// Maximum random padding (bytes) added to an obfuscated rendezvous-message
@@ -86,11 +111,16 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
 }
 
 fn usage_exit() -> ! {
-    eprintln!("usage: yip-rendezvous <listen-addr> [--obf-psk <hex64>]   e.g. 0.0.0.0:51821");
+    eprintln!(
+        "usage: yip-rendezvous <listen-addr> [--obf-psk <hex64>] \
+         [--listen-tcp <addr> --tls-cert <path> --tls-key <path> [--decoy <addr>]]\n\
+         e.g. 0.0.0.0:51821"
+    );
     std::process::exit(2);
 }
 
-fn main() -> std::io::Result<()> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> std::io::Result<()> {
     let mut args = std::env::args();
     let _prog = args.next();
 
@@ -100,6 +130,11 @@ fn main() -> std::io::Result<()> {
     // (expecting `yip_obf::RDV_TYPE`) before `Message::decode`, and every
     // reply is obfuscated before `send_to`.
     let mut obf_psk: Option<[u8; 32]> = None;
+    // TCP/TLS Trojan front (3c.3), all opt-in via `--listen-tcp`.
+    let mut listen_tcp: Option<String> = None;
+    let mut tls_cert: Option<String> = None;
+    let mut tls_key: Option<String> = None;
+    let mut decoy: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -120,6 +155,34 @@ fn main() -> std::io::Result<()> {
                     }
                 }
             }
+            "--listen-tcp" => {
+                let Some(v) = args.next() else {
+                    eprintln!("--listen-tcp requires an address argument");
+                    std::process::exit(2);
+                };
+                listen_tcp = Some(v);
+            }
+            "--tls-cert" => {
+                let Some(v) = args.next() else {
+                    eprintln!("--tls-cert requires a path argument");
+                    std::process::exit(2);
+                };
+                tls_cert = Some(v);
+            }
+            "--tls-key" => {
+                let Some(v) = args.next() else {
+                    eprintln!("--tls-key requires a path argument");
+                    std::process::exit(2);
+                };
+                tls_key = Some(v);
+            }
+            "--decoy" => {
+                let Some(v) = args.next() else {
+                    eprintln!("--decoy requires an address argument");
+                    std::process::exit(2);
+                };
+                decoy = Some(v);
+            }
             _ if listen.is_none() => listen = Some(arg),
             other => {
                 eprintln!("unexpected argument: {other}");
@@ -132,46 +195,95 @@ fn main() -> std::io::Result<()> {
     // The derived rendezvous-layer obfuscation key, or `None` when `--obf-psk`
     // was not given (plain rendezvous path, byte-identical to before Task 4).
     let obf_key: Option<[u8; 16]> = obf_psk.map(|psk| yip_obf::derive_key(&psk));
-
-    let sock = UdpSocket::bind(&listen)?;
-    sock.set_read_timeout(Some(SWEEP_INTERVAL))?;
-    eprintln!("yip-rendezvous listening on {listen}");
+    let decoy_addr: Option<SocketAddr> = match decoy {
+        Some(ref d) => match d.parse() {
+            Ok(a) => Some(a),
+            Err(e) => {
+                eprintln!("invalid --decoy address: {e}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
 
     // Millisecond clock from a monotonic base (Instant), so `now_ms` never goes
     // backwards and needs no wall clock.
     let base = Instant::now();
+    let server = Arc::new(Mutex::new(RendezvousServer::new(0)));
+
+    let sock = tokio::net::UdpSocket::bind(&listen).await?;
+    eprintln!("yip-rendezvous listening on {listen} (udp)");
+
+    // TLS Trojan front (3c.3): opt-in via --listen-tcp. Requires --tls-cert,
+    // --tls-key, and (as the discriminator) --obf-psk.
+    if let Some(tcp_addr) = listen_tcp {
+        let (Some(cert), Some(key)) = (tls_cert.as_deref(), tls_key.as_deref()) else {
+            eprintln!("--listen-tcp requires --tls-cert and --tls-key");
+            std::process::exit(2);
+        };
+        let Some(obf_key) = obf_key else {
+            eprintln!("--listen-tcp requires --obf-psk (it is the tunnel discriminator)");
+            std::process::exit(2);
+        };
+        let acceptor = Arc::new(tls_front::build_acceptor(cert, key).unwrap_or_else(|e| {
+            eprintln!("tls cert/key error: {e}");
+            std::process::exit(2);
+        }));
+        let tcp = tokio::net::TcpListener::bind(&tcp_addr).await?;
+        eprintln!("yip-rendezvous TLS front listening on {tcp_addr} (tcp)");
+        let cfg = Arc::new(tls_front::TlsFrontCfg {
+            server: Arc::clone(&server),
+            obf_key,
+            decoy: decoy_addr,
+            base,
+            routes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        });
+        tokio::spawn(tls_front::run_tls_front(tcp, acceptor, cfg));
+    }
+
+    run_udp(sock, Arc::clone(&server), obf_key, base).await
+}
+
+/// The UDP rendezvous task: recover a Message, drive the shared state machine,
+/// send replies. Sweeps on a 5 s interval. Behavior-identical to the previous
+/// blocking loop.
+async fn run_udp(
+    sock: tokio::net::UdpSocket,
+    server: Arc<Mutex<RendezvousServer>>,
+    obf_key: Option<[u8; 16]>,
+    base: Instant,
+) -> std::io::Result<()> {
     let now_ms =
         |base: Instant| -> u64 { u64::try_from(base.elapsed().as_millis()).unwrap_or(u64::MAX) };
-
-    let mut server = RendezvousServer::new(now_ms(base));
-    let mut last_sweep = Instant::now();
     let mut rx = [0u8; 2048];
-
+    let mut sweep =
+        tokio::time::interval_at(tokio::time::Instant::now() + SWEEP_INTERVAL, SWEEP_INTERVAL);
     loop {
-        match sock.recv_from(&mut rx) {
-            Ok((n, src)) => {
+        tokio::select! {
+            r = sock.recv_from(&mut rx) => {
+                let (n, src) = r?;
                 // Obf on: unwrap the rendezvous envelope first (wrong key /
                 // wrong ptype ⇒ drop, fail-closed, no panic). Obf off: decode
                 // the plain bytes exactly as before Task 4.
                 if let Some(msg) = decode_inbound(obf_key.as_ref(), &rx[..n]) {
-                    for (dst, reply) in server.handle(src, msg, now_ms(base)) {
+                    let replies = {
+                        let mut s = server.lock().await;
+                        s.handle(src, msg, now_ms(base))
+                    };
+                    for (dst, reply) in replies {
                         let wire = wrap_reply(obf_key.as_ref(), &reply);
-                        let _ = sock.send_to(&wire, dst); // best-effort; drop on error
+                        let _ = sock.send_to(&wire, dst).await; // best-effort; drop on error
                     }
                 }
             }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => return Err(e),
-        }
-        if last_sweep.elapsed() >= SWEEP_INTERVAL {
-            server.sweep(now_ms(base));
-            last_sweep = Instant::now();
-            // Lets the netns money tests (and operators) grep stderr for the
-            // final relay-forward count to assert *which path* carried
-            // traffic, without needing any extra IPC/metrics surface.
-            eprintln!("relay-forwarded={}", server.forwarded_count());
+            _ = sweep.tick() => {
+                let mut s = server.lock().await;
+                s.sweep(now_ms(base));
+                // Lets the netns money tests (and operators) grep stderr for the
+                // final relay-forward count to assert *which path* carried
+                // traffic, without needing any extra IPC/metrics surface.
+                eprintln!("relay-forwarded={}", s.forwarded_count());
+            }
         }
     }
 }
@@ -210,6 +322,7 @@ mod obf_tests {
     fn wrap_and_decode_plain_obf_off() {
         let msg = Message::Register {
             node: node_id(&[4u8; 32]),
+            counter: 1,
         };
         let mut plain = Vec::new();
         encode(&msg, &mut plain);

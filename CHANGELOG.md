@@ -6,6 +6,20 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- REALITY-style Trojan relay front (anti-DPI milestone 3c.3): `yip-rendezvous`
+  gains an opt-in TCP/TLS listener (`--listen-tcp`/`--tls-cert`/`--tls-key`/
+  `--decoy`) that terminates **real-cert** TLS and routes a fresh, obfuscated
+  `Register` (now carrying a monotonic `counter` for replay rejection) to the
+  relay tunnel, while transparently reverse-proxying every other connection —
+  active probes, scanners, plain browsers — to a real decoy site, so the relay
+  is indistinguishable from an ordinary HTTPS server to anyone without
+  `obf_psk`. `--obf-psk` is now **required** with `--listen-tcp` (it is the
+  tunnel discriminator). `tokio` is added to `yip-rendezvous` — the control/
+  relay tier only; the `yipd` data plane stays 100% async-free. **New build
+  dependency: `cmake` + a BoringSSL compile, now also required to build
+  `yip-rendezvous`** (already required for `yipd` since 3c.2). The `yipd`
+  client that dials this front (`rendezvous = "tls://host:443"`) is milestone
+  3c.4, not shipped here.
 - TLS-over-TCP mimicry transport (`transport=tls`, anti-DPI milestone 3c.2):
   carries the **unchanged** inner yip protocol (Noise-IK, FEC, AEAD) inside a
   real TLS 1.3 connection over TCP/443 with a **browser-parrot ClientHello**

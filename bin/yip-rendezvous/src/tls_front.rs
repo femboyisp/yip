@@ -1,0 +1,169 @@
+//! The TCP/TLS Trojan front for the relay (3c.3). Terminates real-cert TLS,
+//! trial-reads the first framed message, and routes a fresh obfuscated
+//! Register to the tunnel or everything else to the decoy backend.
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use boring::error::ErrorStack;
+use boring::ssl::{SslAcceptor, SslFiletype, SslMethod};
+use tokio::sync::{Mutex, Semaphore};
+use yip_rendezvous::RendezvousServer;
+
+/// Upper bound on how long a TLS handshake may take before we give up on the
+/// connection. Without this, a client that sends a ClientHello and then
+/// stalls (never completing the handshake) parks the accept future forever —
+/// `CLASSIFY_TIMEOUT` in `conn.rs` only starts once the handshake has
+/// completed, so it does nothing to bound this phase (I1, slowloris).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Hard cap on concurrently in-flight TLS handshakes/connections on this
+/// front. Bounds the number of tasks/fds a slow-handshake flood can pin,
+/// independent of the per-handshake timeout above (I1).
+const MAX_TLS_CONNS: usize = 1024;
+
+pub struct TlsFrontCfg {
+    pub server: Arc<Mutex<RendezvousServer>>,
+    pub obf_key: [u8; 16],
+    pub decoy: Option<SocketAddr>,
+    pub base: Instant,
+    /// Delivery channels for TLS-connected relay peers, keyed by `NodeId`.
+    /// Registered by `conn_tunnel::run_tunnel` on upgrade and removed on
+    /// disconnect; `RelaySend { dst }` routes here when `dst` is TLS-connected.
+    pub routes: Arc<
+        Mutex<
+            std::collections::HashMap<yip_rendezvous::NodeId, tokio::sync::mpsc::Sender<Vec<u8>>>,
+        >,
+    >,
+}
+
+/// Build a server TLS acceptor from PEM cert-chain + key files, configured to
+/// resemble a mainstream web server (mozilla-intermediate profile: TLS 1.3+1.2,
+/// standard ciphers, session tickets) with ALPN `h2`,`http/1.1`.
+pub fn build_acceptor(cert_path: &str, key_path: &str) -> Result<SslAcceptor, ErrorStack> {
+    let mut b = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())?;
+    b.set_certificate_chain_file(cert_path)?;
+    b.set_private_key_file(key_path, SslFiletype::PEM)?;
+    b.check_private_key()?;
+    // ALPN in the conventional browser-server order.
+    b.set_alpn_protos(b"\x02h2\x08http/1.1")?;
+    Ok(b.build())
+}
+
+/// Accept TLS connections forever, spawning one handler task per connection.
+/// Bounded on two axes (I1, slowloris hardening): each handshake is capped by
+/// `HANDSHAKE_TIMEOUT`, and no more than `MAX_TLS_CONNS` connections may be
+/// in flight (handshaking or tunneling) at once — at capacity, new TCP
+/// connections are dropped immediately rather than queued.
+pub async fn run_tls_front(
+    listener: tokio::net::TcpListener,
+    acceptor: Arc<SslAcceptor>,
+    cfg: Arc<TlsFrontCfg>,
+) {
+    let permits = Arc::new(Semaphore::new(MAX_TLS_CONNS));
+    loop {
+        let (tcp, _peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("tls-front: accept error: {e}");
+                continue;
+            }
+        };
+        // At capacity: refuse rather than queue unboundedly. The dropped `tcp`
+        // closes on drop.
+        let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+            eprintln!("tls-front: at capacity ({MAX_TLS_CONNS} connections), dropping");
+            continue;
+        };
+        let acceptor = Arc::clone(&acceptor);
+        let cfg = Arc::clone(&cfg);
+        tokio::spawn(async move {
+            // Move `permit` into the task so it is released on task end
+            // (success, handshake failure, or timeout alike).
+            let _permit = permit;
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_boring::accept(&acceptor, tcp))
+                .await
+            {
+                Ok(Ok(stream)) => super::conn::handle_connection(stream, cfg).await,
+                Ok(Err(e)) => eprintln!("tls-front: handshake failed: {e}"),
+                Err(_) => eprintln!("tls-front: handshake timed out after {HANDSHAKE_TIMEOUT:?}"),
+            }
+        });
+    }
+}
+
+/// Write a throwaway self-signed cert/key PEM pair for `relay.test` into
+/// `dir`, returning `(cert_path, key_path)`. Shared by `tls_front`'s and
+/// `conn`'s tests (both need a real cert to hand `build_acceptor`/
+/// `run_tls_front`).
+#[cfg(test)]
+pub(crate) fn write_self_signed(dir: &std::path::Path) -> (String, String) {
+    let cert = rcgen::generate_simple_self_signed(vec!["relay.test".into()]).unwrap();
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    (
+        cert_path.to_str().unwrap().to_owned(),
+        key_path.to_str().unwrap().to_owned(),
+    )
+}
+
+/// Accept-any-cert client connector, mirroring `yipd`'s
+/// `build_client_connector` (zero-auth outer TLS by design — see module docs
+/// on `TlsFrontCfg`/`run_tls_front`; the inner yip framing is the real
+/// security). Shared by `tls_front`'s and `conn`'s tests.
+#[cfg(test)]
+pub(crate) fn build_test_client_connector() -> boring::ssl::SslConnector {
+    let mut builder = boring::ssl::SslConnector::builder(SslMethod::tls()).unwrap();
+    builder.set_verify(boring::ssl::SslVerifyMode::NONE);
+    builder.build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_acceptor_from_pem_succeeds() {
+        let dir = std::env::temp_dir().join(format!("yip-rdv-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key) = write_self_signed(&dir);
+        assert!(build_acceptor(&cert, &key).is_ok());
+    }
+
+    /// End-to-end localhost smoke test: `run_tls_front` accepts a real TCP
+    /// connection and completes a real BoringSSL TLS handshake against it.
+    /// `handle_connection` is still the Task-5/6 stub, so the connection
+    /// closes right after — this only proves the listener + acceptor plumbing
+    /// works, not the inner protocol.
+    #[tokio::test]
+    async fn localhost_tls_handshake_completes() {
+        let dir = std::env::temp_dir().join(format!("yip-rdv-tls-hs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key) = write_self_signed(&dir);
+        let acceptor = Arc::new(build_acceptor(&cert, &key).unwrap());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let cfg = Arc::new(TlsFrontCfg {
+            server: Arc::new(Mutex::new(RendezvousServer::new(0))),
+            obf_key: [0u8; 16],
+            decoy: None,
+            base: Instant::now(),
+            routes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        });
+        tokio::spawn(run_tls_front(listener, acceptor, cfg));
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let connector = build_test_client_connector();
+        let config = connector.configure().unwrap();
+        let result = tokio_boring::connect(config, "relay.test", tcp).await;
+        assert!(
+            result.is_ok(),
+            "client TLS handshake against the listener must complete: {:?}",
+            result.err()
+        );
+    }
+}

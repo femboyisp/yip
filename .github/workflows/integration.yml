@@ -225,6 +225,13 @@ jobs:
       - name: Build release yipd
         run: cargo build --release -p yipd
 
+      - name: Build yip-rendezvous
+        # Debug build: the 3c.3 probe-resistance oracle below runs the binary
+        # directly (not netns-namespaced tunnel throughput), so a debug build
+        # is sufficient — mirrors the local repro command in
+        # run-netns-reality-probe.sh's header.
+        run: cargo build -p yip-rendezvous-bin
+
       - name: Run the nDPI undetectability oracle under sudo
         run: |
           sudo bash bin/yipd/tests/run-ndpi-oracle.sh \
@@ -303,3 +310,27 @@ jobs:
           # run-tls-mimicry-oracle.sh's header. The former is the R8/3d
           # port-plausibility follow-up; the latter is inherent to a P2P TLS
           # costume whose SNI (a real site) never matches the peer's IP.
+
+      - name: Run the REALITY probe-resistance oracle under sudo
+        # 3c.3's headline money test: an active prober (curl, garbage bytes
+        # over TLS, an idle connection) dialing the relay's TLS Trojan front
+        # must see only a real decoy site, never rendezvous/tunnel behavior,
+        # and the relay must not hard-close a connection at its internal ~3s
+        # classification timeout. See run-netns-reality-probe.sh for the
+        # full assertion set (including the #63 follow-up: sub-second
+        # decoy-connect timing parity for a fully-silent connection is a
+        # known, tracked gap and is NOT gated here).
+        run: |
+          sudo bash bin/yipd/tests/run-netns-reality-probe.sh \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/reality-probe-oracle.log
+          # Honesty guard, same reasoning as the oracles above: this job
+          # always runs as sudo and always builds yip-rendezvous-bin above,
+          # so a SKIP here means the harness itself is broken.
+          if grep -q "^SKIP run-netns-reality-probe" /tmp/reality-probe-oracle.log; then
+            echo "::error::probe-resistance oracle skipped — expected root + a built yip-rendezvous binary in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/reality-probe-oracle.log; then
+            echo "::error::an active probe was not served the decoy, or the relay hard-closed an idle connection at its classification timeout — 3c.3 probe-resistance regression"
+            exit 1
+          fi

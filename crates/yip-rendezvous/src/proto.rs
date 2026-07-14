@@ -38,6 +38,10 @@ enum Tag {
 pub enum Message {
     Register {
         node: NodeId,
+        /// Monotonic per-node freshness counter (anti-replay). Strictly
+        /// increasing across a node's registrations; the relay rejects any
+        /// Register whose counter is not greater than the last seen.
+        counter: u64,
     },
     Lookup {
         node: NodeId,
@@ -99,9 +103,10 @@ fn take_addr(buf: &[u8]) -> Option<(SocketAddr, usize)> {
 /// Serialize `msg` onto `out` (appends; caller clears if reusing).
 pub fn encode(msg: &Message, out: &mut Vec<u8>) {
     match msg {
-        Message::Register { node } => {
+        Message::Register { node, counter } => {
             out.push(Tag::Register as u8);
             out.extend_from_slice(node);
+            out.extend_from_slice(&counter.to_be_bytes());
         }
         Message::Lookup { node } => {
             out.push(Tag::Lookup as u8);
@@ -140,9 +145,11 @@ pub fn decode(buf: &[u8]) -> Option<Message> {
     let (&tag, rest) = buf.split_first()?;
     let node16 = |b: &[u8]| -> Option<NodeId> { b.get(..16)?.try_into().ok() };
     match tag {
-        t if t == Tag::Register as u8 => Some(Message::Register {
-            node: node16(rest)?,
-        }),
+        t if t == Tag::Register as u8 => {
+            let node = node16(rest)?;
+            let counter = u64::from_be_bytes(rest.get(16..24)?.try_into().ok()?);
+            Some(Message::Register { node, counter })
+        }
         t if t == Tag::Lookup as u8 => Some(Message::Lookup {
             node: node16(rest)?,
         }),
@@ -200,11 +207,25 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_invalid_address_family() {
+        // A PeerInfo whose address family byte is neither 4 nor 6 must be
+        // rejected (fail-closed), not misparsed.
+        let mut buf = vec![Tag::PeerInfo as u8];
+        buf.extend_from_slice(&[7u8; 16]); // node
+        buf.push(99); // invalid family (valid are 4 / 6)
+        buf.extend_from_slice(&[0u8; 4]);
+        assert_eq!(decode(&buf), None);
+    }
+
+    #[test]
     fn all_messages_roundtrip() {
         let n = [1u8; 16];
         let v4: SocketAddr = "203.0.113.9:5000".parse().unwrap();
         let v6: SocketAddr = "[2001:db8::1]:5000".parse().unwrap();
-        roundtrip(Message::Register { node: n });
+        roundtrip(Message::Register {
+            node: n,
+            counter: 1,
+        });
         roundtrip(Message::Lookup { node: n });
         roundtrip(Message::PeerInfo {
             node: n,
@@ -244,5 +265,26 @@ mod tests {
         );
         buf.truncate(buf.len() - 1);
         assert_eq!(decode(&buf), None); // truncated addr
+    }
+
+    #[test]
+    fn register_roundtrips_with_counter() {
+        let n = node_id(&[7u8; 32]);
+        let msg = Message::Register {
+            node: n,
+            counter: 0x0102_0304_0506_0708,
+        };
+        let mut buf = Vec::new();
+        encode(&msg, &mut buf);
+        assert_eq!(decode(&buf), Some(msg));
+    }
+
+    #[test]
+    fn register_truncated_counter_is_none() {
+        // tag(1) + node(16) + only 4 of the 8 counter bytes
+        let mut buf = vec![0u8]; // Tag::Register
+        buf.extend_from_slice(&[9u8; 16]);
+        buf.extend_from_slice(&[0u8; 4]);
+        assert_eq!(decode(&buf), None);
     }
 }

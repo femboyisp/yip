@@ -65,7 +65,8 @@ impl ConfiguredServerRendezvous {
 
 impl Rendezvous for ConfiguredServerRendezvous {
     fn register(&mut self, node: NodeId) -> EgressDatagram {
-        self.to_server(&Message::Register { node })
+        // counter bumped per-registration in 3c.4; 0 is accepted as first-seen
+        self.to_server(&Message::Register { node, counter: 0 })
     }
     fn lookup(&mut self, node: NodeId) -> EgressDatagram {
         self.to_server(&Message::Lookup { node })
@@ -114,7 +115,10 @@ mod tests {
         assert_eq!(dg.dst, server());
         assert_eq!(
             yip_rendezvous::decode(&dg.bytes),
-            Some(Message::Register { node: me })
+            Some(Message::Register {
+                node: me,
+                counter: 0
+            })
         );
     }
 
