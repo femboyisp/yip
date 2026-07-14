@@ -47,6 +47,12 @@ fn wrap_reply(obf_key: Option<&[u8; 16]>, reply: &Message) -> Vec<u8> {
     }
 }
 
+/// Largest length-prefixed TLS-front frame (a Register during classification,
+/// or any framed message once upgraded onto the relay tunnel) that will ever
+/// be accepted. Shared by `conn`'s classifier and `conn_tunnel::drain_frames`
+/// so the two paths' caps can never desync (M8).
+pub(crate) const TLS_FRAME_CAP: usize = 2048;
+
 /// Frame a rendezvous Message for the TLS byte-stream: `[u16 BE len][obf env]`.
 pub(crate) fn frame_obf(obf_key: &[u8; 16], msg: &Message) -> Vec<u8> {
     let mut plain = Vec::new();

@@ -3,12 +3,24 @@
 //! Register to the tunnel or everything else to the decoy backend.
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use boring::error::ErrorStack;
 use boring::ssl::{SslAcceptor, SslFiletype, SslMethod};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use yip_rendezvous::RendezvousServer;
+
+/// Upper bound on how long a TLS handshake may take before we give up on the
+/// connection. Without this, a client that sends a ClientHello and then
+/// stalls (never completing the handshake) parks the accept future forever —
+/// `CLASSIFY_TIMEOUT` in `conn.rs` only starts once the handshake has
+/// completed, so it does nothing to bound this phase (I1, slowloris).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Hard cap on concurrently in-flight TLS handshakes/connections on this
+/// front. Bounds the number of tasks/fds a slow-handshake flood can pin,
+/// independent of the per-handshake timeout above (I1).
+const MAX_TLS_CONNS: usize = 1024;
 
 pub struct TlsFrontCfg {
     pub server: Arc<Mutex<RendezvousServer>>,
@@ -39,11 +51,16 @@ pub fn build_acceptor(cert_path: &str, key_path: &str) -> Result<SslAcceptor, Er
 }
 
 /// Accept TLS connections forever, spawning one handler task per connection.
+/// Bounded on two axes (I1, slowloris hardening): each handshake is capped by
+/// `HANDSHAKE_TIMEOUT`, and no more than `MAX_TLS_CONNS` connections may be
+/// in flight (handshaking or tunneling) at once — at capacity, new TCP
+/// connections are dropped immediately rather than queued.
 pub async fn run_tls_front(
     listener: tokio::net::TcpListener,
     acceptor: Arc<SslAcceptor>,
     cfg: Arc<TlsFrontCfg>,
 ) {
+    let permits = Arc::new(Semaphore::new(MAX_TLS_CONNS));
     loop {
         let (tcp, _peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -52,12 +69,24 @@ pub async fn run_tls_front(
                 continue;
             }
         };
+        // At capacity: refuse rather than queue unboundedly. The dropped `tcp`
+        // closes on drop.
+        let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+            eprintln!("tls-front: at capacity ({MAX_TLS_CONNS} connections), dropping");
+            continue;
+        };
         let acceptor = Arc::clone(&acceptor);
         let cfg = Arc::clone(&cfg);
         tokio::spawn(async move {
-            match tokio_boring::accept(&acceptor, tcp).await {
-                Ok(stream) => super::conn::handle_connection(stream, cfg).await,
-                Err(e) => eprintln!("tls-front: handshake failed: {e}"),
+            // Move `permit` into the task so it is released on task end
+            // (success, handshake failure, or timeout alike).
+            let _permit = permit;
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_boring::accept(&acceptor, tcp))
+                .await
+            {
+                Ok(Ok(stream)) => super::conn::handle_connection(stream, cfg).await,
+                Ok(Err(e)) => eprintln!("tls-front: handshake failed: {e}"),
+                Err(_) => eprintln!("tls-front: handshake timed out after {HANDSHAKE_TIMEOUT:?}"),
             }
         });
     }

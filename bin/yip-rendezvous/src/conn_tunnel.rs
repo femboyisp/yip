@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use yip_rendezvous::{decode, Message, NodeId};
 
 use crate::tls_front::TlsFrontCfg;
+use crate::TLS_FRAME_CAP;
 
 const CHANNEL_DEPTH: usize = 64;
 
@@ -76,7 +77,7 @@ async fn drain_frames(buf: &mut Vec<u8>, cfg: &TlsFrontCfg, _self_node: NodeId) 
             return true;
         }
         let len = usize::from(u16::from_be_bytes([buf[0], buf[1]]));
-        if len == 0 || len > 2048 {
+        if len == 0 || len > TLS_FRAME_CAP {
             return false;
         }
         if buf.len() < 2 + len {
@@ -105,13 +106,20 @@ async fn route(msg: Message, cfg: &TlsFrontCfg) {
         // channel. (UDP-connected destinations are served by the UDP task via
         // the shared RendezvousServer; a future refinement can bridge here.)
         let frame = crate::frame_obf(&cfg.obf_key, &deliver);
-        // Clone the sender and drop the `routes` guard before awaiting the
-        // send: `tx.send(...).await` under a full destination channel must
-        // never hold the global routes mutex, or it wedges all routing and
-        // registration on this front (deadlock, reproduced in review).
+        // Clone the sender and drop the `routes` guard before touching it:
+        // holding the global routes mutex across delivery must never happen,
+        // or it wedges all routing and registration on this front.
         let tx = cfg.routes.lock().await.get(&dst).cloned();
         if let Some(tx) = tx {
-            let _ = tx.send(frame).await;
+            // Best-effort, non-blocking delivery — matches the UDP path's
+            // drop-on-full/errored `send_to`. This is a blind relay; the
+            // inner Noise/ARQ session handles loss. Blocking here (`.send`)
+            // would park this task's OWN read loop (both ends of `select!`
+            // live in the caller) whenever the destination's channel is
+            // full, and if A and B relay to each other simultaneously that
+            // is a mutual deadlock (I2, reproduced in review) — `try_send`
+            // is drop-on-full/closed and can never wedge.
+            let _ = tx.try_send(frame);
         }
     }
     // Register refreshes and other control messages on an established tunnel

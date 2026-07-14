@@ -31,10 +31,20 @@ struct Rate {
     count: usize,
 }
 
+/// Freshness record for the TLS-front discriminator (`register_if_fresh_tls`),
+/// kept separate from `Reg` — a TLS peer has no meaningful `SocketAddr` (the
+/// caller synthesizes `0.0.0.0:0`) and must never be servable via the
+/// UDP-facing `regs` map.
+struct TlsSeen {
+    last_counter: u64,
+    expiry_ms: u64,
+}
+
 /// Soft-state rendezvous + blind relay. Keyed by `NodeId`.
 pub struct RendezvousServer {
     regs: HashMap<NodeId, Reg>,
     rates: HashMap<SocketAddr, Rate>,
+    tls_seen: HashMap<NodeId, TlsSeen>,
     forwarded: u64,
 }
 
@@ -43,6 +53,7 @@ impl RendezvousServer {
         Self {
             regs: HashMap::new(),
             rates: HashMap::new(),
+            tls_seen: HashMap::new(),
             forwarded: 0,
         }
     }
@@ -89,6 +100,8 @@ impl RendezvousServer {
         // Rate windows are cheap; drop stale ones opportunistically.
         self.rates
             .retain(|_, r| now_ms.saturating_sub(r.window_start_ms) < RATE_WINDOW_MS);
+        // Same 60 s horizon as `regs`, so `tls_seen` is equally bounded.
+        self.tls_seen.retain(|_, s| s.expiry_ms > now_ms);
     }
 
     /// Register `node` iff the message is fresh: a first-seen/expired node, or a
@@ -118,6 +131,27 @@ impl RendezvousServer {
                 addr: src,
                 expiry_ms: now_ms.saturating_add(REG_TTL_MS),
                 last_counter: counter,
+            },
+        );
+        true
+    }
+
+    /// Freshness gate for the TLS-front discriminator, kept SEPARATE from the
+    /// UDP-servable `regs` map (a TLS peer is not UDP-reachable and must not
+    /// appear in `Lookup`/`RelaySend` results with a bogus addr). Returns true
+    /// iff `counter` is fresh (first-seen/expired, or strictly greater than the
+    /// last accepted) for this node on the TLS path.
+    pub fn register_if_fresh_tls(&mut self, node: NodeId, counter: u64, now_ms: u64) -> bool {
+        if let Some(seen) = self.tls_seen.get(&node) {
+            if seen.expiry_ms > now_ms && counter <= seen.last_counter {
+                return false;
+            }
+        }
+        self.tls_seen.insert(
+            node,
+            TlsSeen {
+                last_counter: counter,
+                expiry_ms: now_ms.saturating_add(REG_TTL_MS),
             },
         );
         true
@@ -450,6 +484,33 @@ mod tests {
         assert!(
             s.register_if_fresh(existing_node, 2, synth_addr(0), 0),
             "existing node's refresh must still succeed at capacity"
+        );
+    }
+
+    /// The TLS-front discriminator (`register_if_fresh_tls`) must never make a
+    /// node visible on the UDP-servable `regs` map — a TLS-connected peer has
+    /// no meaningful UDP reflexive addr, so leaking it in would hand out the
+    /// synthetic `0.0.0.0:0` to a UDP `Lookup` (I4).
+    #[test]
+    fn register_if_fresh_tls_does_not_populate_regs() {
+        let mut s = RendezvousServer::new(0);
+        let node = node_id(&[1u8; 32]);
+
+        assert!(
+            s.register_if_fresh_tls(node, 1, 0),
+            "first-seen node on the TLS path is accepted"
+        );
+
+        // The UDP path must have no idea this node exists.
+        let out = s.handle(addr("203.0.113.9:52000"), Message::Lookup { node }, 0);
+        assert_eq!(
+            out,
+            vec![(addr("203.0.113.9:52000"), Message::NotFound { node })],
+            "a TLS-only registration must not be visible to UDP Lookup"
+        );
+        assert!(
+            !s.is_registered(&node, 0),
+            "TLS registration must not count as a UDP-servable registration"
         );
     }
 

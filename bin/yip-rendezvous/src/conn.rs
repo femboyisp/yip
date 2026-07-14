@@ -1,7 +1,6 @@
 //! Per-connection TLS handling for the relay Trojan front (3c.3): classify the
 //! first framed message, then either upgrade to a relay tunnel or hand off to
 //! the decoy. No `unsafe`; all TLS/socket work is via tokio-boring / tokio.
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10,10 +9,7 @@ use tokio::net::TcpStream;
 use yip_rendezvous::{decode, Message, NodeId, RendezvousServer};
 
 use crate::tls_front::TlsFrontCfg;
-
-/// Largest first-frame we will buffer before deciding (a rendezvous Register is
-/// tiny; anything larger is a decoy request). Matches yipd's TLS frame cap.
-const MAX_FIRST_FRAME: usize = 2048;
+use crate::TLS_FRAME_CAP as MAX_FIRST_FRAME;
 
 /// Result of inspecting a connection's first framed message.
 pub enum Classify {
@@ -26,12 +22,13 @@ pub enum Classify {
 
 /// Pure classification of the first frame. De-frames `[u16 len][obf env]`,
 /// deobfuscates with `obf_key` (requiring RDV_TYPE), decodes, and accepts only
-/// a fresh `Register` (monotonic counter enforced by `server.handle`).
+/// a fresh `Register` (monotonic counter enforced by
+/// `server.register_if_fresh_tls`, kept separate from the UDP-servable `regs`
+/// map — see `RendezvousServer::register_if_fresh_tls`).
 pub fn classify_first_frame(
     buf: &[u8],
     obf_key: &[u8; 16],
     server: &mut RendezvousServer,
-    src: SocketAddr,
     now_ms: u64,
 ) -> Classify {
     // Length prefix present and plausible?
@@ -59,7 +56,11 @@ pub fn classify_first_frame(
     // The state machine reports whether THIS Register was accepted (fresh
     // insert / counter advance). A stale replay — even one in the same
     // millisecond — or a first-seen node at capacity returns false ⇒ decoy.
-    if !server.register_if_fresh(node, counter, src, now_ms) {
+    // Uses the TLS-only freshness state (`register_if_fresh_tls`), NOT the
+    // UDP-servable `regs` map: a TLS peer is not UDP-reachable and must never
+    // appear in a UDP `Lookup`/`RelaySend` result with the synthetic
+    // `0.0.0.0:0` address this path would otherwise register (I4).
+    if !server.register_if_fresh_tls(node, counter, now_ms) {
         return Classify::Decoy;
     }
     // Build the framed obfuscated ack (an empty-payload Register echo is
@@ -83,12 +84,12 @@ pub async fn handle_connection(
     cfg: Arc<TlsFrontCfg>,
 ) {
     let now_ms = u64::try_from(cfg.base.elapsed().as_millis()).unwrap_or(u64::MAX);
-    // The relay is blind to the real TCP peer identity; use a fixed synthetic
-    // src for state-machine rate-limiting/registration keying on this path.
-    let src: SocketAddr = "0.0.0.0:0".parse().expect("valid addr");
+    // The relay is blind to the real TCP peer identity, and the TLS-only
+    // freshness gate (`register_if_fresh_tls`) no longer needs a source addr
+    // (I4) — there is nothing left to key on this path.
 
     let mut buf = Vec::new();
-    let decision = read_and_classify(&mut stream, &cfg, &mut buf, src, now_ms).await;
+    let decision = read_and_classify(&mut stream, &cfg, &mut buf, now_ms).await;
 
     match decision {
         Some(Classify::Upgrade { node, reply }) => {
@@ -118,7 +119,6 @@ async fn read_and_classify(
     stream: &mut tokio_boring::SslStream<TcpStream>,
     cfg: &TlsFrontCfg,
     buf: &mut Vec<u8>,
-    src: SocketAddr,
     now_ms: u64,
 ) -> Option<Classify> {
     let deadline = tokio::time::sleep(CLASSIFY_TIMEOUT);
@@ -130,13 +130,7 @@ async fn read_and_classify(
             let len = usize::from(u16::from_be_bytes([buf[0], buf[1]]));
             if len > 0 && len <= MAX_FIRST_FRAME && buf.len() >= 2 + len {
                 let mut server = cfg.server.lock().await;
-                return Some(classify_first_frame(
-                    buf,
-                    &cfg.obf_key,
-                    &mut server,
-                    src,
-                    now_ms,
-                ));
+                return Some(classify_first_frame(buf, &cfg.obf_key, &mut server, now_ms));
             }
             if len == 0 || len > MAX_FIRST_FRAME {
                 return Some(Classify::Decoy); // implausible length ⇒ decoy now
@@ -161,9 +155,18 @@ async fn into_decoy(
     buffered: Vec<u8>,
 ) {
     let Some(decoy_addr) = cfg.decoy else {
-        // No decoy configured: minimal static fallback (documented weaker path).
-        let page = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 40\r\nConnection: close\r\n\r\n<!doctype html><title>OK</title><p>OK</p>";
-        let _ = stream.write_all(page).await;
+        // No decoy configured: minimal static fallback (documented weaker
+        // path). The Content-Length is computed from the actual body bytes
+        // so the two can never drift out of sync — a mismatched
+        // Content-Length is itself a DPI fingerprint (M5).
+        const FALLBACK_BODY: &[u8] = b"<!doctype html><title>OK</title><p>OK</p>";
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            FALLBACK_BODY.len()
+        );
+        let mut page = header.into_bytes();
+        page.extend_from_slice(FALLBACK_BODY);
+        let _ = stream.write_all(&page).await;
         return;
     };
     let Ok(mut backend) = TcpStream::connect(decoy_addr).await else {
@@ -196,12 +199,20 @@ mod tests {
         let node = node_id(&[1u8; 32]);
         let mut s = RendezvousServer::new(0);
         let frame = framed_register(&key, node, 1);
-        let src = "127.0.0.1:9".parse().unwrap();
-        match classify_first_frame(&frame, &key, &mut s, src, 0) {
+        match classify_first_frame(&frame, &key, &mut s, 0) {
             Classify::Upgrade { node: got, reply } => {
                 assert_eq!(got, node);
                 assert!(!reply.is_empty());
-                assert!(s.is_registered(&node, 0));
+                // The TLS-only freshness state (`register_if_fresh_tls`) must
+                // NOT populate the UDP-servable `regs` map (I4) — a replay of
+                // the same counter is rejected (proving the acceptance was
+                // recorded), but `is_registered` (which reads `regs`) stays
+                // false.
+                assert!(!s.is_registered(&node, 0), "TLS path must not touch regs");
+                assert!(matches!(
+                    classify_first_frame(&frame, &key, &mut s, 0),
+                    Classify::Decoy
+                ));
             }
             Classify::Decoy => panic!("fresh Register must upgrade"),
         }
@@ -211,11 +222,10 @@ mod tests {
     fn http_get_is_decoy() {
         let key = yip_obf::derive_key(&[4u8; 32]);
         let mut s = RendezvousServer::new(0);
-        let src = "127.0.0.1:9".parse().unwrap();
         // A censor probe: raw HTTP, no length-prefixed obf envelope.
         let buf = b"GET / HTTP/1.1\r\nHost: relay.test\r\n\r\n";
         assert!(matches!(
-            classify_first_frame(buf, &key, &mut s, src, 0),
+            classify_first_frame(buf, &key, &mut s, 0),
             Classify::Decoy
         ));
     }
@@ -227,9 +237,8 @@ mod tests {
         let node = node_id(&[1u8; 32]);
         let mut s = RendezvousServer::new(0);
         let frame = framed_register(&attacker, node, 1); // obf'd with the WRONG key
-        let src = "127.0.0.1:9".parse().unwrap();
         assert!(matches!(
-            classify_first_frame(&frame, &real, &mut s, src, 0),
+            classify_first_frame(&frame, &real, &mut s, 0),
             Classify::Decoy
         ));
     }
@@ -239,15 +248,14 @@ mod tests {
         let key = yip_obf::derive_key(&[4u8; 32]);
         let node = node_id(&[1u8; 32]);
         let mut s = RendezvousServer::new(0);
-        let src = "127.0.0.1:9".parse().unwrap();
         let frame = framed_register(&key, node, 7);
         assert!(matches!(
-            classify_first_frame(&frame, &key, &mut s, src, 0),
+            classify_first_frame(&frame, &key, &mut s, 0),
             Classify::Upgrade { .. }
         ));
         // Replaying the identical frame (counter 7) must now be a decoy.
         assert!(matches!(
-            classify_first_frame(&frame, &key, &mut s, src, 1),
+            classify_first_frame(&frame, &key, &mut s, 1),
             Classify::Decoy
         ));
     }
@@ -321,14 +329,13 @@ mod tests {
         let key = yip_obf::derive_key(&[4u8; 32]);
         let node = node_id(&[1u8; 32]);
         let mut s = RendezvousServer::new(0);
-        let src = "127.0.0.1:9".parse().unwrap();
         let frame = framed_register(&key, node, 7);
         assert!(matches!(
-            classify_first_frame(&frame, &key, &mut s, src, 100),
+            classify_first_frame(&frame, &key, &mut s, 100),
             Classify::Upgrade { .. }
         ));
         assert!(matches!(
-            classify_first_frame(&frame, &key, &mut s, src, 100),
+            classify_first_frame(&frame, &key, &mut s, 100),
             Classify::Decoy
         ));
     }
