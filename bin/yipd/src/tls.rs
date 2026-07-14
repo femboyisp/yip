@@ -152,8 +152,10 @@ const WOULD_BLOCK_RETRY_MS: i32 = 20;
 const TICK_MS: i32 = 10;
 
 /// Reconnect / re-accept backoff: starts at 100 ms, doubles, caps at ~5 s.
-const INITIAL_BACKOFF_MS: u64 = 100;
-const MAX_BACKOFF_MS: u64 = 5_000;
+/// `pub(crate)`: also the reconnect backoff for the 3c.4 relay-dial client
+/// (`crate::relay_client`), which mirrors this exact policy.
+pub(crate) const INITIAL_BACKOFF_MS: u64 = 100;
+pub(crate) const MAX_BACKOFF_MS: u64 = 5_000;
 
 /// Maximum wall-clock a single TLS handshake may take before it is abandoned.
 /// Without this bound a peer that opens a TCP connection and then stalls (never
@@ -161,7 +163,8 @@ const MAX_BACKOFF_MS: u64 = 5_000;
 /// slot indefinitely — an off-path, zero-crypto DoS, since the outer TLS is
 /// zero-auth and `run_tls` serves one connection at a time. On timeout the
 /// connection is dropped and the server re-accepts (or the client re-dials).
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// `pub(crate)`: also used by `crate::relay_client::spawn`'s connect path.
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// ALPN protocols offered (client) / accepted (server), RFC 7301 wire format
 /// (one-byte length prefix per protocol name): `h2` then `http/1.1`, matching
@@ -178,7 +181,7 @@ const TLS_ALPN_WIRE: &[u8] = b"\x02h2\x08http/1.1";
 /// not blocked on here) and zero-auth verify (the outer TLS authenticates
 /// nothing — inner yip Noise-IK is the real security, exactly like `quic.rs`'s
 /// `SkipServerVerification`).
-fn build_client_connector() -> io::Result<SslConnector> {
+pub(crate) fn build_client_connector() -> io::Result<SslConnector> {
     let mut builder = SslConnector::builder(SslMethod::tls()).map_err(io::Error::other)?;
     builder.set_verify(SslVerifyMode::NONE);
     builder.set_grease_enabled(true);
@@ -191,7 +194,7 @@ fn build_client_connector() -> io::Result<SslConnector> {
 /// Server-side BoringSSL config: a throwaway self-signed cert for `tls_sni`
 /// (mirrors `quic.rs`'s `gen_cert`) on a modern (TLS 1.2+, no legacy ciphers)
 /// `mozilla_intermediate_v5` base configuration.
-fn build_server_acceptor(tls_sni: &str) -> io::Result<SslAcceptor> {
+pub(crate) fn build_server_acceptor(tls_sni: &str) -> io::Result<SslAcceptor> {
     let (cert, key) = gen_cert(tls_sni)?;
     let mut builder =
         SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).map_err(io::Error::other)?;
@@ -226,7 +229,7 @@ fn ssl_error_to_io(e: boring::ssl::Error) -> io::Error {
 /// attempts (the standard non-blocking OpenSSL/BoringSSL pattern:
 /// `MidHandshakeSslStream::handshake` is re-invoked on the *same* in-progress
 /// handshake state after each wait, not restarted).
-fn drive_handshake<S>(
+pub(crate) fn drive_handshake<S>(
     mut result: Result<SslStream<S>, HandshakeError<S>>,
     poller: &Epoll,
     deadline: Instant,
@@ -262,7 +265,7 @@ where
 /// Returns once the stream would block (the normal "caught up" exit) or on a
 /// genuine TLS/TCP error (peer close, malformed record, etc — connection-level,
 /// the caller tears the connection down).
-fn drain_tls_read(
+pub(crate) fn drain_tls_read(
     stream: &mut SslStream<TcpStream>,
     reader: &mut FrameReader,
     buf: &mut [u8],
@@ -288,7 +291,7 @@ fn drain_tls_read(
 /// Write `buf` in full to the TLS stream, retrying `WANT_READ`/`WANT_WRITE` by
 /// waiting on `poller` (see [`WOULD_BLOCK_RETRY_MS`]) and looping on partial
 /// writes.
-fn write_all_tls(
+pub(crate) fn write_all_tls(
     stream: &mut SslStream<TcpStream>,
     poller: &Epoll,
     mut buf: &[u8],
@@ -412,7 +415,11 @@ fn connection_role(local_pub: &[u8; 32], peer_pub: &[u8; 32]) -> io::Result<Role
 /// Dial `peer_endpoint`, set the stream non-blocking (via [`Epoll::new`]), and
 /// drive the TLS client handshake (browser-parrot ClientHello, SNI =
 /// `tls_sni`) to completion.
-fn connect_and_handshake(
+/// `pub(crate)`: also the connect path used by `crate::relay_client::spawn`
+/// (the TLS relay-dial client, 3c.4) — `tun_fd` there is actually the
+/// socketpair fd to the data plane; `Epoll` only cares that it is a second
+/// watchable fd (see `yip_io::epoll::Ready`'s doc comment on name reuse).
+pub(crate) fn connect_and_handshake(
     peer_endpoint: SocketAddr,
     tls_sni: &str,
     tun_fd: RawFd,
