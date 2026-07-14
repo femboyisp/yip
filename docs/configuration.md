@@ -55,6 +55,7 @@ below); otherwise an empty peer list is an error.
 | Key | Value | Notes |
 |---|---|---|
 | `rendezvous` | `IP:port` | Address of a `yip-rendezvous` server. Enables lazy **Direct → UDP hole-punch → Relay** bring-up for peers behind NAT. |
+| `rendezvous` | `tls://host:port` | TLS relay-dial (anti-DPI milestone 3c.4). Dials the 3c.3 relay's `--listen-tcp` front over a persistent browser-parrot TLS connection and relays every peer's traffic through it — no Direct/UDP-punch attempt. See below. |
 
 ### Mesh / decentralized discovery (optional)
 
@@ -168,10 +169,42 @@ an HTTP probe, a scanner, a plain browser, garbage bytes, or silence — is
 transparently reverse-proxied to the decoy backend. A prober who does not hold
 `obf_psk` therefore sees only an ordinary HTTPS site.
 
-On the `yipd` side, a `rendezvous` value of the form `tls://host:443` is
-reserved to mean "dial this relay's TLS front" (as opposed to the plain
-`IP:port` UDP form). **The client dialer that speaks this scheme ships in
-milestone 3c.4** — it is not implemented yet.
+### TLS relay-dial client (`rendezvous=tls://`, anti-DPI milestone 3c.4)
+
+On the `yipd` side, a `rendezvous` value of the form `tls://host:port` (e.g.
+`rendezvous=tls://relay.example.com:443`) means "dial this relay's TLS front"
+(as opposed to the plain `IP:port` UDP form above). It is the client half of
+the 3c.3 `--listen-tcp` Trojan front: a dedicated thread opens one persistent
+browser-parrot TLS connection to `host:port` (SNI = `host`; the data plane
+itself stays tokio-free — the thread pumps obfuscated envelope bytes to/from
+the tunnel loop over a `UnixStream::pair()` socketpair), sends the obfuscated
+`Register` first on every (re)connect (the relay classifies a connection by
+its first frame), and thereafter relays `RelaySend`/`RelayDeliver` envelopes
+carrying the **unchanged** inner Noise/FEC/AEAD protocol as the relayed
+payload.
+
+This path is **straight-to-relay**: every peer starts (and stays) in the
+Relay path state, with no Direct or UDP hole-punch attempt — `tls://`
+exists for networks where raw UDP to the relay is blocked in the first
+place, so trying UDP first would defeat the point. Peers must therefore be
+listed by `public_key` (`endpoint` is optional and ignored on this path),
+and the far peer must dial the same relay for the two to meet.
+
+Requirements and interactions:
+
+- **Requires `obf_psk`** — rejected at config load otherwise, since `obf_psk`
+  is the relay's discriminator (the same secret the `Register` envelope is
+  wrapped in; see the threat model below).
+- **Forces the poll (`epoll`) I/O driver**, like `transport=quic`/`transport=tls`
+  — `YIP_USE_URING` has no effect on this path.
+- **Mutually exclusive with `transport=tls`** (the peer *data* transport
+  costume, 3c.2) in practice: `transport=tls` forbids `obf_psk`, while
+  `rendezvous=tls://` requires it, so the two cannot both be set.
+
+Both TLS connections in this pairing dial the same relay process's
+`--listen-tcp` front — see [`--listen-tcp` above](#tls-trojan-front---listen-tcp-anti-dpi-milestone-3c3)
+for the server side (real TLS 1.3, decoy handoff, `Register`-first
+classification).
 
 **Threat model.** Probe-resistance is **exactly as strong as `obf_psk`
 secrecy**: without it, a prober can never forge a valid `Register` and is
