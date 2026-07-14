@@ -26,11 +26,15 @@
 #   (a) HARD: PROBE -> DECOY. `curl -sk https://127.0.0.1:8443/` (a stand-in
 #       for a censor's active TLS probe / vanilla HTTPS client) receives the
 #       decoy site's real index.html body, not any rendezvous/tunnel bytes.
-#   (b) HARD (lenient content check, per the brief): GARBAGE -> DECOY. A
-#       connection that sends a few non-HTTP, non-rendezvous bytes over TLS
-#       is handled (proxied to the decoy, or the decoy backend's own
-#       response/closure) without hanging past a bounded timeout, and does
-#       not crash the relay process.
+#   (b) HARD: GARBAGE -> DECOY. A connection that sends a few non-HTTP,
+#       non-rendezvous bytes over TLS is handled (proxied to the decoy)
+#       without hanging past a bounded timeout, does not crash the relay
+#       process, AND — the same rigor as gate (a) — is POSITIVELY confirmed
+#       by content to have been routed to the decoy: the captured reply must
+#       contain the decoy backend's own HTTP response marker. "No hang, no
+#       crash" alone would not catch a regression where garbage got
+#       misclassified into a rendezvous-shaped reply, so this gate also
+#       asserts on the reply bytes.
 #   (c) HARD: TIMING PARITY. An idle TLS connection (no bytes sent either
 #       way) is NOT closed by the relay at its ~3s internal classification
 #       timeout (see bin/yip-rendezvous/src/conn.rs CLASSIFY_TIMEOUT) — it
@@ -195,7 +199,7 @@ else
     FAIL=1
 fi
 
-# ── 6. gate (b): GARBAGE -> DECOY (lenient: no hang, no crash) ─────────────
+# ── 6. gate (b): GARBAGE -> DECOY (no hang, no crash, decoy content) ───────
 echo "[probe] sending non-HTTP garbage bytes over a fresh TLS connection"
 # Trailing CRLF CRLF gives the decoy (an ordinary Python http.server, whose
 # request parser blocks on readline() until a line terminator) a complete
@@ -204,10 +208,14 @@ echo "[probe] sending non-HTTP garbage bytes over a fresh TLS connection"
 # forever on a request line that never arrives. That termination behavior is
 # a property of the decoy backend, not of the relay; the point of this gate
 # is that the relay handed the bytes off to the decoy at all, and didn't
-# itself hang or crash.
+# itself hang or crash. `-ign_eof` keeps s_client reading after stdin (the
+# printf) hits EOF, so the decoy's response has time to arrive and be
+# flushed to garbage.out before the process exits or the outer `timeout`
+# fires — without it, s_client can tear the connection down right after
+# writing and race the decoy's reply out of the capture.
 set +e
 timeout 5 ip netns exec "$NS" bash -c \
-    "printf '\x00\x01\x02\x03\r\n\r\n' | openssl s_client -quiet -connect 127.0.0.1:${RDV_TCP_PORT} 2>/dev/null" \
+    "printf '\x00\x01\x02\x03\r\n\r\n' | openssl s_client -quiet -ign_eof -connect 127.0.0.1:${RDV_TCP_PORT} 2>/dev/null" \
     >"$TMPDIR_TEST/garbage.out" 2>&1
 GARBAGE_RC=$?
 set -e
@@ -217,8 +225,28 @@ if [ "$GARBAGE_RC" -eq 124 ]; then
 elif ! kill -0 "$PID_RDV" 2>/dev/null; then
     echo "[FAIL] gate (b): relay process died after receiving garbage bytes — must fail closed, not crash"
     FAIL=1
+elif grep -q -e "HTTP/1\." -e "Error code: 400" -e "Bad request syntax" "$TMPDIR_TEST/garbage.out" 2>/dev/null; then
+    # The decoy backend (python http.server) is what governs this response
+    # shape — we assert the reply IS an HTTP/decoy response (positive
+    # confirmation of decoy routing), not that it merely lacks
+    # rendezvous/obf-looking bytes. This is the same rigor as gate (a).
+    #
+    # NOTE: empirically (this Python's http.server, verified across
+    # multiple runs), a genuinely unparseable request line like our garbage
+    # payload never negotiates an HTTP version, so http.server treats it as
+    # HTTP/0.9 and omits the "HTTP/1.x 400 ..." status line entirely,
+    # emitting only its DEFAULT_ERROR_MESSAGE body ("Error code: 400",
+    # "Bad request syntax (...)"). That body text is just as
+    # decoy-backend-specific and unambiguous a positive signal as a status
+    # line would be, so it's included as an alternative match; "HTTP/1."
+    # is kept in case a differently-shaped garbage payload (or a different
+    # decoy backend) does produce a status line.
+    echo "[PASS] gate (b): garbage bytes handled without hanging/crashing, and the reply is confirmed decoy HTTP content"
 else
-    echo "[PASS] gate (b): garbage bytes handled without hanging and without crashing the relay (proxied to decoy)"
+    echo "[FAIL] gate (b): garbage did not yield a decoy HTTP response (possible tunnel/rendezvous leak)"
+    echo "[FAIL] gate (b): captured reply was:"
+    cat "$TMPDIR_TEST/garbage.out" || true
+    FAIL=1
 fi
 
 # ── 7. gate (c): TIMING PARITY — idle connection not closed at ~3s ─────────
