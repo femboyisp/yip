@@ -24,6 +24,12 @@ pub async fn run_tunnel(
     prefix: Vec<u8>,
 ) {
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_DEPTH);
+    // Keep an identity handle so the exit-time removal below can tell
+    // "my registration" apart from a newer task's registration for the same
+    // `node` (reconnect race) — a `Sender` clone used only for
+    // `same_channel` identity does not keep `rx` alive in a way that matters,
+    // since this task always drops it at exit.
+    let tx_id = tx.clone();
     cfg.routes.lock().await.insert(node, tx);
 
     let mut read_buf = prefix;
@@ -48,7 +54,18 @@ pub async fn run_tunnel(
             },
         }
     }
-    cfg.routes.lock().await.remove(&node);
+    // Only remove the route if it's still ours: if `node` reconnected while
+    // this task was unwinding, a newer `run_tunnel` task has already
+    // overwritten the map entry with its own sender, and removing it here
+    // would black-hole all future deliveries to `node` until it reconnects
+    // again.
+    let mut routes = cfg.routes.lock().await;
+    if routes
+        .get(&node)
+        .is_some_and(|cur| cur.same_channel(&tx_id))
+    {
+        routes.remove(&node);
+    }
 }
 
 /// Parse and act on every complete `[u16 len][obf Message]` frame in `buf`.
@@ -88,7 +105,12 @@ async fn route(msg: Message, cfg: &TlsFrontCfg) {
         // channel. (UDP-connected destinations are served by the UDP task via
         // the shared RendezvousServer; a future refinement can bridge here.)
         let frame = crate::frame_obf(&cfg.obf_key, &deliver);
-        if let Some(tx) = cfg.routes.lock().await.get(&dst) {
+        // Clone the sender and drop the `routes` guard before awaiting the
+        // send: `tx.send(...).await` under a full destination channel must
+        // never hold the global routes mutex, or it wedges all routing and
+        // registration on this front (deadlock, reproduced in review).
+        let tx = cfg.routes.lock().await.get(&dst).cloned();
+        if let Some(tx) = tx {
             let _ = tx.send(frame).await;
         }
     }
@@ -157,6 +179,41 @@ mod tests {
                 src: a,
                 payload: b"hello".to_vec(),
             })
+        );
+    }
+
+    /// Reconnect race (Fix 2): node X registers (tx1), then reconnects and
+    /// registers again (tx2) before the old task's exit-removal runs. The
+    /// old task's `same_channel`-guarded removal must NOT evict the newer
+    /// registration — X's route must still resolve to tx2 afterward.
+    #[tokio::test]
+    async fn reconnect_does_not_evict_newer_route() {
+        let cfg = test_cfg(yip_obf::derive_key(&[3u8; 32]));
+        let x = node_id(&[30u8; 32]);
+
+        let (tx1, _rx1) = mpsc::channel::<Vec<u8>>(CHANNEL_DEPTH);
+        let tx1_id = tx1.clone();
+        cfg.routes.lock().await.insert(x, tx1);
+
+        // X reconnects: a new task registers a fresh sender, overwriting the
+        // map entry before the old task's exit path runs.
+        let (tx2, _rx2) = mpsc::channel::<Vec<u8>>(CHANNEL_DEPTH);
+        cfg.routes.lock().await.insert(x, tx2.clone());
+
+        // Simulate the OLD task's exit-removal logic: only remove if the map
+        // still holds *our* sender.
+        {
+            let mut routes = cfg.routes.lock().await;
+            if routes.get(&x).is_some_and(|cur| cur.same_channel(&tx1_id)) {
+                routes.remove(&x);
+            }
+        }
+
+        let routes = cfg.routes.lock().await;
+        let current = routes.get(&x).expect("newer registration must survive");
+        assert!(
+            current.same_channel(&tx2),
+            "route for X must still point at the newer sender (tx2), not be evicted by the stale task"
         );
     }
 
