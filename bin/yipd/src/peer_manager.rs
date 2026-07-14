@@ -1900,7 +1900,9 @@ impl PeerManager {
         {
             let node = self.local_node_id;
             if let Some(r) = self.rendezvous.as_mut() {
-                self.tick_egress.push(r.register(node));
+                if let Some(dg) = r.register(node) {
+                    self.tick_egress.push(dg);
+                }
             }
             self.last_register_ms = now_ms;
             self.reg_refresh_ms = if self.obf_key.is_some() {
@@ -2756,9 +2758,9 @@ mod tests {
     }
 
     impl Rendezvous for MockRdv {
-        fn register(&mut self, node: NodeId) -> EgressDatagram {
+        fn register(&mut self, node: NodeId) -> Option<EgressDatagram> {
             // counter bumped per-registration in 3c.4; 0 is accepted as first-seen
-            self.to_server(yip_rendezvous::Message::Register { node, counter: 0 })
+            Some(self.to_server(yip_rendezvous::Message::Register { node, counter: 0 }))
         }
         fn lookup(&mut self, node: NodeId) -> EgressDatagram {
             self.to_server(yip_rendezvous::Message::Lookup { node })
