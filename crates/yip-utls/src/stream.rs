@@ -86,6 +86,13 @@ const MAX_APP_RECORD_LEN: usize = 16384;
 /// far below "attacker can make us buffer gigabytes" territory.
 const MAX_HANDSHAKE_MSG_LEN: usize = 1 << 20;
 
+/// Upper bound on the TOTAL decrypted server handshake flight
+/// (EncryptedExtensions + Certificate + CertificateVerify + Finished). A real
+/// flight is tens of KiB; 256 KiB is generous. Without this, a peer (the outer
+/// TLS is zero-server-auth, so this could be a MITM) can stream endless valid
+/// non-`Finished` handshake messages and exhaust our memory (review I1).
+const MAX_SERVER_FLIGHT_LEN: usize = 256 * 1024;
+
 /// [`RandomSource`] backed by the OS CSPRNG (`getrandom`), for driving
 /// [`hello::craft`] in production. [`RandomSource::fill`] cannot itself
 /// return a `Result`, so failures are latched and surfaced by
@@ -310,15 +317,6 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
         ));
     }
     let server_hello_info = parse_server_hello(&sh_msg)?;
-    eprintln!(
-        "[yip-utls] server selected key_share group {} ({})",
-        server_hello_info.group,
-        if server_hello_info.group == GROUP_X25519MLKEM768 {
-            "X25519MLKEM768 hybrid"
-        } else {
-            "plain X25519"
-        }
-    );
 
     let mut ch_sh_transcript = Vec::with_capacity(hello_msg.len() + sh_msg.len());
     ch_sh_transcript.extend_from_slice(&hello_msg);
@@ -407,6 +405,11 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
             .checked_add(1)
             .ok_or(Error::Protocol("server handshake sequence overflow"))?;
         hs_flight.extend_from_slice(&opened);
+        if hs_flight.len() > MAX_SERVER_FLIGHT_LEN {
+            return Err(Error::Protocol(
+                "server handshake flight exceeds sane bound",
+            ));
+        }
 
         if let Some(end) = find_finished_end(&hs_flight)? {
             break end;

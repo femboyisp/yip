@@ -126,3 +126,21 @@ Each sub-milestone is its own spec → plan → PR (per the never-merge / review
 - Pinned Chrome version for the template + CI capture: **current stable** (default).
 - "signal-tlsd" concrete reference: **standard REALITY semantics** assumed pending detail.
 - P2P `transport=tls`: **left as-is** (default).
+
+## REALITY.2 whole-branch review — follow-ups (recorded 2026-07-15)
+
+REALITY.2 (`yip-utls`) shipped READY-WITH-FOLLOWUPS (no Critical). Fixed inline: I1
+(bound the server handshake flight — anti-OOM) and M2 (drop the stderr debug line).
+Remaining, to fold in before/with REALITY.4:
+- **REALITY.4 hard caveat (load-bearing):** the outer REALITY TLS provides ZERO server
+  authentication by design (no cert/Finished verification — the camouflage). So when
+  `yip-utls::connect` is wired into yipd's relay-dial, the **inner yip handshake MUST
+  provide mutual (server) authentication** — a MITM can complete the outer TLS with its
+  own key_share and sees only inner ciphertext, but this assumption must be explicit and
+  verified at REALITY.4. (Differs from Xray REALITY, where the client authenticates the
+  server via a cert keyed by the shared secret; here that role is the inner layer's.)
+- **M3:** `RealityStream::poll_shutdown` sends no `close_notify` alert — a mild teardown
+  fingerprint tell vs real Chrome; seal+write a close_notify before inner shutdown.
+- **M4:** zeroize sensitive locals (`eph_priv`, ecdhe/handshake/traffic secrets, ML-KEM dk).
+- **M5:** `hello::craft` uses `debug_assert` for the ML-KEM ek length — make it a hard check
+  or type-level invariant for external callers.
