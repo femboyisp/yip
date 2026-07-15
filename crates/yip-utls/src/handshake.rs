@@ -6,23 +6,28 @@
 //! primitives around the byte-faithful `ClientHello` crafted by [`crate::hello`].
 //!
 //! Scope is deliberately narrow: TLS 1.3 only, X25519 key exchange only, and
-//! exactly the two cipher suites Chrome/BoringSSL and this crate's crafted
-//! `ClientHello` offer — `TLS_AES_128_GCM_SHA256` (`0x1301`) and
-//! `TLS_CHACHA20_POLY1305_SHA256` (`0x1303`). Everything here is fail-closed:
-//! malformed or out-of-scope server input is a `Result::Err`, never a panic.
+//! exactly the three cipher suites Chrome/BoringSSL and this crate's crafted
+//! `ClientHello` offer — `TLS_AES_128_GCM_SHA256` (`0x1301`),
+//! `TLS_AES_256_GCM_SHA384` (`0x1302`), and `TLS_CHACHA20_POLY1305_SHA256`
+//! (`0x1303`). Everything here is fail-closed: malformed or out-of-scope
+//! server input is a `Result::Err`, never a panic.
 
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM, CHACHA20_POLY1305};
+use ring::aead::{
+    Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM, AES_256_GCM, CHACHA20_POLY1305,
+};
 use ring::{digest, hmac};
 
 const HANDSHAKE_TYPE_SERVER_HELLO: u8 = 0x02;
 const EXT_KEY_SHARE: u16 = 51;
 const GROUP_X25519: u16 = 0x001d;
 const SUITE_AES_128_GCM_SHA256: u16 = 0x1301;
+const SUITE_AES_256_GCM_SHA384: u16 = 0x1302;
 const SUITE_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 
 /// TLS 1.3 record-layer content types (RFC 8446 §5.1), used both as the AAD
 /// "outer type" and as the trailing byte of the `TLSInnerPlaintext` that
 /// [`record_seal`]/[`record_open`] append/strip.
+const CONTENT_TYPE_ALERT: u8 = 0x15;
 const CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
 const CONTENT_TYPE_APPLICATION_DATA: u8 = 0x17;
 
@@ -36,8 +41,8 @@ pub enum Error {
     Truncated,
     /// The handshake message's type byte was not `0x02` (`ServerHello`).
     WrongHandshakeType,
-    /// The negotiated cipher suite is not one of the two this module
-    /// supports (`0x1301`, `0x1303`).
+    /// The negotiated cipher suite is not one of the three this module
+    /// supports (`0x1301`, `0x1302`, `0x1303`).
     UnsupportedCipherSuite,
     /// The `key_share` extension's group was not `x25519` (`0x001d`).
     UnsupportedGroup,
@@ -45,9 +50,6 @@ pub enum Error {
     BadKeyShareLength,
     /// The `ServerHello` had no `key_share` extension (51) at all.
     MissingKeyShare,
-    /// A record-layer key was neither 16 bytes (AES-128-GCM) nor 32 bytes
-    /// (ChaCha20-Poly1305).
-    UnsupportedKeyLength,
     /// A record's ciphertext+tag length does not fit the AAD's 16-bit length
     /// field.
     RecordTooLarge,
@@ -57,8 +59,10 @@ pub enum Error {
     /// After stripping trailing zero padding, no content-type byte remained
     /// — an empty or all-zero `TLSInnerPlaintext`.
     EmptyInnerPlaintext,
-    /// The recovered inner content type was neither `handshake` (0x16) nor
-    /// `application_data` (0x17) — e.g. an `alert` (0x15).
+    /// The recovered inner content type was none of `handshake` (0x16),
+    /// `application_data` (0x17), or `alert` (0x15) — e.g. `change_cipher_spec`
+    /// (0x14), which RFC 8446 never protects (it's only ever sent/accepted
+    /// plaintext, for middlebox compatibility).
     UnexpectedContentType,
 }
 
@@ -71,7 +75,6 @@ impl core::fmt::Display for Error {
             Error::UnsupportedGroup => "key_share group is not x25519",
             Error::BadKeyShareLength => "key_share key is not 32 bytes",
             Error::MissingKeyShare => "ServerHello has no key_share extension",
-            Error::UnsupportedKeyLength => "record key is not 16 or 32 bytes",
             Error::RecordTooLarge => "record ciphertext+tag length exceeds u16",
             Error::Crypto => "AEAD seal/open failed",
             Error::EmptyInnerPlaintext => "TLSInnerPlaintext has no content-type byte",
@@ -139,7 +142,7 @@ impl<'a> Reader<'a> {
 
 /// Parses a `ServerHello` handshake message: `0x02 ‖ u24 len ‖ version(2) ‖
 /// random(32) ‖ sid_len(1)+sid ‖ cipher_suite(2) ‖ comp(1) ‖ ext_len(2) ‖
-/// exts`. Requires the negotiated suite to be one of the two this crate
+/// exts`. Requires the negotiated suite to be one of the three this crate
 /// supports, and requires exactly one `key_share`(51) extension entry with
 /// group x25519 (`0x001d`) and a 32-byte key. Fail-closed on any malformed
 /// or out-of-scope field.
@@ -161,7 +164,10 @@ pub fn parse_server_hello(record_payload: &[u8]) -> Result<ServerHelloInfo, Erro
     let _session_id = b.take(sid_len)?;
 
     let suite = b.u16()?;
-    if suite != SUITE_AES_128_GCM_SHA256 && suite != SUITE_CHACHA20_POLY1305_SHA256 {
+    if suite != SUITE_AES_128_GCM_SHA256
+        && suite != SUITE_AES_256_GCM_SHA384
+        && suite != SUITE_CHACHA20_POLY1305_SHA256
+    {
         return Err(Error::UnsupportedCipherSuite);
     }
 
@@ -202,7 +208,9 @@ pub fn parse_server_hello(record_payload: &[u8]) -> Result<ServerHelloInfo, Erro
 // HKDF (TLS 1.3 flavored, RFC 8446 §7.1 / RFC 5869)
 // ---------------------------------------------------------------------------
 
-/// `SHA-256(m)`.
+/// `SHA-256(m)`. A convenience wrapper for the RFC 8448 test vectors (all of
+/// which negotiate `TLS_AES_128_GCM_SHA256`) — the real handshake path uses
+/// [`transcript_hash`], which picks the hash tied to the negotiated suite.
 pub fn sha256(m: &[u8]) -> [u8; 32] {
     let d = digest::digest(&digest::SHA256, m);
     let mut out = [0u8; 32];
@@ -210,26 +218,73 @@ pub fn sha256(m: &[u8]) -> [u8; 32] {
     out
 }
 
-/// `HKDF-Extract(salt, ikm) = HMAC-SHA256(salt, ikm)` (RFC 5869 §2.2).
+/// The RFC 8446 §7.1 "Hash" the *entire* key schedule (transcript hash,
+/// `HKDF-Extract`/`HKDF-Expand`, `Derive-Secret`) MUST use for a given
+/// negotiated suite: SHA-256 for `TLS_AES_128_GCM_SHA256` (`0x1301`) and
+/// `TLS_CHACHA20_POLY1305_SHA256` (`0x1303`), SHA-384 for
+/// `TLS_AES_256_GCM_SHA384` (`0x1302`) — the suite name literally encodes
+/// it. A client that always used SHA-256 derives the wrong keys for `0x1302`
+/// and fails to decrypt the server's very first handshake record; this is
+/// exactly the bug REALITY.2 Task 8's live test against `www.microsoft.com`
+/// (which negotiates `0x1302`) exposed as `AEAD seal/open failed`.
+/// `parse_server_hello` already restricts a negotiated suite to
+/// `{0x1301, 0x1302, 0x1303}` before this is reached on the real handshake
+/// path; treating any other value as the SHA-256 case is a defensive
+/// default for callers that bypass that check, not a silent correctness gap
+/// on the real path.
+fn digest_algorithm_for_suite(suite: u16) -> &'static digest::Algorithm {
+    if suite == SUITE_AES_256_GCM_SHA384 {
+        &digest::SHA384
+    } else {
+        &digest::SHA256
+    }
+}
+
+/// The `ring::hmac::Algorithm` (HMAC keyed with the same hash — see
+/// [`digest_algorithm_for_suite`]) `HKDF-Extract`/`HKDF-Expand` use for a
+/// negotiated suite.
+fn hmac_algorithm_for_suite(suite: u16) -> hmac::Algorithm {
+    if suite == SUITE_AES_256_GCM_SHA384 {
+        hmac::HMAC_SHA384
+    } else {
+        hmac::HMAC_SHA256
+    }
+}
+
+/// `Hash(m)` for the negotiated `suite`'s key-schedule hash (RFC 8446 §7.1).
+/// 32 bytes for SHA-256-hash suites, 48 for `TLS_AES_256_GCM_SHA384`.
+pub fn transcript_hash(m: &[u8], suite: u16) -> Vec<u8> {
+    digest::digest(digest_algorithm_for_suite(suite), m)
+        .as_ref()
+        .to_vec()
+}
+
+/// `HKDF-Extract(salt, ikm) = HMAC-Hash(salt, ikm)` (RFC 5869 §2.2), using
+/// the negotiated `suite`'s key-schedule hash.
+fn hkdf_extract_for_suite(salt: &[u8], ikm: &[u8], suite: u16) -> Vec<u8> {
+    let key = hmac::Key::new(hmac_algorithm_for_suite(suite), salt);
+    hmac::sign(&key, ikm).as_ref().to_vec()
+}
+
+/// `HKDF-Extract(salt, ikm) = HMAC-SHA256(salt, ikm)` (RFC 5869 §2.2) — the
+/// SHA-256-only convenience wrapper the RFC 8448 test vectors use.
 pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
-    let key = hmac::Key::new(hmac::HMAC_SHA256, salt);
-    let tag = hmac::sign(&key, ikm);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(tag.as_ref());
-    out
+    hkdf_extract_for_suite(salt, ikm, SUITE_AES_128_GCM_SHA256)
+        .try_into()
+        .expect("SHA-256 HMAC output is always 32 bytes")
 }
 
 /// `HKDF-Expand(prk, info, len)` (RFC 5869 §2.3): `T(0) = ""`, `T(n) =
-/// HMAC-SHA256(prk, T(n-1) ‖ info ‖ n)`, output = `T(1) ‖ T(2) ‖ …`
-/// truncated to `len`.
-fn hkdf_expand(prk: &[u8], info: &[u8], len: usize) -> Vec<u8> {
-    let key = hmac::Key::new(hmac::HMAC_SHA256, prk);
+/// HMAC-Hash(prk, T(n-1) ‖ info ‖ n)`, output = `T(1) ‖ T(2) ‖ …` truncated
+/// to `len`, using the negotiated `suite`'s key-schedule hash.
+fn hkdf_expand_for_suite(prk: &[u8], info: &[u8], len: usize, suite: u16) -> Vec<u8> {
+    let key = hmac::Key::new(hmac_algorithm_for_suite(suite), prk);
     let mut out = Vec::with_capacity(len);
     let mut prev: Vec<u8> = Vec::new();
     let mut counter: u8 = 0;
     while out.len() < len {
         counter = counter.checked_add(1).expect(
-            "HKDF-Expand: requested length exceeds 255 * SHA-256-output-size; \
+            "HKDF-Expand: requested length exceeds 255 * hash-output-size; \
              far beyond any TLS 1.3 key/iv/secret this module ever derives",
         );
         let mut ctx = hmac::Context::with_key(&key);
@@ -246,15 +301,22 @@ fn hkdf_expand(prk: &[u8], info: &[u8], len: usize) -> Vec<u8> {
 
 /// `HKDF-Expand-Label(secret, label, context, len)` (RFC 8446 §7.1):
 /// `HkdfLabel = u16(len) ‖ u8(len("tls13 "+label)) ‖ "tls13 "+label ‖
-/// u8(len(context)) ‖ context`, then `HKDF-Expand(secret, HkdfLabel, len)`.
-pub fn hkdf_expand_label(secret: &[u8], label: &[u8], context: &[u8], len: usize) -> Vec<u8> {
+/// u8(len(context)) ‖ context`, then `HKDF-Expand(secret, HkdfLabel, len)`,
+/// using the negotiated `suite`'s key-schedule hash.
+fn hkdf_expand_label_for_suite(
+    secret: &[u8],
+    label: &[u8],
+    context: &[u8],
+    len: usize,
+    suite: u16,
+) -> Vec<u8> {
     let mut full_label = Vec::with_capacity(6 + label.len());
     full_label.extend_from_slice(b"tls13 ");
     full_label.extend_from_slice(label);
 
     let mut info = Vec::with_capacity(2 + 1 + full_label.len() + 1 + context.len());
     let len_u16 = u16::try_from(len).expect(
-        "hkdf_expand_label: len is always a TLS 1.3 key/iv/secret size (<=32) here, well within u16",
+        "hkdf_expand_label: len is always a TLS 1.3 key/iv/secret size (<=48) here, well within u16",
     );
     info.extend_from_slice(&len_u16.to_be_bytes());
     let label_len = u8::try_from(full_label.len())
@@ -262,20 +324,41 @@ pub fn hkdf_expand_label(secret: &[u8], label: &[u8], context: &[u8], len: usize
     info.push(label_len);
     info.extend_from_slice(&full_label);
     let context_len = u8::try_from(context.len()).expect(
-        "hkdf_expand_label: context is a SHA-256 transcript hash (32 bytes) or empty, well within u8",
+        "hkdf_expand_label: context is a transcript hash (32 or 48 bytes) or empty, well within u8",
     );
     info.push(context_len);
     info.extend_from_slice(context);
 
-    hkdf_expand(secret, &info, len)
+    hkdf_expand_for_suite(secret, &info, len, suite)
+}
+
+/// `HKDF-Expand-Label(secret, label, context, len)` (RFC 8446 §7.1), fixed
+/// to SHA-256 — the convenience wrapper the RFC 8448 test vectors use.
+pub fn hkdf_expand_label(secret: &[u8], label: &[u8], context: &[u8], len: usize) -> Vec<u8> {
+    hkdf_expand_label_for_suite(secret, label, context, len, SUITE_AES_128_GCM_SHA256)
+}
+
+/// `Derive-Secret(secret, label, transcript_hash) = HKDF-Expand-Label(secret,
+/// label, transcript_hash, Hash.length)` (RFC 8446 §7.1), using the
+/// negotiated `suite`'s key-schedule hash and output length (32 bytes for
+/// SHA-256-hash suites, 48 for `TLS_AES_256_GCM_SHA384`).
+fn derive_secret_for_suite(
+    secret: &[u8],
+    label: &[u8],
+    transcript_hash: &[u8],
+    suite: u16,
+) -> Vec<u8> {
+    let hash_len = digest_algorithm_for_suite(suite).output_len();
+    hkdf_expand_label_for_suite(secret, label, transcript_hash, hash_len, suite)
 }
 
 /// `Derive-Secret(secret, label, transcript_hash) =
-/// HKDF-Expand-Label(secret, label, transcript_hash, 32)` (RFC 8446 §7.1).
+/// HKDF-Expand-Label(secret, label, transcript_hash, 32)` (RFC 8446 §7.1),
+/// fixed to SHA-256 — the convenience wrapper the RFC 8448 test vectors use.
 pub fn derive_secret(secret: &[u8], label: &[u8], transcript_hash: &[u8]) -> [u8; 32] {
-    let v = hkdf_expand_label(secret, label, transcript_hash, 32);
+    let v = derive_secret_for_suite(secret, label, transcript_hash, SUITE_AES_128_GCM_SHA256);
     v.try_into()
-        .expect("hkdf_expand_label(..., 32) always returns exactly 32 bytes")
+        .expect("SHA-256 Derive-Secret output is always 32 bytes")
 }
 
 fn iv12(v: Vec<u8>) -> [u8; 12] {
@@ -284,11 +367,12 @@ fn iv12(v: Vec<u8>) -> [u8; 12] {
 }
 
 /// AEAD key length for a suite: 16 bytes for `TLS_AES_128_GCM_SHA256`
-/// (`0x1301`), 32 bytes otherwise. `parse_server_hello` already restricts a
-/// negotiated suite to `{0x1301, 0x1303}` before this is reached on the real
-/// handshake path; treating any other value as the 32-byte (ChaCha20-shaped)
-/// case is a defensive default for callers that bypass that check, not a
-/// silent correctness gap on the real path.
+/// (`0x1301`), 32 bytes for `TLS_AES_256_GCM_SHA384` (`0x1302`) and
+/// `TLS_CHACHA20_POLY1305_SHA256` (`0x1303`). `parse_server_hello` already
+/// restricts a negotiated suite to `{0x1301, 0x1302, 0x1303}` before this is
+/// reached on the real handshake path; treating any other value as the
+/// 32-byte case is a defensive default for callers that bypass that check,
+/// not a silent correctness gap on the real path.
 fn key_len_for_suite(suite: u16) -> usize {
     if suite == SUITE_AES_128_GCM_SHA256 {
         16
@@ -303,18 +387,19 @@ fn key_len_for_suite(suite: u16) -> usize {
 
 /// The client/server handshake traffic keys, plus the handshake secret
 /// itself (needed as an input to [`derive_application_keys`]) and the raw
-/// client handshake traffic secret (needed by Task 7's `connect` to derive
-/// the client `Finished` message's `finished_key` via
-/// `HKDF-Expand-Label(client_hs_traffic, "finished", "", 32)`, RFC 8446
-/// §4.4.4).
+/// client handshake traffic secret (needed by Task 7's `connect`, via
+/// [`finished_verify_data`], to derive the client `Finished` message).
+/// `handshake_secret`/`client_hs_traffic` are 32 bytes for SHA-256-hash
+/// suites, 48 bytes for `TLS_AES_256_GCM_SHA384` (`0x1302`) — hence `Vec<u8>`
+/// rather than a fixed-size array.
 pub struct HandshakeKeys {
     pub client_key: Vec<u8>,
     pub client_iv: [u8; 12],
     pub server_key: Vec<u8>,
     pub server_iv: [u8; 12],
     pub suite: u16,
-    pub handshake_secret: [u8; 32],
-    pub client_hs_traffic: [u8; 32],
+    pub handshake_secret: Vec<u8>,
+    pub client_hs_traffic: Vec<u8>,
 }
 
 /// Derives the TLS 1.3 handshake traffic keys from the ECDHE shared secret
@@ -329,26 +414,40 @@ pub struct HandshakeKeys {
 /// {c,s}_key  = HKDF-Expand-Label({c,s}_hs, "key", "", key_len)
 /// {c,s}_iv   = HKDF-Expand-Label({c,s}_hs, "iv",  "", 12)
 /// ```
+///
+/// Every step here uses the `suite`-selected hash (RFC 8446 §7.1) — see
+/// [`digest_algorithm_for_suite`].
 pub fn derive_handshake_keys(
     ecdhe: &[u8; 32],
     transcript_hash_ch_sh: &[u8],
     suite: u16,
 ) -> HandshakeKeys {
-    let zeros = [0u8; 32];
-    let empty_hash = sha256(b"");
+    let hash_len = digest_algorithm_for_suite(suite).output_len();
+    let zeros = vec![0u8; hash_len];
+    let empty_hash = transcript_hash(b"", suite);
 
-    let early = hkdf_extract(&zeros, &zeros);
-    let derived = derive_secret(&early, b"derived", &empty_hash);
-    let handshake_secret = hkdf_extract(&derived, ecdhe);
+    let early = hkdf_extract_for_suite(&zeros, &zeros, suite);
+    let derived = derive_secret_for_suite(&early, b"derived", &empty_hash, suite);
+    let handshake_secret = hkdf_extract_for_suite(&derived, ecdhe, suite);
 
-    let c_hs = derive_secret(&handshake_secret, b"c hs traffic", transcript_hash_ch_sh);
-    let s_hs = derive_secret(&handshake_secret, b"s hs traffic", transcript_hash_ch_sh);
+    let c_hs = derive_secret_for_suite(
+        &handshake_secret,
+        b"c hs traffic",
+        transcript_hash_ch_sh,
+        suite,
+    );
+    let s_hs = derive_secret_for_suite(
+        &handshake_secret,
+        b"s hs traffic",
+        transcript_hash_ch_sh,
+        suite,
+    );
 
     let key_len = key_len_for_suite(suite);
-    let client_key = hkdf_expand_label(&c_hs, b"key", b"", key_len);
-    let server_key = hkdf_expand_label(&s_hs, b"key", b"", key_len);
-    let client_iv = iv12(hkdf_expand_label(&c_hs, b"iv", b"", 12));
-    let server_iv = iv12(hkdf_expand_label(&s_hs, b"iv", b"", 12));
+    let client_key = hkdf_expand_label_for_suite(&c_hs, b"key", b"", key_len, suite);
+    let server_key = hkdf_expand_label_for_suite(&s_hs, b"key", b"", key_len, suite);
+    let client_iv = iv12(hkdf_expand_label_for_suite(&c_hs, b"iv", b"", 12, suite));
+    let server_iv = iv12(hkdf_expand_label_for_suite(&s_hs, b"iv", b"", 12, suite));
 
     HandshakeKeys {
         client_key,
@@ -359,6 +458,20 @@ pub fn derive_handshake_keys(
         handshake_secret,
         client_hs_traffic: c_hs,
     }
+}
+
+/// Computes the client `Finished` message's `verify_data = HMAC(finished_key,
+/// transcript_hash)`, where `finished_key = HKDF-Expand-Label(base_secret,
+/// "finished", "", Hash.length)` (RFC 8446 §4.4.4) — using the negotiated
+/// `suite`'s hash/HMAC throughout, matching the rest of the key schedule.
+/// `base_secret` is [`HandshakeKeys::client_hs_traffic`] for the client
+/// `Finished` (the only one this crate ever sends — it never validates the
+/// server's `Finished` contents; see [`crate::stream::connect`]'s module doc).
+pub fn finished_verify_data(base_secret: &[u8], transcript_hash: &[u8], suite: u16) -> Vec<u8> {
+    let hash_len = digest_algorithm_for_suite(suite).output_len();
+    let finished_key = hkdf_expand_label_for_suite(base_secret, b"finished", b"", hash_len, suite);
+    let key = hmac::Key::new(hmac_algorithm_for_suite(suite), &finished_key);
+    hmac::sign(&key, transcript_hash).as_ref().to_vec()
 }
 
 /// The client/server application traffic keys.
@@ -383,23 +496,34 @@ pub struct ApplicationKeys {
 /// {c,s}_iv   = HKDF-Expand-Label({c,s}_ap, "iv",  "", 12)
 /// ```
 pub fn derive_application_keys(
-    handshake_secret: &[u8; 32],
+    handshake_secret: &[u8],
     transcript_hash_through_sfin: &[u8],
     suite: u16,
 ) -> ApplicationKeys {
-    let zeros = [0u8; 32];
-    let empty_hash = sha256(b"");
-    let derived = derive_secret(handshake_secret, b"derived", &empty_hash);
-    let master = hkdf_extract(&derived, &zeros);
+    let hash_len = digest_algorithm_for_suite(suite).output_len();
+    let zeros = vec![0u8; hash_len];
+    let empty_hash = transcript_hash(b"", suite);
+    let derived = derive_secret_for_suite(handshake_secret, b"derived", &empty_hash, suite);
+    let master = hkdf_extract_for_suite(&derived, &zeros, suite);
 
-    let c_ap = derive_secret(&master, b"c ap traffic", transcript_hash_through_sfin);
-    let s_ap = derive_secret(&master, b"s ap traffic", transcript_hash_through_sfin);
+    let c_ap = derive_secret_for_suite(
+        &master,
+        b"c ap traffic",
+        transcript_hash_through_sfin,
+        suite,
+    );
+    let s_ap = derive_secret_for_suite(
+        &master,
+        b"s ap traffic",
+        transcript_hash_through_sfin,
+        suite,
+    );
 
     let key_len = key_len_for_suite(suite);
-    let client_key = hkdf_expand_label(&c_ap, b"key", b"", key_len);
-    let server_key = hkdf_expand_label(&s_ap, b"key", b"", key_len);
-    let client_iv = iv12(hkdf_expand_label(&c_ap, b"iv", b"", 12));
-    let server_iv = iv12(hkdf_expand_label(&s_ap, b"iv", b"", 12));
+    let client_key = hkdf_expand_label_for_suite(&c_ap, b"key", b"", key_len, suite);
+    let server_key = hkdf_expand_label_for_suite(&s_ap, b"key", b"", key_len, suite);
+    let client_iv = iv12(hkdf_expand_label_for_suite(&c_ap, b"iv", b"", 12, suite));
+    let server_iv = iv12(hkdf_expand_label_for_suite(&s_ap, b"iv", b"", 12, suite));
 
     ApplicationKeys {
         client_key,
@@ -414,11 +538,18 @@ pub fn derive_application_keys(
 // Record layer (RFC 8446 §5.2/§5.3)
 // ---------------------------------------------------------------------------
 
-fn algorithm_for_key_len(len: usize) -> Result<&'static ring::aead::Algorithm, Error> {
-    match len {
-        16 => Ok(&AES_128_GCM),
-        32 => Ok(&CHACHA20_POLY1305),
-        _ => Err(Error::UnsupportedKeyLength),
+/// Selects the AEAD algorithm for a negotiated suite. Deliberately keyed on
+/// the *suite*, not the key length: `TLS_AES_256_GCM_SHA384` (`0x1302`) and
+/// `TLS_CHACHA20_POLY1305_SHA256` (`0x1303`) both use 32-byte keys, so key
+/// length alone cannot disambiguate them — a real bug this crate shipped
+/// with until the REALITY.2 Task 8 live test against `www.microsoft.com`
+/// (which negotiates `0x1302`) exposed it.
+fn algorithm_for_suite(suite: u16) -> Result<&'static ring::aead::Algorithm, Error> {
+    match suite {
+        SUITE_AES_128_GCM_SHA256 => Ok(&AES_128_GCM),
+        SUITE_AES_256_GCM_SHA384 => Ok(&AES_256_GCM),
+        SUITE_CHACHA20_POLY1305_SHA256 => Ok(&CHACHA20_POLY1305),
+        _ => Err(Error::UnsupportedCipherSuite),
     }
 }
 
@@ -435,18 +566,21 @@ fn make_nonce(iv: &[u8; 12], seq: u64) -> Nonce {
 
 /// Seals `plaintext` as a TLS 1.3 protected record, appending `content_type`
 /// as the real (inner) content type before encryption (no additional
-/// padding). AEAD algorithm is selected from `key.len()` (16 => AES-128-GCM,
-/// 32 => ChaCha20-Poly1305). Returns the wire `encrypted_record` body
-/// (ciphertext ‖ tag) — the caller prepends the 5-byte outer record header
-/// `[0x17, 0x03, 0x03, len_hi, len_lo]` (`len = ` returned length) itself.
+/// padding). AEAD algorithm is selected from the negotiated `suite` (key
+/// length alone cannot disambiguate `TLS_AES_256_GCM_SHA384` from
+/// `TLS_CHACHA20_POLY1305_SHA256` — both use 32-byte keys). Returns the wire
+/// `encrypted_record` body (ciphertext ‖ tag) — the caller prepends the
+/// 5-byte outer record header `[0x17, 0x03, 0x03, len_hi, len_lo]` (`len = `
+/// returned length) itself.
 pub fn record_seal(
     key: &[u8],
     iv: &[u8; 12],
     seq: u64,
+    suite: u16,
     content_type: u8,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, Error> {
-    let alg = algorithm_for_key_len(key.len())?;
+    let alg = algorithm_for_suite(suite)?;
     let unbound = UnboundKey::new(alg, key).map_err(|_| Error::Crypto)?;
     let less_safe = LessSafeKey::new(unbound);
     let nonce = make_nonce(iv, seq);
@@ -488,23 +622,30 @@ pub fn record_open(
     key: &[u8],
     iv: &[u8; 12],
     seq: u64,
+    suite: u16,
     record_type: u8,
     payload: &mut Vec<u8>,
 ) -> Result<Vec<u8>, Error> {
-    record_open_typed(key, iv, seq, record_type, payload).map(|(_content_type, content)| content)
+    record_open_typed(key, iv, seq, suite, record_type, payload)
+        .map(|(_content_type, content)| content)
 }
 
 /// Identical to [`record_open`], but also returns the recovered TLS 1.3
-/// inner content type (`0x16` handshake or `0x17` application_data) instead
-/// of discarding it after validation.
+/// inner content type — `0x16` handshake, `0x17` application_data, or `0x15`
+/// alert (RFC 8446 §5.2: once traffic keys are in place, alerts are
+/// protected records too, carried inside `TLSInnerPlaintext` exactly like
+/// handshake/application-data content, NOT sent as a distinct plaintext
+/// outer record) — instead of discarding it after validation. Callers that
+/// don't care which of the three it was can use [`record_open`].
 pub fn record_open_typed(
     key: &[u8],
     iv: &[u8; 12],
     seq: u64,
+    suite: u16,
     record_type: u8,
     payload: &mut Vec<u8>,
 ) -> Result<(u8, Vec<u8>), Error> {
-    let alg = algorithm_for_key_len(key.len())?;
+    let alg = algorithm_for_suite(suite)?;
     let unbound = UnboundKey::new(alg, key).map_err(|_| Error::Crypto)?;
     let less_safe = LessSafeKey::new(unbound);
     let nonce = make_nonce(iv, seq);
@@ -524,7 +665,10 @@ pub fn record_open_typed(
         payload.pop();
     }
     let content_type = payload.pop().ok_or(Error::EmptyInnerPlaintext)?;
-    if content_type != CONTENT_TYPE_HANDSHAKE && content_type != CONTENT_TYPE_APPLICATION_DATA {
+    if content_type != CONTENT_TYPE_HANDSHAKE
+        && content_type != CONTENT_TYPE_APPLICATION_DATA
+        && content_type != CONTENT_TYPE_ALERT
+    {
         return Err(Error::UnexpectedContentType);
     }
 
@@ -734,6 +878,51 @@ mod tests {
         assert_eq!(s_ap, hex32(RFC8448_SERVER_AP_TRAFFIC_SECRET));
     }
 
+    /// RFC 8448's "Simple 1-RTT Handshake" example only demonstrates
+    /// `TLS_AES_128_GCM_SHA256`, so there's no published vector to KAT
+    /// `TLS_AES_256_GCM_SHA384`'s key schedule against directly. This locks
+    /// the *shape* and *hash-algorithm selection* RFC 8446 §7.1 requires
+    /// instead: every secret/hash the `0x1302` key schedule touches must be
+    /// SHA-384-sized (48 bytes), and must differ from what the SAME ECDHE
+    /// input produces under `0x1301`'s SHA-256 schedule — proving `suite`
+    /// actually selects the hash rather than being an unused label. This is
+    /// exactly the bug REALITY.2 Task 8's live test against a real server
+    /// (`www.microsoft.com`, which negotiates `0x1302`) exposed: this crate
+    /// always used SHA-256 internally regardless of suite, so it derived the
+    /// wrong keys and failed to decrypt the server's first handshake record.
+    #[test]
+    fn derive_handshake_keys_uses_sha384_for_aes256_gcm_suite() {
+        let ecdhe = [0x11u8; 32];
+
+        let transcript_384 = transcript_hash(b"some transcript", SUITE_AES_256_GCM_SHA384);
+        assert_eq!(
+            transcript_384.len(),
+            48,
+            "SHA-384 transcript hash is 48 bytes"
+        );
+        let keys_384 = derive_handshake_keys(&ecdhe, &transcript_384, SUITE_AES_256_GCM_SHA384);
+        assert_eq!(keys_384.handshake_secret.len(), 48);
+        assert_eq!(keys_384.client_hs_traffic.len(), 48);
+        assert_eq!(keys_384.client_key.len(), 32, "AES-256-GCM key is 32 bytes");
+        assert_eq!(keys_384.server_key.len(), 32);
+
+        let transcript_256 = transcript_hash(b"some transcript", SUITE_AES_128_GCM_SHA256);
+        assert_eq!(
+            transcript_256.len(),
+            32,
+            "SHA-256 transcript hash is 32 bytes"
+        );
+        let keys_256 = derive_handshake_keys(&ecdhe, &transcript_256, SUITE_AES_128_GCM_SHA256);
+        assert_eq!(keys_256.handshake_secret.len(), 32);
+        assert_ne!(
+            keys_384.handshake_secret[..32],
+            keys_256.handshake_secret[..],
+            "the same ECDHE input must derive a DIFFERENT handshake_secret under a \
+             different suite's hash — same value here would mean `suite` isn't \
+             actually selecting SHA-384"
+        );
+    }
+
     /// The strongest KAT in this module: `record_open` against a REAL
     /// TLS 1.3 ciphertext record from RFC 8448 (the server's
     /// EncryptedExtensions/Certificate/CertificateVerify/Finished flight,
@@ -750,7 +939,8 @@ mod tests {
         let iv = iv12(hex(RFC8448_SERVER_HS_IV));
         let mut payload = ciphertext.to_vec();
 
-        let plaintext = record_open(&key, &iv, 0, 0x17, &mut payload).expect("valid record");
+        let plaintext = record_open(&key, &iv, 0, SUITE_AES_128_GCM_SHA256, 0x17, &mut payload)
+            .expect("valid record");
         assert_eq!(plaintext, hex(RFC8448_EE_PLAINTEXT));
     }
 
@@ -765,35 +955,97 @@ mod tests {
         let last = payload.len() - 1;
         payload[last] ^= 0xFF; // flip a tag byte
         assert_eq!(
-            record_open(&key, &iv, 0, 0x17, &mut payload).unwrap_err(),
+            record_open(&key, &iv, 0, SUITE_AES_128_GCM_SHA256, 0x17, &mut payload).unwrap_err(),
             Error::Crypto
         );
     }
 
     #[test]
-    fn record_seal_then_open_round_trips_both_suites() {
-        for suite in [SUITE_AES_128_GCM_SHA256, SUITE_CHACHA20_POLY1305_SHA256] {
+    fn record_seal_then_open_round_trips_all_suites() {
+        for suite in [
+            SUITE_AES_128_GCM_SHA256,
+            SUITE_AES_256_GCM_SHA384,
+            SUITE_CHACHA20_POLY1305_SHA256,
+        ] {
             let key_len = key_len_for_suite(suite);
             let key = vec![0x42u8; key_len];
             let iv = [0x24u8; 12];
             let plaintext = b"hello REALITY handshake test vector";
 
             let mut sealed =
-                record_seal(&key, &iv, 7, CONTENT_TYPE_HANDSHAKE, plaintext).expect("seal");
-            let opened = record_open(&key, &iv, 7, CONTENT_TYPE_APPLICATION_DATA, &mut sealed)
-                .expect("open");
+                record_seal(&key, &iv, 7, suite, CONTENT_TYPE_HANDSHAKE, plaintext).expect("seal");
+            let opened = record_open(
+                &key,
+                &iv,
+                7,
+                suite,
+                CONTENT_TYPE_APPLICATION_DATA,
+                &mut sealed,
+            )
+            .expect("open");
             assert_eq!(opened, plaintext);
         }
+    }
+
+    /// `TLS_AES_256_GCM_SHA384` (`0x1302`) and `TLS_CHACHA20_POLY1305_SHA256`
+    /// (`0x1303`) both use 32-byte keys — the AEAD algorithm MUST be chosen
+    /// from the negotiated suite, not inferred from key length, or a
+    /// same-length-but-wrong-algorithm open would silently corrupt data (or,
+    /// as actually happened here, fail to interoperate with any real server
+    /// that negotiates AES-256-GCM).
+    #[test]
+    fn record_open_rejects_wrong_suite_for_same_key_length() {
+        let key = vec![0x55u8; 32];
+        let iv = [0x66u8; 12];
+        let sealed = record_seal(
+            &key,
+            &iv,
+            0,
+            SUITE_AES_256_GCM_SHA384,
+            CONTENT_TYPE_APPLICATION_DATA,
+            b"payload",
+        )
+        .expect("seal under AES-256-GCM");
+        let mut wrong_suite_payload = sealed.clone();
+        assert_eq!(
+            record_open(
+                &key,
+                &iv,
+                0,
+                SUITE_CHACHA20_POLY1305_SHA256,
+                CONTENT_TYPE_APPLICATION_DATA,
+                &mut wrong_suite_payload,
+            )
+            .unwrap_err(),
+            Error::Crypto,
+            "opening an AES-256-GCM record as ChaCha20-Poly1305 must fail, not silently \
+             misinterpret ciphertext as plaintext"
+        );
     }
 
     #[test]
     fn record_open_rejects_wrong_sequence_number() {
         let key = vec![0x11u8; 32];
         let iv = [0x22u8; 12];
-        let mut sealed = record_seal(&key, &iv, 0, CONTENT_TYPE_APPLICATION_DATA, b"payload")
-            .expect("seal at seq 0");
+        let mut sealed = record_seal(
+            &key,
+            &iv,
+            0,
+            SUITE_CHACHA20_POLY1305_SHA256,
+            CONTENT_TYPE_APPLICATION_DATA,
+            b"payload",
+        )
+        .expect("seal at seq 0");
         assert_eq!(
-            record_open(&key, &iv, 1, CONTENT_TYPE_APPLICATION_DATA, &mut sealed).unwrap_err(),
+            record_open(
+                &key,
+                &iv,
+                1,
+                SUITE_CHACHA20_POLY1305_SHA256,
+                CONTENT_TYPE_APPLICATION_DATA,
+                &mut sealed,
+            )
+            .unwrap_err(),
             Error::Crypto
         );
     }
@@ -805,11 +1057,20 @@ mod tests {
         // than panic.
         let key = vec![0x33u8; 16];
         let iv = [0x44u8; 12];
-        let mut sealed = record_seal(&key, &iv, 0, 0x00, b"").expect("seal");
+        let mut sealed =
+            record_seal(&key, &iv, 0, SUITE_AES_128_GCM_SHA256, 0x00, b"").expect("seal");
         // record_seal appends content_type=0x00 with no other payload, so
         // the stripped inner plaintext is empty -> EmptyInnerPlaintext.
         assert_eq!(
-            record_open(&key, &iv, 0, CONTENT_TYPE_APPLICATION_DATA, &mut sealed).unwrap_err(),
+            record_open(
+                &key,
+                &iv,
+                0,
+                SUITE_AES_128_GCM_SHA256,
+                CONTENT_TYPE_APPLICATION_DATA,
+                &mut sealed,
+            )
+            .unwrap_err(),
             Error::EmptyInnerPlaintext
         );
     }

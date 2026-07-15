@@ -20,11 +20,10 @@
 use crate::auth;
 use crate::error::Error;
 use crate::handshake::{
-    self, derive_application_keys, derive_handshake_keys, hkdf_expand_label, parse_server_hello,
-    record_open, record_open_typed, record_seal, sha256, HandshakeKeys,
+    self, derive_application_keys, derive_handshake_keys, finished_verify_data, parse_server_hello,
+    record_open, record_open_typed, record_seal, transcript_hash, HandshakeKeys,
 };
 use crate::hello::{self, ClientHelloParams, RandomSource};
-use ring::hmac;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -33,8 +32,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 /// TLS record-layer content types (RFC 8446 §5.1).
 const CONTENT_TYPE_CHANGE_CIPHER_SPEC: u8 = 0x14;
+const CONTENT_TYPE_ALERT: u8 = 0x15;
 const CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
 const CONTENT_TYPE_APPLICATION_DATA: u8 = 0x17;
+
+/// `AlertDescription::close_notify` (RFC 8446 §6.1) — the one alert a
+/// well-behaved peer sends to end a connection cleanly; every other alert
+/// description is a genuine error.
+const ALERT_DESCRIPTION_CLOSE_NOTIFY: u8 = 0;
 
 /// Handshake message type for `Finished` (RFC 8446 §4.4.4).
 const HS_TYPE_FINISHED: u8 = 0x14;
@@ -235,7 +240,7 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
     let mut ch_sh_transcript = Vec::with_capacity(hello_msg.len() + sh_msg.len());
     ch_sh_transcript.extend_from_slice(&hello_msg);
     ch_sh_transcript.extend_from_slice(&sh_msg);
-    let transcript_ch_sh = sha256(&ch_sh_transcript);
+    let transcript_ch_sh = transcript_hash(&ch_sh_transcript, server_hello_info.suite);
 
     let ecdhe = secret
         .diffie_hellman(&x25519_dalek::PublicKey::from(
@@ -264,6 +269,7 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
             &hk.server_key,
             &hk.server_iv,
             server_seq,
+            server_hello_info.suite,
             record_type,
             &mut payload,
         )?;
@@ -280,18 +286,26 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
 
     let mut full_transcript = ch_sh_transcript;
     full_transcript.extend_from_slice(&hs_flight);
-    let transcript_thru_sfin = sha256(&full_transcript);
+    let transcript_thru_sfin = transcript_hash(&full_transcript, server_hello_info.suite);
 
-    // Client Finished: verify_data = HMAC-SHA256(finished_key, transcript),
-    // finished_key = HKDF-Expand-Label(client_hs_traffic, "finished", "", 32).
-    let finished_key_bytes = hkdf_expand_label(&hk.client_hs_traffic, b"finished", b"", 32);
-    let finished_hmac_key = hmac::Key::new(hmac::HMAC_SHA256, &finished_key_bytes);
-    let verify_data = hmac::sign(&finished_hmac_key, &transcript_thru_sfin);
+    // Client Finished: verify_data = HMAC-Hash(finished_key, transcript),
+    // finished_key = HKDF-Expand-Label(client_hs_traffic, "finished", "",
+    // Hash.length) — Hash is the suite's key-schedule hash throughout (RFC
+    // 8446 §4.4.4/§7.1), so verify_data is 32 bytes for SHA-256-hash suites
+    // but 48 bytes for TLS_AES_256_GCM_SHA384 (0x1302); the u24 length
+    // prefix below must match that, not be hardcoded.
+    let verify_data = finished_verify_data(
+        &hk.client_hs_traffic,
+        &transcript_thru_sfin,
+        server_hello_info.suite,
+    );
 
-    let mut client_finished_msg = Vec::with_capacity(4 + verify_data.as_ref().len());
+    let mut client_finished_msg = Vec::with_capacity(4 + verify_data.len());
     client_finished_msg.push(HS_TYPE_FINISHED);
-    client_finished_msg.extend_from_slice(&[0x00, 0x00, 0x20]); // u24(32)
-    client_finished_msg.extend_from_slice(verify_data.as_ref());
+    let vd_len = u32::try_from(verify_data.len())
+        .map_err(|_| Error::Protocol("Finished verify_data length exceeds a u24"))?;
+    client_finished_msg.extend_from_slice(&vd_len.to_be_bytes()[1..]); // u24
+    client_finished_msg.extend_from_slice(&verify_data);
 
     // Middlebox-compatibility CCS, then the sealed client Finished, matching
     // real Chrome/BoringSSL's wire shape.
@@ -301,6 +315,7 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
         &hk.client_key,
         &hk.client_iv,
         0,
+        server_hello_info.suite,
         CONTENT_TYPE_HANDSHAKE,
         &client_finished_msg,
     )?;
@@ -320,6 +335,7 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
 
     Ok(RealityStream {
         inner: stream,
+        suite: ak.suite,
         client_key: ak.client_key,
         client_iv: ak.client_iv,
         client_seq: 0,
@@ -343,6 +359,11 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
 /// closed rather than reusing a nonce.
 pub struct RealityStream<S> {
     inner: S,
+    /// The negotiated TLS 1.3 cipher suite (`0x1301`/`0x1302`/`0x1303`) —
+    /// needed on every seal/open, since `TLS_AES_256_GCM_SHA384` and
+    /// `TLS_CHACHA20_POLY1305_SHA256` share a 32-byte key length and so
+    /// cannot be told apart from `client_key`/`server_key` alone.
+    suite: u16,
     client_key: Vec<u8>,
     client_iv: [u8; 12],
     client_seq: u64,
@@ -362,6 +383,10 @@ pub struct RealityStream<S> {
 }
 
 fn protocol_io_error(msg: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
+fn protocol_io_error_owned(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
@@ -403,6 +428,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> RealityStream<S> {
                     &self.server_key,
                     &self.server_iv,
                     self.server_seq,
+                    self.suite,
                     record_type,
                     &mut payload,
                 )
@@ -414,6 +440,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> RealityStream<S> {
                 if inner_type == CONTENT_TYPE_APPLICATION_DATA {
                     self.read_buf.extend_from_slice(&content);
                     return Poll::Ready(Ok(()));
+                }
+                if inner_type == CONTENT_TYPE_ALERT {
+                    // RFC 8446 §5.2/§6.1: post-handshake alerts arrive
+                    // encrypted, inside TLSInnerPlaintext, exactly like
+                    // handshake/application-data content — never as a
+                    // distinct outer record type. `content` is
+                    // `level(1) || description(1)`.
+                    let description = content.get(1).copied();
+                    return Poll::Ready(match description {
+                        Some(ALERT_DESCRIPTION_CLOSE_NOTIFY) => Ok(()), // clean EOF
+                        Some(d) => Err(protocol_io_error_owned(format!(
+                            "peer sent a fatal TLS alert (description {d}) instead of application data"
+                        ))),
+                        None => Err(protocol_io_error("peer sent a truncated TLS alert record")),
+                    });
                 }
                 // Inner type is handshake (e.g. a post-handshake
                 // NewSessionTicket) — consumed and ignored, look for the
@@ -514,6 +555,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for RealityStream<S> {
             &this.client_key,
             &this.client_iv,
             this.client_seq,
+            this.suite,
             CONTENT_TYPE_APPLICATION_DATA,
             chunk,
         )
@@ -732,6 +774,7 @@ mod tests {
 
         let mut a = RealityStream {
             inner: a_io,
+            suite: 0x1301, // TLS_AES_128_GCM_SHA256 -- matches the 16-byte test keys
             client_key: key_a.clone(),
             client_iv: iv_a,
             client_seq: 0,
@@ -746,6 +789,7 @@ mod tests {
         };
         let mut b = RealityStream {
             inner: b_io,
+            suite: 0x1301, // TLS_AES_128_GCM_SHA256 -- matches the 16-byte test keys
             client_key: key_b,
             client_iv: iv_b,
             client_seq: 0,

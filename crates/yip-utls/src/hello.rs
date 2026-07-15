@@ -2,27 +2,31 @@
 //! Task 3).
 //!
 //! Every extension's *content* here is fixed to match real Chrome 150
-//! captures (see `docs/superpowers/specs/reality-2-chrome150-fingerprint.txt`).
-//! Only the *order* of the 16 "real" extensions is randomized per connection
-//! via a Fisher–Yates shuffle seeded from the caller's [`RandomSource`] — the
-//! fingerprint reference documents three real Chrome captures with three
-//! different JA3 hashes (order-sensitive) but one stable JA4 (order-insensitive,
-//! it sorts): modern Chrome/BoringSSL permutes its ClientHello extension order
-//! every connection, keeping one GREASE extension first and one last. A FIXED
-//! extension order here would make yip MORE fingerprintable than real Chrome —
-//! defeating the point of this crafter.
+//! captures (see `docs/superpowers/specs/reality-2-chrome150-fingerprint.txt`),
+//! with one deliberate, documented exception: `X25519MLKEM768` (`4588`) is
+//! dropped from `key_share` (and, to stay consistent, from `supported_groups`
+//! too) because this crate can't forge a canonically-valid ML-KEM-768 key —
+//! see [`key_share_body`]'s and [`supported_groups_body`]'s doc comments for
+//! why sending one anyway got REALITY.2 Task 8's live test killed by real
+//! ML-KEM-strict servers. Only the *order* of the real extensions is
+//! randomized per connection via a Fisher–Yates shuffle seeded from the
+//! caller's [`RandomSource`] — the fingerprint reference documents three real
+//! Chrome captures with three different JA3 hashes (order-sensitive) but one
+//! stable JA4 (order-insensitive, it sorts): modern Chrome/BoringSSL permutes
+//! its ClientHello extension order every connection, keeping one GREASE
+//! extension first and one last. A FIXED extension order here would make yip
+//! MORE fingerprintable than real Chrome — defeating the point of this
+//! crafter.
 
 use crate::wire::HelloWriter;
 
 const HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 0x01;
 const LEGACY_VERSION_TLS12: u16 = 0x0303;
 
-const GROUP_X25519_MLKEM768: u16 = 4588;
 const GROUP_X25519: u16 = 29;
 const GROUP_SECP256R1: u16 = 23;
 const GROUP_SECP384R1: u16 = 24;
 
-const MLKEM768_KEY_SHARE_LEN: usize = 1216;
 const ECH_ENC_LEN: usize = 32;
 const ECH_PAYLOAD_LEN: usize = 160;
 
@@ -128,11 +132,26 @@ fn wrap_handshake_message(body: Vec<u8>) -> Vec<u8> {
 /// Builds the 16 real (non-GREASE) extensions as `(id, body)` pairs, in an
 /// arbitrary construction order — `craft` shuffles this list before writing
 /// it, so this order is never observed on the wire.
+///
+/// `supported_groups` and `key_share` each carry a leading GREASE entry, and
+/// RFC 8701 §3.4 requires those two GREASE values to be the *same* codepoint
+/// within one `ClientHello` (real Chrome captures confirm this — see
+/// `docs/superpowers/specs/reality-2-chrome150-fingerprint.txt`'s
+/// `GREASE(0x7a7a)` appearing in both extensions' comments). Drawing it once
+/// here and threading it into both builders — rather than each calling
+/// [`grease`] independently — is not just fingerprint fidelity: real TLS 1.3
+/// servers (confirmed against Cloudflare, Google, `www.microsoft.com`, and a
+/// local `openssl s_server`) cross-check the two and kill the connection
+/// with `illegal_parameter`/`decode_error` on a mismatch.
 fn build_extensions(params: &ClientHelloParams, rng: &mut dyn RandomSource) -> Vec<(u16, Vec<u8>)> {
+    let groups_key_share_grease = grease(rng);
     vec![
         (EXT_SCT, Vec::new()),
         (EXT_ALPS, protocol_list_body(&["h2"])),
-        (EXT_SUPPORTED_GROUPS, supported_groups_body(rng)),
+        (
+            EXT_SUPPORTED_GROUPS,
+            supported_groups_body(groups_key_share_grease),
+        ),
         (EXT_EC_POINT_FORMATS, ec_point_formats_body()),
         (EXT_PSK_KEY_EXCHANGE_MODES, vec![0x01, 0x01]),
         (EXT_SERVER_NAME, server_name_body(&params.sni)),
@@ -145,7 +164,10 @@ fn build_extensions(params: &ClientHelloParams, rng: &mut dyn RandomSource) -> V
         (EXT_RENEGOTIATION_INFO, vec![0x00]),
         (EXT_EXTENDED_MASTER_SECRET, Vec::new()),
         (EXT_STATUS_REQUEST, status_request_body()),
-        (EXT_KEY_SHARE, key_share_body(params, rng)),
+        (
+            EXT_KEY_SHARE,
+            key_share_body(params, rng, groups_key_share_grease),
+        ),
     ]
 }
 
@@ -161,11 +183,23 @@ fn protocol_list_body(protocols: &[&str]) -> Vec<u8> {
     w.into_bytes()
 }
 
-fn supported_groups_body(rng: &mut dyn RandomSource) -> Vec<u8> {
+/// `supported_groups` (RFC 8446 §4.2.7): GREASE, then the three classical
+/// curves this crate actually completes a handshake for. Real Chrome-150
+/// also lists `X25519MLKEM768` (`4588`) first — deliberately NOT included
+/// here; see [`key_share_body`]'s doc comment for why advertising it without
+/// a real ML-KEM-768 key share gets this crate HelloRetryRequest'd (not
+/// simply ignored) by ML-KEM-preferring servers like Cloudflare and Google,
+/// which this client has no way to complete (no ML-KEM keygen, and REALITY.2
+/// is a one-round-trip design — HRR is a second round trip). This is a real,
+/// intentional fingerprint gap (JA3's curve list differs from real Chrome-150;
+/// JA4 is unaffected — it never hashes `supported_groups` content, only
+/// extension IDs/cipher IDs/signature algorithms) traded for actually
+/// completing handshakes against real, currently-deployed PQ-preferring
+/// TLS 1.3 servers.
+fn supported_groups_body(grease_value: u16) -> Vec<u8> {
     let mut w = HelloWriter::new();
     w.u16_prefixed(|w| {
-        w.u16(grease(rng));
-        w.u16(GROUP_X25519_MLKEM768);
+        w.u16(grease_value);
         w.u16(GROUP_X25519);
         w.u16(GROUP_SECP256R1);
         w.u16(GROUP_SECP384R1);
@@ -192,10 +226,17 @@ fn server_name_body(sni: &str) -> Vec<u8> {
 /// plausibly-shaped outer extension (HPKE cipher suite, config id, KEM
 /// `enc`, and an encrypted-payload-sized blob), all drawn from `rng`. Chrome
 /// sends real GREASE ECH when it has no ECH config to use; content is
-/// opaque, so shape (not exact bytes) is what matters here.
+/// opaque, so shape (not exact bytes) is what matters here — EXCEPT the
+/// leading `ECHClientHelloType` tag, which ECH-terminating servers (e.g.
+/// Cloudflare, Google) actually parse: it MUST be `outer` (`0x00`), which is
+/// the only variant carrying the `cipher_suite`/`config_id`/`enc`/`payload`
+/// fields this function writes (`inner`, `0x01`, is an empty struct — a real
+/// TLS 1.3 server that supports ECH treats `outer` tagged as `inner` with
+/// trailing bytes as `decode_error` and kills the connection before
+/// `ServerHello`, exactly as real Chrome's GREASE ECH does not do).
 fn ech_body(rng: &mut dyn RandomSource) -> Vec<u8> {
     let mut w = HelloWriter::new();
-    w.u8(0x01); // outer client hello marker
+    w.u8(0x00); // ECHClientHelloType::outer (draft-ietf-tls-esni)
     w.u16(0x0001); // HPKE KDF: HKDF-SHA256
     w.u16(0x0001); // HPKE AEAD: AES-128-GCM
 
@@ -254,23 +295,39 @@ fn status_request_body() -> Vec<u8> {
     w.into_bytes()
 }
 
-/// `key_share` (RFC 8446 ยง4.2.8): GREASE (1 random byte), X25519MLKEM768
-/// (1216 random bytes — the hybrid PQ KEM share is decorative filler here;
-/// REALITY's auth seal rides the X25519 entry), then X25519 carrying the
-/// caller's real public key.
-fn key_share_body(params: &ClientHelloParams, rng: &mut dyn RandomSource) -> Vec<u8> {
+/// `key_share` (RFC 8446 §4.2.8): GREASE (1 random byte, the SAME codepoint
+/// as `supported_groups`'s leading GREASE entry — see [`build_extensions`]),
+/// then X25519 carrying the caller's real public key.
+///
+/// Real Chrome also sends a THIRD entry here for `X25519MLKEM768` (`4588`),
+/// carrying an actual ML-KEM-768 encapsulation key it generated. This crate
+/// does not implement ML-KEM keygen, and REALITY.2 Task 8's live test
+/// against real servers proved *why* that entry can't just be random filler
+/// bytes the way GREASE fillers elsewhere in this module are: unlike GREASE
+/// (an intentionally-unknown codepoint every RFC 8701-aware server ignores),
+/// group `4588` is a REAL, registered group that Cloudflare and Google's
+/// edges actively parse and validate — FIPS 203's `ByteDecode_12` requires
+/// each encoded coefficient to be canonically reduced mod `q = 3329`, and a
+/// uniformly-random 1184-byte blob fails that check on virtually every
+/// connection. Sending a garbage `4588` key_share entry got this crate's
+/// ClientHello killed with `decode_error`/`illegal_parameter` by every major
+/// ML-KEM-strict server tested (`www.microsoft.com`, which apparently
+/// doesn't validate that deeply, was the one exception). `4588` is still
+/// listed in `supported_groups` (byte-faithful to real Chrome, and
+/// unobserved by JA3/JA4 either way since neither inspects `key_share`
+/// content) — the client is just truthfully NOT also offering a key share
+/// for it, which RFC 8446 explicitly permits (a client may list more
+/// `supported_groups` than it sends optimistic `key_share` entries for).
+fn key_share_body(
+    params: &ClientHelloParams,
+    rng: &mut dyn RandomSource,
+    grease_value: u16,
+) -> Vec<u8> {
     let mut w = HelloWriter::new();
     w.u16_prefixed(|w| {
-        w.u16(grease(rng));
+        w.u16(grease_value);
         w.u16_prefixed(|w| {
             let mut data = [0u8; 1];
-            rng.fill(&mut data);
-            w.bytes(&data);
-        });
-
-        w.u16(GROUP_X25519_MLKEM768);
-        w.u16_prefixed(|w| {
-            let mut data = vec![0u8; MLKEM768_KEY_SHARE_LEN];
             rng.fill(&mut data);
             w.bytes(&data);
         });
@@ -485,7 +542,12 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(real_ids, expected);
 
-        // supported_groups (ext 10): GREASE,4588,29,23,24.
+        // supported_groups (ext 10): GREASE,29,23,24. NOT 4588
+        // (X25519MLKEM768) — see supported_groups_body's doc comment: this
+        // crate deliberately doesn't advertise a group it can't back with a
+        // real key share, since ML-KEM-preferring real servers (Cloudflare,
+        // Google) respond with a HelloRetryRequest this one-round-trip
+        // client can't complete rather than silently accepting X25519.
         let groups_body = &parsed
             .extensions
             .iter()
@@ -493,19 +555,17 @@ mod tests {
             .unwrap()
             .1;
         let groups = parse_u16_len16_list(groups_body);
-        assert_eq!(groups.len(), 5);
+        assert_eq!(groups.len(), 4);
         assert!(is_grease(groups[0]));
         assert_eq!(
             &groups[1..],
-            &[
-                GROUP_X25519_MLKEM768,
-                GROUP_X25519,
-                GROUP_SECP256R1,
-                GROUP_SECP384R1
-            ]
+            &[GROUP_X25519, GROUP_SECP256R1, GROUP_SECP384R1]
         );
 
-        // key_share (ext 51): GREASE(1B), 4588(1216B), 29(our 32B pub).
+        // key_share (ext 51): GREASE(1B), 29(our 32B pub). NOT 4588
+        // (X25519MLKEM768) — see key_share_body's doc comment: this crate
+        // can't forge a canonically-valid ML-KEM-768 key, and real
+        // ML-KEM-strict servers (Cloudflare, Google) reject a random one.
         let ks_body = &parsed
             .extensions
             .iter()
@@ -513,13 +573,24 @@ mod tests {
             .unwrap()
             .1;
         let entries = parse_key_share_entries(ks_body);
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 2);
         assert!(is_grease(entries[0].0));
         assert_eq!(entries[0].1.len(), 1);
-        assert_eq!(entries[1].0, GROUP_X25519_MLKEM768);
-        assert_eq!(entries[1].1.len(), MLKEM768_KEY_SHARE_LEN);
-        assert_eq!(entries[2].0, GROUP_X25519);
-        assert_eq!(entries[2].1, params.key_share_x25519_pub.to_vec());
+        assert_eq!(entries[1].0, GROUP_X25519);
+        assert_eq!(entries[1].1, params.key_share_x25519_pub.to_vec());
+
+        // RFC 8701 §3.4: the GREASE codepoint in `key_share`'s leading entry
+        // MUST be the SAME value as `supported_groups`'s leading GREASE
+        // entry. A mismatch here (independently-drawn GREASE values) is
+        // exactly the bug REALITY.2 Task 8's live test against real
+        // Cloudflare/Google/Microsoft servers (and a local openssl s_server)
+        // exposed: every one of them killed the connection with
+        // illegal_parameter/decode_error rather than silently ignoring the
+        // unrecognized-but-inconsistent GREASE group.
+        assert_eq!(
+            groups[0], entries[0].0,
+            "supported_groups and key_share must share one GREASE codepoint (RFC 8701 §3.4)"
+        );
     }
 
     #[test]
