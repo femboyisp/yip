@@ -128,6 +128,19 @@ fn fingerprinted_vpn_port(port: u16) -> Option<&'static str> {
     }
 }
 
+/// The anti-DPI startup warning for a fingerprinted VPN listen `port`, or `None`
+/// for a plausible port. Kept a pure function (rather than inlining the
+/// `format!` in `main`) so the message construction is unit-testable; `main`
+/// only prints what this returns.
+fn vpn_port_warning(port: u16) -> Option<String> {
+    fingerprinted_vpn_port(port).map(|proto| {
+        format!(
+            "yip-rendezvous: listen port {port} is {proto}'s default; DPI classifies the relay's \
+             UDP traffic as {proto} by port — prefer a neutral/plausible port (anti-DPI R8)"
+        )
+    })
+}
+
 fn usage_exit() -> ! {
     eprintln!(
         "usage: yip-rendezvous <listen-addr> [--obf-psk <hex64>] \
@@ -211,14 +224,8 @@ async fn main() -> std::io::Result<()> {
 
     let listen = listen.unwrap_or_else(|| usage_exit());
     if let Ok(sa) = listen.parse::<std::net::SocketAddr>() {
-        if let Some(proto) = fingerprinted_vpn_port(sa.port()) {
-            eprintln!(
-                "yip-rendezvous: listen port {} is {}'s default; DPI classifies the relay's UDP \
-                 traffic as {} by port — prefer a neutral/plausible port (anti-DPI R8)",
-                sa.port(),
-                proto,
-                proto
-            );
+        if let Some(w) = vpn_port_warning(sa.port()) {
+            eprintln!("{w}");
         }
     }
     // The derived rendezvous-layer obfuscation key, or `None` when `--obf-psk`
@@ -319,7 +326,7 @@ async fn run_udp(
 
 #[cfg(test)]
 mod port_lint_tests {
-    use super::fingerprinted_vpn_port;
+    use super::{fingerprinted_vpn_port, vpn_port_warning};
 
     /// Known VPN default ports are flagged with their protocol name; a
     /// plausible/neutral port (including the rendezvous crate's own example
@@ -335,6 +342,16 @@ mod port_lint_tests {
         assert_eq!(fingerprinted_vpn_port(655), Some("tinc"));
         assert_eq!(fingerprinted_vpn_port(51821), None);
         assert_eq!(fingerprinted_vpn_port(443), None);
+    }
+
+    /// A fingerprinted port yields a warning naming both the port and the
+    /// protocol it looks like; a plausible port yields no warning.
+    #[test]
+    fn vpn_port_warning_names_port_and_protocol() {
+        let w = vpn_port_warning(51820).expect("51820 must warn");
+        assert!(w.contains("51820"), "warning names the port: {w}");
+        assert!(w.contains("WireGuard"), "warning names the protocol: {w}");
+        assert_eq!(vpn_port_warning(443), None);
     }
 }
 
