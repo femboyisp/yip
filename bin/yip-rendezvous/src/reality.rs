@@ -60,9 +60,13 @@ pub fn parse_client_hello(msg: &[u8]) -> Option<ClientHelloInfo> {
     }
     let len_bytes = msg.get(1..4)?;
     let body_len = u24_be(len_bytes)?;
-    // The declared body must exactly fill the rest of the buffer (this
-    // parser handles one already-defragmented handshake message, not a
-    // stream), and everything we read below stays inside it.
+    // The declared body must EXACTLY fill the rest of the buffer (this parser
+    // handles one already-defragmented handshake message, not a stream):
+    // reject trailing bytes rather than silently ignoring them (fail-closed).
+    // `4 + body_len` cannot overflow — `body_len` is a u24 (≤ 0xFF_FFFF).
+    if 4 + body_len != msg.len() {
+        return None;
+    }
     let body = msg.get(4..4 + body_len)?;
 
     // legacy_version (2 bytes): present but unchecked — TLS 1.3
@@ -520,7 +524,7 @@ mod tests {
             key_share_x25519: Some(eph_pub),
         };
 
-        // Exactly at the skew boundary: accepted.
+        // Client clock in the PAST (now > ts): at the boundary accepted, past it rejected.
         assert!(reality_auth_open(
             &reality_priv,
             &info,
@@ -528,12 +532,28 @@ mod tests {
             ts_min + skew_min,
             skew_min
         ));
-        // One minute past the boundary: rejected.
         assert!(!reality_auth_open(
             &reality_priv,
             &info,
             &[short_id],
             ts_min + skew_min + 1,
+            skew_min
+        ));
+        // Client clock in the FUTURE (now < ts): at the boundary accepted, past it
+        // rejected. Guards the unsigned-underflow trap — a regression from
+        // `abs_diff` to a naive `ts - now` would wrap and wrongly accept/reject here.
+        assert!(reality_auth_open(
+            &reality_priv,
+            &info,
+            &[short_id],
+            ts_min - skew_min,
+            skew_min
+        ));
+        assert!(!reality_auth_open(
+            &reality_priv,
+            &info,
+            &[short_id],
+            ts_min - skew_min - 1,
             skew_min
         ));
     }
