@@ -34,3 +34,11 @@ peetprint: GREASE-772-771|2-1.1|GREASE-4588-29-23-24|2308-2309-2310-1027-2052-10
 #    JA3 would be MORE fingerprintable than real Chrome, defeating the purpose).
 #  - Both capture-1 (e229e1bc..) and capture-2 (f2caf6de..) JA3 hashes are valid
 #    Chrome-150 permutations — the crafter should be able to reproduce a given order.
+
+# ── THIRD CAPTURE (2026-07-15, Windows genuine Chrome 149) — cross-check ──
+# ja3_hash: 5a6b4cd05ab75eca6e0aa88d3e4ca2c8   (3rd distinct JA3 -> permutation confirmed)
+# ja4:      t13d1516h2_8daaf6152771_d8a2da3f94cd   (hash-b DIFFERS from Chrome 150's _806a8c22fdea)
+# WHY: Chrome 150 added 3 post-quantum signature_algorithms 0x0904/0x0905/0x0906 (ML-DSA)
+#      that Chrome 149 lacks (149=8 sig-algs, 150=11). JA4 hash-b hashes sig-algs -> version-sensitive.
+# PIN DECISION CONFIRMED: we target Chrome 150 -> JA4 ..._806a8c22fdea, using 150's full 11 sig-algs
+#      (0904,0905,0906,0403,0804,0401,0503,0805,0501,0806,0601). 149 is a cross-check only.

@@ -182,7 +182,8 @@ impl HelloWriter {
 
 ## Success criteria
 1. `yip-utls` builds `forbid(unsafe)`, `clippy -D warnings` clean.
-2. `tests/ja_diff.rs`: crafted hello JA3==`e229e1bc25321cbef7268568d386cf86`,
-   JA4==`t13d1516h2_8daaf6152771_806a8c22fdea`, byte-match vs fixture modulo the normalized fields.
+2. `tests/ja_diff.rs`: crafted hello JA4==`t13d1516h2_8daaf6152771_806a8c22fdea` (stable across
+   two seeds), and JA3 **differs** across two seeds (per-connection extension permutation, like
+   real Chrome — NOT a fixed JA3, which would be more fingerprintable).
 3. `connect()` completes a real TLS 1.3 handshake and returns a usable app-data stream (live + openssl tests).
 4. `yip-utls::auth` seal is accepted by `yip-rendezvous::reality_auth_open` (interop test); tamper/stale/wrong-key rejected.

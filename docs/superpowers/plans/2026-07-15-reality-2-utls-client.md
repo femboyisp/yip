@@ -12,7 +12,7 @@
 - `#![forbid(unsafe_code)]` on the whole crate. No bare `#[allow]` (use `#[expect(reason=)]`). No `as` numeric casts — use `to_be_bytes`/`from_be_bytes`/`try_from`.
 - **Not wired into yipd** — `yip-utls` is a standalone library (REALITY.4 wires it). Never add a yipd dependency on it in this milestone.
 - Auth-seal primitives MUST byte-match REALITY.1's (`x25519-dalek` + `chacha20poly1305` + HKDF-SHA256, info `b"yip-reality-v1"`, nonce `client_random[..12]`, plaintext `short_id(8) ‖ unix_minutes_le(8)`).
-- Ground truth: `docs/superpowers/specs/reality-2-chrome150-fingerprint.txt` — JA3 `e229e1bc25321cbef7268568d386cf86`, JA4 `t13d1516h2_8daaf6152771_806a8c22fdea`, and the exact cipher/extension/group/sig-alg lists + wire order.
+- Ground truth: `docs/superpowers/specs/reality-2-chrome150-fingerprint.txt` — the exact cipher/extension/group/sig-alg lists. The fidelity lock is the **JA4 `t13d1516h2_8daaf6152771_806a8c22fdea`** (STABLE across Chrome's per-connection extension permutation). JA3 is order-sensitive and **varies per connection** in real Chrome (captures show `e229e1bc…`, `f2caf6de…`, …) — the crafter must reproduce that variation, so DO NOT pin a single JA3 hash.
 - Live-network tests are `#[ignore]` so default CI stays offline.
 - Wire assembly uses the `HelloWriter` helper (below), never magic slice offsets.
 
@@ -159,7 +159,10 @@ fn ja3_of_known_hello_matches() {
 
 - [ ] **Step 2: Run — expect FAIL.** `cargo test -p yip-utls hello`
 
-- [ ] **Step 3: Implement `craft`.** Using `HelloWriter`, emit in order (IDs from the fixture): `legacy_version 0x0303`; `random(32)` from rng; `session_id` = params.legacy_session_id (u8_prefixed, 32); cipher_suites (u16_prefixed: GREASE(drawn), then `1301,1302,1303,c02b,c02f,c02c,c030,cca9,cca8,c013,c014,009c,009d,002f,0035`); compression `01 00`; extensions (u16_prefixed) in the exact fixture order: GREASE, sct(18,empty), ALPS(17613, `h2`), supported_groups(10: GREASE,4588,29,23,24), ec_point_formats(11: `00`), psk_key_exchange_modes(45: `01 01`), server_name(0, params.sni), ECH(65037: right-shaped random from rng), session_ticket(35,empty), signature_algorithms(13: the fixture's list), ALPN(16: `h2`,`http/1.1`), compress_certificate(27: brotli `0002`), supported_versions(43: GREASE,`0304`,`0303`), renegotiation_info(65281: `00`), extended_master_secret(23,empty), status_request(5: `01 0000 0000`), key_share(51: GREASE(1B rng), 4588 = 1216B rng, 29 = params.key_share_x25519_pub), GREASE. Draw the 5 GREASE 16-bit values from rng and mask to the GREASE pattern `(x & 0xf0f0) | 0x0a0a` with matching low/high bytes. Wrap the body as the handshake message (`0x01 ‖ u24 ‖ body`).
+- [ ] **Step 3: Implement `craft`.** Using `HelloWriter`, emit: `legacy_version 0x0303`; `random(32)` from rng; `session_id` = params.legacy_session_id (u8_prefixed, 32); cipher_suites (u16_prefixed: GREASE(drawn), then FIXED `1301,1302,1303,c02b,c02f,c02c,c030,cca9,cca8,c013,c014,009c,009d,002f,0035`); compression `01 00`; then the extensions block (u16_prefixed).
+  **EXTENSION ORDER — PERMUTE PER CONNECTION (critical; see the fingerprint reference "SECOND/THIRD CAPTURE" notes):** modern Chrome/BoringSSL shuffles its extension order every connection, keeping ONE GREASE first and ONE GREASE last; a *fixed* order would make us MORE fingerprintable than real Chrome (its JA3 varies each connection; ours must too). So: emit **GREASE first**, then these **16 real extensions in a per-connection order produced by a Fisher–Yates shuffle seeded from `rng`**, then **GREASE last**. Each extension's own content is FIXED; only their relative order varies. The 16 real extensions (build each as an `(id, body)` then shuffle the list):
+  sct(18, empty), ALPS(17613, `h2`), supported_groups(10: GREASE,4588,29,23,24), ec_point_formats(11: `00`), psk_key_exchange_modes(45: `01 01`), server_name(0, params.sni), ECH(65037: right-shaped random from rng), session_ticket(35, empty), signature_algorithms(13: `0904,0905,0906,0403,0804,0401,0503,0805,0501,0806,0601` — the Chrome-150 list, 11 entries incl. the 3 PQ ML-DSA algs), ALPN(16: `h2`,`http/1.1`), compress_certificate(27: brotli `0002`), supported_versions(43: GREASE,`0304`,`0303`), renegotiation_info(65281: `00`), extended_master_secret(23, empty), status_request(5: `01 0000 0000`), key_share(51: GREASE(1B rng), 4588 = 1216B rng, 29 = params.key_share_x25519_pub).
+  Draw the GREASE 16-bit values from rng and build them as `0x?a?a` with equal bytes (one random nibble `n` → byte `(n<<4)|0x0a`, used for both bytes). Wrap the body as the handshake message (`0x01 ‖ u24 ‖ body`). **NOTE:** shuffle is deterministic given the seed (so Task 4's byte-exact assertions hold), but produces a DIFFERENT order for different seeds.
    - GREASE construction detail: a GREASE value is `0x?a?a` where both nibble-pairs equal (e.g. `0x1a1a`, `0xdada`). Generate one random nibble `n`, value = `((n<<4)|0x0a)` repeated in both bytes.
 
 - [ ] **Step 4: Run — expect PASS.** `cargo test -p yip-utls hello` + clippy.
@@ -183,18 +186,30 @@ impl hello::RandomSource for Seed {
     fn fill(&mut self, b: &mut [u8]) { for x in b { self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1); *x = (self.0 >> 33) as u8; } }
 }
 #[test]
-fn crafted_hello_matches_chrome150_ja3_ja4() {
+fn crafted_hello_matches_chrome150_ja4_and_permutes_ja3() {
     let params = hello::ClientHelloParams {
         sni: "www.apple.com".into(),
         key_share_x25519_pub: [0x11; 32],
         legacy_session_id: [0x22; 32],
     };
-    let msg = hello::craft(&params, &mut Seed(1));
-    assert_eq!(ja::ja3_hash(&msg).unwrap(), "e229e1bc25321cbef7268568d386cf86");
-    assert_eq!(ja::ja4(&msg).unwrap(), "t13d1516h2_8daaf6152771_806a8c22fdea");
+    // JA4 is STABLE across Chrome's per-connection extension permutation — lock it.
+    let m1 = hello::craft(&params, &mut Seed(1));
+    let m2 = hello::craft(&params, &mut Seed(2));
+    assert_eq!(ja::ja4(&m1).unwrap(), "t13d1516h2_8daaf6152771_806a8c22fdea");
+    assert_eq!(ja::ja4(&m2).unwrap(), "t13d1516h2_8daaf6152771_806a8c22fdea");
+    // JA3 is order-sensitive; real Chrome's varies every connection, so ours MUST too
+    // (a fixed JA3 is MORE fingerprintable than real Chrome — defeats the purpose).
+    assert_ne!(
+        ja::ja3_hash(&m1).unwrap(),
+        ja::ja3_hash(&m2).unwrap(),
+        "extension order must permute per connection like real Chrome"
+    );
+    // Same seed is reproducible (deterministic shuffle) — for byte-exact debugging.
+    let m1b = hello::craft(&params, &mut Seed(1));
+    assert_eq!(m1, m1b);
 }
 ```
-(The `as u8` in the test PRNG is acceptable in test-only code; if clippy objects, use `u8::try_from(self.0 & 0xff).unwrap()`.)
+(The `as u8` in the test PRNG is acceptable in test-only code; if clippy objects, use `u8::try_from(self.0 & 0xff).unwrap()`. Note: the assertion is on **JA4** (stable) + **JA3 varies** — NOT a fixed JA3 hash, per the fingerprint reference's permutation finding.)
 
 - [ ] **Step 2: Run — expect FAIL** (JA3/JA4 mismatch → iterate `hello.rs` field order/ID lists against the fixture until it matches). This is the fidelity-proving loop.
 
