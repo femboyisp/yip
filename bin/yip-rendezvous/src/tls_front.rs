@@ -221,7 +221,12 @@ async fn run_reality_conn(mut tcp: TcpStream, acceptor: &Arc<SslAcceptor>, cfg: 
 /// record are indistinguishable to an active prober by construction, since
 /// they both end up here.
 async fn splice_to_dest(mut tcp: TcpStream, dest: SocketAddr, replay: &[u8]) {
-    let Ok(mut up) = TcpStream::connect(dest).await else {
+    // Bound the connect: `dest` is a REMOTE site, so a black-holed/slow upstream
+    // would otherwise pin this connection's `MAX_TLS_CONNS` permit for the full
+    // OS connect timeout — a flood could exhaust the front, and a REALITY front
+    // that stops answering is itself an availability distinguisher (review M-1).
+    let Ok(Ok(mut up)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(dest)).await
+    else {
         return;
     };
     if !replay.is_empty() && up.write_all(replay).await.is_err() {

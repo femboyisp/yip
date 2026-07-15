@@ -337,6 +337,16 @@ async fn main() -> std::io::Result<()> {
         eprintln!("--reality-dest requires --listen-tcp (REALITY runs on the TCP front)");
         std::process::exit(2);
     }
+    // No short-ids ⇒ no client can ever authenticate, so the relay forwards EVERY
+    // connection to dest (a pure, correct front, but likely a misconfiguration if
+    // the operator meant to serve a tunnel). Warn rather than fail — this is a
+    // valid "decoy-only" mode (review M-3).
+    if reality_cfg.as_ref().is_some_and(|c| c.short_ids.is_empty()) {
+        eprintln!(
+            "warning: --reality-dest set with no --reality-short-id; no client can \
+             authenticate — every connection will be forwarded to the dest"
+        );
+    }
 
     // Millisecond clock from a monotonic base (Instant), so `now_ms` never goes
     // backwards and needs no wall clock.
