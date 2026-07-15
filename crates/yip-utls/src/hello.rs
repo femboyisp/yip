@@ -70,6 +70,13 @@ pub struct ClientHelloParams {
     pub sni: String,
     pub key_share_x25519_pub: [u8; 32],
     pub legacy_session_id: [u8; 32],
+    /// The 32-byte `random` field written into the ClientHello body.
+    /// Callers that seal a REALITY auth payload (`auth::seal`) keyed by
+    /// `client_random` MUST pass that exact same value here — the server
+    /// derives its AEAD nonce from the ClientHello's `random` field, so the
+    /// sealed value and the wire value must be identical or the seal will
+    /// never open.
+    pub client_random: [u8; 32],
 }
 
 /// Crafts a byte-faithful Chrome-150 ClientHello **handshake message**
@@ -81,10 +88,7 @@ pub fn craft(params: &ClientHelloParams, rng: &mut dyn RandomSource) -> Vec<u8> 
     let mut body = HelloWriter::new();
 
     body.u16(LEGACY_VERSION_TLS12);
-
-    let mut client_random = [0u8; 32];
-    rng.fill(&mut client_random);
-    body.bytes(&client_random);
+    body.bytes(&params.client_random);
 
     body.u8_prefixed(|w| w.bytes(&params.legacy_session_id));
 
@@ -353,6 +357,7 @@ mod tests {
             sni: "example.com".to_string(),
             key_share_x25519_pub: [0x42; 32],
             legacy_session_id: [0x99; 32],
+            client_random: [0x77; 32],
         }
     }
 

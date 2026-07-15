@@ -302,7 +302,11 @@ fn key_len_for_suite(suite: u16) -> usize {
 // ---------------------------------------------------------------------------
 
 /// The client/server handshake traffic keys, plus the handshake secret
-/// itself (needed as an input to [`derive_application_keys`]).
+/// itself (needed as an input to [`derive_application_keys`]) and the raw
+/// client handshake traffic secret (needed by Task 7's `connect` to derive
+/// the client `Finished` message's `finished_key` via
+/// `HKDF-Expand-Label(client_hs_traffic, "finished", "", 32)`, RFC 8446
+/// §4.4.4).
 pub struct HandshakeKeys {
     pub client_key: Vec<u8>,
     pub client_iv: [u8; 12],
@@ -310,6 +314,7 @@ pub struct HandshakeKeys {
     pub server_iv: [u8; 12],
     pub suite: u16,
     pub handshake_secret: [u8; 32],
+    pub client_hs_traffic: [u8; 32],
 }
 
 /// Derives the TLS 1.3 handshake traffic keys from the ECDHE shared secret
@@ -352,6 +357,7 @@ pub fn derive_handshake_keys(
         server_iv,
         suite,
         handshake_secret,
+        client_hs_traffic: c_hs,
     }
 }
 
@@ -474,7 +480,10 @@ pub fn record_seal(
 /// is the record's ciphertext+tag body (mutated in place as scratch space).
 /// Strips the TLS 1.3 inner padding on success — trailing zero bytes, then
 /// the real content-type byte — and requires that byte to be `handshake`
-/// (0x16) or `application_data` (0x17). Returns the recovered content only.
+/// (0x16) or `application_data` (0x17). Returns the recovered content only;
+/// use [`record_open_typed`] when the caller also needs to know which of the
+/// two the recovered content type was (e.g. to skip a post-handshake
+/// `NewSessionTicket` interleaved with application-data records).
 pub fn record_open(
     key: &[u8],
     iv: &[u8; 12],
@@ -482,6 +491,19 @@ pub fn record_open(
     record_type: u8,
     payload: &mut Vec<u8>,
 ) -> Result<Vec<u8>, Error> {
+    record_open_typed(key, iv, seq, record_type, payload).map(|(_content_type, content)| content)
+}
+
+/// Identical to [`record_open`], but also returns the recovered TLS 1.3
+/// inner content type (`0x16` handshake or `0x17` application_data) instead
+/// of discarding it after validation.
+pub fn record_open_typed(
+    key: &[u8],
+    iv: &[u8; 12],
+    seq: u64,
+    record_type: u8,
+    payload: &mut Vec<u8>,
+) -> Result<(u8, Vec<u8>), Error> {
     let alg = algorithm_for_key_len(key.len())?;
     let unbound = UnboundKey::new(alg, key).map_err(|_| Error::Crypto)?;
     let less_safe = LessSafeKey::new(unbound);
@@ -506,7 +528,7 @@ pub fn record_open(
         return Err(Error::UnexpectedContentType);
     }
 
-    Ok(core::mem::take(payload))
+    Ok((content_type, core::mem::take(payload)))
 }
 
 #[cfg(test)]
@@ -671,6 +693,10 @@ mod tests {
         assert_eq!(keys.client_key, hex(RFC8448_CLIENT_HS_KEY));
         assert_eq!(keys.client_iv, iv12(hex(RFC8448_CLIENT_HS_IV)));
         assert_eq!(keys.suite, SUITE_AES_128_GCM_SHA256);
+        assert_eq!(
+            keys.client_hs_traffic,
+            hex32(RFC8448_CLIENT_HS_TRAFFIC_SECRET)
+        );
 
         // Sanity-check the traffic secrets themselves too (not just their
         // key/iv expansions), matching RFC 8448's intermediate values.

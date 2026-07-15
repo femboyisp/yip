@@ -4,7 +4,12 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod error;
 pub mod handshake;
 pub mod hello;
 pub mod ja;
+pub mod stream;
 pub mod wire;
+
+pub use error::Error;
+pub use stream::{connect, RealityStream};
