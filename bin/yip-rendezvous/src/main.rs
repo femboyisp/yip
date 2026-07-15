@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
+use tls_front::RealityCfg;
 use yip_rendezvous::{decode, encode, Message, RendezvousServer};
 
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
@@ -103,6 +104,21 @@ fn hex_to_32(hex: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
+/// Decode a 16-char hex string into 8 bytes (`--reality-short-id <hex16>`).
+/// Mirrors `hex_to_32` at a shorter width (REALITY short IDs are 8 bytes).
+fn hex_to_8(hex: &str) -> Result<[u8; 8], String> {
+    if hex.len() != 16 {
+        return Err(format!("expected 16 hex chars, got {}", hex.len()));
+    }
+    let mut out = [0u8; 8];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
 fn hex_nibble(b: u8) -> Result<u8, String> {
     match b {
         b'0'..=b'9' => Ok(b - b'0'),
@@ -146,7 +162,10 @@ fn vpn_port_warning(port: u16) -> Option<String> {
 fn usage_exit() -> ! {
     eprintln!(
         "usage: yip-rendezvous <listen-addr> [--obf-psk <hex64>] \
-         [--listen-tcp <addr> --tls-cert <path> --tls-key <path> [--decoy <addr>]]\n\
+         [--listen-tcp <addr> --tls-cert <path> --tls-key <path> [--decoy <addr>] \
+         [--reality-dest <host:port> --reality-private-key <hex64> \
+         [--reality-short-id <hex16>]... [--reality-server-name <name>]...]]\n\
+         (--reality-dest supersedes --decoy when both are set)\n\
          e.g. 0.0.0.0:51821"
     );
     std::process::exit(2);
@@ -168,6 +187,12 @@ async fn main() -> std::io::Result<()> {
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
     let mut decoy: Option<String> = None;
+    // REALITY anti-probe front (REALITY.1 Task 4), all opt-in via
+    // --reality-dest.
+    let mut reality_dest: Option<String> = None;
+    let mut reality_priv_key: Option<[u8; 32]> = None;
+    let mut reality_short_ids: Vec<[u8; 8]> = Vec::new();
+    let mut reality_server_names: Vec<String> = Vec::new();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -216,6 +241,46 @@ async fn main() -> std::io::Result<()> {
                 };
                 decoy = Some(v);
             }
+            "--reality-dest" => {
+                let Some(v) = args.next() else {
+                    eprintln!("--reality-dest requires a host:port argument");
+                    std::process::exit(2);
+                };
+                reality_dest = Some(v);
+            }
+            "--reality-private-key" => {
+                let Some(hex) = args.next() else {
+                    eprintln!("--reality-private-key requires a 64-char hex argument");
+                    std::process::exit(2);
+                };
+                match hex_to_32(&hex) {
+                    Ok(key) => reality_priv_key = Some(key),
+                    Err(e) => {
+                        eprintln!("invalid --reality-private-key: {e}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--reality-short-id" => {
+                let Some(hex) = args.next() else {
+                    eprintln!("--reality-short-id requires a 16-char hex argument");
+                    std::process::exit(2);
+                };
+                match hex_to_8(&hex) {
+                    Ok(id) => reality_short_ids.push(id),
+                    Err(e) => {
+                        eprintln!("invalid --reality-short-id: {e}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--reality-server-name" => {
+                let Some(v) = args.next() else {
+                    eprintln!("--reality-server-name requires a name argument");
+                    std::process::exit(2);
+                };
+                reality_server_names.push(v);
+            }
             _ if listen.is_none() => listen = Some(arg),
             other => {
                 eprintln!("unexpected argument: {other}");
@@ -241,6 +306,28 @@ async fn main() -> std::io::Result<()> {
                 std::process::exit(2);
             }
         },
+        None => None,
+    };
+    // REALITY config: presence of --reality-dest enables it. --reality-dest
+    // supersedes --decoy at runtime (tls_front branches on cfg.reality first),
+    // so accepting both flags together is harmless.
+    let reality_cfg: Option<RealityCfg> = match reality_dest {
+        Some(ref d) => {
+            let dest: SocketAddr = d.parse().unwrap_or_else(|e| {
+                eprintln!("invalid --reality-dest address: {e}");
+                std::process::exit(2);
+            });
+            let Some(priv_key) = reality_priv_key else {
+                eprintln!("--reality-dest requires --reality-private-key");
+                std::process::exit(2);
+            };
+            Some(RealityCfg {
+                dest,
+                priv_key,
+                short_ids: reality_short_ids,
+                server_names: reality_server_names,
+            })
+        }
         None => None,
     };
 
@@ -275,10 +362,9 @@ async fn main() -> std::io::Result<()> {
             decoy: decoy_addr,
             base,
             routes: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            // REALITY mode has no CLI wiring yet (out of scope for
-            // REALITY.1 Task 3, which only wires the TLS-front branch and
-            // splice logic); the relay keeps running the 3c.3 Trojan front.
-            reality: None,
+            // REALITY.1 Task 4: wired from --reality-*; None keeps the 3c.3
+            // Trojan front's behavior byte-identical.
+            reality: reality_cfg,
         });
         tokio::spawn(tls_front::run_tls_front(tcp, acceptor, cfg));
     }
@@ -358,6 +444,33 @@ mod port_lint_tests {
         assert!(w.contains("51820"), "warning names the port: {w}");
         assert!(w.contains("WireGuard"), "warning names the protocol: {w}");
         assert_eq!(vpn_port_warning(443), None);
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::hex_to_8;
+
+    /// A valid 16-char hex string decodes to the expected 8 bytes.
+    #[test]
+    fn hex_to_8_valid() {
+        assert_eq!(
+            hex_to_8("0123456789abcdef"),
+            Ok([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef])
+        );
+    }
+
+    /// Wrong-length input (too short / too long) is rejected.
+    #[test]
+    fn hex_to_8_wrong_length() {
+        assert!(hex_to_8("0123456789abcde").is_err()); // 15 chars
+        assert!(hex_to_8("0123456789abcdef00").is_err()); // 18 chars
+    }
+
+    /// Non-hex characters are rejected.
+    #[test]
+    fn hex_to_8_non_hex() {
+        assert!(hex_to_8("012345678zabcdef").is_err());
     }
 }
 
