@@ -12,3 +12,25 @@ peetprint: GREASE-772-771|2-1.1|GREASE-4588-29-23-24|2308-2309-2310-1027-2052-10
 # key_share entries: GREASE(0x7a7a)=1byte, X25519MLKEM768(4588)=1216 bytes, X25519(29)=32 bytes  <-- REALITY auth rides the X25519 entry
 # legacy_session_id: 32 random bytes  <-- REALITY auth seal goes here (same length, fingerprint-faithful)
 # sig_algs: 0x904,0x905,0x906(MLDSA?),ecdsa_p256_sha256,rsa_pss_sha256,rsa_pkcs1_sha256,ecdsa_p384_sha384,rsa_pss_sha384,rsa_pkcs1_sha384,rsa_pss_sha512,rsa_pkcs1_sha512
+
+# ── SECOND CAPTURE (2026-07-15, Windows Chromium/Brave 150) — CRITICAL FINDING ──
+# ja3_hash: f2caf6dea7cf16ae28b4e0d4fa0a1ff0   (DIFFERENT from capture 1's e229e1bc..)
+# ja4:      t13d1516h2_8daaf6152771_806a8c22fdea   (IDENTICAL to capture 1)
+# ext order: GREASE,23,5,65037,65281,10,27,16,17613,45,18,35,13,11,43,51,0,GREASE
+#
+# FINDING: modern Chromium/BoringSSL PERMUTES the ClientHello extension order every
+# connection (keeping one GREASE first + one GREASE last; the ~16 real extensions
+# shuffled between). JA3 is order-sensitive -> a DIFFERENT ja3_hash every connection.
+# JA4 SORTS ciphers+extensions before hashing -> STABLE across the permutation.
+#
+# DESIGN CONSEQUENCE for the crafter (hello.rs):
+#  - Emit GREASE first, then the real extensions in a PER-CONNECTION RANDOM order
+#    (drawn from the seeded RandomSource), then GREASE last. Do NOT hard-code one order.
+#  - The cipher list, group list, sig-alg list, and the extension SET are fixed;
+#    only the extension ORDER varies.
+# DESIGN CONSEQUENCE for the CI diff (ja_diff.rs):
+#  - Lock the JA4: crafted ja4 == t13d1516h2_8daaf6152771_806a8c22fdea (stable).
+#  - Assert the JA3 VARIES across two different seeds (matches real Chrome; a fixed
+#    JA3 would be MORE fingerprintable than real Chrome, defeating the purpose).
+#  - Both capture-1 (e229e1bc..) and capture-2 (f2caf6de..) JA3 hashes are valid
+#    Chrome-150 permutations — the crafter should be able to reproduce a given order.
