@@ -3,5 +3,6 @@
 //! handshake to an application-data stream. Standalone — not wired into yipd.
 #![forbid(unsafe_code)]
 
+pub mod hello;
 pub mod ja;
 pub mod wire;
