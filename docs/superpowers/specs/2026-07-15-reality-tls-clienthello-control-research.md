@@ -142,10 +142,26 @@ not true REALITY. **Verdict:** ❌ does not meet the goal.
 
 ---
 
+## Feasibility spike (2026-07-15) — PROVEN
+
+A throwaway pure-Rust spike (`ring` only, no Go, no BoringSSL fork, no `unsafe`)
+built a TLS 1.3 ClientHello with a **caller-chosen `legacy_session_id`** and **our
+own X25519 `key_share`** (we hold the private), sent it to the real
+`cloudflare.com:443`, ran the RFC 8446 key schedule against the server's key_share,
+and **decrypted the server's first encrypted record — `inner_type=0x16`, first byte
+`0x08` = EncryptedExtensions.** i.e. both REALITY prerequisites hold in safe Rust:
+we control the exact ClientHello fields REALITY needs, *and* our TLS 1.3 key schedule
+is correct against real internet infrastructure.
+
+Remaining REALITY.2 work is therefore known-tractable byte-work, not open research:
+(a) expand the minimal spike hello into a **byte-exact Chrome template** with the
+JA3/JA4 CI diff test, and (b) finish the handshake past EncryptedExtensions
+(client Finished + app data). No uncertainty remains in the approach.
+
 ## Recommendation
 
 **Client side: Option 3 (pure-Rust uTLS-equivalent), delivered as its own
-milestone** — it is the only path that gives real REALITY auth *and* honors yip's
+milestone** — spike-confirmed viable (above). — it is the only path that gives real REALITY auth *and* honors yip's
 pure-Rust / `forbid(unsafe)` / from-scratch constraints. Reject the Go-FFI shortcut
 (Option 4): it would be the only Go+cgo+unsafe surface in the project and would
 wreck the cross-compile pipeline the WAN bench just validated.
