@@ -6,6 +6,14 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- Port plausibility (anti-DPI 3d, R8/#45): `listen` is now optional and
+  auto-defaults every transport to 443 (443/TCP for `tls`, 443/UDP for
+  `quic`/`raw`) — the single least-suspicious port — falling back to 8443
+  with a warning when binding 443 is denied (grant `CAP_NET_BIND_SERVICE`).
+  yipd (and `yip-rendezvous`) warn at config load when a port is a known
+  DPI-fingerprinted VPN default (51820/1194/500/4500/1701/1723/655);
+  `example.config` no longer ships WireGuard's 51820. Fixes the port-match
+  tell (#45).
 - REALITY-style Trojan relay front (anti-DPI milestone 3c.3): `yip-rendezvous`
   gains an opt-in TCP/TLS listener (`--listen-tcp`/`--tls-cert`/`--tls-key`/
   `--decoy`) that terminates **real-cert** TLS and routes a fresh, obfuscated

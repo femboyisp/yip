@@ -21,12 +21,32 @@ guided walkthroughs (first tunnel, mesh setup, obfuscation) see the
 |---|---|---|
 | `local_private` | 64 hex chars (32 bytes) | This node's X25519 private key. **Secret.** Generate with `yipd --genkey`. |
 | `local_public` | 64 hex chars (32 bytes) | This node's X25519 public key. Determines this node's self-certifying mesh address (`yipd --addr`). |
-| `listen` | `IP:port` | Local UDP bind address (`0.0.0.0:51820` for all interfaces). |
+| `listen` | `IP:port` or `IP` | **Optional.** Local bind address for the tunnel socket. Absent, or an IP with no port (e.g. `0.0.0.0`), auto-selects port **443** — the same plausible port for every transport (443/TCP for `transport=tls`, 443/UDP for `transport=quic`/`raw`), so DPI can't port-match yip. See "Port plausibility" below. |
 | `device` | string | TUN/TAP device name to create, e.g. `yip0`. |
 | `device_kind` | `tun` \| `tap` | `tun` (L3/IP, default) or `tap` (L2/Ethernet). Any other value is an error. |
 
-Missing any of `local_private`, `local_public`, `listen`, `device` is a fatal
-config error.
+Missing any of `local_private`, `local_public`, `device` is a fatal config
+error.
+
+#### Port plausibility (anti-DPI R8, #45)
+
+`listen` is optional. When it is absent, or set to an IP with no port
+(`listen=0.0.0.0`), yipd auto-selects port **443** — the single
+least-suspicious port, and the same one every transport uses. Binding a port
+below 1024 requires `CAP_NET_BIND_SERVICE`; if binding 443 fails with
+`PermissionDenied` (e.g. running unprivileged), yipd falls back to port
+**8443** and logs a warning. Grant the capability instead of running as root:
+
+```sh
+setcap cap_net_bind_service+ep /path/to/yipd
+```
+
+An explicit `listen=IP:port` is always honored exactly — no 8443 fallback
+applies. yipd (and `yip-rendezvous`, for its own listen address) warns at
+config load, but does not reject, if the configured port is a known
+DPI-fingerprinted VPN default: `51820` (WireGuard), `1194` (OpenVPN), `500`/
+`4500` (IPsec/IKE), `1701` (L2TP), `1723` (PPTP), `655` (tinc) — DPI
+port-matches these regardless of payload.
 
 ### Peers (static peer list)
 
