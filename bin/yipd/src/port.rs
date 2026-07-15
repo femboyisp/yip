@@ -62,9 +62,54 @@ mod tests {
         match bind_tcp(addr, true) {
             Ok(l) => {
                 let p = l.local_addr().unwrap().port();
-                assert!(p == 443 || p == super::super::config::FALLBACK_LISTEN_PORT);
+                assert!(p == 443 || p == FALLBACK_LISTEN_PORT);
             }
             Err(e) => panic!("auto bind must not error (443 or 8443): {e}"),
+        }
+    }
+
+    #[test]
+    fn bind_tcp_explicit_privileged_port_never_falls_back() {
+        // The headline safety invariant: an EXPLICITLY-configured port is never
+        // silently substituted. As a non-root process, binding a privileged
+        // port with port_auto=false must surface PermissionDenied — it must NOT
+        // fall back to 8443 (that guard is gated on port_auto). If the test runs
+        // AS root (CI sudo), it binds directly on the configured port. Either
+        // outcome is fine; a listener on the 8443 fallback port is NOT.
+        //
+        // Uses 1023 (privileged, no standard service) rather than 443 so it
+        // never races the auto-fallback test above for the same port under the
+        // root/sudo path, where both could otherwise contend on 443 in parallel.
+        const EXPLICIT_PRIV_PORT: u16 = 1023;
+        let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), EXPLICIT_PRIV_PORT);
+        match bind_tcp(addr, false) {
+            Ok(l) => assert_eq!(
+                l.local_addr().unwrap().port(),
+                EXPLICIT_PRIV_PORT,
+                "an explicit port must bind as-configured, never fall back to {FALLBACK_LISTEN_PORT}"
+            ),
+            Err(e) => assert_eq!(
+                e.kind(),
+                io::ErrorKind::PermissionDenied,
+                "explicit privileged bind must surface PermissionDenied, not fall back"
+            ),
+        }
+    }
+
+    #[test]
+    fn bind_udp_auto_propagates_addr_in_use_without_falling_back() {
+        // Fallback fires ONLY on PermissionDenied. AddrInUse must propagate even
+        // when port_auto=true — never be swallowed into an 8443 fallback, which
+        // would mask a real port conflict and silently move the listener. We
+        // hold an OS-assigned (always unprivileged) port, then try to re-bind it.
+        let held = UdpSocket::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)).unwrap();
+        let taken = held.local_addr().unwrap();
+        match bind_udp(taken, true) {
+            Ok(s) => panic!(
+                "AddrInUse must not fall back; got a socket on {}",
+                s.local_addr().unwrap()
+            ),
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::AddrInUse),
         }
     }
 }

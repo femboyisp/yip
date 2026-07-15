@@ -30,7 +30,7 @@
 //! 30 ms feedback interval.
 
 use std::io;
-use std::net::ToSocketAddrs;
+use std::net::{ToSocketAddrs, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::process::Command;
@@ -50,17 +50,11 @@ use crate::peer_manager::PeerManager;
 ///
 /// Only returns on a fatal I/O error.
 pub fn run(config: Config) -> io::Result<()> {
-    // ── bind the UDP socket ───────────────────────────────────────────────────
-    // Unconnected (the addressed socket seam, #33): drivers use
-    // recvfrom/sendto (poll.rs) or recvmsg/sendmsg (uring.rs) and carry the
-    // peer address on every datagram; `PeerManager` routes by that address
-    // (and, once established, by the per-peer `DataPlane`'s own stamped
-    // `dst`) instead of relying on a fixed connected peer.
-    let sock = crate::port::bind_udp(config.listen, config.listen_port_auto)?;
-
-    // Raise kernel socket buffers to 4 MiB so bursts do not overflow the
-    // OS receive ring.
-    set_socket_buffers(&sock, 4 * 1024 * 1024)?;
+    // The data-plane UDP socket is bound lazily, only on the transports that
+    // actually use it (raw + quic) — see `bind_dataplane_udp` and the dispatch
+    // below. The TLS costume and TLS relay-dial paths open their own TCP sockets
+    // and must NOT bind UDP: with 3d's 443 default that would needlessly fail on
+    // a co-located UDP:443 decoy (3d review finding I1).
 
     // ── build the peer manager ────────────────────────────────────────────────
     let mode = config.device_kind;
@@ -174,13 +168,11 @@ pub fn run(config: Config) -> io::Result<()> {
     tun.set_nonblocking().map_err(io::Error::other)?;
     let tun_fd = tun.as_raw_fd();
 
-    // ── set UDP non-blocking ──────────────────────────────────────────────────
-    sock.set_nonblocking(true)?;
-    let udp_fd = sock.as_raw_fd();
-
     // ── run the selected event loop ───────────────────────────────────────────
-    // `tun` and `sock` are kept alive on the stack here, so `tun_fd` and
-    // `udp_fd` remain valid for the duration of the selected driver loop.
+    // `tun` is kept alive on the stack here, so `tun_fd` remains valid for the
+    // duration of the selected driver loop. The data-plane UDP socket is bound
+    // lazily inside the raw/quic branches (see `bind_dataplane_udp`); the TLS
+    // costume and TLS relay-dial paths below never bind UDP.
     //
     // QUIC-mimicry mode (`transport=quic`, 3c.1): drive the dedicated
     // `run_quic` pump, which carries yip's UNCHANGED inner protocol inside QUIC
@@ -194,6 +186,7 @@ pub fn run(config: Config) -> io::Result<()> {
             .iter()
             .filter_map(|p| p.endpoint.map(|ep| (p.public_key, ep)))
             .collect();
+        let sock = bind_dataplane_udp(&config)?;
         return crate::quic::run_quic(sock, tun_fd, &mut manager, config.local_public, &quic_peers);
     }
 
@@ -201,8 +194,8 @@ pub fn run(config: Config) -> io::Result<()> {
     // pump, which carries yip's UNCHANGED inner protocol length-prefixed over
     // a BoringSSL TLS-over-TCP byte-stream. It opens its own TCP socket(s)
     // (client-dials or server-`accept`s per `connection_role`) and the raw
-    // `tun_fd`; `sock` (the UDP socket bound above) goes unused on this path,
-    // same as the QUIC path above.
+    // `tun_fd`; it never binds a data-plane UDP socket — with 3d's 443 default
+    // that would needlessly fail on a co-located UDP:443 decoy (3d, I1).
     if config.transport == crate::config::TransportMode::Tls {
         let tls_peers: Vec<([u8; 32], std::net::SocketAddr)> = config
             .peers
@@ -234,9 +227,8 @@ pub fn run(config: Config) -> io::Result<()> {
     // blocked the data-plane thread or killed the whole process on a full
     // buffer; `SOCK_DGRAM`'s atomic `send` lets backpressure be handled the
     // same best-effort way as a dropped UDP packet — see
-    // `relay_client::send_socketpair`. `sock` (the UDP socket bound above)
-    // goes unused on this path, same as the QUIC/TLS paths above — UDP is
-    // exactly what this path exists to avoid. The poll driver is forced (not
+    // `relay_client::send_socketpair`. It never binds a data-plane UDP socket —
+    // UDP is exactly what this path exists to avoid. The poll driver is forced (not
     // `YIP_USE_URING`-gated): `run_relay_tls` is a dedicated `Epoll`-based
     // pump, structurally the same class of loop as `run_quic`/`run_tls`, not
     // `yip_io::uring`/`yip_io::poll::run_poll`.
@@ -265,11 +257,34 @@ pub fn run(config: Config) -> io::Result<()> {
     // the workspace's only `unsafe`, so it is opt-in via `YIP_USE_URING=1` for
     // A/B work until it beats epoll (SQPOLL / working GSO batching) and
     // re-benchmarks favourably. See crates/yip-bench/README.md "io_uring Phase B".
+    let sock = bind_dataplane_udp(&config)?;
+    let udp_fd = sock.as_raw_fd();
+    // `sock` is held on the stack until `run()` returns, so `udp_fd` stays valid
+    // for the whole driver loop below (which only returns on a fatal I/O error).
     if use_uring {
         yip_io::uring::run_uring(udp_fd, tun_fd, &mut manager)
     } else {
         yip_io::poll::run_poll(udp_fd, tun_fd, tun.vnet_hdr_len().is_some(), &mut manager)
     }
+}
+
+/// Bind the data-plane UDP socket — used only by the raw and QUIC transports —
+/// on the plausible port with the 3d 443→8443 fallback, raise its kernel
+/// buffers to 4 MiB, and set it non-blocking. The TLS costume (`transport=tls`)
+/// and TLS relay-dial (`rendezvous=tls://`) paths open their own TCP sockets and
+/// never call this: binding UDP for them would, with 3d's 443 default, fail on a
+/// co-located UDP:443 decoy (an HTTP/3 front is exactly the plausibility case
+/// 443 exists for). See 3d review finding I1.
+///
+/// Unconnected (the addressed socket seam, #33): drivers use recvfrom/sendto
+/// (poll.rs) or recvmsg/sendmsg (uring.rs) and carry the peer address on every
+/// datagram; `PeerManager` routes by that address (and, once established, by the
+/// per-peer `DataPlane`'s own stamped `dst`) instead of a fixed connected peer.
+fn bind_dataplane_udp(config: &Config) -> io::Result<UdpSocket> {
+    let sock = crate::port::bind_udp(config.listen, config.listen_port_auto)?;
+    set_socket_buffers(&sock, 4 * 1024 * 1024)?;
+    sock.set_nonblocking(true)?;
+    Ok(sock)
 }
 
 /// Best-effort: assign `local_addr/128` to `device` and route the mesh
