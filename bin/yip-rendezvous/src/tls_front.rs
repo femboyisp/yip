@@ -12,7 +12,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Semaphore};
 use yip_rendezvous::RendezvousServer;
 
-use crate::reality_io::{read_first_tls_record, PrefixedStream};
+use crate::reality_io::{read_first_tls_record, FirstRecord, PrefixedStream};
 
 /// Upper bound on how long a TLS handshake may take before we give up on the
 /// connection. Without this, a client that sends a ClientHello and then
@@ -132,19 +132,38 @@ pub async fn run_tls_front(
 /// checked by the caller): peek the raw `ClientHello` before terminating
 /// TLS, decide REALITY auth fully before acting, then either hand the
 /// already-read hello + connection to the real acceptor (authed) or
-/// transparently splice to the real upstream `dest`, replaying the buffered
-/// hello (un-authed / unparseable — same code path, so an active prober
-/// cannot distinguish the two outcomes by timing).
+/// transparently splice to the real upstream `dest`, replaying whatever
+/// bytes were already consumed (un-authed / unparseable / malformed —
+/// same code path, so an active prober cannot distinguish the outcomes).
+///
+/// A stalled read (nothing arrives before `HANDSHAKE_TIMEOUT`) or a
+/// genuinely empty connection (immediate EOF, nothing consumed) still just
+/// drops — there is nothing to replay and a real server would see the same
+/// thing. Everything else that consumed at least one byte, even a malformed
+/// or oversized first record, gets spliced to `dest` rather than dropped: a
+/// real upstream would answer a broken record with its own alert/close, and
+/// silently dropping here would be an observable distinguisher (REALITY.1
+/// Task 3 review I-1).
 async fn run_reality_conn(mut tcp: TcpStream, acceptor: &Arc<SslAcceptor>, cfg: &Arc<TlsFrontCfg>) {
     let Some(r) = cfg.reality.as_ref() else {
         return; // unreachable: caller only takes this branch when Some
     };
 
-    // A stalled/oversized/short read just drops the connection — the same
-    // slowloris bound the non-REALITY path gets from HANDSHAKE_TIMEOUT.
-    let rec = match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_first_tls_record(&mut tcp)).await {
-        Ok(Ok(rec)) => rec,
-        _ => return,
+    // A stalled read has no buffered bytes to replay — drop, same slowloris
+    // bound the non-REALITY path gets from HANDSHAKE_TIMEOUT.
+    let outcome =
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_first_tls_record(&mut tcp)).await {
+            Ok(outcome) => outcome,
+            Err(_) => return,
+        };
+
+    let rec = match outcome {
+        FirstRecord::Complete(rec) => rec,
+        FirstRecord::Passthrough(bytes) => {
+            splice_to_dest(tcp, r.dest, &bytes).await;
+            return;
+        }
+        FirstRecord::Empty => return,
     };
 
     let now_min = std::time::SystemTime::now()
@@ -189,10 +208,23 @@ async fn run_reality_conn(mut tcp: TcpStream, acceptor: &Arc<SslAcceptor>, cfg: 
         return;
     }
 
-    let Ok(mut up) = TcpStream::connect(r.dest).await else {
+    splice_to_dest(tcp, r.dest, &rec).await;
+}
+
+/// Connect to the real upstream `dest`, replay `replay` (the bytes already
+/// consumed off the client connection) to it, then splice the two sockets
+/// together bidirectionally so `dest` — not us — produces the rest of the
+/// TLS conversation (handshake, alert, whatever a real server would do).
+///
+/// Shared by every REALITY path that must forward rather than drop: an
+/// un-authed-but-well-formed hello and a malformed/oversized/truncated first
+/// record are indistinguishable to an active prober by construction, since
+/// they both end up here.
+async fn splice_to_dest(mut tcp: TcpStream, dest: SocketAddr, replay: &[u8]) {
+    let Ok(mut up) = TcpStream::connect(dest).await else {
         return;
     };
-    if up.write_all(&rec).await.is_err() {
+    if !replay.is_empty() && up.write_all(replay).await.is_err() {
         return;
     }
     let _ = tokio::io::copy_bidirectional(&mut tcp, &mut up).await;
