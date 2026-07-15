@@ -270,11 +270,29 @@ fi
 
 # HARD gate 1b: the R8 payoff — Known Proto on Non Std Port is ABSENT now
 # that the cover protocol (TLS) is running on its own standard port.
-if grep -qiE 'known proto on non std port|ndpi_known_protocol_on_non_standard_port' "$NDPI_OUT_443"; then
-    echo "[FAIL] gate (1b): Known Proto on Non Std Port risk STILL fired on port 443 — the R8 port fix did not remove it"
+#
+# ndpiReader -v 2 prints one line per flow, and both [proto:...] and
+# [Risk:...] land on that same per-flow line. The capture window starts
+# before the daemons, so it can non-deterministically pick up a spurious
+# extra flow (e.g. a probe-only TCP SYN/retransmit on 443) — if THAT flow
+# ever carries a Non-Std-Port risk, grepping the whole ndpiReader output
+# would false-fail this hard (absence) gate on a flow that isn't ours. So
+# scope the assertion to the yip/TLS flow's own line(s), identified the same
+# way gate 1a's sibling (SNI) is identified elsewhere: by the configured SNI,
+# which a stray flow won't carry.
+YIP_FLOW_LINE_443="$(grep -iF "$SNI" "$NDPI_OUT_443" || true)"
+if [ -z "$YIP_FLOW_LINE_443" ]; then
+    # Gate 1a already requires the flow be classified as TLS; if we can't
+    # even isolate it by SNI here, something is wrong independent of 1a's
+    # content-classification check — fail explicitly rather than silently
+    # passing an assertion that scoped to nothing.
+    echo "[FAIL] gate (1b): could not isolate the yip/TLS flow by SNI ($SNI) in ndpiReader output — cannot scope the Non-Std-Port assertion"
+    FAIL=1
+elif echo "$YIP_FLOW_LINE_443" | grep -qiE 'known proto on non std port|ndpi_known_protocol_on_non_standard_port'; then
+    echo "[FAIL] gate (1b): Known Proto on Non Std Port risk STILL fired on the yip flow (port 443) — the R8 port fix did not remove it"
     FAIL=1
 else
-    echo "[PASS] gate (1b): Known Proto on Non Std Port risk is ABSENT on 443 — the R8 payoff"
+    echo "[PASS] gate (1b): Known Proto on Non Std Port risk is ABSENT on the yip flow (443) — the R8 payoff"
 fi
 
 # HARD gate 1c: no WireGuard/VPN classification on the 443 flow — it must
