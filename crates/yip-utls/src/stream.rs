@@ -778,6 +778,56 @@ mod tests {
         (header[0], payload)
     }
 
+    /// Walks a crafted `ClientHello` handshake message (`0x01 ‖ u24 len ‖
+    /// body`) far enough to recover `client_random` and the `x25519`
+    /// (group `0x001d`) `key_share` entry's public value — everything a
+    /// mock TLS 1.3 server needs to compute the ECDHE shared secret and
+    /// derive the same handshake keys `connect` derives. Shared by both the
+    /// hello-inspection test above and the full mock-server handshake test
+    /// below, rather than duplicating the extension walk twice.
+    fn client_hello_random_and_x25519(ch_msg: &[u8]) -> ([u8; 32], [u8; 32]) {
+        let body = &ch_msg[4..];
+        let client_random: [u8; 32] = body[2..34].try_into().unwrap();
+        let sid_len = usize::from(body[34]);
+
+        let mut cursor = 35 + sid_len;
+        let cs_len = usize::from(u16::from_be_bytes([body[cursor], body[cursor + 1]]));
+        cursor += 2 + cs_len;
+        let cm_len = usize::from(body[cursor]);
+        cursor += 1 + cm_len;
+        let ext_total_len = usize::from(u16::from_be_bytes([body[cursor], body[cursor + 1]]));
+        cursor += 2;
+
+        let mut i = cursor;
+        let ext_end = cursor + ext_total_len;
+        let mut eph_pub = None;
+        while i < ext_end {
+            let ext_type = u16::from_be_bytes([body[i], body[i + 1]]);
+            let ext_len = usize::from(u16::from_be_bytes([body[i + 2], body[i + 3]]));
+            let ext_body = &body[i + 4..i + 4 + ext_len];
+            if ext_type == 51 {
+                let ks_len = usize::from(u16::from_be_bytes([ext_body[0], ext_body[1]]));
+                let mut j = 2;
+                let ks_end = 2 + ks_len;
+                while j < ks_end {
+                    let group = u16::from_be_bytes([ext_body[j], ext_body[j + 1]]);
+                    let data_len =
+                        usize::from(u16::from_be_bytes([ext_body[j + 2], ext_body[j + 3]]));
+                    let data = &ext_body[j + 4..j + 4 + data_len];
+                    if group == GROUP_X25519 {
+                        eph_pub = Some(<[u8; 32]>::try_from(data).unwrap());
+                    }
+                    j += 4 + data_len;
+                }
+            }
+            i += 4 + ext_len;
+        }
+        (
+            client_random,
+            eph_pub.expect("crafted hello must carry an x25519 key_share entry"),
+        )
+    }
+
     /// `connect` must emit a byte-faithful `hello::craft` ClientHello whose
     /// `legacy_session_id` is the REALITY seal of the *same* `client_random`
     /// carried in the hello itself — the crux of Task 7's "ONE EPHEMERAL
@@ -811,55 +861,19 @@ mod tests {
         assert!(ja::ja3(&ch_msg).is_some(), "not a well-formed ClientHello");
         assert!(ja::ja4(&ch_msg).is_some(), "not a well-formed ClientHello");
 
-        // Recover client_random (bytes [2..34) of the handshake body,
-        // itself at offset 4 past the type+u24-len header) and the
+        // Recover client_random and the x25519 key_share pub (shared walk,
+        // see `client_hello_random_and_x25519`'s doc comment), plus the
         // legacy_session_id (u8-length-prefixed, right after
-        // client_random), then verify the seal opens under the server's
-        // REALITY key with this exact client_random and eph pub — proving
+        // client_random) — then verify the seal opens under the server's
+        // REALITY key with this exact client_random and eph pub, proving
         // hello::craft's wire client_random and auth::seal's sealed
         // client_random are the same value.
         let body = &ch_msg[4..];
-        let client_random: [u8; 32] = body[2..34].try_into().unwrap();
         let sid_len = usize::from(body[34]);
         let session_id = &body[35..35 + sid_len];
         assert_eq!(sid_len, 32);
 
-        // Walk past cipher_suites and compression_methods (both
-        // variable-length) to find the extensions block, rather than
-        // hardcoding offsets — key_share (ext 51)'s x25519 entry carries the
-        // ephemeral pub used for the seal's ECDH.
-        let mut cursor = 35 + sid_len;
-        let cs_len = usize::from(u16::from_be_bytes([body[cursor], body[cursor + 1]]));
-        cursor += 2 + cs_len;
-        let cm_len = usize::from(body[cursor]);
-        cursor += 1 + cm_len;
-        let ext_total_len = usize::from(u16::from_be_bytes([body[cursor], body[cursor + 1]]));
-        cursor += 2;
-        let mut i = cursor;
-        let ext_end = cursor + ext_total_len;
-        let mut eph_pub = None;
-        while i < ext_end {
-            let ext_type = u16::from_be_bytes([body[i], body[i + 1]]);
-            let ext_len = usize::from(u16::from_be_bytes([body[i + 2], body[i + 3]]));
-            let ext_body = &body[i + 4..i + 4 + ext_len];
-            if ext_type == 51 {
-                let ks_len = usize::from(u16::from_be_bytes([ext_body[0], ext_body[1]]));
-                let mut j = 2;
-                let ks_end = 2 + ks_len;
-                while j < ks_end {
-                    let group = u16::from_be_bytes([ext_body[j], ext_body[j + 1]]);
-                    let data_len =
-                        usize::from(u16::from_be_bytes([ext_body[j + 2], ext_body[j + 3]]));
-                    let data = &ext_body[j + 4..j + 4 + data_len];
-                    if group == 29 {
-                        eph_pub = Some(<[u8; 32]>::try_from(data).unwrap());
-                    }
-                    j += 4 + data_len;
-                }
-            }
-            i += 4 + ext_len;
-        }
-        let eph_pub = eph_pub.expect("crafted hello must carry an x25519 key_share entry");
+        let (client_random, eph_pub) = client_hello_random_and_x25519(&ch_msg);
 
         assert!(
             auth::open(
@@ -944,5 +958,205 @@ mod tests {
         let mut buf2 = vec![0u8; 32];
         let n2 = a.read(&mut buf2).await.unwrap();
         assert_eq!(&buf2[..n2], b"hi back from B");
+    }
+
+    /// Plays the TLS 1.3 SERVER role, entirely in-process, against a real
+    /// `connect()` call driving the CLIENT role over the other half of a
+    /// `tokio::io::duplex` — proving `connect`/`RealityStream` end-to-end
+    /// OFFLINE (no real network), using this crate's OWN handshake
+    /// primitives on both sides, mirroring exactly what `connect` itself
+    /// does but in reverse.
+    ///
+    /// Always negotiates group `x25519` (`0x001d`), never the ML-KEM hybrid
+    /// (`4588`) — `connect` offers both, but a server is free to pick either
+    /// per RFC 8446 §4.2.8, and implementing a from-scratch ML-KEM
+    /// encapsulation here would duplicate the `ml_kem` crate's job with no
+    /// additional coverage of `connect`'s own logic (the `ecdhe` derivation
+    /// branch for group 4588 is exercised directly against RFC-vector-shaped
+    /// hybrid IKM in `handshake.rs`'s
+    /// `derive_handshake_keys_accepts_64_byte_hybrid_ecdhe`).
+    ///
+    /// Does not send a `Certificate`/`CertificateVerify` — `connect` never
+    /// looks at either (see this module's doc comment: REALITY is
+    /// zero-cert-auth by design) — and sends an arbitrary (unverified)
+    /// server `Finished` `verify_data`, since `connect` consumes but never
+    /// validates the server `Finished` contents.
+    async fn run_mock_tls13_server(mut io: tokio::io::DuplexStream) {
+        const SUITE: u16 = 0x1301; // TLS_AES_128_GCM_SHA256
+
+        // -- ClientHello ------------------------------------------------
+        let (record_type, ch_msg) = read_one_record(&mut io).await;
+        assert_eq!(
+            record_type, CONTENT_TYPE_HANDSHAKE,
+            "ClientHello must arrive as a plaintext handshake record"
+        );
+        let (_client_random, client_x25519_pub) = client_hello_random_and_x25519(&ch_msg);
+
+        // -- ServerHello (group x25519) -----------------------------------
+        let server_secret = x25519_dalek::StaticSecret::from([9u8; 32]);
+        let server_x25519_pub: [u8; 32] = x25519_dalek::PublicKey::from(&server_secret).to_bytes();
+        let ecdhe: Vec<u8> = server_secret
+            .diffie_hellman(&x25519_dalek::PublicKey::from(client_x25519_pub))
+            .to_bytes()
+            .to_vec();
+
+        let mut server_random = [0u8; 32];
+        getrandom::getrandom(&mut server_random).unwrap();
+
+        let mut key_share_entry = Vec::new();
+        key_share_entry.extend_from_slice(&GROUP_X25519.to_be_bytes());
+        key_share_entry.extend_from_slice(&32u16.to_be_bytes());
+        key_share_entry.extend_from_slice(&server_x25519_pub);
+
+        let mut exts = Vec::new();
+        // supported_versions (43): TLS 1.3 only.
+        exts.extend_from_slice(&43u16.to_be_bytes());
+        exts.extend_from_slice(&2u16.to_be_bytes());
+        exts.extend_from_slice(&0x0304u16.to_be_bytes());
+        // key_share (51).
+        exts.extend_from_slice(&51u16.to_be_bytes());
+        exts.extend_from_slice(&u16::try_from(key_share_entry.len()).unwrap().to_be_bytes());
+        exts.extend_from_slice(&key_share_entry);
+
+        let mut sh_body = Vec::new();
+        sh_body.extend_from_slice(&0x0303u16.to_be_bytes()); // legacy_version
+        sh_body.extend_from_slice(&server_random);
+        sh_body.push(0); // legacy_session_id_echo: empty (connect() ignores it)
+        sh_body.extend_from_slice(&SUITE.to_be_bytes());
+        sh_body.push(0); // legacy_compression_method
+        sh_body.extend_from_slice(&u16::try_from(exts.len()).unwrap().to_be_bytes());
+        sh_body.extend_from_slice(&exts);
+
+        let mut sh_msg = Vec::new();
+        sh_msg.push(0x02); // ServerHello
+        let body_len = u32::try_from(sh_body.len()).unwrap().to_be_bytes();
+        sh_msg.extend_from_slice(&body_len[1..]); // u24
+        sh_msg.extend_from_slice(&sh_body);
+
+        let sh_header =
+            record_header(CONTENT_TYPE_HANDSHAKE, LEGACY_RECORD_VERSION, sh_msg.len()).unwrap();
+        io.write_all(&sh_header).await.unwrap();
+        io.write_all(&sh_msg).await.unwrap();
+
+        // -- Handshake keys, matching connect()'s own derivation exactly --
+        let mut ch_sh_transcript = Vec::with_capacity(ch_msg.len() + sh_msg.len());
+        ch_sh_transcript.extend_from_slice(&ch_msg);
+        ch_sh_transcript.extend_from_slice(&sh_msg);
+        let transcript_ch_sh = transcript_hash(&ch_sh_transcript, SUITE);
+        let hk = derive_handshake_keys(&ecdhe, &transcript_ch_sh, SUITE);
+
+        // -- Middlebox-compatibility CCS, then the encrypted server flight:
+        // EncryptedExtensions(empty) ‖ Finished(arbitrary verify_data) ------
+        io.write_all(&CHANGE_CIPHER_SPEC_RECORD).await.unwrap();
+
+        let ee_msg: [u8; 4] = [0x08, 0x00, 0x00, 0x00]; // EncryptedExtensions, 0-length
+        let verify_data = [0xABu8; 32]; // arbitrary: connect() never checks it
+        let mut finished_msg = Vec::with_capacity(4 + verify_data.len());
+        finished_msg.push(HS_TYPE_FINISHED);
+        finished_msg.extend_from_slice(&[0x00, 0x00, 0x20]); // u24 len = 32
+        finished_msg.extend_from_slice(&verify_data);
+
+        let mut server_flight_plain = Vec::with_capacity(ee_msg.len() + finished_msg.len());
+        server_flight_plain.extend_from_slice(&ee_msg);
+        server_flight_plain.extend_from_slice(&finished_msg);
+
+        let sealed_flight = record_seal(
+            &hk.server_key,
+            &hk.server_iv,
+            0,
+            SUITE,
+            CONTENT_TYPE_HANDSHAKE,
+            &server_flight_plain,
+        )
+        .unwrap();
+        let flight_header = record_header(
+            CONTENT_TYPE_APPLICATION_DATA,
+            LEGACY_RECORD_VERSION,
+            sealed_flight.len(),
+        )
+        .unwrap();
+        io.write_all(&flight_header).await.unwrap();
+        io.write_all(&sealed_flight).await.unwrap();
+
+        let mut full_transcript = ch_sh_transcript;
+        full_transcript.extend_from_slice(&server_flight_plain);
+        let transcript_thru_sfin = transcript_hash(&full_transcript, SUITE);
+        let ak = derive_application_keys(&hk.handshake_secret, &transcript_thru_sfin, SUITE);
+
+        // -- Drain the client's CCS + sealed Finished (contents unchecked,
+        // exactly mirroring connect()'s own "never verifies the peer's
+        // Finished" stance) ------------------------------------------------
+        loop {
+            let (record_type, _payload) = read_one_record(&mut io).await;
+            if record_type == CONTENT_TYPE_CHANGE_CIPHER_SPEC {
+                continue;
+            }
+            assert_eq!(
+                record_type, CONTENT_TYPE_APPLICATION_DATA,
+                "expected the client's sealed Finished record"
+            );
+            break;
+        }
+
+        // -- Echo one application-data record under the application keys --
+        let (record_type, mut app_payload) = read_one_record(&mut io).await;
+        assert_eq!(record_type, CONTENT_TYPE_APPLICATION_DATA);
+        let plaintext = record_open(
+            &ak.client_key,
+            &ak.client_iv,
+            0,
+            SUITE,
+            CONTENT_TYPE_APPLICATION_DATA,
+            &mut app_payload,
+        )
+        .unwrap();
+
+        let sealed_reply = record_seal(
+            &ak.server_key,
+            &ak.server_iv,
+            0,
+            SUITE,
+            CONTENT_TYPE_APPLICATION_DATA,
+            &plaintext,
+        )
+        .unwrap();
+        let reply_header = record_header(
+            CONTENT_TYPE_APPLICATION_DATA,
+            LEGACY_RECORD_VERSION,
+            sealed_reply.len(),
+        )
+        .unwrap();
+        io.write_all(&reply_header).await.unwrap();
+        io.write_all(&sealed_reply).await.unwrap();
+    }
+
+    /// The end-to-end, fully OFFLINE proof: `connect()` (the CLIENT role)
+    /// against `run_mock_tls13_server` (the SERVER role, built from this
+    /// same crate's `handshake` primitives) over an in-process
+    /// `tokio::io::duplex` — no real network, no `#[ignore]`. Drives
+    /// `connect` all the way through `ClientHello` → `ServerHello` → key
+    /// derivation → server flight → client `Finished` → application data,
+    /// then round-trips one message over the resulting `RealityStream`,
+    /// exercising the `AsyncRead`/`AsyncWrite` impls with data actually
+    /// produced by a full handshake (as opposed to
+    /// `reality_stream_round_trips_over_duplex`'s hand-picked fixed keys).
+    #[tokio::test]
+    async fn connect_completes_full_handshake_against_in_process_mock_server() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let server_task = tokio::spawn(run_mock_tls13_server(server_io));
+
+        let mut s = connect(client_io, "example.com", &[9u8; 32], [1u8; 8])
+            .await
+            .expect("handshake against the in-process mock server must succeed");
+
+        s.write_all(b"PING").await.unwrap();
+        s.flush().await.unwrap();
+
+        let mut buf = [0u8; 4];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"PING");
+
+        server_task.await.unwrap();
     }
 }
