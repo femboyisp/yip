@@ -266,6 +266,7 @@ pub(crate) fn build_test_client_connector() -> boring::ssl::SslConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn build_acceptor_from_pem_succeeds() {
@@ -309,5 +310,118 @@ mod tests {
             "client TLS handshake against the listener must complete: {:?}",
             result.err()
         );
+    }
+
+    // ---- REALITY front (in-process, so coverage sees run_reality_conn/splice) ----
+
+    /// A "dest" upstream: accept one connection, drain whatever the front
+    /// replays, then answer a fixed banner. Returns its address.
+    async fn spawn_dest_banner(banner: &'static [u8]) -> SocketAddr {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = l.accept().await {
+                let mut sink = [0u8; 512];
+                let _ = tokio::time::timeout(Duration::from_millis(200), s.read(&mut sink)).await;
+                let _ = s.write_all(banner).await;
+                let _ = s.flush().await;
+            }
+        });
+        addr
+    }
+
+    /// A minimal but well-formed TLS 1.3 ClientHello record (no REALITY auth):
+    /// parses cleanly, so `reality_auth_open` runs and fails (no key_share).
+    fn minimal_client_hello_record() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // legacy_version
+        body.extend_from_slice(&[0xAB; 32]); // random
+        body.push(32);
+        body.extend_from_slice(&[0xCD; 32]); // legacy_session_id
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher_suites: len 2, TLS_AES_128_GCM
+        body.extend_from_slice(&[0x01, 0x00]); // compression: len 1, null
+        body.extend_from_slice(&[0x00, 0x00]); // extensions: len 0
+        let body_len = u16::try_from(body.len()).unwrap();
+        let mut msg = vec![0x01, 0x00]; // client_hello, u24 high byte (body < 64 KiB)
+        msg.extend_from_slice(&body_len.to_be_bytes());
+        msg.extend_from_slice(&body);
+        let rec_len = u16::try_from(msg.len()).unwrap();
+        let mut rec = vec![0x16, 0x03, 0x01];
+        rec.extend_from_slice(&rec_len.to_be_bytes());
+        rec.extend_from_slice(&msg);
+        rec
+    }
+
+    async fn start_reality_front(dest: SocketAddr) -> SocketAddr {
+        let dir = std::env::temp_dir().join(format!("yip-rdv-reality-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key) = write_self_signed(&dir);
+        let acceptor = Arc::new(build_acceptor(&cert, &key).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cfg = Arc::new(TlsFrontCfg {
+            server: Arc::new(Mutex::new(RendezvousServer::new(0))),
+            obf_key: [0u8; 16],
+            decoy: None,
+            base: Instant::now(),
+            routes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            reality: Some(RealityCfg {
+                dest,
+                priv_key: [7u8; 32],
+                short_ids: Vec::new(), // no client can authenticate ⇒ everything forwards
+                server_names: Vec::new(),
+            }),
+        });
+        tokio::spawn(run_tls_front(listener, acceptor, cfg));
+        addr
+    }
+
+    async fn assert_gets_banner(front: SocketAddr, first_bytes: &[u8], banner: &[u8]) {
+        let mut client = tokio::net::TcpStream::connect(front).await.unwrap();
+        client.write_all(first_bytes).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 128];
+            loop {
+                let n = client.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(banner.len()).any(|w| w == banner) {
+                    break;
+                }
+            }
+            buf
+        })
+        .await
+        .expect("banner within timeout");
+        assert!(
+            got.windows(banner.len()).any(|w| w == banner),
+            "expected dest banner spliced back, got {got:?}"
+        );
+    }
+
+    /// Un-authed (well-formed, no seal) ClientHello ⇒ spliced to the real dest.
+    #[tokio::test]
+    async fn reality_unauthed_hello_is_spliced_to_dest() {
+        let dest = spawn_dest_banner(b"HELLO-DEST-UNAUTH").await;
+        let front = start_reality_front(dest).await;
+        assert_gets_banner(front, &minimal_client_hello_record(), b"HELLO-DEST-UNAUTH").await;
+    }
+
+    /// A first record declaring an oversized body (> MAX_RECORD_BODY_LEN) ⇒
+    /// Passthrough ⇒ spliced to dest (not silently dropped — review I-1).
+    #[tokio::test]
+    async fn reality_oversized_record_is_spliced_to_dest() {
+        let dest = spawn_dest_banner(b"HELLO-DEST-OVERSIZE").await;
+        let front = start_reality_front(dest).await;
+        // 5-byte record header claiming a 16385-byte body (> 16384 cap).
+        assert_gets_banner(
+            front,
+            &[0x16, 0x03, 0x01, 0x40, 0x01],
+            b"HELLO-DEST-OVERSIZE",
+        )
+        .await;
     }
 }
