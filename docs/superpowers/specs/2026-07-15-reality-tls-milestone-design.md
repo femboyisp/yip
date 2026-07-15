@@ -69,6 +69,18 @@ Each sub-milestone is its own spec → plan → PR (per the never-merge / review
   probe-faithful relay-front-that-looks-like-a-website. The tunnel path stays on the
   existing obf/Trojan branch behind a config flag until REALITY.2 lands.
 
+> **Hard prerequisites before REALITY.2 ships a working client** (from the REALITY.1
+> final review — latent today because no client authenticates yet, but they unmask the
+> relay the moment one does):
+> - **Anti-replay (I-1):** `reality_auth_open` keeps no record of seen seals — a captured
+>   authed ClientHello replays within the ~20-min window. Add a time-bounded dedup set
+>   keyed on the seal / `client_random` within the freshness window.
+> - **Splice-faithful authed fallback (I-1/M-2):** an authed connection whose inner
+>   obf-`Register` classification fails currently drops / serves `into_decoy` (or `--decoy`
+>   if set, M-2) — both distinct from `dest`. It must `splice_to_dest` instead, so even a
+>   replay or a buggy authed client stays cover-faithful. Depends on REALITY.3 (stolen
+>   cert), since the authed branch otherwise presents the relay's own cert, not `dest`'s.
+
 ### REALITY.2 — pure-Rust REALITY ClientHello crafter + TLS 1.3 client (the crux)
 - New crate `yip-utls` (pure Rust, `forbid(unsafe)`): a **single pinned Chrome**
   ClientHello template (JA3/JA4-faithful) where we own `key_share` + `legacy_session_id`.
