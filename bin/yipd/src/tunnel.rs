@@ -30,7 +30,7 @@
 //! 30 ms feedback interval.
 
 use std::io;
-use std::net::{ToSocketAddrs, UdpSocket};
+use std::net::ToSocketAddrs;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::process::Command;
@@ -56,7 +56,7 @@ pub fn run(config: Config) -> io::Result<()> {
     // peer address on every datagram; `PeerManager` routes by that address
     // (and, once established, by the per-peer `DataPlane`'s own stamped
     // `dst`) instead of relying on a fixed connected peer.
-    let sock = UdpSocket::bind(config.listen)?;
+    let sock = crate::port::bind_udp(config.listen, config.listen_port_auto)?;
 
     // Raise kernel socket buffers to 4 MiB so bursts do not overflow the
     // OS receive ring.
@@ -215,6 +215,7 @@ pub fn run(config: Config) -> io::Result<()> {
             config.local_public,
             &tls_peers,
             config.listen,
+            config.listen_port_auto,
             &config.tls_sni,
         );
     }

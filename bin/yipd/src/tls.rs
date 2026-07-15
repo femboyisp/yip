@@ -555,12 +555,12 @@ fn pump(
 /// `peers` is the list of `(peer_public_key, endpoint)` for every configured
 /// peer; only the **first** is served (see the follow-up note below). `listen`
 /// is the local TCP listen address used when this node is the TLS server role
-/// (see [`connection_role`]) — **note:** this parameter is not present in the
-/// 3c.2 task brief's `run_tls` signature; it was added here because the pump
-/// structurally needs a bind address for the server role and no other
-/// parameter supplies one (Task 6, which wires `tunnel.rs` to call this
-/// function, is expected to pass `config.listen`, the same address already
-/// used for the raw-UDP/QUIC sockets).
+/// (see [`connection_role`]); `listen_port_auto` is forwarded to
+/// [`crate::port::bind_tcp`], which binds `listen` directly when `false` and
+/// falls back 443→8443 (with a warning) on `PermissionDenied` when `true`
+/// (anti-DPI 3d — see `port.rs`). `tunnel.rs` passes `config.listen` /
+/// `config.listen_port_auto`, the same address/flag already used for the
+/// raw-UDP/QUIC sockets.
 ///
 /// `manager` is driven UNCHANGED — it runs the inner yip Noise-IK/FEC/AEAD
 /// protocol inside the TLS byte-stream.
@@ -570,6 +570,7 @@ pub(crate) fn run_tls(
     local_public: [u8; 32],
     peers: &[([u8; 32], SocketAddr)],
     listen: SocketAddr,
+    listen_port_auto: bool,
     tls_sni: &str,
 ) -> io::Result<()> {
     // TODO(3c.2 follow-up): multi-peer TLS. `run_tls` is scoped to a single
@@ -587,7 +588,7 @@ pub(crate) fn run_tls(
     let role = connection_role(&local_public, &peer_public)?;
 
     let listener = match role {
-        Role::Server => Some(TcpListener::bind(listen)?),
+        Role::Server => Some(crate::port::bind_tcp(listen, listen_port_auto)?),
         Role::Client => None,
     };
 

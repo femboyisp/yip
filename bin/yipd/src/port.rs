@@ -1,13 +1,6 @@
 //! Plausible-port bind helpers (anti-DPI 3d, R8/#45): auto-selected ports try
 //! 443 and fall back to 8443 (with a warning) when binding a privileged port is
 //! denied. Explicit operator ports never fall back.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "bind_udp/bind_tcp are wired into the transport binds in 3d Task 3"
-    )
-)]
 use std::io;
 use std::net::{SocketAddr, TcpListener, UdpSocket};
 
