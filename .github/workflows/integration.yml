@@ -311,6 +311,32 @@ jobs:
           # port-plausibility follow-up; the latter is inherent to a P2P TLS
           # costume whose SNI (a real site) never matches the peer's IP.
 
+      - name: Run the nDPI port-plausibility oracle under sudo
+        # 3d Task 6's headline: proves the R8 port fix actually removes the
+        # "unknown thing on a weird port" risk. Arm 1 reruns the TLS-mimicry
+        # costume on 443 (instead of the neutral port above) and asserts
+        # `Known Proto on Non Std Port` — reported, never gated, by the
+        # neutral-port oracle above — is now ABSENT. Arm 2 reruns the
+        # undetectability oracle's obf capture on UDP 51820 (WireGuard's
+        # default) and asserts nDPI classifies it as WireGuard BY PORT — the
+        # concrete #45 tell that motivates moving off 51820. See
+        # run-port-plausibility-oracle.sh for the full assertion set.
+        run: |
+          sudo bash bin/yipd/tests/run-port-plausibility-oracle.sh \
+            "$(pwd)/target/release/yipd" \
+            /tmp/nDPI/example/ndpiReader | tee /tmp/port-plausibility-oracle.log
+          # Honesty guard, same reasoning as the oracles above: this job
+          # always runs as sudo and always builds ndpiReader, so a SKIP means
+          # the harness itself is broken.
+          if grep -q "^SKIP run-port-plausibility-oracle" /tmp/port-plausibility-oracle.log; then
+            echo "::error::port-plausibility oracle skipped — expected root + a built ndpiReader in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/port-plausibility-oracle.log; then
+            echo "::error::the 443 TLS-mimicry flow still showed Known-Proto-on-Non-Std-Port / a VPN classification, or the 51820 raw-yip flow was not port-matched as WireGuard — 3d port-plausibility regression"
+            exit 1
+          fi
+
       - name: Run the REALITY probe-resistance oracle under sudo
         # 3c.3's headline money test: an active prober (curl, garbage bytes
         # over TLS, an idle connection) dialing the relay's TLS Trojan front

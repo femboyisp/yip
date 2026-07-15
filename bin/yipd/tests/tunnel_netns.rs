@@ -811,6 +811,58 @@ fn tls_classified_as_tls() {
 }
 
 #[test]
+fn port_plausibility_oracle() {
+    // The 3d headline (Task 6): proves the R8 port fix actually removes the
+    // "unknown thing on a weird port" risk. Arm 1 runs transport=tls on 443
+    // (instead of run-tls-mimicry-oracle.sh's neutral 34567) and asserts the
+    // `Known Proto on Non Std Port` risk that oracle only REPORTS is now
+    // ABSENT. Arm 2 reruns run-ndpi-oracle.sh's obf-capture harness on UDP
+    // 51820 (WireGuard's default) and asserts nDPI classifies it as
+    // WireGuard BY PORT — the concrete #45 tell that motivates moving off
+    // 51820 in the first place. See run-port-plausibility-oracle.sh for the
+    // full assertion set.
+    //
+    // Requires root: netns creation + TUN devices + tcpdump + binding 443.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP port_plausibility_oracle: needs root (run under sudo in CI)");
+        return;
+    }
+    let ndpi = ndpi_reader_bin();
+    if !ndpi.exists() {
+        eprintln!(
+            "SKIP port_plausibility_oracle: ndpiReader binary not found at {}; \
+             build it from refrences/nDPI (autogen.sh && ./configure && make) first",
+            ndpi.display()
+        );
+        return;
+    }
+    let yipd = env!("CARGO_BIN_EXE_yipd");
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/run-port-plausibility-oracle.sh"
+    );
+    let status = Command::new("bash")
+        .arg(script)
+        .arg(yipd)
+        .arg(&ndpi)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "nDPI port-plausibility oracle failed (either the 443 TLS-mimicry flow still showed the \
+         Known-Proto-on-Non-Std-Port risk / a VPN classification, or the 51820 raw-yip flow was \
+         NOT port-matched as WireGuard — the 3d port-plausibility proof regressed)"
+    );
+}
+
+#[test]
 fn reality_probe_serves_decoy() {
     // The 3c.3 headline money test: an active prober (curl, garbage bytes
     // over TLS, an idle connection) dialing the relay's TLS Trojan front
