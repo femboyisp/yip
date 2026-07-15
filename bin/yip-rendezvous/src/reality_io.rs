@@ -7,14 +7,8 @@
 //! wire without interpreting it as TLS, and [`PrefixedStream`] replays an
 //! already-consumed byte prefix so `tokio_boring::accept` can "re-read" the
 //! `ClientHello` it needs from a socket that has already had it drained.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "REALITY.1 Task 2: I/O primitives exercised by their own unit tests; \
-                   not yet called from main.rs — Task 3 wires them into the async TLS front"
-    )
-)]
+//! Wired into the async TLS front by `tls_front::run_reality_conn`
+//! (REALITY.1 Task 3).
 use std::pin::Pin;
 use std::task::{Context, Poll};
 

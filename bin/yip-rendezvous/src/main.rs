@@ -275,6 +275,10 @@ async fn main() -> std::io::Result<()> {
             decoy: decoy_addr,
             base,
             routes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            // REALITY mode has no CLI wiring yet (out of scope for
+            // REALITY.1 Task 3, which only wires the TLS-front branch and
+            // splice logic); the relay keeps running the 3c.3 Trojan front.
+            reality: None,
         });
         tokio::spawn(tls_front::run_tls_front(tcp, acceptor, cfg));
     }

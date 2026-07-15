@@ -7,15 +7,8 @@
 //! input yields `None`, never a panic), and the auth check verifies a
 //! ChaCha20-Poly1305 seal carried in `legacy_session_id`, keyed by an X25519
 //! ECDH between the client's ephemeral key-share and the relay's REALITY
-//! private key. Later tasks wire this into the async TLS front.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "REALITY.1 Task 1: pure parser + auth core, exercised by its own unit tests; \
-                   not yet called from main.rs — later tasks wire it into the async TLS front"
-    )
-)]
+//! private key. Wired into the async TLS front by `tls_front::run_reality_conn`
+//! (REALITY.1 Task 3).
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use ring::hkdf;

@@ -7,8 +7,12 @@ use std::time::{Duration, Instant};
 
 use boring::error::ErrorStack;
 use boring::ssl::{SslAcceptor, SslFiletype, SslMethod};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Semaphore};
 use yip_rendezvous::RendezvousServer;
+
+use crate::reality_io::{read_first_tls_record, PrefixedStream};
 
 /// Upper bound on how long a TLS handshake may take before we give up on the
 /// connection. Without this, a client that sends a ClientHello and then
@@ -21,6 +25,30 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// front. Bounds the number of tasks/fds a slow-handshake flood can pin,
 /// independent of the per-handshake timeout above (I1).
 const MAX_TLS_CONNS: usize = 1024;
+
+/// Allowed clock skew (in minutes) between a REALITY client's embedded
+/// timestamp and the relay's wall clock (REALITY.1 Task 3). This is the
+/// relay/control tier, not the data plane's rekey-driven clock — wall time
+/// is fine here.
+const REALITY_SKEW_MIN: u64 = 10;
+
+/// REALITY-mode config for the TLS front (REALITY.1 Task 3): when present on
+/// `TlsFrontCfg`, `run_tls_front` peeks the raw `ClientHello` and only hands
+/// authenticated connections to the real BoringSSL acceptor / relay Trojan
+/// front; anything else is transparently spliced to `dest` so an active
+/// prober completes a genuine handshake with the real upstream site and
+/// never observes our certificate.
+pub struct RealityCfg {
+    /// Real upstream to splice un-authed (or unparseable-hello) connections
+    /// to, replaying the buffered `ClientHello` first.
+    pub dest: SocketAddr,
+    /// Relay's REALITY X25519 private key.
+    pub priv_key: [u8; 32],
+    /// Accepted short-ids for the auth seal.
+    pub short_ids: Vec<[u8; 8]>,
+    /// Allowed SNIs for the authenticated check; empty accepts any SNI.
+    pub server_names: Vec<String>,
+}
 
 pub struct TlsFrontCfg {
     pub server: Arc<Mutex<RendezvousServer>>,
@@ -35,6 +63,10 @@ pub struct TlsFrontCfg {
             std::collections::HashMap<yip_rendezvous::NodeId, tokio::sync::mpsc::Sender<Vec<u8>>>,
         >,
     >,
+    /// REALITY anti-probe mode (REALITY.1). `None` keeps the 3c.3 Trojan
+    /// front's behavior byte-identical (terminate TLS immediately, classify
+    /// the first frame, decoy-or-tunnel).
+    pub reality: Option<RealityCfg>,
 }
 
 /// Build a server TLS acceptor from PEM cert-chain + key files, configured to
@@ -81,6 +113,10 @@ pub async fn run_tls_front(
             // Move `permit` into the task so it is released on task end
             // (success, handshake failure, or timeout alike).
             let _permit = permit;
+            if cfg.reality.is_some() {
+                run_reality_conn(tcp, &acceptor, &cfg).await;
+                return;
+            }
             match tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_boring::accept(&acceptor, tcp))
                 .await
             {
@@ -90,6 +126,76 @@ pub async fn run_tls_front(
             }
         });
     }
+}
+
+/// The REALITY branch of the per-connection task (`cfg.reality` is `Some`,
+/// checked by the caller): peek the raw `ClientHello` before terminating
+/// TLS, decide REALITY auth fully before acting, then either hand the
+/// already-read hello + connection to the real acceptor (authed) or
+/// transparently splice to the real upstream `dest`, replaying the buffered
+/// hello (un-authed / unparseable — same code path, so an active prober
+/// cannot distinguish the two outcomes by timing).
+async fn run_reality_conn(mut tcp: TcpStream, acceptor: &Arc<SslAcceptor>, cfg: &Arc<TlsFrontCfg>) {
+    let Some(r) = cfg.reality.as_ref() else {
+        return; // unreachable: caller only takes this branch when Some
+    };
+
+    // A stalled/oversized/short read just drops the connection — the same
+    // slowloris bound the non-REALITY path gets from HANDSHAKE_TIMEOUT.
+    let rec = match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_first_tls_record(&mut tcp)).await {
+        Ok(Ok(rec)) => rec,
+        _ => return,
+    };
+
+    let now_min = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 60)
+        // Wall clock is fine on this relay/control tier; a clock that's
+        // somehow before the epoch just fails REALITY auth (fail-closed),
+        // not a panic.
+        .unwrap_or(0);
+
+    // Decide auth fully before acting: no early return that fires only on a
+    // parse failure ahead of the `dest` connect — that would leak timing
+    // distinguishing "malformed hello" from "well-formed but unauthed".
+    let authed = super::reality::parse_client_hello(rec.get(5..).unwrap_or(&[]))
+        .map(|info| {
+            let sni_ok = r.server_names.is_empty()
+                || info
+                    .sni
+                    .as_deref()
+                    .is_some_and(|s| r.server_names.iter().any(|n| n == s));
+            sni_ok
+                && super::reality::reality_auth_open(
+                    &r.priv_key,
+                    &info,
+                    &r.short_ids,
+                    now_min,
+                    REALITY_SKEW_MIN,
+                )
+        })
+        .unwrap_or(false);
+
+    if authed {
+        let stream = PrefixedStream::new(rec, tcp);
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_boring::accept(acceptor, stream)).await
+        {
+            Ok(Ok(s)) => super::conn::handle_connection(s, Arc::clone(cfg)).await,
+            Ok(Err(e)) => eprintln!("tls-front: reality handshake failed: {e}"),
+            Err(_) => {
+                eprintln!("tls-front: reality handshake timed out after {HANDSHAKE_TIMEOUT:?}")
+            }
+        }
+        return;
+    }
+
+    let Ok(mut up) = TcpStream::connect(r.dest).await else {
+        return;
+    };
+    if up.write_all(&rec).await.is_err() {
+        return;
+    }
+    let _ = tokio::io::copy_bidirectional(&mut tcp, &mut up).await;
 }
 
 /// Write a throwaway self-signed cert/key PEM pair for `relay.test` into
@@ -153,6 +259,7 @@ mod tests {
             decoy: None,
             base: Instant::now(),
             routes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            reality: None,
         });
         tokio::spawn(run_tls_front(listener, acceptor, cfg));
 
