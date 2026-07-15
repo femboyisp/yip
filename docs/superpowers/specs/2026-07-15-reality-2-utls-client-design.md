@@ -52,13 +52,13 @@ sig-alg IDs) — **not** the `key_share` or ECH *data*. Therefore:
 `x25519-dalek` + `chacha20poly1305` (+ HKDF-SHA256). The shared auth codec (`auth.rs`)
 **must reuse those exact primitives** so a `yip-utls` seal is byte-identical to what
 `reality_auth_open` expects — this is a correctness (interop) requirement, verified by the
-interop test. The separate TLS 1.3 handshake (`handshake.rs`) may use `ring` (as the spike
-did) or the RustCrypto stack; KAT its key schedule against openssl either way.
+interop test. The separate TLS 1.3 handshake (`handshake.rs`) uses **`ring`** (as the spike
+did — aligns with the workspace crypto backend); KAT its key schedule against openssl.
 
 ```
 crates/yip-utls/
   Cargo.toml            # forbid-unsafe; auth: x25519-dalek + chacha20poly1305 + hkdf/sha2
-                        #   (match REALITY.1 for interop); handshake: ring OR RustCrypto; getrandom
+                        #   (match REALITY.1 for interop); handshake: ring; getrandom
   src/lib.rs            # pub connect(...) entry + re-exports
   src/hello.rs          # Chrome-150 ClientHello crafter (2a)
   src/auth.rs           # SHARED REALITY auth seal/open codec (client seals, server opens)
@@ -109,13 +109,21 @@ proves crafter-seal ↔ `reality_auth_open` round-trips.
   X25519 + AES-128-GCM/ChaCha20-Poly1305, zero-auth on the server cert (REALITY key, not CA).
 
 ## Testing / adversary
-- **JA3/JA4 diff (the anti-fingerprint guard):** crafted hello == `e229e1bc…` /
-  `t13d1516h2_8daaf6152771_…`, byte-diff vs fixture modulo GREASE/randoms. Fails the build
-  on any drift — this is what prevents "hand-rolled hello is *more* fingerprintable."
+- **Deterministic crafter (enables byte-exact diffing):** `hello.rs` accepts an injected
+  random source (a seed / `Fn(&mut [u8])`) that populates `client_random`, `legacy_session_id`
+  (or the auth seal), the 5 GREASE values, and the MLKEM768/ECH random data. In tests we feed
+  a fixed seed so the crafted hello is fully reproducible and can be asserted **byte-for-byte**
+  against the pinned fixture — catching even a 1-byte drift in padding or extension order.
+- **JA3/JA4 diff (the anti-fingerprint guard):** `tests/ja_diff.rs` computes JA3/JA4 of the
+  crafted hello via `ja.rs` and asserts they **equal** the ground truth exactly —
+  JA3 `e229e1bc25321cbef7268568d386cf86`, JA4 `t13d1516h2_8daaf6152771_806a8c22fdea` — plus a
+  byte-for-byte equality vs the fixture under the fixed seed. Fails the build on any drift.
 - **Auth interop:** `yip-utls` seal opened by `yip-rendezvous::reality_auth_open` → authed;
   wrong key/short_id/stale → rejected.
-- **Live handshake:** craft → connect a real TLS 1.3 endpoint → decrypt its EncryptedExtensions
-  (spike's proof), plus a full round to app-data against `openssl s_server`.
+- **Live handshake (`tests/handshake_live.rs`, `#[ignore]` in CI):** craft → connect a real
+  TLS 1.3 site → complete the handshake to app-data → **send `GET / HTTP/1.1` and assert a
+  valid HTTP response status/headers** (not just decrypting EncryptedExtensions — this proves
+  full RFC 8446 client compliance). Also an `openssl s_server` round.
 - **Fail-closed:** malformed ServerHello / unexpected group / alert → `Error`, never panic.
 
 ## Risks & mitigations
@@ -132,6 +140,45 @@ proves crafter-seal ↔ `reality_auth_open` round-trips.
 ## Non-goals (REALITY.2)
 - Wiring into yipd (REALITY.4). On-the-fly stolen dest cert (REALITY.3). Server anti-replay
   (lands with REALITY.3/.4). ML-KEM/Kyber or ECH *crypto* (decorative bytes only). TLS 1.2.
+
+## Commands
+```sh
+cargo build   -p yip-utls
+cargo test    -p yip-utls                        # unit + JA3/JA4 fixture diff (offline)
+cargo test    -p yip-utls -- --ignored           # live-server handshake tests (network)
+cargo clippy  -p yip-utls --all-targets -- -D warnings
+cargo fmt     -p yip-utls -- --check
+```
+
+## Boundaries
+- **Always:** keep `#![forbid(unsafe_code)]` on the whole crate; mark every live-network test
+  `#[ignore]` so default CI stays offline; give the crafter a deterministic (seeded) mode so
+  `ja_diff` can assert byte-exact equality.
+- **Ask first:** bumping the pinned Chrome template to a newer version; adding any dependency
+  not named in this spec.
+- **Never:** wire `yip-utls` into yipd's active paths (that is REALITY.4); implement real ECH
+  or ML-KEM crypto (both stay decorative, random-of-right-length).
+
+## Code style — wire assembly
+Assemble the ClientHello with a small structured writer, not magic slice offsets, so
+length prefixes can never desync from their bodies:
+```rust
+struct HelloWriter { buf: Vec<u8> }
+impl HelloWriter {
+    fn u8(&mut self, v: u8)        { self.buf.push(v); }
+    fn u16(&mut self, v: u16)      { self.buf.extend_from_slice(&v.to_be_bytes()); }
+    fn bytes(&mut self, b: &[u8])  { self.buf.extend_from_slice(b); }
+    /// Reserve a u16 length, run `f`, then backfill the length of what it wrote.
+    fn u16_prefixed(&mut self, f: impl FnOnce(&mut Self)) {
+        let at = self.buf.len();
+        self.u16(0);
+        f(self);
+        let len = u16::try_from(self.buf.len() - at - 2).expect("section fits u16");
+        self.buf[at..at + 2].copy_from_slice(&len.to_be_bytes());
+    }
+}
+```
+(No `as` casts — use `to_be_bytes`/`try_from`, per the workspace rule.)
 
 ## Success criteria
 1. `yip-utls` builds `forbid(unsafe)`, `clippy -D warnings` clean.
