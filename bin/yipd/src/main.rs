@@ -12,6 +12,7 @@ mod membership;
 mod mode;
 mod path;
 mod peer_manager;
+mod port;
 mod quic;
 mod relay_client;
 mod rendezvous;

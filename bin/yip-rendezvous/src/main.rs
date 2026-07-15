@@ -110,6 +110,37 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
     }
 }
 
+/// If `port` is a canonical VPN/tunnel default port that DPI port-matches,
+/// return the protocol it makes the relay look like; `None` for a plausible
+/// port. Mirrors `yipd::config::fingerprinted_vpn_port` — kept local to this
+/// binary rather than shared with `yipd` since the two live in separate
+/// crates (same rationale as `hex_to_32` above). Used to warn (not reject) at
+/// startup — anti-DPI R8 (#45).
+fn fingerprinted_vpn_port(port: u16) -> Option<&'static str> {
+    match port {
+        51820 => Some("WireGuard"),
+        1194 => Some("OpenVPN"),
+        500 | 4500 => Some("IPsec/IKE"),
+        1701 => Some("L2TP"),
+        1723 => Some("PPTP"),
+        655 => Some("tinc"),
+        _ => None,
+    }
+}
+
+/// The anti-DPI startup warning for a fingerprinted VPN listen `port`, or `None`
+/// for a plausible port. Kept a pure function (rather than inlining the
+/// `format!` in `main`) so the message construction is unit-testable; `main`
+/// only prints what this returns.
+fn vpn_port_warning(port: u16) -> Option<String> {
+    fingerprinted_vpn_port(port).map(|proto| {
+        format!(
+            "yip-rendezvous: listen port {port} is {proto}'s default; DPI classifies the relay's \
+             UDP traffic as {proto} by port — prefer a neutral/plausible port (anti-DPI R8)"
+        )
+    })
+}
+
 fn usage_exit() -> ! {
     eprintln!(
         "usage: yip-rendezvous <listen-addr> [--obf-psk <hex64>] \
@@ -192,6 +223,11 @@ async fn main() -> std::io::Result<()> {
     }
 
     let listen = listen.unwrap_or_else(|| usage_exit());
+    if let Ok(sa) = listen.parse::<std::net::SocketAddr>() {
+        if let Some(w) = vpn_port_warning(sa.port()) {
+            eprintln!("{w}");
+        }
+    }
     // The derived rendezvous-layer obfuscation key, or `None` when `--obf-psk`
     // was not given (plain rendezvous path, byte-identical to before Task 4).
     let obf_key: Option<[u8; 16]> = obf_psk.map(|psk| yip_obf::derive_key(&psk));
@@ -285,6 +321,37 @@ async fn run_udp(
                 eprintln!("relay-forwarded={}", s.forwarded_count());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod port_lint_tests {
+    use super::{fingerprinted_vpn_port, vpn_port_warning};
+
+    /// Known VPN default ports are flagged with their protocol name; a
+    /// plausible/neutral port (including the rendezvous crate's own example
+    /// port, 51821) is not — mirrors `yipd::config::fingerprinted_vpn_ports_are_flagged`.
+    #[test]
+    fn fingerprinted_vpn_ports_are_flagged() {
+        assert_eq!(fingerprinted_vpn_port(51820), Some("WireGuard"));
+        assert_eq!(fingerprinted_vpn_port(1194), Some("OpenVPN"));
+        assert_eq!(fingerprinted_vpn_port(500), Some("IPsec/IKE"));
+        assert_eq!(fingerprinted_vpn_port(4500), Some("IPsec/IKE"));
+        assert_eq!(fingerprinted_vpn_port(1701), Some("L2TP"));
+        assert_eq!(fingerprinted_vpn_port(1723), Some("PPTP"));
+        assert_eq!(fingerprinted_vpn_port(655), Some("tinc"));
+        assert_eq!(fingerprinted_vpn_port(51821), None);
+        assert_eq!(fingerprinted_vpn_port(443), None);
+    }
+
+    /// A fingerprinted port yields a warning naming both the port and the
+    /// protocol it looks like; a plausible port yields no warning.
+    #[test]
+    fn vpn_port_warning_names_port_and_protocol() {
+        let w = vpn_port_warning(51820).expect("51820 must warn");
+        assert!(w.contains("51820"), "warning names the port: {w}");
+        assert!(w.contains("WireGuard"), "warning names the protocol: {w}");
+        assert_eq!(vpn_port_warning(443), None);
     }
 }
 
