@@ -1,0 +1,44 @@
+# Real Chrome 150.0.0.0 (Linux x86_64) TLS fingerprint — captured 2026-07-15 via
+# tls.peet.ws/api/all through the Claude-in-Chrome real browser. CI fixture ground truth.
+user_agent: Chrome/150.0.0.0
+ja3:      771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,18-17613-10-11-45-0-65037-35-13-16-27-43-65281-23-5-51,4588-29-23-24,0
+ja3_hash: e229e1bc25321cbef7268568d386cf86
+ja4:      t13d1516h2_8daaf6152771_806a8c22fdea
+ja4_r:    t13d1516h2_002f,0035,009c,009d,1301,1302,1303,c013,c014,c02b,c02c,c02f,c030,cca8,cca9_0005,000a,000b,000d,0012,0017,001b,0023,002b,002d,0033,44cd,fe0d,ff01_0904,0905,0906,0403,0804,0401,0503,0805,0501,0806,0601
+peetprint: GREASE-772-771|2-1.1|GREASE-4588-29-23-24|2308-2309-2310-1027-2052-1025-1283-2053-1281-2054-1537|1|2|GREASE-4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53|0-10-11-13-16-17613-18-23-27-35-43-45-5-51-65037-65281-GREASE-GREASE
+# Cipher list (with GREASE first): GREASE,1301,1302,1303,c02b,c02f,c02c,c030,cca9,cca8,c013,c014,009c,009d,002f,0035
+# Extension order (on the wire): GREASE, 18(sct), 17613(ALPS), 10(groups), 11(ec_point), 45(psk_ke_modes), 0(SNI), 65037(ECH), 35(session_ticket), 13(sig_algs), 16(ALPN h2/http11), 27(cert_compress brotli), 43(supported_versions GREASE/1.3/1.2), 65281(reneg_info), 23(EMS), 5(status_request OCSP), 51(key_share), GREASE
+# supported_groups: GREASE(0x7a7a), X25519MLKEM768(4588), X25519(29), P-256(23), P-384(24)
+# key_share entries: GREASE(0x7a7a)=1byte, X25519MLKEM768(4588)=1216 bytes, X25519(29)=32 bytes  <-- REALITY auth rides the X25519 entry
+# legacy_session_id: 32 random bytes  <-- REALITY auth seal goes here (same length, fingerprint-faithful)
+# sig_algs: 0x904,0x905,0x906(MLDSA?),ecdsa_p256_sha256,rsa_pss_sha256,rsa_pkcs1_sha256,ecdsa_p384_sha384,rsa_pss_sha384,rsa_pkcs1_sha384,rsa_pss_sha512,rsa_pkcs1_sha512
+
+# ── SECOND CAPTURE (2026-07-15, Windows Chromium/Brave 150) — CRITICAL FINDING ──
+# ja3_hash: f2caf6dea7cf16ae28b4e0d4fa0a1ff0   (DIFFERENT from capture 1's e229e1bc..)
+# ja4:      t13d1516h2_8daaf6152771_806a8c22fdea   (IDENTICAL to capture 1)
+# ext order: GREASE,23,5,65037,65281,10,27,16,17613,45,18,35,13,11,43,51,0,GREASE
+#
+# FINDING: modern Chromium/BoringSSL PERMUTES the ClientHello extension order every
+# connection (keeping one GREASE first + one GREASE last; the ~16 real extensions
+# shuffled between). JA3 is order-sensitive -> a DIFFERENT ja3_hash every connection.
+# JA4 SORTS ciphers+extensions before hashing -> STABLE across the permutation.
+#
+# DESIGN CONSEQUENCE for the crafter (hello.rs):
+#  - Emit GREASE first, then the real extensions in a PER-CONNECTION RANDOM order
+#    (drawn from the seeded RandomSource), then GREASE last. Do NOT hard-code one order.
+#  - The cipher list, group list, sig-alg list, and the extension SET are fixed;
+#    only the extension ORDER varies.
+# DESIGN CONSEQUENCE for the CI diff (ja_diff.rs):
+#  - Lock the JA4: crafted ja4 == t13d1516h2_8daaf6152771_806a8c22fdea (stable).
+#  - Assert the JA3 VARIES across two different seeds (matches real Chrome; a fixed
+#    JA3 would be MORE fingerprintable than real Chrome, defeating the purpose).
+#  - Both capture-1 (e229e1bc..) and capture-2 (f2caf6de..) JA3 hashes are valid
+#    Chrome-150 permutations — the crafter should be able to reproduce a given order.
+
+# ── THIRD CAPTURE (2026-07-15, Windows genuine Chrome 149) — cross-check ──
+# ja3_hash: 5a6b4cd05ab75eca6e0aa88d3e4ca2c8   (3rd distinct JA3 -> permutation confirmed)
+# ja4:      t13d1516h2_8daaf6152771_d8a2da3f94cd   (hash-b DIFFERS from Chrome 150's _806a8c22fdea)
+# WHY: Chrome 150 added 3 post-quantum signature_algorithms 0x0904/0x0905/0x0906 (ML-DSA)
+#      that Chrome 149 lacks (149=8 sig-algs, 150=11). JA4 hash-b hashes sig-algs -> version-sensitive.
+# PIN DECISION CONFIRMED: we target Chrome 150 -> JA4 ..._806a8c22fdea, using 150's full 11 sig-algs
+#      (0904,0905,0906,0403,0804,0401,0503,0805,0501,0806,0601). 149 is a cross-check only.
