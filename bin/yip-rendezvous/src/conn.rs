@@ -3,7 +3,7 @@
 //! the decoy. No `unsafe`; all TLS/socket work is via tokio-boring / tokio.
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use yip_rendezvous::{decode, Message, NodeId, RendezvousServer};
@@ -79,10 +79,10 @@ const CLASSIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 /// anything else (a censor probe, a browser, garbage, silence) is
 /// transparently reverse-proxied to the decoy backend, so the relay looks
 /// like an ordinary web server to everyone but a real yip client.
-pub async fn handle_connection(
-    mut stream: tokio_boring::SslStream<TcpStream>,
-    cfg: Arc<TlsFrontCfg>,
-) {
+pub async fn handle_connection<S>(mut stream: tokio_boring::SslStream<S>, cfg: Arc<TlsFrontCfg>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let now_ms = u64::try_from(cfg.base.elapsed().as_millis()).unwrap_or(u64::MAX);
     // The relay is blind to the real TCP peer identity, and the TLS-only
     // freshness gate (`register_if_fresh_tls`) no longer needs a source addr
@@ -115,12 +115,15 @@ pub async fn handle_connection(
 /// Read the first frame (up to CLASSIFY_TIMEOUT) and classify it. Returns
 /// `None` on idle-timeout/read-error (caller treats as decoy). All bytes read
 /// are accumulated in `buf` so they can be replayed to the decoy.
-async fn read_and_classify(
-    stream: &mut tokio_boring::SslStream<TcpStream>,
+async fn read_and_classify<S>(
+    stream: &mut tokio_boring::SslStream<S>,
     cfg: &TlsFrontCfg,
     buf: &mut Vec<u8>,
     now_ms: u64,
-) -> Option<Classify> {
+) -> Option<Classify>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let deadline = tokio::time::sleep(CLASSIFY_TIMEOUT);
     tokio::pin!(deadline);
     let mut chunk = [0u8; 2048];
@@ -149,11 +152,10 @@ async fn read_and_classify(
 
 /// Proxy this connection to the decoy backend: replay the buffered bytes, then
 /// splice bidirectionally. The decoy's own behavior/timing governs from here.
-async fn into_decoy(
-    mut stream: tokio_boring::SslStream<TcpStream>,
-    cfg: &TlsFrontCfg,
-    buffered: Vec<u8>,
-) {
+async fn into_decoy<S>(mut stream: tokio_boring::SslStream<S>, cfg: &TlsFrontCfg, buffered: Vec<u8>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let Some(decoy_addr) = cfg.decoy else {
         // No decoy configured: minimal static fallback (documented weaker
         // path). The Content-Length is computed from the actual body bytes
@@ -293,6 +295,7 @@ mod tests {
             decoy: Some(decoy_addr),
             base: std::time::Instant::now(),
             routes: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            reality: None,
         });
         tokio::spawn(crate::tls_front::run_tls_front(listener, acceptor, cfg));
 

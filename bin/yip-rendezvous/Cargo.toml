@@ -19,6 +19,14 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 # tokio/boring/tokio-boring are scoped to THIS binary only.
 boring = "4.22.0"
 tokio-boring = "4.22.0"
+# REALITY.1 Task 1: pure TLS-ClientHello parser + REALITY auth core
+# (src/reality.rs). ring supplies HKDF-SHA256; x25519-dalek supplies raw
+# 32-byte-key X25519 ECDH (ring::agreement does not accept raw private-key
+# bytes, which the fixed REALITY private key needs); chacha20poly1305 is the
+# session-id AEAD seal.
+ring = "0.17"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
 
 [dev-dependencies]
 # "pem" is required in addition to the brief's ["ring", "crypto"]: the test

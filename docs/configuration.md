@@ -154,6 +154,10 @@ The standalone rendezvous + blind-relay server (no TUN, no tunnel keys).
 yip-rendezvous <listen-addr> [--obf-psk <hex64>]
 yip-rendezvous <listen-addr> --obf-psk <hex64> \
                --listen-tcp <addr> --tls-cert <path> --tls-key <path> [--decoy <addr>]
+yip-rendezvous <listen-addr> --obf-psk <hex64> \
+               --listen-tcp <addr> --tls-cert <path> --tls-key <path> \
+               --reality-dest <host:port> --reality-private-key <hex64> \
+               [--reality-short-id <hex16>]... [--reality-server-name <name>]...
 yip-rendezvous --version | -V
 ```
 
@@ -188,6 +192,43 @@ seen for that node) upgrades the connection to a relay tunnel; anything else —
 an HTTP probe, a scanner, a plain browser, garbage bytes, or silence — is
 transparently reverse-proxied to the decoy backend. A prober who does not hold
 `obf_psk` therefore sees only an ordinary HTTPS site.
+
+### REALITY-style TLS front (`--reality-dest`, anti-DPI milestone REALITY.1)
+
+`--reality-dest` opts the `--listen-tcp` front into full Xray-style REALITY,
+a stronger active-probe defense than the 3c.3 Trojan model above. Instead of
+terminating TLS unconditionally and classifying the first framed message,
+the relay reads the raw TLS `ClientHello` **before** terminating TLS and
+checks it for REALITY auth: an X25519-ECDH-keyed ChaCha20-Poly1305 seal
+carried in the ClientHello's `legacy_session_id`, validated against the
+relay's REALITY private key, the configured `short_id`s, and a ±10-minute
+timestamp freshness window. **`--reality-dest` supersedes `--decoy`** — if
+both are given, REALITY mode is used and `--decoy` is silently ignored.
+
+| Flag | Value | Notes |
+|---|---|---|
+| `--reality-dest <host:port>` | e.g. `www.apple.com:443` | The real upstream to splice un-authed connections to. Enables REALITY mode. Requires `--listen-tcp`/`--tls-cert`/`--tls-key` — the authed branch still terminates TLS with the configured cert. |
+| `--reality-private-key <hex64>` | 32 bytes hex | The relay's REALITY X25519 private key. **Required** with `--reality-dest` — omitting it is a fatal startup error. |
+| `--reality-short-id <hex16>` | 8 bytes hex | A client auth token. **Repeatable.** A client's sealed ClientHello must carry one of these to authenticate. With none configured, no client can ever authenticate, so **every** connection forwards to `dest`. |
+| `--reality-server-name <name>` | domain string | An allowed SNI for the authenticated check. **Repeatable**; none configured ⇒ accept any SNI. **Must be lowercase with no trailing dot** — the match is exact/case-sensitive (mirrors Xray REALITY semantics), not validated or normalized at startup; a mismatched SNI just forwards the client to `dest` like any other un-authed connection. |
+
+**Authenticated** connections (valid seal, known `short_id`, timestamp
+within the freshness window, and SNI match if any `--reality-server-name`
+is configured) are served the relay tunnel — TLS terminated with the
+`--tls-cert`/`--tls-key` pair, same as the 3c.3 Trojan front. **Everything
+else** — an active prober, a scanner, a plain browser, or any connection
+without valid REALITY auth, *including malformed or oversized TLS
+records* — is transparently spliced to the real upstream `--reality-dest`,
+replaying the bytes already read, so the prober completes a genuine
+handshake with the real site and sees **its own** real cert —
+indistinguishable from connecting to that site directly.
+
+**Status.** REALITY.1 is the *server* side only. The yip client that embeds
+REALITY auth into its ClientHello is milestone **REALITY.2** and has not
+shipped yet — today the authed path is exercised by unit and integration
+tests, but no production `yipd` client authenticates. Until REALITY.2
+ships, the relay behaves as a perfect "front for `<dest>`" server for all
+live traffic: every real connection lacks a valid seal and is forwarded.
 
 ### TLS relay-dial client (`rendezvous=tls://`, anti-DPI milestone 3c.4)
 

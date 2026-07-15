@@ -3,7 +3,8 @@
 //! RelaySend to the destination's TLS channel.
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(test)]
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use yip_rendezvous::{decode, Message, NodeId};
@@ -18,12 +19,14 @@ const CHANNEL_DEPTH: usize = 64;
 /// malformed frame is seen (fail-closed teardown). `prefix` carries any bytes
 /// already read past the first (Register) frame during classification — a
 /// pipelined second frame in the same TLS read must not be lost.
-pub async fn run_tunnel(
-    mut stream: tokio_boring::SslStream<TcpStream>,
+pub async fn run_tunnel<S>(
+    mut stream: tokio_boring::SslStream<S>,
     cfg: Arc<TlsFrontCfg>,
     node: NodeId,
     prefix: Vec<u8>,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_DEPTH);
     // Keep an identity handle so the exit-time removal below can tell
     // "my registration" apart from a newer task's registration for the same
@@ -152,6 +155,7 @@ mod tests {
             decoy: None,
             base: Instant::now(),
             routes: Arc::new(Mutex::new(HashMap::new())),
+            reality: None,
         })
     }
 

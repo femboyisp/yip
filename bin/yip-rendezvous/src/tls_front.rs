@@ -7,8 +7,12 @@ use std::time::{Duration, Instant};
 
 use boring::error::ErrorStack;
 use boring::ssl::{SslAcceptor, SslFiletype, SslMethod};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Semaphore};
 use yip_rendezvous::RendezvousServer;
+
+use crate::reality_io::{read_first_tls_record, FirstRecord, PrefixedStream};
 
 /// Upper bound on how long a TLS handshake may take before we give up on the
 /// connection. Without this, a client that sends a ClientHello and then
@@ -21,6 +25,30 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// front. Bounds the number of tasks/fds a slow-handshake flood can pin,
 /// independent of the per-handshake timeout above (I1).
 const MAX_TLS_CONNS: usize = 1024;
+
+/// Allowed clock skew (in minutes) between a REALITY client's embedded
+/// timestamp and the relay's wall clock (REALITY.1 Task 3). This is the
+/// relay/control tier, not the data plane's rekey-driven clock — wall time
+/// is fine here.
+const REALITY_SKEW_MIN: u64 = 10;
+
+/// REALITY-mode config for the TLS front (REALITY.1 Task 3): when present on
+/// `TlsFrontCfg`, `run_tls_front` peeks the raw `ClientHello` and only hands
+/// authenticated connections to the real BoringSSL acceptor / relay Trojan
+/// front; anything else is transparently spliced to `dest` so an active
+/// prober completes a genuine handshake with the real upstream site and
+/// never observes our certificate.
+pub struct RealityCfg {
+    /// Real upstream to splice un-authed (or unparseable-hello) connections
+    /// to, replaying the buffered `ClientHello` first.
+    pub dest: SocketAddr,
+    /// Relay's REALITY X25519 private key.
+    pub priv_key: [u8; 32],
+    /// Accepted short-ids for the auth seal.
+    pub short_ids: Vec<[u8; 8]>,
+    /// Allowed SNIs for the authenticated check; empty accepts any SNI.
+    pub server_names: Vec<String>,
+}
 
 pub struct TlsFrontCfg {
     pub server: Arc<Mutex<RendezvousServer>>,
@@ -35,6 +63,10 @@ pub struct TlsFrontCfg {
             std::collections::HashMap<yip_rendezvous::NodeId, tokio::sync::mpsc::Sender<Vec<u8>>>,
         >,
     >,
+    /// REALITY anti-probe mode (REALITY.1). `None` keeps the 3c.3 Trojan
+    /// front's behavior byte-identical (terminate TLS immediately, classify
+    /// the first frame, decoy-or-tunnel).
+    pub reality: Option<RealityCfg>,
 }
 
 /// Build a server TLS acceptor from PEM cert-chain + key files, configured to
@@ -81,6 +113,10 @@ pub async fn run_tls_front(
             // Move `permit` into the task so it is released on task end
             // (success, handshake failure, or timeout alike).
             let _permit = permit;
+            if cfg.reality.is_some() {
+                run_reality_conn(tcp, &acceptor, &cfg).await;
+                return;
+            }
             match tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_boring::accept(&acceptor, tcp))
                 .await
             {
@@ -90,6 +126,113 @@ pub async fn run_tls_front(
             }
         });
     }
+}
+
+/// The REALITY branch of the per-connection task (`cfg.reality` is `Some`,
+/// checked by the caller): peek the raw `ClientHello` before terminating
+/// TLS, decide REALITY auth fully before acting, then either hand the
+/// already-read hello + connection to the real acceptor (authed) or
+/// transparently splice to the real upstream `dest`, replaying whatever
+/// bytes were already consumed (un-authed / unparseable / malformed —
+/// same code path, so an active prober cannot distinguish the outcomes).
+///
+/// A stalled read (nothing arrives before `HANDSHAKE_TIMEOUT`) or a
+/// genuinely empty connection (immediate EOF, nothing consumed) still just
+/// drops — there is nothing to replay and a real server would see the same
+/// thing. Everything else that consumed at least one byte, even a malformed
+/// or oversized first record, gets spliced to `dest` rather than dropped: a
+/// real upstream would answer a broken record with its own alert/close, and
+/// silently dropping here would be an observable distinguisher (REALITY.1
+/// Task 3 review I-1).
+async fn run_reality_conn(mut tcp: TcpStream, acceptor: &Arc<SslAcceptor>, cfg: &Arc<TlsFrontCfg>) {
+    let Some(r) = cfg.reality.as_ref() else {
+        return; // unreachable: caller only takes this branch when Some
+    };
+
+    // A stalled read has no buffered bytes to replay — drop, same slowloris
+    // bound the non-REALITY path gets from HANDSHAKE_TIMEOUT.
+    let outcome =
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_first_tls_record(&mut tcp)).await {
+            Ok(outcome) => outcome,
+            Err(_) => return,
+        };
+
+    let rec = match outcome {
+        FirstRecord::Complete(rec) => rec,
+        FirstRecord::Passthrough(bytes) => {
+            splice_to_dest(tcp, r.dest, &bytes).await;
+            return;
+        }
+        FirstRecord::Empty => return,
+    };
+
+    let now_min = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 60)
+        // Wall clock is fine on this relay/control tier; a clock that's
+        // somehow before the epoch just fails REALITY auth (fail-closed),
+        // not a panic.
+        .unwrap_or(0);
+
+    // Decide auth fully before acting: no early return that fires only on a
+    // parse failure ahead of the `dest` connect — that would leak timing
+    // distinguishing "malformed hello" from "well-formed but unauthed".
+    let authed = super::reality::parse_client_hello(rec.get(5..).unwrap_or(&[]))
+        .map(|info| {
+            let sni_ok = r.server_names.is_empty()
+                || info
+                    .sni
+                    .as_deref()
+                    .is_some_and(|s| r.server_names.iter().any(|n| n == s));
+            sni_ok
+                && super::reality::reality_auth_open(
+                    &r.priv_key,
+                    &info,
+                    &r.short_ids,
+                    now_min,
+                    REALITY_SKEW_MIN,
+                )
+        })
+        .unwrap_or(false);
+
+    if authed {
+        let stream = PrefixedStream::new(rec, tcp);
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_boring::accept(acceptor, stream)).await
+        {
+            Ok(Ok(s)) => super::conn::handle_connection(s, Arc::clone(cfg)).await,
+            Ok(Err(e)) => eprintln!("tls-front: reality handshake failed: {e}"),
+            Err(_) => {
+                eprintln!("tls-front: reality handshake timed out after {HANDSHAKE_TIMEOUT:?}")
+            }
+        }
+        return;
+    }
+
+    splice_to_dest(tcp, r.dest, &rec).await;
+}
+
+/// Connect to the real upstream `dest`, replay `replay` (the bytes already
+/// consumed off the client connection) to it, then splice the two sockets
+/// together bidirectionally so `dest` — not us — produces the rest of the
+/// TLS conversation (handshake, alert, whatever a real server would do).
+///
+/// Shared by every REALITY path that must forward rather than drop: an
+/// un-authed-but-well-formed hello and a malformed/oversized/truncated first
+/// record are indistinguishable to an active prober by construction, since
+/// they both end up here.
+async fn splice_to_dest(mut tcp: TcpStream, dest: SocketAddr, replay: &[u8]) {
+    // Bound the connect: `dest` is a REMOTE site, so a black-holed/slow upstream
+    // would otherwise pin this connection's `MAX_TLS_CONNS` permit for the full
+    // OS connect timeout — a flood could exhaust the front, and a REALITY front
+    // that stops answering is itself an availability distinguisher (review M-1).
+    let Ok(Ok(mut up)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(dest)).await
+    else {
+        return;
+    };
+    if !replay.is_empty() && up.write_all(replay).await.is_err() {
+        return;
+    }
+    let _ = tokio::io::copy_bidirectional(&mut tcp, &mut up).await;
 }
 
 /// Write a throwaway self-signed cert/key PEM pair for `relay.test` into
@@ -123,6 +266,7 @@ pub(crate) fn build_test_client_connector() -> boring::ssl::SslConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn build_acceptor_from_pem_succeeds() {
@@ -153,6 +297,7 @@ mod tests {
             decoy: None,
             base: Instant::now(),
             routes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            reality: None,
         });
         tokio::spawn(run_tls_front(listener, acceptor, cfg));
 
@@ -165,5 +310,118 @@ mod tests {
             "client TLS handshake against the listener must complete: {:?}",
             result.err()
         );
+    }
+
+    // ---- REALITY front (in-process, so coverage sees run_reality_conn/splice) ----
+
+    /// A "dest" upstream: accept one connection, drain whatever the front
+    /// replays, then answer a fixed banner. Returns its address.
+    async fn spawn_dest_banner(banner: &'static [u8]) -> SocketAddr {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = l.accept().await {
+                let mut sink = [0u8; 512];
+                let _ = tokio::time::timeout(Duration::from_millis(200), s.read(&mut sink)).await;
+                let _ = s.write_all(banner).await;
+                let _ = s.flush().await;
+            }
+        });
+        addr
+    }
+
+    /// A minimal but well-formed TLS 1.3 ClientHello record (no REALITY auth):
+    /// parses cleanly, so `reality_auth_open` runs and fails (no key_share).
+    fn minimal_client_hello_record() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // legacy_version
+        body.extend_from_slice(&[0xAB; 32]); // random
+        body.push(32);
+        body.extend_from_slice(&[0xCD; 32]); // legacy_session_id
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher_suites: len 2, TLS_AES_128_GCM
+        body.extend_from_slice(&[0x01, 0x00]); // compression: len 1, null
+        body.extend_from_slice(&[0x00, 0x00]); // extensions: len 0
+        let body_len = u16::try_from(body.len()).unwrap();
+        let mut msg = vec![0x01, 0x00]; // client_hello, u24 high byte (body < 64 KiB)
+        msg.extend_from_slice(&body_len.to_be_bytes());
+        msg.extend_from_slice(&body);
+        let rec_len = u16::try_from(msg.len()).unwrap();
+        let mut rec = vec![0x16, 0x03, 0x01];
+        rec.extend_from_slice(&rec_len.to_be_bytes());
+        rec.extend_from_slice(&msg);
+        rec
+    }
+
+    async fn start_reality_front(dest: SocketAddr) -> SocketAddr {
+        let dir = std::env::temp_dir().join(format!("yip-rdv-reality-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key) = write_self_signed(&dir);
+        let acceptor = Arc::new(build_acceptor(&cert, &key).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cfg = Arc::new(TlsFrontCfg {
+            server: Arc::new(Mutex::new(RendezvousServer::new(0))),
+            obf_key: [0u8; 16],
+            decoy: None,
+            base: Instant::now(),
+            routes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            reality: Some(RealityCfg {
+                dest,
+                priv_key: [7u8; 32],
+                short_ids: Vec::new(), // no client can authenticate ⇒ everything forwards
+                server_names: Vec::new(),
+            }),
+        });
+        tokio::spawn(run_tls_front(listener, acceptor, cfg));
+        addr
+    }
+
+    async fn assert_gets_banner(front: SocketAddr, first_bytes: &[u8], banner: &[u8]) {
+        let mut client = tokio::net::TcpStream::connect(front).await.unwrap();
+        client.write_all(first_bytes).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 128];
+            loop {
+                let n = client.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(banner.len()).any(|w| w == banner) {
+                    break;
+                }
+            }
+            buf
+        })
+        .await
+        .expect("banner within timeout");
+        assert!(
+            got.windows(banner.len()).any(|w| w == banner),
+            "expected dest banner spliced back, got {got:?}"
+        );
+    }
+
+    /// Un-authed (well-formed, no seal) ClientHello ⇒ spliced to the real dest.
+    #[tokio::test]
+    async fn reality_unauthed_hello_is_spliced_to_dest() {
+        let dest = spawn_dest_banner(b"HELLO-DEST-UNAUTH").await;
+        let front = start_reality_front(dest).await;
+        assert_gets_banner(front, &minimal_client_hello_record(), b"HELLO-DEST-UNAUTH").await;
+    }
+
+    /// A first record declaring an oversized body (> MAX_RECORD_BODY_LEN) ⇒
+    /// Passthrough ⇒ spliced to dest (not silently dropped — review I-1).
+    #[tokio::test]
+    async fn reality_oversized_record_is_spliced_to_dest() {
+        let dest = spawn_dest_banner(b"HELLO-DEST-OVERSIZE").await;
+        let front = start_reality_front(dest).await;
+        // 5-byte record header claiming a 16385-byte body (> 16384 cap).
+        assert_gets_banner(
+            front,
+            &[0x16, 0x03, 0x01, 0x40, 0x01],
+            b"HELLO-DEST-OVERSIZE",
+        )
+        .await;
     }
 }
