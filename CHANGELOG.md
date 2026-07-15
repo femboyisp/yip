@@ -6,6 +6,19 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- REALITY.2 (anti-DPI): new pure-Rust `yip-utls` crate — a uTLS-equivalent
+  REALITY client that crafts a **byte-faithful latest-Chrome (150) ClientHello**
+  (with our own X25519 `key_share` and a REALITY auth seal in `legacy_session_id`)
+  and completes a **TLS 1.3 handshake to an application-data stream**, entirely in
+  safe Rust (`ring` + `x25519-dalek` + `chacha20poly1305` + `ml-kem`; no Go, no
+  BoringSSL, `#![forbid(unsafe_code)]`). The crafted hello is locked to the real
+  Chrome JA4 (`t13d1516h2_8daaf6152771_806a8c22fdea`) by a CI diff test, permutes
+  its extension order per connection like real Chrome (so JA3 varies), and includes
+  a genuine **X25519MLKEM768 post-quantum hybrid** key — the client completes the
+  real ML-KEM-768 + X25519 hybrid handshake (verified live against Cloudflare, which
+  selects it). The REALITY auth seal/open is now a shared codec used by both this
+  client and the `yip-rendezvous` relay (REALITY.1). Standalone library — wired into
+  yipd in REALITY.4.
 - REALITY-style TLS front for the relay, server side (anti-DPI milestone
   REALITY.1): `yip-rendezvous`'s `--listen-tcp` TLS front gains an opt-in
   full Xray-style REALITY mode — `--reality-dest <host:port>`,
