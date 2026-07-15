@@ -22,6 +22,7 @@ fn crafted_hello_matches_chrome150_ja4_and_permutes_ja3() {
     let params = hello::ClientHelloParams {
         sni: "www.apple.com".into(),
         key_share_x25519_pub: [0x11; 32],
+        key_share_mlkem_ek: vec![0x44; 1184],
         legacy_session_id: [0x22; 32],
         client_random: [0x33; 32],
     };

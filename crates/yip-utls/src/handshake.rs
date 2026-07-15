@@ -19,7 +19,17 @@ use ring::{digest, hmac};
 
 const HANDSHAKE_TYPE_SERVER_HELLO: u8 = 0x02;
 const EXT_KEY_SHARE: u16 = 51;
-const GROUP_X25519: u16 = 0x001d;
+/// `X25519` (RFC 8446 §4.2.7 / RFC 7748).
+pub const GROUP_X25519: u16 = 0x001d;
+/// `X25519MLKEM768` (draft-kwiatkowski-tls-ecdhe-mlkem), the hybrid PQ group
+/// real Chrome 150 sends as its primary key share. Server `key_share` for
+/// this group is `mlkem768_ciphertext(1088) ‖ x25519_public(32)` = 1120
+/// bytes.
+pub const GROUP_X25519MLKEM768: u16 = 4588;
+/// Byte length of an ML-KEM-768 ciphertext (FIPS 203 §7.2).
+const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
+/// Byte length of an X25519 public value (RFC 7748).
+const X25519_LEN: usize = 32;
 const SUITE_AES_128_GCM_SHA256: u16 = 0x1301;
 const SUITE_AES_256_GCM_SHA384: u16 = 0x1302;
 const SUITE_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
@@ -44,9 +54,12 @@ pub enum Error {
     /// The negotiated cipher suite is not one of the three this module
     /// supports (`0x1301`, `0x1302`, `0x1303`).
     UnsupportedCipherSuite,
-    /// The `key_share` extension's group was not `x25519` (`0x001d`).
+    /// The `key_share` extension's group was neither `x25519` (`0x001d`) nor
+    /// `X25519MLKEM768` (`4588`).
     UnsupportedGroup,
-    /// The `key_share` extension's key was not exactly 32 bytes.
+    /// The `key_share` extension's key length did not match its group: 32
+    /// bytes for `x25519`, 1120 bytes (`1088` ML-KEM-768 ciphertext ‖ `32`
+    /// X25519 public) for `X25519MLKEM768`.
     BadKeyShareLength,
     /// The `ServerHello` had no `key_share` extension (51) at all.
     MissingKeyShare,
@@ -59,6 +72,10 @@ pub enum Error {
     /// After stripping trailing zero padding, no content-type byte remained
     /// — an empty or all-zero `TLSInnerPlaintext`.
     EmptyInnerPlaintext,
+    /// ML-KEM-768 decapsulation of the server's `X25519MLKEM768` (`4588`)
+    /// ciphertext failed — a malformed/corrupted ciphertext, or (per FIPS
+    /// 203's implicit-rejection design) a mismatched decapsulation key.
+    MlKemDecapsulation,
     /// The recovered inner content type was none of `handshake` (0x16),
     /// `application_data` (0x17), or `alert` (0x15) — e.g. `change_cipher_spec`
     /// (0x14), which RFC 8446 never protects (it's only ever sent/accepted
@@ -72,12 +89,15 @@ impl core::fmt::Display for Error {
             Error::Truncated => "truncated TLS field",
             Error::WrongHandshakeType => "not a ServerHello handshake message",
             Error::UnsupportedCipherSuite => "unsupported TLS 1.3 cipher suite",
-            Error::UnsupportedGroup => "key_share group is not x25519",
-            Error::BadKeyShareLength => "key_share key is not 32 bytes",
+            Error::UnsupportedGroup => "key_share group is neither x25519 nor X25519MLKEM768",
+            Error::BadKeyShareLength => "key_share key length does not match its group",
             Error::MissingKeyShare => "ServerHello has no key_share extension",
             Error::RecordTooLarge => "record ciphertext+tag length exceeds u16",
             Error::Crypto => "AEAD seal/open failed",
             Error::EmptyInnerPlaintext => "TLSInnerPlaintext has no content-type byte",
+            Error::MlKemDecapsulation => {
+                "ML-KEM-768 decapsulation of the server's ciphertext failed"
+            }
             Error::UnexpectedContentType => "unexpected TLS record content type",
         };
         f.write_str(msg)
@@ -90,12 +110,18 @@ impl std::error::Error for Error {}
 // ServerHello parsing
 // ---------------------------------------------------------------------------
 
-/// The two fields Task 7's key schedule needs out of a `ServerHello`: the
-/// negotiated cipher suite and the server's X25519 key-share.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The fields Task 7/Task 9's key schedule needs out of a `ServerHello`: the
+/// negotiated cipher suite, the negotiated `key_share` group, and the
+/// server's raw key-share bytes for that group — 32 bytes (X25519 public) for
+/// group `29`, or 1120 bytes (`mlkem768_ciphertext(1088) ‖ x25519_public(32)`)
+/// for group `4588`. The caller ([`crate::stream::connect`]) interprets
+/// `server_key_share` according to `group`; this module only validates that
+/// the length matches the group.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerHelloInfo {
     pub suite: u16,
-    pub server_key_share: [u8; 32],
+    pub group: u16,
+    pub server_key_share: Vec<u8>,
 }
 
 /// A bounds-checked, panic-free cursor over a byte slice.
@@ -144,8 +170,8 @@ impl<'a> Reader<'a> {
 /// random(32) ‖ sid_len(1)+sid ‖ cipher_suite(2) ‖ comp(1) ‖ ext_len(2) ‖
 /// exts`. Requires the negotiated suite to be one of the three this crate
 /// supports, and requires exactly one `key_share`(51) extension entry with
-/// group x25519 (`0x001d`) and a 32-byte key. Fail-closed on any malformed
-/// or out-of-scope field.
+/// group x25519 (`0x001d`, 32-byte key) or `X25519MLKEM768` (`4588`,
+/// 1120-byte key). Fail-closed on any malformed or out-of-scope field.
 pub fn parse_server_hello(record_payload: &[u8]) -> Result<ServerHelloInfo, Error> {
     let mut r = Reader::new(record_payload);
 
@@ -189,17 +215,22 @@ pub fn parse_server_hello(record_payload: &[u8]) -> Result<ServerHelloInfo, Erro
             let key_len = usize::from(k.u16()?);
             let key = k.take(key_len)?;
 
-            if group != GROUP_X25519 {
-                return Err(Error::UnsupportedGroup);
+            let expected_len = match group {
+                GROUP_X25519 => X25519_LEN,
+                GROUP_X25519MLKEM768 => MLKEM768_CIPHERTEXT_LEN + X25519_LEN,
+                _ => return Err(Error::UnsupportedGroup),
+            };
+            if key.len() != expected_len {
+                return Err(Error::BadKeyShareLength);
             }
-            let key: [u8; 32] = key.try_into().map_err(|_| Error::BadKeyShareLength)?;
-            server_key_share = Some(key);
+            server_key_share = Some((group, key.to_vec()));
         }
     }
 
-    let server_key_share = server_key_share.ok_or(Error::MissingKeyShare)?;
+    let (group, server_key_share) = server_key_share.ok_or(Error::MissingKeyShare)?;
     Ok(ServerHelloInfo {
         suite,
+        group,
         server_key_share,
     })
 }
@@ -402,8 +433,9 @@ pub struct HandshakeKeys {
     pub client_hs_traffic: Vec<u8>,
 }
 
-/// Derives the TLS 1.3 handshake traffic keys from the ECDHE shared secret
-/// and the transcript hash of `ClientHello ‖ ServerHello`:
+/// Derives the TLS 1.3 handshake traffic keys from the ECDHE (or hybrid
+/// ECDHE+ML-KEM) shared secret and the transcript hash of `ClientHello ‖
+/// ServerHello`:
 ///
 /// ```text
 /// early      = HKDF-Extract(0, 0)
@@ -415,10 +447,16 @@ pub struct HandshakeKeys {
 /// {c,s}_iv   = HKDF-Expand-Label({c,s}_hs, "iv",  "", 12)
 /// ```
 ///
+/// `ecdhe` is 32 bytes for a plain X25519 exchange (group `29`), or 64 bytes
+/// (`mlkem_shared_secret(32) ‖ x25519_shared_secret(32)`) for the
+/// `X25519MLKEM768` hybrid (group `4588`) — `HKDF-Extract` accepts arbitrary-
+/// length IKM (RFC 5869 §2.2), so no other step of the schedule changes
+/// shape.
+///
 /// Every step here uses the `suite`-selected hash (RFC 8446 §7.1) — see
 /// [`digest_algorithm_for_suite`].
 pub fn derive_handshake_keys(
-    ecdhe: &[u8; 32],
+    ecdhe: &[u8],
     transcript_hash_ch_sh: &[u8],
     suite: u16,
 ) -> HandshakeKeys {
@@ -756,9 +794,10 @@ mod tests {
     fn parse_server_hello_reads_rfc8448_vector() {
         let info = parse_server_hello(&hex(RFC8448_SERVER_HELLO_MSG)).expect("valid ServerHello");
         assert_eq!(info.suite, SUITE_AES_128_GCM_SHA256);
+        assert_eq!(info.group, GROUP_X25519);
         assert_eq!(
             info.server_key_share,
-            hex32("c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f")
+            hex32("c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f").to_vec()
         );
     }
 
@@ -920,6 +959,33 @@ mod tests {
             "the same ECDHE input must derive a DIFFERENT handshake_secret under a \
              different suite's hash — same value here would mean `suite` isn't \
              actually selecting SHA-384"
+        );
+    }
+
+    /// `derive_handshake_keys` must also accept a 64-byte IKM — the
+    /// `X25519MLKEM768` hybrid shared secret (`mlkem_ss(32) ‖ x25519_ss(32)`,
+    /// REALITY.2 Task 9) — and produce correctly-sized, and DIFFERENT, keys
+    /// from what the same suite derives from a 32-byte plain-X25519 IKM.
+    /// `HKDF-Extract`'s IKM has no fixed length requirement (RFC 5869 §2.2),
+    /// so this is purely a shape/non-collision check, not a published KAT (no
+    /// hybrid vector exists yet the way RFC 8448 covers plain X25519).
+    #[test]
+    fn derive_handshake_keys_accepts_64_byte_hybrid_ecdhe() {
+        let hybrid_ecdhe = [0x22u8; 64];
+        let plain_ecdhe = [0x22u8; 32];
+        let transcript = transcript_hash(b"some transcript", SUITE_AES_128_GCM_SHA256);
+
+        let keys_hybrid =
+            derive_handshake_keys(&hybrid_ecdhe, &transcript, SUITE_AES_128_GCM_SHA256);
+        let keys_plain = derive_handshake_keys(&plain_ecdhe, &transcript, SUITE_AES_128_GCM_SHA256);
+
+        assert_eq!(keys_hybrid.handshake_secret.len(), 32);
+        assert_eq!(keys_hybrid.client_key.len(), 16);
+        assert_eq!(keys_hybrid.server_key.len(), 16);
+        assert_ne!(
+            keys_hybrid.handshake_secret, keys_plain.handshake_secret,
+            "a 64-byte hybrid IKM must derive a DIFFERENT handshake_secret than the \
+             32-byte prefix alone — proving all 64 bytes are actually consumed"
         );
     }
 

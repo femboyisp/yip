@@ -21,14 +21,21 @@ use crate::auth;
 use crate::error::Error;
 use crate::handshake::{
     self, derive_application_keys, derive_handshake_keys, finished_verify_data, parse_server_hello,
-    record_open, record_open_typed, record_seal, transcript_hash, HandshakeKeys,
+    record_open, record_open_typed, record_seal, transcript_hash, HandshakeKeys, GROUP_X25519,
+    GROUP_X25519MLKEM768,
 };
 use crate::hello::{self, ClientHelloParams, RandomSource};
+use ml_kem::kem::Decapsulate;
+use ml_kem::{EncodedSizeUser, KemCore, MlKem768};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+/// Byte length of an ML-KEM-768 ciphertext (FIPS 203 §7.2) — the length of
+/// the leading portion of a group-`4588` server `key_share`.
+const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
 
 /// TLS record-layer content types (RFC 8446 §5.1).
 const CONTENT_TYPE_CHANGE_CIPHER_SPEC: u8 = 0x14;
@@ -112,6 +119,60 @@ impl RandomSource for OsRng {
     }
 }
 
+/// The same OS-CSPRNG-backed, latched-error `getrandom` bridge as [`OsRng`],
+/// but implementing `rand_core::{RngCore, CryptoRng}` instead of
+/// [`RandomSource`] — the trait bound `ml_kem::MlKem768::generate` needs
+/// (`rand_core::CryptoRngCore`, blanket-implemented for any
+/// `RngCore + CryptoRng`). `rand_core::RngCore::fill_bytes` has no `Result`
+/// return, so a `getrandom` failure is latched the same way `OsRng` latches
+/// one, and [`MlKemRng::into_result`] surfaces it to the caller after
+/// `generate` returns (which, on a latched failure, still returns *some*
+/// keypair built from bytes that silently stayed zero — [`connect`] discards
+/// it and bails out via `into_result` before ever using it).
+#[derive(Default)]
+struct MlKemRng {
+    error: Option<getrandom::Error>,
+}
+
+impl MlKemRng {
+    fn into_result(self) -> Result<(), Error> {
+        match self.error {
+            Some(e) => Err(Error::Rng(e)),
+            None => Ok(()),
+        }
+    }
+}
+
+impl rand_core::RngCore for MlKemRng {
+    fn next_u32(&mut self) -> u32 {
+        let mut buf = [0u8; 4];
+        self.fill_bytes(&mut buf);
+        u32::from_ne_bytes(buf)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut buf = [0u8; 8];
+        self.fill_bytes(&mut buf);
+        u64::from_ne_bytes(buf)
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        if self.error.is_some() {
+            return;
+        }
+        if let Err(e) = getrandom::getrandom(dest) {
+            self.error = Some(e);
+        }
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
+}
+
+impl rand_core::CryptoRng for MlKemRng {}
+
 /// Builds a 5-byte TLS record header for a `content_type`/`legacy_version`
 /// record of plaintext-or-ciphertext length `len`.
 fn record_header(
@@ -193,6 +254,18 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
     let secret = x25519_dalek::StaticSecret::from(eph_priv);
     let eph_pub: [u8; 32] = x25519_dalek::PublicKey::from(&secret).to_bytes();
 
+    // A genuine ML-KEM-768 keypair (REALITY.2 Task 9), generated fresh per
+    // connection like the X25519 ephemeral key above. Real Chrome sends
+    // `X25519MLKEM768` (group 4588) as its PRIMARY key_share, and real
+    // ML-KEM-strict servers (Cloudflare, Google) validate the encapsulation
+    // key's canonical encoding — only a genuine key survives that check (see
+    // `hello::key_share_body`'s doc comment). `mlkem_dk` is kept to complete
+    // the hybrid exchange if the server selects group 4588 below; `mlkem_ek`
+    // is sent as-is in the ClientHello.
+    let mut mlkem_rng = MlKemRng::default();
+    let (mlkem_dk, mlkem_ek) = MlKem768::generate(&mut mlkem_rng);
+    mlkem_rng.into_result()?;
+
     let mut client_random = [0u8; 32];
     getrandom::getrandom(&mut client_random)?;
 
@@ -213,6 +286,7 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
     let params = ClientHelloParams {
         sni: sni.to_string(),
         key_share_x25519_pub: eph_pub,
+        key_share_mlkem_ek: mlkem_ek.as_bytes().to_vec(),
         legacy_session_id,
         client_random,
     };
@@ -236,17 +310,73 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
         ));
     }
     let server_hello_info = parse_server_hello(&sh_msg)?;
+    eprintln!(
+        "[yip-utls] server selected key_share group {} ({})",
+        server_hello_info.group,
+        if server_hello_info.group == GROUP_X25519MLKEM768 {
+            "X25519MLKEM768 hybrid"
+        } else {
+            "plain X25519"
+        }
+    );
 
     let mut ch_sh_transcript = Vec::with_capacity(hello_msg.len() + sh_msg.len());
     ch_sh_transcript.extend_from_slice(&hello_msg);
     ch_sh_transcript.extend_from_slice(&sh_msg);
     let transcript_ch_sh = transcript_hash(&ch_sh_transcript, server_hello_info.suite);
 
-    let ecdhe = secret
-        .diffie_hellman(&x25519_dalek::PublicKey::from(
-            server_hello_info.server_key_share,
-        ))
-        .to_bytes();
+    // The (possibly hybrid) ECDHE shared secret fed to the TLS 1.3 key
+    // schedule (RFC 8446 §7.1's "(EC)DHE" input, generalized to `&[u8]` —
+    // see `derive_handshake_keys`'s doc comment). Group 29 (plain X25519):
+    // 32 bytes, the X25519 ECDH output alone. Group 4588
+    // (X25519MLKEM768): 64 bytes, `mlkem_shared_secret(32) ‖
+    // x25519_shared_secret(32)` — ML-KEM first, matching the client
+    // `key_share` entry's own `mlkem_ek ‖ x25519_pub` byte order (see
+    // `hello::key_share_body`), per
+    // draft-kwiatkowski-tls-ecdhe-mlkem's hybrid combiner. The server's
+    // group-4588 key_share is `mlkem768_ciphertext(1088) ‖
+    // x25519_public(32)` — `parse_server_hello` already validated that
+    // exact length for this group.
+    let ecdhe: Vec<u8> = match server_hello_info.group {
+        GROUP_X25519MLKEM768 => {
+            let (ct_bytes, server_x25519_pub) = server_hello_info
+                .server_key_share
+                .split_at(MLKEM768_CIPHERTEXT_LEN);
+            let ciphertext = ct_bytes
+                .try_into()
+                .map_err(|_| handshake::Error::MlKemDecapsulation)?;
+            let mlkem_ss = mlkem_dk
+                .decapsulate(&ciphertext)
+                .map_err(|()| handshake::Error::MlKemDecapsulation)?;
+            let server_x25519_pub: [u8; 32] = server_x25519_pub
+                .try_into()
+                .map_err(|_| handshake::Error::BadKeyShareLength)?;
+            let x25519_ss = secret
+                .diffie_hellman(&x25519_dalek::PublicKey::from(server_x25519_pub))
+                .to_bytes();
+
+            let mut combined = Vec::with_capacity(64);
+            combined.extend_from_slice(&mlkem_ss);
+            combined.extend_from_slice(&x25519_ss);
+            combined
+        }
+        GROUP_X25519 => {
+            let server_x25519_pub: [u8; 32] = server_hello_info
+                .server_key_share
+                .as_slice()
+                .try_into()
+                .map_err(|_| handshake::Error::BadKeyShareLength)?;
+            secret
+                .diffie_hellman(&x25519_dalek::PublicKey::from(server_x25519_pub))
+                .to_bytes()
+                .to_vec()
+        }
+        _ => {
+            return Err(Error::Protocol(
+                "parse_server_hello returned an unexpected key_share group",
+            ))
+        }
+    };
     let hk: HandshakeKeys =
         derive_handshake_keys(&ecdhe, &transcript_ch_sh, server_hello_info.suite);
 
