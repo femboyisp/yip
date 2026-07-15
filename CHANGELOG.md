@@ -6,6 +6,27 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- REALITY-style TLS front for the relay, server side (anti-DPI milestone
+  REALITY.1): `yip-rendezvous`'s `--listen-tcp` TLS front gains an opt-in
+  full Xray-style REALITY mode — `--reality-dest <host:port>`,
+  `--reality-private-key <hex64>`, `--reality-short-id <hex16>` (repeatable),
+  `--reality-server-name <name>` (repeatable). The relay reads the raw TLS
+  `ClientHello` off the socket *before* terminating TLS and checks for a
+  REALITY auth seal — an X25519-ECDH-keyed ChaCha20-Poly1305 seal carried in
+  `legacy_session_id`, validated against the relay's REALITY private key, the
+  configured `short_id`s, and a ±10-minute timestamp freshness window.
+  Authenticated connections are served the relay tunnel (TLS terminated with
+  the configured cert, same as the 3c.3 front below); everything else — an
+  active prober, a scanner, a plain browser, or any connection without valid
+  auth, including malformed/oversized TLS records — is **transparently
+  spliced to a real upstream site** (`--reality-dest`, e.g.
+  `www.apple.com:443`), replaying the bytes already read, so the prober
+  completes a genuine handshake with the real site and sees *its* real cert.
+  `--reality-dest` **supersedes `--decoy`** (the 3c.3 self-hosted-backend
+  Trojan model) when both are given. **Server side only:** the yip client
+  that embeds REALITY auth into its ClientHello is milestone REALITY.2, not
+  yet shipped — until it lands, no production client authenticates and the
+  relay forwards every live connection to `dest`.
 - Port plausibility (anti-DPI 3d, R8/#45): `listen` is now optional and
   auto-defaults every transport to 443 (443/TCP for `tls`, 443/UDP for
   `quic`/`raw`) — the single least-suspicious port — falling back to 8443

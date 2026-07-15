@@ -6,6 +6,17 @@
 **Approach:** Option 3 (pure-Rust uTLS-equivalent client) — chosen. No Go/cgo, no
 BoringSSL fork; `forbid(unsafe_code)` preserved outside `yip-io`/`yip-device`.
 
+## REALITY.1 status: shipped
+
+The server-side raw-`ClientHello`-parse + REALITY auth check + transparent
+`dest` forwarding described in "REALITY.1" below is implemented and tested
+on `feat/reality-tls-design` (`bin/yip-rendezvous/src/reality.rs`,
+`reality_io.rs`, `tls_front.rs`; the `--reality-*` CLI flags in `main.rs`).
+See [`docs/superpowers/plans/2026-07-15-reality-1-server-forwarding.md`](../plans/2026-07-15-reality-1-server-forwarding.md)
+for the REALITY.1 task plan.
+REALITY.2 (the client that authenticates against this front) is not yet
+built — see the "Interim" note under REALITY.1 below, which still holds.
+
 ## Goal
 
 Give the yip **relay path** true Xray-style REALITY: an active prober who connects

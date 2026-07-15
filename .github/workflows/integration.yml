@@ -360,6 +360,15 @@ jobs:
             echo "::error::an active probe was not served the decoy, or the relay hard-closed an idle connection at its classification timeout — 3c.3 probe-resistance regression"
             exit 1
           fi
+          # FOLLOW-UP (REALITY.3/CI, not yet built): the oracle above still
+          # exercises the 3c.3 Trojan `--decoy` model (own self-signed cert +
+          # self-hosted decoy backend). REALITY.1 (server-side --reality-dest
+          # splice, see docs/configuration.md's "REALITY-style TLS front"
+          # section) needs its own active-probe oracle: dial the relay with
+          # --reality-dest set and NO valid REALITY auth (no key, or a
+          # wrong/absent short_id) and assert the TLS cert returned is
+          # dest's genuine cert, never the relay's own — proving the splice,
+          # not just a decoy-shaped reply. Track under REALITY.3.
 
       - name: Run the relay-over-TLS money test under sudo
         # The 3c.4 headline money test: two UDP-blocked yipd peers tunnel to
