@@ -20,6 +20,12 @@ All notable changes to this project are documented here, following
   `yip-rendezvous`** (already required for `yipd` since 3c.2). The `yipd`
   client that dials this front (`rendezvous = "tls://host:443"`) is milestone
   3c.4, not shipped here.
+- TLS relay-dial client (`rendezvous = tls://host:443`, anti-DPI 3c.4): a
+  `yipd` node reaches the 3c.3 relay over a persistent browser-parrot TLS
+  connection (a dedicated thread; the data plane stays tokio-free) and relays
+  the unchanged inner protocol through it — so two UDP-blocked peers can
+  tunnel to each other. Requires `obf_psk`; poll-driver-only; straight-to-relay
+  (no Direct/UDP-punch).
 - TLS-over-TCP mimicry transport (`transport=tls`, anti-DPI milestone 3c.2):
   carries the **unchanged** inner yip protocol (Noise-IK, FEC, AEAD) inside a
   real TLS 1.3 connection over TCP/443 with a **browser-parrot ClientHello**

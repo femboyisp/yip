@@ -36,6 +36,15 @@ pub enum TransportMode {
 /// handshake doesn't stand out with a blank or bespoke SNI.
 pub const DEFAULT_TLS_SNI: &str = "www.apple.com";
 
+/// Where and how to reach the rendezvous+relay server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rendezvous {
+    /// Plain UDP rendezvous (2b), `rendezvous=<ip:port>`.
+    Udp(SocketAddr),
+    /// TLS relay-dial (3c.4), `rendezvous=tls://host:port`.
+    Tls { host: String, port: u16 },
+}
+
 /// Configuration for a single remote peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerConfig {
@@ -62,10 +71,11 @@ pub struct Config {
     pub device: String,
     /// Tunnel mode selected from `device_kind=tun|tap` (`tun` by default).
     pub device_kind: TunnelMode,
-    /// Configured rendezvous+relay server, if any (`rendezvous=<IP:port>`).
-    /// Enables lazy Direct→Punch→Relay peer bring-up in `PeerManager` via
-    /// `ConfiguredServerRendezvous`.
-    pub rendezvous: Option<SocketAddr>,
+    /// Configured rendezvous+relay server, if any (`rendezvous=<IP:port>` or
+    /// `rendezvous=tls://host:port`). Enables lazy Direct→Punch→Relay peer
+    /// bring-up in `PeerManager` via `ConfiguredServerRendezvous` (UDP form)
+    /// or the TLS relay-dial client (3c.4, TLS form).
+    pub rendezvous: Option<Rendezvous>,
     /// Mesh CA public key(s) trusted to sign member certs (repeatable
     /// `ca_public=<hex64>`). Empty when mesh mode is not configured.
     pub ca_public: Vec<[u8; 32]>,
@@ -200,6 +210,46 @@ fn hex_nibble(b: u8) -> io::Result<u8> {
     }
 }
 
+// ── tls:// rendezvous host:port split ───────────────────────────────────────
+
+/// Split a `tls://`-stripped rendezvous value into `(host, port_str)`.
+///
+/// The common case — a DNS hostname (the intended SNI-decoy model) or a bare
+/// IPv4 literal — has exactly one `:`, so `rsplit_once(':')` alone handles
+/// it. A bracketed IPv6 literal (`tls://[::1]:443`, `tls://[2001:db8::1]:443`)
+/// has multiple `:` characters *inside* the address, which `rsplit_once(':')`
+/// would mis-split on the address's own last colon rather than the one
+/// separating it from the port (3c.4 final review FIX 4) — so a leading `[`
+/// is handled as its own case, splitting on the closing `]` instead. The
+/// returned `host` has brackets stripped: `to_socket_addrs`'s `(&str, u16)`
+/// impl parses a bare IPv6 literal like `::1` directly (no brackets needed),
+/// so keeping the brackets in `host` would make every later resolution fail.
+fn parse_tls_rendezvous_host_port(rest: &str) -> io::Result<(String, &str)> {
+    if let Some(after_bracket) = rest.strip_prefix('[') {
+        let (host, tail) = after_bracket.split_once(']').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tls:// rendezvous has an unterminated IPv6 literal (missing ']')",
+            )
+        })?;
+        let port_str = tail.strip_prefix(':').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tls:// rendezvous IPv6 literal must be followed by :port",
+            )
+        })?;
+        Ok((host.to_owned(), port_str))
+    } else {
+        let (host, port_str) = rest.rsplit_once(':').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tls:// rendezvous must be tls://host:port",
+            )
+        })?;
+        Ok((host.to_owned(), port_str))
+    }
+}
+
 // ── missing key helper ────────────────────────────────────────────────────────
 
 fn missing(key: &str) -> io::Error {
@@ -255,7 +305,7 @@ impl Config {
         let mut listen: Option<SocketAddr> = None;
         let mut device: Option<String> = None;
         let mut device_kind = TunnelMode::default();
-        let mut rendezvous: Option<SocketAddr> = None;
+        let mut rendezvous: Option<Rendezvous> = None;
         let mut ca_public: Vec<[u8; 32]> = Vec::new();
         let mut cert: Option<Cert> = None;
         let mut roots: Option<RootSet> = None;
@@ -314,10 +364,17 @@ impl Config {
                 "device" => device = Some(val.to_owned()),
                 "device_kind" => device_kind = TunnelMode::parse_device_kind(val)?,
                 "rendezvous" => {
-                    rendezvous =
-                        Some(val.parse::<SocketAddr>().map_err(|e| {
+                    rendezvous = Some(if let Some(rest) = val.strip_prefix("tls://") {
+                        let (host, port_str) = parse_tls_rendezvous_host_port(rest)?;
+                        let port = port_str.parse::<u16>().map_err(|e| {
+                            io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                        })?;
+                        Rendezvous::Tls { host, port }
+                    } else {
+                        Rendezvous::Udp(val.parse::<SocketAddr>().map_err(|e| {
                             io::Error::new(io::ErrorKind::InvalidData, e.to_string())
                         })?)
+                    });
                 }
                 "ca_public" => ca_public.push(hex_to_32(val)?),
                 "cert" => cert = Some(load_cert_file(val)?),
@@ -429,6 +486,18 @@ impl Config {
                      (QUIC provides its own wire obfuscation)",
                 ),
             });
+        }
+
+        // A TLS rendezvous dial is only as unobservable as the obfuscation
+        // wrapped around it — `obf_psk` is the relay's discriminator (how it
+        // tells our TLS-mimicry handshake apart from every other TLS
+        // connection it terminates), so a TLS rendezvous with no `obf_psk`
+        // is a misconfiguration, not a degraded-but-working mode.
+        if matches!(rendezvous, Some(Rendezvous::Tls { .. })) && obf_psk.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "rendezvous=tls:// requires obf_psk (it is the relay's discriminator)",
+            ));
         }
 
         Ok(Config {
@@ -691,7 +760,10 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
                     listen=0.0.0.0:51820\ndevice=yip0\nrendezvous=203.0.113.1:51821\n\
                     [peer]\npublic_key=00000000000000000000000000000000000000000000000000000000000000b1\n";
         let cfg = Config::parse(text).expect("parses");
-        assert_eq!(cfg.rendezvous, Some("203.0.113.1:51821".parse().unwrap()));
+        assert_eq!(
+            cfg.rendezvous,
+            Some(Rendezvous::Udp("203.0.113.1:51821".parse().unwrap()))
+        );
         assert_eq!(cfg.peers.len(), 1);
         assert_eq!(
             cfg.peers[0].endpoint, None,
@@ -711,6 +783,85 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
             cfg.peers[0].endpoint,
             Some("10.0.0.2:51820".parse().unwrap())
         );
+    }
+
+    // ── tls:// rendezvous (3c.4 Task 1) ─────────────────────────────────
+
+    #[test]
+    fn parses_tls_rendezvous_scheme() {
+        let cfg = Config::parse(
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             listen=0.0.0.0:51820\ndevice=yip0\n\
+             obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
+             rendezvous=tls://relay.example.com:443\n\
+             [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            cfg.rendezvous,
+            Some(Rendezvous::Tls { ref host, port }) if host == "relay.example.com" && port == 443
+        ));
+    }
+
+    // 3c.4 final review FIX 4: `tls://[ipv6]:port` must parse, with brackets
+    // stripped from `host` (so downstream `to_socket_addrs` resolution
+    // doesn't choke on them — `Ipv6Addr::from_str` wants a bare literal).
+    #[test]
+    fn parses_tls_rendezvous_ipv6_literal() {
+        let cfg = Config::parse(
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             listen=0.0.0.0:51820\ndevice=yip0\n\
+             obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
+             rendezvous=tls://[2001:db8::1]:443\n\
+             [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            cfg.rendezvous,
+            Some(Rendezvous::Tls { ref host, port }) if host == "2001:db8::1" && port == 443
+        ));
+    }
+
+    #[test]
+    fn tls_rendezvous_ipv6_literal_missing_close_bracket_is_error() {
+        let err = Config::parse(
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             listen=0.0.0.0:51820\ndevice=yip0\n\
+             obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
+             rendezvous=tls://[2001:db8::1:443\n\
+             [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn tls_rendezvous_without_obf_psk_is_error() {
+        let err = Config::parse(
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             listen=0.0.0.0:51820\ndevice=yip0\n\
+             rendezvous=tls://relay.example.com:443\n\
+             [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn parses_udp_rendezvous_unchanged() {
+        let cfg = Config::parse(
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             listen=0.0.0.0:51820\ndevice=yip0\n\
+             rendezvous=203.0.113.9:51821\n\
+             [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
+        )
+        .unwrap();
+        assert!(matches!(cfg.rendezvous, Some(Rendezvous::Udp(_))));
     }
 
     // ── mesh config (2c/Task 5) ────────────────────────────────────────

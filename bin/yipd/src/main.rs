@@ -13,6 +13,7 @@ mod mode;
 mod path;
 mod peer_manager;
 mod quic;
+mod relay_client;
 mod rendezvous;
 mod tls;
 mod tunnel;

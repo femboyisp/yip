@@ -32,7 +32,10 @@ pub enum RdvEvent {
 /// Not yet consumed outside tests — Task 6 wires a `Rendezvous` impl into
 /// `PeerManager`.
 pub trait Rendezvous {
-    fn register(&mut self, node: NodeId) -> EgressDatagram;
+    /// Emit a registration datagram, or `None` if registration is handled
+    /// elsewhere (the 3c.4 relay thread sends `Register` itself). UDP impls
+    /// return `Some`.
+    fn register(&mut self, node: NodeId) -> Option<EgressDatagram>;
     fn lookup(&mut self, node: NodeId) -> EgressDatagram;
     fn relay(&mut self, src: NodeId, dst: NodeId, payload: &[u8]) -> EgressDatagram;
     fn parse(&self, dg: &[u8]) -> RdvEvent;
@@ -64,9 +67,9 @@ impl ConfiguredServerRendezvous {
 }
 
 impl Rendezvous for ConfiguredServerRendezvous {
-    fn register(&mut self, node: NodeId) -> EgressDatagram {
+    fn register(&mut self, node: NodeId) -> Option<EgressDatagram> {
         // counter bumped per-registration in 3c.4; 0 is accepted as first-seen
-        self.to_server(&Message::Register { node, counter: 0 })
+        Some(self.to_server(&Message::Register { node, counter: 0 }))
     }
     fn lookup(&mut self, node: NodeId) -> EgressDatagram {
         self.to_server(&Message::Lookup { node })
@@ -98,6 +101,53 @@ impl Rendezvous for ConfiguredServerRendezvous {
     }
 }
 
+/// The 3c.4 relay-dial client's `Rendezvous` view: `Register` is owned by the
+/// relay thread (so `register` is `None`), and `relay`/`parse` behave exactly
+/// like the UDP impl but addressed at the relay's routing-key `SocketAddr`.
+pub struct TlsRelayRendezvous {
+    relay_addr: SocketAddr,
+}
+
+impl TlsRelayRendezvous {
+    pub fn new(relay_addr: SocketAddr) -> Self {
+        Self { relay_addr }
+    }
+    fn to_server(&self, msg: &Message) -> EgressDatagram {
+        let mut bytes = Vec::new();
+        encode(msg, &mut bytes);
+        EgressDatagram {
+            fate: 0,
+            dst: self.relay_addr,
+            bytes,
+        }
+    }
+}
+
+impl Rendezvous for TlsRelayRendezvous {
+    fn register(&mut self, _node: NodeId) -> Option<EgressDatagram> {
+        None // the relay thread owns Register (first-on-connect + keepalive)
+    }
+    fn lookup(&mut self, _node: NodeId) -> EgressDatagram {
+        // Never called on the straight-to-relay path (no hole-punch). Kept a
+        // harmless server-addressed no-op rather than `unreachable!` so a stray
+        // call can never panic the data plane.
+        self.to_server(&Message::Lookup { node: [0u8; 16] })
+    }
+    fn relay(&mut self, src: NodeId, dst: NodeId, payload: &[u8]) -> EgressDatagram {
+        self.to_server(&Message::RelaySend {
+            src,
+            dst,
+            payload: payload.to_vec(),
+        })
+    }
+    fn parse(&self, dg: &[u8]) -> RdvEvent {
+        ConfiguredServerRendezvous::new(self.relay_addr).parse(dg)
+    }
+    fn server_addr(&self) -> SocketAddr {
+        self.relay_addr
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,7 +161,7 @@ mod tests {
     fn register_targets_server_with_our_node_id() {
         let mut r = ConfiguredServerRendezvous::new(server());
         let me = node_id(&[1u8; 32]);
-        let dg = r.register(me);
+        let dg = r.register(me).expect("UDP register is always Some");
         assert_eq!(dg.dst, server());
         assert_eq!(
             yip_rendezvous::decode(&dg.bytes),
@@ -196,5 +246,18 @@ mod tests {
             matches!(r.parse(&buf), RdvEvent::Relayed { src, payload } if src == n && payload == vec![1, 2])
         );
         assert!(matches!(r.parse(&[0xFF]), RdvEvent::Ignored));
+    }
+
+    #[test]
+    fn tls_relay_register_is_none_but_relay_works() {
+        let addr: SocketAddr = "203.0.113.9:443".parse().unwrap();
+        let mut r = TlsRelayRendezvous::new(addr);
+        let n = node_id(&[7u8; 32]);
+        assert!(
+            r.register(n).is_none(),
+            "thread owns Register on the TLS path"
+        );
+        let dg = r.relay(node_id(&[1u8; 32]), n, b"payload");
+        assert_eq!(dg.dst, addr, "relay egress is addressed to the relay");
     }
 }

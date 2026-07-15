@@ -62,6 +62,20 @@ impl RendezvousServer {
         self.forwarded
     }
 
+    /// Record one relayed hop that happened OUTSIDE `handle`'s own
+    /// `RelaySend` match arm — specifically, the TLS-tunnel relay path
+    /// (`bin/yip-rendezvous/src/conn_tunnel.rs`'s `route`), which forwards
+    /// `RelaySend`->`RelayDeliver` directly over its own per-connection
+    /// `mpsc` channels and never calls `handle` at all. Without this, the
+    /// TLS-relay path would be invisible to `forwarded_count` even while
+    /// genuinely carrying traffic, since `forwarded` would only ever reflect
+    /// the UDP-facing relay half. Same best-effort semantics as the UDP
+    /// path's own increment: counted when a live destination route was
+    /// found and delivery was attempted, not gated on confirmed receipt.
+    pub fn record_relay_forward(&mut self) {
+        self.forwarded += 1;
+    }
+
     /// True iff `node` has a live (unexpired) registration. Used by the TLS
     /// front to distinguish an upgraded tunnel client from a decoy request.
     pub fn is_registered(&self, node: &NodeId, now_ms: u64) -> bool {

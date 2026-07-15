@@ -895,3 +895,66 @@ fn flowshape_not_obviously_constant() {
          reaching the wire as expected)"
     );
 }
+
+#[test]
+fn relay_tls_tunnel_ping() {
+    // The 3c.4 headline money test: two UDP-blocked yipd peers tunnel to
+    // each other THROUGH the 3c.3 TLS relay — `rendezvous=tls://host:port`
+    // + `obf_psk` dials the relay over browser-parrot TLS (relay_client.rs),
+    // registers, and the relay blindly forwards ALL peer traffic
+    // (RelaySend/RelayDeliver), carrying the unchanged inner Noise/FEC/AEAD
+    // payload. See run-netns-relay-tls.sh for the full topology and
+    // assertion set (ping success, relay-forwarded>0, TCP-carried with zero
+    // UDP crossing the peer<->relay link).
+    //
+    // Requires root: netns creation + TUN devices + yip-rendezvous + tcpdump.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP relay_tls_tunnel_ping: needs root (run under sudo in CI)");
+        return;
+    }
+    // Use the release yipd binary: the inner Noise/FEC handshake+dataplane
+    // needs release for reasonable speed within the ping test's timeout
+    // budget, same reasoning as `arq_recovers_bulk_loss`.
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let workspace_root = std::path::Path::new(manifest_dir)
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root two levels up from CARGO_MANIFEST_DIR");
+    let yipd_release = workspace_root.join("target/release/yipd");
+    if !yipd_release.exists() {
+        eprintln!(
+            "SKIP relay_tls_tunnel_ping: release yipd not found at {}; \
+             run `cargo build --release -p yipd` first",
+            yipd_release.display()
+        );
+        return;
+    }
+    let rdv = yip_rendezvous_bin();
+    if !rdv.exists() {
+        eprintln!(
+            "SKIP relay_tls_tunnel_ping: yip-rendezvous binary not found at {}; \
+             run `cargo build -p yip-rendezvous-bin` first",
+            rdv.display()
+        );
+        return;
+    }
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run-netns-relay-tls.sh");
+    let status = Command::new("bash")
+        .arg(script)
+        .arg(&yipd_release)
+        .arg(&rdv)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "relay-over-TLS netns money test failed (ping did not succeed over the TLS relay, \
+         relay-forwarded stayed 0, or the peer<->relay link was not TCP-only)"
+    );
+}

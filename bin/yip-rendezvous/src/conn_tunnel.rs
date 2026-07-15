@@ -120,6 +120,12 @@ async fn route(msg: Message, cfg: &TlsFrontCfg) {
             // is a mutual deadlock (I2, reproduced in review) — `try_send`
             // is drop-on-full/closed and can never wedge.
             let _ = tx.try_send(frame);
+            // Count this hop on the SAME `forwarded` counter the UDP path's
+            // `RendezvousServer::handle` increments (`cfg.server` is the
+            // identical `Arc<Mutex<RendezvousServer>>` main.rs hands to both
+            // fronts) — see `record_relay_forward`'s doc comment for why
+            // this is needed: this path never calls `handle` at all.
+            cfg.server.lock().await.record_relay_forward();
         }
     }
     // Register refreshes and other control messages on an established tunnel
@@ -187,6 +193,17 @@ mod tests {
                 src: a,
                 payload: b"hello".to_vec(),
             })
+        );
+        // The TLS-tunnel relay path must be visible on the SAME shared
+        // counter the UDP path's `RendezvousServer::handle` increments —
+        // `route` never calls `handle` at all, so without an explicit
+        // `record_relay_forward` call this would silently stay 0 forever
+        // (the bug the netns money test caught: `relay-forwarded=0` even
+        // while a TLS-relayed ping succeeded).
+        assert_eq!(
+            cfg.server.lock().await.forwarded_count(),
+            1,
+            "a TLS-tunnel relay hop must be counted on the shared forwarded_count"
         );
     }
 
