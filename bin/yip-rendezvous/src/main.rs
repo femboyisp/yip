@@ -5,6 +5,7 @@
 
 mod conn;
 mod conn_tunnel;
+mod reality;
 mod tls_front;
 
 use std::net::SocketAddr;
