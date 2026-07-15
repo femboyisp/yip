@@ -331,6 +331,13 @@ async fn main() -> std::io::Result<()> {
         None => None,
     };
 
+    // REALITY runs on the TCP front (the authed branch terminates TLS there), so
+    // `--reality-dest` without `--listen-tcp` would be silently ignored — reject it.
+    if reality_cfg.is_some() && listen_tcp.is_none() {
+        eprintln!("--reality-dest requires --listen-tcp (REALITY runs on the TCP front)");
+        std::process::exit(2);
+    }
+
     // Millisecond clock from a monotonic base (Instant), so `now_ms` never goes
     // backwards and needs no wall clock.
     let base = Instant::now();
