@@ -11,10 +11,20 @@
 #![allow(dead_code)]
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use crate::mode::TunnelMode;
 use yip_membership::{Cert, RootSet};
+
+/// The plausible default listen port (looks like HTTPS to DPI port-matching)
+/// used when `listen` is absent or gives only an IP with no port — anti-DPI
+/// R8 (#45).
+pub(crate) const DEFAULT_LISTEN_PORT: u16 = 443;
+
+/// Fallback listen port applied at bind time (see `tunnel.rs`) if binding
+/// [`DEFAULT_LISTEN_PORT`] fails (e.g. unprivileged process, port in use by a
+/// real HTTPS server) — Task 2.
+pub(crate) const FALLBACK_LISTEN_PORT: u16 = 8443;
 
 /// Wire transport selected via `transport=quic|tls|raw|udp` (absent ⇒
 /// `RawUdp`).
@@ -45,6 +55,21 @@ pub enum Rendezvous {
     Tls { host: String, port: u16 },
 }
 
+/// If `port` is a canonical VPN/tunnel default port that DPI port-matches,
+/// return the protocol it makes yip look like; `None` for a plausible port.
+/// Used to warn (not reject) at config load — anti-DPI R8 (#45).
+pub fn fingerprinted_vpn_port(port: u16) -> Option<&'static str> {
+    match port {
+        51820 => Some("WireGuard"),
+        1194 => Some("OpenVPN"),
+        500 | 4500 => Some("IPsec/IKE"),
+        1701 => Some("L2TP"),
+        1723 => Some("PPTP"),
+        655 => Some("tinc"),
+        _ => None,
+    }
+}
+
 /// Configuration for a single remote peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerConfig {
@@ -65,8 +90,16 @@ pub struct Config {
     pub local_public: [u8; 32],
     /// List of remote peers.
     pub peers: Vec<PeerConfig>,
-    /// Local UDP address to bind.
+    /// Local UDP address to bind. Port defaults to
+    /// [`DEFAULT_LISTEN_PORT`] (443) when `listen=` gives no port, or is
+    /// absent entirely — see `listen_port_auto`.
     pub listen: SocketAddr,
+    /// `true` when `listen`'s port was auto-selected (absent `listen`, or
+    /// `listen=<IP>` with no port) rather than explicitly configured. Lets
+    /// the bind site (`tunnel.rs`) fall back to [`FALLBACK_LISTEN_PORT`]
+    /// (8443) if binding the auto-selected 443 fails; an explicit port is
+    /// never silently substituted.
+    pub listen_port_auto: bool,
     /// TUN/TAP device name (e.g. `"yip0"`).
     pub device: String,
     /// Tunnel mode selected from `device_kind=tun|tap` (`tun` by default).
@@ -303,6 +336,7 @@ impl Config {
         let mut legacy_peer_public: Option<[u8; 32]> = None;
         let mut legacy_peer_endpoint: Option<SocketAddr> = None;
         let mut listen: Option<SocketAddr> = None;
+        let mut listen_port_auto = false;
         let mut device: Option<String> = None;
         let mut device_kind = TunnelMode::default();
         let mut rendezvous: Option<Rendezvous> = None;
@@ -356,10 +390,29 @@ impl Config {
                         })?)
                 }
                 "listen" => {
-                    listen =
-                        Some(val.parse::<SocketAddr>().map_err(|e| {
-                            io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-                        })?)
+                    // Accept `IP:port` (explicit) or `IP` (auto port). An
+                    // explicit VPN-default port is warned about (R8) but honored.
+                    if let Ok(sa) = val.parse::<SocketAddr>() {
+                        if let Some(proto) = fingerprinted_vpn_port(sa.port()) {
+                            eprintln!(
+                                "yipd: listen port {} is {}'s default; DPI classifies yip as {} \
+                                 by port regardless of payload — prefer 443 (anti-DPI R8)",
+                                sa.port(),
+                                proto,
+                                proto
+                            );
+                        }
+                        listen = Some(sa);
+                        listen_port_auto = false;
+                    } else if let Ok(ip) = val.parse::<IpAddr>() {
+                        listen = Some(SocketAddr::new(ip, DEFAULT_LISTEN_PORT));
+                        listen_port_auto = true;
+                    } else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid listen address: {val}"),
+                        ));
+                    }
                 }
                 "device" => device = Some(val.to_owned()),
                 "device_kind" => device_kind = TunnelMode::parse_device_kind(val)?,
@@ -500,11 +553,19 @@ impl Config {
             ));
         }
 
+        // `listen` absent ⇒ auto-select all interfaces on the plausible default
+        // port (443; the 8443 fallback is applied at bind time — see tunnel.rs).
+        let listen_port_auto = listen.is_none() || listen_port_auto;
+        let listen = listen.unwrap_or_else(|| {
+            SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), DEFAULT_LISTEN_PORT)
+        });
+
         Ok(Config {
             local_private: local_private.ok_or_else(|| missing("local_private"))?,
             local_public: local_public.ok_or_else(|| missing("local_public"))?,
             peers,
-            listen: listen.ok_or_else(|| missing("listen"))?,
+            listen,
+            listen_port_auto,
             device: device.ok_or_else(|| missing("device"))?,
             device_kind,
             rendezvous,
@@ -559,8 +620,8 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
     }
 
     #[test]
-    fn parse_config_missing_key_returns_error() {
-        // missing 'listen'
+    fn parse_config_missing_listen_defaults_to_auto_443() {
+        // `listen` absent is no longer an error — it defaults to auto-443.
         let text = "\
 device=yip0
 peer_endpoint=10.0.0.2:51820
@@ -569,7 +630,9 @@ local_private=0000000000000000000000000000000000000000000000000000000000000001
 local_public=0000000000000000000000000000000000000000000000000000000000000002
 peer_public=0000000000000000000000000000000000000000000000000000000000000003
 ";
-        assert!(Config::parse(text).is_err());
+        let cfg = Config::parse(text).unwrap();
+        assert!(cfg.listen_port_auto);
+        assert_eq!(cfg.listen.port(), 443);
     }
 
     #[test]
@@ -1388,5 +1451,56 @@ local_public=0000000000000000000000000000000000000000000000000000000000000002
 ";
         let err = Config::parse(text).unwrap_err();
         assert!(err.to_string().contains("no peers configured"));
+    }
+
+    // ── port plausibility (3d Task 1) ───────────────────────────────────
+
+    #[test]
+    fn fingerprinted_vpn_ports_are_flagged() {
+        assert_eq!(fingerprinted_vpn_port(51820), Some("WireGuard"));
+        assert_eq!(fingerprinted_vpn_port(1194), Some("OpenVPN"));
+        assert_eq!(fingerprinted_vpn_port(500), Some("IPsec/IKE"));
+        assert_eq!(fingerprinted_vpn_port(4500), Some("IPsec/IKE"));
+        assert_eq!(fingerprinted_vpn_port(1701), Some("L2TP"));
+        assert_eq!(fingerprinted_vpn_port(1723), Some("PPTP"));
+        assert_eq!(fingerprinted_vpn_port(655), Some("tinc"));
+        assert_eq!(fingerprinted_vpn_port(443), None);
+        assert_eq!(fingerprinted_vpn_port(8443), None);
+    }
+
+    #[test]
+    fn listen_absent_defaults_to_auto_443() {
+        let cfg = Config::parse(
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             device=yip0\n[peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.listen, "0.0.0.0:443".parse().unwrap());
+        assert!(cfg.listen_port_auto);
+    }
+
+    #[test]
+    fn listen_ip_only_defaults_port_to_auto_443() {
+        let cfg = Config::parse(
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             device=yip0\nlisten=127.0.0.1\n[peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.listen, "127.0.0.1:443".parse().unwrap());
+        assert!(cfg.listen_port_auto);
+    }
+
+    #[test]
+    fn listen_explicit_port_is_honored_not_auto() {
+        let cfg = Config::parse(
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             device=yip0\nlisten=0.0.0.0:9999\n[peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.listen, "0.0.0.0:9999".parse().unwrap());
+        assert!(!cfg.listen_port_auto);
     }
 }
