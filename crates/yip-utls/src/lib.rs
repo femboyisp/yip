@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod handshake;
 pub mod hello;
 pub mod ja;
 pub mod wire;
