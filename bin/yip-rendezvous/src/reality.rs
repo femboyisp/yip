@@ -367,6 +367,38 @@ mod tests {
         msg
     }
 
+    /// Like `build_client_hello`, but takes the fully-assembled extensions
+    /// block verbatim instead of building it from `sni`/`key_share_x25519` —
+    /// gives the parser-edge-case tests full control over malformed or
+    /// multi-entry extension bytes that `build_client_hello`'s API can't
+    /// express (REALITY.1 Task 5, deferred parser coverage).
+    fn build_client_hello_with_raw_exts(
+        client_random: [u8; 32],
+        session_id: &[u8],
+        raw_exts: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0303u16.to_be_bytes()); // legacy_version
+        body.extend_from_slice(&client_random);
+        body.push(u8::try_from(session_id.len()).unwrap());
+        body.extend_from_slice(session_id);
+        // cipher_suites: one suite (TLS_AES_128_GCM_SHA256).
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&0x1301u16.to_be_bytes());
+        // compression_methods: null only.
+        body.push(1);
+        body.push(0x00);
+        body.extend_from_slice(&u16::try_from(raw_exts.len()).unwrap().to_be_bytes());
+        body.extend_from_slice(raw_exts);
+
+        let mut msg = Vec::new();
+        msg.push(super::HANDSHAKE_TYPE_CLIENT_HELLO);
+        let body_len = u32::try_from(body.len()).unwrap();
+        msg.extend_from_slice(&body_len.to_be_bytes()[1..]); // u24 BE
+        msg.extend_from_slice(&body);
+        msg
+    }
+
     // ---- Part A: parser ----
 
     #[test]
@@ -630,5 +662,172 @@ mod tests {
             key_share_x25519: Some([1u8; 32]),
         };
         assert!(!reality_auth_open(&reality_priv, &info, &[[0u8; 8]], 0, 60));
+    }
+
+    // ---- Part C: parse -> auth end-to-end on a realistic sealed hello
+    // (REALITY.1 Task 5, Test 2) ----
+
+    /// Parses AND authenticates a byte-accurate ClientHello whose
+    /// `legacy_session_id` is a real `reality_seal` output and whose
+    /// `key_share` carries the matching ephemeral public key — proves
+    /// `parse_client_hello` -> `reality_auth_open` end-to-end on realistic
+    /// wire bytes, not just a hand-set `ClientHelloInfo`.
+    #[test]
+    fn parses_and_authenticates_a_realistic_sealed_client_hello() {
+        let reality_priv = [21u8; 32];
+        let reality_pub = pubkey_of(&reality_priv);
+        let eph_priv = [23u8; 32];
+        let eph_pub = pubkey_of(&eph_priv);
+        let client_random = [44u8; 32];
+        let short_id = [9u8; 8];
+        let now = 2_000_000u64;
+
+        let session_id = reality_seal(&reality_pub, &eph_priv, &client_random, short_id, now);
+        let msg = build_client_hello(
+            client_random,
+            &session_id,
+            Some("example.com"),
+            Some(eph_pub),
+        );
+
+        let info = parse_client_hello(&msg).expect("realistic sealed ClientHello must parse");
+        assert!(reality_auth_open(
+            &reality_priv,
+            &info,
+            &[short_id],
+            now,
+            10
+        ));
+    }
+
+    /// Same realistic hello as above, but authenticated against the WRONG
+    /// REALITY private key: must be rejected (the ECDH shared secret differs,
+    /// so the AEAD open fails).
+    #[test]
+    fn realistic_sealed_client_hello_rejected_under_wrong_reality_key() {
+        let reality_priv = [21u8; 32];
+        let reality_pub = pubkey_of(&reality_priv);
+        let wrong_reality_priv = [99u8; 32];
+        let eph_priv = [23u8; 32];
+        let eph_pub = pubkey_of(&eph_priv);
+        let client_random = [44u8; 32];
+        let short_id = [9u8; 8];
+        let now = 2_000_000u64;
+
+        let session_id = reality_seal(&reality_pub, &eph_priv, &client_random, short_id, now);
+        let msg = build_client_hello(
+            client_random,
+            &session_id,
+            Some("example.com"),
+            Some(eph_pub),
+        );
+
+        let info = parse_client_hello(&msg).expect("realistic sealed ClientHello must parse");
+        assert!(!reality_auth_open(
+            &wrong_reality_priv,
+            &info,
+            &[short_id],
+            now,
+            10
+        ));
+    }
+
+    // ---- Part D: deferred parser-edge coverage (REALITY.1 Task 5, Test 3) ----
+
+    /// A `key_share` entry with the x25519 group but `key_len != 32` must be
+    /// ignored (not force-cast into a 32-byte key), yielding
+    /// `key_share_x25519 == None` — but the rest of the hello still parses.
+    #[test]
+    fn key_share_entry_with_wrong_length_yields_no_key_share() {
+        let mut entry = Vec::new();
+        entry.extend_from_slice(&super::GROUP_X25519.to_be_bytes());
+        entry.extend_from_slice(&16u16.to_be_bytes()); // key_len = 16, not 32
+        entry.extend_from_slice(&[0xABu8; 16]);
+
+        let mut ks_body = Vec::new();
+        ks_body.extend_from_slice(&u16::try_from(entry.len()).unwrap().to_be_bytes());
+        ks_body.extend_from_slice(&entry);
+
+        let mut exts = Vec::new();
+        exts.extend_from_slice(&super::EXT_KEY_SHARE.to_be_bytes());
+        exts.extend_from_slice(&u16::try_from(ks_body.len()).unwrap().to_be_bytes());
+        exts.extend_from_slice(&ks_body);
+
+        let msg = build_client_hello_with_raw_exts([1u8; 32], &[2u8; 32], &exts);
+        let info = parse_client_hello(&msg)
+            .expect("a wrong-length key_share entry must not fail the whole parse");
+        assert_eq!(info.key_share_x25519, None);
+    }
+
+    /// `key_share` may carry several supported-group entries; the x25519 one
+    /// need not be first. `parse_key_share_x25519` must keep scanning past a
+    /// non-x25519 entry and still find the x25519 key.
+    #[test]
+    fn key_share_x25519_entry_after_non_x25519_entry_is_found() {
+        const GROUP_SECP256R1: u16 = 0x0017;
+        let other_key = [0xCCu8; 65]; // arbitrary non-x25519 entry content
+        let x25519_key = [0x42u8; 32];
+
+        let mut entries = Vec::new();
+        entries.extend_from_slice(&GROUP_SECP256R1.to_be_bytes());
+        entries.extend_from_slice(&u16::try_from(other_key.len()).unwrap().to_be_bytes());
+        entries.extend_from_slice(&other_key);
+        entries.extend_from_slice(&super::GROUP_X25519.to_be_bytes());
+        entries.extend_from_slice(&32u16.to_be_bytes());
+        entries.extend_from_slice(&x25519_key);
+
+        let mut ks_body = Vec::new();
+        ks_body.extend_from_slice(&u16::try_from(entries.len()).unwrap().to_be_bytes());
+        ks_body.extend_from_slice(&entries);
+
+        let mut exts = Vec::new();
+        exts.extend_from_slice(&super::EXT_KEY_SHARE.to_be_bytes());
+        exts.extend_from_slice(&u16::try_from(ks_body.len()).unwrap().to_be_bytes());
+        exts.extend_from_slice(&ks_body);
+
+        let msg = build_client_hello_with_raw_exts([3u8; 32], &[4u8; 32], &exts);
+        let info = parse_client_hello(&msg).expect("multi-entry key_share must parse");
+        assert_eq!(info.key_share_x25519, Some(x25519_key));
+    }
+
+    /// A `server_name` whose bytes aren't valid UTF-8 must yield `sni ==
+    /// None` (not an error/panic), while the rest of `ClientHelloInfo` still
+    /// parses (`Some`).
+    #[test]
+    fn invalid_utf8_server_name_yields_no_sni_but_still_parses() {
+        let name_bytes: &[u8] = &[0xFF, 0xFE, 0x00, 0x01]; // not valid UTF-8
+        let name_len = u16::try_from(name_bytes.len()).unwrap();
+        let list_len = name_len + 3;
+
+        let mut sn_body = Vec::new();
+        sn_body.extend_from_slice(&list_len.to_be_bytes());
+        sn_body.push(0); // name_type = host_name
+        sn_body.extend_from_slice(&name_len.to_be_bytes());
+        sn_body.extend_from_slice(name_bytes);
+
+        let mut exts = Vec::new();
+        exts.extend_from_slice(&super::EXT_SERVER_NAME.to_be_bytes());
+        exts.extend_from_slice(&u16::try_from(sn_body.len()).unwrap().to_be_bytes());
+        exts.extend_from_slice(&sn_body);
+
+        let msg = build_client_hello_with_raw_exts([5u8; 32], &[6u8; 32], &exts);
+        let info =
+            parse_client_hello(&msg).expect("invalid-UTF-8 SNI must not fail the whole parse");
+        assert_eq!(info.sni, None);
+    }
+
+    /// An extension whose declared `ext_len` overruns the extensions block —
+    /// while the outer u24 body length is internally consistent (matches the
+    /// actual message length) — must be rejected, not silently truncated or
+    /// panicked on.
+    #[test]
+    fn extension_len_overrunning_extensions_block_is_rejected() {
+        let mut exts = Vec::new();
+        exts.extend_from_slice(&0x1234u16.to_be_bytes()); // arbitrary unknown ext type
+        exts.extend_from_slice(&100u16.to_be_bytes()); // ext_len claims 100 bytes...
+                                                       // ...but `exts` ends here: no body bytes actually follow.
+
+        let msg = build_client_hello_with_raw_exts([7u8; 32], &[8u8; 32], &exts);
+        assert_eq!(parse_client_hello(&msg), None);
     }
 }
