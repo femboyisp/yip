@@ -28,6 +28,19 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// is fine here.
 const REALITY_SKEW_MIN: u64 = 10;
 
+/// Compile-time guard tying `reality_replay::WINDOW` to `REALITY_SKEW_MIN`.
+/// The two constants live in different modules and there is no other static
+/// link between them; a seal with a fixed `ts_min` passes the stateless skew
+/// gate (`reality_auth_recover`, below) for any arrival minute in
+/// `[ts_min - REALITY_SKEW_MIN, ts_min + REALITY_SKEW_MIN]` — a span
+/// `2 * REALITY_SKEW_MIN` minutes wide — so the replay dedup memory must
+/// cover at least that whole span or a seal can age out of the ring while
+/// still inside the skew-gate's acceptance window and be wrongly re-accepted
+/// as `Fresh` on replay (whole-branch review, REALITY.3). This fails the
+/// build if `WINDOW` is ever lowered, or `REALITY_SKEW_MIN` raised, without
+/// updating the other to match.
+const _: () = assert!(crate::reality_replay::WINDOW >= 2 * REALITY_SKEW_MIN);
+
 /// REALITY-mode config for the TLS front (REALITY.1 Task 3): when present on
 /// `TlsFrontCfg`, `run_tls_front` peeks the raw `ClientHello` and only hands
 /// authenticated connections to the real BoringSSL acceptor / relay Trojan

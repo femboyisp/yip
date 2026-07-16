@@ -18,11 +18,24 @@ use std::sync::Mutex;
 
 /// Freshness window in minutes. The ring has `WINDOW + 1` buckets so minute
 /// `m` and `m - WINDOW` never share a slot (spec §2 advisor #8 off-by-one).
-const WINDOW: u64 = 10;
+///
+/// MUST be `>= 2 * REALITY_SKEW_MIN` (the stateless skew gate in
+/// `tls_front::reality_auth_recover`/`open_recover`, `REALITY_SKEW_MIN =
+/// 10`). That gate accepts a seal with a FIXED `ts_min` for any arrival
+/// minute in `[ts_min - REALITY_SKEW_MIN, ts_min + REALITY_SKEW_MIN]` — a
+/// span `2 * REALITY_SKEW_MIN` minutes wide. If this replay memory only
+/// covered `REALITY_SKEW_MIN` minutes (the old value, 10), a seal accepted
+/// near one edge of the skew band could age out of the dedup ring while
+/// still inside the skew-gate's acceptance window, and a replay arriving in
+/// that outer half would be wrongly re-accepted as Fresh (whole-branch
+/// review, REALITY.3). `pub(crate)` so `tls_front` can assert the
+/// relationship at compile time instead of the two constants silently
+/// drifting apart in separate modules.
+pub(crate) const WINDOW: u64 = 20;
 /// `WINDOW + 1`, at `usize` width. Not computed from `WINDOW` via
 /// `usize::try_from` because `TryFrom` is not yet const-stable — kept in
 /// sync by the `ring_size_matches_window` test instead of a numeric cast.
-const RING: usize = 11;
+const RING: usize = 21;
 /// Number of lock shards (power of two); seal low bits select the shard.
 const SHARDS: usize = 16;
 
@@ -140,8 +153,49 @@ mod tests {
         let g = ReplayGuard::new(1000, 65536);
         assert_eq!(g.check(seal(1), 1000, 1000), Verdict::Fresh);
         assert_eq!(g.check(seal(1), 1000, 1000), Verdict::Replay);
-        // Advance now past the window: the old bucket ages out, seal is Fresh.
-        assert_eq!(g.check(seal(1), 1012, 1012), Verdict::Fresh);
+        // Advance now past the window (WINDOW=20): the old bucket ages out,
+        // seal is Fresh again only once `now - minute > WINDOW`.
+        assert_eq!(g.check(seal(1), 1021, 1021), Verdict::Fresh);
+    }
+
+    /// Regression for the whole-branch-review anti-replay defect: the replay
+    /// memory must span the FULL `2 * REALITY_SKEW_MIN` arrival window the
+    /// stateless skew gate accepts a fixed seal over, not just
+    /// `REALITY_SKEW_MIN`. A seal accepted at arrival minute `m` must still
+    /// be remembered — and so rejected as `Replay` — at every arrival minute
+    /// through `m + WINDOW` inclusive (in particular `m + 11 ..= m + 20`,
+    /// which is exactly the outer half of the `REALITY_SKEW_MIN = 10` skew
+    /// band that a `WINDOW = 10` ring would have already forgotten). It must
+    /// only become `Fresh` again at `m + WINDOW + 1`.
+    ///
+    /// This test FAILS (asserts `Replay`, gets `Fresh`) at `now = m + 11`
+    /// against the old `WINDOW = 10`, and PASSES against `WINDOW = 20`.
+    #[test]
+    fn replay_is_remembered_across_full_skew_span() {
+        let m = 5000;
+        let g = ReplayGuard::new(0, 65536);
+        // ts_min = start_min = 0 so only the arrival-window memory is under
+        // test, not the cross-restart belt or the (stateless, out of scope
+        // here) skew gate itself.
+        assert_eq!(g.check(seal(9), 0, m), Verdict::Fresh);
+        // Literal 11..=20, NOT derived from `WINDOW`: the point of this test
+        // is to fail against the old `WINDOW = 10` (where this range would
+        // already have aged out) and pass against `WINDOW = 20`. Deriving
+        // the bound from `WINDOW` itself would make the loop vacuously empty
+        // under the old value and silently defeat the regression test.
+        for offset in 11..=20u64 {
+            let now = m + offset;
+            assert_eq!(
+                g.check(seal(9), 0, now),
+                Verdict::Replay,
+                "seal replayed at now={now} (m+{offset}) must still be remembered"
+            );
+        }
+        assert_eq!(
+            g.check(seal(9), 0, m + WINDOW + 1),
+            Verdict::Fresh,
+            "seal must age out and become Fresh again exactly one minute past WINDOW"
+        );
     }
 
     #[test]
