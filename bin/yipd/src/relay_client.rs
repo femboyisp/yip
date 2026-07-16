@@ -360,7 +360,9 @@ where
                     // drain, so drop on backpressure instead of awaiting it.
                     match sock.try_send(&dg) {
                         Ok(_) => {}
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            log_socketpair_drop_rate_limited();
+                        }
                         Err(e) => return Err(e),
                     }
                 }
@@ -368,11 +370,13 @@ where
             r = sock.recv(&mut sock_read_buf) => {
                 let n = r?;
                 if n == 0 {
-                    // Fail closed on an empty datagram (see
-                    // `drain_socketpair`'s same invariant): framing a
-                    // zero-length payload would emit a `[0x00,0x00]` frame
-                    // that the peer's `FrameReader::next` rejects as a
-                    // bad-length self-inflicted protocol violation.
+                    // Skip a zero-length datagram — a discrete empty
+                    // SOCK_DGRAM message, NOT EOF; framing it would emit a
+                    // `[0x00,0x00]` frame that the peer's `FrameReader::next`
+                    // rejects as a bad-length self-inflicted protocol
+                    // violation. Best-effort skip, unlike `drain_socketpair`,
+                    // which treats `Ok(0)` as "peer gone" and tears the loop
+                    // down (`Err`) instead of tolerating it.
                     continue;
                 }
                 let mut framed = Vec::new();
