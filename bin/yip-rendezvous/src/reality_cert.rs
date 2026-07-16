@@ -78,6 +78,115 @@ pub fn forge_leaf(
     params.self_signed(key)
 }
 
+use std::net::IpAddr;
+
+/// boring renders an `Asn1Time` as `"%b %e %H:%M:%S %Y GMT"` (month abbrev,
+/// space-padded day). Parse that back into an `OffsetDateTime`. On any parse
+/// failure fall back to a wide window anchored at the Unix epoch / far future
+/// so a forged cert is never accidentally "already expired" (the client does
+/// not validate it, but an obviously-expired notAfter would be a needless
+/// tell) — validity copying is best-effort per spec §1.
+fn parse_asn1_time(t: &boring::asn1::Asn1TimeRef) -> time::OffsetDateTime {
+    let s = t.to_string(); // e.g. "Feb  3 04:05:06 2025 GMT"
+    let fmt = time::format_description::parse_borrowed::<1>(
+        "[month repr:short] [day padding:space] [hour]:[minute]:[second] [year] GMT",
+    );
+    let parsed = fmt
+        .ok()
+        .and_then(|f| time::PrimitiveDateTime::parse(&s, &f).ok())
+        .map(|p| p.assume_utc());
+    parsed.unwrap_or(time::OffsetDateTime::UNIX_EPOCH)
+}
+
+/// Extract the copyable identity fields from a real leaf. Fields boring does
+/// not cleanly expose (AIA, SCTs) are intentionally not copied (see
+/// `StolenFields` / spec §1 — best-effort, passively invisible under TLS 1.3).
+pub fn extract_fields(leaf: &boring::x509::X509Ref) -> StolenFields {
+    let subject_cn = leaf
+        .subject_name()
+        .entries_by_nid(boring::nid::Nid::COMMONNAME)
+        .next()
+        .and_then(|e| e.data().as_utf8().ok().map(|s| s.to_string()));
+
+    let mut dns_sans = Vec::new();
+    let mut ip_sans: Vec<IpAddr> = Vec::new();
+    if let Some(names) = leaf.subject_alt_names() {
+        for n in names.iter() {
+            if let Some(dns) = n.dnsname() {
+                dns_sans.push(dns.to_owned());
+            } else if let Some(ip) = n.ipaddress() {
+                // boring yields raw 4- or 16-byte IP bytes.
+                if let Ok(v4) = <[u8; 4]>::try_from(ip) {
+                    ip_sans.push(IpAddr::from(v4));
+                } else if let Ok(v6) = <[u8; 16]>::try_from(ip) {
+                    ip_sans.push(IpAddr::from(v6));
+                }
+            }
+        }
+    }
+
+    let serial = leaf
+        .serial_number()
+        .to_bn()
+        .ok()
+        .map(|bn| bn.to_vec())
+        .unwrap_or_default();
+
+    StolenFields {
+        subject_cn,
+        dns_sans,
+        ip_sans,
+        not_before: parse_asn1_time(leaf.not_before()),
+        not_after: parse_asn1_time(leaf.not_after()),
+        serial,
+        // Copy standard server-leaf usages; boring's per-bit keyUsage
+        // accessor is awkward, and a server leaf's usages are near-universal.
+        // This is best-effort mimicry, not byte-parity (spec §1).
+        key_usages: vec![
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyEncipherment,
+        ],
+        eku: vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth],
+        is_ca: false,
+    }
+}
+
+use boring::ssl::{SslConnector, SslMethod, SslVerifyMode};
+use std::net::SocketAddr;
+use std::time::Duration;
+use tokio::net::TcpStream;
+
+/// Dial `dest` as a TLS client borrowing `sni`, and extract the peer leaf's
+/// `StolenFields`. Verification is disabled (we only want the presented
+/// bytes, not a trust decision) and the whole dial is bounded by `timeout`
+/// so a black-holed `dest` cannot stall startup/refresh.
+pub async fn fetch_dest_leaf(
+    dest: SocketAddr,
+    sni: &str,
+    timeout: Duration,
+) -> Result<StolenFields, String> {
+    let dial = async {
+        let tcp = TcpStream::connect(dest)
+            .await
+            .map_err(|e| format!("connect {dest}: {e}"))?;
+        let mut b = SslConnector::builder(SslMethod::tls()).map_err(|e| e.to_string())?;
+        b.set_verify(SslVerifyMode::NONE);
+        let cfg = b.build().configure().map_err(|e| e.to_string())?;
+        let stream = tokio_boring::connect(cfg, sni, tcp)
+            .await
+            .map_err(|e| format!("tls to {sni}: {e}"))?;
+        let leaf = stream
+            .ssl()
+            .peer_cert_chain()
+            .and_then(|chain| chain.get(0))
+            .ok_or_else(|| "no peer cert".to_owned())?;
+        Ok::<StolenFields, String>(extract_fields(leaf))
+    };
+    tokio::time::timeout(timeout, dial)
+        .await
+        .map_err(|_| format!("fetch_dest_leaf({sni}) timed out after {timeout:?}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +224,54 @@ mod tests {
         // Serial copied.
         let serial = x.serial_number().to_bn().unwrap().to_vec();
         assert_eq!(serial, vec![0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn extract_fields_reads_a_forged_sample() {
+        // Build a known leaf with rcgen, serialize to DER, parse via boring,
+        // and assert extract_fields recovers what we put in.
+        let mut params = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "sample.test");
+        params.distinguished_name = dn;
+        params.subject_alt_names.push(SanType::DnsName(
+            "sample.test".to_owned().try_into().unwrap(),
+        ));
+        params.not_before = time::macros::datetime!(2025-02-03 04:05:06 UTC);
+        params.not_after = time::macros::datetime!(2026-02-03 04:05:06 UTC);
+        params.serial_number = Some(SerialNumber::from_slice(&[0xAA, 0xBB]));
+        params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let key = KeyPair::generate().unwrap();
+        let sample = params.self_signed(&key).unwrap();
+
+        let x = boring::x509::X509::from_der(sample.der().as_ref()).unwrap();
+        let got = extract_fields(&x);
+
+        assert_eq!(got.dns_sans, vec!["sample.test".to_owned()]);
+        assert_eq!(got.serial, vec![0xAA, 0xBB]);
+        assert_eq!(
+            got.not_before,
+            time::macros::datetime!(2025-02-03 04:05:06 UTC)
+        );
+        assert_eq!(
+            got.not_after,
+            time::macros::datetime!(2026-02-03 04:05:06 UTC)
+        );
+        assert!(!got.is_ca);
+    }
+
+    #[tokio::test]
+    #[ignore] // network; run with `cargo test -p yip-rendezvous-bin -- --ignored`
+    async fn fetch_real_leaf_from_cloudflare() {
+        let addr = tokio::net::lookup_host("cloudflare.com:443")
+            .await
+            .unwrap()
+            .next()
+            .unwrap();
+        let f = fetch_dest_leaf(addr, "cloudflare.com", std::time::Duration::from_secs(10))
+            .await
+            .expect("fetch cloudflare leaf");
+        assert!(f.dns_sans.iter().any(|s| s.contains("cloudflare")));
     }
 }
