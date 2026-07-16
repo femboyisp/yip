@@ -123,21 +123,30 @@ pub fn craft(params: &ClientHelloParams, rng: &mut dyn RandomSource) -> Vec<u8> 
     let mut extensions = build_extensions(params, rng);
     shuffle(rng, &mut extensions);
 
-    // The leading and trailing GREASE extension bookends must be DISTINCT
-    // codepoints: two extensions of the same type is an RFC 8446 §4.2 violation
-    // (strict servers reject the ClientHello), and real Chrome/BoringSSL always
-    // draws them distinct (#78). Draw the leading value, then draw the trailing
-    // value excluding it — mirroring the coordinated GREASE the supported_groups
-    // /key_share pair already uses.
+    // The two GREASE extension bookends, byte-faithful to BoringSSL
+    // (`ssl_add_clienthello_tlsext`): the LEADING one has an EMPTY body, the
+    // TRAILING one carries a SINGLE ZERO BYTE, and their codepoints must be
+    // DISTINCT — two extensions of the same type is an RFC 8446 §4.2 violation
+    // that strict servers reject, and an empty trailing body is a per-connection
+    // fingerprint tell (#78). BoringSSL guarantees distinctness deterministically:
+    // if the second draw collides with the first it XORs `0x1010`, mapping GREASE
+    // value n to n^1 (always a distinct GREASE value) — we mirror that exact
+    // fixup rather than redrawing, so our joint (lead, trail) distribution matches
+    // Chrome's rather than being uniform.
     let lead_grease = grease(rng);
-    let trail_grease = grease_distinct_from(rng, lead_grease);
+    let mut trail_grease = grease(rng);
+    if trail_grease == lead_grease {
+        trail_grease ^= 0x1010;
+    }
     body.u16_prefixed(|w| {
-        write_grease_extension(w, lead_grease);
+        w.u16(lead_grease);
+        w.u16_prefixed(|_| {}); // leading GREASE extension: empty body
         for (id, ext_body) in &extensions {
             w.u16(*id);
             w.u16_prefixed(|w| w.bytes(ext_body));
         }
-        write_grease_extension(w, trail_grease);
+        w.u16(trail_grease);
+        w.u16_prefixed(|w| w.u8(0x00)); // trailing GREASE extension: one zero byte
     });
 
     wrap_handshake_message(body.into_bytes())
@@ -366,15 +375,6 @@ fn key_share_body(
     w.into_bytes()
 }
 
-/// Write a GREASE extension: the given (already-drawn) GREASE codepoint as the
-/// extension type, with an empty body. The value is passed in — not drawn here —
-/// so the caller can coordinate the leading/trailing bookends to be distinct
-/// (see `craft`, #78).
-fn write_grease_extension(w: &mut HelloWriter, value: u16) {
-    w.u16(value);
-    w.u16_prefixed(|_| {});
-}
-
 /// A GREASE value per RFC 8701: `0x?a?a` with both nibble-pairs equal. Draws
 /// one random nibble from `rng` and repeats it in both bytes.
 fn grease(rng: &mut dyn RandomSource) -> u16 {
@@ -383,20 +383,6 @@ fn grease(rng: &mut dyn RandomSource) -> u16 {
     let nibble = b[0] & 0x0f;
     let byte = (nibble << 4) | 0x0a;
     u16::from_be_bytes([byte, byte])
-}
-
-/// A GREASE value distinct from `exclude`. Redraws until it differs — one of 16
-/// values, so it terminates in ~1.07 draws on average — mirroring how real
-/// Chrome/BoringSSL guarantees distinct extension-GREASE bookends. Determinism
-/// is preserved (`rng` is deterministic); only the trailing bookend's draw
-/// count varies, and it is the last GREASE consumed in `craft`.
-fn grease_distinct_from(rng: &mut dyn RandomSource, exclude: u16) -> u16 {
-    loop {
-        let g = grease(rng);
-        if g != exclude {
-            return g;
-        }
-    }
 }
 
 /// Fisher–Yates shuffle, deterministic given `rng`'s output sequence. This
@@ -670,24 +656,35 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    /// #78: the leading and trailing GREASE *extension* bookends must NEVER be
-    /// the same codepoint. Two extensions of the same type is an RFC 8446 §4.2
-    /// violation — a strict TLS 1.3 server rejects the ClientHello — and real
-    /// Chrome/BoringSSL always emits distinct extension-GREASE bookends. Since
-    /// GREASE has only 16 values, an independent draw collides ~1/16, so this
-    /// hammers many seeds to catch a regression that a single seed would miss.
+    /// #78: the GREASE extension bookends must be byte-faithful to BoringSSL:
+    /// (1) DISTINCT codepoints — two extensions of the same type is an RFC 8446
+    /// §4.2 violation a strict TLS 1.3 server rejects; and (2) the LEADING body
+    /// is empty while the TRAILING body is a single zero byte (an empty trailing
+    /// body is a per-connection fingerprint tell). GREASE has only 16 values, so
+    /// an independent draw collides ~1/16 — this hammers many distinct seeds to
+    /// catch a regression a single seed would miss. `TestRng::new` does
+    /// `seed | 1`, so only ODD seeds are unique rng streams; iterate 512 of them.
     #[test]
-    fn craft_grease_extension_bookends_are_always_distinct() {
+    fn craft_grease_extension_bookends_are_boringssl_faithful() {
         let params = test_params();
-        for seed in 0u64..512 {
+        for seed in (1u64..1024).step_by(2) {
             let msg = craft(&params, &mut TestRng::new(seed));
             let parsed = parse(&msg);
-            let lead = parsed.extensions.first().unwrap().0;
-            let trail = parsed.extensions.last().unwrap().0;
-            assert!(is_grease(lead) && is_grease(trail));
+            let (lead_id, lead_body) = parsed.extensions.first().unwrap();
+            let (trail_id, trail_body) = parsed.extensions.last().unwrap();
+            assert!(is_grease(*lead_id) && is_grease(*trail_id));
             assert_ne!(
-                lead, trail,
-                "seed {seed}: extension GREASE bookends collided ({lead:#06x})"
+                lead_id, trail_id,
+                "seed {seed}: extension GREASE bookends collided ({lead_id:#06x})"
+            );
+            assert!(
+                lead_body.is_empty(),
+                "leading GREASE extension body must be empty"
+            );
+            assert_eq!(
+                trail_body.as_slice(),
+                &[0x00],
+                "trailing GREASE extension body must be a single zero byte"
             );
         }
     }
