@@ -90,6 +90,15 @@ pub fn run(config: Config) -> io::Result<()> {
                     as Box<dyn crate::rendezvous::Rendezvous>,
             )
         }
+        // REALITY.4a (this task) only parses `rendezvous=reality://...`; the
+        // relay dial itself (mirroring the `Tls` arm above, once REALITY's
+        // handshake plumbing lands) is future work.
+        Some(crate::config::Rendezvous::Reality { .. }) => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "rendezvous=reality:// dial is not implemented yet",
+            ));
+        }
     };
     // Build the mesh membership directory (2c) only when the full mesh config is
     // present (a trusted CA set, our cert, the signed root set, our record-
