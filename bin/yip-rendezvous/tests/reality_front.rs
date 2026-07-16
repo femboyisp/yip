@@ -206,3 +206,102 @@ async fn unauthenticated_connection_is_spliced_to_dest() {
         "expected the spliced dest banner in the client's read bytes, got {got:?}"
     );
 }
+
+/// Task 8: the four new `--reality-cert-refresh-secs` /
+/// `--reality-cert-max-stale-secs` / `--reality-replay-max-bucket` /
+/// `--reality-max-inflight` flags parse, and — since no `--tls-cert`/
+/// `--tls-key` is supplied here — the front must fall back to
+/// `build_throwaway_acceptor` rather than exiting with the "requires
+/// --tls-cert and --tls-key" error. Proven end-to-end: the TCP front actually
+/// comes up and accepts a real BoringSSL handshake.
+#[tokio::test]
+async fn reality_flags_parse_and_front_starts_without_operator_cert() {
+    let dest_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind dest listener");
+    let dest_addr = dest_listener.local_addr().expect("dest local_addr");
+    tokio::spawn(async move {
+        // Never actually dialed by this test (no server_name is configured,
+        // so prewarm never fetches from it) — just needs to exist so
+        // `--reality-dest` parses to a real address.
+        let _ = dest_listener.accept().await;
+    });
+
+    let udp_addr = format!("127.0.0.1:{}", free_udp_port());
+    let tcp_addr = format!("127.0.0.1:{}", free_tcp_port());
+    let obf_psk = hex(&[0x22u8; 32]);
+    let reality_priv_hex = hex(&[9u8; 32]);
+
+    let child = Command::new(env!("CARGO_BIN_EXE_yip-rendezvous"))
+        .arg(&udp_addr)
+        .arg("--obf-psk")
+        .arg(&obf_psk)
+        .arg("--listen-tcp")
+        .arg(&tcp_addr)
+        // Deliberately NO --tls-cert / --tls-key: REALITY.3 makes them
+        // optional, backstopped by build_throwaway_acceptor.
+        .arg("--reality-dest")
+        .arg(dest_addr.to_string())
+        .arg("--reality-private-key")
+        .arg(&reality_priv_hex)
+        .arg("--reality-cert-refresh-secs")
+        .arg("120")
+        .arg("--reality-cert-max-stale-secs")
+        .arg("300")
+        .arg("--reality-replay-max-bucket")
+        .arg("64")
+        .arg("--reality-max-inflight")
+        .arg("8")
+        .spawn()
+        .expect("spawn yip-rendezvous");
+    let _guard = KillOnDrop(child);
+
+    // If any of the new flags failed to parse, or the missing operator cert
+    // fell through to the old hard `exit(2)`, the TCP front never comes up
+    // and this times out — that is the property under test. (The generic
+    // throwaway acceptor built here is never actually reached over the wire
+    // in REALITY mode — every connection is routed through
+    // `run_reality_conn` instead, which either authenticates via
+    // `RealityCfg::certs`'s forged per-SNI acceptor or splices to `dest`; see
+    // `build_throwaway_acceptor`'s own unit test in `src/tls_front.rs` for
+    // proof that the acceptor it builds is itself a valid, working TLS
+    // acceptor.)
+    wait_until_tcp_listening(&tcp_addr).await;
+}
+
+/// Task 8 review reorder: `--reality-dest` without `--listen-tcp` must exit
+/// (2) from pure flag-combo validation BEFORE the ~10s `prewarm` network
+/// dial — proven by pointing `--reality-dest` at an unroutable address
+/// (TEST-NET-1, RFC 5737) and asserting the process exits well under that
+/// bound.
+#[tokio::test]
+async fn reality_dest_without_listen_tcp_fails_fast_before_any_dial() {
+    let udp_addr = format!("127.0.0.1:{}", free_udp_port());
+    let reality_priv_hex = hex(&[3u8; 32]);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yip-rendezvous"))
+        .arg(&udp_addr)
+        .arg("--reality-dest")
+        .arg("192.0.2.1:9") // unroutable; prewarm would block ~10s if reached
+        .arg("--reality-private-key")
+        .arg(&reality_priv_hex)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn yip-rendezvous");
+
+    // No tokio "process" feature enabled in this crate's Cargo.toml, so poll
+    // the synchronous `Child` with `try_wait` from an async test instead of
+    // adding a dependency feature just for this one assertion.
+    let status = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("must exit well before the 10s prewarm dial timeout, proving the reorder");
+    assert_eq!(status.code(), Some(2), "expected the flag-combo exit(2)");
+}

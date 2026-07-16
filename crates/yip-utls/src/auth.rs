@@ -82,13 +82,66 @@ pub fn seal(
         .expect("16-byte plaintext + 16-byte tag == 32 bytes")
 }
 
+/// Like [`open`], but returns the recovered `(short_id, ts_min)` on success
+/// (for callers that need the timestamp, e.g. anti-replay's cross-restart
+/// belt). Same fail-closed checks as `open`. The wire format is unchanged.
+pub fn open_recover(
+    reality_priv: &[u8; 32],
+    eph_pub: &[u8; 32],
+    client_random: &[u8; 32],
+    session_id: &[u8],
+    short_ids: &[[u8; 8]],
+    now_min: u64,
+    skew_min: u64,
+) -> Option<([u8; 8], u64)> {
+    if session_id.len() != SESSION_ID_LEN {
+        return None;
+    }
+
+    let secret = StaticSecret::from(*reality_priv);
+    let shared = secret.diffie_hellman(&PublicKey::from(*eph_pub));
+    let aead_key = derive_aead_key(shared.as_bytes());
+
+    let cipher = ChaCha20Poly1305::new_from_slice(&aead_key)
+        .expect("aead_key is exactly 32 bytes, ChaCha20Poly1305's required key length");
+    let nonce_bytes = client_random.get(..12)?;
+    let nonce = Nonce::from_slice(nonce_bytes);
+
+    let plaintext = cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: session_id,
+                aad: b"",
+            },
+        )
+        .ok()?;
+    if plaintext.len() != PLAINTEXT_LEN {
+        return None;
+    }
+
+    let short_id = <[u8; 8]>::try_from(plaintext.get(..8)?).ok()?;
+    let ts_bytes = <[u8; 8]>::try_from(plaintext.get(8..16)?).ok()?;
+    let ts_min = u64::from_le_bytes(ts_bytes);
+
+    if !short_ids.contains(&short_id) {
+        return None;
+    }
+    if ts_min.abs_diff(now_min) > skew_min {
+        return None;
+    }
+
+    Some((short_id, ts_min))
+}
+
 /// Server-side REALITY auth check. True iff `session_id` opens under the
 /// shared key derived from `reality_priv` and `eph_pub` (the ClientHello's
 /// x25519 key-share), AND the recovered `short_id` is in `short_ids`, AND
 /// `|ts_min - now_min| <= skew_min`.
 ///
 /// Fail-closed: a wrong-length `session_id`, failed AEAD open, unknown
-/// `short_id`, or out-of-skew timestamp all return `false`.
+/// `short_id`, or out-of-skew timestamp all return `false`. A bool wrapper
+/// over [`open_recover`] — see that function for the recovered `ts_min`.
 pub fn open(
     reality_priv: &[u8; 32],
     eph_pub: &[u8; 32],
@@ -98,50 +151,16 @@ pub fn open(
     now_min: u64,
     skew_min: u64,
 ) -> bool {
-    if session_id.len() != SESSION_ID_LEN {
-        return false;
-    }
-
-    let secret = StaticSecret::from(*reality_priv);
-    let shared = secret.diffie_hellman(&PublicKey::from(*eph_pub));
-    let aead_key = derive_aead_key(shared.as_bytes());
-
-    let cipher = ChaCha20Poly1305::new_from_slice(&aead_key)
-        .expect("aead_key is exactly 32 bytes, ChaCha20Poly1305's required key length");
-    let Some(nonce_bytes) = client_random.get(..12) else {
-        return false;
-    };
-    let nonce = Nonce::from_slice(nonce_bytes);
-
-    let Ok(plaintext) = cipher.decrypt(
-        nonce,
-        Payload {
-            msg: session_id,
-            aad: b"",
-        },
-    ) else {
-        return false;
-    };
-    if plaintext.len() != PLAINTEXT_LEN {
-        return false;
-    }
-
-    let Some(short_id) = plaintext.get(..8).and_then(|s| <[u8; 8]>::try_from(s).ok()) else {
-        return false;
-    };
-    let Some(ts_bytes) = plaintext
-        .get(8..16)
-        .and_then(|s| <[u8; 8]>::try_from(s).ok())
-    else {
-        return false;
-    };
-    let ts_min = u64::from_le_bytes(ts_bytes);
-
-    if !short_ids.contains(&short_id) {
-        return false;
-    }
-
-    ts_min.abs_diff(now_min) <= skew_min
+    open_recover(
+        reality_priv,
+        eph_pub,
+        client_random,
+        session_id,
+        short_ids,
+        now_min,
+        skew_min,
+    )
+    .is_some()
 }
 
 #[cfg(test)]
@@ -277,6 +296,43 @@ mod tests {
             now,
             60
         ));
+    }
+
+    #[test]
+    fn open_recover_returns_ts_and_short_id() {
+        let reality_priv = [11u8; 32];
+        let reality_pub = pubkey_of(&reality_priv);
+        let eph_priv = [22u8; 32];
+        let eph_pub = pubkey_of(&eph_priv);
+        let client_random = [33u8; 32];
+        let short_id = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let ts_min = 12_345u64;
+
+        let session_id = seal(&reality_pub, &eph_priv, &client_random, short_id, ts_min);
+        let got = open_recover(
+            &reality_priv,
+            &eph_pub,
+            &client_random,
+            &session_id,
+            &[short_id],
+            ts_min,
+            10,
+        );
+        assert_eq!(got, Some((short_id, ts_min)));
+
+        // Wrong short_id ⇒ None.
+        assert_eq!(
+            open_recover(
+                &reality_priv,
+                &eph_pub,
+                &client_random,
+                &session_id,
+                &[[0u8; 8]],
+                ts_min,
+                10,
+            ),
+            None
+        );
     }
 
     #[test]

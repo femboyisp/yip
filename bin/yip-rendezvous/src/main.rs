@@ -6,7 +6,9 @@
 mod conn;
 mod conn_tunnel;
 mod reality;
+mod reality_cert;
 mod reality_io;
+mod reality_replay;
 mod tls_front;
 
 use std::net::SocketAddr;
@@ -162,10 +164,13 @@ fn vpn_port_warning(port: u16) -> Option<String> {
 fn usage_exit() -> ! {
     eprintln!(
         "usage: yip-rendezvous <listen-addr> [--obf-psk <hex64>] \
-         [--listen-tcp <addr> --tls-cert <path> --tls-key <path> [--decoy <addr>] \
+         [--listen-tcp <addr> [--tls-cert <path> --tls-key <path>] [--decoy <addr>] \
          [--reality-dest <host:port> --reality-private-key <hex64> \
-         [--reality-short-id <hex16>]... [--reality-server-name <name>]...]]\n\
-         (--reality-dest supersedes --decoy when both are set)\n\
+         [--reality-short-id <hex16>]... [--reality-server-name <name>]... \
+         [--reality-cert-refresh-secs <secs>] [--reality-cert-max-stale-secs <secs>] \
+         [--reality-replay-max-bucket <n>] [--reality-max-inflight <n>]]]\n\
+         (--reality-dest supersedes --decoy when both are set; --tls-cert/--tls-key are \
+         optional when --reality-dest is set — REALITY forges its own per-SNI cert)\n\
          e.g. 0.0.0.0:51821"
     );
     std::process::exit(2);
@@ -193,6 +198,12 @@ async fn main() -> std::io::Result<()> {
     let mut reality_priv_key: Option<[u8; 32]> = None;
     let mut reality_short_ids: Vec<[u8; 8]> = Vec::new();
     let mut reality_server_names: Vec<String> = Vec::new();
+    // REALITY.3 cert-cache / replay-guard tuning (Task 8), all optional with
+    // spec-default values.
+    let mut reality_cert_refresh_secs: u64 = 3600;
+    let mut reality_cert_max_stale_secs: u64 = 21600;
+    let mut reality_replay_max_bucket: usize = 16384;
+    let mut reality_max_inflight: usize = 1024;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -281,6 +292,46 @@ async fn main() -> std::io::Result<()> {
                 };
                 reality_server_names.push(v);
             }
+            "--reality-cert-refresh-secs" => {
+                let Some(v) = args.next() else {
+                    eprintln!("--reality-cert-refresh-secs requires a seconds argument");
+                    std::process::exit(2);
+                };
+                reality_cert_refresh_secs = v.parse().unwrap_or_else(|e| {
+                    eprintln!("invalid --reality-cert-refresh-secs: {e}");
+                    std::process::exit(2);
+                });
+            }
+            "--reality-cert-max-stale-secs" => {
+                let Some(v) = args.next() else {
+                    eprintln!("--reality-cert-max-stale-secs requires a seconds argument");
+                    std::process::exit(2);
+                };
+                reality_cert_max_stale_secs = v.parse().unwrap_or_else(|e| {
+                    eprintln!("invalid --reality-cert-max-stale-secs: {e}");
+                    std::process::exit(2);
+                });
+            }
+            "--reality-replay-max-bucket" => {
+                let Some(v) = args.next() else {
+                    eprintln!("--reality-replay-max-bucket requires a count argument");
+                    std::process::exit(2);
+                };
+                reality_replay_max_bucket = v.parse().unwrap_or_else(|e| {
+                    eprintln!("invalid --reality-replay-max-bucket: {e}");
+                    std::process::exit(2);
+                });
+            }
+            "--reality-max-inflight" => {
+                let Some(v) = args.next() else {
+                    eprintln!("--reality-max-inflight requires a count argument");
+                    std::process::exit(2);
+                };
+                reality_max_inflight = v.parse().unwrap_or_else(|e| {
+                    eprintln!("invalid --reality-max-inflight: {e}");
+                    std::process::exit(2);
+                });
+            }
             _ if listen.is_none() => listen = Some(arg),
             other => {
                 eprintln!("unexpected argument: {other}");
@@ -308,6 +359,16 @@ async fn main() -> std::io::Result<()> {
         },
         None => None,
     };
+    // Pure flag-combo validation, before any network I/O (Task 8 review
+    // reorder — a misconfigured REALITY setup must fail fast, not after the
+    // ~10s `prewarm` dial below). REALITY runs on the TCP front (the authed
+    // branch terminates TLS there), so `--reality-dest` without
+    // `--listen-tcp` would be silently ignored — reject it up front.
+    if reality_dest.is_some() && listen_tcp.is_none() {
+        eprintln!("--reality-dest requires --listen-tcp (REALITY runs on the TCP front)");
+        std::process::exit(2);
+    }
+
     // REALITY config: presence of --reality-dest enables it. --reality-dest
     // supersedes --decoy at runtime (tls_front branches on cfg.reality first),
     // so accepting both flags together is harmless.
@@ -321,22 +382,44 @@ async fn main() -> std::io::Result<()> {
                 eprintln!("--reality-dest requires --reality-private-key");
                 std::process::exit(2);
             };
+            let refresh = Duration::from_secs(reality_cert_refresh_secs);
+            let max_stale = Duration::from_secs(reality_cert_max_stale_secs);
+            let fetch_timeout = Duration::from_secs(10);
+            let certs = reality_cert::RealityCertCache::prewarm(
+                &reality_server_names,
+                dest,
+                refresh,
+                max_stale,
+                fetch_timeout,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("fatal: {e}");
+                std::process::exit(1);
+            });
+            // Start the background refresh now, before `certs` moves into
+            // `RealityCfg` — `spawn_refresh` takes `&Arc<Self>`.
+            certs.spawn_refresh(dest, refresh, max_stale, fetch_timeout);
+            let start_min = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() / 60)
+                .unwrap_or(0);
+            let replay = Arc::new(reality_replay::ReplayGuard::new(
+                start_min,
+                reality_replay_max_bucket,
+            ));
             Some(RealityCfg {
                 dest,
                 priv_key,
                 short_ids: reality_short_ids,
                 server_names: reality_server_names,
+                certs,
+                replay,
             })
         }
         None => None,
     };
 
-    // REALITY runs on the TCP front (the authed branch terminates TLS there), so
-    // `--reality-dest` without `--listen-tcp` would be silently ignored — reject it.
-    if reality_cfg.is_some() && listen_tcp.is_none() {
-        eprintln!("--reality-dest requires --listen-tcp (REALITY runs on the TCP front)");
-        std::process::exit(2);
-    }
     // No short-ids ⇒ no client can ever authenticate, so the relay forwards EVERY
     // connection to dest (a pure, correct front, but likely a misconfiguration if
     // the operator meant to serve a tunnel). Warn rather than fail — this is a
@@ -356,21 +439,36 @@ async fn main() -> std::io::Result<()> {
     let sock = tokio::net::UdpSocket::bind(&listen).await?;
     eprintln!("yip-rendezvous listening on {listen} (udp)");
 
-    // TLS Trojan front (3c.3): opt-in via --listen-tcp. Requires --tls-cert,
-    // --tls-key, and (as the discriminator) --obf-psk.
+    // TLS Trojan front (3c.3): opt-in via --listen-tcp. Requires --obf-psk
+    // (as the discriminator) always. --tls-cert/--tls-key are required for
+    // the non-REALITY Trojan front, but optional under REALITY.3: the authed
+    // branch (`run_reality_conn`) never uses this generic `acceptor` at all —
+    // it builds its own per-SNI forged acceptor from `RealityCfg::certs` — so
+    // this acceptor only backstops the (never-taken under REALITY) plain
+    // `tokio_boring::accept(&acceptor, ..)` fallback in `run_tls_front`, and a
+    // throwaway self-signed cert is fine for that.
     if let Some(tcp_addr) = listen_tcp {
-        let (Some(cert), Some(key)) = (tls_cert.as_deref(), tls_key.as_deref()) else {
-            eprintln!("--listen-tcp requires --tls-cert and --tls-key");
-            std::process::exit(2);
-        };
         let Some(obf_key) = obf_key else {
             eprintln!("--listen-tcp requires --obf-psk (it is the tunnel discriminator)");
             std::process::exit(2);
         };
-        let acceptor = Arc::new(tls_front::build_acceptor(cert, key).unwrap_or_else(|e| {
-            eprintln!("tls cert/key error: {e}");
-            std::process::exit(2);
-        }));
+        let acceptor = match (tls_cert.as_deref(), tls_key.as_deref()) {
+            (Some(cert), Some(key)) => tls_front::build_acceptor(cert, key).unwrap_or_else(|e| {
+                eprintln!("tls cert/key error: {e}");
+                std::process::exit(2);
+            }),
+            _ if reality_cfg.is_some() => {
+                tls_front::build_throwaway_acceptor().unwrap_or_else(|e| {
+                    eprintln!("failed to build throwaway TLS acceptor: {e}");
+                    std::process::exit(1);
+                })
+            }
+            _ => {
+                eprintln!("--listen-tcp requires --tls-cert and --tls-key");
+                std::process::exit(2);
+            }
+        };
+        let acceptor = Arc::new(acceptor);
         let tcp = tokio::net::TcpListener::bind(&tcp_addr).await?;
         eprintln!("yip-rendezvous TLS front listening on {tcp_addr} (tcp)");
         let cfg = Arc::new(tls_front::TlsFrontCfg {
@@ -382,6 +480,7 @@ async fn main() -> std::io::Result<()> {
             // REALITY.1 Task 4: wired from --reality-*; None keeps the 3c.3
             // Trojan front's behavior byte-identical.
             reality: reality_cfg,
+            max_conns: reality_max_inflight,
         });
         tokio::spawn(tls_front::run_tls_front(tcp, acceptor, cfg));
     }

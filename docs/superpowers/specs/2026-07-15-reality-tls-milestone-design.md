@@ -144,3 +144,16 @@ Remaining, to fold in before/with REALITY.4:
 - **M4:** zeroize sensitive locals (`eph_priv`, ecdhe/handshake/traffic secrets, ML-KEM dk).
 - **M5:** `hello::craft` uses `debug_assert` for the ML-KEM ek length — make it a hard check
   or type-level invariant for external callers.
+
+## REALITY.3 advisor review — follow-up spun out (recorded 2026-07-15)
+
+The REALITY.3 spec's adversarial advisor pass surfaced one gap too large for REALITY.3's scope,
+now tracked as its own milestone:
+- **REALITY.5 — server-flight (ServerHello) fidelity:** the authed relay's `ServerHello` is
+  BoringSSL's, not `dest`'s, and is cleartext (TLS 1.3 encrypts only the Certificate onward). A
+  passive DPI holding a per-`dest` ServerHello template (cipher choice, chosen group, extension
+  set/order, GREASE placement, cert-compression) could distinguish authed relay traffic from a real
+  browser↔`dest` session. REALITY.3 explicitly does NOT claim passive indistinguishability for the
+  authed path (only for the un-authed splice, which is `dest`'s own bytes). REALITY.5 will pursue
+  matching the server flight to the borrowed `dest`'s stack (or at least to a common CDN template).
+  All other advisor findings were folded directly into the REALITY.3 rev-3 spec.

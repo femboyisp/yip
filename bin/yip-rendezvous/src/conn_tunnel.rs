@@ -156,6 +156,7 @@ mod tests {
             base: Instant::now(),
             routes: Arc::new(Mutex::new(HashMap::new())),
             reality: None,
+            max_conns: 1024,
         })
     }
 
@@ -256,8 +257,7 @@ mod tests {
         let a = node_id(&[20u8; 32]);
         let b = node_id(&[21u8; 32]);
 
-        let dir = std::env::temp_dir().join(format!("yip-rdv-tunnel-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::tls_front::unique_tmp_dir("tunnel");
         let (cert, key_path) = crate::tls_front::write_self_signed(&dir);
         let acceptor = Arc::new(crate::tls_front::build_acceptor(&cert, &key_path).unwrap());
 
