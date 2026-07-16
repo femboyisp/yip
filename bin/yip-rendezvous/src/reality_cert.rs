@@ -55,8 +55,9 @@ use rcgen::{
 
 /// Build a forged leaf whose identity fields copy `fields`, self-signed by
 /// `key` (the relay-ephemeral key). Self-signed is sufficient: the outer TLS
-/// is zero-CA-auth, so no chain-building is needed. Unreproducible fields
-/// (CA signature, SCTs, AIA) are omitted by design — see `StolenFields`.
+/// is zero-CA-auth, so no chain-building is needed. AIA is copied when present
+/// (#75, best-effort — see `StolenFields::aia_der`); the CA signature and SCTs
+/// are unreproducible (bound to the real CA/CT-log keys) and are omitted.
 pub fn forge_leaf(
     fields: &StolenFields,
     key: &KeyPair,
