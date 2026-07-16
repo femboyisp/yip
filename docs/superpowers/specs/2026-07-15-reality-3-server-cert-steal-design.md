@@ -1,11 +1,15 @@
 # REALITY.3 — server: on-the-fly stolen-cert authed path + anti-replay + splice-faithful fallback — design spec
 
 **Date:** 2026-07-15
-**Status:** design — rev 3 (rev 2 folded the user's 8-point review; rev 3 folds an adversarial
-advisor pass: TLS-1.3-only authed acceptor, per-SNI all-required startup, forged-cert staleness
-bound, ring WINDOW+1 + monotonic clock, overflow metric, handshake/splice concurrency caps, explicit
-threat-model boundary, and honest ServerHello-fidelity deferral to REALITY.5; corrected the earlier
-passive-DPI overclaim). Pending user review.
+**Status:** design — rev 4 (rev 2 folded the user's 8-point review; rev 3 an adversarial advisor
+subagent; rev 4 a cross-model pass via `agy`/GPT-OSS-120B). Net of rev 3+4: TLS-1.3-only authed
+acceptor; **per-SNI degrade-to-splice startup** (one unreachable dest no longer DoSes the relay);
+forged-cert staleness bound keyed to dest TTL; ring WINDOW+1 + monotonic clock; **cross-restart
+replay belt** (`ts_min` < relay-start); configurable/lowered `MAX_BUCKET`; overflow metric;
+handshake/splice concurrency caps; explicit threat-model boundary; ServerHello fidelity deferred to
+REALITY.5 (passive-DPI overclaim corrected); SNI-in-AAD noted as a codec follow-up. Pending user
+review. (Gemini 3.1 Pro declined the review on safety grounds; GPT-OSS-120B provided the
+cross-architecture pass.)
 **Parent:** [`2026-07-15-reality-tls-milestone-design.md`](2026-07-15-reality-tls-milestone-design.md)
 **Depends on:** REALITY.1 (merged, the server front) + REALITY.2 (merged, the shared auth codec).
 **Scope:** `yip-rendezvous` server only. PR 1 of the REALITY.3+.4 pair (REALITY.4 = client wiring, separate).
@@ -71,14 +75,21 @@ routing to the relay tunnel or, on classification failure, `into_decoy`.
   caches them before serving traffic. A background task **refreshes** them (e.g. hourly) and, on a
   refresh failure, **keeps the last-good acceptor** — a transient `dest` outage never degrades the
   authed handshake.
-- **No self-signed fallback for a real domain (review #2).** Serving a self-signed cert for
-  `microsoft.com` on a fetch failure would instantly out the proxy. So there is **no runtime
-  self-signed path** — ever. Startup granularity is **per-SNI, all-required** (advisor #6): the
-  pre-warm must succeed for **every** configured server_name; if *any* one fails, the relay **fails
-  to start** (not just "if all fail"). This closes the silent-hole case where a partial success would
-  start a relay that has no acceptor for some authed SNI. (The operator fixes `dest`/network; a
-  censor blocking egress at boot yields "relay won't start", which is the correct fail-closed outcome
-  — better than leaking.)
+- **No self-signed fallback for a real domain (review #2); per-SNI degrade-to-splice on startup
+  (advisor #6 + cross-model refinement).** Serving a self-signed cert for `microsoft.com` on a fetch
+  failure would instantly out the proxy, so there is **no runtime self-signed path** — ever. For
+  startup granularity, a cross-model review flagged that "fail the whole relay if *any* server_name
+  fails to pre-warm" (rev-3's rule) turns one unreachable `dest` into a total-availability DoS. The
+  better rule closes *both* the silent-hole case and that DoS: pre-warm is **per-SNI**, and a
+  server_name whose fetch fails becomes **splice-only** (no authed acceptor for it — connections to
+  that SNI, authed or not, route to the real `dest`), while server_names that succeed serve their
+  forged acceptor. The relay boots if **at least one** server_name pre-warms; it **fails to start
+  only if none do** (a pure-splice relay is useless as a VPN front, and signals misconfiguration).
+  A `reality_cert_degraded{sni}` metric + warn log makes each splice-only SNI visible. This is
+  fail-closed for *security* (never self-signed, never a fake-authed path) and merely degraded for
+  *availability* (our own authed clients for that SNI can't connect until its cert fetches — the same
+  degraded-to-splice behavior as the staleness bound below, so there is no new failure shape).
+  The background refresh promotes a splice-only SNI back to authed once its fetch succeeds.
 - **TLS-1.3-only authed acceptor (advisor #2).** `build_acceptor` today uses
   `mozilla_intermediate_v5`, which **permits TLS 1.2** — where the Certificate message is sent in
   cleartext. A config-holding prober could then offer only TLS 1.2 and read the forged leaf
@@ -89,11 +100,13 @@ routing to the relay tunnel or, on classification failure, `into_decoy`.
 - **Bounded staleness of the forged leaf (advisor #7).** The forged leaf copies `dest`'s
   serial/validity as of the last successful refresh; a config-holding prober comparing the authed
   (forged) serial against the un-authed (spliced, live) serial could spot drift on fast-rotating
-  CDN/short-lived certs. Mitigation: refresh well inside the cert's own validity, and cap last-good
-  staleness — if the last successful fetch for an SNI is older than `REALITY_CERT_MAX_STALE`
-  (default 6 h), stop serving the authed path for that SNI and **splice** instead of presenting an
-  ever-staler forgery. (Byte-perfect parity with a rotating live serial is unreachable and is noted,
-  not claimed.)
+  CDN/short-lived certs. Mitigation: refresh well inside the cert's own validity — key the refresh
+  off the observed leaf's `notAfter` (trigger an immediate re-fetch when `notAfter` is within, say,
+  2× the refresh interval), and set `REALITY_CERT_MAX_STALE` **below `dest`'s observed rotation
+  period** (default 6 h is a ceiling, not a target; for hourly-rotating CDNs the operator lowers it).
+  If the last successful fetch for an SNI is older than `REALITY_CERT_MAX_STALE`, stop serving the
+  authed path for that SNI and **splice** instead of presenting an ever-staler forgery. (Byte-perfect
+  parity with a rotating live serial is unreachable and is noted, not claimed.)
 - **Cache is bounded by the `reality_server_names` allowlist (review #7).** Certs are forged/cached
   ONLY for the configured server_names (a small, fixed set). An authed check already requires the
   SNI ∈ `server_names` (REALITY.1); an SNI outside it is un-authed ⇒ spliced to `dest`, and no cert
@@ -121,8 +134,13 @@ needed. So a seal replayed after the window (or after a relay restart that clear
 rejected by the timestamp check ⇒ spliced to `dest`; it does **not** reach local termination. The
 dedup set below only has to catch replays **within** the skew window. The one residual is a replay
 within the *same* window across a relay restart (memory lost, timestamp still valid) — a ≤10-min
-window per restart, accepted as a minor, documented residual (not the unbounded-in-time distinguisher
-the review first supposed).
+window per restart. A cross-model pass suggested closing even that cheaply: **latch the relay's
+start minute and additionally reject any seal whose `ts_min` predates it** (`ts_min <
+relay_start_min`). A legitimate client mints a *fresh* seal per connection (`ts_min = now`), so it is
+never rejected; only a seal minted before the restart — i.e. exactly a cross-restart replay — is
+caught, statelessly, without persisting the dedup set to disk. This is folded in as a cheap belt to
+the memory dedup, shrinking the residual to sub-second (seals minted in the same minute as the
+restart).
 
 A **time-bounded dedup set** keyed on the 32-byte seal (`legacy_session_id`). On an authed decision,
 if the seal was seen within the freshness window (±`REALITY_SKEW_MIN` = 10 min), treat the connection
@@ -149,11 +167,15 @@ as **un-authed** (⇒ splice to `dest`). The review flagged three concrete failu
   the same seal serialize on the shard lock; exactly one sees `Fresh`, the other `Replay`. There is
   no check-then-insert gap.
 
-Bounded memory: at most (seals seen in a ~10-min window) live entries, hard-capped per shard —
-if a shard's current bucket exceeds `MAX_BUCKET` = 65 536 (a defense-in-depth ceiling; worst case
-16 shards × 11 buckets × 65 536 × 32 B ≈ 370 MB), further inserts into that minute are dropped and
-the connection is treated as **un-authed/splice** (fail-safe: a flood degrades to "spliced to dest",
-never to unbounded RAM or to accepting replays). **Note the availability edge (advisor #9):** only
+Bounded memory: at most (seals seen in a ~10-min window) live entries, hard-capped per shard — if a
+shard's current bucket exceeds `MAX_BUCKET`, further inserts into that minute are dropped and the
+connection is treated as **un-authed/splice** (fail-safe: a flood degrades to "spliced to dest",
+never to unbounded RAM or to accepting replays). `MAX_BUCKET` is **configurable**
+(`--reality-replay-max-bucket`) because the worst-case footprint scales with it — a cross-model pass
+noted the earlier 65 536 default is ~370 MB worst case (16 shards × 11 buckets × 65 536 × 32 B),
+which can OOM a small VPS. Default is lowered to **16 384** (~92 MB worst case; still ~180 k
+authed-conn/min before the cliff, far above any legitimate load), and operators on large boxes can
+raise it. **Note the availability edge (advisor #9):** only
 *valid* seals ever insert (an invalid seal splices without inserting), so overflow cannot be forced
 by junk — it happens only under genuine authed load, and its effect is that a real client is spliced
 (its inner handshake then fails against the real `dest`). That is fail-safe for secrecy but a silent
@@ -227,19 +249,25 @@ so latency for legitimate load is unaffected. Per-source rate limiting is noted 
 - New (optional, defaulted): `--reality-cert-refresh-secs` (default 3600, cert-refresh cadence);
   `--reality-cert-max-stale-secs` (default 21600 / 6 h, `REALITY_CERT_MAX_STALE`, past which an SNI's
   authed path degrades to splice); `--reality-max-inflight-handshakes` (default 1024);
-  `--reality-max-splices` (default 2048).
+  `--reality-max-splices` (default 2048); `--reality-replay-max-bucket` (default 16384, per-shard
+  per-minute cap).
+- Startup no longer aborts on a single unreachable server_name: a failed pre-warm makes that SNI
+  **splice-only** (metric `reality_cert_degraded{sni}`); the relay refuses to start only if **no**
+  server_name pre-warms.
 
 ## Testing / adversary
 - Unit (cert): stolen-cert forgery copies subject / all SANs / validity / serial / keyUsage / EKU /
-  basicConstraints / AIA from a sample `dest` leaf; startup fails (does not serve self-signed) when
-  the `dest` fetch fails for **any** configured server_name; the cache holds exactly one acceptor per
-  configured server_name and forges none for an unlisted SNI; the acceptor **rejects a TLS-1.2-only
-  ClientHello** (min-proto pin); an SNI past `REALITY_CERT_MAX_STALE` degrades to splice.
+  basicConstraints / AIA from a sample `dest` leaf; a server_name whose fetch fails becomes
+  splice-only while others still serve authed (relay boots); startup fails only when **no**
+  server_name pre-warms; the cache forges none for an unlisted SNI and never serves self-signed; the
+  acceptor **rejects a TLS-1.2-only ClientHello** (min-proto pin); an SNI past `REALITY_CERT_MAX_STALE`
+  degrades to splice.
 - Unit (anti-replay): `check_and_remember` returns `Fresh` once and `Replay` for a same-window
   repeat, `Fresh` again after the bucket ages out; **the WINDOW+1 ring does not evict a still-live
   minute** (off-by-one guard) and a monotonic-clock step-back doesn't accept a replay; two concurrent
   calls with the same seal yield exactly one `Fresh`; shard distribution over random seals is roughly
-  even; a per-minute flood past `MAX_BUCKET` degrades to `Replay`/splice and bumps the overflow metric.
+  even; a per-minute flood past `MAX_BUCKET` degrades to `Replay`/splice and bumps the overflow metric;
+  a seal whose `ts_min` predates the latched relay-start minute is rejected (cross-restart replay belt).
 - Unit (concurrency): past the handshake/splice semaphore caps, new connections are shed (no
   unbounded `dest` dial-out).
 - netns/integration: an authed connection (crafted with `yip_utls::auth::seal` + a `yip_utls`-style
@@ -250,9 +278,10 @@ so latency for legitimate load is unaffected. Per-source rate limiting is noted 
 - Keep the REALITY.1 active-probe property intact (un-authed ⇒ `dest`).
 
 ## Risks
-- **Startup depends on `dest` reachability** — the pre-warm must succeed for **every** configured
-  server_name or the relay refuses to start (deliberate: no self-signed leak, no silent per-SNI
-  hole). Bounded by a connect timeout; operators ensure `dest` is reachable at boot.
+- **Startup depends on `dest` reachability (per-SNI, graceful)** — a server_name that fails to
+  pre-warm is served **splice-only** (no authed path for it) rather than blocking the whole relay;
+  the relay refuses to start only if **no** server_name pre-warms. Bounded by a connect timeout. No
+  self-signed leak, no silent hole, and one unreachable `dest` no longer DoSes the whole relay.
 - **Server-flight (ServerHello) fidelity is NOT addressed here** — the authed path's ServerHello is
   BoringSSL's, not `dest`'s, and is cleartext; a passive per-dest template could distinguish authed
   traffic. Explicitly deferred to **REALITY.5**; this spec claims passive indistinguishability only
@@ -274,14 +303,23 @@ so latency for legitimate load is unaffected. Per-source rate limiting is noted 
 ## Non-goals
 - Client wiring / `reality://` scheme (REALITY.4). REALITY-key-based client cert verification
   (optional REALITY.4 follow-up). Changing the un-authed splice (REALITY.1, unchanged).
-  Cross-relay shared anti-replay state (single-process only here).
+  Cross-relay shared anti-replay state (single-process only here). Server-flight/ServerHello
+  fidelity for the authed path (REALITY.5, see milestone spec).
+
+## Follow-ups noted (out of this PR's scope)
+- **Bind SNI into the seal AAD (REALITY.2 codec).** A cross-model pass observed the seal's AEAD
+  currently uses `aad=b""`, so a valid seal opens under any SNI in the allowlist. It's not a security
+  hole (the opener is already an authorized key-holder, and SNI ∈ allowlist is checked separately),
+  but binding the SNI into the AAD would be clean defense-in-depth. It touches the shared client+server
+  auth codec (`yip-utls::auth`), so it is tracked as a REALITY.2-codec follow-up, not folded here.
 
 ## Success criteria
 1. Authed branch presents a cert whose subject/SAN/validity/serial/keyUsage/EKU/basicConstraints/AIA
    copy `dest`'s live leaf, pre-warmed at startup (no first-request fetch spike), no operator cert
-   required; the acceptor is **TLS-1.3-only** (no cleartext-cert path); if *any* configured
-   server_name fails to pre-warm the relay refuses to start (never self-signed for a real domain);
-   an SNI whose cert goes staler than `REALITY_CERT_MAX_STALE` degrades to splice.
+   required; the acceptor is **TLS-1.3-only** (no cleartext-cert path); a server_name that fails to
+   pre-warm degrades to **splice-only** (metric-visible) and the relay boots if ≥1 succeeds (refuses
+   to start only if none do); an SNI whose cert goes staler than `REALITY_CERT_MAX_STALE` degrades to
+   splice; never self-signed for a real domain.
 2. A replayed authed ClientHello is rejected: out-of-window by the existing stateless `ts_min` skew
    gate, in-window by a sharded/time-bucketed/atomic dedup that is O(1)-evicting (WINDOW+1 slots,
    monotonic clock), contention-sharded, race-free, memory-bounded, and metered on overflow.
