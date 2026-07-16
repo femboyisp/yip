@@ -123,13 +123,21 @@ pub fn craft(params: &ClientHelloParams, rng: &mut dyn RandomSource) -> Vec<u8> 
     let mut extensions = build_extensions(params, rng);
     shuffle(rng, &mut extensions);
 
+    // The leading and trailing GREASE extension bookends must be DISTINCT
+    // codepoints: two extensions of the same type is an RFC 8446 §4.2 violation
+    // (strict servers reject the ClientHello), and real Chrome/BoringSSL always
+    // draws them distinct (#78). Draw the leading value, then draw the trailing
+    // value excluding it — mirroring the coordinated GREASE the supported_groups
+    // /key_share pair already uses.
+    let lead_grease = grease(rng);
+    let trail_grease = grease_distinct_from(rng, lead_grease);
     body.u16_prefixed(|w| {
-        write_grease_extension(w, rng);
+        write_grease_extension(w, lead_grease);
         for (id, ext_body) in &extensions {
             w.u16(*id);
             w.u16_prefixed(|w| w.bytes(ext_body));
         }
-        write_grease_extension(w, rng);
+        write_grease_extension(w, trail_grease);
     });
 
     wrap_handshake_message(body.into_bytes())
@@ -358,8 +366,12 @@ fn key_share_body(
     w.into_bytes()
 }
 
-fn write_grease_extension(w: &mut HelloWriter, rng: &mut dyn RandomSource) {
-    w.u16(grease(rng));
+/// Write a GREASE extension: the given (already-drawn) GREASE codepoint as the
+/// extension type, with an empty body. The value is passed in — not drawn here —
+/// so the caller can coordinate the leading/trailing bookends to be distinct
+/// (see `craft`, #78).
+fn write_grease_extension(w: &mut HelloWriter, value: u16) {
+    w.u16(value);
     w.u16_prefixed(|_| {});
 }
 
@@ -371,6 +383,20 @@ fn grease(rng: &mut dyn RandomSource) -> u16 {
     let nibble = b[0] & 0x0f;
     let byte = (nibble << 4) | 0x0a;
     u16::from_be_bytes([byte, byte])
+}
+
+/// A GREASE value distinct from `exclude`. Redraws until it differs — one of 16
+/// values, so it terminates in ~1.07 draws on average — mirroring how real
+/// Chrome/BoringSSL guarantees distinct extension-GREASE bookends. Determinism
+/// is preserved (`rng` is deterministic); only the trailing bookend's draw
+/// count varies, and it is the last GREASE consumed in `craft`.
+fn grease_distinct_from(rng: &mut dyn RandomSource, exclude: u16) -> u16 {
+    loop {
+        let g = grease(rng);
+        if g != exclude {
+            return g;
+        }
+    }
 }
 
 /// Fisher–Yates shuffle, deterministic given `rng`'s output sequence. This
@@ -549,6 +575,15 @@ mod tests {
         assert_eq!(parsed.extensions.len(), 18);
         assert!(is_grease(parsed.extensions.first().unwrap().0));
         assert!(is_grease(parsed.extensions.last().unwrap().0));
+        // The leading and trailing GREASE extension codepoints MUST differ:
+        // two extensions of the same type is an RFC 8446 §4.2 violation (strict
+        // servers reject the ClientHello), and real Chrome/BoringSSL always
+        // draws distinct extension-GREASE bookends (#78).
+        assert_ne!(
+            parsed.extensions.first().unwrap().0,
+            parsed.extensions.last().unwrap().0,
+            "extension GREASE bookends must be distinct codepoints"
+        );
 
         // The 16 real ids appear exactly once each, in SOME order, between
         // the two GREASE bookends -- the whole point of Task 3 is that this
@@ -633,6 +668,28 @@ mod tests {
         let a = craft(&params, &mut TestRng::new(42));
         let b = craft(&params, &mut TestRng::new(42));
         assert_eq!(a, b);
+    }
+
+    /// #78: the leading and trailing GREASE *extension* bookends must NEVER be
+    /// the same codepoint. Two extensions of the same type is an RFC 8446 §4.2
+    /// violation — a strict TLS 1.3 server rejects the ClientHello — and real
+    /// Chrome/BoringSSL always emits distinct extension-GREASE bookends. Since
+    /// GREASE has only 16 values, an independent draw collides ~1/16, so this
+    /// hammers many seeds to catch a regression that a single seed would miss.
+    #[test]
+    fn craft_grease_extension_bookends_are_always_distinct() {
+        let params = test_params();
+        for seed in 0u64..512 {
+            let msg = craft(&params, &mut TestRng::new(seed));
+            let parsed = parse(&msg);
+            let lead = parsed.extensions.first().unwrap().0;
+            let trail = parsed.extensions.last().unwrap().0;
+            assert!(is_grease(lead) && is_grease(trail));
+            assert_ne!(
+                lead, trail,
+                "seed {seed}: extension GREASE bookends collided ({lead:#06x})"
+            );
+        }
     }
 
     #[test]
