@@ -168,27 +168,23 @@ fn u24_be(b: &[u8]) -> Option<usize> {
 #[cfg(test)]
 const SESSION_ID_LEN: usize = 32;
 
-/// Server-side REALITY auth check. True iff `info.legacy_session_id` opens
-/// under the shared key derived from `reality_priv` and the ClientHello's
-/// x25519 key-share, AND the recovered `short_id` is in `short_ids`, AND
-/// `|ts_min - now_unix_min| <= skew_min`.
+/// Like [`reality_auth_open`] but returns the recovered `ts_min` on success
+/// (for the anti-replay cross-restart belt). `None` ⇒ not authenticated.
 ///
 /// Fail-closed: any missing key-share, wrong-length session id, failed AEAD
-/// open, unknown short_id, or out-of-skew timestamp returns `false`. Delegates
-/// to `yip_utls::auth::open` (REALITY.2 Task 5) — the shared codec also used
-/// by the `yip-utls` client's seal, so this server accepts exactly what that
-/// client produces.
-pub fn reality_auth_open(
+/// open, unknown short_id, or out-of-skew timestamp returns `None`. Delegates
+/// to `yip_utls::auth::open_recover` (REALITY.2 Task 5) — the shared codec
+/// also used by the `yip-utls` client's seal, so this server accepts exactly
+/// what that client produces.
+pub fn reality_auth_recover(
     reality_priv: &[u8; 32],
     info: &ClientHelloInfo,
     short_ids: &[[u8; 8]],
     now_unix_min: u64,
     skew_min: u64,
-) -> bool {
-    let Some(eph_pub) = info.key_share_x25519 else {
-        return false;
-    };
-    yip_utls::auth::open(
+) -> Option<u64> {
+    let eph_pub = info.key_share_x25519?;
+    yip_utls::auth::open_recover(
         reality_priv,
         &eph_pub,
         &info.client_random,
@@ -197,6 +193,25 @@ pub fn reality_auth_open(
         now_unix_min,
         skew_min,
     )
+    .map(|(_short_id, ts_min)| ts_min)
+}
+
+/// Server-side REALITY auth check. True iff `info.legacy_session_id` opens
+/// under the shared key derived from `reality_priv` and the ClientHello's
+/// x25519 key-share, AND the recovered `short_id` is in `short_ids`, AND
+/// `|ts_min - now_unix_min| <= skew_min`.
+///
+/// Fail-closed: any missing key-share, wrong-length session id, failed AEAD
+/// open, unknown short_id, or out-of-skew timestamp returns `false`. A bool
+/// wrapper over [`reality_auth_recover`].
+pub fn reality_auth_open(
+    reality_priv: &[u8; 32],
+    info: &ClientHelloInfo,
+    short_ids: &[[u8; 8]],
+    now_unix_min: u64,
+    skew_min: u64,
+) -> bool {
+    reality_auth_recover(reality_priv, info, short_ids, now_unix_min, skew_min).is_some()
 }
 
 #[cfg(test)]
