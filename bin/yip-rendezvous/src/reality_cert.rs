@@ -82,11 +82,16 @@ use std::net::IpAddr;
 
 /// boring renders an `Asn1Time` as `"%b %e %H:%M:%S %Y GMT"` (month abbrev,
 /// space-padded day). Parse that back into an `OffsetDateTime`. On any parse
-/// failure fall back to a wide window anchored at the Unix epoch / far future
-/// so a forged cert is never accidentally "already expired" (the client does
-/// not validate it, but an obviously-expired notAfter would be a needless
-/// tell) — validity copying is best-effort per spec §1.
-fn parse_asn1_time(t: &boring::asn1::Asn1TimeRef) -> time::OffsetDateTime {
+/// failure return `fallback` instead — callers must pass a fallback on the
+/// side that keeps the forged cert from looking "already expired": a
+/// far-*past* sentinel for `not_before`, a far-*future* sentinel for
+/// `not_after` (the client does not validate the chain, but an obviously
+/// bad bound would be a needless tell) — validity copying is best-effort
+/// per spec §1.
+fn parse_asn1_time(
+    t: &boring::asn1::Asn1TimeRef,
+    fallback: time::OffsetDateTime,
+) -> time::OffsetDateTime {
     let s = t.to_string(); // e.g. "Feb  3 04:05:06 2025 GMT"
     let fmt = time::format_description::parse_borrowed::<1>(
         "[month repr:short] [day padding:space] [hour]:[minute]:[second] [year] GMT",
@@ -95,7 +100,7 @@ fn parse_asn1_time(t: &boring::asn1::Asn1TimeRef) -> time::OffsetDateTime {
         .ok()
         .and_then(|f| time::PrimitiveDateTime::parse(&s, &f).ok())
         .map(|p| p.assume_utc());
-    parsed.unwrap_or(time::OffsetDateTime::UNIX_EPOCH)
+    parsed.unwrap_or(fallback)
 }
 
 /// Extract the copyable identity fields from a real leaf. Fields boring does
@@ -136,8 +141,11 @@ pub fn extract_fields(leaf: &boring::x509::X509Ref) -> StolenFields {
         subject_cn,
         dns_sans,
         ip_sans,
-        not_before: parse_asn1_time(leaf.not_before()),
-        not_after: parse_asn1_time(leaf.not_after()),
+        not_before: parse_asn1_time(leaf.not_before(), time::OffsetDateTime::UNIX_EPOCH),
+        not_after: parse_asn1_time(
+            leaf.not_after(),
+            time::macros::datetime!(9999-12-31 23:59:59 UTC),
+        ),
         serial,
         // Copy standard server-leaf usages; boring's per-bit keyUsage
         // accessor is awkward, and a server leaf's usages are near-universal.
