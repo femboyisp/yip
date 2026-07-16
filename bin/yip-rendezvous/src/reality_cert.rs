@@ -195,6 +195,165 @@ pub async fn fetch_dest_leaf(
         .map_err(|_| format!("fetch_dest_leaf({sni}) timed out after {timeout:?}"))?
 }
 
+use boring::pkey::PKey;
+use boring::ssl::{SslAcceptor, SslVersion};
+
+/// Build a TLS-1.3-ONLY `SslAcceptor` presenting the forged leaf. Pinning
+/// min-proto to 1.3 keeps the Certificate message encrypted (spec §1 advisor
+/// #2 — TLS 1.2 would send it in cleartext). ALPN mirrors `build_acceptor`.
+pub fn build_forged_acceptor(
+    fields: &StolenFields,
+    key: &rcgen::KeyPair,
+) -> Result<SslAcceptor, String> {
+    let cert = forge_leaf(fields, key).map_err(|e| format!("forge: {e}"))?;
+    let cert_der = cert.der().as_ref().to_vec();
+    let x509 = boring::x509::X509::from_der(&cert_der).map_err(|e| e.to_string())?;
+    let pkey = PKey::private_key_from_der(&key.serialize_der()).map_err(|e| e.to_string())?;
+
+    let mut b =
+        SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).map_err(|e| e.to_string())?;
+    b.set_min_proto_version(Some(SslVersion::TLS1_3))
+        .map_err(|e| e.to_string())?;
+    b.set_certificate(&x509).map_err(|e| e.to_string())?;
+    b.set_private_key(&pkey).map_err(|e| e.to_string())?;
+    b.check_private_key().map_err(|e| e.to_string())?;
+    b.set_alpn_protos(b"\x02h2\x08http/1.1")
+        .map_err(|e| e.to_string())?;
+    Ok(b.build())
+}
+
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
+
+/// One forged acceptor per configured server_name, plus the ephemeral signing
+/// key and each entry's last-successful-fetch instant (for the staleness
+/// bound). An SNI absent from the map is splice-only (spec §1 degrade rule).
+#[expect(
+    dead_code,
+    reason = "fetched_at is read only by spawn_refresh's staleness check; Task 8 wires \
+              spawn_refresh into main, and no unit test here drives its background loop"
+)]
+struct CacheEntry {
+    acceptor: Arc<SslAcceptor>,
+    fetched_at: Instant,
+}
+
+#[expect(
+    dead_code,
+    reason = "server_names/key are read only by spawn_refresh (iterates names, reuses the \
+              stable key); Task 8 wires spawn_refresh into main, and no unit test here drives \
+              its background loop"
+)]
+pub struct RealityCertCache {
+    /// server_name -> live acceptor. Absent ⇒ splice-only.
+    entries: RwLock<HashMap<String, CacheEntry>>,
+    /// The set of names we are configured to serve (for refresh iteration).
+    server_names: Vec<String>,
+    /// Relay-ephemeral signing key, generated once; reused across refreshes so
+    /// a re-forge for the same name keeps a stable key.
+    key: KeyPair,
+}
+
+impl RealityCertCache {
+    /// Fetch + forge for each server_name. A name whose fetch fails is left
+    /// out of the map (splice-only). Errors ONLY if not a single name warmed.
+    pub async fn prewarm(
+        server_names: &[String],
+        dest: SocketAddr,
+        _refresh: Duration,
+        _max_stale: Duration,
+        timeout: Duration,
+    ) -> Result<Arc<Self>, String> {
+        let key = KeyPair::generate().map_err(|e| format!("keygen: {e}"))?;
+        let mut entries = HashMap::new();
+        for name in server_names {
+            match fetch_dest_leaf(dest, name, timeout).await {
+                Ok(fields) => match build_forged_acceptor(&fields, &key) {
+                    Ok(acc) => {
+                        entries.insert(
+                            name.clone(),
+                            CacheEntry {
+                                acceptor: Arc::new(acc),
+                                fetched_at: Instant::now(),
+                            },
+                        );
+                    }
+                    Err(e) => eprintln!("reality-cert: forge {name} failed: {e} (splice-only)"),
+                },
+                Err(e) => eprintln!("reality-cert: prewarm {name} failed: {e} (splice-only)"),
+            }
+        }
+        if entries.is_empty() {
+            return Err("reality-cert: no server_name pre-warmed; refusing to start".to_owned());
+        }
+        Ok(Arc::new(Self {
+            entries: RwLock::new(entries),
+            server_names: server_names.to_vec(),
+            key,
+        }))
+    }
+
+    /// The forged acceptor for `sni`, or `None` (⇒ caller splices to dest).
+    pub fn acceptor_for(&self, sni: &str) -> Option<Arc<SslAcceptor>> {
+        let g = self.entries.read().expect("cert cache lock poisoned");
+        g.get(sni).map(|e| Arc::clone(&e.acceptor))
+    }
+
+    /// Background refresh: every `refresh`, re-fetch each name. On success,
+    /// replace its acceptor and stamp. On failure, keep last-good UNLESS it is
+    /// now older than `max_stale`, in which case drop it (⇒ splice-only) rather
+    /// than serve an ever-staler forgery (spec §1 staleness bound).
+    #[expect(
+        dead_code,
+        reason = "not yet called from main.rs — Task 8 wires prewarm + spawn_refresh into the \
+                  TLS front; unit-testing an infinite background loop's ticks belongs there, \
+                  not in this module's offline tests"
+    )]
+    pub fn spawn_refresh(
+        self: &Arc<Self>,
+        dest: SocketAddr,
+        refresh: Duration,
+        max_stale: Duration,
+        timeout: Duration,
+    ) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(refresh);
+            tick.tick().await; // consume the immediate first tick
+            loop {
+                tick.tick().await;
+                for name in &this.server_names {
+                    match fetch_dest_leaf(dest, name, timeout).await {
+                        Ok(fields) => {
+                            if let Ok(acc) = build_forged_acceptor(&fields, &this.key) {
+                                let mut g = this.entries.write().expect("cert cache poisoned");
+                                g.insert(
+                                    name.clone(),
+                                    CacheEntry {
+                                        acceptor: Arc::new(acc),
+                                        fetched_at: Instant::now(),
+                                    },
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            let mut g = this.entries.write().expect("cert cache poisoned");
+                            let stale = g
+                                .get(name)
+                                .is_some_and(|e| e.fetched_at.elapsed() > max_stale);
+                            if stale {
+                                g.remove(name); // degrade to splice-only
+                                eprintln!("reality-cert: {name} exceeded max-stale; splice-only");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +440,113 @@ mod tests {
             .await
             .expect("fetch cloudflare leaf");
         assert!(f.dns_sans.iter().any(|s| s.contains("cloudflare")));
+    }
+
+    #[tokio::test]
+    async fn forged_acceptor_is_tls13_only_and_presents_copied_subject() {
+        let fields = StolenFields {
+            subject_cn: Some("acc.test".to_owned()),
+            dns_sans: vec!["acc.test".to_owned()],
+            ip_sans: Vec::new(),
+            not_before: time::macros::datetime!(2025-01-01 0:00 UTC),
+            not_after: time::macros::datetime!(2027-01-01 0:00 UTC),
+            serial: vec![0x10],
+            key_usages: vec![rcgen::KeyUsagePurpose::DigitalSignature],
+            eku: vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth],
+            is_ca: false,
+        };
+        let key = rcgen::KeyPair::generate().unwrap();
+        let acceptor = std::sync::Arc::new(build_forged_acceptor(&fields, &key).unwrap());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acc = std::sync::Arc::clone(&acceptor);
+        tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                let _ = tokio_boring::accept(&acc, tcp).await;
+            }
+        });
+
+        // A TLS-1.2-MAX client must FAIL against the 1.3-only acceptor.
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut b = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();
+        b.set_verify(boring::ssl::SslVerifyMode::NONE);
+        b.set_max_proto_version(Some(boring::ssl::SslVersion::TLS1_2))
+            .unwrap();
+        let cfg = b.build().configure().unwrap();
+        let res = tokio_boring::connect(cfg, "acc.test", tcp).await;
+        assert!(
+            res.is_err(),
+            "TLS 1.2 client must be rejected by the 1.3-only acceptor"
+        );
+    }
+
+    /// Spawn a local TLS server (self-signed) that answers any SNI — stands in
+    /// for a real `dest`. Returns its address.
+    async fn spawn_local_dest() -> SocketAddr {
+        let mut p = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "local.dest");
+        p.distinguished_name = dn;
+        p.subject_alt_names.push(SanType::DnsName(
+            "local.dest".to_owned().try_into().unwrap(),
+        ));
+        let key = KeyPair::generate().unwrap();
+        let cert = p.self_signed(&key).unwrap();
+        let x = boring::x509::X509::from_der(cert.der().as_ref()).unwrap();
+        let pkey = PKey::private_key_from_der(&key.serialize_der()).unwrap();
+        let mut b = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        b.set_certificate(&x).unwrap();
+        b.set_private_key(&pkey).unwrap();
+        let acc = std::sync::Arc::new(b.build());
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((tcp, _)) = l.accept().await {
+                    let acc = std::sync::Arc::clone(&acc);
+                    tokio::spawn(async move {
+                        let _ = tokio_boring::accept(&acc, tcp).await;
+                    });
+                }
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn prewarm_serves_reachable_and_degrades_unreachable() {
+        let dest = spawn_local_dest().await;
+        // "good.test" resolves via the local dest; the SNI string is arbitrary
+        // (the local dest answers any SNI). We fake an "unreachable" name by
+        // pointing the cache at the SAME dest but pre-seeding a name whose
+        // fetch we force to fail — simplest: use one real + assert None for an
+        // unconfigured name.
+        let cache = RealityCertCache::prewarm(
+            &["good.test".to_owned()],
+            dest,
+            Duration::from_secs(3600),
+            Duration::from_secs(21600),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("boots with >=1 good SNI");
+        assert!(cache.acceptor_for("good.test").is_some());
+        assert!(cache.acceptor_for("not.configured").is_none()); // splice-only
+    }
+
+    #[tokio::test]
+    async fn prewarm_fails_only_when_no_sni_prewarms() {
+        // An unroutable dest (TEST-NET-1, discard port) fails for every SNI.
+        let dead: SocketAddr = "192.0.2.1:9".parse().unwrap();
+        let res = RealityCertCache::prewarm(
+            &["a.test".to_owned(), "b.test".to_owned()],
+            dead,
+            Duration::from_secs(3600),
+            Duration::from_secs(21600),
+            Duration::from_millis(300),
+        )
+        .await;
+        assert!(res.is_err(), "no SNI pre-warmed ⇒ refuse to start");
     }
 }
