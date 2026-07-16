@@ -108,8 +108,36 @@ where
             };
             super::conn_tunnel::run_tunnel(stream, cfg, node, prefix).await;
         }
-        _ => into_decoy(stream, &cfg, buf).await,
+        _ => {
+            if cfg.reality.is_some() {
+                // REALITY authed path: this connection already passed the seal
+                // check, so only a key-holding own-peer with a malformed inner
+                // frame reaches here. Do NOT proxy (spec §3) — reject generically.
+                reality_reject(stream).await;
+            } else {
+                into_decoy(stream, &cfg, buf).await;
+            }
+        }
     }
+}
+
+/// REALITY authed-but-inner-fail response (spec §3): a minimal generic error,
+/// then shut the write half (which flushes a TLS close_notify on an SslStream).
+/// Best-effort behavior parity with a real origin rejecting a bad request —
+/// NOT a bare RST, and NOT a proxy of decrypted bytes to dest (see spec §3).
+async fn reality_reject<S>(mut stream: S)
+where
+    S: AsyncWrite + Unpin,
+{
+    const BODY: &[u8] = b"<!doctype html><title>400</title>";
+    let header = format!(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        BODY.len()
+    );
+    let mut msg = header.into_bytes();
+    msg.extend_from_slice(BODY);
+    let _ = stream.write_all(&msg).await;
+    let _ = stream.shutdown().await; // close_notify on SslStream
 }
 
 /// Read the first frame (up to CLASSIFY_TIMEOUT) and classify it. Returns
@@ -320,6 +348,21 @@ mod tests {
             got.contains("200 OK") && got.contains("hi"),
             "probe must be transparently proxied to the decoy backend, got: {got:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn reality_inner_fail_writes_generic_error_not_decoy() {
+        // A duplex stand-in for the TLS stream.
+        let (client, server) = tokio::io::duplex(4096);
+        // reality_reject writes a generic error and shuts the write half.
+        reality_reject(server).await;
+        // The client side should read a 400 status line then EOF.
+        let mut buf = Vec::new();
+        let mut c = client;
+        use tokio::io::AsyncReadExt;
+        c.read_to_end(&mut buf).await.unwrap();
+        let s = String::from_utf8_lossy(&buf);
+        assert!(s.starts_with("HTTP/1.1 400"), "got: {s:?}");
     }
 
     #[test]
