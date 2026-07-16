@@ -215,17 +215,6 @@ fn run(
     clippy::too_many_arguments,
     reason = "mirrors the existing sync `spawn`; the dial parameters are all distinct config-derived values"
 )]
-// REALITY.4a: not yet wired into tunnel dispatch (config plumbing lands in a
-// later REALITY task) — dead in a non-test build, but exercised directly by
-// this module's own test, so the `dead_code` expectation is test-gated
-// (an unconditional `#[expect]` would itself go unfulfilled under `#[cfg(test)]`).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "REALITY.4a: not yet wired into tunnel dispatch; exercised directly by this module's own test"
-    )
-)]
 pub(crate) fn spawn_reality(
     host: String,
     port: u16,
@@ -257,13 +246,6 @@ pub(crate) fn spawn_reality(
 #[expect(
     clippy::too_many_arguments,
     reason = "parameters mirror `spawn_reality`; threading them is clearer than a struct here"
-)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "REALITY.4a: only reachable via `spawn_reality`, not yet wired into tunnel dispatch"
-    )
 )]
 async fn run_reality(
     host: &str,
@@ -339,13 +321,6 @@ async fn run_reality(
 /// `RealityStream` (inbound relay frames → socketpair), the socketpair
 /// (outbound datagrams → framed → RealityStream), and a keepalive timer
 /// (re-`Register`). Returns on any stream error/EOF so the caller reconnects.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "REALITY.4a: only reachable via `run_reality`, not yet wired into tunnel dispatch"
-    )
-)]
 async fn pump_reality<S>(
     mut stream: yip_utls::RealityStream<S>,
     sock: &tokio::net::UnixDatagram,

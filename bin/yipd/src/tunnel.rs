@@ -68,6 +68,14 @@ pub fn run(config: Config) -> io::Result<()> {
     // spawn `relay_client::spawn` and enter `relay_client::run_relay_tls`
     // instead of a UDP-socket driver.
     let mut relay_tls: Option<(String, u16, std::net::SocketAddr)> = None;
+    // `Rendezvous::Reality { host, port, pubkey, short_id, sni }` (REALITY.4a,
+    // rendezvous=reality://) resolves `host:port` up front exactly like the
+    // `Tls` arm above; `relay_reality` carries the full dial parameters
+    // forward to the transport dispatch below, which spawns
+    // `relay_client::spawn_reality` and enters the byte-identical
+    // `relay_client::run_relay_tls` data-plane loop.
+    type RelayRealityParams = (String, u16, [u8; 32], [u8; 8], String, std::net::SocketAddr);
+    let mut relay_reality: Option<RelayRealityParams> = None;
     let rendezvous: Option<Box<dyn crate::rendezvous::Rendezvous>> = match &config.rendezvous {
         None => None,
         Some(crate::config::Rendezvous::Udp(addr)) => Some(Box::new(
@@ -90,14 +98,38 @@ pub fn run(config: Config) -> io::Result<()> {
                     as Box<dyn crate::rendezvous::Rendezvous>,
             )
         }
-        // REALITY.4a (this task) only parses `rendezvous=reality://...`; the
-        // relay dial itself (mirroring the `Tls` arm above, once REALITY's
-        // handshake plumbing lands) is future work.
-        Some(crate::config::Rendezvous::Reality { .. }) => {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "rendezvous=reality:// dial is not implemented yet",
+        // `Rendezvous::Reality` (REALITY.4a, rendezvous=reality://...): same
+        // shape as the `Tls` arm above, plus the pinned relay pubkey/short_id
+        // and the borrowed SNI, all carried forward in `relay_reality` for
+        // `relay_client::spawn_reality` below.
+        Some(crate::config::Rendezvous::Reality {
+            host,
+            port,
+            pubkey,
+            short_id,
+            sni,
+        }) => {
+            let relay_addr = (host.as_str(), *port)
+                .to_socket_addrs()?
+                .next()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("rendezvous relay {host}:{port} resolved to no addresses"),
+                    )
+                })?;
+            relay_reality = Some((
+                host.clone(),
+                *port,
+                *pubkey,
+                *short_id,
+                sni.clone(),
+                relay_addr,
             ));
+            Some(
+                Box::new(crate::rendezvous::TlsRelayRendezvous::new(relay_addr))
+                    as Box<dyn crate::rendezvous::Rendezvous>,
+            )
         }
     };
     // Build the mesh membership directory (2c) only when the full mesh config is
@@ -125,9 +157,10 @@ pub fn run(config: Config) -> io::Result<()> {
         }
         _ => None,
     };
-    // `relay_only` (rendezvous=tls://, 3c.4) starts every peer straight in
-    // Relaying and skips Direct/UDP-punch, since UDP is blocked on that path.
-    let relay_only = relay_tls.is_some();
+    // `relay_only` (rendezvous=tls:// or rendezvous=reality://) starts every
+    // peer straight in Relaying and skips Direct/UDP-punch, since UDP is
+    // blocked on that path.
+    let relay_only = relay_tls.is_some() || relay_reality.is_some();
     let mut manager = PeerManager::new(
         config.local_private,
         config.local_public,
@@ -252,6 +285,42 @@ pub fn run(config: Config) -> io::Result<()> {
         let (relay_thread_sock, data_plane_sock) = UnixDatagram::pair()?;
         let sni = host.clone();
         crate::relay_client::spawn(host, port, sni, obf_key, self_node, relay_thread_sock);
+        return crate::relay_client::run_relay_tls(
+            tun_fd,
+            &mut manager,
+            relay_addr,
+            data_plane_sock,
+        );
+    }
+
+    // REALITY relay-dial (`rendezvous=reality://`, REALITY.4a): same
+    // straight-to-relay shape as the TLS relay-dial block above — `relay_only`
+    // already put `manager` in Relaying-only mode. The only difference is the
+    // outer dial itself: `relay_client::spawn_reality` drives a Chrome-faithful
+    // REALITY ClientHello + TLS 1.3 handshake (`yip_utls::connect`) on a
+    // confined tokio runtime, instead of `spawn`'s boring/browser-parrot dial.
+    // The data-plane tail is byte-identical to the `Tls` path: the same
+    // `SOCK_DGRAM` `UnixDatagram::pair()` socketpair convention and the same
+    // `run_relay_tls` pump — the data plane is scheme-agnostic.
+    if let Some((host, port, pubkey, short_id, sni, relay_addr)) = relay_reality {
+        let obf_key = yip_obf::derive_key(
+            config
+                .obf_psk
+                .as_ref()
+                .expect("rendezvous=reality:// requires obf_psk (enforced at config load)"),
+        );
+        let self_node = yip_rendezvous::node_id(&config.local_public);
+        let (relay_thread_sock, data_plane_sock) = UnixDatagram::pair()?;
+        crate::relay_client::spawn_reality(
+            host,
+            port,
+            pubkey,
+            short_id,
+            sni,
+            obf_key,
+            self_node,
+            relay_thread_sock,
+        );
         return crate::relay_client::run_relay_tls(
             tun_fd,
             &mut manager,

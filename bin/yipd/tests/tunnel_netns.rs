@@ -1010,3 +1010,70 @@ fn relay_tls_tunnel_ping() {
          relay-forwarded stayed 0, or the peer<->relay link was not TCP-only)"
     );
 }
+
+#[test]
+fn relay_reality_tunnel_ping() {
+    // REALITY.4a's headline money test: two UDP-blocked yipd peers tunnel to
+    // each other THROUGH a REALITY relay — `rendezvous=reality://host:port?
+    // pbk=&sid=&sni=` + `obf_psk` dials the relay with a Chrome-faithful
+    // REALITY ClientHello (`relay_client::spawn_reality`), registers, and the
+    // relay blindly forwards ALL peer traffic. Also proves the zero-cert-auth
+    // caveat's fail-closed side: a wrong `pbk=` yields NO tunnel (the relay's
+    // seal-open fails and splices the connection to `--reality-dest`
+    // instead). See run-netns-reality-relay.sh for the full topology and
+    // assertion set (money test + wrong-pubkey negative test).
+    //
+    // Requires root: netns creation + TUN devices + yip-rendezvous + openssl.
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false);
+    if !is_root {
+        eprintln!("SKIP relay_reality_tunnel_ping: needs root (run under sudo in CI)");
+        return;
+    }
+    // Use the release yipd binary: the inner Noise/FEC handshake+dataplane
+    // needs release for reasonable speed within the ping test's timeout
+    // budget, same reasoning as `relay_tls_tunnel_ping`.
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let workspace_root = std::path::Path::new(manifest_dir)
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root two levels up from CARGO_MANIFEST_DIR");
+    let yipd_release = workspace_root.join("target/release/yipd");
+    if !yipd_release.exists() {
+        eprintln!(
+            "SKIP relay_reality_tunnel_ping: release yipd not found at {}; \
+             run `cargo build --release -p yipd` first",
+            yipd_release.display()
+        );
+        return;
+    }
+    let rdv = yip_rendezvous_bin();
+    if !rdv.exists() {
+        eprintln!(
+            "SKIP relay_reality_tunnel_ping: yip-rendezvous binary not found at {}; \
+             run `cargo build -p yip-rendezvous-bin` first",
+            rdv.display()
+        );
+        return;
+    }
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/run-netns-reality-relay.sh"
+    );
+    let status = Command::new("bash")
+        .arg(script)
+        .arg(&yipd_release)
+        .arg(&rdv)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "relay-over-REALITY netns money/wrong-pubkey test failed (ping did not succeed over the \
+         REALITY relay, relay-forwarded stayed 0, or a wrong pbk was wrongly accepted)"
+    );
+}
