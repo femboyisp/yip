@@ -304,10 +304,21 @@ async fn run_reality(
         // would add ~40ms latency, gratuitous on a latency-sensitive VPN.
         let _ = tcp.set_nodelay(true);
 
-        let stream = match yip_utls::connect(tcp, sni, pubkey, short_id).await {
-            Ok(s) => s,
-            Err(e) => {
+        let handshake = tokio::time::timeout(
+            crate::tls::HANDSHAKE_TIMEOUT,
+            yip_utls::connect(tcp, sni, pubkey, short_id),
+        )
+        .await;
+        let stream = match handshake {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
                 eprintln!("relay_client(reality): REALITY handshake to {sni} failed: {e}");
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                continue;
+            }
+            Err(_elapsed) => {
+                eprintln!("relay_client(reality): REALITY handshake to {sni} timed out");
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                 backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
                 continue;
@@ -366,12 +377,29 @@ where
                 }
                 reader.push(&tls_read_buf[..n]);
                 while let Some(dg) = reader.next()? {
-                    // One datagram → one socketpair send (SOCK_DGRAM atomic).
-                    sock.send(&dg).await?;
+                    // Best-effort, non-blocking send: the socketpair is a
+                    // UDP-equivalent, never-a-reliability-layer channel (see
+                    // `send_socketpair`). A blocking `.await` here would stall
+                    // this whole `select!` loop — including the REALITY
+                    // stream read/keepalive arms — on a slow data-plane
+                    // drain, so drop on backpressure instead of awaiting it.
+                    match sock.try_send(&dg) {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(e) => return Err(e),
+                    }
                 }
             }
             r = sock.recv(&mut sock_read_buf) => {
                 let n = r?;
+                if n == 0 {
+                    // Fail closed on an empty datagram (see
+                    // `drain_socketpair`'s same invariant): framing a
+                    // zero-length payload would emit a `[0x00,0x00]` frame
+                    // that the peer's `FrameReader::next` rejects as a
+                    // bad-length self-inflicted protocol violation.
+                    continue;
+                }
                 let mut framed = Vec::new();
                 crate::tls::frame_datagram(&sock_read_buf[..n], &mut framed)?;
                 stream.write_all(&framed).await?;
