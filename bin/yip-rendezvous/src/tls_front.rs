@@ -279,6 +279,24 @@ async fn splice_to_dest(mut tcp: TcpStream, dest: SocketAddr, replay: &[u8]) {
     let _ = tokio::io::copy_bidirectional(&mut tcp, &mut up).await;
 }
 
+/// Build a temp dir unique to this *call*, not just this process: every test
+/// thread in a `cargo test` run shares one process, so `std::process::id()`
+/// alone is identical across all of them. A dir keyed only on the pid lets
+/// two concurrently-running tests race `write_self_signed` against the same
+/// cert/key files (mismatched-pair `KEY_VALUES_MISMATCH` / `NO_START_LINE`
+/// flakes). A per-call counter keeps every caller's files distinct. Shared by
+/// every test module (`tls_front`, `conn`, `conn_tunnel`) that needs a
+/// throwaway cert directory.
+#[cfg(test)]
+pub(crate) fn unique_tmp_dir(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("yip-rdv-{tag}-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 /// Write a throwaway self-signed cert/key PEM pair for `relay.test` into
 /// `dir`, returning `(cert_path, key_path)`. Shared by `tls_front`'s and
 /// `conn`'s tests (both need a real cert to hand `build_acceptor`/
@@ -314,8 +332,7 @@ mod tests {
 
     #[test]
     fn build_acceptor_from_pem_succeeds() {
-        let dir = std::env::temp_dir().join(format!("yip-rdv-tls-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = unique_tmp_dir("tls");
         let (cert, key) = write_self_signed(&dir);
         assert!(build_acceptor(&cert, &key).is_ok());
     }
@@ -327,8 +344,7 @@ mod tests {
     /// works, not the inner protocol.
     #[tokio::test]
     async fn localhost_tls_handshake_completes() {
-        let dir = std::env::temp_dir().join(format!("yip-rdv-tls-hs-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = unique_tmp_dir("tls-hs");
         let (cert, key) = write_self_signed(&dir);
         let acceptor = Arc::new(build_acceptor(&cert, &key).unwrap());
 
@@ -403,18 +419,11 @@ mod tests {
     /// deliberately a bare TCP server and cannot itself serve TLS.
     ///
     /// Multiple `reality_*` tests call `start_reality_front` (and so this
-    /// helper) concurrently; a dir keyed only on the pid would let two
-    /// threads race `write_self_signed` against the same cert/key files
-    /// (mismatched-pair `KEY_VALUES_MISMATCH` flakes) — a counter keeps each
-    /// call's files distinct.
+    /// helper) concurrently; `unique_tmp_dir` keeps each call's cert/key
+    /// files distinct so they can't race `write_self_signed` against the
+    /// same files (mismatched-pair `KEY_VALUES_MISMATCH` flakes).
     async fn spawn_cert_source() -> SocketAddr {
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "yip-rdv-reality-certsrc-{}-{n}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = unique_tmp_dir("reality-certsrc");
         let (cert, key) = write_self_signed(&dir);
         let acceptor = Arc::new(build_acceptor(&cert, &key).unwrap());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -433,8 +442,7 @@ mod tests {
     }
 
     async fn start_reality_front(dest: SocketAddr) -> SocketAddr {
-        let dir = std::env::temp_dir().join(format!("yip-rdv-reality-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = unique_tmp_dir("reality");
         let (cert, key) = write_self_signed(&dir);
         let acceptor = Arc::new(build_acceptor(&cert, &key).unwrap());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

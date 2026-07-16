@@ -281,8 +281,7 @@ mod tests {
                 .unwrap();
         });
 
-        let dir = std::env::temp_dir().join(format!("yip-rdv-conn-decoy-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::tls_front::unique_tmp_dir("conn-decoy");
         let (cert, key) = crate::tls_front::write_self_signed(&dir);
         let acceptor = std::sync::Arc::new(crate::tls_front::build_acceptor(&cert, &key).unwrap());
 
