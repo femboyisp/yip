@@ -40,6 +40,12 @@ bytes = { version = "1", default-features = false }
 # TCP (the outer TLS is a throwaway zero-auth costume; the inner yip handshake is
 # the real security).
 boring = "4.22.0"
+# REALITY.4a: the relay-dial thread hosts a CONFINED current-thread tokio
+# runtime to drive yip_utls's async REALITY client. The data-plane loop
+# (run_relay_tls + PeerManager) stays sync/epoll and tokio-free. tokio already
+# enters yipd transitively via yip-utls, so this is not a new heavyweight dep.
+tokio = { version = "1", features = ["rt", "net", "time", "io-util", "sync", "macros"] }
+yip-utls = { path = "../../crates/yip-utls" }
 
 [dev-dependencies]
 ed25519-dalek = { version = "2.1", default-features = false }

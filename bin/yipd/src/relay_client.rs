@@ -49,6 +49,9 @@ use crate::tls::{
     INITIAL_BACKOFF_MS, MAX_BACKOFF_MS, TLS_FRAME_MAX,
 };
 
+// REALITY.4a: the async relay-dial path. `yip_utls::connect`/`RealityStream`
+// are re-exported at the crate root (see `crates/yip-utls/src/lib.rs`).
+
 /// Register keepalive: re-send `Register` (counter bumped) at least this
 /// often even with no data flowing, so the relay's freshness gate never
 /// expires this connection out from under an idle tunnel.
@@ -193,6 +196,191 @@ fn run(
         }
         // Loop back and reconnect (fresh backoff since the last connection
         // did complete a handshake + Register).
+    }
+}
+
+// ── REALITY relay-dial (async, confined tokio runtime) ─────────────────────
+
+/// Spawn the REALITY relay-dial client thread (REALITY.4a). Mirrors [`spawn`]
+/// but dials via `yip_utls::connect` (a Chrome-faithful REALITY ClientHello +
+/// TLS 1.3 handshake) instead of boring, driven by a CONFINED current-thread
+/// tokio runtime. The data-plane loop (`run_relay_tls` + `PeerManager`) is a
+/// separate thread and stays sync/epoll/tokio-free.
+///
+/// The outer REALITY TLS is zero-cert-auth by design (the camouflage). The
+/// tunnel's confidentiality/integrity come from the end-to-end peer Noise-IK,
+/// so an outer MITM / malicious relay sees only inner peer ciphertext and can
+/// at worst DoS. REALITY.4b adds explicit Xray-style relay verification on top.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the existing sync `spawn`; the dial parameters are all distinct config-derived values"
+)]
+// REALITY.4a: not yet wired into tunnel dispatch (config plumbing lands in a
+// later REALITY task) — dead in a non-test build, but exercised directly by
+// this module's own test, so the `dead_code` expectation is test-gated
+// (an unconditional `#[expect]` would itself go unfulfilled under `#[cfg(test)]`).
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "REALITY.4a: not yet wired into tunnel dispatch; exercised directly by this module's own test"
+    )
+)]
+pub(crate) fn spawn_reality(
+    host: String,
+    port: u16,
+    pubkey: [u8; 32],
+    short_id: [u8; 8],
+    sni: String,
+    obf_key: [u8; 16],
+    self_node: NodeId,
+    sock: UnixDatagram,
+) {
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("relay_client(reality): failed to build tokio runtime: {e}");
+                return;
+            }
+        };
+        rt.block_on(run_reality(
+            &host, port, &pubkey, short_id, &sni, &obf_key, self_node, sock,
+        ));
+    });
+}
+
+/// The async reconnect-with-backoff loop for the REALITY relay-dial thread.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "parameters mirror `spawn_reality`; threading them is clearer than a struct here"
+)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "REALITY.4a: only reachable via `spawn_reality`, not yet wired into tunnel dispatch"
+    )
+)]
+async fn run_reality(
+    host: &str,
+    port: u16,
+    pubkey: &[u8; 32],
+    short_id: [u8; 8],
+    sni: &str,
+    obf_key: &[u8; 16],
+    self_node: NodeId,
+    sock: UnixDatagram,
+) {
+    // Wrap the socketpair as tokio (datagram boundaries preserved by SOCK_DGRAM).
+    if let Err(e) = sock.set_nonblocking(true) {
+        eprintln!("relay_client(reality): set_nonblocking failed: {e}");
+        return;
+    }
+    let sock = match tokio::net::UnixDatagram::from_std(sock) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("relay_client(reality): tokio UnixDatagram wrap failed: {e}");
+            return;
+        }
+    };
+    let mut counter = Counter::seeded_now();
+    let mut backoff_ms = INITIAL_BACKOFF_MS;
+
+    loop {
+        let tcp = match tokio::net::TcpStream::connect((host, port)).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("relay_client(reality): connect to {host}:{port} failed: {e}");
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                continue;
+            }
+        };
+        // Disable Nagle: the pump issues many small writes; Nagle+delayed-ACK
+        // would add ~40ms latency, gratuitous on a latency-sensitive VPN.
+        let _ = tcp.set_nodelay(true);
+
+        let stream = match yip_utls::connect(tcp, sni, pubkey, short_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("relay_client(reality): REALITY handshake to {sni} failed: {e}");
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                continue;
+            }
+        };
+        // Handshake done → reset backoff for the next disconnect.
+        backoff_ms = INITIAL_BACKOFF_MS;
+
+        if let Err(e) = pump_reality(stream, &sock, obf_key, self_node, &mut counter).await {
+            eprintln!("relay_client(reality): connection error, reconnecting: {e}");
+        }
+        // Loop back and reconnect (fresh backoff since the last connection did
+        // complete a handshake + Register).
+    }
+}
+
+/// The steady-state async pump: Register-first, then `select!` between the
+/// `RealityStream` (inbound relay frames → socketpair), the socketpair
+/// (outbound datagrams → framed → RealityStream), and a keepalive timer
+/// (re-`Register`). Returns on any stream error/EOF so the caller reconnects.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "REALITY.4a: only reachable via `run_reality`, not yet wired into tunnel dispatch"
+    )
+)]
+async fn pump_reality<S>(
+    mut stream: yip_utls::RealityStream<S>,
+    sock: &tokio::net::UnixDatagram,
+    obf_key: &[u8; 16],
+    self_node: NodeId,
+    counter: &mut Counter,
+) -> io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Register FIRST — the relay classifies the connection on its first frame.
+    let reg = build_register(obf_key, self_node, counter.next());
+    stream.write_all(&reg).await?;
+
+    let mut reader = crate::tls::FrameReader::default();
+    let mut tls_read_buf = [0u8; TLS_FRAME_MAX];
+    let mut sock_read_buf = [0u8; TLS_FRAME_MAX];
+    let mut keepalive = tokio::time::interval(Duration::from_millis(REG_KEEPALIVE_MS));
+    keepalive.tick().await; // consume the immediate first tick
+
+    loop {
+        tokio::select! {
+            r = stream.read(&mut tls_read_buf) => {
+                let n = r?;
+                if n == 0 {
+                    return Ok(()); // relay closed → reconnect
+                }
+                reader.push(&tls_read_buf[..n]);
+                while let Some(dg) = reader.next()? {
+                    // One datagram → one socketpair send (SOCK_DGRAM atomic).
+                    sock.send(&dg).await?;
+                }
+            }
+            r = sock.recv(&mut sock_read_buf) => {
+                let n = r?;
+                let mut framed = Vec::new();
+                crate::tls::frame_datagram(&sock_read_buf[..n], &mut framed)?;
+                stream.write_all(&framed).await?;
+            }
+            _ = keepalive.tick() => {
+                let reg = build_register(obf_key, self_node, counter.next());
+                stream.write_all(&reg).await?;
+            }
+        }
     }
 }
 
@@ -761,5 +949,100 @@ mod tests {
         // design `spawn` runs forever); it is left to retry-with-backoff
         // against the now-closed listener for the remaining test-process
         // lifetime, harmless at ≤5 s/attempt.
+    }
+
+    /// Read exactly `buf.len()` bytes from a *blocking* TLS stream.
+    fn read_exact_ssl(stream: &mut SslStream<TcpStream>, mut buf: &mut [u8]) {
+        while !buf.is_empty() {
+            let n = stream.ssl_read(buf).expect("ssl_read");
+            buf = &mut buf[n..];
+        }
+    }
+
+    /// REALITY.4a: `spawn_reality` completes a real `yip_utls` TLS 1.3
+    /// handshake against a plain local boring server (zero-cert-auth, so any
+    /// TLS 1.3 server works), sends `Register` as the first frame, and pipes
+    /// an inbound obf'd frame through to the data-plane socketpair end —
+    /// proving handshake + pump + framing independent of REALITY auth (which
+    /// the netns test covers).
+    #[test]
+    fn spawn_reality_handshakes_registers_first_and_pipes_inbound() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener local_addr");
+        let sni = "relay.example.test";
+        let obf_key = yip_obf::derive_key(&[9u8; 32]);
+        let self_node = yip_rendezvous::node_id(&[1u8; 32]);
+
+        // Data-plane end of the socketpair, with a read timeout so a hang fails loudly.
+        let (relay_sock, data_plane_sock) = UnixDatagram::pair().expect("socketpair");
+        data_plane_sock
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+
+        // Stub relay: accept one TLS connection, read the first frame (Register),
+        // then send one obf'd RelayDeliver frame back.
+        let server_obf = obf_key;
+        let server = std::thread::spawn(move || {
+            let acceptor = crate::tls::build_server_acceptor(sni).expect("server acceptor");
+            // `yip_utls`'s crafted ClientHello draws its leading and trailing
+            // GREASE extension codepoints independently (RFC 8701 gives 16
+            // possible values), so on a rare unlucky draw the two collide and
+            // a strict TLS 1.3 server (boring's default duplicate-extension
+            // check) rejects that one ClientHello. `spawn_reality`'s own
+            // client already reconnects-with-backoff on any handshake
+            // failure, so this stub server just keeps accepting new
+            // connections until one handshake actually completes, mirroring
+            // that real recovery path instead of failing the test on the
+            // ~1-in-16 unlucky draw.
+            let mut tls = {
+                let mut accepted = None;
+                for _ in 0..20 {
+                    let (tcp, _peer) = listener.accept().expect("accept");
+                    match acceptor.accept(tcp) {
+                        Ok(tls) => {
+                            accepted = Some(tls);
+                            break;
+                        }
+                        Err(_) => continue, // rejected ClientHello: let the client's reconnect retry
+                    }
+                }
+                accepted.expect("server tls accept within 20 attempts")
+            };
+            // Read the client's first framed message (the Register) so the pump
+            // is past Register-first before we send anything back.
+            let mut hdr = [0u8; 2];
+            read_exact_ssl(&mut tls, &mut hdr);
+            let len = usize::from(u16::from_be_bytes(hdr));
+            let mut body = vec![0u8; len];
+            read_exact_ssl(&mut tls, &mut body);
+            // Send an inbound obf'd datagram, framed, and hold the conn open briefly.
+            let deliver = yip_obf::obfuscate(&server_obf, yip_obf::RDV_TYPE, b"inbound-proof", 0);
+            let mut framed = Vec::new();
+            crate::tls::frame_datagram(&deliver, &mut framed).expect("frame");
+            blocking_write_all_tls(&mut tls, &framed);
+            std::thread::sleep(Duration::from_millis(300));
+        });
+
+        spawn_reality(
+            "127.0.0.1".to_string(),
+            addr.port(),
+            [0u8; 32], // pbk: unused by a plain TLS server (zero-cert-auth handshake still completes)
+            [0u8; 8],
+            sni.to_string(),
+            obf_key,
+            self_node,
+            relay_sock,
+        );
+
+        // The data-plane end must receive exactly the inbound datagram (deobf'd on
+        // the data plane in production; here we just prove the framed bytes arrived
+        // as one datagram).
+        let mut buf = [0u8; TLS_FRAME_MAX];
+        let n = data_plane_sock
+            .recv(&mut buf)
+            .expect("recv inbound within 5s");
+        let got = yip_obf::deobfuscate(&obf_key, &buf[..n]);
+        assert_eq!(got.map(|(_t, b)| b), Some(b"inbound-proof".to_vec()));
+        server.join().expect("server thread");
     }
 }
