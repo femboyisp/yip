@@ -258,7 +258,7 @@ indistinguishable from connecting to that site directly.
 **Status.** REALITY.1–3 (server-side transparent forwarding, the pure-Rust
 uTLS client library `yip-utls`, and stolen-cert forging) and REALITY.4a (the
 `yipd`-side `rendezvous=reality://` relay-dial client) are complete — see
-[REALITY relay-dial client](#reality-relay-dial-client--rendezvousrealityhostportpbksidsni-reality4a)
+[REALITY relay-dial client](#reality-relay-dial-client-rendezvousrealityhostportpbksidsni-reality4a)
 below.
 
 ### TLS relay-dial client (`rendezvous=tls://`, anti-DPI milestone 3c.4)
