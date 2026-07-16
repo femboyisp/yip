@@ -157,3 +157,20 @@ now tracked as its own milestone:
   authed path (only for the un-authed splice, which is `dest`'s own bytes). REALITY.5 will pursue
   matching the server flight to the borrowed `dest`'s stack (or at least to a common CDN template).
   All other advisor findings were folded directly into the REALITY.3 rev-3 spec.
+
+## REALITY.4 split into 4a + 4b (recorded 2026-07-16)
+
+REALITY.4 (client wiring) is staged into two PRs (user decision):
+- **REALITY.4a** — the core loop: `reality://host:port?pbk=&sid=&sni=` rendezvous scheme +
+  `yip_utls::connect` wired into yipd's relay-dial via a **confined current-thread tokio runtime**
+  on the relay-dial thread (Approach A; the sync/epoll data-plane loop stays tokio-free). Outer TLS
+  is zero-cert-auth; the tunnel rests on the **inner peer Noise-IK** (documented + wrong-pubkey
+  no-tunnel test). Spec: `docs/superpowers/specs/2026-07-16-reality-4a-client-wiring-design.md`.
+- **REALITY.4b** — **Xray-style relay verification, default ON** (user decision), toggled by
+  `verify=` on the `reality://` URL (4a hard-rejects `verify=` as 4b-only). The relay binds the
+  seal's ECDH shared secret (`ECDH(client_eph, relay_priv)` = the seal's own key) into the cert /
+  handshake it presents; the client derives the same secret and verifies, and on failure **falls
+  back to plain-browser behavior** instead of retry-looping (client-side active-probe resistance).
+  Needs a server-side addition — REALITY.3's forged leaf is self-signed by a throwaway key and does
+  NOT bind the shared secret — plus client verification + fallback in `yip_utls`. Security-sensitive;
+  gets its own spec.
