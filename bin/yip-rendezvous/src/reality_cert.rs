@@ -8,10 +8,14 @@
 //! security. See the design spec's §1 + Threat model.
 
 /// The subset of a real leaf certificate we copy into the forged leaf.
-/// AIA / SCTs / the original CA signature are intentionally NOT copied:
-/// they are bound to the real CA/CT-log keys and unreproducible, and in
-/// TLS 1.3 the Certificate message is encrypted so passive DPI never sees
-/// them. See spec §1 "Forge a leaf".
+/// SCTs and the original CA signature are intentionally NOT copied: they
+/// are bound to the real CA/CT-log keys and are cryptographically
+/// unreproducible by an ephemeral-key forgery — no amount of byte-copying
+/// fixes that. AIA (#75) IS copied (see `aia_der`), but is best-effort
+/// superficial fidelity, not a security property: in TLS 1.3 the
+/// Certificate message is encrypted, so passive DPI never sees either SCTs
+/// or AIA — they matter only to an active, config-holding prober that
+/// decrypts the connection. See spec §1 "Forge a leaf".
 pub struct StolenFields {
     pub subject_cn: Option<String>,
     pub dns_sans: Vec<String>,
@@ -22,6 +26,26 @@ pub struct StolenFields {
     pub key_usages: Vec<rcgen::KeyUsagePurpose>,
     pub eku: Vec<rcgen::ExtendedKeyUsagePurpose>,
     pub is_ca: bool,
+    /// Raw DER value of the dest leaf's Authority Information Access
+    /// extension (RFC 5280 §4.2.2.1, OID 1.3.6.1.5.5.7.1.1) — i.e. the
+    /// content bytes inside the extension's OCTET STRING (the DER-encoded
+    /// `AuthorityInfoAccessSyntax`), copied verbatim. `None` if the dest
+    /// leaf has no AIA extension, or if it could not be extracted.
+    ///
+    /// AIA is copyable (unlike SCTs — see the struct doc above), but
+    /// copying it is superficial fidelity, not real fidelity, for two
+    /// reasons (#75):
+    ///   1. It is passively invisible: TLS 1.3 encrypts the Certificate
+    ///      message, so this only matters to an active prober that holds
+    ///      the connection key and decrypts it — never to passive DPI.
+    ///   2. It is residually inconsistent: the copied AIA CA-issuers URL
+    ///      still points at the real dest's CA, but that CA did NOT sign
+    ///      this leaf (it's self-signed by a relay-ephemeral key per
+    ///      `forge_leaf`) — a prober that actually fetches and checks the
+    ///      AIA URL will find a mismatch. Copying it closes the "AIA is
+    ///      simply absent" tell without claiming to fully replicate the
+    ///      dest's PKI chain.
+    pub aia_der: Option<Vec<u8>>,
 }
 
 use rcgen::{
@@ -67,6 +91,20 @@ pub fn forge_leaf(
         IsCa::ExplicitNoCa
     };
 
+    // #75: re-emit the dest leaf's AIA extension byte-identically, if one
+    // was copied. See `StolenFields::aia_der` for why this is superficial
+    // (passively invisible under TLS 1.3; the copied CA-issuers URL points
+    // to a CA that did not sign this ephemeral-key leaf) rather than a
+    // security property.
+    if let Some(aia) = &fields.aia_der {
+        params
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 5, 5, 7, 1, 1],
+                aia.clone(),
+            ));
+    }
+
     params.self_signed(key)
 }
 
@@ -95,9 +133,22 @@ fn parse_asn1_time(
     parsed.unwrap_or(fallback)
 }
 
-/// Extract the copyable identity fields from a real leaf. Fields boring does
-/// not cleanly expose (AIA, SCTs) are intentionally not copied (see
-/// `StolenFields` / spec §1 — best-effort, passively invisible under TLS 1.3).
+/// Extract the AIA extension's raw value bytes from a leaf's DER, via
+/// `x509-parser` (boring does not expose AIA). Best-effort: any parse
+/// failure, or the extension simply being absent, yields `None` rather than
+/// panicking — see `StolenFields::aia_der`.
+fn extract_aia_der(leaf_der: &[u8]) -> Option<Vec<u8>> {
+    let (_, cert) = x509_parser::parse_x509_certificate(leaf_der).ok()?;
+    cert.extensions()
+        .iter()
+        .find(|e| e.oid == x509_parser::oid_registry::OID_PKIX_AUTHORITY_INFO_ACCESS)
+        .map(|e| e.value.to_vec())
+}
+
+/// Extract the copyable identity fields from a real leaf. SCTs are
+/// intentionally not copied — bound to CT-log keys, unreproducible (see
+/// `StolenFields`). AIA (#75) IS copied, best-effort, via `extract_aia_der`
+/// since boring does not expose it.
 pub fn extract_fields(leaf: &boring::x509::X509Ref) -> StolenFields {
     let subject_cn = leaf
         .subject_name()
@@ -129,6 +180,12 @@ pub fn extract_fields(leaf: &boring::x509::X509Ref) -> StolenFields {
         .map(|bn| bn.to_vec())
         .unwrap_or_default();
 
+    // #75: boring exposes no AIA accessor, so re-derive the leaf's DER and
+    // hand it to x509-parser. `to_der()` failing (should not happen for a
+    // leaf boring itself just parsed) degrades to `None`, same as AIA simply
+    // being absent — never a panic.
+    let aia_der = leaf.to_der().ok().and_then(|der| extract_aia_der(&der));
+
     StolenFields {
         subject_cn,
         dns_sans,
@@ -148,6 +205,7 @@ pub fn extract_fields(leaf: &boring::x509::X509Ref) -> StolenFields {
         ],
         eku: vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth],
         is_ca: false,
+        aia_der,
     }
 }
 
@@ -382,6 +440,35 @@ enum RefreshOutcome {
     NothingToDo,
 }
 
+/// A syntactically-valid `AuthorityInfoAccessSyntax` DER value (RFC 5280
+/// §4.2.2.1) — one `AccessDescription` with `accessMethod = id-ad-caIssuers`
+/// (1.3.6.1.5.5.7.48.2) and `accessLocation = uniformResourceIdentifier`
+/// `"http://example.test/ca.crt"`. Used as "known DER bytes" for the AIA
+/// round-trip tests below; built from primitives (not hand-counted magic
+/// lengths) so the encoding is trustworthy.
+#[cfg(test)]
+fn sample_aia_der() -> Vec<u8> {
+    let url = b"http://example.test/ca.crt";
+    // OID 1.3.6.1.5.5.7.48.2 (id-ad-caIssuers): 1*40+3=43=0x2B, then 6,1,5,5,7,48,2.
+    let oid: &[u8] = &[0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x02];
+    let mut general_name = vec![0x86, u8::try_from(url.len()).expect("test url fits in u8")];
+    general_name.extend_from_slice(url);
+    let mut access_description = Vec::new();
+    access_description.extend_from_slice(oid);
+    access_description.extend_from_slice(&general_name);
+    let mut access_description_seq = vec![
+        0x30,
+        u8::try_from(access_description.len()).expect("test content fits in u8"),
+    ];
+    access_description_seq.extend_from_slice(&access_description);
+    let mut aia = vec![
+        0x30,
+        u8::try_from(access_description_seq.len()).expect("test content fits in u8"),
+    ];
+    aia.extend_from_slice(&access_description_seq);
+    aia
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,6 +485,7 @@ mod tests {
             key_usages: vec![rcgen::KeyUsagePurpose::DigitalSignature],
             eku: vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth],
             is_ca: false,
+            aia_der: None,
         };
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = forge_leaf(&fields, &key).unwrap();
@@ -482,6 +570,7 @@ mod tests {
             key_usages: vec![rcgen::KeyUsagePurpose::DigitalSignature],
             eku: vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth],
             is_ca: false,
+            aia_der: None,
         };
         let key = rcgen::KeyPair::generate().unwrap();
         let acceptor = std::sync::Arc::new(build_forged_acceptor(&fields, &key).unwrap());
@@ -611,6 +700,7 @@ mod tests {
             key_usages: vec![rcgen::KeyUsagePurpose::DigitalSignature],
             eku: vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth],
             is_ca: false,
+            aia_der: None,
         };
         let key = KeyPair::generate().unwrap();
         Arc::new(build_forged_acceptor(&fields, &key).unwrap())
@@ -706,5 +796,82 @@ mod tests {
         let outcome = cache.apply_refresh("never.configured", None, t0, Duration::from_secs(3600));
 
         assert_eq!(outcome, RefreshOutcome::NothingToDo);
+    }
+
+    /// Build a sample leaf carrying a custom AIA extension with `content` as
+    /// its raw value, self-signed via rcgen, returned as DER.
+    fn leaf_with_aia_der(content: &[u8]) -> Vec<u8> {
+        let mut params = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "aia.test");
+        params.distinguished_name = dn;
+        params
+            .subject_alt_names
+            .push(SanType::DnsName("aia.test".to_owned().try_into().unwrap()));
+        params
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 5, 5, 7, 1, 1],
+                content.to_vec(),
+            ));
+        let key = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        cert.der().as_ref().to_vec()
+    }
+
+    /// #75: `extract_fields` must copy the dest leaf's AIA extension value
+    /// verbatim, and `forge_leaf` must re-emit it byte-identically in the
+    /// forged leaf — a config-holding prober decrypting the TLS 1.3
+    /// Certificate message should see the same AIA bytes the real `dest`
+    /// leaf had (even though the CA-issuers URL it points to did not sign
+    /// this ephemeral-key forgery — see `StolenFields::aia_der` docs).
+    #[test]
+    fn aia_round_trips_through_extract_and_forge() {
+        let known = sample_aia_der();
+        let leaf_der = leaf_with_aia_der(&known);
+        let leaf = boring::x509::X509::from_der(&leaf_der).unwrap();
+
+        let extracted = extract_fields(&leaf);
+        assert_eq!(
+            extracted.aia_der,
+            Some(known.clone()),
+            "extract_fields must copy the AIA extension value verbatim"
+        );
+
+        let key = KeyPair::generate().unwrap();
+        let forged = forge_leaf(&extracted, &key).unwrap();
+        let forged_der = forged.der().as_ref().to_vec();
+
+        let (_, parsed) = x509_parser::parse_x509_certificate(&forged_der)
+            .expect("forged leaf must be valid DER");
+        let aia_ext = parsed
+            .extensions()
+            .iter()
+            .find(|e| e.oid == x509_parser::oid_registry::OID_PKIX_AUTHORITY_INFO_ACCESS)
+            .expect("forged leaf must carry a re-emitted AIA extension");
+        assert_eq!(
+            aia_ext.value, known,
+            "forged leaf's AIA extension value must byte-match the stolen one"
+        );
+    }
+
+    /// A dest leaf with no AIA extension must extract to `aia_der: None` —
+    /// AIA is optional per RFC 5280, and its absence must not be treated as
+    /// an extraction failure.
+    #[test]
+    fn extract_fields_no_aia_is_none() {
+        let mut params = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "no-aia.test");
+        params.distinguished_name = dn;
+        params.subject_alt_names.push(SanType::DnsName(
+            "no-aia.test".to_owned().try_into().unwrap(),
+        ));
+        let key = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let leaf = boring::x509::X509::from_der(cert.der().as_ref()).unwrap();
+
+        let extracted = extract_fields(&leaf);
+        assert_eq!(extracted.aia_der, None);
     }
 }

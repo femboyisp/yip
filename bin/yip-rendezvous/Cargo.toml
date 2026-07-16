@@ -33,6 +33,13 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 rcgen = { version = "0.13.2", default-features = false, features = ["ring", "crypto", "pem"] }
 # REALITY.3: map boring Asn1Time validity onto rcgen's OffsetDateTime fields.
 time = { version = "0.3", default-features = false, features = ["parsing", "macros"] }
+# REALITY.3 (#75): boring does not expose the AIA extension, so we parse the
+# dest leaf's raw DER ourselves to copy it into the forged leaf byte-for-byte.
+# Pure-Rust (asn1-rs/der-parser backends) — no unsafe, compatible with this
+# crate's #![forbid(unsafe_code)]. default-features disabled: we only need
+# DER parsing, not the validate/verify/ring/aws-lc-rs signature-checking
+# features (this crate never chain-validates the forged/stolen certs).
+x509-parser = { version = "0.18.1", default-features = false }
 
 [lints]
 workspace = true
