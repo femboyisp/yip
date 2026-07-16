@@ -229,11 +229,9 @@ use std::time::Instant;
 /// One forged acceptor per configured server_name, plus the ephemeral signing
 /// key and each entry's last-successful-fetch instant (for the staleness
 /// bound). An SNI absent from the map is splice-only (spec §1 degrade rule).
-#[expect(
-    dead_code,
-    reason = "fetched_at is read only by spawn_refresh's staleness check; Task 8 wires \
-              spawn_refresh into main, and no unit test here drives its background loop"
-)]
+/// `fetched_at` is now read directly by `RealityCertCache::apply_refresh`
+/// (exercised by its own `#[cfg(test)]` unit tests), so no dead_code
+/// suppression is needed here any more.
 struct CacheEntry {
     acceptor: Arc<SslAcceptor>,
     fetched_at: Instant,
@@ -300,10 +298,52 @@ impl RealityCertCache {
         g.get(sni).map(|e| Arc::clone(&e.acceptor))
     }
 
-    /// Background refresh: every `refresh`, re-fetch each name. On success,
-    /// replace its acceptor and stamp. On failure, keep last-good UNLESS it is
-    /// now older than `max_stale`, in which case drop it (⇒ splice-only) rather
-    /// than serve an ever-staler forgery (spec §1 staleness bound).
+    /// Apply one refresh outcome for `name` to the cache. `new_acceptor` is
+    /// `Some(acc)` on full success (fetch AND forge both succeeded), `None`
+    /// on ANY refresh failure (fetch failed, or fetch succeeded but forge
+    /// failed). `now`/`max_stale` are injected (rather than reading
+    /// `Instant::now()` internally) so this stays pure and unit-testable
+    /// without real time or network. This is the ONLY place cache mutation +
+    /// the staleness bound (spec §1) are decided.
+    fn apply_refresh(
+        &self,
+        name: &str,
+        new_acceptor: Option<Arc<SslAcceptor>>,
+        now: Instant,
+        max_stale: Duration,
+    ) -> RefreshOutcome {
+        let mut g = self.entries.write().expect("cert cache poisoned");
+        match new_acceptor {
+            Some(acceptor) => {
+                g.insert(
+                    name.to_owned(),
+                    CacheEntry {
+                        acceptor,
+                        fetched_at: now,
+                    },
+                );
+                RefreshOutcome::Refreshed
+            }
+            None => match g.get(name) {
+                None => RefreshOutcome::NothingToDo,
+                Some(e) if now.saturating_duration_since(e.fetched_at) > max_stale => {
+                    g.remove(name); // degrade to splice-only
+                    RefreshOutcome::Evicted
+                }
+                Some(_) => RefreshOutcome::KeptStale,
+            },
+        }
+    }
+
+    /// Background refresh: every `refresh`, re-fetch each name. A tick has
+    /// exactly two outcomes per name: full success (fetch AND forge succeed)
+    /// replaces the acceptor and stamps `fetched_at`; ANY failure (fetch
+    /// failed, or fetch succeeded but forge failed) runs the staleness check
+    /// — keep last-good unless it is now older than `max_stale`, in which
+    /// case drop it (⇒ splice-only) rather than serve an ever-staler forgery
+    /// (spec §1 staleness bound). All cache-mutation/staleness logic lives in
+    /// the pure `apply_refresh` helper; this loop only fetches, forges, and
+    /// logs.
     #[expect(
         dead_code,
         reason = "not yet called from main.rs — Task 8 wires prewarm + spawn_refresh into the \
@@ -324,34 +364,37 @@ impl RealityCertCache {
             loop {
                 tick.tick().await;
                 for name in &this.server_names {
-                    match fetch_dest_leaf(dest, name, timeout).await {
-                        Ok(fields) => {
-                            if let Ok(acc) = build_forged_acceptor(&fields, &this.key) {
-                                let mut g = this.entries.write().expect("cert cache poisoned");
-                                g.insert(
-                                    name.clone(),
-                                    CacheEntry {
-                                        acceptor: Arc::new(acc),
-                                        fetched_at: Instant::now(),
-                                    },
-                                );
+                    let new_acceptor = match fetch_dest_leaf(dest, name, timeout).await {
+                        Ok(fields) => match build_forged_acceptor(&fields, &this.key) {
+                            Ok(acc) => Some(Arc::new(acc)),
+                            Err(e) => {
+                                eprintln!("reality-cert: refresh {name} forge failed: {e}");
+                                None
                             }
-                        }
-                        Err(_) => {
-                            let mut g = this.entries.write().expect("cert cache poisoned");
-                            let stale = g
-                                .get(name)
-                                .is_some_and(|e| e.fetched_at.elapsed() > max_stale);
-                            if stale {
-                                g.remove(name); // degrade to splice-only
-                                eprintln!("reality-cert: {name} exceeded max-stale; splice-only");
-                            }
-                        }
+                        },
+                        Err(_) => None,
+                    };
+                    let outcome = this.apply_refresh(name, new_acceptor, Instant::now(), max_stale);
+                    if outcome == RefreshOutcome::Evicted {
+                        eprintln!("reality-cert: {name} exceeded max-stale; splice-only");
                     }
                 }
             }
         });
     }
+}
+
+/// Result of `RealityCertCache::apply_refresh` for one name on one tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshOutcome {
+    /// Fetch AND forge both succeeded; the entry was replaced.
+    Refreshed,
+    /// Refresh failed but the existing entry is still within `max_stale`.
+    KeptStale,
+    /// Refresh failed and the existing entry exceeded `max_stale`; removed.
+    Evicted,
+    /// Refresh failed and there was no existing entry for this name.
+    NothingToDo,
 }
 
 #[cfg(test)]
@@ -548,5 +591,115 @@ mod tests {
         )
         .await;
         assert!(res.is_err(), "no SNI pre-warmed ⇒ refuse to start");
+    }
+
+    /// Build a throwaway forged acceptor for tests that only care about
+    /// cache bookkeeping (insert/replace/evict), not TLS behavior.
+    fn dummy_acceptor() -> Arc<SslAcceptor> {
+        let fields = StolenFields {
+            subject_cn: Some("dummy.test".to_owned()),
+            dns_sans: vec!["dummy.test".to_owned()],
+            ip_sans: Vec::new(),
+            not_before: time::macros::datetime!(2025-01-01 0:00 UTC),
+            not_after: time::macros::datetime!(2027-01-01 0:00 UTC),
+            serial: vec![0x01],
+            key_usages: vec![rcgen::KeyUsagePurpose::DigitalSignature],
+            eku: vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth],
+            is_ca: false,
+        };
+        let key = KeyPair::generate().unwrap();
+        Arc::new(build_forged_acceptor(&fields, &key).unwrap())
+    }
+
+    /// A cache pre-seeded with a single entry for `name` stamped `fetched_at`
+    /// — lets tests drive `apply_refresh` with an injected `now` instead of
+    /// real time, and without any network access.
+    fn cache_with_entry(name: &str, fetched_at: Instant) -> RealityCertCache {
+        let key = KeyPair::generate().unwrap();
+        let mut entries = HashMap::new();
+        entries.insert(
+            name.to_owned(),
+            CacheEntry {
+                acceptor: dummy_acceptor(),
+                fetched_at,
+            },
+        );
+        RealityCertCache {
+            entries: RwLock::new(entries),
+            server_names: vec![name.to_owned()],
+            key,
+        }
+    }
+
+    #[test]
+    fn apply_refresh_full_success_replaces_entry_and_stamps_now() {
+        let t0 = Instant::now();
+        let cache = cache_with_entry("a.test", t0);
+        let new_acc = dummy_acceptor();
+        let later = t0 + Duration::from_secs(10);
+
+        let outcome = cache.apply_refresh(
+            "a.test",
+            Some(Arc::clone(&new_acc)),
+            later,
+            Duration::from_secs(3600),
+        );
+
+        assert_eq!(outcome, RefreshOutcome::Refreshed);
+        assert!(
+            cache.acceptor_for("a.test").is_some(),
+            "replaced entry must still be served"
+        );
+        // Stamped at `later`: a failure just 1s after that must NOT be stale
+        // under a 3600s bound, proving the replace actually updated fetched_at.
+        let still_fresh = cache.apply_refresh(
+            "a.test",
+            None,
+            later + Duration::from_secs(1),
+            Duration::from_secs(3600),
+        );
+        assert_eq!(still_fresh, RefreshOutcome::KeptStale);
+    }
+
+    #[test]
+    fn apply_refresh_failure_within_max_stale_keeps_last_good() {
+        let t0 = Instant::now();
+        let cache = cache_with_entry("a.test", t0);
+        let max_stale = Duration::from_secs(3600);
+        let now = t0 + Duration::from_secs(60); // well within max_stale
+
+        let outcome = cache.apply_refresh("a.test", None, now, max_stale);
+
+        assert_eq!(outcome, RefreshOutcome::KeptStale);
+        assert!(
+            cache.acceptor_for("a.test").is_some(),
+            "last-good acceptor must still be served while within max_stale"
+        );
+    }
+
+    #[test]
+    fn apply_refresh_failure_past_max_stale_evicts_entry() {
+        let t0 = Instant::now();
+        let cache = cache_with_entry("a.test", t0);
+        let max_stale = Duration::from_secs(3600);
+        let now = t0 + Duration::from_secs(3601); // just past max_stale
+
+        let outcome = cache.apply_refresh("a.test", None, now, max_stale);
+
+        assert_eq!(outcome, RefreshOutcome::Evicted);
+        assert!(
+            cache.acceptor_for("a.test").is_none(),
+            "stale entry must be evicted ⇒ splice-only"
+        );
+    }
+
+    #[test]
+    fn apply_refresh_failure_for_unknown_name_is_a_noop() {
+        let t0 = Instant::now();
+        let cache = cache_with_entry("a.test", t0);
+
+        let outcome = cache.apply_refresh("never.configured", None, t0, Duration::from_secs(3600));
+
+        assert_eq!(outcome, RefreshOutcome::NothingToDo);
     }
 }
