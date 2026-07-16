@@ -8,6 +8,7 @@ mod conn_tunnel;
 mod reality;
 mod reality_cert;
 mod reality_io;
+mod reality_replay;
 mod tls_front;
 
 use std::net::SocketAddr;
