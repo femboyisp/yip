@@ -204,6 +204,16 @@ pub fn reality_auth_recover(
 /// Fail-closed: any missing key-share, wrong-length session id, failed AEAD
 /// open, unknown short_id, or out-of-skew timestamp returns `false`. A bool
 /// wrapper over [`reality_auth_recover`].
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "REALITY.3 Task 6: tls_front::run_reality_conn now calls reality_auth_recover \
+                   directly (it needs the recovered ts_min for the replay guard); this bool \
+                   wrapper is kept as a documented convenience API and is still exercised by \
+                   this module's own unit tests"
+    )
+)]
 pub fn reality_auth_open(
     reality_priv: &[u8; 32],
     info: &ClientHelloInfo,

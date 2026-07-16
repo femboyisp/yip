@@ -255,7 +255,12 @@ pub struct RealityCertCache {
 
 impl RealityCertCache {
     /// Fetch + forge for each server_name. A name whose fetch fails is left
-    /// out of the map (splice-only). Errors ONLY if not a single name warmed.
+    /// out of the map (splice-only). Errors if at least one name was
+    /// REQUESTED and not a single one warmed (misconfiguration guard) — but
+    /// an empty `server_names` (the "decoy-only" REALITY config: no SNI is
+    /// ever forged, so `run_reality_conn` splices every connection — same
+    /// spirit as the existing no-short-ids decoy-only mode) is not itself a
+    /// failure and returns a validly-empty cache.
     pub async fn prewarm(
         server_names: &[String],
         dest: SocketAddr,
@@ -282,7 +287,7 @@ impl RealityCertCache {
                 Err(e) => eprintln!("reality-cert: prewarm {name} failed: {e} (splice-only)"),
             }
         }
-        if entries.is_empty() {
+        if entries.is_empty() && !server_names.is_empty() {
             return Err("reality-cert: no server_name pre-warmed; refusing to start".to_owned());
         }
         Ok(Arc::new(Self {
@@ -591,6 +596,26 @@ mod tests {
         )
         .await;
         assert!(res.is_err(), "no SNI pre-warmed ⇒ refuse to start");
+    }
+
+    #[tokio::test]
+    async fn prewarm_with_no_requested_names_is_a_valid_empty_cache() {
+        // Zero REQUESTED names (the "decoy-only" REALITY config, mirroring the
+        // existing no-short-ids decoy-only mode) must NOT be treated as "every
+        // requested name failed" — it boots with a validly-empty, splice-only
+        // cache instead of refusing to start. Dest is unroutable to prove the
+        // dest is never even dialed for an empty request.
+        let dead: SocketAddr = "192.0.2.1:9".parse().unwrap();
+        let cache = RealityCertCache::prewarm(
+            &[],
+            dead,
+            Duration::from_secs(3600),
+            Duration::from_secs(21600),
+            Duration::from_millis(300),
+        )
+        .await
+        .expect("empty server_names must boot with an empty cache, not refuse to start");
+        assert!(cache.acceptor_for("anything.test").is_none());
     }
 
     /// Build a throwaway forged acceptor for tests that only care about

@@ -21,11 +21,6 @@ use crate::reality_io::{read_first_tls_record, FirstRecord, PrefixedStream};
 /// completed, so it does nothing to bound this phase (I1, slowloris).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Hard cap on concurrently in-flight TLS handshakes/connections on this
-/// front. Bounds the number of tasks/fds a slow-handshake flood can pin,
-/// independent of the per-handshake timeout above (I1).
-const MAX_TLS_CONNS: usize = 1024;
-
 /// Allowed clock skew (in minutes) between a REALITY client's embedded
 /// timestamp and the relay's wall clock (REALITY.1 Task 3). This is the
 /// relay/control tier, not the data plane's rekey-driven clock — wall time
@@ -48,6 +43,11 @@ pub struct RealityCfg {
     pub short_ids: Vec<[u8; 8]>,
     /// Allowed SNIs for the authenticated check; empty accepts any SNI.
     pub server_names: Vec<String>,
+    /// Per-SNI forged acceptors (REALITY.3 §1). `None` from `acceptor_for`
+    /// ⇒ splice-only for that SNI.
+    pub certs: Arc<crate::reality_cert::RealityCertCache>,
+    /// Anti-replay dedup on the auth seal (REALITY.3 §2).
+    pub replay: Arc<crate::reality_replay::ReplayGuard>,
 }
 
 pub struct TlsFrontCfg {
@@ -67,6 +67,10 @@ pub struct TlsFrontCfg {
     /// front's behavior byte-identical (terminate TLS immediately, classify
     /// the first frame, decoy-or-tunnel).
     pub reality: Option<RealityCfg>,
+    /// Hard cap on concurrently in-flight TLS handshakes/connections on this
+    /// front (I1, slowloris hardening — see `run_tls_front`). Callers outside
+    /// this module default to `1024`.
+    pub max_conns: usize,
 }
 
 /// Build a server TLS acceptor from PEM cert-chain + key files, configured to
@@ -84,7 +88,7 @@ pub fn build_acceptor(cert_path: &str, key_path: &str) -> Result<SslAcceptor, Er
 
 /// Accept TLS connections forever, spawning one handler task per connection.
 /// Bounded on two axes (I1, slowloris hardening): each handshake is capped by
-/// `HANDSHAKE_TIMEOUT`, and no more than `MAX_TLS_CONNS` connections may be
+/// `HANDSHAKE_TIMEOUT`, and no more than `cfg.max_conns` connections may be
 /// in flight (handshaking or tunneling) at once — at capacity, new TCP
 /// connections are dropped immediately rather than queued.
 pub async fn run_tls_front(
@@ -92,7 +96,7 @@ pub async fn run_tls_front(
     acceptor: Arc<SslAcceptor>,
     cfg: Arc<TlsFrontCfg>,
 ) {
-    let permits = Arc::new(Semaphore::new(MAX_TLS_CONNS));
+    let permits = Arc::new(Semaphore::new(cfg.max_conns));
     loop {
         let (tcp, _peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -104,7 +108,10 @@ pub async fn run_tls_front(
         // At capacity: refuse rather than queue unboundedly. The dropped `tcp`
         // closes on drop.
         let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
-            eprintln!("tls-front: at capacity ({MAX_TLS_CONNS} connections), dropping");
+            eprintln!(
+                "tls-front: at capacity ({} connections), dropping",
+                cfg.max_conns
+            );
             continue;
         };
         let acceptor = Arc::clone(&acceptor);
@@ -114,7 +121,7 @@ pub async fn run_tls_front(
             // (success, handshake failure, or timeout alike).
             let _permit = permit;
             if cfg.reality.is_some() {
-                run_reality_conn(tcp, &acceptor, &cfg).await;
+                run_reality_conn(tcp, &cfg).await;
                 return;
             }
             match tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_boring::accept(&acceptor, tcp))
@@ -144,7 +151,7 @@ pub async fn run_tls_front(
 /// real upstream would answer a broken record with its own alert/close, and
 /// silently dropping here would be an observable distinguisher (REALITY.1
 /// Task 3 review I-1).
-async fn run_reality_conn(mut tcp: TcpStream, acceptor: &Arc<SslAcceptor>, cfg: &Arc<TlsFrontCfg>) {
+async fn run_reality_conn(mut tcp: TcpStream, cfg: &Arc<TlsFrontCfg>) {
     let Some(r) = cfg.reality.as_ref() else {
         return; // unreachable: caller only takes this branch when Some
     };
@@ -174,41 +181,78 @@ async fn run_reality_conn(mut tcp: TcpStream, acceptor: &Arc<SslAcceptor>, cfg: 
         // not a panic.
         .unwrap_or(0);
 
-    // Decide auth fully before acting: no early return that fires only on a
-    // parse failure ahead of the `dest` connect — that would leak timing
-    // distinguishing "malformed hello" from "well-formed but unauthed".
-    let authed = super::reality::parse_client_hello(rec.get(5..).unwrap_or(&[]))
-        .map(|info| {
-            let sni_ok = r.server_names.is_empty()
-                || info
-                    .sni
-                    .as_deref()
-                    .is_some_and(|s| r.server_names.iter().any(|n| n == s));
-            sni_ok
-                && super::reality::reality_auth_open(
-                    &r.priv_key,
-                    &info,
-                    &r.short_ids,
-                    now_min,
-                    REALITY_SKEW_MIN,
-                )
-        })
-        .unwrap_or(false);
-
-    if authed {
-        let stream = PrefixedStream::new(rec, tcp);
-        match tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_boring::accept(acceptor, stream)).await
-        {
-            Ok(Ok(s)) => super::conn::handle_connection(s, Arc::clone(cfg)).await,
-            Ok(Err(e)) => eprintln!("tls-front: reality handshake failed: {e}"),
-            Err(_) => {
-                eprintln!("tls-front: reality handshake timed out after {HANDSHAKE_TIMEOUT:?}")
-            }
+    // Decide auth + routing fully before acting: no early return that fires
+    // only on a parse failure ahead of the `dest` connect — that would leak
+    // timing distinguishing "malformed hello" from "well-formed but unauthed".
+    // Every failure mode below (parse failure, disallowed SNI, failed auth,
+    // unparseable seal) collapses to `None` and falls through to the same
+    // `splice_to_dest` call at the bottom, so an active prober cannot
+    // distinguish them.
+    let info_opt = super::reality::parse_client_hello(rec.get(5..).unwrap_or(&[]));
+    let decision = info_opt.as_ref().and_then(|info| {
+        let sni = info.sni.as_deref()?;
+        if !(r.server_names.is_empty() || r.server_names.iter().any(|n| n == sni)) {
+            return None; // SNI not allowed ⇒ treat as un-authed
         }
-        return;
+        let ts_min = super::reality::reality_auth_recover(
+            &r.priv_key,
+            info,
+            &r.short_ids,
+            now_min,
+            REALITY_SKEW_MIN,
+        )?;
+        let seal = <[u8; 32]>::try_from(info.legacy_session_id.as_slice()).ok()?;
+        let acc = r.certs.acceptor_for(sni);
+        Some((sni.to_owned(), ts_min, seal, acc))
+    });
+
+    if let Some((sni, ts_min, seal, Some(acceptor))) = decision {
+        match decide_authed(&r.replay, seal, ts_min, now_min, true) {
+            Decision::Accept => {
+                let stream = PrefixedStream::new(rec, tcp);
+                match tokio::time::timeout(
+                    HANDSHAKE_TIMEOUT,
+                    tokio_boring::accept(&acceptor, stream),
+                )
+                .await
+                {
+                    Ok(Ok(s)) => super::conn::handle_connection(s, Arc::clone(cfg)).await,
+                    Ok(Err(e)) => {
+                        eprintln!("tls-front: reality forged handshake failed ({sni}): {e}")
+                    }
+                    Err(_) => eprintln!("tls-front: reality forged handshake timed out"),
+                }
+                return;
+            }
+            Decision::Splice => {} // fall through to splice
+        }
     }
 
     splice_to_dest(tcp, r.dest, &rec).await;
+}
+
+/// Post-auth routing decision (pure, testable). An authed hello routes to the
+/// forged acceptor only if (a) its SNI has a forged acceptor AND (b) the seal
+/// is fresh per the replay guard; otherwise splice to dest.
+pub(crate) enum Decision {
+    Accept,
+    Splice,
+}
+
+pub(crate) fn decide_authed(
+    replay: &crate::reality_replay::ReplayGuard,
+    seal: [u8; 32],
+    ts_min: u64,
+    now_min: u64,
+    sni_has_acceptor: bool,
+) -> Decision {
+    if !sni_has_acceptor {
+        return Decision::Splice;
+    }
+    match replay.check(seal, ts_min, now_min) {
+        crate::reality_replay::Verdict::Fresh => Decision::Accept,
+        crate::reality_replay::Verdict::Replay => Decision::Splice,
+    }
 }
 
 /// Connect to the real upstream `dest`, replay `replay` (the bytes already
@@ -222,7 +266,7 @@ async fn run_reality_conn(mut tcp: TcpStream, acceptor: &Arc<SslAcceptor>, cfg: 
 /// they both end up here.
 async fn splice_to_dest(mut tcp: TcpStream, dest: SocketAddr, replay: &[u8]) {
     // Bound the connect: `dest` is a REMOTE site, so a black-holed/slow upstream
-    // would otherwise pin this connection's `MAX_TLS_CONNS` permit for the full
+    // would otherwise pin this connection's `max_conns` permit for the full
     // OS connect timeout — a flood could exhaust the front, and a REALITY front
     // that stops answering is itself an availability distinguisher (review M-1).
     let Ok(Ok(mut up)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(dest)).await
@@ -298,6 +342,7 @@ mod tests {
             base: Instant::now(),
             routes: Arc::new(Mutex::new(std::collections::HashMap::new())),
             reality: None,
+            max_conns: 1024,
         });
         tokio::spawn(run_tls_front(listener, acceptor, cfg));
 
@@ -352,6 +397,41 @@ mod tests {
         rec
     }
 
+    /// A local TLS server (self-signed) that answers any SNI — a stand-in
+    /// `dest` purely for `RealityCertCache::prewarm` to fetch a leaf from.
+    /// Separate from `spawn_dest_banner` (the splice target), which is
+    /// deliberately a bare TCP server and cannot itself serve TLS.
+    ///
+    /// Multiple `reality_*` tests call `start_reality_front` (and so this
+    /// helper) concurrently; a dir keyed only on the pid would let two
+    /// threads race `write_self_signed` against the same cert/key files
+    /// (mismatched-pair `KEY_VALUES_MISMATCH` flakes) — a counter keeps each
+    /// call's files distinct.
+    async fn spawn_cert_source() -> SocketAddr {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "yip-rdv-reality-certsrc-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key) = write_self_signed(&dir);
+        let acceptor = Arc::new(build_acceptor(&cert, &key).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((tcp, _)) = listener.accept().await {
+                    let acceptor = Arc::clone(&acceptor);
+                    tokio::spawn(async move {
+                        let _ = tokio_boring::accept(&acceptor, tcp).await;
+                    });
+                }
+            }
+        });
+        addr
+    }
+
     async fn start_reality_front(dest: SocketAddr) -> SocketAddr {
         let dir = std::env::temp_dir().join(format!("yip-rdv-reality-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -359,6 +439,22 @@ mod tests {
         let acceptor = Arc::new(build_acceptor(&cert, &key).unwrap());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+
+        // Un-authed hellos never reach `certs`/`replay` (auth fails first), but
+        // constructing `RealityCfg` still needs a real, non-empty cert cache —
+        // `prewarm` refuses to start with zero warmed names.
+        let cert_src = spawn_cert_source().await;
+        let certs = crate::reality_cert::RealityCertCache::prewarm(
+            &["cache.test".to_owned()],
+            cert_src,
+            Duration::from_secs(3600),
+            Duration::from_secs(21600),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("prewarm at least one SNI against the local cert source");
+        let replay = Arc::new(crate::reality_replay::ReplayGuard::new(0, 65536));
+
         let cfg = Arc::new(TlsFrontCfg {
             server: Arc::new(Mutex::new(RendezvousServer::new(0))),
             obf_key: [0u8; 16],
@@ -370,7 +466,10 @@ mod tests {
                 priv_key: [7u8; 32],
                 short_ids: Vec::new(), // no client can authenticate ⇒ everything forwards
                 server_names: Vec::new(),
+                certs,
+                replay,
             }),
+            max_conns: 1024,
         });
         tokio::spawn(run_tls_front(listener, acceptor, cfg));
         addr
@@ -423,5 +522,34 @@ mod tests {
             b"HELLO-DEST-OVERSIZE",
         )
         .await;
+    }
+
+    // ---- decide_authed (pure routing decision) ----
+
+    /// A seal that is `Fresh` the first time routes to `Accept`; the second,
+    /// identical seal is a replay and must flip the decision to `Splice`.
+    #[test]
+    fn decide_replay_flips_to_splice() {
+        let guard = crate::reality_replay::ReplayGuard::new(0, 65536);
+        let seal = [5u8; 32];
+        assert!(matches!(
+            decide_authed(&guard, seal, 0, 0, /* sni_has_acceptor= */ true),
+            Decision::Accept
+        ));
+        assert!(matches!(
+            decide_authed(&guard, seal, 0, 0, true),
+            Decision::Splice
+        ));
+    }
+
+    /// An SNI with no forged acceptor is splice-only regardless of the seal's
+    /// freshness — the replay guard is never even consulted.
+    #[test]
+    fn decide_unknown_sni_splices() {
+        let guard = crate::reality_replay::ReplayGuard::new(0, 65536);
+        assert!(matches!(
+            decide_authed(&guard, [6u8; 32], 0, 0, /* sni_has_acceptor= */ false),
+            Decision::Splice
+        ));
     }
 }

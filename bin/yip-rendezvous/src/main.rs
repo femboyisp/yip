@@ -313,6 +313,11 @@ async fn main() -> std::io::Result<()> {
     // REALITY config: presence of --reality-dest enables it. --reality-dest
     // supersedes --decoy at runtime (tls_front branches on cfg.reality first),
     // so accepting both flags together is harmless.
+    //
+    // The cert cache (`certs`) and replay guard (`replay`) below use fixed
+    // defaults (refresh/max-stale/timeout/bucket-cap); Task 8 exposes these as
+    // `--reality-*` flags and adds `certs.spawn_refresh(..)` — out of scope
+    // here, so the cache is prewarmed once at startup and never refreshed yet.
     let reality_cfg: Option<RealityCfg> = match reality_dest {
         Some(ref d) => {
             let dest: SocketAddr = d.parse().unwrap_or_else(|e| {
@@ -323,11 +328,30 @@ async fn main() -> std::io::Result<()> {
                 eprintln!("--reality-dest requires --reality-private-key");
                 std::process::exit(2);
             };
+            let certs = reality_cert::RealityCertCache::prewarm(
+                &reality_server_names,
+                dest,
+                Duration::from_secs(3600),
+                Duration::from_secs(21600),
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("fatal: {e}");
+                std::process::exit(1);
+            });
+            let start_min = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() / 60)
+                .unwrap_or(0);
+            let replay = Arc::new(reality_replay::ReplayGuard::new(start_min, 65536));
             Some(RealityCfg {
                 dest,
                 priv_key,
                 short_ids: reality_short_ids,
                 server_names: reality_server_names,
+                certs,
+                replay,
             })
         }
         None => None,
@@ -384,6 +408,7 @@ async fn main() -> std::io::Result<()> {
             // REALITY.1 Task 4: wired from --reality-*; None keeps the 3c.3
             // Trojan front's behavior byte-identical.
             reality: reality_cfg,
+            max_conns: 1024,
         });
         tokio::spawn(tls_front::run_tls_front(tcp, acceptor, cfg));
     }

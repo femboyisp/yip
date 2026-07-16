@@ -156,6 +156,7 @@ mod tests {
             base: Instant::now(),
             routes: Arc::new(Mutex::new(HashMap::new())),
             reality: None,
+            max_conns: 1024,
         })
     }
 

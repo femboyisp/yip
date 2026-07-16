@@ -296,6 +296,7 @@ mod tests {
             base: std::time::Instant::now(),
             routes: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             reality: None,
+            max_conns: 1024,
         });
         tokio::spawn(crate::tls_front::run_tls_front(listener, acceptor, cfg));
 
