@@ -6,6 +6,7 @@
 mod conn;
 mod conn_tunnel;
 mod reality;
+mod reality_cert;
 mod reality_io;
 mod tls_front;
 

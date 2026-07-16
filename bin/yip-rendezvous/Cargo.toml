@@ -28,12 +28,11 @@ tokio-boring = "4.22.0"
 # which needs raw 32-byte-key construction — `ring::agreement` doesn't
 # accept raw private-key bytes).
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-
-[dev-dependencies]
-# "pem" is required in addition to the brief's ["ring", "crypto"]: the test
-# helper writes PEM (cert.pem() / key_pair.serialize_pem()) for
-# set_certificate_chain_file/set_private_key_file, which take PEM files.
+# REALITY.3: runtime leaf forgery for the stolen-cert authed acceptor
+# (src/reality_cert.rs). Same feature set the tests already used.
 rcgen = { version = "0.13.2", default-features = false, features = ["ring", "crypto", "pem"] }
+# REALITY.3: map boring Asn1Time validity onto rcgen's OffsetDateTime fields.
+time = { version = "0.3", default-features = false, features = ["parsing", "macros"] }
 
 [lints]
 workspace = true
