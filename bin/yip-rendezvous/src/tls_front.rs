@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use boring::error::ErrorStack;
+use boring::pkey::PKey;
 use boring::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -83,6 +84,35 @@ pub fn build_acceptor(cert_path: &str, key_path: &str) -> Result<SslAcceptor, Er
     b.check_private_key()?;
     // ALPN in the conventional browser-server order.
     b.set_alpn_protos(b"\x02h2\x08http/1.1")?;
+    Ok(b.build())
+}
+
+/// Build a throwaway, in-memory, self-signed `SslAcceptor` for the
+/// REALITY-only case where the operator did not supply `--tls-cert`/
+/// `--tls-key` (REALITY.3 §1 forges its own per-SNI cert from the stolen
+/// `dest` leaf, so an operator cert is no longer required). This acceptor is
+/// never actually used to serve a REALITY connection: the authed branch
+/// (`run_reality_conn`) builds its acceptor from `RealityCfg::certs` instead,
+/// and every other connection is either spliced to `dest` or dropped before
+/// `tokio_boring::accept` is called on this one — it exists purely so
+/// `run_tls_front`'s non-REALITY code path still has a well-formed acceptor
+/// to hold. Generated fresh at each startup; no PEM files touch disk.
+pub fn build_throwaway_acceptor() -> Result<SslAcceptor, String> {
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["reality-throwaway.invalid".to_owned()])
+            .map_err(|e| e.to_string())?;
+    let der = certified.cert.der().as_ref().to_vec();
+    let x509 = boring::x509::X509::from_der(&der).map_err(|e| e.to_string())?;
+    let pkey = PKey::private_key_from_der(&certified.key_pair.serialize_der())
+        .map_err(|e| e.to_string())?;
+
+    let mut b =
+        SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).map_err(|e| e.to_string())?;
+    b.set_certificate(&x509).map_err(|e| e.to_string())?;
+    b.set_private_key(&pkey).map_err(|e| e.to_string())?;
+    b.check_private_key().map_err(|e| e.to_string())?;
+    b.set_alpn_protos(b"\x02h2\x08http/1.1")
+        .map_err(|e| e.to_string())?;
     Ok(b.build())
 }
 
@@ -335,6 +365,34 @@ mod tests {
         let dir = unique_tmp_dir("tls");
         let (cert, key) = write_self_signed(&dir);
         assert!(build_acceptor(&cert, &key).is_ok());
+    }
+
+    /// `build_throwaway_acceptor` (Task 8: the REALITY-only, no-operator-cert
+    /// fallback) must itself be a genuinely working TLS acceptor — a real
+    /// client can complete a handshake against it — even though nothing in
+    /// REALITY mode ever routes a live connection to it (that acceptor is
+    /// only reachable via the non-REALITY `tokio_boring::accept` fallback in
+    /// `run_tls_front`).
+    #[tokio::test]
+    async fn build_throwaway_acceptor_completes_a_real_handshake() {
+        let acceptor = Arc::new(build_throwaway_acceptor().expect("build throwaway acceptor"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                let _ = tokio_boring::accept(&acceptor, tcp).await;
+            }
+        });
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let connector = build_test_client_connector();
+        let config = connector.configure().unwrap();
+        let result = tokio_boring::connect(config, "reality-throwaway.invalid", tcp).await;
+        assert!(
+            result.is_ok(),
+            "client TLS handshake against the throwaway acceptor must complete: {:?}",
+            result.err()
+        );
     }
 
     /// End-to-end localhost smoke test: `run_tls_front` accepts a real TCP

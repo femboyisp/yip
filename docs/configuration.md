@@ -155,9 +155,11 @@ yip-rendezvous <listen-addr> [--obf-psk <hex64>]
 yip-rendezvous <listen-addr> --obf-psk <hex64> \
                --listen-tcp <addr> --tls-cert <path> --tls-key <path> [--decoy <addr>]
 yip-rendezvous <listen-addr> --obf-psk <hex64> \
-               --listen-tcp <addr> --tls-cert <path> --tls-key <path> \
+               --listen-tcp <addr> [--tls-cert <path> --tls-key <path>] \
                --reality-dest <host:port> --reality-private-key <hex64> \
-               [--reality-short-id <hex16>]... [--reality-server-name <name>]...
+               [--reality-short-id <hex16>]... [--reality-server-name <name>]... \
+               [--reality-cert-refresh-secs <secs>] [--reality-cert-max-stale-secs <secs>] \
+               [--reality-replay-max-bucket <n>] [--reality-max-inflight <n>]
 yip-rendezvous --version | -V
 ```
 
@@ -193,7 +195,7 @@ an HTTP probe, a scanner, a plain browser, garbage bytes, or silence — is
 transparently reverse-proxied to the decoy backend. A prober who does not hold
 `obf_psk` therefore sees only an ordinary HTTPS site.
 
-### REALITY-style TLS front (`--reality-dest`, anti-DPI milestone REALITY.1)
+### REALITY-style TLS front (`--reality-dest`, anti-DPI milestone REALITY.1–3)
 
 `--reality-dest` opts the `--listen-tcp` front into full Xray-style REALITY,
 a stronger active-probe defense than the 3c.3 Trojan model above. Instead of
@@ -207,28 +209,59 @@ both are given, REALITY mode is used and `--decoy` is silently ignored.
 
 | Flag | Value | Notes |
 |---|---|---|
-| `--reality-dest <host:port>` | e.g. `www.apple.com:443` | The real upstream to splice un-authed connections to. Enables REALITY mode. Requires `--listen-tcp`/`--tls-cert`/`--tls-key` — the authed branch still terminates TLS with the configured cert. |
+| `--reality-dest <host:port>` | e.g. `www.apple.com:443` | The real upstream to splice un-authed connections to, and the source the relay steals a live leaf certificate from at startup. Enables REALITY mode. Requires `--listen-tcp` and `--reality-private-key`. |
 | `--reality-private-key <hex64>` | 32 bytes hex | The relay's REALITY X25519 private key. **Required** with `--reality-dest` — omitting it is a fatal startup error. |
 | `--reality-short-id <hex16>` | 8 bytes hex | A client auth token. **Repeatable.** A client's sealed ClientHello must carry one of these to authenticate. With none configured, no client can ever authenticate, so **every** connection forwards to `dest`. |
-| `--reality-server-name <name>` | domain string | An allowed SNI for the authenticated check. **Repeatable**; none configured ⇒ accept any SNI. **Must be lowercase with no trailing dot** — the match is exact/case-sensitive (mirrors Xray REALITY semantics), not validated or normalized at startup; a mismatched SNI just forwards the client to `dest` like any other un-authed connection. |
+| `--reality-server-name <name>` | domain string | An allowed SNI for the authenticated check, and the name the relay pre-warms a forged, stolen-identity certificate for at startup (see below). **Repeatable**; none configured ⇒ accept any SNI, but then no SNI ever has a forged cert, so every connection splices to `dest` (a valid "decoy-only" mode). **Must be lowercase with no trailing dot** — the match is exact/case-sensitive (mirrors Xray REALITY semantics), not validated or normalized at startup; a mismatched SNI just forwards the client to `dest` like any other un-authed connection. |
+| `--reality-cert-refresh-secs <secs>` | integer, default `3600` | How often the relay re-fetches and re-forges each `--reality-server-name`'s leaf from `dest` in the background. |
+| `--reality-cert-max-stale-secs <secs>` | integer, default `21600` | How long a forged cert may keep serving after its refresh starts failing before that SNI degrades to splice-only. Bounds how far a forged cert can drift from `dest`'s real (possibly since-rotated) certificate. |
+| `--reality-replay-max-bucket <n>` | integer, default `16384` | Per-shard, per-minute cap on the anti-replay dedup set for authed auth seals. A shard/minute that fills up fail-safes to treating further seals as replays (splice), rather than growing unboundedly under a flood. |
+| `--reality-max-inflight <n>` | integer, default `1024` | Hard cap on concurrently in-flight connections on the `--listen-tcp` front (REALITY and non-REALITY alike). At capacity, new TCP connections are dropped immediately rather than queued (slowloris hardening). |
+
+`--tls-cert`/`--tls-key` are **no longer required** when `--reality-dest` is
+set: REALITY.3 forges its own per-SNI leaf certificate (see below), so the
+operator does not need a real cert for the relay's own domain. If
+`--tls-cert`/`--tls-key` are *also* supplied under REALITY they are still
+accepted but unused — REALITY's authed branch always serves the forged cert,
+never the operator's. (Without `--reality-dest`, `--tls-cert`/`--tls-key`
+remain required for the plain 3c.3 Trojan front, as before.)
+
+**At startup**, the relay dials `--reality-dest` once per
+`--reality-server-name`, steals the live leaf's identity fields (subject,
+SAN, validity window, serial, keyUsage/EKU, basicConstraints — see the
+REALITY.3 design spec for exactly what is and is not copied), and forges a
+leaf with those fields self-signed by a relay-ephemeral key, served from a
+**TLS-1.3-only** `SslAcceptor` (pinning out TLS 1.2 keeps the Certificate
+message encrypted, so the forged identity is never visible to passive DPI).
+An SNI whose fetch fails at startup boots anyway — it simply has no forged
+cert and **degrades to splice-only** for that name (the relay still refuses
+to start only if *every* requested SNI fails to pre-warm). A background task
+then re-fetches/re-forges each name every `--reality-cert-refresh-secs`;
+a name whose refresh keeps failing keeps serving its last-good forged cert
+until it exceeds `--reality-cert-max-stale-secs`, at which point it too
+degrades to splice-only rather than serving an ever-staler forgery.
 
 **Authenticated** connections (valid seal, known `short_id`, timestamp
-within the freshness window, and SNI match if any `--reality-server-name`
-is configured) are served the relay tunnel — TLS terminated with the
-`--tls-cert`/`--tls-key` pair, same as the 3c.3 Trojan front. **Everything
-else** — an active prober, a scanner, a plain browser, or any connection
-without valid REALITY auth, *including malformed or oversized TLS
+within the freshness window, SNI match if any `--reality-server-name` is
+configured, a fresh — not previously seen — auth seal per
+`--reality-replay-max-bucket`'s dedup window, *and* a live forged cert for
+that SNI) are served the relay tunnel, TLS terminated with the forged leaf.
+**Everything else** — an active prober, a scanner, a plain browser, a
+replayed auth seal, an SNI with no (or an evicted) forged cert, or any
+connection without valid REALITY auth, *including malformed or oversized TLS
 records* — is transparently spliced to the real upstream `--reality-dest`,
 replaying the bytes already read, so the prober completes a genuine
 handshake with the real site and sees **its own** real cert —
 indistinguishable from connecting to that site directly.
 
-**Status.** REALITY.1 is the *server* side only. The yip client that embeds
-REALITY auth into its ClientHello is milestone **REALITY.2** and has not
-shipped yet — today the authed path is exercised by unit and integration
-tests, but no production `yipd` client authenticates. Until REALITY.2
-ships, the relay behaves as a perfect "front for `<dest>`" server for all
-live traffic: every real connection lacks a valid seal and is forwarded.
+**Status.** REALITY.1–3 (server-side transparent forwarding, the pure-Rust
+uTLS client library `yip-utls`, and stolen-cert forging) are complete. The
+`yip-utls` client crate is not yet wired into `yipd`'s production
+rendezvous-dial path, so today the authed path is exercised by unit and
+integration tests, but no production `yipd` client authenticates yet.
+Until that wiring lands, the relay behaves as a perfect "front for `<dest>`"
+server for all live traffic: every real connection lacks a valid seal and is
+forwarded.
 
 ### TLS relay-dial client (`rendezvous=tls://`, anti-DPI milestone 3c.4)
 

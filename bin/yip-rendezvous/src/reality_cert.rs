@@ -6,14 +6,6 @@
 //! zero-CA-auth by design, so the forged chain intentionally does not
 //! validate against a public CA; the inner yip handshake is the real
 //! security. See the design spec's §1 + Threat model.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "REALITY.3 Task 1: pure leaf-forging core, exercised by its own unit test; \
-                   not yet called from main.rs — Task 2 wires it into the async TLS front"
-    )
-)]
 
 /// The subset of a real leaf certificate we copy into the forged leaf.
 /// AIA / SCTs / the original CA signature are intentionally NOT copied:
@@ -237,12 +229,6 @@ struct CacheEntry {
     fetched_at: Instant,
 }
 
-#[expect(
-    dead_code,
-    reason = "server_names/key are read only by spawn_refresh (iterates names, reuses the \
-              stable key); Task 8 wires spawn_refresh into main, and no unit test here drives \
-              its background loop"
-)]
 pub struct RealityCertCache {
     /// server_name -> live acceptor. Absent ⇒ splice-only.
     entries: RwLock<HashMap<String, CacheEntry>>,
@@ -349,12 +335,6 @@ impl RealityCertCache {
     /// (spec §1 staleness bound). All cache-mutation/staleness logic lives in
     /// the pure `apply_refresh` helper; this loop only fetches, forges, and
     /// logs.
-    #[expect(
-        dead_code,
-        reason = "not yet called from main.rs — Task 8 wires prewarm + spawn_refresh into the \
-                  TLS front; unit-testing an infinite background loop's ticks belongs there, \
-                  not in this module's offline tests"
-    )]
     pub fn spawn_refresh(
         self: &Arc<Self>,
         dest: SocketAddr,
