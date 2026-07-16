@@ -344,9 +344,31 @@ fn parse_reality_rendezvous(rest: &str) -> io::Result<Rendezvous> {
             )
         })?;
         match key {
-            "pbk" => pbk = Some(hex_to_32(value)?),
-            "sid" => sid = Some(hex_to_8(value)?),
+            "pbk" => {
+                if pbk.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "reality:// duplicate pbk=",
+                    ));
+                }
+                pbk = Some(hex_to_32(value)?);
+            }
+            "sid" => {
+                if sid.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "reality:// duplicate sid=",
+                    ));
+                }
+                sid = Some(hex_to_8(value)?);
+            }
             "sni" => {
+                if sni.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "reality:// duplicate sni=",
+                    ));
+                }
                 if value.is_empty() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -1143,6 +1165,55 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         assert!(
             Config::parse(&no_psk).is_err(),
             "reality:// without obf_psk must be rejected"
+        );
+
+        // missing sid
+        let no_sid =
+            format!("{HEAD}{base_psk}rendezvous=reality://h.test:443?pbk={p}&sni=a.test\n{PEER}");
+        assert!(
+            Config::parse(&no_sid).is_err(),
+            "missing sid must be rejected"
+        );
+    }
+
+    #[test]
+    fn reality_rendezvous_rejects_duplicate_pbk() {
+        const HEAD: &str =
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             listen=0.0.0.0:51820\ndevice=yip0\n";
+        const PEER: &str =
+            "[peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n";
+        let base_psk = "obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n";
+        let pbk_a = "a".repeat(64);
+        let pbk_b = "b".repeat(64);
+
+        let dup_pbk = format!(
+            "{HEAD}{base_psk}rendezvous=reality://h.test:443?pbk={pbk_a}&pbk={pbk_b}&sid=0011223344556677&sni=a.test\n{PEER}"
+        );
+        assert!(
+            Config::parse(&dup_pbk).is_err(),
+            "duplicate pbk= must be rejected, not silently last-wins"
+        );
+    }
+
+    #[test]
+    fn reality_rendezvous_rejects_query_pair_without_equals() {
+        const HEAD: &str =
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             listen=0.0.0.0:51820\ndevice=yip0\n";
+        const PEER: &str =
+            "[peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n";
+        let base_psk = "obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n";
+        let p = "a".repeat(64);
+
+        let no_equals = format!(
+            "{HEAD}{base_psk}rendezvous=reality://h.test:443?pbk={p}&sid=0011223344556677&sni=a.test&garbage\n{PEER}"
+        );
+        assert!(
+            Config::parse(&no_equals).is_err(),
+            "query param with no '=' must be rejected"
         );
     }
 
