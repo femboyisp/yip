@@ -237,7 +237,11 @@ async fn run_reality_conn(mut tcp: TcpStream, cfg: &Arc<TlsFrontCfg>) {
         if !(r.server_names.is_empty() || r.server_names.iter().any(|n| n == sni)) {
             return None; // SNI not allowed ⇒ treat as un-authed
         }
-        let ts_min = super::reality::reality_auth_recover(
+        // REALITY.4b: recover `shared` too, so the authed branch below can
+        // derive the per-connection cert key from it (the fixed cache
+        // acceptor is no longer served to a real client — only used to keep
+        // `fields_for` warm).
+        let (ts_min, shared) = super::reality::reality_auth_recover_shared(
             &r.priv_key,
             info,
             &r.short_ids,
@@ -245,13 +249,30 @@ async fn run_reality_conn(mut tcp: TcpStream, cfg: &Arc<TlsFrontCfg>) {
             REALITY_SKEW_MIN,
         )?;
         let seal = <[u8; 32]>::try_from(info.legacy_session_id.as_slice()).ok()?;
-        let acc = r.certs.acceptor_for(sni);
-        Some((sni.to_owned(), ts_min, seal, acc))
+        let fields = r.certs.fields_for(sni);
+        Some((sni.to_owned(), ts_min, seal, shared, fields))
     });
 
-    if let Some((sni, ts_min, seal, Some(acceptor))) = decision {
+    if let Some((sni, ts_min, seal, shared, Some(fields))) = decision {
         match decide_authed(&r.replay, seal, ts_min, now_min, true) {
             Decision::Accept => {
+                // The relay ALWAYS binds: re-forge the leaf per-connection,
+                // signed by the key derived from THIS connection's `shared`
+                // (REALITY.4b) — not the cache's fixed ephemeral key — so the
+                // presented leaf proves possession of `reality_priv` for the
+                // client (Task 2) to pin against.
+                let dk = yip_utls::auth::derive_cert_key(&shared);
+                let acceptor = match crate::reality_cert::build_forged_acceptor_with_pkcs8(
+                    &fields,
+                    &dk.pkcs8_der,
+                ) {
+                    Ok(acc) => acc,
+                    Err(e) => {
+                        eprintln!("tls-front: reality per-connection re-forge failed ({sni}): {e}");
+                        splice_to_dest(tcp, r.dest, &rec).await;
+                        return;
+                    }
+                };
                 let stream = PrefixedStream::new(rec, tcp);
                 match tokio::time::timeout(
                     HANDSHAKE_TIMEOUT,
@@ -512,19 +533,34 @@ mod tests {
         addr
     }
 
-    async fn start_reality_front(dest: SocketAddr) -> SocketAddr {
+    /// General REALITY front spinner: parameterized on `priv_key`/`short_ids`/
+    /// `server_names` so both the un-authed splice tests (empty `short_ids`/
+    /// `server_names` ⇒ no client can ever authenticate) and the REALITY.4b
+    /// authed end-to-end test (a real `short_id` + a warmed SNI) share one
+    /// setup path.
+    async fn start_reality_front_with(
+        dest: SocketAddr,
+        priv_key: [u8; 32],
+        short_ids: Vec<[u8; 8]>,
+        server_names: Vec<String>,
+    ) -> SocketAddr {
         let dir = unique_tmp_dir("reality");
         let (cert, key) = write_self_signed(&dir);
         let acceptor = Arc::new(build_acceptor(&cert, &key).unwrap());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // Un-authed hellos never reach `certs`/`replay` (auth fails first), but
-        // constructing `RealityCfg` still needs a real, non-empty cert cache —
-        // `prewarm` refuses to start with zero warmed names.
+        // `prewarm` refuses to start with zero warmed names when at least one
+        // was requested, so an un-authed-only caller still passes a
+        // real-but-irrelevant name here (never reached — auth fails first).
         let cert_src = spawn_cert_source().await;
+        let warm_names = if server_names.is_empty() {
+            vec!["cache.test".to_owned()]
+        } else {
+            server_names.clone()
+        };
         let certs = crate::reality_cert::RealityCertCache::prewarm(
-            &["cache.test".to_owned()],
+            &warm_names,
             cert_src,
             Duration::from_secs(3600),
             Duration::from_secs(21600),
@@ -542,9 +578,9 @@ mod tests {
             routes: Arc::new(Mutex::new(std::collections::HashMap::new())),
             reality: Some(RealityCfg {
                 dest,
-                priv_key: [7u8; 32],
-                short_ids: Vec::new(), // no client can authenticate ⇒ everything forwards
-                server_names: Vec::new(),
+                priv_key,
+                short_ids,
+                server_names,
                 certs,
                 replay,
             }),
@@ -552,6 +588,12 @@ mod tests {
         });
         tokio::spawn(run_tls_front(listener, acceptor, cfg));
         addr
+    }
+
+    async fn start_reality_front(dest: SocketAddr) -> SocketAddr {
+        // No client can authenticate ⇒ everything forwards (empty short_ids
+        // AND empty server_names — see `start_reality_front_with`).
+        start_reality_front_with(dest, [7u8; 32], Vec::new(), Vec::new()).await
     }
 
     async fn assert_gets_banner(front: SocketAddr, first_bytes: &[u8], banner: &[u8]) {
@@ -601,6 +643,51 @@ mod tests {
             b"HELLO-DEST-OVERSIZE",
         )
         .await;
+    }
+
+    /// REALITY.4b end-to-end: an authed connection is terminated with a
+    /// PER-CONNECTION acceptor whose leaf key equals
+    /// `derive_cert_key(shared).public_sec1` for THAT connection's `shared`
+    /// — proven the same way a real yip client proves it, by driving the
+    /// actual client-side `yip_utls::connect(.., verify: true)` REALITY.4b
+    /// binding check against this front, rather than re-implementing the
+    /// check here. `connect(verify: true)` fails closed
+    /// (`Err(yip_utls::Error::RealityVerify(_))`) unless the server's
+    /// `CertificateVerify` signature verifies under EXACTLY
+    /// `derive_cert_key(shared).public_sec1`, where the client independently
+    /// computes `shared` via its own ECDH — so a success here is direct
+    /// evidence of the property under test, not a restatement of it.
+    ///
+    /// Two independent connections are driven, each with `connect`'s own
+    /// fresh random ephemeral key (hence its own distinct `shared`) — both
+    /// must succeed, proving the server re-forges a leaf bound to EACH
+    /// connection individually rather than reusing one fixed leaf (which
+    /// would only ever match a single, first-observed `shared`).
+    #[tokio::test]
+    async fn reality_authed_connection_leaf_is_bound_to_connections_shared() {
+        let dest = spawn_dest_banner(b"SHOULD-NEVER-BE-SPLICED").await;
+
+        let reality_priv = [55u8; 32];
+        let reality_pub =
+            *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(reality_priv))
+                .as_bytes();
+        let short_id = [9u8; 8];
+        let sni = "auth.test";
+
+        let front =
+            start_reality_front_with(dest, reality_priv, vec![short_id], vec![sni.to_owned()])
+                .await;
+
+        for attempt in 0..2 {
+            let tcp = tokio::net::TcpStream::connect(front).await.unwrap();
+            let result = yip_utls::connect(tcp, sni, &reality_pub, short_id, true).await;
+            assert!(
+                result.is_ok(),
+                "attempt {attempt}: REALITY.4b client verify must succeed against the \
+                 per-connection re-forged leaf: {:?}",
+                result.err()
+            );
+        }
     }
 
     // ---- decide_authed (pure routing decision) ----

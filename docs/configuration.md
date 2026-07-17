@@ -76,7 +76,7 @@ below); otherwise an empty peer list is an error.
 |---|---|---|
 | `rendezvous` | `IP:port` | Address of a `yip-rendezvous` server. Enables lazy **Direct → UDP hole-punch → Relay** bring-up for peers behind NAT. |
 | `rendezvous` | `tls://host:port` | TLS relay-dial (anti-DPI milestone 3c.4). Dials the 3c.3 relay's `--listen-tcp` front over a persistent browser-parrot TLS connection and relays every peer's traffic through it — no Direct/UDP-punch attempt. See below. |
-| `rendezvous` | `reality://host:port?pbk=&sid=&sni=` | REALITY relay-dial (milestone REALITY.4a). Dials the relay's `--reality-dest` REALITY front with a Chrome-faithful crafted `ClientHello` and relays every peer's traffic through it — no Direct/UDP-punch attempt. See below. |
+| `rendezvous` | `reality://host:port?pbk=&sid=&sni=&verify=` | REALITY relay-dial (milestone REALITY.4a; `verify=` is REALITY.4b). Dials the relay's `--reality-dest` REALITY front with a Chrome-faithful crafted `ClientHello` and relays every peer's traffic through it — no Direct/UDP-punch attempt. `verify` (default `on`) additionally checks the relay proves possession of its private key. See below. |
 
 ### Mesh / decentralized discovery (optional)
 
@@ -255,9 +255,22 @@ replaying the bytes already read, so the prober completes a genuine
 handshake with the real site and sees **its own** real cert —
 indistinguishable from connecting to that site directly.
 
+**REALITY.4b relay binding (server side, automatic, no flag).** On every
+*authenticated* connection, the relay additionally re-forges its served leaf
+one more time, keyed to that specific connection's seal-derived ECDH
+`shared` secret (`yip_utls::auth::derive_cert_key(shared)` — an ECDSA-P256
+keypair, HKDF-derived, deterministic) rather than the startup-time stolen
+identity alone, and signs the TLS 1.3 `CertificateVerify` with it. This is
+**always on** for authed connections — there is no server-side flag to
+enable or disable it; it is what the client's `verify=` (below) checks
+against. An un-authed/spliced connection is unaffected (it never reaches
+this path at all).
+
 **Status.** REALITY.1–3 (server-side transparent forwarding, the pure-Rust
-uTLS client library `yip-utls`, and stolen-cert forging) and REALITY.4a (the
-`yipd`-side `rendezvous=reality://` relay-dial client) are complete — see
+uTLS client library `yip-utls`, and stolen-cert forging), REALITY.4a (the
+`yipd`-side `rendezvous=reality://` relay-dial client), and REALITY.4b
+(client-side relay verification + the automatic per-connection cert binding
+above) are complete — see
 [REALITY relay-dial client](#reality-relay-dial-client-rendezvousrealityhostportpbksidsni-reality4a)
 below.
 
@@ -336,7 +349,7 @@ Query parameters:
 | `pbk` | 64 hex chars (32 bytes) | The relay's REALITY X25519 **public** key — the public half of its `--reality-private-key`. **Required.** |
 | `sid` | 16 hex chars (8 bytes) | A `--reality-short-id` the relay accepts. **Required.** |
 | `sni` | domain string | The borrowed SNI presented in the crafted `ClientHello` — must match one of the relay's `--reality-server-name` values for the connection to authenticate (and, separately, be a domain the relay has a live forged cert for). **Required.** |
-| `verify` | — | **Reserved for REALITY.4b** (explicit Xray-style relay verification). Currently **rejected** at config load — `reality://` with `verify=` set is a fatal config error, not silently ignored. |
+| `verify` | `on`/`true` or `off`/`false` | **REALITY.4b**: whether the client performs explicit Xray-style relay verification (leaf key / `CertificateVerify` / scheme checks — see below). Defaults to `on` when absent. `verify=off` is accepted but logs a `WARNING` at config load — it disables the client's only check that it is talking to the genuine relay rather than an on-path MITM/decoy, so it is a deliberate downgrade, not a supported steady-state posture. Any other value (e.g. `verify=bogus`) is a fatal config-parse error. |
 
 Any other query parameter, a missing required parameter, or a duplicate
 parameter is a fatal config-parse error (fail-closed — REALITY.4a does not
@@ -364,12 +377,56 @@ so it treats the connection as unauthenticated and transparently splices it
 to `--reality-dest` — the client's `Register` is never accepted, the inner
 Noise-IK handshake never gets a chance to run, and no tunnel forms. This
 fail-closed behavior is exercised end-to-end by the wrong-pubkey negative
-test in `run-netns-reality-relay.sh`. The tunnel's actual confidentiality and
-integrity come from the end-to-end peer Noise-IK handshake carried inside the
-relayed envelopes, not from the outer TLS — an outer MITM or malicious relay
-sees only inner peer ciphertext and can at worst deny service. **REALITY.4b**
-adds an optional explicit relay-identity check on top (the reserved `verify=`
-parameter above).
+test in `run-netns-reality-relay.sh` (a misconfigured client `pbk`). The
+tunnel's actual confidentiality and integrity come from the end-to-end peer
+Noise-IK handshake carried inside the relayed envelopes, not from the outer
+TLS — an outer MITM or malicious relay sees only inner peer ciphertext and
+can at worst deny service.
+
+**REALITY.4b relay verification (`verify=`, client side).** Adds an explicit
+relay-identity check on top of the zero-cert-auth handshake above, closing
+the "any TLS 1.3 peer completes the handshake" gap: when `verify=on`
+(default), `yip_utls::connect` additionally pins the relay's presented leaf
+key and validates its `CertificateVerify` signature against
+`derive_cert_key(shared).public_sec1` — the same ECDSA-P256 key the relay's
+REALITY.4b binding (above) signed with, both sides deriving it from the
+identical seal ECDH `shared` secret. `verify` is **purely client-local
+policy**: it is never sent on the wire, never negotiated, and does not
+change anything the relay does (the relay always binds; only whether the
+*client* checks it is configurable). A verification failure
+(`yip_utls::Error::RealityVerify`) is treated as "this is probably not the
+genuine relay" (on-path MITM, decoy, or a misconfigured `pbk`/relay key)
+rather than an ordinary transient failure: before closing, the client sends
+a browser-faithful fatal TLS alert (`bad_certificate`, description `42` —
+documented as what mainstream browsers/BoringSSL send on a TLS 1.3
+cert-verify failure, so the close itself doesn't stand out), then gives up
+and backs off on a long, jittered interval (`verify_fail_backoff`: a 300s
+base plus up to 120s of jitter) instead of the ordinary sub-5-second
+reconnect ladder — this bounds retry attempts to roughly one every 5+
+minutes rather than hammering whatever answered. Both the client-side
+(`pbk` mismatch) and relay-side (mismatched `--reality-private-key`)
+variants of this failure, plus the bounded-retry assertion, are exercised
+end-to-end by the wrong-pubkey and wrong-relay-key negative tests in
+`run-netns-reality-relay.sh`.
+
+`verify=off` disables this check entirely, reverting to the REALITY.4a
+zero-cert-auth behavior described above (any TLS 1.3 peer completes the
+handshake; only the relay's own seal-open gates a tunnel). It is accepted
+but logs a `WARNING` at config load (see the `verify` param row above) — a
+deliberate downgrade for cases where the extra round-trip of leaf
+inspection is unwanted, not a supported steady-state posture, since it
+removes the client's only defense against an on-path MITM or a decoy
+standing in for the genuine relay.
+
+**Deferred to REALITY.5.** Verification checks the leaf *key* and
+`CertificateVerify` *signature*, not wire-level size fidelity of the
+server's certificate flight — a passive observer diffing packet lengths
+against a real target site's handshake could in principle distinguish a
+forged flight from a genuine one on size alone. Cert-flight size padding is
+explicitly out of scope here (see the REALITY.4b plan/spec) and deferred to
+REALITY.5 (issue #76); the fields REALITY.3 does and does not copy from the
+stolen leaf (SCTs and the CA signature are intentionally never copied) are
+documented in the REALITY.3 design spec, referenced above.
 
 ---
 

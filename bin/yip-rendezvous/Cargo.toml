@@ -41,5 +41,14 @@ time = { version = "0.3", default-features = false, features = ["parsing", "macr
 # features (this crate never chain-validates the forged/stolen certs).
 x509-parser = { version = "0.18.1", default-features = false }
 
+[dev-dependencies]
+# REALITY.4b Task 3 test-only: parses the SPKI DER `boring` hands back for a
+# presented leaf's public key, to compare it (as a SEC1 point) against
+# `yip_utls::auth::derive_cert_key`'s `public_sec1` — the leaf-pubkey-match
+# gate for `build_forged_acceptor_with_pkcs8`. Same version yip-utls already
+# depends on for the identical derivation; dev-only here so it adds no
+# footprint to the shipped binary.
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+
 [lints]
 workspace = true

@@ -62,7 +62,7 @@ async fn handshake_and_get(host: &str) -> Result<Vec<u8>, String> {
     // it), but that's fine — REALITY's seal rides inside a field
     // (`legacy_session_id`) a normal TLS 1.3 server never inspects, so the
     // handshake proceeds exactly as it would for any other client.
-    let mut s = yip_utls::connect(tcp, host, &[0u8; 32], [0u8; 8])
+    let mut s = yip_utls::connect(tcp, host, &[0u8; 32], [0u8; 8], false)
         .await
         .map_err(|e| format!("tls handshake with {host} failed: {e}"))?;
 
@@ -154,7 +154,7 @@ async fn handshake_against_local_openssl_s_server() {
         eprintln!("[local s_server] no server on 127.0.0.1:8443 — skipping (start `openssl s_server -tls1_3` to run)");
         return;
     };
-    let mut s = yip_utls::connect(tcp, "localhost", &[0u8; 32], [0u8; 8])
+    let mut s = yip_utls::connect(tcp, "localhost", &[0u8; 32], [0u8; 8], false)
         .await
         .expect("tls handshake with local openssl s_server");
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

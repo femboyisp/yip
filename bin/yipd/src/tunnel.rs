@@ -68,13 +68,22 @@ pub fn run(config: Config) -> io::Result<()> {
     // spawn `relay_client::spawn` and enter `relay_client::run_relay_tls`
     // instead of a UDP-socket driver.
     let mut relay_tls: Option<(String, u16, std::net::SocketAddr)> = None;
-    // `Rendezvous::Reality { host, port, pubkey, short_id, sni }` (REALITY.4a,
-    // rendezvous=reality://) resolves `host:port` up front exactly like the
-    // `Tls` arm above; `relay_reality` carries the full dial parameters
-    // forward to the transport dispatch below, which spawns
-    // `relay_client::spawn_reality` and enters the byte-identical
-    // `relay_client::run_relay_tls` data-plane loop.
-    type RelayRealityParams = (String, u16, [u8; 32], [u8; 8], String, std::net::SocketAddr);
+    // `Rendezvous::Reality { host, port, pubkey, short_id, sni, verify }`
+    // (REALITY.4a/4b, rendezvous=reality://) resolves `host:port` up front
+    // exactly like the `Tls` arm above; `relay_reality` carries the full dial
+    // parameters (including the `verify=on|off` policy) forward to the
+    // transport dispatch below, which spawns `relay_client::spawn_reality`
+    // and enters the byte-identical `relay_client::run_relay_tls` data-plane
+    // loop.
+    type RelayRealityParams = (
+        String,
+        u16,
+        [u8; 32],
+        [u8; 8],
+        String,
+        bool,
+        std::net::SocketAddr,
+    );
     let mut relay_reality: Option<RelayRealityParams> = None;
     let rendezvous: Option<Box<dyn crate::rendezvous::Rendezvous>> = match &config.rendezvous {
         None => None,
@@ -108,6 +117,7 @@ pub fn run(config: Config) -> io::Result<()> {
             pubkey,
             short_id,
             sni,
+            verify,
         }) => {
             let relay_addr = (host.as_str(), *port)
                 .to_socket_addrs()?
@@ -124,6 +134,7 @@ pub fn run(config: Config) -> io::Result<()> {
                 *pubkey,
                 *short_id,
                 sni.clone(),
+                *verify,
                 relay_addr,
             ));
             Some(
@@ -302,7 +313,7 @@ pub fn run(config: Config) -> io::Result<()> {
     // The data-plane tail is byte-identical to the `Tls` path: the same
     // `SOCK_DGRAM` `UnixDatagram::pair()` socketpair convention and the same
     // `run_relay_tls` pump — the data plane is scheme-agnostic.
-    if let Some((host, port, pubkey, short_id, sni, relay_addr)) = relay_reality {
+    if let Some((host, port, pubkey, short_id, sni, verify, relay_addr)) = relay_reality {
         let obf_key = yip_obf::derive_key(
             config
                 .obf_psk
@@ -317,6 +328,7 @@ pub fn run(config: Config) -> io::Result<()> {
             pubkey,
             short_id,
             sni,
+            verify,
             obf_key,
             self_node,
             relay_thread_sock,

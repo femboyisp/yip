@@ -27,6 +27,10 @@ pub enum Error {
     /// The system clock reads before the Unix epoch, so `ts_min` cannot be
     /// computed for the REALITY auth seal.
     Clock,
+    /// REALITY.4b relay verification failed (leaf key mismatch, bad
+    /// CertificateVerify, wrong scheme, or a missing/malformed message). The
+    /// caller must treat the relay as unauthenticated and NOT tunnel.
+    RealityVerify(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -37,6 +41,7 @@ impl fmt::Display for Error {
             Error::Rng(e) => write!(f, "OS RNG failure: {e}"),
             Error::Protocol(msg) => write!(f, "REALITY/TLS protocol error: {msg}"),
             Error::Clock => write!(f, "system clock reads before the Unix epoch"),
+            Error::RealityVerify(m) => write!(f, "REALITY relay verification failed: {m}"),
         }
     }
 }
@@ -47,7 +52,7 @@ impl std::error::Error for Error {
             Error::Io(e) => Some(e),
             Error::Handshake(e) => Some(e),
             Error::Rng(e) => Some(e),
-            Error::Protocol(_) | Error::Clock => None,
+            Error::Protocol(_) | Error::Clock | Error::RealityVerify(_) => None,
         }
     }
 }

@@ -7,9 +7,20 @@
 //! back an `AsyncRead + AsyncWrite` stream over the negotiated application
 //! traffic keys. REALITY is zero-cert-auth by design (the whole point is
 //! that the wire is indistinguishable from a real TLS 1.3 connection to the
-//! camouflage SNI): this module does not verify the server's certificate
-//! chain or the server's `CertificateVerify`/`Finished` contents, but it
-//! does consume every handshake message so the transcript stays correct.
+//! camouflage SNI): by default (`verify: false`) this module does not
+//! verify the server's certificate chain or the server's
+//! `CertificateVerify`/`Finished` contents, but it does consume every
+//! handshake message so the transcript stays correct.
+//!
+//! REALITY.4b (`verify: true`) adds an OPTIONAL relay-binding check on top
+//! of that: it pins the server Certificate leaf's P-256 key to the
+//! shared-secret-derived key ([`auth::derive_cert_key`]) and verifies the
+//! `CertificateVerify` signature over it, hard-pinning
+//! `ecdsa_secp256r1_sha256` — proof the peer holds the REALITY relay's
+//! private key, not merely that it can answer a `ClientHello` (which any
+//! camouflage-only decoy site also does). This still never validates a CA
+//! chain — the leaf is always self-signed — and still never checks
+//! `Finished`. See [`verify_reality_binding`].
 //!
 //! The ephemeral X25519 key is generated once, as raw bytes, and reused for
 //! both the TLS `key_share`/ECDHE *and* the REALITY auth seal's ECDH — see
@@ -233,24 +244,366 @@ fn find_finished_end(hs_flight: &[u8]) -> Result<Option<usize>, Error> {
     Ok(None)
 }
 
+/// Handshake message type for `Certificate` (RFC 8446 §4.4.2).
+const HS_TYPE_CERTIFICATE: u8 = 0x0b;
+/// Handshake message type for `CertificateVerify` (RFC 8446 §4.4.3).
+const HS_TYPE_CERTIFICATE_VERIFY: u8 = 0x0f;
+
+/// A generous sanity bound on a single leaf certificate's DER length — real
+/// leaf certs are a few KiB; 64 KiB is generous headroom. Bounds
+/// [`certificate_leaf_der`]'s allocation against a hostile/MITM peer (the
+/// outer TLS is zero-server-auth) claiming an absurd `cert_data` length
+/// within the already-bounded server flight — defense in depth alongside
+/// [`MAX_SERVER_FLIGHT_LEN`]/[`MAX_HANDSHAKE_MSG_LEN`].
+const MAX_LEAF_CERT_DER_LEN: usize = 64 * 1024;
+
+/// `AlertLevel::fatal` (RFC 8446 §6.1, value `2`) — every alert this client
+/// ever sends is fatal.
+const ALERT_LEVEL_FATAL: u8 = 2;
+
+/// `AlertDescription::bad_certificate` (RFC 8446 §6.2, value `42`) — pinned
+/// as the alert a REALITY.4b `CertificateVerify` verification failure sends.
+/// This is the RFC-canonical description for "a certificate was corrupt,
+/// contained signatures that did not verify correctly, etc." — exactly this
+/// client's situation on a pin/signature mismatch — and is documented as
+/// what mainstream browsers (Chrome/BoringSSL) send for a TLS 1.3
+/// cert-verify failure. This value was NOT captured against a live browser
+/// in this environment (no network access + no real cert-mismatch harness
+/// available here); REALITY.5's wire-fidelity pass is the place that
+/// re-verifies it against a real packet capture and swaps it out if reality
+/// disagrees.
+const ALERT_DESCRIPTION_BAD_CERTIFICATE: u8 = 42;
+
+/// What REALITY.4b verification needs out of the server's
+/// EncryptedExtensions/Certificate/CertificateVerify/Finished flight: the
+/// leaf certificate's raw DER, the byte offset in the flight at which the
+/// `CertificateVerify` message begins (the RFC 8446 §4.4.3 transcript
+/// boundary — everything strictly before this offset is
+/// `Transcript-Hash(ClientHello‥Certificate)`), and the `CertificateVerify`
+/// message's raw `signature` field.
+struct CertFlightInfo {
+    leaf_der: Vec<u8>,
+    certverify_start: usize,
+    signature: Vec<u8>,
+}
+
+/// Scans `hs_flight` (see [`find_finished_end`] for its shape — the
+/// concatenation of the server's decrypted post-`ServerHello` handshake
+/// messages) for the first `Certificate` message and the `CertificateVerify`
+/// message, extracting what [`verify_reality_binding`] needs from each.
+/// Fail-closed: a missing message, truncated field, or an out-of-bounds
+/// value is `Err(Error::RealityVerify(_))`; every access is bounds-checked
+/// (`.get`, never direct indexing past a validated point) so hostile bytes
+/// cannot panic this.
+fn scan_cert_flight(hs_flight: &[u8]) -> Result<CertFlightInfo, Error> {
+    let mut pos = 0;
+    let mut leaf_der: Option<Vec<u8>> = None;
+
+    while hs_flight.len() >= pos + 4 {
+        let msg_type = hs_flight[pos];
+        let len = (usize::from(hs_flight[pos + 1]) << 16)
+            | (usize::from(hs_flight[pos + 2]) << 8)
+            | usize::from(hs_flight[pos + 3]);
+        if len > MAX_HANDSHAKE_MSG_LEN {
+            return Err(Error::RealityVerify(
+                "server handshake message exceeds sane length bound",
+            ));
+        }
+        let body_start = pos + 4;
+        let msg_end = body_start + len;
+        let Some(body) = hs_flight.get(body_start..msg_end) else {
+            break; // not fully buffered — cannot happen on an already-complete flight
+        };
+
+        if msg_type == HS_TYPE_CERTIFICATE && leaf_der.is_none() {
+            leaf_der = Some(certificate_leaf_der(body)?);
+        }
+        if msg_type == HS_TYPE_CERTIFICATE_VERIFY {
+            let signature = certificate_verify_signature(body)?;
+            let leaf_der = leaf_der.ok_or(Error::RealityVerify(
+                "server flight is missing a Certificate message",
+            ))?;
+            return Ok(CertFlightInfo {
+                leaf_der,
+                certverify_start: pos,
+                signature,
+            });
+        }
+        pos = msg_end;
+    }
+
+    Err(Error::RealityVerify(
+        "server flight is missing a CertificateVerify message",
+    ))
+}
+
+/// Extracts the first `CertificateEntry`'s raw DER (the leaf) from a
+/// `Certificate` message body (RFC 8446 §4.4.2): `context_len(1) ‖ context
+/// ‖ list_len(3) ‖ [cert_data_len(3) ‖ cert_data ‖ ext_len(2) ‖ ext]…`.
+/// Fail-closed on truncation, an empty list, or a leaf exceeding
+/// [`MAX_LEAF_CERT_DER_LEN`].
+fn certificate_leaf_der(body: &[u8]) -> Result<Vec<u8>, Error> {
+    let ctx_len = usize::from(
+        *body
+            .first()
+            .ok_or(Error::RealityVerify("truncated Certificate message"))?,
+    );
+    let list_len_start = 1 + ctx_len;
+    let list_len_bytes = body
+        .get(list_len_start..list_len_start + 3)
+        .ok_or(Error::RealityVerify("truncated Certificate message"))?;
+    let list_len = (usize::from(list_len_bytes[0]) << 16)
+        | (usize::from(list_len_bytes[1]) << 8)
+        | usize::from(list_len_bytes[2]);
+    let list_start = list_len_start + 3;
+    let list_end = list_start + list_len;
+    let list = body
+        .get(list_start..list_end)
+        .ok_or(Error::RealityVerify("truncated Certificate list"))?;
+
+    let cd_len_bytes = list
+        .get(0..3)
+        .ok_or(Error::RealityVerify("empty Certificate list"))?;
+    let cd_len = (usize::from(cd_len_bytes[0]) << 16)
+        | (usize::from(cd_len_bytes[1]) << 8)
+        | usize::from(cd_len_bytes[2]);
+    if cd_len == 0 || cd_len > MAX_LEAF_CERT_DER_LEN {
+        return Err(Error::RealityVerify(
+            "leaf certificate length out of bounds",
+        ));
+    }
+    let cert_data = list
+        .get(3..3 + cd_len)
+        .ok_or(Error::RealityVerify("truncated leaf certificate"))?;
+    Ok(cert_data.to_vec())
+}
+
+/// Extracts the `signature` field from a `CertificateVerify` message body
+/// (RFC 8446 §4.4.3): `algorithm(2) ‖ signature_len(2) ‖ signature`. The
+/// `algorithm` field is intentionally never returned — REALITY.4b hard-pins
+/// `ecdsa_secp256r1_sha256` and never reads/trusts the server's announced
+/// scheme (see [`verify_certificate_verify`]). Fail-closed on truncation or
+/// an empty signature.
+fn certificate_verify_signature(body: &[u8]) -> Result<Vec<u8>, Error> {
+    let sig_len_bytes = body
+        .get(2..4)
+        .ok_or(Error::RealityVerify("truncated CertificateVerify message"))?;
+    let sig_len = usize::from(u16::from_be_bytes([sig_len_bytes[0], sig_len_bytes[1]]));
+    let sig = body.get(4..4 + sig_len).ok_or(Error::RealityVerify(
+        "truncated CertificateVerify signature",
+    ))?;
+    if sig.is_empty() {
+        return Err(Error::RealityVerify("empty CertificateVerify signature"));
+    }
+    Ok(sig.to_vec())
+}
+
+/// Extracts the P-256 subject public key from a leaf certificate's DER (RFC
+/// 5280 `Certificate` → `TBSCertificate` → `SubjectPublicKeyInfo`), returned
+/// as uncompressed SEC1 bytes (`0x04 ‖ X ‖ Y`, 65 bytes) — the same encoding
+/// [`auth::derive_cert_key`]'s `public_sec1` uses, so the two can be
+/// compared byte-for-byte.
+///
+/// Walks the DER with the `der` crate's bounds-checked, panic-free reader
+/// (never hand-rolled ASN.1 length arithmetic on untrusted bytes):
+/// `TBSCertificate`'s fields are read sequentially — `[0] EXPLICIT Version`
+/// is OPTIONAL (default v1), so it is skipped only when present, otherwise
+/// the field just peeked at IS `serialNumber` — up through
+/// `subjectPublicKeyInfo`, whose raw TLV is handed to
+/// [`p256::ecdsa::VerifyingKey::from_public_key_der`]. That call itself
+/// fail-closes on "not an EC key", "not the P-256 curve OID", and "not a
+/// valid point on the curve" — this function does not duplicate any of
+/// those checks.
+fn spki_sec1_pubkey_from_der(cert_der: &[u8]) -> Result<Vec<u8>, Error> {
+    use der::{AnyRef, Decode, Reader, SliceReader, Tag, Tagged};
+    use p256::pkcs8::DecodePublicKey;
+
+    let bad_der = || Error::RealityVerify("leaf certificate is not valid DER");
+
+    let mut top = SliceReader::new(cert_der).map_err(|_| bad_der())?;
+    let cert_any = AnyRef::decode(&mut top).map_err(|_| bad_der())?;
+    if cert_any.tag() != Tag::Sequence {
+        return Err(bad_der());
+    }
+
+    let mut cert_body = SliceReader::new(cert_any.value()).map_err(|_| bad_der())?;
+    let tbs_any = AnyRef::decode(&mut cert_body).map_err(|_| bad_der())?;
+    if tbs_any.tag() != Tag::Sequence {
+        return Err(bad_der());
+    }
+
+    let mut tbs = SliceReader::new(tbs_any.value()).map_err(|_| bad_der())?;
+
+    // version [0] EXPLICIT is OPTIONAL; if present, consume+discard it — the
+    // NEXT field is then serialNumber. If absent, the field already peeked
+    // at (still unconsumed) IS serialNumber.
+    let first_tag = tbs.peek_tag().map_err(|_| bad_der())?;
+    if first_tag.is_context_specific() {
+        tbs.tlv_bytes().map_err(|_| bad_der())?; // version
+    }
+    tbs.tlv_bytes().map_err(|_| bad_der())?; // serialNumber
+    tbs.tlv_bytes().map_err(|_| bad_der())?; // signature AlgorithmIdentifier
+    tbs.tlv_bytes().map_err(|_| bad_der())?; // issuer
+    tbs.tlv_bytes().map_err(|_| bad_der())?; // validity
+    tbs.tlv_bytes().map_err(|_| bad_der())?; // subject
+    let spki_der = tbs.tlv_bytes().map_err(|_| bad_der())?; // subjectPublicKeyInfo
+
+    let vk = p256::ecdsa::VerifyingKey::from_public_key_der(spki_der).map_err(|_| {
+        Error::RealityVerify("leaf certificate's public key is not a valid P-256 SPKI")
+    })?;
+    Ok(vk.to_encoded_point(false).as_bytes().to_vec())
+}
+
+/// Verify a TLS 1.3 server `CertificateVerify` for REALITY.4b: the leaf's
+/// key must be exactly `expected_pubkey_sec1` (the shared-secret-derived
+/// P-256 key — see [`auth::derive_cert_key`]), and the signature must verify
+/// over the RFC 8446 §4.4.3 signed content with `ecdsa_secp256r1_sha256`
+/// HARD-PINNED — the `SignatureScheme` the server's `CertificateVerify`
+/// message itself announces is never read or trusted. Fail-closed on every
+/// edge: a leaf-key mismatch, a malformed DER signature, or a signature
+/// that does not verify are all `Err(Error::RealityVerify(_))`, never `Ok`.
+fn verify_certificate_verify(
+    expected_pubkey_sec1: &[u8],
+    leaf_spki_pubkey_sec1: &[u8],
+    transcript_hash_through_cert: &[u8],
+    signature_der: &[u8],
+) -> Result<(), Error> {
+    use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+
+    // 1. Pin the leaf key to the derived key (byte comparison — the derived
+    // key is always a valid P-256 point by construction, so an exact match
+    // also proves the leaf key is one).
+    if leaf_spki_pubkey_sec1 != expected_pubkey_sec1 {
+        return Err(Error::RealityVerify(
+            "leaf key does not match the derived REALITY key",
+        ));
+    }
+
+    // 2. Reconstruct the §4.4.3 signed content: 0x20*64 ‖ context ‖ 0x00 ‖ hash.
+    let mut signed = Vec::with_capacity(64 + 34 + 1 + transcript_hash_through_cert.len());
+    signed.extend_from_slice(&[0x20u8; 64]);
+    signed.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+    signed.push(0x00);
+    signed.extend_from_slice(transcript_hash_through_cert);
+
+    // 3. Verify with ecdsa_secp256r1_sha256 hard-pinned (`Verifier::verify`
+    // for `ecdsa::Signature<NistP256>` hashes SHA-256 internally, matching
+    // ecdsa_secp256r1_sha256 exactly; the announced SignatureScheme from the
+    // wire is never consulted).
+    let vk = VerifyingKey::from_sec1_bytes(expected_pubkey_sec1)
+        .map_err(|_| Error::RealityVerify("derived key is not a valid P-256 point"))?;
+    let sig = Signature::from_der(signature_der)
+        .map_err(|_| Error::RealityVerify("CertificateVerify signature is not valid DER ECDSA"))?;
+    vk.verify(&signed, &sig)
+        .map_err(|_| Error::RealityVerify("CertificateVerify signature does not verify"))
+}
+
+/// Orchestrates REALITY.4b `CertificateVerify` verification: locates the
+/// Certificate/CertificateVerify messages in `hs_flight` (see
+/// [`scan_cert_flight`]), extracts the leaf's P-256 SPKI (see
+/// [`spki_sec1_pubkey_from_der`]), computes `Transcript-Hash(ClientHello‥
+/// Certificate)` at the exact RFC 8446 §4.4.3 boundary `scan_cert_flight`
+/// reports, and checks it against `expected_pubkey_sec1` (see
+/// [`verify_certificate_verify`]). `ch_sh_transcript` is the raw
+/// `ClientHello ‖ ServerHello` bytes `connect` already accumulates —
+/// `Transcript-Hash(ClientHello‥Certificate)` is `transcript_hash` of that
+/// prefix concatenated with `hs_flight` up to (not including)
+/// `certverify_start`.
+fn verify_reality_binding(
+    hs_flight: &[u8],
+    ch_sh_transcript: &[u8],
+    suite: u16,
+    expected_pubkey_sec1: &[u8],
+) -> Result<(), Error> {
+    let flight = scan_cert_flight(hs_flight)?;
+    let leaf_pubkey_sec1 = spki_sec1_pubkey_from_der(&flight.leaf_der)?;
+
+    let mut thru_cert = Vec::with_capacity(ch_sh_transcript.len() + flight.certverify_start);
+    thru_cert.extend_from_slice(ch_sh_transcript);
+    thru_cert.extend_from_slice(&hs_flight[..flight.certverify_start]);
+    let transcript_thru_cert = transcript_hash(&thru_cert, suite);
+
+    verify_certificate_verify(
+        expected_pubkey_sec1,
+        &leaf_pubkey_sec1,
+        &transcript_thru_cert,
+        &flight.signature,
+    )
+}
+
+/// Best-effort: seals `[fatal, description]` as an encrypted TLS 1.3 alert
+/// record under the CLIENT handshake traffic keys (sequence 0 — no prior
+/// client-side handshake-key-sealed record has been sent at the point
+/// REALITY.4b verification can fail, since it runs before the client
+/// `Finished` is sealed/sent) and writes it to `stream`. A seal or write
+/// failure on this already-failing path is silently ignored — the caller is
+/// about to return the real `Error::RealityVerify` regardless, and a peer
+/// that never gets the alert just sees the connection drop, same as any
+/// other network failure.
+async fn send_alert<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    hk: &HandshakeKeys,
+    suite: u16,
+    description: u8,
+) {
+    let alert_msg = [ALERT_LEVEL_FATAL, description];
+    let Ok(sealed) = record_seal(
+        &hk.client_key,
+        &hk.client_iv,
+        0,
+        suite,
+        CONTENT_TYPE_ALERT,
+        &alert_msg,
+    ) else {
+        return;
+    };
+    let Ok(header) = record_header(
+        CONTENT_TYPE_APPLICATION_DATA,
+        LEGACY_RECORD_VERSION,
+        sealed.len(),
+    ) else {
+        return;
+    };
+    let _ = stream.write_all(&header).await;
+    let _ = stream.write_all(&sealed).await;
+}
+
 /// Performs a full RFC 8446 §2 one-round-trip TLS 1.3 client handshake to
 /// `stream`, carrying a REALITY auth seal (keyed by `server_reality_pub` and
 /// `short_id`) in the crafted Chrome-150 `ClientHello`'s `legacy_session_id`.
 /// On success, returns a [`RealityStream`] over the negotiated application
 /// traffic keys.
 ///
-/// Does not verify the server's certificate chain, `CertificateVerify`, or
-/// `Finished` contents — REALITY's camouflage design means the server on the
-/// other end of a *successful* connection presents the real target site's
-/// certificate, which this client has no way (and no need) to validate; a
-/// misconfigured or non-REALITY-aware peer simply fails to open the auth
-/// seal server-side and this handshake either times out or is rejected
+/// When `verify` is `false` (byte-identical to this function's pre-
+/// REALITY.4b behavior — the JA3/JA4 wire fingerprint is unaffected either
+/// way, since verification never changes anything this client SENDS, only
+/// what it does with what it receives): does not verify the server's
+/// certificate chain, `CertificateVerify`, or `Finished` contents —
+/// REALITY's camouflage design means the server on the other end of a
+/// *successful* connection presents the real target site's certificate,
+/// which this client has no way (and no need) to validate; a misconfigured
+/// or non-REALITY-aware peer simply fails to open the auth seal
+/// server-side and this handshake either times out or is rejected
 /// upstream, not here.
+///
+/// When `verify` is `true` (REALITY.4b): after the server's
+/// EncryptedExtensions/Certificate/CertificateVerify/Finished flight is
+/// fully received, ADDITIONALLY pins the Certificate leaf's P-256 key to
+/// `auth::derive_cert_key(auth::shared_secret(server_reality_pub,
+/// &eph_priv)).public_sec1` and verifies `CertificateVerify` over it (see
+/// [`verify_reality_binding`]) — proof the peer holds
+/// `server_reality_pub`'s private key, not merely that it can answer a
+/// `ClientHello`. On failure, best-effort sends a `bad_certificate` TLS
+/// alert (see [`send_alert`]) and returns `Err(Error::RealityVerify(_))`
+/// BEFORE the client `Finished` is sent — this client never completes a
+/// handshake with, nor sends any encrypted client bytes to, a peer that
+/// fails this check.
 pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     sni: &str,
     server_reality_pub: &[u8; 32],
     short_id: [u8; 8],
+    verify: bool,
 ) -> Result<RealityStream<S>, Error> {
     // THE ONE EPHEMERAL KEY: raw bytes from getrandom, reused via
     // x25519-dalek for both the TLS key_share/ECDHE and the REALITY auth
@@ -416,6 +769,26 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
     hs_flight.truncate(finished_end);
+
+    if verify {
+        let shared = auth::shared_secret(server_reality_pub, &eph_priv);
+        let expected_pubkey_sec1 = auth::derive_cert_key(&shared).public_sec1;
+        if let Err(e) = verify_reality_binding(
+            &hs_flight,
+            &ch_sh_transcript,
+            server_hello_info.suite,
+            &expected_pubkey_sec1,
+        ) {
+            send_alert(
+                &mut stream,
+                &hk,
+                server_hello_info.suite,
+                ALERT_DESCRIPTION_BAD_CERTIFICATE,
+            )
+            .await;
+            return Err(e);
+        }
+    }
 
     let mut full_transcript = ch_sh_transcript;
     full_transcript.extend_from_slice(&hs_flight);
@@ -850,7 +1223,14 @@ mod tests {
         let short_id = [1, 2, 3, 4, 5, 6, 7, 8];
 
         let connect_task = tokio::spawn(async move {
-            let _ = connect(client_io, "example.com", &server_reality_pub, short_id).await;
+            let _ = connect(
+                client_io,
+                "example.com",
+                &server_reality_pub,
+                short_id,
+                false,
+            )
+            .await;
         });
 
         let (record_type, ch_msg) = read_one_record(&mut server_io).await;
@@ -1149,13 +1529,501 @@ mod tests {
 
         let server_task = tokio::spawn(run_mock_tls13_server(server_io));
 
-        let mut s = connect(client_io, "example.com", &[9u8; 32], [1u8; 8])
+        let mut s = connect(client_io, "example.com", &[9u8; 32], [1u8; 8], false)
             .await
             .expect("handshake against the in-process mock server must succeed");
 
         s.write_all(b"PING").await.unwrap();
         s.flush().await.unwrap();
 
+        let mut buf = [0u8; 4];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"PING");
+
+        server_task.await.unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // REALITY.4b Task 2: CertificateVerify verification
+    // -----------------------------------------------------------------
+
+    /// KAT: reconstruct the RFC 8446 §4.4.3 signed content and verify a
+    /// known-good ECDSA-P256 `CertificateVerify` by the shared-secret-
+    /// derived key; a ONE-BYTE transcript perturbation must flip the
+    /// verdict to `Err` — this is the guard against getting the §4.4.3
+    /// transcript boundary wrong (the failure mode a wrong boundary causes
+    /// is silent, since it always signs/verifies SOME 32/48-byte string —
+    /// it just isn't the one RFC 8446 actually requires).
+    #[test]
+    fn certverify_predicate_kat() {
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+        use p256::pkcs8::DecodePrivateKey;
+
+        let shared = [0x42u8; 32];
+        let derived = auth::derive_cert_key(&shared);
+        let signing_key =
+            SigningKey::from_pkcs8_der(&derived.pkcs8_der).expect("derived pkcs8 loads");
+
+        // A stand-in "transcript hash" — the predicate treats it as opaque
+        // bytes, so any fixed value proves the point.
+        let transcript = [0x11u8; 32].to_vec();
+
+        let mut signed = Vec::with_capacity(64 + 34 + 1 + transcript.len());
+        signed.extend_from_slice(&[0x20u8; 64]);
+        signed.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+        signed.push(0x00);
+        signed.extend_from_slice(&transcript);
+
+        let signature: Signature = signing_key.sign(&signed);
+        let signature_der = signature.to_der().as_ref().to_vec();
+
+        assert!(verify_certificate_verify(
+            &derived.public_sec1,
+            &derived.public_sec1,
+            &transcript,
+            &signature_der,
+        )
+        .is_ok());
+
+        let mut perturbed = transcript.clone();
+        perturbed[0] ^= 0xFF;
+        assert!(
+            matches!(
+                verify_certificate_verify(
+                    &derived.public_sec1,
+                    &derived.public_sec1,
+                    &perturbed,
+                    &signature_der,
+                ),
+                Err(Error::RealityVerify(_))
+            ),
+            "a one-byte transcript perturbation must flip the verdict to Err"
+        );
+    }
+
+    /// What kind of Certificate/CertificateVerify a mock server presents in
+    /// the `connect_verify_*` tests below.
+    enum ServerCertBehavior {
+        /// Leaf key IS the shared-secret-derived key; `CertificateVerify`
+        /// signed by that SAME key — a genuine REALITY.4b binding.
+        CorrectBinder,
+        /// Leaf key is an unrelated random P-256 key (never the derived
+        /// one); `CertificateVerify` is signed by that SAME random key (an
+        /// internally-consistent but wrongly-pinned leaf).
+        WrongLeafKey,
+        /// Leaf key IS the derived key (the pin matches), but
+        /// `CertificateVerify` is signed by a DIFFERENT random key.
+        BadSignature,
+    }
+
+    /// Builds a wire `Certificate` handshake message (RFC 8446 §4.4.2)
+    /// carrying a single `CertificateEntry` (no per-cert extensions)
+    /// wrapping `leaf_der` — the test-only encoder counterpart of
+    /// `scan_cert_flight`/`certificate_leaf_der`.
+    fn build_certificate_message(leaf_der: &[u8]) -> Vec<u8> {
+        let mut entry = Vec::new();
+        let cd_len = u32::try_from(leaf_der.len()).unwrap().to_be_bytes();
+        entry.extend_from_slice(&cd_len[1..]);
+        entry.extend_from_slice(leaf_der);
+        entry.extend_from_slice(&0u16.to_be_bytes()); // no per-cert extensions
+
+        let mut body = Vec::new();
+        body.push(0); // certificate_request_context: empty
+        let list_len = u32::try_from(entry.len()).unwrap().to_be_bytes();
+        body.extend_from_slice(&list_len[1..]);
+        body.extend_from_slice(&entry);
+
+        let mut msg = Vec::new();
+        msg.push(HS_TYPE_CERTIFICATE);
+        let len = u32::try_from(body.len()).unwrap().to_be_bytes();
+        msg.extend_from_slice(&len[1..]);
+        msg.extend_from_slice(&body);
+        msg
+    }
+
+    /// Builds a wire `CertificateVerify` handshake message (RFC 8446
+    /// §4.4.3) announcing `ecdsa_secp256r1_sha256` (`0x0403`, filler —
+    /// `verify_certificate_verify` never reads it) and carrying
+    /// `signature_der` — the test-only encoder counterpart of
+    /// `scan_cert_flight`/`certificate_verify_signature`.
+    fn build_certificate_verify_message(signature_der: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0403u16.to_be_bytes());
+        let sig_len = u16::try_from(signature_der.len()).unwrap().to_be_bytes();
+        body.extend_from_slice(&sig_len);
+        body.extend_from_slice(signature_der);
+
+        let mut msg = Vec::new();
+        msg.push(HS_TYPE_CERTIFICATE_VERIFY);
+        let len = u32::try_from(body.len()).unwrap().to_be_bytes();
+        msg.extend_from_slice(&len[1..]);
+        msg.extend_from_slice(&body);
+        msg
+    }
+
+    /// Builds a throwaway self-signed leaf certificate DER around `key` —
+    /// just enough of a real X.509 structure for `spki_sec1_pubkey_from_der`
+    /// to walk.
+    fn leaf_der_for_key(key: &rcgen::KeyPair) -> Vec<u8> {
+        let mut params = rcgen::CertificateParams::default();
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(rcgen::DnType::CommonName, "mock-reality-relay.test");
+        params.distinguished_name = dn;
+        let cert = params.self_signed(key).unwrap();
+        cert.der().as_ref().to_vec()
+    }
+
+    /// Like `run_mock_tls13_server`, but additionally sends a
+    /// Certificate/CertificateVerify pair ahead of Finished, built per
+    /// `behavior` — driving `connect(.., verify: true)`'s REALITY.4b
+    /// verification path against a mock SERVER role that speaks this
+    /// crate's OWN handshake primitives, exactly mirroring
+    /// `run_mock_tls13_server`'s "no external TLS stack" design (see that
+    /// function's doc comment for why).
+    ///
+    /// A client that REJECTS the presented binding sends an alert instead
+    /// of a CCS/Finished and never gets here — callers driving a rejecting
+    /// `behavior` must NOT `.await` the returned task's `JoinHandle` (it
+    /// would hang forever on the client's CCS/Finished that never arrives);
+    /// see the `connect_verify_rejects_*` tests below.
+    async fn run_mock_tls13_server_with_cert(
+        mut io: tokio::io::DuplexStream,
+        server_reality_priv: [u8; 32],
+        behavior: ServerCertBehavior,
+    ) {
+        const SUITE: u16 = 0x1301; // TLS_AES_128_GCM_SHA256
+
+        // -- ClientHello ------------------------------------------------
+        let (record_type, ch_msg) = read_one_record(&mut io).await;
+        assert_eq!(
+            record_type, CONTENT_TYPE_HANDSHAKE,
+            "ClientHello must arrive as a plaintext handshake record"
+        );
+        let (_client_random, client_x25519_pub) = client_hello_random_and_x25519(&ch_msg);
+
+        // -- ServerHello (group x25519) -----------------------------------
+        let server_secret = x25519_dalek::StaticSecret::from([9u8; 32]);
+        let server_x25519_pub: [u8; 32] = x25519_dalek::PublicKey::from(&server_secret).to_bytes();
+        let ecdhe: Vec<u8> = server_secret
+            .diffie_hellman(&x25519_dalek::PublicKey::from(client_x25519_pub))
+            .to_bytes()
+            .to_vec();
+
+        let mut server_random = [0u8; 32];
+        getrandom::getrandom(&mut server_random).unwrap();
+
+        let mut key_share_entry = Vec::new();
+        key_share_entry.extend_from_slice(&GROUP_X25519.to_be_bytes());
+        key_share_entry.extend_from_slice(&32u16.to_be_bytes());
+        key_share_entry.extend_from_slice(&server_x25519_pub);
+
+        let mut exts = Vec::new();
+        exts.extend_from_slice(&43u16.to_be_bytes());
+        exts.extend_from_slice(&2u16.to_be_bytes());
+        exts.extend_from_slice(&0x0304u16.to_be_bytes());
+        exts.extend_from_slice(&51u16.to_be_bytes());
+        exts.extend_from_slice(&u16::try_from(key_share_entry.len()).unwrap().to_be_bytes());
+        exts.extend_from_slice(&key_share_entry);
+
+        let mut sh_body = Vec::new();
+        sh_body.extend_from_slice(&0x0303u16.to_be_bytes());
+        sh_body.extend_from_slice(&server_random);
+        sh_body.push(0);
+        sh_body.extend_from_slice(&SUITE.to_be_bytes());
+        sh_body.push(0);
+        sh_body.extend_from_slice(&u16::try_from(exts.len()).unwrap().to_be_bytes());
+        sh_body.extend_from_slice(&exts);
+
+        let mut sh_msg = Vec::new();
+        sh_msg.push(0x02);
+        let body_len = u32::try_from(sh_body.len()).unwrap().to_be_bytes();
+        sh_msg.extend_from_slice(&body_len[1..]);
+        sh_msg.extend_from_slice(&sh_body);
+
+        let sh_header =
+            record_header(CONTENT_TYPE_HANDSHAKE, LEGACY_RECORD_VERSION, sh_msg.len()).unwrap();
+        io.write_all(&sh_header).await.unwrap();
+        io.write_all(&sh_msg).await.unwrap();
+
+        // -- Handshake keys, matching connect()'s own derivation exactly --
+        let mut ch_sh_transcript = Vec::with_capacity(ch_msg.len() + sh_msg.len());
+        ch_sh_transcript.extend_from_slice(&ch_msg);
+        ch_sh_transcript.extend_from_slice(&sh_msg);
+        let transcript_ch_sh = transcript_hash(&ch_sh_transcript, SUITE);
+        let hk = derive_handshake_keys(&ecdhe, &transcript_ch_sh, SUITE);
+
+        // -- REALITY.4b binding: derive the cert key from the SAME shared
+        // secret the client derives (`auth::shared_secret(server_reality_pub,
+        // &client_eph_priv)`) — by X25519 DH symmetry, ECDH(server_priv,
+        // client_pub) == ECDH(client_priv, server_pub), so this reuses the
+        // exact function the client uses, just with the arguments swapped. --
+        let shared = auth::shared_secret(&client_x25519_pub, &server_reality_priv);
+        let derived = auth::derive_cert_key(&shared);
+
+        let (leaf_key_pkcs8, signing_key_pkcs8): (Vec<u8>, Vec<u8>) = match behavior {
+            ServerCertBehavior::CorrectBinder => {
+                (derived.pkcs8_der.clone(), derived.pkcs8_der.clone())
+            }
+            ServerCertBehavior::WrongLeafKey => {
+                let wrong = rcgen::KeyPair::generate().unwrap().serialize_der();
+                (wrong.clone(), wrong)
+            }
+            ServerCertBehavior::BadSignature => {
+                let other = rcgen::KeyPair::generate().unwrap().serialize_der();
+                (derived.pkcs8_der.clone(), other)
+            }
+        };
+        use p256::pkcs8::DecodePrivateKey as _;
+
+        let leaf_key = rcgen::KeyPair::try_from(leaf_key_pkcs8.as_slice())
+            .expect("leaf signing key pkcs8 loads");
+        let leaf_der = leaf_der_for_key(&leaf_key);
+
+        let ee_msg: [u8; 4] = [0x08, 0x00, 0x00, 0x00]; // EncryptedExtensions, 0-length
+        let certificate_msg = build_certificate_message(&leaf_der);
+
+        // The RFC 8446 §4.4.3 transcript boundary: everything through
+        // Certificate, NOT including CertificateVerify.
+        let mut thru_cert = ch_sh_transcript.clone();
+        thru_cert.extend_from_slice(&ee_msg);
+        thru_cert.extend_from_slice(&certificate_msg);
+        let transcript_thru_cert = transcript_hash(&thru_cert, SUITE);
+
+        let mut signed = Vec::with_capacity(64 + 34 + 1 + transcript_thru_cert.len());
+        signed.extend_from_slice(&[0x20u8; 64]);
+        signed.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+        signed.push(0x00);
+        signed.extend_from_slice(&transcript_thru_cert);
+
+        let signing_key = p256::ecdsa::SigningKey::from_pkcs8_der(&signing_key_pkcs8)
+            .expect("signing key pkcs8 loads");
+        let signature: p256::ecdsa::Signature = {
+            use p256::ecdsa::signature::Signer;
+            signing_key.sign(&signed)
+        };
+        let certificate_verify_msg = build_certificate_verify_message(signature.to_der().as_ref());
+
+        let verify_data = [0xABu8; 32]; // arbitrary: connect() never checks it
+        let mut finished_msg = Vec::with_capacity(4 + verify_data.len());
+        finished_msg.push(HS_TYPE_FINISHED);
+        finished_msg.extend_from_slice(&[0x00, 0x00, 0x20]); // u24 len = 32
+        finished_msg.extend_from_slice(&verify_data);
+
+        let mut server_flight_plain = Vec::new();
+        server_flight_plain.extend_from_slice(&ee_msg);
+        server_flight_plain.extend_from_slice(&certificate_msg);
+        server_flight_plain.extend_from_slice(&certificate_verify_msg);
+        server_flight_plain.extend_from_slice(&finished_msg);
+
+        let sealed_flight = record_seal(
+            &hk.server_key,
+            &hk.server_iv,
+            0,
+            SUITE,
+            CONTENT_TYPE_HANDSHAKE,
+            &server_flight_plain,
+        )
+        .unwrap();
+        let flight_header = record_header(
+            CONTENT_TYPE_APPLICATION_DATA,
+            LEGACY_RECORD_VERSION,
+            sealed_flight.len(),
+        )
+        .unwrap();
+        io.write_all(&flight_header).await.unwrap();
+        io.write_all(&sealed_flight).await.unwrap();
+
+        let mut full_transcript = ch_sh_transcript;
+        full_transcript.extend_from_slice(&server_flight_plain);
+        let transcript_thru_sfin = transcript_hash(&full_transcript, SUITE);
+        let ak = derive_application_keys(&hk.handshake_secret, &transcript_thru_sfin, SUITE);
+
+        // -- Drain the client's CCS + sealed Finished. Only reached if the
+        // client ACCEPTED the binding — see this function's doc comment. --
+        loop {
+            let (record_type, _payload) = read_one_record(&mut io).await;
+            if record_type == CONTENT_TYPE_CHANGE_CIPHER_SPEC {
+                continue;
+            }
+            assert_eq!(
+                record_type, CONTENT_TYPE_APPLICATION_DATA,
+                "expected the client's sealed Finished record"
+            );
+            break;
+        }
+
+        // -- Echo one application-data record under the application keys --
+        let (record_type, mut app_payload) = read_one_record(&mut io).await;
+        assert_eq!(record_type, CONTENT_TYPE_APPLICATION_DATA);
+        let plaintext = record_open(
+            &ak.client_key,
+            &ak.client_iv,
+            0,
+            SUITE,
+            CONTENT_TYPE_APPLICATION_DATA,
+            &mut app_payload,
+        )
+        .unwrap();
+
+        let sealed_reply = record_seal(
+            &ak.server_key,
+            &ak.server_iv,
+            0,
+            SUITE,
+            CONTENT_TYPE_APPLICATION_DATA,
+            &plaintext,
+        )
+        .unwrap();
+        let reply_header = record_header(
+            CONTENT_TYPE_APPLICATION_DATA,
+            LEGACY_RECORD_VERSION,
+            sealed_reply.len(),
+        )
+        .unwrap();
+        io.write_all(&reply_header).await.unwrap();
+        io.write_all(&sealed_reply).await.unwrap();
+    }
+
+    /// `verify=true` against a mock server whose leaf/signature genuinely
+    /// bind the shared secret: `connect` must succeed, and the resulting
+    /// stream must carry application data exactly like the non-verifying
+    /// path — REALITY.4b verification is a gate, not a change to the data
+    /// plane.
+    #[tokio::test]
+    async fn connect_verify_accepts_correct_binder() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_reality_priv = [3u8; 32];
+        let server_reality_pub = {
+            let secret = x25519_dalek::StaticSecret::from(server_reality_priv);
+            x25519_dalek::PublicKey::from(&secret).to_bytes()
+        };
+
+        let server_task = tokio::spawn(run_mock_tls13_server_with_cert(
+            server_io,
+            server_reality_priv,
+            ServerCertBehavior::CorrectBinder,
+        ));
+
+        let mut s = connect(
+            client_io,
+            "example.com",
+            &server_reality_pub,
+            [1u8; 8],
+            true,
+        )
+        .await
+        .expect("a correctly-bound relay must verify");
+
+        s.write_all(b"PING").await.unwrap();
+        s.flush().await.unwrap();
+        let mut buf = [0u8; 4];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"PING");
+
+        server_task.await.unwrap();
+    }
+
+    /// `verify=true` against a mock server presenting a leaf key that is
+    /// NOT the shared-secret-derived key: `connect` must reject with
+    /// `Error::RealityVerify`. The mock server's own CCS/Finished-draining
+    /// tail is never reached by a rejecting client, so its `JoinHandle` is
+    /// intentionally left un-awaited (see `run_mock_tls13_server_with_cert`'s
+    /// doc comment).
+    #[tokio::test]
+    async fn connect_verify_rejects_wrong_key() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_reality_priv = [4u8; 32];
+        let server_reality_pub = {
+            let secret = x25519_dalek::StaticSecret::from(server_reality_priv);
+            x25519_dalek::PublicKey::from(&secret).to_bytes()
+        };
+
+        let _server_task = tokio::spawn(run_mock_tls13_server_with_cert(
+            server_io,
+            server_reality_priv,
+            ServerCertBehavior::WrongLeafKey,
+        ));
+
+        let result = connect(
+            client_io,
+            "example.com",
+            &server_reality_pub,
+            [1u8; 8],
+            true,
+        )
+        .await;
+        match result {
+            Err(Error::RealityVerify(_)) => {}
+            Err(e) => panic!("expected Error::RealityVerify, got a different error: {e}"),
+            Ok(_) => panic!("a wrong-key relay must be rejected, but connect() succeeded"),
+        }
+    }
+
+    /// `verify=true` against a mock server whose leaf key MATCHES the
+    /// derived key but whose `CertificateVerify` is signed by a different
+    /// key: `connect` must reject with `Error::RealityVerify`. Same
+    /// un-awaited-`JoinHandle` note as `connect_verify_rejects_wrong_key`.
+    #[tokio::test]
+    async fn connect_verify_rejects_bad_signature() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_reality_priv = [5u8; 32];
+        let server_reality_pub = {
+            let secret = x25519_dalek::StaticSecret::from(server_reality_priv);
+            x25519_dalek::PublicKey::from(&secret).to_bytes()
+        };
+
+        let _server_task = tokio::spawn(run_mock_tls13_server_with_cert(
+            server_io,
+            server_reality_priv,
+            ServerCertBehavior::BadSignature,
+        ));
+
+        let result = connect(
+            client_io,
+            "example.com",
+            &server_reality_pub,
+            [1u8; 8],
+            true,
+        )
+        .await;
+        match result {
+            Err(Error::RealityVerify(_)) => {}
+            Err(e) => panic!("expected Error::RealityVerify, got a different error: {e}"),
+            Ok(_) => panic!("a bad-signature relay must be rejected, but connect() succeeded"),
+        }
+    }
+
+    /// `verify=false` against the SAME wrong-key mock server that
+    /// `connect_verify_rejects_wrong_key` proves is rejected under
+    /// `verify=true`: `connect` must still succeed — zero-cert-auth
+    /// camouflage is preserved by default.
+    #[tokio::test]
+    async fn connect_no_verify_ignores_cert() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_reality_priv = [6u8; 32];
+        let server_reality_pub = {
+            let secret = x25519_dalek::StaticSecret::from(server_reality_priv);
+            x25519_dalek::PublicKey::from(&secret).to_bytes()
+        };
+
+        let server_task = tokio::spawn(run_mock_tls13_server_with_cert(
+            server_io,
+            server_reality_priv,
+            ServerCertBehavior::WrongLeafKey,
+        ));
+
+        let mut s = connect(
+            client_io,
+            "example.com",
+            &server_reality_pub,
+            [1u8; 8],
+            false,
+        )
+        .await
+        .expect("verify=false must ignore the cert entirely (zero-cert-auth camouflage)");
+
+        s.write_all(b"PING").await.unwrap();
+        s.flush().await.unwrap();
         let mut buf = [0u8; 4];
         s.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"PING");

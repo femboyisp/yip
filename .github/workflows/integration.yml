@@ -397,21 +397,28 @@ jobs:
             exit 1
           fi
 
-      - name: Run the relay-over-REALITY money + wrong-pubkey test under sudo
-        # REALITY.4a's headline money test: two UDP-blocked yipd peers tunnel
-        # to each other THROUGH a REALITY relay —
-        # `rendezvous=reality://host:port?pbk=&sid=&sni=` + `obf_psk` dials
-        # the relay with a Chrome-faithful REALITY ClientHello
-        # (`relay_client::spawn_reality`), registers, and the relay blindly
-        # forwards ALL peer traffic. Also proves the zero-cert-auth caveat's
-        # fail-closed side: a wrong `pbk=` yields NO tunnel (the relay's
-        # seal-open fails and splices the connection to `--reality-dest`
-        # instead). See run-netns-reality-relay.sh for the full topology,
-        # pinned keypair derivation, and assertion set. Release yipd (already
-        # built above) is required for the same reason as the TLS relay test;
-        # the debug yip-rendezvous-bin built above is sufficient for the
-        # relay side (it also needs cmake, already installed in this job for
-        # the `boring`/BoringSSL crate yipd links).
+      - name: Run the relay-over-REALITY verify=on money + wrong-pubkey/wrong-relay-key tests under sudo
+        # REALITY.4a/4b's headline money test: two UDP-blocked yipd peers
+        # tunnel to each other THROUGH a REALITY relay, with the clients
+        # explicitly `verify=on` —
+        # `rendezvous=reality://host:port?pbk=&sid=&sni=&verify=on` +
+        # `obf_psk` dials the relay with a Chrome-faithful REALITY
+        # ClientHello (`relay_client::spawn_reality`), registers, and the
+        # relay blindly forwards ALL peer traffic, with the relay's automatic
+        # per-connection cert bind (REALITY.4b) verified end-to-end by the
+        # client. Also proves the zero-cert-auth caveat's fail-closed side
+        # two ways: a wrong `pbk=` (client-side) and a mismatched
+        # `--reality-private-key` (relay-side) both yield NO tunnel (the
+        # relay's seal-open fails and splices the connection to
+        # `--reality-dest` instead, and the client's own `verify=on` check
+        # then fails closed too, backing off on the long jittered interval
+        # instead of retry-storming). See run-netns-reality-relay.sh for the
+        # full topology, pinned keypair derivation, and assertion set.
+        # Release yipd (already built above) is required for the same reason
+        # as the TLS relay test; the debug yip-rendezvous-bin built above is
+        # sufficient for the relay side (it also needs cmake, already
+        # installed in this job for the `boring`/BoringSSL crate yipd
+        # links).
         run: |
           sudo bash bin/yipd/tests/run-netns-reality-relay.sh \
             "$(pwd)/target/release/yipd" \
@@ -424,6 +431,6 @@ jobs:
             exit 1
           fi
           if grep -q "\[FAIL\]" /tmp/relay-reality-money-test.log; then
-            echo "::error::two UDP-blocked peers failed to tunnel via the REALITY relay (ping failed, relay-forwarded stayed 0, or a wrong pbk was wrongly accepted) — REALITY.4a relay-dial regression"
+            echo "::error::two UDP-blocked peers failed to tunnel via the REALITY relay under verify=on (ping failed, relay-forwarded stayed 0, a wrong pbk/relay key was wrongly accepted, or the client retry-stormed on a verify failure) — REALITY.4a/4b relay-dial regression"
             exit 1
           fi

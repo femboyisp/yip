@@ -196,6 +196,32 @@ pub fn reality_auth_recover(
     .map(|(_short_id, ts_min)| ts_min)
 }
 
+/// Like [`reality_auth_recover`] but also returns the X25519 `shared` bytes
+/// (REALITY.4b): the relay derives the per-connection cert key from `shared`
+/// via `yip_utls::auth::derive_cert_key` so the leaf it presents proves it
+/// holds `reality_priv`, not just a fixed ephemeral key (REALITY.3). Same
+/// fail-closed checks as `reality_auth_recover` — delegates to
+/// `yip_utls::auth::open_recover_shared`, dropping only the `short_id`.
+pub fn reality_auth_recover_shared(
+    reality_priv: &[u8; 32],
+    info: &ClientHelloInfo,
+    short_ids: &[[u8; 8]],
+    now_unix_min: u64,
+    skew_min: u64,
+) -> Option<(u64, [u8; 32])> {
+    let eph_pub = info.key_share_x25519?;
+    yip_utls::auth::open_recover_shared(
+        reality_priv,
+        &eph_pub,
+        &info.client_random,
+        &info.legacy_session_id,
+        short_ids,
+        now_unix_min,
+        skew_min,
+    )
+    .map(|(_short_id, ts_min, shared)| (ts_min, shared))
+}
+
 /// Server-side REALITY auth check. True iff `info.legacy_session_id` opens
 /// under the shared key derived from `reality_priv` and the ClientHello's
 /// x25519 key-share, AND the recovered `short_id` is in `short_ids`, AND
@@ -669,6 +695,67 @@ mod tests {
             now,
             10
         ));
+    }
+
+    /// REALITY.4b: `reality_auth_recover_shared` returns the same `ts_min` as
+    /// `reality_auth_recover` on a valid seal, PLUS a 32-byte `shared` equal
+    /// to the X25519 ECDH of `reality_priv` and the client's ephemeral
+    /// key-share — the same value the client independently computes via
+    /// `yip_utls::auth::shared_secret`, proving the server side of the
+    /// REALITY.4b cert-key derivation input agrees with the client.
+    #[test]
+    fn reality_auth_recover_shared_matches_recover_ts_and_ecdh_shared() {
+        let reality_priv = [21u8; 32];
+        let reality_pub = pubkey_of(&reality_priv);
+        let eph_priv = [23u8; 32];
+        let eph_pub = pubkey_of(&eph_priv);
+        let client_random = [44u8; 32];
+        let short_id = [9u8; 8];
+        let now = 2_000_000u64;
+
+        let session_id =
+            yip_utls::auth::seal(&reality_pub, &eph_priv, &client_random, short_id, now);
+        let info = ClientHelloInfo {
+            sni: None,
+            client_random,
+            legacy_session_id: session_id.to_vec(),
+            key_share_x25519: Some(eph_pub),
+        };
+
+        let ts_from_recover = reality_auth_recover(&reality_priv, &info, &[short_id], now, 10)
+            .expect("valid seal opens via reality_auth_recover");
+        let (ts_from_shared, shared) =
+            reality_auth_recover_shared(&reality_priv, &info, &[short_id], now, 10)
+                .expect("valid seal opens via reality_auth_recover_shared");
+
+        assert_eq!(
+            ts_from_shared, ts_from_recover,
+            "reality_auth_recover_shared must return the same ts_min as reality_auth_recover"
+        );
+
+        let expected_shared = yip_utls::auth::shared_secret(&reality_pub, &eph_priv);
+        assert_eq!(
+            shared, expected_shared,
+            "recovered shared must equal X25519(reality_priv, eph_pub)"
+        );
+    }
+
+    /// A missing key-share ⇒ `reality_auth_recover_shared` also fails closed
+    /// (`None`), mirroring `missing_key_share_is_rejected` for the plain
+    /// `reality_auth_recover`.
+    #[test]
+    fn reality_auth_recover_shared_missing_key_share_is_rejected() {
+        let reality_priv = [11u8; 32];
+        let info = ClientHelloInfo {
+            sni: None,
+            client_random: [0u8; 32],
+            legacy_session_id: vec![0u8; SESSION_ID_LEN],
+            key_share_x25519: None,
+        };
+        assert_eq!(
+            reality_auth_recover_shared(&reality_priv, &info, &[[0u8; 8]], 0, 60),
+            None
+        );
     }
 
     // ---- Part D: deferred parser-edge coverage (REALITY.1 Task 5, Test 3) ----

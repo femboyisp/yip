@@ -53,7 +53,7 @@ pub enum Rendezvous {
     Udp(SocketAddr),
     /// TLS relay-dial (3c.4), `rendezvous=tls://host:port`.
     Tls { host: String, port: u16 },
-    /// REALITY relay-dial (REALITY.4a), `rendezvous=reality://host:port?pbk=&sid=&sni=`.
+    /// REALITY relay-dial (REALITY.4a/4b), `rendezvous=reality://host:port?pbk=&sid=&sni=&verify=`.
     Reality {
         host: String,
         port: u16,
@@ -63,6 +63,12 @@ pub enum Rendezvous {
         short_id: [u8; 8],
         /// Borrowed SNI presented in the crafted ClientHello (`sni=`).
         sni: String,
+        /// Relay verification policy (`verify=on|off`, default `on` —
+        /// REALITY.4b). `off` disables Xray-style relay authentication (the
+        /// client no longer confirms it is talking to the genuine relay
+        /// rather than an on-path MITM/decoy) — a downgrade, warned about at
+        /// config load.
+        verify: bool,
     },
 }
 
@@ -314,10 +320,14 @@ fn parse_rendezvous_host_port<'a>(rest: &'a str, scheme: &str) -> io::Result<(St
     }
 }
 
-/// Parse a `reality://`-stripped value: `host:port?pbk=<64hex>&sid=<16hex>&sni=<domain>`.
-/// Fail-closed: missing/duplicate/unknown params, malformed hex, empty sni, or the
-/// 4b-only `verify=` param all error. `verify=` is rejected here (REALITY.4a does no
-/// relay verification — that is REALITY.4b).
+/// Parse a `reality://`-stripped value:
+/// `host:port?pbk=<64hex>&sid=<16hex>&sni=<domain>&verify=<on|off>`.
+/// Fail-closed: missing/duplicate/unknown params, malformed hex, empty sni, or an
+/// invalid `verify=` value all error. `verify=` (REALITY.4b) selects whether the
+/// client performs Xray-style relay authentication: `on`/`true` (the default when
+/// absent) or `off`/`false`, which is a downgrade — WARNed about at config load,
+/// not rejected, since it is occasionally a deliberate operator choice (e.g.
+/// debugging against a relay that hasn't rotated its REALITY key yet).
 fn parse_reality_rendezvous(rest: &str) -> io::Result<Rendezvous> {
     let (hostport, query) = rest.split_once('?').ok_or_else(|| {
         io::Error::new(
@@ -336,6 +346,7 @@ fn parse_reality_rendezvous(rest: &str) -> io::Result<Rendezvous> {
     let mut pbk: Option<[u8; 32]> = None;
     let mut sid: Option<[u8; 8]> = None;
     let mut sni: Option<String> = None;
+    let mut verify: Option<bool> = None;
     for pair in query.split('&') {
         let (key, value) = pair.split_once('=').ok_or_else(|| {
             io::Error::new(
@@ -378,10 +389,22 @@ fn parse_reality_rendezvous(rest: &str) -> io::Result<Rendezvous> {
                 sni = Some(value.to_owned());
             }
             "verify" => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "reality:// verify= is not supported yet (REALITY.4b)",
-                ));
+                if verify.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "reality:// duplicate verify=",
+                    ));
+                }
+                verify = Some(match value {
+                    "on" | "true" => true,
+                    "off" | "false" => false,
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "reality:// verify must be on|off",
+                        ));
+                    }
+                });
             }
             other => {
                 return Err(io::Error::new(
@@ -398,12 +421,21 @@ fn parse_reality_rendezvous(rest: &str) -> io::Result<Rendezvous> {
         sid.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "reality:// missing sid="))?;
     let sni =
         sni.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "reality:// missing sni="))?;
+    let verify = verify.unwrap_or(true);
+    if !verify {
+        eprintln!(
+            "yipd: WARNING - rendezvous=reality://{host}:{port} has verify=off — REALITY relay \
+             verification is DISABLED; this client will not detect an on-path MITM or decoy \
+             posing as the relay (REALITY.4b downgrade, not recommended in production)"
+        );
+    }
     Ok(Rendezvous::Reality {
         host,
         port,
         pubkey,
         short_id,
         sni,
+        verify,
     })
 }
 
@@ -1079,15 +1111,107 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
                 pubkey,
                 short_id,
                 sni,
+                verify,
             }) => {
                 assert_eq!(host, "relay.example.test");
                 assert_eq!(port, 8443);
                 assert_eq!(pubkey, [0xAA; 32]);
                 assert_eq!(short_id, [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77]);
                 assert_eq!(sni, "www.microsoft.com");
+                assert!(verify, "verify= absent must default to true");
             }
             other => panic!("expected Rendezvous::Reality, got {other:?}"),
         }
+    }
+
+    // ── verify=on|off (REALITY.4b) ──────────────────────────────────────
+
+    #[test]
+    fn reality_rendezvous_verify_off_parses_false() {
+        let p = "a".repeat(64);
+        let text = format!(
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             listen=0.0.0.0:51820\ndevice=yip0\n\
+             obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
+             rendezvous=reality://h.test:443?pbk={p}&sid=0011223344556677&sni=a.test&verify=off\n\
+             [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
+        );
+        let cfg = Config::parse(&text).expect("verify=off parses");
+        match cfg.rendezvous {
+            Some(Rendezvous::Reality { verify, .. }) => assert!(!verify),
+            other => panic!("expected Rendezvous::Reality, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reality_rendezvous_verify_true_and_on_parse_true() {
+        let p = "a".repeat(64);
+        for word in ["true", "on"] {
+            let text = format!(
+                "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                 local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                 listen=0.0.0.0:51820\ndevice=yip0\n\
+                 obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
+                 rendezvous=reality://h.test:443?pbk={p}&sid=0011223344556677&sni=a.test&verify={word}\n\
+                 [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
+            );
+            let cfg = Config::parse(&text).unwrap_or_else(|e| panic!("verify={word} parses: {e}"));
+            match cfg.rendezvous {
+                Some(Rendezvous::Reality { verify, .. }) => {
+                    assert!(verify, "verify={word} must parse to true")
+                }
+                other => panic!("expected Rendezvous::Reality, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn reality_rendezvous_verify_absent_defaults_true() {
+        let p = "a".repeat(64);
+        let text = format!(
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             listen=0.0.0.0:51820\ndevice=yip0\n\
+             obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
+             rendezvous=reality://h.test:443?pbk={p}&sid=0011223344556677&sni=a.test\n\
+             [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
+        );
+        let cfg = Config::parse(&text).expect("verify absent parses");
+        match cfg.rendezvous {
+            Some(Rendezvous::Reality { verify, .. }) => assert!(verify),
+            other => panic!("expected Rendezvous::Reality, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reality_rendezvous_verify_bogus_value_is_error() {
+        let p = "a".repeat(64);
+        let text = format!(
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             listen=0.0.0.0:51820\ndevice=yip0\n\
+             obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
+             rendezvous=reality://h.test:443?pbk={p}&sid=0011223344556677&sni=a.test&verify=bogus\n\
+             [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
+        );
+        let err = Config::parse(&text).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn reality_rendezvous_duplicate_verify_is_error() {
+        let p = "a".repeat(64);
+        let text = format!(
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             listen=0.0.0.0:51820\ndevice=yip0\n\
+             obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
+             rendezvous=reality://h.test:443?pbk={p}&sid=0011223344556677&sni=a.test&verify=on&verify=off\n\
+             [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
+        );
+        let err = Config::parse(&text).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -1122,13 +1246,13 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         let base_psk = "obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n";
         let p = "a".repeat(64);
 
-        // verify= is 4b-only → hard reject
+        // verify=on now parses (REALITY.4b) rather than hard-rejecting.
         let with_verify = format!(
             "{HEAD}{base_psk}rendezvous=reality://h.test:443?pbk={p}&sid=0011223344556677&sni=a.test&verify=on\n{PEER}"
         );
         assert!(
-            Config::parse(&with_verify).is_err(),
-            "verify= must be rejected (4b-only)"
+            Config::parse(&with_verify).is_ok(),
+            "verify=on must parse (REALITY.4b)"
         );
 
         // unknown param

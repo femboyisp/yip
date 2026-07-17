@@ -199,6 +199,52 @@ fn run(
     }
 }
 
+// ── REALITY.4b: jittered give-up on relay-verification failure ─────────────
+
+/// Base backoff applied after a `yip_utls::Error::RealityVerify` failure —
+/// several minutes, deliberately much longer than [`MAX_BACKOFF_MS`] (5 s).
+/// A verification failure means the peer we just handshook with is very
+/// likely NOT the genuine REALITY relay (on-path MITM, decoy, or a
+/// misconfigured pinned pubkey/short_id): retrying on the fast ladder used
+/// for ordinary transient failures would just hammer whatever is actually on
+/// the other end of that connection.
+const VERIFY_FAIL_BACKOFF_BASE: Duration = Duration::from_secs(300);
+
+/// Width of the uniform jitter window added on top of
+/// [`VERIFY_FAIL_BACKOFF_BASE`] — up to two more minutes, so repeated
+/// verification failures across restarts/peers don't line up into an
+/// observable lockstep retry cadence.
+const VERIFY_FAIL_BACKOFF_JITTER_MS: u64 = 120_000;
+
+/// Pure, deterministic given `rng_bytes`: the jittered backoff duration to
+/// apply after a `RealityVerify` failure — [`VERIFY_FAIL_BACKOFF_BASE`] plus
+/// a uniform `[0, VERIFY_FAIL_BACKOFF_JITTER_MS)` millisecond jitter derived
+/// from `rng_bytes`. Factored out from [`draw_verify_fail_backoff`] (which
+/// supplies real `getrandom` bytes) purely so this selection logic is
+/// testable without touching the OS RNG. No numeric `as` casts.
+fn verify_fail_backoff(rng_bytes: [u8; 8]) -> Duration {
+    let raw = u64::from_le_bytes(rng_bytes);
+    let jitter_ms = raw % VERIFY_FAIL_BACKOFF_JITTER_MS;
+    VERIFY_FAIL_BACKOFF_BASE + Duration::from_millis(jitter_ms)
+}
+
+/// Draw [`verify_fail_backoff`]'s jitter bytes from the OS CSPRNG (mirrors
+/// `peer_manager::random_pad`/`jitter_ms`'s `getrandom` usage) and compute
+/// the resulting backoff. A `getrandom` failure is vanishingly rare (a
+/// broken/exhausted OS RNG) and is not fatal here — it just means this one
+/// backoff falls back to `rng_bytes = [0; 8]` (zero jitter, still the full
+/// `VERIFY_FAIL_BACKOFF_BASE`), which is safe.
+fn draw_verify_fail_backoff() -> Duration {
+    let mut rng_bytes = [0u8; 8];
+    if let Err(e) = getrandom::getrandom(&mut rng_bytes) {
+        eprintln!(
+            "relay_client(reality): getrandom failed while jittering the verify-fail backoff, \
+             using zero jitter: {e}"
+        );
+    }
+    verify_fail_backoff(rng_bytes)
+}
+
 // ── REALITY relay-dial (async, confined tokio runtime) ─────────────────────
 
 /// Spawn the REALITY relay-dial client thread (REALITY.4a). Mirrors [`spawn`]
@@ -210,7 +256,9 @@ fn run(
 /// The outer REALITY TLS is zero-cert-auth by design (the camouflage). The
 /// tunnel's confidentiality/integrity come from the end-to-end peer Noise-IK,
 /// so an outer MITM / malicious relay sees only inner peer ciphertext and can
-/// at worst DoS. REALITY.4b adds explicit Xray-style relay verification on top.
+/// at worst DoS. REALITY.4b adds explicit Xray-style relay verification on
+/// top, gated by `verify` (from `rendezvous=reality://...?verify=on|off`,
+/// default `on` — see `crate::config::parse_reality_rendezvous`).
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors the existing sync `spawn`; the dial parameters are all distinct config-derived values"
@@ -221,6 +269,7 @@ pub(crate) fn spawn_reality(
     pubkey: [u8; 32],
     short_id: [u8; 8],
     sni: String,
+    verify: bool,
     obf_key: [u8; 16],
     self_node: NodeId,
     sock: UnixDatagram,
@@ -237,7 +286,7 @@ pub(crate) fn spawn_reality(
             }
         };
         rt.block_on(run_reality(
-            &host, port, &pubkey, short_id, &sni, &obf_key, self_node, sock,
+            &host, port, &pubkey, short_id, &sni, verify, &obf_key, self_node, sock,
         ));
     });
 }
@@ -253,6 +302,7 @@ async fn run_reality(
     pubkey: &[u8; 32],
     short_id: [u8; 8],
     sni: &str,
+    verify: bool,
     obf_key: &[u8; 16],
     self_node: NodeId,
     sock: UnixDatagram,
@@ -288,11 +338,29 @@ async fn run_reality(
 
         let handshake = tokio::time::timeout(
             crate::tls::HANDSHAKE_TIMEOUT,
-            yip_utls::connect(tcp, sni, pubkey, short_id),
+            // `verify` (REALITY.4b Task 4) is the config/CLI-driven policy
+            // threaded all the way from `rendezvous=reality://...?verify=`
+            // through `spawn_reality`/`run_reality` — see this function's doc.
+            yip_utls::connect(tcp, sni, pubkey, short_id, verify),
         )
         .await;
         let stream = match handshake {
             Ok(Ok(s)) => s,
+            Ok(Err(yip_utls::Error::RealityVerify(reason))) => {
+                // Not an ordinary transient network/handshake failure: the
+                // peer completed a TLS handshake but failed REALITY relay
+                // verification, i.e. it is very likely NOT the genuine relay
+                // (on-path MITM, decoy, or a misconfigured pinned pubkey/
+                // short_id). Retrying on the fast INITIAL/MAX_BACKOFF_MS
+                // ladder would hammer whatever is on the other end; back off
+                // on the much longer, jittered `verify_fail_backoff` instead.
+                eprintln!(
+                    "relay_client(reality): relay verification failed — not the genuine \
+                     REALITY relay ({reason}); backing off {host}:{port}"
+                );
+                tokio::time::sleep(draw_verify_fail_backoff()).await;
+                continue;
+            }
             Ok(Err(e)) => {
                 eprintln!("relay_client(reality): REALITY handshake to {sni} failed: {e}");
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
@@ -683,6 +751,49 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
+    // ── REALITY.4b: verify_fail_backoff ─────────────────────────────────
+
+    /// Every output of [`verify_fail_backoff`] must land in
+    /// `[VERIFY_FAIL_BACKOFF_BASE, VERIFY_FAIL_BACKOFF_BASE +
+    /// VERIFY_FAIL_BACKOFF_JITTER_MS]` regardless of the RNG bytes fed in —
+    /// checked at both jitter extremes (`0` and `u64::MAX`).
+    #[test]
+    fn verify_fail_backoff_is_bounded_by_base_and_jitter_window() {
+        let max_backoff =
+            VERIFY_FAIL_BACKOFF_BASE + Duration::from_millis(VERIFY_FAIL_BACKOFF_JITTER_MS);
+
+        let zero_jitter = verify_fail_backoff([0u8; 8]);
+        assert!(zero_jitter >= VERIFY_FAIL_BACKOFF_BASE);
+        assert!(zero_jitter <= max_backoff);
+
+        let max_jitter = verify_fail_backoff([0xff; 8]);
+        assert!(max_jitter >= VERIFY_FAIL_BACKOFF_BASE);
+        assert!(max_jitter <= max_backoff);
+    }
+
+    /// The whole point of a distinct verify-fail backoff is that it is much
+    /// longer than the ordinary INITIAL/MAX_BACKOFF_MS ladder used for
+    /// transient connect/handshake failures — assert that even at zero
+    /// jitter it clears `MAX_BACKOFF_MS` by a wide margin.
+    #[test]
+    fn verify_fail_backoff_is_distinct_from_the_normal_backoff_ladder() {
+        let shortest_possible = verify_fail_backoff([0u8; 8]);
+        assert!(
+            shortest_possible > Duration::from_millis(MAX_BACKOFF_MS * 10),
+            "verify-fail backoff ({shortest_possible:?}) must be far longer than the normal \
+             ladder's ceiling ({MAX_BACKOFF_MS}ms)"
+        );
+    }
+
+    /// Different RNG draws must select different backoffs (the jitter is
+    /// actually applied, not silently ignored).
+    #[test]
+    fn verify_fail_backoff_varies_with_rng_bytes() {
+        let a = verify_fail_backoff([1, 0, 0, 0, 0, 0, 0, 0]);
+        let b = verify_fail_backoff([2, 0, 0, 0, 0, 0, 0, 0]);
+        assert_ne!(a, b);
+    }
+
     #[test]
     fn register_frame_deobfuscates_to_fresh_register() {
         let key = yip_obf::derive_key(&[9u8; 32]);
@@ -1036,6 +1147,7 @@ mod tests {
             [0u8; 32], // pbk: unused by a plain TLS server (zero-cert-auth handshake still completes)
             [0u8; 8],
             sni.to_string(),
+            false, // verify: this stub server is plain TLS, not a REALITY relay
             obf_key,
             self_node,
             relay_sock,
