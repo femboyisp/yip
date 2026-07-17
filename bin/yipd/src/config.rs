@@ -53,6 +53,17 @@ pub enum Rendezvous {
     Udp(SocketAddr),
     /// TLS relay-dial (3c.4), `rendezvous=tls://host:port`.
     Tls { host: String, port: u16 },
+    /// REALITY relay-dial (REALITY.4a), `rendezvous=reality://host:port?pbk=&sid=&sni=`.
+    Reality {
+        host: String,
+        port: u16,
+        /// Relay's REALITY X25519 public key (pinned; `pbk=` 64 hex).
+        pubkey: [u8; 32],
+        /// Auth short-id (`sid=` 16 hex).
+        short_id: [u8; 8],
+        /// Borrowed SNI presented in the crafted ClientHello (`sni=`).
+        sni: String,
+    },
 }
 
 /// If `port` is a canonical VPN/tunnel default port that DPI port-matches,
@@ -185,6 +196,23 @@ pub(crate) fn hex_to_16(hex: &str) -> io::Result<[u8; 16]> {
     Ok(out)
 }
 
+/// Decode a 16-char hex string into 8 bytes (REALITY `sid=<hex16>`).
+pub(crate) fn hex_to_8(hex: &str) -> io::Result<[u8; 8]> {
+    if hex.len() != 16 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected 16 hex chars, got {}", hex.len()),
+        ));
+    }
+    let mut out = [0u8; 8];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
 /// Decode an arbitrary-length hex string into bytes — used for the
 /// variable-length `cert=<path>`/`roots=<path>` file contents (a
 /// `Cert`/`RootSet` encodes to a variable number of bytes, unlike the
@@ -243,9 +271,12 @@ fn hex_nibble(b: u8) -> io::Result<u8> {
     }
 }
 
-// ── tls:// rendezvous host:port split ───────────────────────────────────────
+// ── rendezvous host:port split (tls://, reality://) ─────────────────────────
 
-/// Split a `tls://`-stripped rendezvous value into `(host, port_str)`.
+/// Split a scheme-stripped rendezvous value into `(host, port_str)`. Handles a
+/// bracketed IPv6 literal (`[::1]:443`) as its own case; the common
+/// hostname/IPv4 case is a single `rsplit_once(':')`. `scheme` names the
+/// caller (`"tls://"` / `"reality://"`) only for error messages.
 ///
 /// The common case — a DNS hostname (the intended SNI-decoy model) or a bare
 /// IPv4 literal — has exactly one `:`, so `rsplit_once(':')` alone handles
@@ -257,18 +288,18 @@ fn hex_nibble(b: u8) -> io::Result<u8> {
 /// returned `host` has brackets stripped: `to_socket_addrs`'s `(&str, u16)`
 /// impl parses a bare IPv6 literal like `::1` directly (no brackets needed),
 /// so keeping the brackets in `host` would make every later resolution fail.
-fn parse_tls_rendezvous_host_port(rest: &str) -> io::Result<(String, &str)> {
+fn parse_rendezvous_host_port<'a>(rest: &'a str, scheme: &str) -> io::Result<(String, &'a str)> {
     if let Some(after_bracket) = rest.strip_prefix('[') {
         let (host, tail) = after_bracket.split_once(']').ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "tls:// rendezvous has an unterminated IPv6 literal (missing ']')",
+                format!("{scheme} rendezvous has an unterminated IPv6 literal (missing ']')"),
             )
         })?;
         let port_str = tail.strip_prefix(':').ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "tls:// rendezvous IPv6 literal must be followed by :port",
+                format!("{scheme} rendezvous IPv6 literal must be followed by :port"),
             )
         })?;
         Ok((host.to_owned(), port_str))
@@ -276,11 +307,104 @@ fn parse_tls_rendezvous_host_port(rest: &str) -> io::Result<(String, &str)> {
         let (host, port_str) = rest.rsplit_once(':').ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "tls:// rendezvous must be tls://host:port",
+                format!("{scheme} rendezvous must be {scheme}host:port"),
             )
         })?;
         Ok((host.to_owned(), port_str))
     }
+}
+
+/// Parse a `reality://`-stripped value: `host:port?pbk=<64hex>&sid=<16hex>&sni=<domain>`.
+/// Fail-closed: missing/duplicate/unknown params, malformed hex, empty sni, or the
+/// 4b-only `verify=` param all error. `verify=` is rejected here (REALITY.4a does no
+/// relay verification — that is REALITY.4b).
+fn parse_reality_rendezvous(rest: &str) -> io::Result<Rendezvous> {
+    let (hostport, query) = rest.split_once('?').ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "reality:// rendezvous must be reality://host:port?pbk=&sid=&sni=",
+        )
+    })?;
+    let (host, port_str) = parse_rendezvous_host_port(hostport, "reality://")?;
+    let port = port_str.parse::<u16>().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid reality:// port: {e}"),
+        )
+    })?;
+
+    let mut pbk: Option<[u8; 32]> = None;
+    let mut sid: Option<[u8; 8]> = None;
+    let mut sni: Option<String> = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("reality:// query param '{pair}' is not key=value"),
+            )
+        })?;
+        match key {
+            "pbk" => {
+                if pbk.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "reality:// duplicate pbk=",
+                    ));
+                }
+                pbk = Some(hex_to_32(value)?);
+            }
+            "sid" => {
+                if sid.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "reality:// duplicate sid=",
+                    ));
+                }
+                sid = Some(hex_to_8(value)?);
+            }
+            "sni" => {
+                if sni.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "reality:// duplicate sni=",
+                    ));
+                }
+                if value.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "reality:// sni is empty",
+                    ));
+                }
+                sni = Some(value.to_owned());
+            }
+            "verify" => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "reality:// verify= is not supported yet (REALITY.4b)",
+                ));
+            }
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("reality:// unknown query param '{other}'"),
+                ));
+            }
+        }
+    }
+
+    let pubkey =
+        pbk.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "reality:// missing pbk="))?;
+    let short_id =
+        sid.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "reality:// missing sid="))?;
+    let sni =
+        sni.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "reality:// missing sni="))?;
+    Ok(Rendezvous::Reality {
+        host,
+        port,
+        pubkey,
+        short_id,
+        sni,
+    })
 }
 
 // ── missing key helper ────────────────────────────────────────────────────────
@@ -417,8 +541,10 @@ impl Config {
                 "device" => device = Some(val.to_owned()),
                 "device_kind" => device_kind = TunnelMode::parse_device_kind(val)?,
                 "rendezvous" => {
-                    rendezvous = Some(if let Some(rest) = val.strip_prefix("tls://") {
-                        let (host, port_str) = parse_tls_rendezvous_host_port(rest)?;
+                    rendezvous = Some(if let Some(rest) = val.strip_prefix("reality://") {
+                        parse_reality_rendezvous(rest)?
+                    } else if let Some(rest) = val.strip_prefix("tls://") {
+                        let (host, port_str) = parse_rendezvous_host_port(rest, "tls://")?;
                         let port = port_str.parse::<u16>().map_err(|e| {
                             io::Error::new(io::ErrorKind::InvalidData, e.to_string())
                         })?;
@@ -541,15 +667,20 @@ impl Config {
             });
         }
 
-        // A TLS rendezvous dial is only as unobservable as the obfuscation
-        // wrapped around it — `obf_psk` is the relay's discriminator (how it
-        // tells our TLS-mimicry handshake apart from every other TLS
-        // connection it terminates), so a TLS rendezvous with no `obf_psk`
-        // is a misconfiguration, not a degraded-but-working mode.
-        if matches!(rendezvous, Some(Rendezvous::Tls { .. })) && obf_psk.is_none() {
+        // A TLS or REALITY rendezvous dial is only as unobservable as the
+        // obfuscation wrapped around it — `obf_psk` is the relay's
+        // discriminator (how it tells our TLS-mimicry handshake apart from
+        // every other TLS connection it terminates), so either scheme with
+        // no `obf_psk` is a misconfiguration, not a degraded-but-working
+        // mode.
+        if matches!(
+            rendezvous,
+            Some(Rendezvous::Tls { .. } | Rendezvous::Reality { .. })
+        ) && obf_psk.is_none()
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "rendezvous=tls:// requires obf_psk (it is the relay's discriminator)",
+                "rendezvous=tls://|reality:// requires obf_psk (it is the relay's discriminator)",
             ));
         }
 
@@ -925,6 +1056,175 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         )
         .unwrap();
         assert!(matches!(cfg.rendezvous, Some(Rendezvous::Udp(_))));
+    }
+
+    // ── reality:// rendezvous (REALITY.4a) ──────────────────────────────
+
+    #[test]
+    fn reality_rendezvous_parses_all_fields() {
+        let pbk = "a".repeat(64);
+        let text = format!(
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             listen=0.0.0.0:51820\ndevice=yip0\n\
+             obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
+             rendezvous=reality://relay.example.test:8443?pbk={pbk}&sid=0011223344556677&sni=www.microsoft.com\n\
+             [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
+        );
+        let cfg = Config::parse(&text).expect("reality:// config parses");
+        match cfg.rendezvous {
+            Some(Rendezvous::Reality {
+                host,
+                port,
+                pubkey,
+                short_id,
+                sni,
+            }) => {
+                assert_eq!(host, "relay.example.test");
+                assert_eq!(port, 8443);
+                assert_eq!(pubkey, [0xAA; 32]);
+                assert_eq!(short_id, [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77]);
+                assert_eq!(sni, "www.microsoft.com");
+            }
+            other => panic!("expected Rendezvous::Reality, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reality_rendezvous_ipv6_host() {
+        let pbk = "b".repeat(64);
+        let text = format!(
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             listen=0.0.0.0:51820\ndevice=yip0\n\
+             obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
+             rendezvous=reality://[2001:db8::1]:443?pbk={pbk}&sid=0011223344556677&sni=a.test\n\
+             [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
+        );
+        let cfg = Config::parse(&text).expect("reality:// ipv6 parses");
+        match cfg.rendezvous {
+            Some(Rendezvous::Reality { host, port, .. }) => {
+                assert_eq!(host, "2001:db8::1");
+                assert_eq!(port, 443);
+            }
+            other => panic!("expected Rendezvous::Reality ipv6, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reality_rendezvous_rejects_bad_and_missing_params() {
+        const HEAD: &str =
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             listen=0.0.0.0:51820\ndevice=yip0\n";
+        const PEER: &str =
+            "[peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n";
+        let base_psk = "obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n";
+        let p = "a".repeat(64);
+
+        // verify= is 4b-only → hard reject
+        let with_verify = format!(
+            "{HEAD}{base_psk}rendezvous=reality://h.test:443?pbk={p}&sid=0011223344556677&sni=a.test&verify=on\n{PEER}"
+        );
+        assert!(
+            Config::parse(&with_verify).is_err(),
+            "verify= must be rejected (4b-only)"
+        );
+
+        // unknown param
+        let unknown = format!(
+            "{HEAD}{base_psk}rendezvous=reality://h.test:443?pbk={p}&sid=0011223344556677&sni=a.test&fp=chrome\n{PEER}"
+        );
+        assert!(
+            Config::parse(&unknown).is_err(),
+            "unknown param must be rejected"
+        );
+
+        // short pbk
+        let short_pbk = format!(
+            "{HEAD}{base_psk}rendezvous=reality://h.test:443?pbk=deadbeef&sid=0011223344556677&sni=a.test\n{PEER}"
+        );
+        assert!(
+            Config::parse(&short_pbk).is_err(),
+            "short pbk must be rejected"
+        );
+
+        // missing sni
+        let no_sni = format!(
+            "{HEAD}{base_psk}rendezvous=reality://h.test:443?pbk={p}&sid=0011223344556677\n{PEER}"
+        );
+        assert!(
+            Config::parse(&no_sni).is_err(),
+            "missing sni must be rejected"
+        );
+
+        // no obf_psk
+        let no_psk = format!(
+            "{HEAD}rendezvous=reality://h.test:443?pbk={p}&sid=0011223344556677&sni=a.test\n{PEER}"
+        );
+        assert!(
+            Config::parse(&no_psk).is_err(),
+            "reality:// without obf_psk must be rejected"
+        );
+
+        // missing sid
+        let no_sid =
+            format!("{HEAD}{base_psk}rendezvous=reality://h.test:443?pbk={p}&sni=a.test\n{PEER}");
+        assert!(
+            Config::parse(&no_sid).is_err(),
+            "missing sid must be rejected"
+        );
+    }
+
+    #[test]
+    fn reality_rendezvous_rejects_duplicate_pbk() {
+        const HEAD: &str =
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             listen=0.0.0.0:51820\ndevice=yip0\n";
+        const PEER: &str =
+            "[peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n";
+        let base_psk = "obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n";
+        let pbk_a = "a".repeat(64);
+        let pbk_b = "b".repeat(64);
+
+        let dup_pbk = format!(
+            "{HEAD}{base_psk}rendezvous=reality://h.test:443?pbk={pbk_a}&pbk={pbk_b}&sid=0011223344556677&sni=a.test\n{PEER}"
+        );
+        assert!(
+            Config::parse(&dup_pbk).is_err(),
+            "duplicate pbk= must be rejected, not silently last-wins"
+        );
+    }
+
+    #[test]
+    fn reality_rendezvous_rejects_query_pair_without_equals() {
+        const HEAD: &str =
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             listen=0.0.0.0:51820\ndevice=yip0\n";
+        const PEER: &str =
+            "[peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n";
+        let base_psk = "obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n";
+        let p = "a".repeat(64);
+
+        let no_equals = format!(
+            "{HEAD}{base_psk}rendezvous=reality://h.test:443?pbk={p}&sid=0011223344556677&sni=a.test&garbage\n{PEER}"
+        );
+        assert!(
+            Config::parse(&no_equals).is_err(),
+            "query param with no '=' must be rejected"
+        );
+    }
+
+    #[test]
+    fn hex_to_8_roundtrip_and_length() {
+        assert_eq!(
+            hex_to_8("0011223344556677").unwrap(),
+            [0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77]
+        );
+        assert!(hex_to_8("00112233").is_err());
+        assert!(hex_to_8("zzzzzzzzzzzzzzzz").is_err());
     }
 
     // ── mesh config (2c/Task 5) ────────────────────────────────────────

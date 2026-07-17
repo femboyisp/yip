@@ -2006,6 +2006,7 @@ dependencies = [
  "quinn-proto",
  "rcgen",
  "rustls",
+ "tokio",
  "yip-crypto",
  "yip-device",
  "yip-io",
@@ -2013,6 +2014,7 @@ dependencies = [
  "yip-obf",
  "yip-rendezvous",
  "yip-transport",
+ "yip-utls",
  "yip-wire",
 ]
 

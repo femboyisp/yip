@@ -76,6 +76,7 @@ below); otherwise an empty peer list is an error.
 |---|---|---|
 | `rendezvous` | `IP:port` | Address of a `yip-rendezvous` server. Enables lazy **Direct → UDP hole-punch → Relay** bring-up for peers behind NAT. |
 | `rendezvous` | `tls://host:port` | TLS relay-dial (anti-DPI milestone 3c.4). Dials the 3c.3 relay's `--listen-tcp` front over a persistent browser-parrot TLS connection and relays every peer's traffic through it — no Direct/UDP-punch attempt. See below. |
+| `rendezvous` | `reality://host:port?pbk=&sid=&sni=` | REALITY relay-dial (milestone REALITY.4a). Dials the relay's `--reality-dest` REALITY front with a Chrome-faithful crafted `ClientHello` and relays every peer's traffic through it — no Direct/UDP-punch attempt. See below. |
 
 ### Mesh / decentralized discovery (optional)
 
@@ -255,13 +256,10 @@ handshake with the real site and sees **its own** real cert —
 indistinguishable from connecting to that site directly.
 
 **Status.** REALITY.1–3 (server-side transparent forwarding, the pure-Rust
-uTLS client library `yip-utls`, and stolen-cert forging) are complete. The
-`yip-utls` client crate is not yet wired into `yipd`'s production
-rendezvous-dial path, so today the authed path is exercised by unit and
-integration tests, but no production `yipd` client authenticates yet.
-Until that wiring lands, the relay behaves as a perfect "front for `<dest>`"
-server for all live traffic: every real connection lacks a valid seal and is
-forwarded.
+uTLS client library `yip-utls`, and stolen-cert forging) and REALITY.4a (the
+`yipd`-side `rendezvous=reality://` relay-dial client) are complete — see
+[REALITY relay-dial client](#reality-relay-dial-client-rendezvousrealityhostportpbksidsni-reality4a)
+below.
 
 ### TLS relay-dial client (`rendezvous=tls://`, anti-DPI milestone 3c.4)
 
@@ -314,6 +312,64 @@ against a leaked/defector-held capture, not the primary probe defense (a
 passive on-path censor cannot capture the `Register` at all, since it rides
 inside TLS). There is also a known, tracked timing-parity gap for a fully
 silent connection on the decoy handoff path (**issue #63**), not yet closed.
+
+### REALITY relay-dial client (`rendezvous=reality://host:port?pbk=&sid=&sni=`, REALITY.4a)
+
+On the `yipd` side, a `rendezvous` value of the form
+`reality://host:port?pbk=<64hex>&sid=<16hex>&sni=<domain>` (e.g.
+`rendezvous=reality://relay.example.com:443?pbk=1a2b...&sid=00112233445566ff&sni=www.microsoft.com`)
+means "dial this relay's REALITY front" — the client half of the REALITY.1–3
+server-side machinery documented above. A dedicated thread (confined to its
+own current-thread tokio runtime; the tunnel data plane stays sync/epoll and
+tokio-free) opens a TCP connection to `host:port` and performs a one-round-trip
+TLS 1.3 handshake with a Chrome-faithful crafted `ClientHello`
+(`yip_utls::connect`) carrying a REALITY auth seal keyed by `pbk`/`sid` in the
+`legacy_session_id`, sends the obfuscated `Register` first on every
+(re)connect (same Register-first classification and `obf_psk`-wrapped framing
+as `tls://` above), and thereafter relays `RelaySend`/`RelayDeliver` envelopes
+carrying the **unchanged** inner Noise/FEC/AEAD protocol.
+
+Query parameters:
+
+| Param | Value | Notes |
+|---|---|---|
+| `pbk` | 64 hex chars (32 bytes) | The relay's REALITY X25519 **public** key — the public half of its `--reality-private-key`. **Required.** |
+| `sid` | 16 hex chars (8 bytes) | A `--reality-short-id` the relay accepts. **Required.** |
+| `sni` | domain string | The borrowed SNI presented in the crafted `ClientHello` — must match one of the relay's `--reality-server-name` values for the connection to authenticate (and, separately, be a domain the relay has a live forged cert for). **Required.** |
+| `verify` | — | **Reserved for REALITY.4b** (explicit Xray-style relay verification). Currently **rejected** at config load — `reality://` with `verify=` set is a fatal config error, not silently ignored. |
+
+Any other query parameter, a missing required parameter, or a duplicate
+parameter is a fatal config-parse error (fail-closed — REALITY.4a does not
+guess at a partial/malformed configuration).
+
+Like `tls://`, this path is **straight-to-relay**: every peer starts (and
+stays) in the Relay path state, with no Direct or UDP hole-punch attempt.
+Peers must be listed by `public_key` only, and the far peer must dial the
+same relay with the same `pbk`/`sid`/`sni` for the two to meet.
+
+Requirements and interactions (same as `tls://`, see above for the full
+reasoning): **requires `obf_psk`**; **forces the poll (`epoll`) I/O driver**;
+**mutually exclusive with `transport=tls`** in practice.
+
+**Zero-cert-auth caveat.** The outer REALITY TLS handshake itself does **not**
+authenticate the relay to the client — `yip_utls::connect` deliberately does
+not verify the server's certificate chain, `CertificateVerify`, or `Finished`
+contents (that is REALITY's camouflage: a genuine target site's real cert
+flows through untouched on a *successful* connection). The handshake
+completing is therefore not proof `pbk`/`sid` were correct — it completes
+against any TLS 1.3 peer, REALITY-aware or not. What actually gates whether a
+tunnel forms is the **relay's** seal-open check: with a wrong `pbk` (or
+`sid`), the relay can never open the auth seal in the client's `ClientHello`,
+so it treats the connection as unauthenticated and transparently splices it
+to `--reality-dest` — the client's `Register` is never accepted, the inner
+Noise-IK handshake never gets a chance to run, and no tunnel forms. This
+fail-closed behavior is exercised end-to-end by the wrong-pubkey negative
+test in `run-netns-reality-relay.sh`. The tunnel's actual confidentiality and
+integrity come from the end-to-end peer Noise-IK handshake carried inside the
+relayed envelopes, not from the outer TLS — an outer MITM or malicious relay
+sees only inner peer ciphertext and can at worst deny service. **REALITY.4b**
+adds an optional explicit relay-identity check on top (the reserved `verify=`
+parameter above).
 
 ---
 
