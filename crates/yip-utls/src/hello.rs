@@ -123,13 +123,30 @@ pub fn craft(params: &ClientHelloParams, rng: &mut dyn RandomSource) -> Vec<u8> 
     let mut extensions = build_extensions(params, rng);
     shuffle(rng, &mut extensions);
 
+    // The two GREASE extension bookends, byte-faithful to BoringSSL
+    // (`ssl_add_clienthello_tlsext`): the LEADING one has an EMPTY body, the
+    // TRAILING one carries a SINGLE ZERO BYTE, and their codepoints must be
+    // DISTINCT — two extensions of the same type is an RFC 8446 §4.2 violation
+    // that strict servers reject, and an empty trailing body is a per-connection
+    // fingerprint tell (#78). BoringSSL guarantees distinctness deterministically:
+    // if the second draw collides with the first it XORs `0x1010`, mapping GREASE
+    // value n to n^1 (always a distinct GREASE value) — we mirror that exact
+    // fixup rather than redrawing, so our joint (lead, trail) distribution matches
+    // Chrome's rather than being uniform.
+    let lead_grease = grease(rng);
+    let mut trail_grease = grease(rng);
+    if trail_grease == lead_grease {
+        trail_grease ^= 0x1010;
+    }
     body.u16_prefixed(|w| {
-        write_grease_extension(w, rng);
+        w.u16(lead_grease);
+        w.u16_prefixed(|_| {}); // leading GREASE extension: empty body
         for (id, ext_body) in &extensions {
             w.u16(*id);
             w.u16_prefixed(|w| w.bytes(ext_body));
         }
-        write_grease_extension(w, rng);
+        w.u16(trail_grease);
+        w.u16_prefixed(|w| w.u8(0x00)); // trailing GREASE extension: one zero byte
     });
 
     wrap_handshake_message(body.into_bytes())
@@ -358,11 +375,6 @@ fn key_share_body(
     w.into_bytes()
 }
 
-fn write_grease_extension(w: &mut HelloWriter, rng: &mut dyn RandomSource) {
-    w.u16(grease(rng));
-    w.u16_prefixed(|_| {});
-}
-
 /// A GREASE value per RFC 8701: `0x?a?a` with both nibble-pairs equal. Draws
 /// one random nibble from `rng` and repeats it in both bytes.
 fn grease(rng: &mut dyn RandomSource) -> u16 {
@@ -549,6 +561,15 @@ mod tests {
         assert_eq!(parsed.extensions.len(), 18);
         assert!(is_grease(parsed.extensions.first().unwrap().0));
         assert!(is_grease(parsed.extensions.last().unwrap().0));
+        // The leading and trailing GREASE extension codepoints MUST differ:
+        // two extensions of the same type is an RFC 8446 §4.2 violation (strict
+        // servers reject the ClientHello), and real Chrome/BoringSSL always
+        // draws distinct extension-GREASE bookends (#78).
+        assert_ne!(
+            parsed.extensions.first().unwrap().0,
+            parsed.extensions.last().unwrap().0,
+            "extension GREASE bookends must be distinct codepoints"
+        );
 
         // The 16 real ids appear exactly once each, in SOME order, between
         // the two GREASE bookends -- the whole point of Task 3 is that this
@@ -633,6 +654,39 @@ mod tests {
         let a = craft(&params, &mut TestRng::new(42));
         let b = craft(&params, &mut TestRng::new(42));
         assert_eq!(a, b);
+    }
+
+    /// #78: the GREASE extension bookends must be byte-faithful to BoringSSL:
+    /// (1) DISTINCT codepoints — two extensions of the same type is an RFC 8446
+    /// §4.2 violation a strict TLS 1.3 server rejects; and (2) the LEADING body
+    /// is empty while the TRAILING body is a single zero byte (an empty trailing
+    /// body is a per-connection fingerprint tell). GREASE has only 16 values, so
+    /// an independent draw collides ~1/16 — this hammers many distinct seeds to
+    /// catch a regression a single seed would miss. `TestRng::new` does
+    /// `seed | 1`, so only ODD seeds are unique rng streams; iterate 512 of them.
+    #[test]
+    fn craft_grease_extension_bookends_are_boringssl_faithful() {
+        let params = test_params();
+        for seed in (1u64..1024).step_by(2) {
+            let msg = craft(&params, &mut TestRng::new(seed));
+            let parsed = parse(&msg);
+            let (lead_id, lead_body) = parsed.extensions.first().unwrap();
+            let (trail_id, trail_body) = parsed.extensions.last().unwrap();
+            assert!(is_grease(*lead_id) && is_grease(*trail_id));
+            assert_ne!(
+                lead_id, trail_id,
+                "seed {seed}: extension GREASE bookends collided ({lead_id:#06x})"
+            );
+            assert!(
+                lead_body.is_empty(),
+                "leading GREASE extension body must be empty"
+            );
+            assert_eq!(
+                trail_body.as_slice(),
+                &[0x00],
+                "trailing GREASE extension body must be a single zero byte"
+            );
+        }
     }
 
     #[test]
