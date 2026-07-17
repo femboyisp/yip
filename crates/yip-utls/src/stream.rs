@@ -1865,21 +1865,24 @@ mod tests {
     }
 
     /// Builds a wire `Certificate` handshake message (RFC 8446 §4.4.2)
-    /// carrying a single `CertificateEntry` (no per-cert extensions)
-    /// wrapping `leaf_der` — the test-only encoder counterpart of
-    /// `scan_cert_flight`/`certificate_leaf_der`.
-    fn build_certificate_message(leaf_der: &[u8]) -> Vec<u8> {
-        let mut entry = Vec::new();
-        let cd_len = u32::try_from(leaf_der.len()).unwrap().to_be_bytes();
-        entry.extend_from_slice(&cd_len[1..]);
-        entry.extend_from_slice(leaf_der);
-        entry.extend_from_slice(&0u16.to_be_bytes()); // no per-cert extensions
+    /// carrying one `CertificateEntry` (no per-cert extensions) per DER in
+    /// `ders`, in order — the shared test-only encoder counterpart of
+    /// `scan_cert_flight`/`certificate_leaf_der` (single-entry chains) and
+    /// `scan_flight_shape`/`certificate_chain_ders` (multi-entry chains).
+    fn build_certificate_entries_message(ders: &[&[u8]]) -> Vec<u8> {
+        let mut entries = Vec::new();
+        for der in ders {
+            let cd_len = u32::try_from(der.len()).unwrap().to_be_bytes();
+            entries.extend_from_slice(&cd_len[1..]);
+            entries.extend_from_slice(der);
+            entries.extend_from_slice(&0u16.to_be_bytes()); // no per-cert extensions
+        }
 
         let mut body = Vec::new();
         body.push(0); // certificate_request_context: empty
-        let list_len = u32::try_from(entry.len()).unwrap().to_be_bytes();
+        let list_len = u32::try_from(entries.len()).unwrap().to_be_bytes();
         body.extend_from_slice(&list_len[1..]);
-        body.extend_from_slice(&entry);
+        body.extend_from_slice(&entries);
 
         let mut msg = Vec::new();
         msg.push(HS_TYPE_CERTIFICATE);
@@ -1887,6 +1890,28 @@ mod tests {
         msg.extend_from_slice(&len[1..]);
         msg.extend_from_slice(&body);
         msg
+    }
+
+    /// Builds a wire `Certificate` handshake message carrying a single
+    /// `CertificateEntry` wrapping `leaf_der` — the common case used by
+    /// every `connect_verify_*` test that doesn't care about chain shape.
+    fn build_certificate_message(leaf_der: &[u8]) -> Vec<u8> {
+        build_certificate_entries_message(&[leaf_der])
+    }
+
+    /// Builds a wire `Certificate` handshake message carrying TWO
+    /// `CertificateEntry` values, leaf first then `intermediate_der` — the
+    /// shape a real relay's CA-issued chain presents (RFC 8446 §4.4.2
+    /// mandates the same per-entry `extensions` framing on every entry, not
+    /// just the leaf). Exercises the multi-entry walk in
+    /// `certificate_chain_ders` (REALITY.5a Task 2), which the 4b verify
+    /// path (`scan_cert_flight` → `certificate_leaf_der`) now runs through
+    /// on every connection, single- or multi-cert alike.
+    fn build_certificate_message_with_intermediate(
+        leaf_der: &[u8],
+        intermediate_der: &[u8],
+    ) -> Vec<u8> {
+        build_certificate_entries_message(&[leaf_der, intermediate_der])
     }
 
     /// Builds a wire `CertificateVerify` handshake message (RFC 8446
@@ -1934,10 +1959,18 @@ mod tests {
     /// `behavior` must NOT `.await` the returned task's `JoinHandle` (it
     /// would hang forever on the client's CCS/Finished that never arrives);
     /// see the `connect_verify_rejects_*` tests below.
+    ///
+    /// When `include_intermediate` is set, the `Certificate` message carries
+    /// a SECOND `CertificateEntry` after the (still first, still pinned)
+    /// leaf — a dummy but wire-well-formed cert standing in for a real
+    /// relay's intermediate CA cert (REALITY.5a Task 2 review: proves
+    /// `certificate_chain_ders`'s full-chain walk doesn't break 4b
+    /// verification of a genuine multi-cert chain).
     async fn run_mock_tls13_server_with_cert(
         mut io: tokio::io::DuplexStream,
         server_reality_priv: [u8; 32],
         behavior: ServerCertBehavior,
+        include_intermediate: bool,
     ) {
         const SUITE: u16 = 0x1301; // TLS_AES_128_GCM_SHA256
 
@@ -2028,7 +2061,16 @@ mod tests {
         let leaf_der = leaf_der_for_key(&leaf_key);
 
         let ee_msg: [u8; 4] = [0x08, 0x00, 0x00, 0x00]; // EncryptedExtensions, 0-length
-        let certificate_msg = build_certificate_message(&leaf_der);
+        let certificate_msg = if include_intermediate {
+            // A dummy "intermediate": any wire-well-formed CertificateEntry
+            // works per RFC 8446 §4.4.2 — it doesn't need to chain-verify to
+            // the leaf, since REALITY.4b only ever pins the FIRST entry.
+            let intermediate_key = rcgen::KeyPair::generate().unwrap();
+            let intermediate_der = leaf_der_for_key(&intermediate_key);
+            build_certificate_message_with_intermediate(&leaf_der, &intermediate_der)
+        } else {
+            build_certificate_message(&leaf_der)
+        };
 
         // The RFC 8446 §4.4.3 transcript boundary: everything through
         // Certificate, NOT including CertificateVerify.
@@ -2150,6 +2192,7 @@ mod tests {
             server_io,
             server_reality_priv,
             ServerCertBehavior::CorrectBinder,
+            false,
         ));
 
         let mut s = connect(
@@ -2161,6 +2204,51 @@ mod tests {
         )
         .await
         .expect("a correctly-bound relay must verify");
+
+        s.write_all(b"PING").await.unwrap();
+        s.flush().await.unwrap();
+        let mut buf = [0u8; 4];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"PING");
+
+        server_task.await.unwrap();
+    }
+
+    /// REALITY.5a Task 2 review gap: every OTHER `connect_verify_*` test
+    /// uses a single-`CertificateEntry` chain, so the multi-entry parse
+    /// path in `certificate_chain_ders` (which the 4b verify path now runs
+    /// through via `scan_cert_flight` → `certificate_leaf_der`) is never
+    /// exercised by the live verify flow. This mirrors
+    /// `connect_verify_accepts_correct_binder` exactly, except the mock
+    /// server presents a 2-entry chain — the correctly-bound leaf FIRST,
+    /// then a dummy but wire-well-formed intermediate `CertificateEntry`
+    /// (RFC 8446 §4.4.2 framing) appended after it. Verification pins ONLY
+    /// the first entry, so `connect` must still succeed.
+    #[tokio::test]
+    async fn connect_verify_accepts_correct_binder_with_intermediate_chain() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_reality_priv = [7u8; 32];
+        let server_reality_pub = {
+            let secret = x25519_dalek::StaticSecret::from(server_reality_priv);
+            x25519_dalek::PublicKey::from(&secret).to_bytes()
+        };
+
+        let server_task = tokio::spawn(run_mock_tls13_server_with_cert(
+            server_io,
+            server_reality_priv,
+            ServerCertBehavior::CorrectBinder,
+            true,
+        ));
+
+        let mut s = connect(
+            client_io,
+            "example.com",
+            &server_reality_pub,
+            [1u8; 8],
+            true,
+        )
+        .await
+        .expect("a correctly-bound relay presenting leaf+intermediate must still verify");
 
         s.write_all(b"PING").await.unwrap();
         s.flush().await.unwrap();
@@ -2190,6 +2278,7 @@ mod tests {
             server_io,
             server_reality_priv,
             ServerCertBehavior::WrongLeafKey,
+            false,
         ));
 
         let result = connect(
@@ -2224,6 +2313,7 @@ mod tests {
             server_io,
             server_reality_priv,
             ServerCertBehavior::BadSignature,
+            false,
         ));
 
         let result = connect(
@@ -2258,6 +2348,7 @@ mod tests {
             server_io,
             server_reality_priv,
             ServerCertBehavior::WrongLeafKey,
+            false,
         ));
 
         let mut s = connect(
