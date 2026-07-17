@@ -336,7 +336,7 @@ Query parameters:
 | `pbk` | 64 hex chars (32 bytes) | The relay's REALITY X25519 **public** key — the public half of its `--reality-private-key`. **Required.** |
 | `sid` | 16 hex chars (8 bytes) | A `--reality-short-id` the relay accepts. **Required.** |
 | `sni` | domain string | The borrowed SNI presented in the crafted `ClientHello` — must match one of the relay's `--reality-server-name` values for the connection to authenticate (and, separately, be a domain the relay has a live forged cert for). **Required.** |
-| `verify` | — | **Reserved for REALITY.4b** (explicit Xray-style relay verification). Currently **rejected** at config load — `reality://` with `verify=` set is a fatal config error, not silently ignored. |
+| `verify` | `on`/`true` or `off`/`false` | **REALITY.4b**: whether the client performs explicit Xray-style relay verification (leaf key / `CertificateVerify` / scheme checks — see below). Defaults to `on` when absent. `verify=off` is accepted but logs a `WARNING` at config load — it disables the client's only check that it is talking to the genuine relay rather than an on-path MITM/decoy, so it is a deliberate downgrade, not a supported steady-state posture. Any other value (e.g. `verify=bogus`) is a fatal config-parse error. |
 
 Any other query parameter, a missing required parameter, or a duplicate
 parameter is a fatal config-parse error (fail-closed — REALITY.4a does not
@@ -368,8 +368,14 @@ test in `run-netns-reality-relay.sh`. The tunnel's actual confidentiality and
 integrity come from the end-to-end peer Noise-IK handshake carried inside the
 relayed envelopes, not from the outer TLS — an outer MITM or malicious relay
 sees only inner peer ciphertext and can at worst deny service. **REALITY.4b**
-adds an optional explicit relay-identity check on top (the reserved `verify=`
-parameter above).
+adds an optional explicit relay-identity check on top (`verify=` above,
+default `on`): when enabled, `yip_utls::connect` additionally validates the
+relay's leaf key/`CertificateVerify`/scheme against the pinned `pbk`, and a
+failure there (`yip_utls::Error::RealityVerify`) is treated as "this is
+probably not the genuine relay" rather than an ordinary transient failure —
+the client logs it and backs off on a long, jittered interval (several
+minutes, not the ordinary sub-5-second reconnect ladder) instead of hammering
+whatever answered.
 
 ---
 
