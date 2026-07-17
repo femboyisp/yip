@@ -36,6 +36,7 @@ use crate::handshake::{
     GROUP_X25519MLKEM768,
 };
 use crate::hello::{self, ClientHelloParams, RandomSource};
+use crate::template::CertChainShape;
 use ml_kem::kem::Decapsulate;
 use ml_kem::{EncodedSizeUser, KemCore, MlKem768};
 use std::io;
@@ -244,6 +245,8 @@ fn find_finished_end(hs_flight: &[u8]) -> Result<Option<usize>, Error> {
     Ok(None)
 }
 
+/// Handshake message type for `EncryptedExtensions` (RFC 8446 §4.3.1).
+const HS_TYPE_ENCRYPTED_EXTENSIONS: u8 = 0x08;
 /// Handshake message type for `Certificate` (RFC 8446 §4.4.2).
 const HS_TYPE_CERTIFICATE: u8 = 0x0b;
 /// Handshake message type for `CertificateVerify` (RFC 8446 §4.4.3).
@@ -337,12 +340,112 @@ fn scan_cert_flight(hs_flight: &[u8]) -> Result<CertFlightInfo, Error> {
     ))
 }
 
-/// Extracts the first `CertificateEntry`'s raw DER (the leaf) from a
-/// `Certificate` message body (RFC 8446 §4.4.2): `context_len(1) ‖ context
-/// ‖ list_len(3) ‖ [cert_data_len(3) ‖ cert_data ‖ ext_len(2) ‖ ext]…`.
-/// Fail-closed on truncation, an empty list, or a leaf exceeding
-/// [`MAX_LEAF_CERT_DER_LEN`].
-fn certificate_leaf_der(body: &[u8]) -> Result<Vec<u8>, Error> {
+/// REALITY.5a Task 2: what capturing a dest's server flight needs beyond
+/// [`scan_cert_flight`] (which REALITY.4b's verify path already relies on and
+/// which this does not alter) — per-message plaintext lengths (each `4 +
+/// body_len`, the handshake-message length INCLUDING its own 4-byte header —
+/// matching [`crate::template::EncryptedFlightShape`]'s length fields) plus
+/// the full cert chain shape (leaf DER + every subsequent chain cert's DER
+/// verbatim; see [`CertChainShape`]).
+pub struct FlightShapeScan {
+    /// The leaf certificate's raw DER (first `CertificateEntry` in the
+    /// `Certificate` message's cert list).
+    pub leaf_der: Vec<u8>,
+    /// The leaf DER's length + every subsequent chain cert's DER, verbatim.
+    pub cert_chain: CertChainShape,
+    /// `EncryptedExtensions` message length, incl. its 4-byte header.
+    pub ee_len: usize,
+    /// `Certificate` message length, incl. its 4-byte header.
+    pub cert_len: usize,
+    /// `CertificateVerify` message length, incl. its 4-byte header.
+    pub cert_verify_len: usize,
+    /// `Finished` message length, incl. its 4-byte header.
+    pub finished_len: usize,
+}
+
+/// Scans `hs_flight` (see [`find_finished_end`] for its shape) for
+/// REALITY.5a's flight-shape capture: per-message plaintext lengths of
+/// EncryptedExtensions/Certificate/CertificateVerify/Finished, plus the
+/// leaf certificate's DER and every subsequent chain cert's DER verbatim
+/// (see [`certificate_chain_ders`]). Mirrors [`scan_cert_flight`]'s bounded
+/// `while hs_flight.len() >= pos + 4` walk over `msg_type ‖ u24 len ‖ body`,
+/// but records EVERY message's length rather than stopping at the first
+/// `CertificateVerify`. Fail-closed: a missing `Certificate` message,
+/// truncated field, or out-of-bounds value is `Err(Error::RealityVerify(_))`;
+/// every access is bounds-checked (`.get`, never direct indexing past a
+/// validated point) so hostile bytes cannot panic this.
+pub fn scan_flight_shape(hs_flight: &[u8]) -> Result<FlightShapeScan, Error> {
+    let mut pos = 0;
+    let mut leaf_der: Option<Vec<u8>> = None;
+    let mut intermediates_der: Vec<Vec<u8>> = Vec::new();
+    let mut ee_len = 0usize;
+    let mut cert_len = 0usize;
+    let mut cert_verify_len = 0usize;
+    let mut finished_len = 0usize;
+
+    while hs_flight.len() >= pos + 4 {
+        let msg_type = hs_flight[pos];
+        let len = (usize::from(hs_flight[pos + 1]) << 16)
+            | (usize::from(hs_flight[pos + 2]) << 8)
+            | usize::from(hs_flight[pos + 3]);
+        if len > MAX_HANDSHAKE_MSG_LEN {
+            return Err(Error::RealityVerify(
+                "server handshake message exceeds sane length bound",
+            ));
+        }
+        let body_start = pos + 4;
+        let msg_end = body_start + len;
+        let Some(body) = hs_flight.get(body_start..msg_end) else {
+            break; // not fully buffered — cannot happen on an already-complete flight
+        };
+        let total_len = 4 + len;
+
+        match msg_type {
+            HS_TYPE_ENCRYPTED_EXTENSIONS => ee_len = total_len,
+            HS_TYPE_CERTIFICATE => {
+                cert_len = total_len;
+                let (leaf, chain) = certificate_chain_ders(body)?;
+                leaf_der = Some(leaf);
+                intermediates_der = chain;
+            }
+            HS_TYPE_CERTIFICATE_VERIFY => cert_verify_len = total_len,
+            HS_TYPE_FINISHED => finished_len = total_len,
+            _ => {}
+        }
+
+        pos = msg_end;
+    }
+
+    let leaf_der = leaf_der.ok_or(Error::RealityVerify(
+        "server flight is missing a Certificate message",
+    ))?;
+    let leaf_der_len = leaf_der.len();
+
+    Ok(FlightShapeScan {
+        leaf_der,
+        cert_chain: CertChainShape {
+            leaf_der_len,
+            intermediates_der,
+        },
+        ee_len,
+        cert_len,
+        cert_verify_len,
+        finished_len,
+    })
+}
+
+/// Extracts every `CertificateEntry`'s raw DER from a `Certificate` message
+/// body (RFC 8446 §4.4.2): `context_len(1) ‖ context ‖ list_len(3) ‖
+/// [cert_data_len(3) ‖ cert_data ‖ ext_len(2) ‖ ext]…`. Returns
+/// `(leaf_der, intermediates_der)` — the FIRST entry is the leaf, every
+/// SUBSEQUENT entry is returned verbatim, in chain order, as
+/// `intermediates_der`. Fail-closed on truncation, an empty list, or a leaf
+/// exceeding [`MAX_LEAF_CERT_DER_LEN`] — this bound is intentionally NOT
+/// applied to intermediates (real intermediate CA certs can legitimately run
+/// larger than a leaf), which are instead bounded by the already-enforced
+/// [`MAX_HANDSHAKE_MSG_LEN`]/[`MAX_SERVER_FLIGHT_LEN`] on the whole
+/// message/flight.
+fn certificate_chain_ders(body: &[u8]) -> Result<(Vec<u8>, Vec<Vec<u8>>), Error> {
     let ctx_len = usize::from(
         *body
             .first()
@@ -361,21 +464,57 @@ fn certificate_leaf_der(body: &[u8]) -> Result<Vec<u8>, Error> {
         .get(list_start..list_end)
         .ok_or(Error::RealityVerify("truncated Certificate list"))?;
 
-    let cd_len_bytes = list
-        .get(0..3)
+    let mut entries: Vec<Vec<u8>> = Vec::new();
+    let mut i = 0;
+    while let Some(cd_len_bytes) = list.get(i..i + 3) {
+        let cd_len = (usize::from(cd_len_bytes[0]) << 16)
+            | (usize::from(cd_len_bytes[1]) << 8)
+            | usize::from(cd_len_bytes[2]);
+        let cert_start = i + 3;
+        let cert_end = cert_start + cd_len;
+        let cert_data = list
+            .get(cert_start..cert_end)
+            .ok_or(Error::RealityVerify("truncated certificate entry"))?;
+        let ext_len_bytes = list
+            .get(cert_end..cert_end + 2)
+            .ok_or(Error::RealityVerify(
+                "truncated certificate entry extensions",
+            ))?;
+        let ext_len = usize::from(u16::from_be_bytes([ext_len_bytes[0], ext_len_bytes[1]]));
+        let ext_start = cert_end + 2;
+        let ext_end = ext_start + ext_len;
+        if ext_end > list.len() {
+            return Err(Error::RealityVerify(
+                "truncated certificate entry extensions",
+            ));
+        }
+        entries.push(cert_data.to_vec());
+        i = ext_end;
+    }
+
+    let mut iter = entries.into_iter();
+    let leaf = iter
+        .next()
         .ok_or(Error::RealityVerify("empty Certificate list"))?;
-    let cd_len = (usize::from(cd_len_bytes[0]) << 16)
-        | (usize::from(cd_len_bytes[1]) << 8)
-        | usize::from(cd_len_bytes[2]);
-    if cd_len == 0 || cd_len > MAX_LEAF_CERT_DER_LEN {
+    if leaf.is_empty() || leaf.len() > MAX_LEAF_CERT_DER_LEN {
         return Err(Error::RealityVerify(
             "leaf certificate length out of bounds",
         ));
     }
-    let cert_data = list
-        .get(3..3 + cd_len)
-        .ok_or(Error::RealityVerify("truncated leaf certificate"))?;
-    Ok(cert_data.to_vec())
+    Ok((leaf, iter.collect()))
+}
+
+/// Extracts the first `CertificateEntry`'s raw DER (the leaf) from a
+/// `Certificate` message body (RFC 8446 §4.4.2): `context_len(1) ‖ context
+/// ‖ list_len(3) ‖ [cert_data_len(3) ‖ cert_data ‖ ext_len(2) ‖ ext]…`.
+/// Fail-closed on truncation, an empty list, or a leaf exceeding
+/// [`MAX_LEAF_CERT_DER_LEN`]. A thin wrapper over
+/// [`certificate_chain_ders`] (REALITY.5a), which does the identical walk
+/// but also returns any subsequent chain certs; [`scan_cert_flight`] (and,
+/// through it, REALITY.4b's verify path) only ever needs the leaf, so it
+/// keeps calling this narrower name.
+fn certificate_leaf_der(body: &[u8]) -> Result<Vec<u8>, Error> {
+    certificate_chain_ders(body).map(|(leaf, _intermediates)| leaf)
 }
 
 /// Extracts the `signature` field from a `CertificateVerify` message body
@@ -1599,6 +1738,115 @@ mod tests {
             ),
             "a one-byte transcript perturbation must flip the verdict to Err"
         );
+    }
+
+    /// Builds a decrypted server flight (`EncryptedExtensions ‖ Certificate
+    /// ‖ CertificateVerify ‖ Finished`, each `type(1) ‖ u24 len ‖ body`) with
+    /// known message lengths, for [`scan_flight_shape`]'s test below. The
+    /// `Certificate` message carries every DER in `certs` (in order) as its
+    /// cert list, each entry `u24 cert_len ‖ cert_der ‖ u16 ext_len(=0)` —
+    /// the exact RFC 8446 §4.4.2 wire format `certificate_chain_ders` walks —
+    /// deliberately independent of `build_certificate_message` (which only
+    /// ever encodes a single leaf entry, for the `scan_cert_flight` tests)
+    /// so this fixture can carry an arbitrary-length chain.
+    fn build_test_server_flight(
+        ee_body: &[u8],
+        certs: &[Vec<u8>],
+        cert_verify_sig_len: usize,
+        finished_len: usize,
+    ) -> Vec<u8> {
+        let mut ee_msg = Vec::new();
+        ee_msg.push(HS_TYPE_ENCRYPTED_EXTENSIONS);
+        let ee_len = u32::try_from(ee_body.len()).unwrap().to_be_bytes();
+        ee_msg.extend_from_slice(&ee_len[1..]);
+        ee_msg.extend_from_slice(ee_body);
+
+        let mut cert_list = Vec::new();
+        for cert in certs {
+            let cd_len = u32::try_from(cert.len()).unwrap().to_be_bytes();
+            cert_list.extend_from_slice(&cd_len[1..]);
+            cert_list.extend_from_slice(cert);
+            cert_list.extend_from_slice(&0u16.to_be_bytes()); // no per-cert extensions
+        }
+        let mut cert_body = Vec::new();
+        cert_body.push(0); // certificate_request_context: empty
+        let list_len = u32::try_from(cert_list.len()).unwrap().to_be_bytes();
+        cert_body.extend_from_slice(&list_len[1..]);
+        cert_body.extend_from_slice(&cert_list);
+
+        let mut cert_msg = Vec::new();
+        cert_msg.push(HS_TYPE_CERTIFICATE);
+        let cert_msg_len = u32::try_from(cert_body.len()).unwrap().to_be_bytes();
+        cert_msg.extend_from_slice(&cert_msg_len[1..]);
+        cert_msg.extend_from_slice(&cert_body);
+
+        let cert_verify_msg = build_certificate_verify_message(&vec![0xCCu8; cert_verify_sig_len]);
+
+        let verify_data = vec![0xABu8; finished_len];
+        let mut finished_msg = Vec::with_capacity(4 + verify_data.len());
+        finished_msg.push(HS_TYPE_FINISHED);
+        let fin_len = u32::try_from(verify_data.len()).unwrap().to_be_bytes();
+        finished_msg.extend_from_slice(&fin_len[1..]);
+        finished_msg.extend_from_slice(&verify_data);
+
+        let mut flight = Vec::new();
+        flight.extend_from_slice(&ee_msg);
+        flight.extend_from_slice(&cert_msg);
+        flight.extend_from_slice(&cert_verify_msg);
+        flight.extend_from_slice(&finished_msg);
+        flight
+    }
+
+    /// REALITY.5a Task 2: `scan_flight_shape` must record each message's
+    /// total wire length (header included) and must split the Certificate
+    /// message's cert list into `leaf_der` (first entry) +
+    /// `intermediates_der` (every subsequent entry, verbatim).
+    #[test]
+    fn scan_flight_shape_records_lengths_and_verbatim_intermediates() {
+        let leaf = vec![0xAAu8; 40];
+        let inter = vec![0xBBu8; 30];
+        let flight = build_test_server_flight(
+            /*ee_body=*/ &[0x00, 0x00], // empty EE
+            /*certs=*/ &[leaf.clone(), inter.clone()], // leaf + 1 intermediate
+            /*cert_verify_sig_len=*/ 70,
+            /*finished_len=*/ 32,
+        );
+        let s = scan_flight_shape(&flight).expect("scan");
+        assert_eq!(s.leaf_der, leaf);
+        assert_eq!(s.cert_chain.leaf_der_len, 40);
+        assert_eq!(s.cert_chain.intermediates_der, vec![inter]); // verbatim
+                                                                 // Per-message lengths include the 4-byte handshake header.
+        assert_eq!(s.ee_len, 4 + 2);
+        assert!(s.cert_len > 0 && s.cert_verify_len > 0 && s.finished_len > 0);
+    }
+
+    /// A leaf-only chain (no intermediates) must yield an empty
+    /// `intermediates_der`, not an error or a spurious entry.
+    #[test]
+    fn scan_flight_shape_leaf_only_chain_has_no_intermediates() {
+        let leaf = vec![0x11u8; 20];
+        let flight = build_test_server_flight(&[0x00, 0x00], std::slice::from_ref(&leaf), 64, 32);
+        let s = scan_flight_shape(&flight).expect("scan");
+        assert_eq!(s.leaf_der, leaf);
+        assert_eq!(s.cert_chain.leaf_der_len, 20);
+        assert!(s.cert_chain.intermediates_der.is_empty());
+    }
+
+    /// A flight missing the `Certificate` message entirely must fail closed,
+    /// not panic or silently return an empty leaf.
+    #[test]
+    fn scan_flight_shape_rejects_flight_without_certificate() {
+        // Only EncryptedExtensions ‖ Finished — no Certificate/CertVerify.
+        let mut flight = Vec::new();
+        flight.extend_from_slice(&[HS_TYPE_ENCRYPTED_EXTENSIONS, 0x00, 0x00, 0x00]);
+        flight.push(HS_TYPE_FINISHED);
+        flight.extend_from_slice(&[0x00, 0x00, 0x20]);
+        flight.extend_from_slice(&[0xABu8; 32]);
+
+        assert!(matches!(
+            scan_flight_shape(&flight),
+            Err(Error::RealityVerify(_))
+        ));
     }
 
     /// What kind of Certificate/CertificateVerify a mock server presents in
