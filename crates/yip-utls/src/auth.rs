@@ -115,8 +115,8 @@ fn signing_key_from_wide(wide: &[u8; 48]) -> SigningKey {
 /// relay verification. Deterministic, uniform, constant-time (RustCrypto
 /// `p256`).
 pub struct DerivedCertKey {
-    /// PKCS#8 DER of the private key — feeds `rcgen::KeyPair::from_der`
-    /// (server).
+    /// PKCS#8 DER of the private key — feeds `rcgen::KeyPair::try_from(&[u8])`
+    /// (server; `from_der` parses an SPKI *public* key, not this private key).
     pub pkcs8_der: Vec<u8>,
     /// Uncompressed SEC1 public key (`0x04 ‖ X ‖ Y`, 65 bytes) — the client
     /// pins the presented leaf's key to this.
