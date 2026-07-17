@@ -166,13 +166,15 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Parses a `ServerHello` handshake message: `0x02 ‖ u24 len ‖ version(2) ‖
-/// random(32) ‖ sid_len(1)+sid ‖ cipher_suite(2) ‖ comp(1) ‖ ext_len(2) ‖
-/// exts`. Requires the negotiated suite to be one of the three this crate
-/// supports, and requires exactly one `key_share`(51) extension entry with
-/// group x25519 (`0x001d`, 32-byte key) or `X25519MLKEM768` (`4588`,
-/// 1120-byte key). Fail-closed on any malformed or out-of-scope field.
-pub fn parse_server_hello(record_payload: &[u8]) -> Result<ServerHelloInfo, Error> {
+/// The common bounded walk [`parse_server_hello`] and
+/// [`parse_server_hello_shape`] share: `0x02 ‖ u24 len ‖ version(2) ‖
+/// random(32) ‖ sid_len(1)+sid ‖ cipher_suite(2) ‖ comp(1) ‖ ext_len(2)`,
+/// stopping just before the extensions block. Returns the negotiated cipher
+/// suite (already validated to be one of the three this crate supports), the
+/// raw compression-method byte, and the still-TLV-encoded extensions bytes
+/// (borrowed from `record_payload`, so callers walk them independently).
+/// Fail-closed on any malformed or out-of-scope field.
+fn parse_server_hello_header(record_payload: &[u8]) -> Result<(u16, u8, &[u8]), Error> {
     let mut r = Reader::new(record_payload);
 
     let msg_type = r.u8()?;
@@ -197,10 +199,22 @@ pub fn parse_server_hello(record_payload: &[u8]) -> Result<ServerHelloInfo, Erro
         return Err(Error::UnsupportedCipherSuite);
     }
 
-    let _compression_method = b.u8()?;
+    let compression_method = b.u8()?;
 
     let ext_len = usize::from(b.u16()?);
     let ext_bytes = b.take(ext_len)?;
+
+    Ok((suite, compression_method, ext_bytes))
+}
+
+/// Parses a `ServerHello` handshake message: `0x02 ‖ u24 len ‖ version(2) ‖
+/// random(32) ‖ sid_len(1)+sid ‖ cipher_suite(2) ‖ comp(1) ‖ ext_len(2) ‖
+/// exts`. Requires the negotiated suite to be one of the three this crate
+/// supports, and requires exactly one `key_share`(51) extension entry with
+/// group x25519 (`0x001d`, 32-byte key) or `X25519MLKEM768` (`4588`,
+/// 1120-byte key). Fail-closed on any malformed or out-of-scope field.
+pub fn parse_server_hello(record_payload: &[u8]) -> Result<ServerHelloInfo, Error> {
+    let (suite, _compression_method, ext_bytes) = parse_server_hello_header(record_payload)?;
 
     let mut server_key_share = None;
     let mut e = Reader::new(ext_bytes);
@@ -232,6 +246,50 @@ pub fn parse_server_hello(record_payload: &[u8]) -> Result<ServerHelloInfo, Erro
         suite,
         group,
         server_key_share,
+    })
+}
+
+/// Like [`parse_server_hello`] but captures the FULL ServerHello structure
+/// (ordered extensions incl. GREASE, compression) for REALITY.5 mimicry. The
+/// per-connection `random` and `key_share` VALUE are not returned here (5b
+/// substitutes the relay's own); the `key_share` group IS
+/// (`key_share_group`). Shares [`parse_server_hello_header`]'s bounded walk
+/// with `parse_server_hello`, so both stay byte-identical up through the
+/// extensions block; this variant additionally walks every extension
+/// (including ones `parse_server_hello` ignores, like GREASE) and records
+/// `(ext_id, ext_body)` in wire order, plus the compression-method byte.
+/// Requires a `key_share`(51) extension to be present (fail-closed, like
+/// `parse_server_hello`); unlike `parse_server_hello` it does NOT validate
+/// the key_share length against the group — it captures structure, not
+/// crypto material.
+pub fn parse_server_hello_shape(
+    record_payload: &[u8],
+) -> Result<crate::template::ServerHelloShape, Error> {
+    let (cipher_suite, legacy_compression_method, ext_bytes) =
+        parse_server_hello_header(record_payload)?;
+
+    let mut extensions = Vec::new();
+    let mut key_share_group = None;
+    let mut e = Reader::new(ext_bytes);
+    while !e.is_empty() {
+        let ext_type = e.u16()?;
+        let ext_body_len = usize::from(e.u16()?);
+        let ext_body = e.take(ext_body_len)?;
+
+        if ext_type == EXT_KEY_SHARE {
+            let mut k = Reader::new(ext_body);
+            key_share_group = Some(k.u16()?);
+        }
+
+        extensions.push((ext_type, ext_body.to_vec()));
+    }
+
+    let key_share_group = key_share_group.ok_or(Error::MissingKeyShare)?;
+    Ok(crate::template::ServerHelloShape {
+        cipher_suite,
+        legacy_compression_method,
+        extensions,
+        key_share_group,
     })
 }
 
@@ -789,6 +847,77 @@ mod tests {
     /// Certificate ‖ CertificateVerify ‖ Finished`, 657 octets (before the
     /// `0x16` content-type byte record_open strips).
     const RFC8448_EE_PLAINTEXT: &str = "080000240022000a00140012001d00170018001901000101010201030104001c00024001000000000b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a864886f70d01010b0500300e310c300a06035504031303727361301e170d3136303733303031323335395a170d3236303733303031323335395a300e310c300a0603550403130372736130819f300d06092a864886f70d010101050003818d0030818902818100b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced43120998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda430846748030530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a8d88d79f7f1e3f0203010001a31a301830090603551d1304023000300b0603551d0f0404030205a0300d06092a864886f70d01010b05000381810085aad2a0e5b9276b908c65f73a7267170618a54c5f8a7b337d2df7a594365417f2eae8f8a58c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102702e608ccae6bec1fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b42b4de100000f000084080400805a747c5d88fa9bd2e55ab085a61015b7211f824cd484145ab3ff52f1fda8477b0b7abc90db78e2d33a5c141a078653fa6bef780c5ea248eeaaa785c4f394cab6d30bbe8d4859ee511f602957b15411ac027671459e46445c9ea58c181e818e95b8c3fb0bf3278409d3be152a3da5043e063dda65cdf5aea20d53dfacd42f74f3140000209b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718";
+
+    /// Builds a minimal `ServerHello` handshake-message payload (`0x02 ‖ u24
+    /// len ‖ { legacy_version(0x0303) ‖ random(32) ‖ session_id(u8 len +
+    /// bytes) ‖ cipher_suite(2) ‖ compression(1) ‖ ext(u16 len + list) }`)
+    /// for [`parse_server_hello_shape`] tests — a hand-rolled fixture rather
+    /// than an RFC 8448 vector, since those tests need to control the exact
+    /// ordered extension list (incl. GREASE) `parse_server_hello` itself
+    /// doesn't capture.
+    fn build_test_server_hello(cipher: u16, compression: u8, exts: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0303u16.to_be_bytes()); // legacy_version
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0); // session_id: empty
+        body.extend_from_slice(&cipher.to_be_bytes());
+        body.push(compression);
+
+        let mut ext_bytes = Vec::new();
+        for (id, data) in exts {
+            ext_bytes.extend_from_slice(&id.to_be_bytes());
+            let data_len = u16::try_from(data.len()).expect("test ext body fits u16");
+            ext_bytes.extend_from_slice(&data_len.to_be_bytes());
+            ext_bytes.extend_from_slice(data);
+        }
+        let ext_len = u16::try_from(ext_bytes.len()).expect("test ext block fits u16");
+        body.extend_from_slice(&ext_len.to_be_bytes());
+        body.extend_from_slice(&ext_bytes);
+
+        let mut msg = Vec::new();
+        msg.push(HANDSHAKE_TYPE_SERVER_HELLO);
+        let len_bytes = u32::try_from(body.len())
+            .expect("test body fits u24")
+            .to_be_bytes();
+        msg.extend_from_slice(&len_bytes[1..]); // u24 big-endian (drop the MSB of the u32)
+        msg.extend_from_slice(&body);
+        msg
+    }
+
+    /// Builds a `key_share` extension body (`group(2) ‖ key_len(2) ‖ key`) —
+    /// a fixed-size dummy key, since `parse_server_hello_shape` only reads
+    /// the group and does not validate key length against it.
+    fn key_share_ext_body(group: u16) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&group.to_be_bytes());
+        let key = [0u8; 32];
+        let key_len = u16::try_from(key.len()).expect("test key fits u16");
+        v.extend_from_slice(&key_len.to_be_bytes());
+        v.extend_from_slice(&key);
+        v
+    }
+
+    #[test]
+    fn parse_server_hello_shape_captures_ordered_extensions() {
+        // handshake msg: type(0x02) ‖ u24 len ‖ { legacy_version(0x0303) ‖ random(32)
+        //   ‖ session_id(u8 len + bytes) ‖ cipher_suite(2) ‖ compression(1) ‖ ext(u16 len + list) }
+        let sh = build_test_server_hello(
+            0x1301, // cipher
+            0x00,   // compression
+            &[
+                (0x002b_u16, vec![0x03, 0x04]), // supported_versions -> TLS 1.3
+                (0x0033_u16, key_share_ext_body(0x001d)), // key_share, group X25519(29)
+                (0x2a2a_u16, vec![]),           // a GREASE extension, empty
+            ],
+        );
+        let shape = parse_server_hello_shape(&sh).expect("parse");
+        assert_eq!(shape.cipher_suite, 0x1301);
+        assert_eq!(shape.legacy_compression_method, 0x00);
+        assert_eq!(shape.key_share_group, 0x001d);
+        // Order + ids preserved (incl. the GREASE ext at its position).
+        let ids: Vec<u16> = shape.extensions.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![0x002b, 0x0033, 0x2a2a]);
+    }
 
     #[test]
     fn parse_server_hello_reads_rfc8448_vector() {
