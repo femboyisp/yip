@@ -1,11 +1,24 @@
 #!/usr/bin/env bash
-# REALITY.4a netns money test: two UDP-blocked yipd peers bring a tunnel up
+# REALITY.4a/4b netns money test: two UDP-blocked yipd peers bring a tunnel up
 # THROUGH a REALITY relay (`yip-rendezvous --reality-dest/--reality-private-key/
-# --reality-short-id/--reality-server-name`), and A pings B. Also a
-# wrong-pubkey negative test: a mismatched `pbk=` yields NO tunnel — the
-# relay's seal-open fails, so it transparently splices the connection to
-# `--reality-dest` instead of treating it as an authed relay client, and the
-# inner Noise-IK handshake never gets a chance to run.
+# --reality-short-id/--reality-server-name`), with the clients running
+# EXPLICIT `verify=on` (REALITY.4b relay verification — the relay binds a
+# per-connection cert derived from the seal's `shared` automatically, no
+# server flag; the client verifies the presented leaf against that same
+# derivation), and A pings B. Also two negative tests, both asserting
+# fail-closed under `verify=on`:
+#   - wrong-pbk: the CLIENT is misconfigured with a mismatched `pbk=`.
+#   - wrong-relay-key: the RELAY is misconfigured with a DIFFERENT
+#     `--reality-private-key` than the client's (correct) `pbk=`.
+# Both are the same underlying shared-secret mismatch (client and relay
+# disagree on the ECDH shared value), reached from opposite sides — see each
+# test's comment below. In both, the relay's seal-open fails, so it
+# transparently splices the connection to `--reality-dest` instead of
+# treating it as an authed relay client; the client's own `verify=on` check
+# then fails against the spliced dest's real (unrelated) leaf certificate —
+# `yip_utls::Error::RealityVerify` — and the client backs off on the long,
+# jittered `verify_fail_backoff` (300s+ base) instead of the fast
+# reconnect ladder, so it must NOT retry-storm.
 #
 # Modeled directly on the 3c.4 `run-netns-relay-tls.sh` (same netns/veth
 # topology, same UDP-blocking, same relay-forwarded assertion). The two
@@ -45,13 +58,22 @@
 # disabled on the fetch side, so an ordinary self-signed cert is fine).
 #
 # Assert:
-#   1. money test: ping A->B across the tunnel succeeds (generous budget: TLS
-#      handshake to the relay + Register + inner Noise-IK handshake, all
-#      serial), and the relay's stderr shows relay-forwarded=<N> with N>0.
+#   1. money test (verify=on, explicit): ping A->B across the tunnel succeeds
+#      (generous budget: TLS handshake to the relay + Register + inner
+#      Noise-IK handshake, all serial), and the relay's stderr shows
+#      relay-forwarded=<N> with N>0 — proving the tunnel formed AND the
+#      client's explicit relay verification passed end-to-end against the
+#      genuine relay.
 #   2. wrong-pubkey test: with A reconfigured to a bogus (all-zero) `pbk=`,
 #      A restarted, ping A->B FAILS within a bounded timeout (the relay
 #      splices A's connection to DEST instead of treating it as authed, so no
 #      tunnel ever forms).
+#   3. wrong-relay-key test: the relay itself is restarted with a DIFFERENT
+#      `--reality-private-key` than the clients' (correct, unchanged) `pbk=`.
+#      A is restarted with `verify=on` and the CORRECT pbk; ping A->B FAILS
+#      within a bounded timeout, AND A's log shows only a handful of relay
+#      verification attempts (the long jittered `verify_fail_backoff` — several
+#      minutes — means no retry-storm within the test's short window).
 #
 # Root-gated SKIP + trap-based cleanup, mirroring the sibling scripts.
 set -euo pipefail
@@ -100,6 +122,23 @@ REALITY_PRIV="2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
 REALITY_PUB="07aaff3e9fc167275544f4c3a6a17cd837f2ec6e78cd8a57b1e3dfb3cc035a76"
 if [ "${#REALITY_PRIV}" -ne 64 ] || [ "${#REALITY_PUB}" -ne 64 ]; then
     echo "[error] pinned REALITY_PRIV/REALITY_PUB must each be 64 hex chars"
+    exit 1
+fi
+# A second, MISMATCHED REALITY relay private key for the wrong-relay-key
+# negative test (§13 below): same derivation approach as REALITY_PRIV (a
+# constant-byte scalar; `x25519_dalek::StaticSecret::from` clamps it
+# internally, same as any other private key), just a different byte value so
+# it derives a different public key. Its own public key is never used or
+# pinned here — the whole point of the test is that the RELAY runs with this
+# key while the CLIENTS keep dialing the ORIGINAL (correct) REALITY_PUB, so
+# the two sides' ECDH shared secrets disagree.
+REALITY_PRIV_WRONG="4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b"
+if [ "${#REALITY_PRIV_WRONG}" -ne 64 ]; then
+    echo "[error] pinned REALITY_PRIV_WRONG must be 64 hex chars"
+    exit 1
+fi
+if [ "$REALITY_PRIV_WRONG" = "$REALITY_PRIV" ]; then
+    echo "[error] REALITY_PRIV_WRONG must differ from REALITY_PRIV"
     exit 1
 fi
 SHORT_ID="00112233445566ff"
@@ -154,13 +193,13 @@ CFG_B="$TMPDIR_TEST/yipB.conf"
 write_cfg_a() {
     local pbk="$1"
     cat > "$CFG_A" <<EOF
-# yipRealA — relay-dial over REALITY, UDP blocked
+# yipRealA — relay-dial over REALITY, UDP blocked, verify=on (explicit)
 local_private=${PRIV_A}
 local_public=${PUB_A}
 listen=${IP_A}:${PORT_A}
 device=${TUN_DEV}
 device_kind=tun
-rendezvous=reality://${IP_R_A}:${RDV_TCP_PORT}?pbk=${pbk}&sid=${SHORT_ID}&sni=${SNI}
+rendezvous=reality://${IP_R_A}:${RDV_TCP_PORT}?pbk=${pbk}&sid=${SHORT_ID}&sni=${SNI}&verify=on
 obf_psk=${OBF_PSK}
 [peer]
 public_key=${PUB_B}
@@ -169,13 +208,13 @@ EOF
 write_cfg_a "$REALITY_PUB"
 
 cat > "$CFG_B" <<EOF
-# yipRealB — relay-dial over REALITY, UDP blocked
+# yipRealB — relay-dial over REALITY, UDP blocked, verify=on (explicit)
 local_private=${PRIV_B}
 local_public=${PUB_B}
 listen=${IP_B}:${PORT_B}
 device=${TUN_DEV}
 device_kind=tun
-rendezvous=reality://${IP_R_B}:${RDV_TCP_PORT}?pbk=${REALITY_PUB}&sid=${SHORT_ID}&sni=${SNI}
+rendezvous=reality://${IP_R_B}:${RDV_TCP_PORT}?pbk=${REALITY_PUB}&sid=${SHORT_ID}&sni=${SNI}&verify=on
 obf_psk=${OBF_PSK}
 [peer]
 public_key=${PUB_A}
@@ -346,10 +385,14 @@ ip netns exec "$NS_A" ip -6 addr show "$TUN_DEV"
 echo "[check] interface state in yipRealB:"
 ip netns exec "$NS_B" ip -6 addr show "$TUN_DEV"
 
-# ── 10. money test: ping A->B, tolerating warm-up loss while both serial
-# handshakes complete (outer REALITY TLS to the relay + Register, then inner
-# Noise-IK) ─────────────────────────────────────────────────────────────────
-echo "[test] pinging ${ADDR_B} from yipRealA (expect REALITY+Register+Noise-IK warm-up, then success)"
+# ── 10. money test (verify=on, explicit): ping A->B, tolerating warm-up loss
+# while both serial handshakes complete (outer REALITY TLS to the relay +
+# Register, then inner Noise-IK) — both A and B dial with `verify=on`
+# explicit in their `rendezvous=reality://...` URL, so a successful ping here
+# also proves the relay's automatic per-connection cert bind (REALITY.4b
+# Task 3) and the client's verification of it (Task 2) both pass end-to-end
+# against the genuine relay ─────────────────────────────────────────────────
+echo "[test] pinging ${ADDR_B} from yipRealA (verify=on; expect REALITY+Register+Noise-IK warm-up, then success)"
 set +e
 ip netns exec "$NS_A" ping -6 -c 30 -W 2 "$ADDR_B"
 PING_STATUS=$?
@@ -359,7 +402,7 @@ if [ "$PING_STATUS" -ne 0 ]; then
     dump_logs
     exit 1
 fi
-echo "[PASS] ping A->B succeeded over the REALITY relay"
+echo "[PASS] ping A->B succeeded over the REALITY relay with verify=on"
 
 # ── 11. assert the relay actually carried it: relay-forwarded=<N>, N>0 ────
 # Give the server one more sweep interval to emit a final relay-forwarded
@@ -373,15 +416,21 @@ if [ -z "${FINAL_COUNT:-}" ] || [ "$FINAL_COUNT" -eq 0 ]; then
     exit 1
 fi
 echo "[PASS] relay-forwarded=${FINAL_COUNT} (>0): the REALITY relay carried the traffic"
-echo "[PASS] netns REALITY-relay money test PASSED: two UDP-blocked peers tunneled via the REALITY relay, blindly forwarded (relay-forwarded=${FINAL_COUNT})"
+echo "[PASS] netns REALITY-relay verify=on money test PASSED: two UDP-blocked peers tunneled via the REALITY relay with explicit verify=on, blindly forwarded (relay-forwarded=${FINAL_COUNT})"
 
-# ── 12. negative test: wrong pbk -> NO tunnel ──────────────────────────────
-# Rewrite A's config with a bogus (all-zero) pbk and restart A. The relay's
-# seal-open must fail against the wrong pubkey, so it splices A's connection
-# to DEST instead of treating it as an authed relay client — no Register is
-# ever accepted, so the inner Noise-IK handshake never gets a chance to run,
-# and the ping must fail within a bounded timeout.
-echo "[test] wrong-pubkey negative test: restarting yipRealA with an all-zero pbk"
+# ── 12. negative test: wrong pbk (client-side) + verify=on -> NO tunnel,
+# fail-closed ────────────────────────────────────────────────────────────
+# Rewrite A's config with a bogus (all-zero) pbk (verify=on stays explicit,
+# inherited from write_cfg_a) and restart A. The relay's seal-open must fail
+# against the wrong pubkey, so it splices A's connection to DEST instead of
+# treating it as an authed relay client — no Register is ever accepted, so
+# the inner Noise-IK handshake never gets a chance to run. Separately, A's
+# OWN `verify=on` check also fails closed against the spliced DEST's real
+# (unrelated) leaf certificate — `yip_utls::Error::RealityVerify` — so A logs
+# a verification failure and backs off on the long jittered
+# `verify_fail_backoff` (not the fast reconnect ladder): the ping must fail
+# within a bounded timeout AND A must not retry-storm.
+echo "[test] wrong-pubkey negative test (verify=on): restarting yipRealA with an all-zero pbk"
 kill "$PID_A" 2>/dev/null || true
 wait "$PID_A" 2>/dev/null || true
 PID_A=""
@@ -394,7 +443,7 @@ fi
 write_cfg_a "$ZERO_PUB"
 
 LOG_A_WRONG="$TMPDIR_TEST/yipA-wrongpbk.log"
-echo "[start] restarting yipRealA with rendezvous pbk=${ZERO_PUB}"
+echo "[start] restarting yipRealA with rendezvous pbk=${ZERO_PUB}&verify=on"
 ip netns exec "$NS_A" "$YIPD" "$CFG_A" >"$LOG_A_WRONG" 2>&1 &
 PID_A=$!
 sleep 1
@@ -413,4 +462,101 @@ if [ "$WRONG_PING_STATUS" -eq 0 ]; then
 fi
 echo "[PASS] ping A->B failed as expected with a wrong pbk (relay spliced to DEST, no tunnel formed)"
 
-echo "[PASS] netns REALITY-relay wrong-pubkey negative test PASSED"
+# Assert no retry-storm: with verify=on, a RealityVerify failure backs off on
+# `verify_fail_backoff` (300s+ jitter base) — vastly longer than this test's
+# ~16s window (1s startup sleep + 15s bounded ping) — so A must have logged
+# only a handful of relay-verification attempts, not the dozens a fast
+# INITIAL_BACKOFF_MS/MAX_BACKOFF_MS (100ms..5s) ladder would produce in the
+# same window.
+WRONG_PBK_ATTEMPTS="$(grep -c 'relay verification failed' "$LOG_A_WRONG" || true)"
+echo "[check] yipRealA (wrong pbk) relay-verification-failed count: ${WRONG_PBK_ATTEMPTS}"
+if [ "$WRONG_PBK_ATTEMPTS" -lt 1 ]; then
+    echo "[FAIL] expected at least one logged RealityVerify failure (wrong pbk) — the client never even attempted verification"
+    cat "$LOG_A_WRONG" || true
+    exit 1
+fi
+if [ "$WRONG_PBK_ATTEMPTS" -gt 3 ]; then
+    echo "[FAIL] yipRealA retry-stormed on a verify failure: ${WRONG_PBK_ATTEMPTS} attempts in ~16s (expected <=3 — verify_fail_backoff is 300s+, not the fast ladder)"
+    cat "$LOG_A_WRONG" || true
+    exit 1
+fi
+echo "[PASS] yipRealA did not retry-storm on the wrong-pbk verify failure (${WRONG_PBK_ATTEMPTS} attempt(s) in ~16s)"
+
+echo "[PASS] netns REALITY-relay wrong-pubkey negative test PASSED (verify=on fail-closed, no retry-storm)"
+
+# ── 13. negative test: wrong relay key (server-side) + verify=on -> NO
+# tunnel, fail-closed, no retry-storm ───────────────────────────────────────
+# Restart the RELAY with a DIFFERENT `--reality-private-key`
+# (REALITY_PRIV_WRONG) than the one the clients' `pbk=` was derived from
+# (REALITY_PUB, matching REALITY_PRIV). Restart A with the ORIGINAL, CORRECT
+# pbk=REALITY_PUB and verify=on (undoing the previous test's all-zero pbk).
+# The shared secret the relay computes (keyed on REALITY_PRIV_WRONG) now
+# disagrees with what A computed (keyed on REALITY_PUB / REALITY_PRIV), so
+# the relay's seal-open fails exactly as in the wrong-pbk case, splices A to
+# DEST, and A's own verify=on check fails closed the same way. This is the
+# mirror image of §12 (misconfiguration on the relay side rather than the
+# client side) and must fail closed identically, with no retry-storm.
+echo "[test] wrong-relay-key negative test (verify=on): restarting yip-rendezvous with a mismatched --reality-private-key"
+kill "$PID_RDV" 2>/dev/null || true
+wait "$PID_RDV" 2>/dev/null || true
+PID_RDV=""
+
+LOG_RDV_WRONGKEY="$TMPDIR_TEST/rdv-wrongkey.log"
+echo "[start] restarting yip-rendezvous in R with REALITY_PRIV_WRONG (clients still expect REALITY_PUB)"
+ip netns exec "$NS_R" "$RDV" "0.0.0.0:${RDV_UDP_PORT}" \
+    --listen-tcp "0.0.0.0:${RDV_TCP_PORT}" \
+    --obf-psk "$OBF_PSK" \
+    --reality-dest "127.0.0.1:${DEST_PORT}" \
+    --reality-private-key "$REALITY_PRIV_WRONG" \
+    --reality-short-id "$SHORT_ID" \
+    --reality-server-name "$SNI" \
+    >"$LOG_RDV_WRONGKEY" 2>&1 &
+PID_RDV=$!
+sleep 0.5
+if ! kill -0 "$PID_RDV" 2>/dev/null; then
+    echo "[error] yip-rendezvous (mismatched key) died at startup"
+    cat "$LOG_RDV_WRONGKEY" || true
+    exit 1
+fi
+
+echo "[test] wrong-relay-key negative test: restarting yipRealA with the CORRECT pbk=${REALITY_PUB}&verify=on"
+kill "$PID_A" 2>/dev/null || true
+wait "$PID_A" 2>/dev/null || true
+PID_A=""
+write_cfg_a "$REALITY_PUB"
+
+LOG_A_WRONGKEY="$TMPDIR_TEST/yipA-wrongrelaykey.log"
+ip netns exec "$NS_A" "$YIPD" "$CFG_A" >"$LOG_A_WRONGKEY" 2>&1 &
+PID_A=$!
+sleep 1
+
+echo "[test] pinging ${ADDR_B} from yipRealA (expect FAILURE: relay's real key no longer matches the clients' pbk)"
+set +e
+timeout 15 ip netns exec "$NS_A" ping -6 -c 10 -W 2 "$ADDR_B"
+WRONGKEY_PING_STATUS=$?
+set -e
+if [ "$WRONGKEY_PING_STATUS" -eq 0 ]; then
+    echo "[FAIL] ping A->B succeeded despite a mismatched relay --reality-private-key — the relay accepted an unauthenticated connection as a real relay client"
+    echo "=== yipRealA (wrong relay key) log ==="
+    cat "$LOG_A_WRONGKEY" || true
+    dump_logs
+    exit 1
+fi
+echo "[PASS] ping A->B failed as expected with a mismatched relay key (relay spliced to DEST, no tunnel formed)"
+
+# Same bounded-attempts / no-retry-storm assertion as §12.
+WRONGKEY_ATTEMPTS="$(grep -c 'relay verification failed' "$LOG_A_WRONGKEY" || true)"
+echo "[check] yipRealA (wrong relay key) relay-verification-failed count: ${WRONGKEY_ATTEMPTS}"
+if [ "$WRONGKEY_ATTEMPTS" -lt 1 ]; then
+    echo "[FAIL] expected at least one logged RealityVerify failure (wrong relay key) — the client never even attempted verification"
+    cat "$LOG_A_WRONGKEY" || true
+    exit 1
+fi
+if [ "$WRONGKEY_ATTEMPTS" -gt 3 ]; then
+    echo "[FAIL] yipRealA retry-stormed on a verify failure: ${WRONGKEY_ATTEMPTS} attempts in ~16s (expected <=3 — verify_fail_backoff is 300s+, not the fast ladder)"
+    cat "$LOG_A_WRONGKEY" || true
+    exit 1
+fi
+echo "[PASS] yipRealA did not retry-storm on the wrong-relay-key verify failure (${WRONGKEY_ATTEMPTS} attempt(s) in ~16s)"
+
+echo "[PASS] netns REALITY-relay wrong-relay-key negative test PASSED (verify=on fail-closed, no retry-storm)"
