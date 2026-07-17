@@ -341,6 +341,36 @@ mod tests {
     }
 
     #[test]
+    fn client_shared_secret_matches_server_open_recover_shared() {
+        let reality_priv = [11u8; 32];
+        let reality_pub = pubkey_of(&reality_priv);
+        let eph_priv = [22u8; 32];
+        let eph_pub = pubkey_of(&eph_priv);
+        let client_random = [33u8; 32];
+        let short_id = [1, 2, 3, 4, 5, 6, 7, 8];
+        let now = 1_000_000u64;
+
+        let client_shared = shared_secret(&reality_pub, &eph_priv);
+
+        let session_id = seal(&reality_pub, &eph_priv, &client_random, short_id, now);
+        let (_short_id, _ts_min, server_shared) = open_recover_shared(
+            &reality_priv,
+            &eph_pub,
+            &client_random,
+            &session_id,
+            &[short_id],
+            now,
+            60,
+        )
+        .expect("valid seal opens");
+
+        assert_eq!(
+            client_shared, server_shared,
+            "client and server must derive the identical shared secret"
+        );
+    }
+
+    #[test]
     fn wrong_reality_key_is_rejected() {
         let reality_priv = [11u8; 32];
         let reality_pub = pubkey_of(&reality_priv);
