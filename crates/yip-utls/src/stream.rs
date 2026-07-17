@@ -148,8 +148,11 @@ impl RandomSource for OsRng {
 /// `generate` returns (which, on a latched failure, still returns *some*
 /// keypair built from bytes that silently stayed zero — [`connect`] discards
 /// it and bails out via `into_result` before ever using it).
+/// `pub(crate)` (not just private to this module) so [`crate::server`]'s test
+/// module can generate a real client ML-KEM keypair the same way `connect`
+/// does, without duplicating this bridge.
 #[derive(Default)]
-struct MlKemRng {
+pub(crate) struct MlKemRng {
     error: Option<getrandom::Error>,
 }
 

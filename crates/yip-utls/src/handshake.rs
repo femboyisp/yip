@@ -26,8 +26,11 @@ pub const GROUP_X25519: u16 = 0x001d;
 /// this group is `mlkem768_ciphertext(1088) ‖ x25519_public(32)` = 1120
 /// bytes.
 pub const GROUP_X25519MLKEM768: u16 = 4588;
-/// Byte length of an ML-KEM-768 ciphertext (FIPS 203 §7.2).
-const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
+/// Byte length of an ML-KEM-768 ciphertext (FIPS 203 §7.2). `pub(crate)`
+/// so [`crate::server`] (REALITY.5b's server-side KEX, the mirror of this
+/// module's client-side group-4588 handling) can size the server
+/// `key_share`'s ciphertext prefix without duplicating the constant.
+pub(crate) const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
 /// Byte length of an X25519 public value (RFC 7748).
 const X25519_LEN: usize = 32;
 const SUITE_AES_128_GCM_SHA256: u16 = 0x1301;

@@ -31,6 +31,10 @@ pub enum Error {
     /// CertificateVerify, wrong scheme, or a missing/malformed message). The
     /// caller must treat the relay as unauthenticated and NOT tunnel.
     RealityVerify(&'static str),
+    /// REALITY.5b: the relay's [`crate::server::server_key_share`] was asked
+    /// to key a TLS group it does not implement server-side KEX for (only
+    /// `29`/X25519 and `4588`/X25519MLKEM768 are supported).
+    UnsupportedGroup(u16),
 }
 
 impl fmt::Display for Error {
@@ -42,6 +46,7 @@ impl fmt::Display for Error {
             Error::Protocol(msg) => write!(f, "REALITY/TLS protocol error: {msg}"),
             Error::Clock => write!(f, "system clock reads before the Unix epoch"),
             Error::RealityVerify(m) => write!(f, "REALITY relay verification failed: {m}"),
+            Error::UnsupportedGroup(g) => write!(f, "REALITY server cannot key TLS group {g}"),
         }
     }
 }
@@ -52,7 +57,10 @@ impl std::error::Error for Error {
             Error::Io(e) => Some(e),
             Error::Handshake(e) => Some(e),
             Error::Rng(e) => Some(e),
-            Error::Protocol(_) | Error::Clock | Error::RealityVerify(_) => None,
+            Error::Protocol(_)
+            | Error::Clock
+            | Error::RealityVerify(_)
+            | Error::UnsupportedGroup(_) => None,
         }
     }
 }
