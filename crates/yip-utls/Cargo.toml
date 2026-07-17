@@ -19,9 +19,22 @@ rand_core = { version = "0.6", default-features = false }
 # for the shared-secret-derived cert key — client verify + server binding.
 # `pkcs8` lets the server hand the derived key to rcgen; `ecdsa` for verify.
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+# REALITY.4b Task 2: a safe, fail-closed (panic-free on hostile bytes), no_std
+# DER reader — already present in the dependency graph transitively via
+# p256's `pkcs8` feature — used to walk the server's Certificate leaf's DER
+# far enough to slice out its `subjectPublicKeyInfo` TLV, which is then
+# handed to `p256::ecdsa::VerifyingKey::from_public_key_der` (never
+# hand-rolled ASN.1 arithmetic on untrusted bytes).
+der = "0.7"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "net", "macros", "rt-multi-thread", "time"] }
+# REALITY.4b Task 2 test-only: builds a real self-signed leaf DER around an
+# arbitrary (including the shared-secret-derived) P-256 key, for the
+# in-process mock-TLS-server `connect(verify=true)` tests. Already in the
+# workspace's Cargo.lock (bin/yip-rendezvous uses it in production); here
+# it's dev-only, so it adds no footprint to the shipped `yip-utls` library.
+rcgen = { version = "0.13.2", default-features = false, features = ["ring", "crypto", "pem"] }
 
 [lints]
 workspace = true

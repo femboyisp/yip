@@ -2115,11 +2115,13 @@ name = "yip-utls"
 version = "0.1.0"
 dependencies = [
  "chacha20poly1305",
+ "der",
  "getrandom 0.2.17",
  "md-5",
  "ml-kem",
  "p256",
  "rand_core 0.6.4",
+ "rcgen",
  "ring",
  "sha2",
  "tokio",

@@ -288,7 +288,14 @@ async fn run_reality(
 
         let handshake = tokio::time::timeout(
             crate::tls::HANDSHAKE_TIMEOUT,
-            yip_utls::connect(tcp, sni, pubkey, short_id),
+            // REALITY.4b Task 2 added `connect`'s `verify` param; wiring a
+            // real policy decision (config/CLI-driven) through to this call
+            // site is REALITY.4b Task 3/4's job. `false` here is a
+            // behavior-preserving placeholder ONLY — it is byte-identical
+            // to this call's pre-Task-2 behavior (verify=false is a no-op
+            // in `connect`), so this keeps the workspace compiling without
+            // pre-empting that later task's actual policy work.
+            yip_utls::connect(tcp, sni, pubkey, short_id, false),
         )
         .await;
         let stream = match handshake {
