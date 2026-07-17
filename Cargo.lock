@@ -2092,6 +2092,7 @@ version = "0.1.0"
 dependencies = [
  "boring",
  "getrandom 0.2.17",
+ "p256",
  "rcgen",
  "time",
  "tokio",
