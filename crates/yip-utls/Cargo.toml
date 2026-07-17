@@ -15,6 +15,10 @@ getrandom = { version = "0.2", features = ["std"] }
 tokio = { version = "1", features = ["io-util", "net", "macros", "rt"] }
 ml-kem = "0.2"
 rand_core = { version = "0.6", default-features = false }
+# REALITY.4b: ECDSA-P256 (ecdsa_secp256r1_sha256, the Chrome-advertised sig alg)
+# for the shared-secret-derived cert key — client verify + server binding.
+# `pkcs8` lets the server hand the derived key to rcgen; `ecdsa` for verify.
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "net", "macros", "rt-multi-thread", "time"] }
