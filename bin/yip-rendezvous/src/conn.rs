@@ -79,9 +79,9 @@ const CLASSIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 /// anything else (a censor probe, a browser, garbage, silence) is
 /// transparently reverse-proxied to the decoy backend, so the relay looks
 /// like an ordinary web server to everyone but a real yip client.
-pub async fn handle_connection<S>(mut stream: tokio_boring::SslStream<S>, cfg: Arc<TlsFrontCfg>)
+pub async fn handle_connection<St>(mut stream: St, cfg: Arc<TlsFrontCfg>)
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    St: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let now_ms = u64::try_from(cfg.base.elapsed().as_millis()).unwrap_or(u64::MAX);
     // The relay is blind to the real TCP peer identity, and the TLS-only
@@ -143,14 +143,14 @@ where
 /// Read the first frame (up to CLASSIFY_TIMEOUT) and classify it. Returns
 /// `None` on idle-timeout/read-error (caller treats as decoy). All bytes read
 /// are accumulated in `buf` so they can be replayed to the decoy.
-async fn read_and_classify<S>(
-    stream: &mut tokio_boring::SslStream<S>,
+async fn read_and_classify<St>(
+    stream: &mut St,
     cfg: &TlsFrontCfg,
     buf: &mut Vec<u8>,
     now_ms: u64,
 ) -> Option<Classify>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    St: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let deadline = tokio::time::sleep(CLASSIFY_TIMEOUT);
     tokio::pin!(deadline);
@@ -180,9 +180,9 @@ where
 
 /// Proxy this connection to the decoy backend: replay the buffered bytes, then
 /// splice bidirectionally. The decoy's own behavior/timing governs from here.
-async fn into_decoy<S>(mut stream: tokio_boring::SslStream<S>, cfg: &TlsFrontCfg, buffered: Vec<u8>)
+async fn into_decoy<St>(mut stream: St, cfg: &TlsFrontCfg, buffered: Vec<u8>)
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    St: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let Some(decoy_addr) = cfg.decoy else {
         // No decoy configured: minimal static fallback (documented weaker
