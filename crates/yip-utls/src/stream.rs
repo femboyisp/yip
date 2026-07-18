@@ -32,8 +32,8 @@ use crate::auth;
 use crate::error::Error;
 use crate::handshake::{
     self, derive_application_keys, derive_handshake_keys, finished_verify_data, parse_server_hello,
-    parse_server_hello_shape, record_open, record_open_typed, record_seal, transcript_hash,
-    HandshakeKeys, GROUP_X25519, GROUP_X25519MLKEM768,
+    parse_server_hello_shape, record_open, record_open_typed, record_seal, record_seal_padded,
+    transcript_hash, ApplicationKeys, HandshakeKeys, GROUP_X25519, GROUP_X25519MLKEM768,
 };
 use crate::hello::{self, ClientHelloParams, RandomSource};
 use crate::template::{CapturedFlight, CertChainShape, EncryptedFlightShape, ServerFlightTemplate};
@@ -1230,6 +1230,153 @@ pub async fn capture_dest_flight<S: AsyncRead + AsyncWrite + Unpin>(
             cert_chain: scan.cert_chain,
         },
     })
+}
+
+/// The output of [`emit_server_flight`]: the wire bytes to send (CCS ‖ sealed
+/// handshake-key records) and the application traffic keys for the data phase.
+pub struct ServerFlight {
+    pub wire: Vec<u8>,
+    pub app_keys: ApplicationKeys,
+}
+
+/// Wrap a handshake-message body as `type ‖ u24 len ‖ body`.
+fn handshake_message(msg_type: u8, body: &[u8]) -> Result<Vec<u8>, Error> {
+    let len = u32::try_from(body.len()).map_err(|_| handshake::Error::RecordTooLarge)?;
+    if body.len() > 0xFF_FFFF {
+        return Err(handshake::Error::RecordTooLarge.into());
+    }
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.push(msg_type);
+    out.extend_from_slice(&len.to_be_bytes()[1..]); // u24
+    out.extend_from_slice(body);
+    Ok(out)
+}
+
+/// A single `CertificateEntry`: `u24 cert_data_len ‖ der ‖ u16 ext_len(0)`.
+fn certificate_entry(der: &[u8]) -> Result<Vec<u8>, Error> {
+    let len = u32::try_from(der.len()).map_err(|_| handshake::Error::RecordTooLarge)?;
+    if der.len() > 0xFF_FFFF {
+        return Err(handshake::Error::RecordTooLarge.into());
+    }
+    let mut out = Vec::with_capacity(3 + der.len() + 2);
+    out.extend_from_slice(&len.to_be_bytes()[1..]); // u24
+    out.extend_from_slice(der);
+    out.extend_from_slice(&[0x00, 0x00]); // empty entry extensions
+    Ok(out)
+}
+
+/// REALITY.5c: assemble the encrypted server flight (EncryptedExtensions/
+/// Certificate/CertificateVerify/Finished), seal it under `keys`'s handshake
+/// keys, and frame it to byte-match `flight_shape.record_lengths` (padding
+/// each record to its captured length), prefixed with the middlebox-compat
+/// CCS. Returns the wire bytes + the derived application keys. Fail-closed: a
+/// malformed or too-small `record_lengths` → `Err` (5d degrades to splice).
+pub fn emit_server_flight(
+    keys: &HandshakeKeys,
+    flight_shape: &crate::template::EncryptedFlightShape,
+    cert_chain: &crate::template::CertChainShape,
+    forged_leaf_der: &[u8],
+    cert_signing_key: &p256::ecdsa::SigningKey,
+    transcript_ch_sh: &[u8],
+) -> Result<ServerFlight, Error> {
+    let suite = keys.suite;
+
+    // 1. EncryptedExtensions: empty extensions list.
+    let ee = handshake_message(0x08, &[0x00, 0x00])?;
+
+    // 2. Certificate: empty context ‖ u24 list-len ‖ leaf entry ‖ intermediates.
+    let mut cert_list = certificate_entry(forged_leaf_der)?;
+    for inter in &cert_chain.intermediates_der {
+        cert_list.extend_from_slice(&certificate_entry(inter)?);
+    }
+    let mut cert_body = Vec::with_capacity(1 + 3 + cert_list.len());
+    cert_body.push(0x00); // certificate_request_context length = 0
+    let list_len = u32::try_from(cert_list.len()).map_err(|_| handshake::Error::RecordTooLarge)?;
+    if cert_list.len() > 0xFF_FFFF {
+        return Err(handshake::Error::RecordTooLarge.into());
+    }
+    cert_body.extend_from_slice(&list_len.to_be_bytes()[1..]); // u24
+    cert_body.extend_from_slice(&cert_list);
+    let certificate = handshake_message(0x0b, &cert_body)?;
+
+    // 3. CertificateVerify over the transcript through Certificate.
+    let mut tr = transcript_ch_sh.to_vec();
+    tr.extend_from_slice(&ee);
+    tr.extend_from_slice(&certificate);
+    let th_cert = transcript_hash(&tr, suite);
+    let sig = sign_certificate_verify(cert_signing_key, &th_cert)?;
+    let mut cv_body = Vec::with_capacity(2 + 2 + sig.len());
+    cv_body.extend_from_slice(&0x0403u16.to_be_bytes()); // ecdsa_secp256r1_sha256
+    cv_body.extend_from_slice(
+        &u16::try_from(sig.len())
+            .map_err(|_| handshake::Error::RecordTooLarge)?
+            .to_be_bytes(),
+    );
+    cv_body.extend_from_slice(&sig);
+    let certificate_verify = handshake_message(0x0f, &cv_body)?;
+
+    // 4. Finished over the transcript through CertificateVerify.
+    tr.extend_from_slice(&certificate_verify);
+    let th_cv = transcript_hash(&tr, suite);
+    let verify_data = finished_verify_data(&keys.server_hs_traffic, &th_cv, suite);
+    let finished = handshake_message(0x14, &verify_data)?;
+
+    // Application keys over the transcript through the server Finished.
+    tr.extend_from_slice(&finished);
+    let th_fin = transcript_hash(&tr, suite);
+    let app_keys = derive_application_keys(&keys.handshake_secret, &th_fin, suite);
+
+    // The contiguous handshake-message plaintext to frame.
+    let mut hs_stream = Vec::with_capacity(
+        ee.len() + certificate.len() + certificate_verify.len() + finished.len(),
+    );
+    hs_stream.extend_from_slice(&ee);
+    hs_stream.extend_from_slice(&certificate);
+    hs_stream.extend_from_slice(&certificate_verify);
+    hs_stream.extend_from_slice(&finished);
+
+    // 5. Greedy record framing to match record_lengths exactly.
+    if flight_shape.record_lengths.is_empty() {
+        return Err(Error::Protocol(
+            "empty record_lengths in captured flight template",
+        ));
+    }
+    let mut wire = CHANGE_CIPHER_SPEC_RECORD.to_vec();
+    let mut off = 0usize;
+    for (i, &rlen) in flight_shape.record_lengths.iter().enumerate() {
+        // cap = plaintext(+padding) budget for this record (excludes content-type + tag).
+        let cap = rlen.checked_sub(17).ok_or(Error::Protocol(
+            "record length below the 17-byte AEAD floor",
+        ))?;
+        let remaining = hs_stream.len() - off;
+        let chunk_len = remaining.min(cap);
+        let chunk = &hs_stream[off..off + chunk_len];
+        let pad_len = cap - chunk_len; // once hs_stream is exhausted, chunk_len=0 → pad_len=cap (pure-padding record)
+        let seq = u64::try_from(i).map_err(|_| Error::Protocol("record index overflow"))?;
+        let sealed = record_seal_padded(
+            &keys.server_key,
+            &keys.server_iv,
+            seq,
+            suite,
+            CONTENT_TYPE_HANDSHAKE,
+            chunk,
+            pad_len,
+        )?;
+        let hdr = record_header(
+            CONTENT_TYPE_APPLICATION_DATA,
+            LEGACY_RECORD_VERSION,
+            sealed.len(),
+        )?;
+        wire.extend_from_slice(&hdr);
+        wire.extend_from_slice(&sealed);
+        off += chunk_len;
+    }
+    if off < hs_stream.len() {
+        // The flight did not fit the captured record framing.
+        return Err(Error::FlightTooLarge);
+    }
+
+    Ok(ServerFlight { wire, app_keys })
 }
 
 /// An established REALITY/TLS 1.3 connection's application-data stream.
@@ -2925,5 +3072,168 @@ mod tests {
             .to_vec();
         let tampered = transcript_hash(b"different-transcript", SUITE);
         assert!(verify_certificate_verify(&signer_pub, &signer_pub, &tampered, &sig).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // REALITY.5c Task 4: emit_server_flight
+    // -----------------------------------------------------------------
+
+    // Shared fixture: derive real handshake keys + a leaf whose SPKI is the
+    // signing key, so the emitted Certificate is well-formed.
+    fn emit_flight_fixture() -> (HandshakeKeys, p256::ecdsa::SigningKey, Vec<u8>, Vec<u8>) {
+        const SUITE_AES_128_GCM_SHA256: u16 = 0x1301;
+
+        let ecdhe = [7u8; 32];
+        let transcript_ch_sh = b"raw-clienthello-bytes||raw-serverhello-bytes".to_vec();
+        let th = transcript_hash(&transcript_ch_sh, SUITE_AES_128_GCM_SHA256);
+        let keys = derive_handshake_keys(&ecdhe, &th, SUITE_AES_128_GCM_SHA256);
+        let signing_key = p256::ecdsa::SigningKey::from_slice(&[0x33u8; 32]).unwrap();
+        // A real leaf whose key is the signing key (test-only helper already used
+        // by the verify tests). `leaf_der_for_key` takes an rcgen KeyPair built
+        // from the p256 pkcs8.
+        use p256::pkcs8::EncodePrivateKey as _;
+        let pkcs8 = signing_key.to_pkcs8_der().unwrap();
+        let leaf_key = rcgen::KeyPair::try_from(pkcs8.as_bytes()).unwrap();
+        let leaf_der = leaf_der_for_key(&leaf_key);
+        (keys, signing_key, leaf_der, transcript_ch_sh)
+    }
+
+    #[test]
+    fn emit_server_flight_matches_record_lengths_and_reopens_to_messages() {
+        let (keys, signing_key, leaf_der, transcript_ch_sh) = emit_flight_fixture();
+        // Generously sized records: 3 records, last two mostly/entirely padding.
+        let shape = crate::template::EncryptedFlightShape {
+            record_lengths: vec![600, 600, 4096],
+            encrypted_extensions_len: 0,
+            certificate_len: 0,
+            certificate_verify_len: 0,
+            finished_len: 0,
+        };
+        let cert_chain = crate::template::CertChainShape {
+            leaf_der_len: leaf_der.len(),
+            intermediates_der: Vec::new(),
+        };
+
+        let flight = emit_server_flight(
+            &keys,
+            &shape,
+            &cert_chain,
+            &leaf_der,
+            &signing_key,
+            &transcript_ch_sh,
+        )
+        .unwrap();
+
+        // First record is the middlebox CCS, byte-for-byte.
+        assert_eq!(
+            &flight.wire[..CHANGE_CIPHER_SPEC_RECORD.len()],
+            &CHANGE_CIPHER_SPEC_RECORD
+        );
+
+        // Walk the sealed records after the CCS: each record's header length field
+        // MUST equal record_lengths[i]; re-open each under the handshake server key
+        // and concatenate the recovered plaintext.
+        let mut off = CHANGE_CIPHER_SPEC_RECORD.len();
+        let mut recovered = Vec::new();
+        for (i, &rlen) in shape.record_lengths.iter().enumerate() {
+            let hdr = &flight.wire[off..off + RECORD_HEADER_LEN];
+            assert_eq!(hdr[0], CONTENT_TYPE_APPLICATION_DATA);
+            let len_field = usize::from(u16::from_be_bytes([hdr[3], hdr[4]]));
+            assert_eq!(
+                len_field, rlen,
+                "record {i} outer length must match record_lengths"
+            );
+            let mut payload =
+                flight.wire[off + RECORD_HEADER_LEN..off + RECORD_HEADER_LEN + rlen].to_vec();
+            let opened = record_open(
+                &keys.server_key,
+                &keys.server_iv,
+                u64::try_from(i).unwrap(),
+                keys.suite,
+                CONTENT_TYPE_APPLICATION_DATA,
+                &mut payload,
+            )
+            .unwrap();
+            recovered.extend_from_slice(&opened);
+            off += RECORD_HEADER_LEN + rlen;
+        }
+        assert_eq!(
+            off,
+            flight.wire.len(),
+            "no trailing bytes after the framed records"
+        );
+
+        // The recovered plaintext begins with EncryptedExtensions (0x08),
+        // Certificate (0x0b), CertificateVerify (0x0f), Finished (0x14) in order.
+        assert_eq!(recovered[0], 0x08, "first message is EncryptedExtensions");
+        // Walk the four handshake messages by their u24 length prefixes.
+        let mut p = 0usize;
+        let mut types = Vec::new();
+        while p + 4 <= recovered.len() {
+            let ty = recovered[p];
+            if ty == 0 {
+                break; // reached padding stripped? (shouldn't; padding was per-record)
+            }
+            let len = (usize::from(recovered[p + 1]) << 16)
+                | (usize::from(recovered[p + 2]) << 8)
+                | usize::from(recovered[p + 3]);
+            types.push(ty);
+            p += 4 + len;
+            if types.len() == 4 {
+                break;
+            }
+        }
+        assert_eq!(types, vec![0x08, 0x0b, 0x0f, 0x14]);
+    }
+
+    #[test]
+    fn emit_server_flight_rejects_malformed_or_over_capacity_framing() {
+        let (keys, signing_key, leaf_der, transcript_ch_sh) = emit_flight_fixture();
+        let cert_chain = crate::template::CertChainShape {
+            leaf_der_len: leaf_der.len(),
+            intermediates_der: Vec::new(),
+        };
+        let mk = |record_lengths: Vec<usize>| crate::template::EncryptedFlightShape {
+            record_lengths,
+            encrypted_extensions_len: 0,
+            certificate_len: 0,
+            certificate_verify_len: 0,
+            finished_len: 0,
+        };
+
+        // Empty record_lengths → Err (not panic).
+        assert!(emit_server_flight(
+            &keys,
+            &mk(vec![]),
+            &cert_chain,
+            &leaf_der,
+            &signing_key,
+            &transcript_ch_sh
+        )
+        .is_err());
+        // A record length below the 17-byte AEAD/content-type floor → Err.
+        assert!(emit_server_flight(
+            &keys,
+            &mk(vec![10]),
+            &cert_chain,
+            &leaf_der,
+            &signing_key,
+            &transcript_ch_sh
+        )
+        .is_err());
+        // Total capacity far below the flight size → FlightTooLarge.
+        // (`ServerFlight` deliberately does not derive `Debug` — it carries the
+        // application traffic keys — so this checks the error variant via
+        // `matches!` rather than `Result::unwrap_err`, which would require
+        // `ServerFlight: Debug`.)
+        let result = emit_server_flight(
+            &keys,
+            &mk(vec![20, 20]),
+            &cert_chain,
+            &leaf_der,
+            &signing_key,
+            &transcript_ch_sh,
+        );
+        assert!(matches!(result, Err(Error::FlightTooLarge)));
     }
 }

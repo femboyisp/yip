@@ -35,6 +35,11 @@ pub enum Error {
     /// to key a TLS group it does not implement server-side KEX for (only
     /// `29`/X25519 and `4588`/X25519MLKEM768 are supported).
     UnsupportedGroup(u16),
+    /// The forged server flight's plaintext does not fit the captured
+    /// `dest` record framing (`sum(record_lengths[i] - 17)` < flight bytes,
+    /// or a malformed `record_lengths`). REALITY.5c fail-safe: 5d degrades
+    /// this connection to splice-only.
+    FlightTooLarge,
 }
 
 impl fmt::Display for Error {
@@ -47,6 +52,12 @@ impl fmt::Display for Error {
             Error::Clock => write!(f, "system clock reads before the Unix epoch"),
             Error::RealityVerify(m) => write!(f, "REALITY relay verification failed: {m}"),
             Error::UnsupportedGroup(g) => write!(f, "REALITY server cannot key TLS group {g}"),
+            Error::FlightTooLarge => {
+                write!(
+                    f,
+                    "REALITY/TLS server flight exceeds the captured dest record framing"
+                )
+            }
         }
     }
 }
@@ -60,7 +71,8 @@ impl std::error::Error for Error {
             Error::Protocol(_)
             | Error::Clock
             | Error::RealityVerify(_)
-            | Error::UnsupportedGroup(_) => None,
+            | Error::UnsupportedGroup(_)
+            | Error::FlightTooLarge => None,
         }
     }
 }
