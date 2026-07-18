@@ -1,35 +1,41 @@
 //! Async I/O plumbing for the REALITY TLS front (REALITY.1 Task 2).
 //!
 //! The front must read the raw TLS `ClientHello` off the socket *before*
-//! terminating TLS (to run REALITY auth on it), then hand the connection to
-//! the TLS acceptor as if nothing had been read. Two primitives make that
-//! possible: [`read_first_tls_record`] pulls the first TLS record off the
-//! wire without interpreting it as TLS, and [`PrefixedStream`] replays an
-//! already-consumed byte prefix so `tokio_boring::accept` can "re-read" the
-//! `ClientHello` it needs from a socket that has already had it drained.
-//! Wired into the async TLS front by `tls_front::run_reality_conn`
-//! (REALITY.1 Task 3).
+//! terminating TLS (to run REALITY auth on it). [`read_first_tls_record`]
+//! pulls the first TLS record off the wire without interpreting it as TLS.
+//!
+//! [`PrefixedStream`] (test-only, `#[cfg(test)]`) replays an already-consumed
+//! byte prefix so a TLS acceptor can "re-read" a `ClientHello` that was
+//! already pulled off the socket. `run_reality_conn`'s authed path no longer
+//! needs this at runtime (REALITY.5d): it hands the parsed `ClientHello`
+//! bytes straight to `yip_utls::server::emit_server_hello` instead of
+//! replaying them onto the socket for a generic TLS acceptor to re-parse —
+//! kept here only as a test double for this module's own read/replay tests.
+#[cfg(test)]
 use std::pin::Pin;
+#[cfg(test)]
 use std::task::{Context, Poll};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
 /// Wraps `inner` so a previously-consumed byte `prefix` is replayed on read
-/// before delegating to `inner`. Lets a TLS acceptor "re-read" a
-/// `ClientHello` that was already pulled off the socket for REALITY auth
-/// inspection: `PrefixedStream::new(record_bytes, tcp)` handed to
-/// `tokio_boring::accept` makes BoringSSL see the ClientHello followed
-/// seamlessly by the rest of the live connection.
+/// before delegating to `inner`. Test-only (see module docs): production
+/// code used this to let a TLS acceptor "re-read" an already-drained
+/// `ClientHello`, but REALITY.5d's hand-rolled flow no longer replays onto
+/// the socket at all — retained here purely to exercise
+/// [`read_first_tls_record`]'s replay-shaped output in this module's tests.
 ///
 /// `AsyncWrite` (and flush/shutdown) delegate straight to `inner` —
 /// `prefix` only affects reads.
+#[cfg(test)]
 pub struct PrefixedStream<S> {
     prefix: Vec<u8>,
     pos: usize,
     inner: S,
 }
 
+#[cfg(test)]
 impl<S> PrefixedStream<S> {
     /// Wrap `inner`, replaying `prefix` first on every `AsyncRead` before
     /// falling through to `inner`.
@@ -42,7 +48,8 @@ impl<S> PrefixedStream<S> {
     }
 }
 
-impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {
+#[cfg(test)]
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PrefixedStream<S> {
     /// While the buffered `prefix` isn't fully drained, copy from it into
     /// `buf` (respecting `buf.remaining()`) and return without touching
     /// `inner` — even if that only partially fills `buf`. Once the prefix is
@@ -50,7 +57,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         if this.pos < this.prefix.len() {
@@ -64,7 +71,8 @@ impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {
     }
 }
 
-impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
+#[cfg(test)]
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PrefixedStream<S> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
