@@ -1365,6 +1365,77 @@ pub fn emit_server_flight(
     Ok(ServerFlight { wire, app_keys })
 }
 
+/// REALITY.5c server entry point — the mirror of [`connect`]. Emits the
+/// encrypted server flight (via [`emit_server_flight`]) framed to `dest`'s
+/// captured record lengths, writes it, drains the client's middlebox CCS +
+/// `Finished` (contents UNCHECKED — the outer TLS is zero client-auth by
+/// design, exactly as `connect` never checks the server's `Finished`), and
+/// returns the server-role [`RealityStream`] on the derived application keys.
+/// The ServerHello (REALITY.5b `emit_server_hello`) and `transcript_ch_sh`
+/// (raw ClientHello ‖ ServerHello) must already have been produced/sent by
+/// the caller (5d).
+pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    keys: &HandshakeKeys,
+    flight_shape: &crate::template::EncryptedFlightShape,
+    cert_chain: &crate::template::CertChainShape,
+    forged_leaf_der: &[u8],
+    cert_signing_key: &p256::ecdsa::SigningKey,
+    transcript_ch_sh: &[u8],
+) -> Result<RealityStream<S>, Error> {
+    let flight = emit_server_flight(
+        keys,
+        flight_shape,
+        cert_chain,
+        forged_leaf_der,
+        cert_signing_key,
+        transcript_ch_sh,
+    )?;
+    stream.write_all(&flight.wire).await?;
+
+    // Drain the client's CCS + sealed Finished. The client sends a CCS record
+    // (skipped) then exactly one application-data record carrying the sealed
+    // Finished, opened under the CLIENT handshake key; its contents are not
+    // validated (zero client-auth).
+    let mut client_hs_seq = 0u64;
+    loop {
+        let (record_type, mut payload) = read_raw_record(&mut stream).await?;
+        if record_type == CONTENT_TYPE_CHANGE_CIPHER_SPEC {
+            continue;
+        }
+        if record_type != CONTENT_TYPE_APPLICATION_DATA {
+            return Err(Error::Protocol(
+                "expected the client's sealed Finished record",
+            ));
+        }
+        // Open (and discard) the client Finished — proves it is well-framed
+        // under the negotiated key; contents intentionally unchecked.
+        record_open(
+            &keys.client_key,
+            &keys.client_iv,
+            client_hs_seq,
+            keys.suite,
+            record_type,
+            &mut payload,
+        )?;
+        #[expect(
+            unused_assignments,
+            reason = "written for symmetry with connect()'s analogous server_seq counter \
+                      (and to fail closed on overflow before the break); this loop always \
+                      exits after the client's single Finished record, so the new value is \
+                      never read back"
+        )]
+        {
+            client_hs_seq = client_hs_seq
+                .checked_add(1)
+                .ok_or(Error::Protocol("client handshake sequence overflow"))?;
+        }
+        break;
+    }
+
+    Ok(RealityStream::server(stream, flight.app_keys))
+}
+
 /// An established REALITY/TLS 1.3 connection's application-data stream.
 /// Implements `AsyncRead`/`AsyncWrite` over the negotiated application
 /// traffic keys, framing plaintext into/out of TLS 1.3 records
@@ -1433,15 +1504,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> RealityStream<S> {
     /// Build the SERVER-role stream (used by [`serve`]): egress sealed with the
     /// server application key, ingress opened with the client's — the mirror of
     /// [`client`].
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Task 5c/6's serve() is this constructor's first non-test caller; \
-                      this module's own test submodule already exercises it under \
-                      cfg(test), but the plain lib build has no caller yet"
-        )
-    )]
     fn server(inner: S, ak: handshake::ApplicationKeys) -> Self {
         RealityStream {
             inner,
@@ -2355,13 +2417,6 @@ mod tests {
         msg
     }
 
-    /// Builds a wire `Certificate` handshake message carrying a single
-    /// `CertificateEntry` wrapping `leaf_der` — the common case used by
-    /// every `connect_verify_*` test that doesn't care about chain shape.
-    fn build_certificate_message(leaf_der: &[u8]) -> Vec<u8> {
-        build_certificate_entries_message(&[leaf_der])
-    }
-
     /// Builds a wire `Certificate` handshake message carrying TWO
     /// `CertificateEntry` values, leaf first then `intermediate_der` — the
     /// shape a real relay's CA-issued chain presents (RFC 8446 §4.4.2
@@ -2517,124 +2572,84 @@ mod tests {
                 (derived.pkcs8_der.clone(), other)
             }
         };
-        use p256::pkcs8::DecodePrivateKey as _;
-
-        let leaf_key = rcgen::KeyPair::try_from(leaf_key_pkcs8.as_slice())
-            .expect("leaf signing key pkcs8 loads");
+        // Build the (forged leaf, signing key) pair per behavior — unchanged.
+        let leaf_key = rcgen::KeyPair::try_from(leaf_key_pkcs8.as_slice()).unwrap();
         let leaf_der = leaf_der_for_key(&leaf_key);
+        use p256::pkcs8::DecodePrivateKey as _;
+        let cert_signing_key = p256::ecdsa::SigningKey::from_pkcs8_der(&signing_key_pkcs8).unwrap();
 
-        let ee_msg: [u8; 4] = [0x08, 0x00, 0x00, 0x00]; // EncryptedExtensions, 0-length
-        let certificate_msg = if include_intermediate {
-            // A dummy "intermediate": any wire-well-formed CertificateEntry
-            // works per RFC 8446 §4.4.2 — it doesn't need to chain-verify to
-            // the leaf, since REALITY.4b only ever pins the FIRST entry.
+        let intermediates = if include_intermediate {
             let intermediate_key = rcgen::KeyPair::generate().unwrap();
-            let intermediate_der = leaf_der_for_key(&intermediate_key);
-            build_certificate_message_with_intermediate(&leaf_der, &intermediate_der)
+            vec![leaf_der_for_key(&intermediate_key)]
         } else {
-            build_certificate_message(&leaf_der)
+            Vec::new()
         };
-
-        // The RFC 8446 §4.4.3 transcript boundary: everything through
-        // Certificate, NOT including CertificateVerify.
-        let mut thru_cert = ch_sh_transcript.clone();
-        thru_cert.extend_from_slice(&ee_msg);
-        thru_cert.extend_from_slice(&certificate_msg);
-        let transcript_thru_cert = transcript_hash(&thru_cert, SUITE);
-
-        let mut signed = Vec::with_capacity(64 + 34 + 1 + transcript_thru_cert.len());
-        signed.extend_from_slice(&[0x20u8; 64]);
-        signed.extend_from_slice(b"TLS 1.3, server CertificateVerify");
-        signed.push(0x00);
-        signed.extend_from_slice(&transcript_thru_cert);
-
-        let signing_key = p256::ecdsa::SigningKey::from_pkcs8_der(&signing_key_pkcs8)
-            .expect("signing key pkcs8 loads");
-        let signature: p256::ecdsa::Signature = {
-            use p256::ecdsa::signature::Signer;
-            signing_key.sign(&signed)
+        let flight_shape = crate::template::EncryptedFlightShape {
+            // A SINGLE record, comfortably larger than either behavior's flight
+            // (~463 bytes CorrectBinder/WrongLeafKey/BadSignature, ~797 bytes
+            // with_intermediate) — exercises real intra-record padding.
+            //
+            // Deliberately NOT split across multiple record_lengths entries
+            // (e.g. [600, 4096]) here: emit_server_flight's greedy chunking
+            // fills only as many records as the flight's actual plaintext
+            // needs, so a template with MORE capacity than the flight
+            // requires leaves any later record(s) as pure padding
+            // (`chunk_len = 0`) — see this fn's self-review note. A real TLS
+            // 1.3 client (this crate's `connect`, mirroring BoringSSL/Chrome)
+            // stops reading the server's encrypted flight the instant it has
+            // assembled a complete `Finished` message; it has no way to know
+            // the captured template called for more records, so it never
+            // reads that trailing pure-padding record — which then sits
+            // unconsumed ahead of the first real application-data record and
+            // fails AEAD-open under the (wrong, still-handshake-sealed) key.
+            // Real production flights avoid this because 5d sizes the forged
+            // leaf to `leaf_der_len`, keeping the forged flight within a byte
+            // or two of `dest`'s real (already record-boundary-fitting)
+            // flight; pre-5d, this mock's ad hoc small self-signed leaf does
+            // not, so a single record sized to comfortably fit either
+            // behavior's flight sidesteps the gap without masking what
+            // `serve`/`emit_server_flight` themselves guarantee.
+            record_lengths: vec![4096],
+            encrypted_extensions_len: 0,
+            certificate_len: 0,
+            certificate_verify_len: 0,
+            finished_len: 0,
         };
-        let certificate_verify_msg = build_certificate_verify_message(signature.to_der().as_ref());
-
-        let verify_data = [0xABu8; 32]; // arbitrary: connect() never checks it
-        let mut finished_msg = Vec::with_capacity(4 + verify_data.len());
-        finished_msg.push(HS_TYPE_FINISHED);
-        finished_msg.extend_from_slice(&[0x00, 0x00, 0x20]); // u24 len = 32
-        finished_msg.extend_from_slice(&verify_data);
-
-        let mut server_flight_plain = Vec::new();
-        server_flight_plain.extend_from_slice(&ee_msg);
-        server_flight_plain.extend_from_slice(&certificate_msg);
-        server_flight_plain.extend_from_slice(&certificate_verify_msg);
-        server_flight_plain.extend_from_slice(&finished_msg);
-
-        let sealed_flight = record_seal(
-            &hk.server_key,
-            &hk.server_iv,
-            0,
-            SUITE,
-            CONTENT_TYPE_HANDSHAKE,
-            &server_flight_plain,
+        let cert_chain = crate::template::CertChainShape {
+            leaf_der_len: leaf_der.len(),
+            intermediates_der: intermediates,
+        };
+        // transcript_ch_sh = the RAW ClientHello ‖ ServerHello bytes (ch_sh_transcript),
+        // NOT the hash — emit_server_flight hashes internally.
+        //
+        // IMPORTANT: do NOT `.expect()` on serve. For the reject behaviors
+        // (WrongLeafKey / BadSignature) the client verifies, FAILS, and drops the
+        // connection WITHOUT sending its Finished — so `serve` (which drains the
+        // client Finished) returns Err. That is the correct outcome for those
+        // tests (they assert the CLIENT `connect` returns Err); the server task
+        // must simply exit cleanly, not panic. `if let Ok` handles both paths.
+        if let Ok(mut server) = serve(
+            io,
+            &hk,
+            &flight_shape,
+            &cert_chain,
+            &leaf_der,
+            &cert_signing_key,
+            &ch_sh_transcript,
         )
-        .unwrap();
-        let flight_header = record_header(
-            CONTENT_TYPE_APPLICATION_DATA,
-            LEGACY_RECORD_VERSION,
-            sealed_flight.len(),
-        )
-        .unwrap();
-        io.write_all(&flight_header).await.unwrap();
-        io.write_all(&sealed_flight).await.unwrap();
-
-        let mut full_transcript = ch_sh_transcript;
-        full_transcript.extend_from_slice(&server_flight_plain);
-        let transcript_thru_sfin = transcript_hash(&full_transcript, SUITE);
-        let ak = derive_application_keys(&hk.handshake_secret, &transcript_thru_sfin, SUITE);
-
-        // -- Drain the client's CCS + sealed Finished. Only reached if the
-        // client ACCEPTED the binding — see this function's doc comment. --
-        loop {
-            let (record_type, _payload) = read_one_record(&mut io).await;
-            if record_type == CONTENT_TYPE_CHANGE_CIPHER_SPEC {
-                continue;
+        .await
+        {
+            // Echo whatever the client sends (robust to any ping size the
+            // round-trip tests use), proving the server-app egress seal + client
+            // ingress open both work.
+            let mut buf = [0u8; 64];
+            if let Ok(n) = server.read(&mut buf).await {
+                if n > 0 {
+                    let _ = server.write_all(&buf[..n]).await;
+                    let _ = server.flush().await;
+                }
             }
-            assert_eq!(
-                record_type, CONTENT_TYPE_APPLICATION_DATA,
-                "expected the client's sealed Finished record"
-            );
-            break;
         }
-
-        // -- Echo one application-data record under the application keys --
-        let (record_type, mut app_payload) = read_one_record(&mut io).await;
-        assert_eq!(record_type, CONTENT_TYPE_APPLICATION_DATA);
-        let plaintext = record_open(
-            &ak.client_key,
-            &ak.client_iv,
-            0,
-            SUITE,
-            CONTENT_TYPE_APPLICATION_DATA,
-            &mut app_payload,
-        )
-        .unwrap();
-
-        let sealed_reply = record_seal(
-            &ak.server_key,
-            &ak.server_iv,
-            0,
-            SUITE,
-            CONTENT_TYPE_APPLICATION_DATA,
-            &plaintext,
-        )
-        .unwrap();
-        let reply_header = record_header(
-            CONTENT_TYPE_APPLICATION_DATA,
-            LEGACY_RECORD_VERSION,
-            sealed_reply.len(),
-        )
-        .unwrap();
-        io.write_all(&reply_header).await.unwrap();
-        io.write_all(&sealed_reply).await.unwrap();
     }
 
     /// `verify=true` against a mock server whose leaf/signature genuinely
@@ -2824,6 +2839,50 @@ mod tests {
         .await
         .expect("verify=false must ignore the cert entirely (zero-cert-auth camouflage)");
 
+        s.write_all(b"PING").await.unwrap();
+        s.flush().await.unwrap();
+        let mut buf = [0u8; 4];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"PING");
+
+        server_task.await.unwrap();
+    }
+
+    /// Proves BOTH data-plane directions over a real [`serve`]-built
+    /// server stream: `connect_verify_accepts_correct_binder` (and friends)
+    /// only checks client→server→echo; this drives a server-initiated write
+    /// too (the mock's echo `write_all`, sealed under the server-app egress
+    /// key and opened by the client's ingress key), proving `serve`'s
+    /// `RealityStream::server` role is symmetric with `client`.
+    #[tokio::test]
+    async fn serve_round_trips_application_data_both_directions() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_reality_priv = [3u8; 32];
+        let server_reality_pub = {
+            let secret = x25519_dalek::StaticSecret::from(server_reality_priv);
+            x25519_dalek::PublicKey::from(&secret).to_bytes()
+        };
+
+        // Server: hand-rolled ServerHello + 5c serve (reuses the refactored mock,
+        // CorrectBinder → the client must verify the 4b binding).
+        let server_task = tokio::spawn(run_mock_tls13_server_with_cert(
+            server_io,
+            server_reality_priv,
+            ServerCertBehavior::CorrectBinder,
+            false,
+        ));
+
+        let mut s = connect(
+            client_io,
+            "example.com",
+            &server_reality_pub,
+            [1u8; 8],
+            true,
+        )
+        .await
+        .expect("correctly-bound relay verifies");
+
+        // client → server → echo (server's echo path in the mock).
         s.write_all(b"PING").await.unwrap();
         s.flush().await.unwrap();
         let mut buf = [0u8; 4];
