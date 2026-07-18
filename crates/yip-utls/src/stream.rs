@@ -640,6 +640,32 @@ fn verify_certificate_verify(
         .map_err(|_| Error::RealityVerify("CertificateVerify signature does not verify"))
 }
 
+/// The signing counterpart of [`verify_certificate_verify`]: sign the TLS 1.3
+/// server `CertificateVerify` (RFC 8446 §4.4.3) with the derived ECDSA-P256
+/// key `signing_key` (from `auth::derive_cert_key(shared)`), over the SAME
+/// signed content the verifier reconstructs. This IS the REALITY.4b binding,
+/// server side — the client pins the presented leaf's SPKI to this key and
+/// verifies this signature. `ecdsa_secp256r1_sha256` (scheme 0x0403) is fixed:
+/// `p256::ecdsa::SigningKey` signs SHA-256 internally, so no `suite` is needed
+/// (the caller uses `suite` only to compute `transcript_hash_through_certificate`).
+pub fn sign_certificate_verify(
+    signing_key: &p256::ecdsa::SigningKey,
+    transcript_hash_through_certificate: &[u8],
+) -> Result<Vec<u8>, Error> {
+    use p256::ecdsa::{signature::Signer, Signature};
+
+    let mut signed = Vec::with_capacity(64 + 33 + 1 + transcript_hash_through_certificate.len());
+    signed.extend_from_slice(&[0x20u8; 64]);
+    signed.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+    signed.push(0x00);
+    signed.extend_from_slice(transcript_hash_through_certificate);
+
+    let sig: Signature = signing_key
+        .try_sign(&signed)
+        .map_err(|_| Error::Handshake(handshake::Error::Crypto))?;
+    Ok(sig.to_der().as_bytes().to_vec())
+}
+
 /// Orchestrates REALITY.4b `CertificateVerify` verification: locates the
 /// Certificate/CertificateVerify messages in `hs_flight` (see
 /// [`scan_cert_flight`]), extracts the leaf's P-256 SPKI (see
@@ -2847,5 +2873,57 @@ mod tests {
         assert!(cap.template.cert_chain.leaf_der_len > 0);
         assert!(!cap.template.encrypted_flight.record_lengths.is_empty());
         assert!(!cap.leaf_der.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // REALITY.5c Task 3: sign_certificate_verify
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn sign_certificate_verify_is_accepted_by_the_verifier() {
+        use p256::ecdsa::SigningKey;
+        const SUITE: u16 = 0x1301; // TLS_AES_128_GCM_SHA256
+
+        let signing_key = SigningKey::from_slice(&[0x11u8; 32]).unwrap();
+        let pubkey_sec1 = signing_key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let transcript = transcript_hash(b"ch||sh||ee||cert", SUITE);
+
+        let sig = sign_certificate_verify(&signing_key, &transcript).unwrap();
+
+        // The shipped verifier accepts it for the same transcript + pinned key.
+        verify_certificate_verify(&pubkey_sec1, &pubkey_sec1, &transcript, &sig)
+            .expect("a self-signed CertificateVerify must verify");
+    }
+
+    #[test]
+    fn sign_certificate_verify_rejected_for_wrong_key_and_tampered_transcript() {
+        use p256::ecdsa::SigningKey;
+        const SUITE: u16 = 0x1301; // TLS_AES_128_GCM_SHA256
+
+        let signing_key = SigningKey::from_slice(&[0x11u8; 32]).unwrap();
+        let other_key = SigningKey::from_slice(&[0x22u8; 32]).unwrap();
+        let other_pub = other_key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let transcript = transcript_hash(b"ch||sh||ee||cert", SUITE);
+        let sig = sign_certificate_verify(&signing_key, &transcript).unwrap();
+
+        // Wrong pinned key → RealityVerify.
+        assert!(verify_certificate_verify(&other_pub, &other_pub, &transcript, &sig).is_err());
+
+        // Tampered transcript (verify against a different hash) → RealityVerify.
+        let signer_pub = signing_key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let tampered = transcript_hash(b"different-transcript", SUITE);
+        assert!(verify_certificate_verify(&signer_pub, &signer_pub, &tampered, &sig).is_err());
     }
 }
