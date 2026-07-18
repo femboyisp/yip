@@ -34,6 +34,12 @@ pub struct ClientHelloInfo {
     /// `key_share_x25519` above stays sourced from the standalone `0x001d`
     /// entry).
     pub key_share_mlkem_ek: Option<Vec<u8>>,
+    /// The x25519 key embedded in the trailing 32 bytes of the group-4588
+    /// (X25519MLKEM768) entry in the `key_share` extension, if present. The
+    /// 4588 entry's `key_exchange` is `mlkem_ek(1184) ‖ x25519(32)`; this is
+    /// only the last 32 bytes. `None` when there is no valid 4588 entry (i.e.,
+    /// entry is missing or not exactly 1216 bytes).
+    pub key_share_mlkem_x25519: Option<[u8; 32]>,
 }
 
 /// TLS extension type for `server_name` (SNI).
@@ -100,7 +106,8 @@ pub fn parse_client_hello(msg: &[u8]) -> Option<ClientHelloInfo> {
     let ext_total_len = usize::from(u16_be(rest.get(..2)?)?);
     let extensions = rest.get(2..2 + ext_total_len)?;
 
-    let (sni, key_share_x25519, key_share_mlkem_ek) = parse_extensions(extensions)?;
+    let (sni, key_share_x25519, key_share_mlkem_ek, key_share_mlkem_x25519) =
+        parse_extensions(extensions)?;
 
     Some(ClientHelloInfo {
         sni,
@@ -108,22 +115,31 @@ pub fn parse_client_hello(msg: &[u8]) -> Option<ClientHelloInfo> {
         legacy_session_id,
         key_share_x25519,
         key_share_mlkem_ek,
+        key_share_mlkem_x25519,
     })
 }
 
 /// Walk the extensions block, extracting `server_name` and `key_share` (the
-/// x25519 entry and the group-4588 ML-KEM ek). Returns `None` if the block
-/// is malformed; a missing extension is not malformed, it's just absent
-/// from the returned tuple.
+/// x25519 entry and the group-4588 ML-KEM ek + x25519 tail). Returns `None` if
+/// the block is malformed; a missing extension is not malformed, it's just
+/// absent from the returned tuple.
 #[expect(
     clippy::type_complexity,
-    reason = "internal helper; the 3-tuple mirrors ClientHelloInfo's three key_share/sni fields \
+    reason = "internal helper; the 4-tuple mirrors ClientHelloInfo's key_share/sni fields \
               and a named struct would be pure ceremony for a single private call site"
 )]
-fn parse_extensions(mut buf: &[u8]) -> Option<(Option<String>, Option<[u8; 32]>, Option<Vec<u8>>)> {
+fn parse_extensions(
+    mut buf: &[u8],
+) -> Option<(
+    Option<String>,
+    Option<[u8; 32]>,
+    Option<Vec<u8>>,
+    Option<[u8; 32]>,
+)> {
     let mut sni = None;
     let mut key_share_x25519 = None;
     let mut key_share_mlkem_ek = None;
+    let mut key_share_mlkem_x25519 = None;
     while !buf.is_empty() {
         let ext_type = u16_be(buf.get(..2)?)?;
         let ext_len = usize::from(u16_be(buf.get(2..4)?)?);
@@ -132,13 +148,21 @@ fn parse_extensions(mut buf: &[u8]) -> Option<(Option<String>, Option<[u8; 32]>,
             EXT_SERVER_NAME => sni = parse_server_name(ext_body),
             EXT_KEY_SHARE => {
                 key_share_x25519 = parse_key_share_x25519(ext_body);
-                key_share_mlkem_ek = parse_key_share_mlkem_ek(ext_body);
+                if let Some((ek, tail)) = parse_key_share_mlkem768(ext_body) {
+                    key_share_mlkem_ek = Some(ek);
+                    key_share_mlkem_x25519 = Some(tail);
+                }
             }
             _ => {}
         }
         buf = buf.get(4 + ext_len..)?;
     }
-    Some((sni, key_share_x25519, key_share_mlkem_ek))
+    Some((
+        sni,
+        key_share_x25519,
+        key_share_mlkem_ek,
+        key_share_mlkem_x25519,
+    ))
 }
 
 /// Parse a `server_name` extension body: `list_len(u16) | name_type(u8) |
@@ -177,14 +201,11 @@ fn parse_key_share_x25519(body: &[u8]) -> Option<[u8; 32]> {
     None
 }
 
-/// Parse a `key_share` (ClientHello) extension body: `client_shares_len(u16)
-/// | entries...`, each entry `group(u16) | key_len(u16) | key_bytes`. Finds
-/// the group-4588 (X25519MLKEM768) entry whose key is exactly
-/// `mlkem_ek(1184) ‖ x25519(32)` = 1216 bytes, and returns the first 1184
-/// bytes (the ML-KEM ek only — the embedded x25519 is not extracted here).
-/// A 4588 entry of any other length is skipped (scanning continues) rather
-/// than treated as malformed.
-fn parse_key_share_mlkem_ek(body: &[u8]) -> Option<Vec<u8>> {
+/// From the `key_share` extension body, find the group-4588 entry
+/// (`mlkem_ek(1184) ‖ x25519(32)`, exactly 1216 bytes) and return
+/// `(mlkem_ek: Vec<u8>, x25519_tail: [u8; 32])`. Any other length or a
+/// missing entry → `None` (fail-closed, bounded `.get(..)`).
+fn parse_key_share_mlkem768(body: &[u8]) -> Option<(Vec<u8>, [u8; 32])> {
     let shares_len = usize::from(u16_be(body.get(..2)?)?);
     let mut entries = body.get(2..2 + shares_len)?;
     while !entries.is_empty() {
@@ -192,8 +213,9 @@ fn parse_key_share_mlkem_ek(body: &[u8]) -> Option<Vec<u8>> {
         let key_len = usize::from(u16_be(entries.get(2..4)?)?);
         let key_bytes = entries.get(4..4 + key_len)?;
         if group == GROUP_X25519MLKEM768 && key_bytes.len() == X25519MLKEM768_KEY_LEN {
-            let ek = key_bytes.get(..MLKEM768_EK_LEN)?;
-            return Some(ek.to_vec());
+            let ek = key_bytes.get(..MLKEM768_EK_LEN)?.to_vec();
+            let tail: [u8; 32] = key_bytes.get(MLKEM768_EK_LEN..)?.try_into().ok()?;
+            return Some((ek, tail));
         }
         entries = entries.get(4 + key_len..)?;
     }
@@ -500,6 +522,7 @@ mod tests {
             legacy_session_id: session_id.to_vec(),
             key_share_x25519: Some(eph_pub),
             key_share_mlkem_ek: None,
+            key_share_mlkem_x25519: None,
         };
 
         assert!(reality_auth_open(
@@ -530,6 +553,7 @@ mod tests {
             legacy_session_id: session_id.to_vec(),
             key_share_x25519: Some(eph_pub),
             key_share_mlkem_ek: None,
+            key_share_mlkem_x25519: None,
         };
 
         assert!(!reality_auth_open(
@@ -560,6 +584,7 @@ mod tests {
             legacy_session_id: session_id.to_vec(),
             key_share_x25519: Some(eph_pub),
             key_share_mlkem_ek: None,
+            key_share_mlkem_x25519: None,
         };
 
         // Client clock in the PAST (now > ts): at the boundary accepted, past it rejected.
@@ -616,6 +641,7 @@ mod tests {
             legacy_session_id: session_id.to_vec(),
             key_share_x25519: Some(eph_pub),
             key_share_mlkem_ek: None,
+            key_share_mlkem_x25519: None,
         };
 
         assert!(!reality_auth_open(
@@ -646,6 +672,7 @@ mod tests {
             legacy_session_id: session_id.to_vec(),
             key_share_x25519: Some(eph_pub),
             key_share_mlkem_ek: None,
+            key_share_mlkem_x25519: None,
         };
 
         assert!(!reality_auth_open(
@@ -666,6 +693,7 @@ mod tests {
             legacy_session_id: vec![0u8; SESSION_ID_LEN],
             key_share_x25519: None,
             key_share_mlkem_ek: None,
+            key_share_mlkem_x25519: None,
         };
         assert!(!reality_auth_open(&reality_priv, &info, &[[0u8; 8]], 0, 60));
     }
@@ -679,6 +707,7 @@ mod tests {
             legacy_session_id: vec![0u8; 10], // not 32 bytes
             key_share_x25519: Some([1u8; 32]),
             key_share_mlkem_ek: None,
+            key_share_mlkem_x25519: None,
         };
         assert!(!reality_auth_open(&reality_priv, &info, &[[0u8; 8]], 0, 60));
     }
@@ -777,6 +806,7 @@ mod tests {
             legacy_session_id: session_id.to_vec(),
             key_share_x25519: Some(eph_pub),
             key_share_mlkem_ek: None,
+            key_share_mlkem_x25519: None,
         };
 
         let ts_from_recover = reality_auth_recover(&reality_priv, &info, &[short_id], now, 10)
@@ -809,6 +839,7 @@ mod tests {
             legacy_session_id: vec![0u8; SESSION_ID_LEN],
             key_share_x25519: None,
             key_share_mlkem_ek: None,
+            key_share_mlkem_x25519: None,
         };
         assert_eq!(
             reality_auth_recover_shared(&reality_priv, &info, &[[0u8; 8]], 0, 60),
@@ -899,6 +930,44 @@ mod tests {
         let info = parse_client_hello(&msg)
             .expect("a wrong-length 4588 key_share entry must not fail the whole parse");
         assert_eq!(info.key_share_mlkem_ek, None);
+    }
+
+    #[test]
+    fn parse_client_hello_extracts_mlkem_x25519_tail() {
+        let mlkem_ek = vec![0xABu8; 1184];
+        let standalone_x25519 = [0xCDu8; 32];
+        let hybrid_x25519 = [0xEEu8; 32];
+        let ch = build_test_client_hello_with_4588_key_share(
+            &mlkem_ek,
+            &standalone_x25519,
+            &hybrid_x25519,
+        );
+        let info = parse_client_hello(&ch).expect("parse");
+        // The 4588 tail is the hybrid x25519, NOT the standalone 0x001d one.
+        assert_eq!(info.key_share_mlkem_x25519, Some(hybrid_x25519));
+        assert_eq!(info.key_share_x25519, Some(standalone_x25519));
+        assert_eq!(info.key_share_mlkem_ek.as_deref(), Some(&mlkem_ek[..]));
+    }
+
+    #[test]
+    fn parse_client_hello_mlkem_x25519_wrong_length_is_none() {
+        // A 4588 entry that isn't exactly 1184+32 = 1216 bytes → tail is None
+        // (same gate as key_share_mlkem_ek).
+        let wrong_key = vec![0xEFu8; 100];
+        let mut entries = Vec::new();
+        entries.extend_from_slice(&super::GROUP_X25519MLKEM768.to_be_bytes());
+        entries.extend_from_slice(&u16::try_from(wrong_key.len()).unwrap().to_be_bytes());
+        entries.extend_from_slice(&wrong_key);
+        let mut ks_body = Vec::new();
+        ks_body.extend_from_slice(&u16::try_from(entries.len()).unwrap().to_be_bytes());
+        ks_body.extend_from_slice(&entries);
+        let mut exts = Vec::new();
+        exts.extend_from_slice(&super::EXT_KEY_SHARE.to_be_bytes());
+        exts.extend_from_slice(&u16::try_from(ks_body.len()).unwrap().to_be_bytes());
+        exts.extend_from_slice(&ks_body);
+        let msg = build_client_hello_with_raw_exts([12u8; 32], &[13u8; 32], &exts);
+        let info = parse_client_hello(&msg).expect("rest of hello still parses");
+        assert_eq!(info.key_share_mlkem_x25519, None);
     }
 
     // ---- Part D: deferred parser-edge coverage (REALITY.1 Task 5, Test 3) ----
