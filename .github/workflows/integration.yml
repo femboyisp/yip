@@ -434,3 +434,34 @@ jobs:
             echo "::error::two UDP-blocked peers failed to tunnel via the REALITY relay under verify=on (ping failed, relay-forwarded stayed 0, a wrong pbk/relay key was wrongly accepted, or the client retry-stormed on a verify failure) — REALITY.4a/4b relay-dial regression"
             exit 1
           fi
+
+      - name: Run the REALITY.5d hand-rolled-flight verify=on money test under sudo
+        # REALITY.5d's headline money test: same topology and assertions as
+        # the 4a/4b relay-over-REALITY test above (verify=on tunnel;
+        # wrong-pbk fail-closed), but proving the relay's AUTHED path now
+        # hand-rolls the entire server flight (`tls_front::run_reality_conn`
+        # `Decision::Accept` — REALITY.5b `emit_server_hello` + REALITY.5c
+        # `emit_server_flight`/`serve`) instead of driving a BoringSSL
+        # `SslAcceptor`. A passing verify=on ping here proves the hand-rolled
+        # flight completed AND the client's REALITY.4b binding check
+        # verified against the relay's forged leaf; the wrong-pbk variant
+        # proves the relay still splices to `--reality-dest`
+        # pre-ServerHello-write (never entering the hand-rolled emit path)
+        # when the seal fails to open. See run-netns-reality-5d.sh for the
+        # full topology and assertion set. Same binary requirements as the
+        # 4a/4b test above (release yipd, debug yip-rendezvous-bin).
+        run: |
+          sudo bash bin/yipd/tests/run-netns-reality-5d.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/relay-reality-5d-money-test.log
+          # Honesty guard, same reasoning as the oracles above: this job
+          # always runs as sudo and always builds both binaries, so a SKIP
+          # here means the harness itself is broken.
+          if grep -q "^SKIP run-netns-reality-5d" /tmp/relay-reality-5d-money-test.log; then
+            echo "::error::REALITY.5d money test skipped — expected root + built yipd/yip-rendezvous binaries in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/relay-reality-5d-money-test.log; then
+            echo "::error::verify=on client failed to tunnel via the REALITY relay's hand-rolled 5b+5c authed flight (ping failed, relay-forwarded stayed 0, or a wrong pbk was wrongly accepted) — REALITY.5d wiring regression"
+            exit 1
+          fi
