@@ -824,16 +824,24 @@ mod tests {
     /// client, which sends both. `key_share_x25519` stays sourced from the
     /// `0x001d` entry (unchanged); `key_share_mlkem_ek` comes from the 4588
     /// entry's first 1184 bytes.
-    fn build_test_client_hello_with_4588_key_share(mlkem_ek: &[u8], x25519: &[u8; 32]) -> Vec<u8> {
+    /// `standalone_x25519` is the `0x001d` entry's key (what `key_share_x25519`
+    /// must resolve to); `hybrid_x25519` is the DISTINCT trailing key inside the
+    /// 4588 entry (must NOT feed `key_share_x25519`) — kept different on purpose
+    /// so the parse test would catch a sourcing regression.
+    fn build_test_client_hello_with_4588_key_share(
+        mlkem_ek: &[u8],
+        standalone_x25519: &[u8; 32],
+        hybrid_x25519: &[u8; 32],
+    ) -> Vec<u8> {
         let mut entries = Vec::new();
         // 0x001d entry: group | key_len(32) | key(32)
         entries.extend_from_slice(&super::GROUP_X25519.to_be_bytes());
         entries.extend_from_slice(&32u16.to_be_bytes());
-        entries.extend_from_slice(x25519);
+        entries.extend_from_slice(standalone_x25519);
         // 4588 entry: group | key_len(1216) | mlkem_ek(1184) ‖ x25519(32)
         let mut hybrid_key = Vec::with_capacity(mlkem_ek.len() + 32);
         hybrid_key.extend_from_slice(mlkem_ek);
-        hybrid_key.extend_from_slice(x25519);
+        hybrid_key.extend_from_slice(hybrid_x25519);
         entries.extend_from_slice(&super::GROUP_X25519MLKEM768.to_be_bytes());
         entries.extend_from_slice(&u16::try_from(hybrid_key.len()).unwrap().to_be_bytes());
         entries.extend_from_slice(&hybrid_key);
@@ -853,11 +861,19 @@ mod tests {
     #[test]
     fn parse_client_hello_extracts_mlkem_ek() {
         let mlkem_ek = vec![0xABu8; 1184];
-        let x25519 = [0xCDu8; 32];
-        let ch = build_test_client_hello_with_4588_key_share(&mlkem_ek, &x25519);
+        // Distinct x25519 in the 0x001d entry vs. the 4588 tail: key_share_x25519
+        // must resolve to the standalone one, proving it is NOT read from the
+        // hybrid entry's trailing key.
+        let standalone_x25519 = [0xCDu8; 32];
+        let hybrid_x25519 = [0xEEu8; 32];
+        let ch = build_test_client_hello_with_4588_key_share(
+            &mlkem_ek,
+            &standalone_x25519,
+            &hybrid_x25519,
+        );
         let info = parse_client_hello(&ch).expect("parse");
         assert_eq!(info.key_share_mlkem_ek.as_deref(), Some(&mlkem_ek[..]));
-        assert_eq!(info.key_share_x25519, Some(x25519));
+        assert_eq!(info.key_share_x25519, Some(standalone_x25519));
     }
 
     #[test]
