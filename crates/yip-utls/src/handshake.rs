@@ -479,11 +479,12 @@ fn key_len_for_suite(suite: u16) -> usize {
 
 /// The client/server handshake traffic keys, plus the handshake secret
 /// itself (needed as an input to [`derive_application_keys`]) and the raw
-/// client handshake traffic secret (needed by Task 7's `connect`, via
-/// [`finished_verify_data`], to derive the client `Finished` message).
-/// `handshake_secret`/`client_hs_traffic` are 32 bytes for SHA-256-hash
-/// suites, 48 bytes for `TLS_AES_256_GCM_SHA384` (`0x1302`) — hence `Vec<u8>`
-/// rather than a fixed-size array.
+/// client/server handshake traffic secrets (needed by Task 7's `connect`, via
+/// [`finished_verify_data`], to derive the client `Finished` message, and by
+/// REALITY.5c's server-side logic to derive the server `Finished`'s verify_data).
+/// `handshake_secret`/`client_hs_traffic`/`server_hs_traffic` are 32 bytes for
+/// SHA-256-hash suites, 48 bytes for `TLS_AES_256_GCM_SHA384` (`0x1302`) —
+/// hence `Vec<u8>` rather than a fixed-size array.
 pub struct HandshakeKeys {
     pub client_key: Vec<u8>,
     pub client_iv: [u8; 12],
@@ -492,6 +493,10 @@ pub struct HandshakeKeys {
     pub suite: u16,
     pub handshake_secret: Vec<u8>,
     pub client_hs_traffic: Vec<u8>,
+    /// The server handshake-traffic secret (`s hs traffic`) — the base secret
+    /// for the SERVER `Finished`'s `verify_data` (REALITY.5c). Sibling of
+    /// `client_hs_traffic`; both are 32 bytes (SHA-256) or 48 (SHA-384).
+    pub server_hs_traffic: Vec<u8>,
 }
 
 /// Derives the TLS 1.3 handshake traffic keys from the ECDHE (or hybrid
@@ -556,6 +561,7 @@ pub fn derive_handshake_keys(
         suite,
         handshake_secret,
         client_hs_traffic: c_hs,
+        server_hs_traffic: s_hs,
     }
 }
 
@@ -1270,6 +1276,22 @@ mod tests {
             )
             .unwrap_err(),
             Error::EmptyInnerPlaintext
+        );
+    }
+
+    #[test]
+    fn handshake_keys_expose_distinct_server_hs_traffic() {
+        let ecdhe = [7u8; 32];
+        let transcript = transcript_hash(b"client-hello||server-hello", SUITE_AES_128_GCM_SHA256);
+        let hk = derive_handshake_keys(&ecdhe, &transcript, SUITE_AES_128_GCM_SHA256);
+        assert!(
+            !hk.server_hs_traffic.is_empty(),
+            "server_hs_traffic must be populated"
+        );
+        assert_eq!(hk.server_hs_traffic.len(), hk.client_hs_traffic.len());
+        assert_ne!(
+            hk.server_hs_traffic, hk.client_hs_traffic,
+            "server and client handshake-traffic secrets must differ"
         );
     }
 }
