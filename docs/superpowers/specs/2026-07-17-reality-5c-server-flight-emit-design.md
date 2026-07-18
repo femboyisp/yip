@@ -54,12 +54,11 @@ Populate it from the existing `s_hs` local in `derive_handshake_keys`. Additive;
 pub fn sign_certificate_verify(
     signing_key: &p256::ecdsa::SigningKey,
     transcript_hash_through_certificate: &[u8],
-    suite: u16,
 ) -> Result<Vec<u8>, Error>
 ```
 
 - Reconstruct the §4.4.3 signed content **identically** to `verify_certificate_verify`: `0x20 × 64 ‖ "TLS 1.3, server CertificateVerify" ‖ 0x00 ‖ transcript_hash_through_certificate`.
-- Sign with `ecdsa_secp256r1_sha256` (scheme `0x0403`) — the hard-pinned scheme the client verifies.
+- Sign with `ecdsa_secp256r1_sha256` (scheme `0x0403`) — the hard-pinned scheme the client verifies. No `suite` argument: 4b hard-pins the scheme, and `p256::ecdsa::SigningKey` signs with SHA-256 internally, so the signer needs no suite (the caller uses `suite` only to compute `transcript_hash_through_certificate`).
 - The signing key is `derive_cert_key(shared)` (4b) — the client pins the leaf's SPKI to this key and verifies this signature, so this **is** the 4b relay-verification binding. `DerivedCertKey` exposes `pkcs8_der` (not a `SigningKey`), so the caller reconstructs `p256::ecdsa::SigningKey::from_pkcs8_der(&derived.pkcs8_der)` — a one-liner that keeps this primitive decoupled from the 4b type and testable with any P-256 key.
 - Fail-closed: propagate any signing error as `Err` (no `unwrap`).
 
@@ -91,7 +90,7 @@ pub struct ServerFlight {
 **Step 1 — build the four handshake messages** into a contiguous plaintext `hs_stream`:
 - **EncryptedExtensions** (`0x08`): minimal valid message — empty extensions list. Wire: `08 00 00 02 00 00` (u24 body-len = 2, u16 ext-list-len = 0).
 - **Certificate** (`0x0b`, RFC 8446 §4.4.2): `certificate_request_context = empty (00)` ‖ `certificate_list` (u24 len) where the first entry is `u24 cert_data_len ‖ forged_leaf_der ‖ u16 ext_len(00 00)` and each `cert_chain.intermediates_der` entry follows verbatim as `u24 len ‖ der ‖ 00 00`. Leaf sizing to `leaf_der_len` is 5d's forging responsibility; 5c uses `forged_leaf_der` as given.
-- **CertificateVerify** (`0x0f`): `algorithm(0x0403) ‖ u16 sig_len ‖ sig`, `sig = sign_certificate_verify(cert_signing_key, transcript_hash(transcript_ch_sh ‖ EE ‖ Certificate, suite), suite)`.
+- **CertificateVerify** (`0x0f`): `algorithm(0x0403) ‖ u16 sig_len ‖ sig`, `sig = sign_certificate_verify(cert_signing_key, transcript_hash(transcript_ch_sh ‖ EE ‖ Certificate, suite))`.
 - **Finished** (`0x14`): body = `finished_verify_data(keys.server_hs_traffic, transcript_hash(transcript_ch_sh ‖ EE ‖ Certificate ‖ CertificateVerify, suite), suite)`.
 
 **Step 2 — record framing** to match `record_lengths` exactly. Greedily chunk `hs_stream` across the records:
