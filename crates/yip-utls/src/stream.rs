@@ -1007,21 +1007,7 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
         server_hello_info.suite,
     );
 
-    Ok(RealityStream {
-        inner: stream,
-        suite: ak.suite,
-        client_key: ak.client_key,
-        client_iv: ak.client_iv,
-        client_seq: 0,
-        server_key: ak.server_key,
-        server_iv: ak.server_iv,
-        server_seq: 0,
-        raw_buf: Vec::new(),
-        read_buf: Vec::new(),
-        read_pos: 0,
-        write_buf: Vec::new(),
-        write_off: 0,
-    })
+    Ok(RealityStream::client(stream, ak))
 }
 
 /// REALITY.5a Task 3: probes a REAL `dest` — no REALITY seal, since `dest`
@@ -1391,14 +1377,14 @@ pub struct RealityStream<S> {
     /// The negotiated TLS 1.3 cipher suite (`0x1301`/`0x1302`/`0x1303`) —
     /// needed on every seal/open, since `TLS_AES_256_GCM_SHA384` and
     /// `TLS_CHACHA20_POLY1305_SHA256` share a 32-byte key length and so
-    /// cannot be told apart from `client_key`/`server_key` alone.
+    /// cannot be told apart from `egress_key`/`ingress_key` alone.
     suite: u16,
-    client_key: Vec<u8>,
-    client_iv: [u8; 12],
-    client_seq: u64,
-    server_key: Vec<u8>,
-    server_iv: [u8; 12],
-    server_seq: u64,
+    egress_key: Vec<u8>,
+    egress_iv: [u8; 12],
+    egress_seq: u64,
+    ingress_key: Vec<u8>,
+    ingress_iv: [u8; 12],
+    ingress_seq: u64,
     /// Raw bytes read from `inner` that have not yet been assembled into a
     /// complete TLS record.
     raw_buf: Vec<u8>,
@@ -1424,6 +1410,56 @@ fn handshake_io_error(e: handshake::Error) -> io::Error {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> RealityStream<S> {
+    /// Build the CLIENT-role stream (used by [`connect`]): egress sealed with
+    /// the client application key, ingress opened with the server's.
+    fn client(inner: S, ak: handshake::ApplicationKeys) -> Self {
+        RealityStream {
+            inner,
+            suite: ak.suite,
+            egress_key: ak.client_key,
+            egress_iv: ak.client_iv,
+            egress_seq: 0,
+            ingress_key: ak.server_key,
+            ingress_iv: ak.server_iv,
+            ingress_seq: 0,
+            raw_buf: Vec::new(),
+            read_buf: Vec::new(),
+            read_pos: 0,
+            write_buf: Vec::new(),
+            write_off: 0,
+        }
+    }
+
+    /// Build the SERVER-role stream (used by [`serve`]): egress sealed with the
+    /// server application key, ingress opened with the client's — the mirror of
+    /// [`client`].
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Task 5c/6's serve() is this constructor's first non-test caller; \
+                      this module's own test submodule already exercises it under \
+                      cfg(test), but the plain lib build has no caller yet"
+        )
+    )]
+    fn server(inner: S, ak: handshake::ApplicationKeys) -> Self {
+        RealityStream {
+            inner,
+            suite: ak.suite,
+            egress_key: ak.server_key,
+            egress_iv: ak.server_iv,
+            egress_seq: 0,
+            ingress_key: ak.client_key,
+            ingress_iv: ak.client_iv,
+            ingress_seq: 0,
+            raw_buf: Vec::new(),
+            read_buf: Vec::new(),
+            read_pos: 0,
+            write_buf: Vec::new(),
+            write_off: 0,
+        }
+    }
+
     /// Attempts to decrypt and buffer one more application-data record into
     /// `self.read_buf`, transparently skipping `ChangeCipherSpec` records and
     /// post-handshake handshake-typed records (e.g. `NewSessionTicket`)
@@ -1454,16 +1490,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> RealityStream<S> {
                 }
 
                 let (inner_type, content) = record_open_typed(
-                    &self.server_key,
-                    &self.server_iv,
-                    self.server_seq,
+                    &self.ingress_key,
+                    &self.ingress_iv,
+                    self.ingress_seq,
                     self.suite,
                     record_type,
                     &mut payload,
                 )
                 .map_err(handshake_io_error)?;
-                self.server_seq = self.server_seq.checked_add(1).ok_or_else(|| {
-                    protocol_io_error("server application sequence counter overflow")
+                self.ingress_seq = self.ingress_seq.checked_add(1).ok_or_else(|| {
+                    protocol_io_error("ingress application sequence counter overflow")
                 })?;
 
                 if inner_type == CONTENT_TYPE_APPLICATION_DATA {
@@ -1581,18 +1617,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for RealityStream<S> {
         let chunk_len = buf.len().min(MAX_APP_RECORD_LEN);
         let chunk = &buf[..chunk_len];
         let sealed = record_seal(
-            &this.client_key,
-            &this.client_iv,
-            this.client_seq,
+            &this.egress_key,
+            &this.egress_iv,
+            this.egress_seq,
             this.suite,
             CONTENT_TYPE_APPLICATION_DATA,
             chunk,
         )
         .map_err(handshake_io_error)?;
-        this.client_seq = this
-            .client_seq
+        this.egress_seq = this
+            .egress_seq
             .checked_add(1)
-            .ok_or_else(|| protocol_io_error("client application sequence counter overflow"))?;
+            .ok_or_else(|| protocol_io_error("egress application sequence counter overflow"))?;
         let header = record_header(
             CONTENT_TYPE_APPLICATION_DATA,
             LEGACY_RECORD_VERSION,
@@ -1825,12 +1861,12 @@ mod tests {
         let mut a = RealityStream {
             inner: a_io,
             suite: 0x1301, // TLS_AES_128_GCM_SHA256 -- matches the 16-byte test keys
-            client_key: key_a.clone(),
-            client_iv: iv_a,
-            client_seq: 0,
-            server_key: key_b.clone(),
-            server_iv: iv_b,
-            server_seq: 0,
+            egress_key: key_a.clone(),
+            egress_iv: iv_a,
+            egress_seq: 0,
+            ingress_key: key_b.clone(),
+            ingress_iv: iv_b,
+            ingress_seq: 0,
             raw_buf: Vec::new(),
             read_buf: Vec::new(),
             read_pos: 0,
@@ -1840,12 +1876,12 @@ mod tests {
         let mut b = RealityStream {
             inner: b_io,
             suite: 0x1301, // TLS_AES_128_GCM_SHA256 -- matches the 16-byte test keys
-            client_key: key_b,
-            client_iv: iv_b,
-            client_seq: 0,
-            server_key: key_a,
-            server_iv: iv_a,
-            server_seq: 0,
+            egress_key: key_b,
+            egress_iv: iv_b,
+            egress_seq: 0,
+            ingress_key: key_a,
+            ingress_iv: iv_a,
+            ingress_seq: 0,
             raw_buf: Vec::new(),
             read_buf: Vec::new(),
             read_pos: 0,
@@ -1864,6 +1900,49 @@ mod tests {
         let mut buf2 = vec![0u8; 32];
         let n2 = a.read(&mut buf2).await.unwrap();
         assert_eq!(&buf2[..n2], b"hi back from B");
+    }
+
+    /// Proves [`RealityStream::client`] and [`RealityStream::server`] are
+    /// exact mirrors of each other: built from the SAME `ApplicationKeys`,
+    /// the client-role stream's egress is opened by the server-role
+    /// stream's ingress and vice versa — the same round trip
+    /// `reality_stream_round_trips_over_duplex` proves via hand-rolled field
+    /// literals, but driven through the constructors themselves. Also keeps
+    /// `server` from being unreachable dead code ahead of Task 6's `serve`,
+    /// which will be the first non-test caller.
+    #[tokio::test]
+    async fn reality_stream_client_and_server_constructors_mirror_each_other() {
+        let (client_io, server_io) = tokio::io::duplex(1 << 20);
+
+        let client_ak = handshake::ApplicationKeys {
+            client_key: vec![0x55u8; 16],
+            client_iv: [0x66u8; 12],
+            server_key: vec![0x77u8; 16],
+            server_iv: [0x88u8; 12],
+            suite: 0x1301, // TLS_AES_128_GCM_SHA256 -- matches the 16-byte test keys
+        };
+        let server_ak = handshake::ApplicationKeys {
+            client_key: vec![0x55u8; 16],
+            client_iv: [0x66u8; 12],
+            server_key: vec![0x77u8; 16],
+            server_iv: [0x88u8; 12],
+            suite: 0x1301,
+        };
+
+        let mut client = RealityStream::client(client_io, client_ak);
+        let mut server = RealityStream::server(server_io, server_ak);
+
+        client.write_all(b"hello from client").await.unwrap();
+        client.flush().await.unwrap();
+        let mut buf = vec![0u8; 32];
+        let n = server.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello from client");
+
+        server.write_all(b"hi back from server").await.unwrap();
+        server.flush().await.unwrap();
+        let mut buf2 = vec![0u8; 32];
+        let n2 = client.read(&mut buf2).await.unwrap();
+        assert_eq!(&buf2[..n2], b"hi back from server");
     }
 
     /// Plays the TLS 1.3 SERVER role, entirely in-process, against a real
