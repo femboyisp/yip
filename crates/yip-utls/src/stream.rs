@@ -1335,7 +1335,15 @@ pub fn emit_server_flight(
             "record length below the 17-byte AEAD floor",
         ))?;
         let remaining = hs_stream.len() - off;
-        let chunk_len = remaining.min(cap);
+        // The client (`connect`) reads records only until it sees `Finished`, then
+        // switches to the application keys. So the `Finished` tail MUST land in the
+        // LAST record — otherwise trailing handshake-key padding records would be
+        // left unread and then fail to open under the app key. Reserve one content
+        // byte for every later record so content is never exhausted early; the last
+        // record always receives the tail. (Leading records may still be pure
+        // padding — that is fine, they precede `Finished` and the client reads them.)
+        let records_after = flight_shape.record_lengths.len() - 1 - i;
+        let chunk_len = cap.min(remaining.saturating_sub(records_after));
         let chunk = &hs_stream[off..off + chunk_len];
         let pad_len = cap - chunk_len; // once hs_stream is exhausted, chunk_len=0 → pad_len=cap (pure-padding record)
         let seq = u64::try_from(i).map_err(|_| Error::Protocol("record index overflow"))?;
@@ -2489,6 +2497,7 @@ mod tests {
         server_reality_priv: [u8; 32],
         behavior: ServerCertBehavior,
         include_intermediate: bool,
+        record_lengths: Vec<usize>,
     ) {
         const SUITE: u16 = 0x1301; // TLS_AES_128_GCM_SHA256
 
@@ -2585,31 +2594,17 @@ mod tests {
             Vec::new()
         };
         let flight_shape = crate::template::EncryptedFlightShape {
-            // A SINGLE record, comfortably larger than either behavior's flight
-            // (~463 bytes CorrectBinder/WrongLeafKey/BadSignature, ~797 bytes
-            // with_intermediate) — exercises real intra-record padding.
-            //
-            // Deliberately NOT split across multiple record_lengths entries
-            // (e.g. [600, 4096]) here: emit_server_flight's greedy chunking
-            // fills only as many records as the flight's actual plaintext
-            // needs, so a template with MORE capacity than the flight
-            // requires leaves any later record(s) as pure padding
-            // (`chunk_len = 0`) — see this fn's self-review note. A real TLS
-            // 1.3 client (this crate's `connect`, mirroring BoringSSL/Chrome)
-            // stops reading the server's encrypted flight the instant it has
-            // assembled a complete `Finished` message; it has no way to know
-            // the captured template called for more records, so it never
-            // reads that trailing pure-padding record — which then sits
-            // unconsumed ahead of the first real application-data record and
-            // fails AEAD-open under the (wrong, still-handshake-sealed) key.
-            // Real production flights avoid this because 5d sizes the forged
-            // leaf to `leaf_der_len`, keeping the forged flight within a byte
-            // or two of `dest`'s real (already record-boundary-fitting)
-            // flight; pre-5d, this mock's ad hoc small self-signed leaf does
-            // not, so a single record sized to comfortably fit either
-            // behavior's flight sidesteps the gap without masking what
-            // `serve`/`emit_server_flight` themselves guarantee.
-            record_lengths: vec![4096],
+            // Caller-supplied record shape. `emit_server_flight` reserves one
+            // content byte per record after the current one, so the
+            // `Finished` tail always lands in the LAST record regardless of
+            // how record capacity is distributed — callers may freely use a
+            // multi-record shape (e.g. `[600, 4096]`) whose total capacity
+            // exceeds the flight's actual plaintext; any resulting
+            // pure-padding record(s) are front-loaded ahead of `Finished`,
+            // where the real TLS 1.3 client (this crate's `connect`,
+            // mirroring BoringSSL/Chrome) still reads them before it stops
+            // parsing the encrypted flight.
+            record_lengths,
             encrypted_extensions_len: 0,
             certificate_len: 0,
             certificate_verify_len: 0,
@@ -2671,6 +2666,7 @@ mod tests {
             server_reality_priv,
             ServerCertBehavior::CorrectBinder,
             false,
+            vec![600, 4096],
         ));
 
         let mut s = connect(
@@ -2716,6 +2712,7 @@ mod tests {
             server_reality_priv,
             ServerCertBehavior::CorrectBinder,
             true,
+            vec![600, 4096],
         ));
 
         let mut s = connect(
@@ -2757,6 +2754,7 @@ mod tests {
             server_reality_priv,
             ServerCertBehavior::WrongLeafKey,
             false,
+            vec![600, 4096],
         ));
 
         let result = connect(
@@ -2792,6 +2790,7 @@ mod tests {
             server_reality_priv,
             ServerCertBehavior::BadSignature,
             false,
+            vec![600, 4096],
         ));
 
         let result = connect(
@@ -2827,6 +2826,7 @@ mod tests {
             server_reality_priv,
             ServerCertBehavior::WrongLeafKey,
             false,
+            vec![600, 4096],
         ));
 
         let mut s = connect(
@@ -2870,6 +2870,7 @@ mod tests {
             server_reality_priv,
             ServerCertBehavior::CorrectBinder,
             false,
+            vec![600, 4096],
         ));
 
         let mut s = connect(
@@ -2883,6 +2884,64 @@ mod tests {
         .expect("correctly-bound relay verifies");
 
         // client → server → echo (server's echo path in the mock).
+        s.write_all(b"PING").await.unwrap();
+        s.flush().await.unwrap();
+        let mut buf = [0u8; 4];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"PING");
+
+        server_task.await.unwrap();
+    }
+
+    /// Regression test for the `emit_server_flight` front-greedy framing bug
+    /// (REALITY.5c Task 6 client round-trip): our minimal EE + P-256
+    /// CertificateVerify + self-signed leaf flight is well under 4096 bytes,
+    /// so a `[4096, 600]` record shape is EXACTLY the failure case — under
+    /// the old pure front-greedy `chunk_len = remaining.min(cap)` framing,
+    /// the whole flight (including `Finished`) fits inside record 0, leaving
+    /// record 1 (600 bytes) a PURE-PADDING record sealed under the
+    /// handshake keys. The real `connect` client (mirroring BoringSSL/
+    /// Chrome) stops reading the encrypted flight the instant it has
+    /// assembled a complete `Finished` message — i.e. after record 0 — so it
+    /// never consumes that trailing record 1, which then sits unread ahead
+    /// of the first application-data record and fails AEAD-open under the
+    /// (wrong) application key.
+    ///
+    /// With the fix (`emit_server_flight` reserves one content byte per
+    /// later record so the `Finished` tail always lands in the LAST
+    /// record), record 1 necessarily carries part of the flight — including
+    /// `Finished` — so the client reads BOTH records and the handshake
+    /// completes normally.
+    #[tokio::test]
+    async fn connect_verify_accepts_correct_binder_with_flight_split_finished_last() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_reality_priv = [11u8; 32];
+        let server_reality_pub = {
+            let secret = x25519_dalek::StaticSecret::from(server_reality_priv);
+            x25519_dalek::PublicKey::from(&secret).to_bytes()
+        };
+
+        let server_task = tokio::spawn(run_mock_tls13_server_with_cert(
+            server_io,
+            server_reality_priv,
+            ServerCertBehavior::CorrectBinder,
+            false,
+            vec![4096, 600],
+        ));
+
+        let mut s = connect(
+            client_io,
+            "example.com",
+            &server_reality_pub,
+            [1u8; 8],
+            true,
+        )
+        .await
+        .expect(
+            "a correctly-bound relay must verify even when the captured template's \
+             largest record comes FIRST (record_lengths = [4096, 600])",
+        );
+
         s.write_all(b"PING").await.unwrap();
         s.flush().await.unwrap();
         let mut buf = [0u8; 4];
