@@ -169,7 +169,12 @@ pub fn emit_server_hello(
     });
     let body = body.into_bytes();
 
-    // Wrap as a handshake message: 0x02 ‖ u24 len ‖ body.
+    // Wrap as a handshake message: 0x02 ‖ u24 len ‖ body. The length is a u24,
+    // so guard against the u24 ceiling (0xFF_FFFF) — NOT u32::MAX — or the high
+    // byte would be silently dropped, emitting a truncated length.
+    if body.len() > 0xFF_FFFF {
+        return Err(Error::Protocol("ServerHello body exceeds u24"));
+    }
     let mut sh_msg = Vec::with_capacity(4 + body.len());
     sh_msg.push(HANDSHAKE_TYPE_SERVER_HELLO);
     let len =
