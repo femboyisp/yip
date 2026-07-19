@@ -143,7 +143,7 @@ async fn read_full(tcp: &mut TcpStream, buf: &mut [u8], deadline: tokio::time::I
     let mut n = 0;
     while n < buf.len() {
         match tokio::time::timeout_at(deadline, tcp.read(&mut buf[n..])).await {
-            Ok(Ok(0)) => return Read::Short(n),  // EOF
+            Ok(Ok(0)) => return Read::Short(n), // EOF
             Ok(Ok(k)) => n += k,
             Ok(Err(_)) => return Read::Short(n), // I/O error
             Err(_) => return Read::Short(n),     // deadline elapsed mid-read
@@ -277,7 +277,10 @@ mod tests {
         // those body bytes — then stall.
         let mut partial = vec![0x16, 0x03, 0x01, 0x00, 37];
         partial.extend_from_slice(&[0xABu8; 10]);
-        writer.write_all(&partial).await.expect("write partial record");
+        writer
+            .write_all(&partial)
+            .await
+            .expect("write partial record");
 
         let got = read_first_tls_record(
             &mut reader,

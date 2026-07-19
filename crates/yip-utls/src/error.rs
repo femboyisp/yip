@@ -67,7 +67,10 @@ impl fmt::Display for Error {
                 )
             }
             Error::MessageTooLarge => {
-                write!(f, "REALITY/TLS handshake message exceeds its 24-bit length prefix")
+                write!(
+                    f,
+                    "REALITY/TLS handshake message exceeds its 24-bit length prefix"
+                )
             }
         }
     }
