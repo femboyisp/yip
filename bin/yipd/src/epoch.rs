@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 
 use crate::dataplane::{DataPlane, Outcome};
 use crate::handshake::HandshakeState;
+use yip_io::poll::EgressDatagram;
 
 /// Production rekey cadence (§ Global Constraints). Test-overridden via
 /// `YIP_REKEY_INTERVAL_MS` at `PeerManager` construction.
@@ -39,11 +40,19 @@ pub struct RekeyInFlight {
 /// Owned inbound result (the `PeerManager` demux already copies the borrowed
 /// `Outcome` into owned Vecs at its call sites, so returning owned here is
 /// free — and it sidesteps the multi-epoch borrow-return limitation).
+///
+/// `Send`/`TunThenSend` carry the full [`EgressDatagram`] (not just its
+/// bytes) so each datagram's real `dst` and `fate` survive the trip through
+/// `EpochSet` — `dst` cannot be losslessly reconstructed from
+/// `self.peers[idx].endpoint` for relay-established peers (their
+/// `DataPlane::peer_addr` is a `server_addr()` placeholder; the real
+/// destination is only known per-datagram), and dropping `fate` would forgo
+/// GSO fate-coalescing on ARQ-retransmit bursts.
 pub enum EpochInbound {
     None,
     Tun(Vec<u8>),
-    Send(Vec<Vec<u8>>),
-    TunThenSend(Vec<u8>, Vec<Vec<u8>>),
+    Send(Vec<EgressDatagram>),
+    TunThenSend(Vec<u8>, Vec<EgressDatagram>),
 }
 
 #[cfg_attr(
@@ -94,13 +103,10 @@ impl EpochSet {
         match outcome {
             Outcome::None => EpochInbound::None,
             Outcome::TunWrite(b) => EpochInbound::Tun(b.to_vec()),
-            Outcome::Send(pkts) => {
-                EpochInbound::Send(pkts.iter().map(|d| d.bytes.clone()).collect())
+            Outcome::Send(pkts) => EpochInbound::Send(pkts.to_vec()),
+            Outcome::TunWriteThenSend(b, pkts) => {
+                EpochInbound::TunThenSend(b.to_vec(), pkts.to_vec())
             }
-            Outcome::TunWriteThenSend(b, pkts) => EpochInbound::TunThenSend(
-                b.to_vec(),
-                pkts.iter().map(|d| d.bytes.clone()).collect(),
-            ),
         }
     }
 

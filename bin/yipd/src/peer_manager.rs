@@ -948,8 +948,12 @@ impl PeerManager {
     }
 
     /// Relay-path counterpart of the `Data`/`Control` demux: dispatch a relayed
-    /// data-plane datagram to peer `idx`'s `DataPlane` and relay-wrap any UDP
-    /// egress it produces (TUN writes still go to the local device).
+    /// data-plane datagram to peer `idx`'s `EpochSet` (via `inbound_open`) and
+    /// relay-wrap any UDP egress it produces (TUN writes still go to the local
+    /// device). Relay egress always goes through `relay_wrap`, so only the
+    /// `EpochInbound::Send`/`TunThenSend` payload bytes are needed here — the
+    /// real `dst`/`fate` on each `EgressDatagram` are irrelevant for a
+    /// relayed peer (the actual wire destination is the relay server).
     fn relayed_data(&mut self, idx: usize, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
         let (tun, udp): (Option<Vec<u8>>, Vec<Vec<u8>>) = {
             let PeerState::Established(epochs) = &mut self.peers[idx].state else {
@@ -958,8 +962,12 @@ impl PeerManager {
             match epochs.inbound_open(dg, now_ms) {
                 crate::epoch::EpochInbound::None => (None, Vec::new()),
                 crate::epoch::EpochInbound::Tun(buf) => (Some(buf), Vec::new()),
-                crate::epoch::EpochInbound::Send(pkts) => (None, pkts),
-                crate::epoch::EpochInbound::TunThenSend(buf, pkts) => (Some(buf), pkts),
+                crate::epoch::EpochInbound::Send(dgs) => {
+                    (None, dgs.iter().map(|d| d.bytes.clone()).collect())
+                }
+                crate::epoch::EpochInbound::TunThenSend(buf, dgs) => {
+                    (Some(buf), dgs.iter().map(|d| d.bytes.clone()).collect())
+                }
             }
         };
         self.egress.clear();
@@ -1071,54 +1079,33 @@ impl PeerManager {
             .position(|p| p.endpoint == Some(src) && matches!(p.state, PeerState::Established(_)))
     }
 
-    /// Dispatch a `Data`/`Control` datagram to peer `idx`'s `DataPlane` and
-    /// re-map its `Outcome` into a `DispatchOut`. Returns `DispatchOut::None`
-    /// if `idx` is not (or no longer) `Established`.
+    /// Dispatch a `Data`/`Control` datagram to peer `idx`'s `EpochSet` (via
+    /// `inbound_open`) and re-map its `EpochInbound` into a `DispatchOut`.
+    /// Returns `DispatchOut::None` if `idx` is not (or no longer)
+    /// `Established`.
     fn dispatch_established(&mut self, idx: usize, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
         let PeerState::Established(epochs) = &mut self.peers[idx].state else {
             return DispatchOut::None;
         };
-        let out = epochs.inbound_open(dg, now_ms);
-        // `EpochInbound::Send`/`TunThenSend` carry raw bytes only (see
-        // `EpochSet::own`): the per-datagram `dst` every `DataPlane` egress
-        // datagram used to carry is dropped there, but it was always the
-        // *same* value — this peer's endpoint (`DataPlane::peer_addr` is
-        // fixed at construction to exactly the address stamped into
-        // `self.peers[idx].endpoint` at that same moment, and neither changes
-        // again while the peer stays `Established`) — so it is losslessly
-        // reconstructed here. `fate` is NOT reconstructed (no longer
-        // recoverable): these datagrams simply forgo GSO fate-coalescing
-        // with each other, which is safe (never miscoalesces) even though
-        // less batched than before.
-        let to_egress = |pkts: Vec<Vec<u8>>, dst: SocketAddr| -> Vec<EgressDatagram> {
-            pkts.into_iter()
-                .map(|bytes| EgressDatagram {
-                    fate: 0,
-                    dst,
-                    bytes,
-                })
-                .collect()
-        };
-        match out {
+        // `EpochInbound::Send`/`TunThenSend` carry the full `EgressDatagram`
+        // (real `dst` + `fate`), so no reconstruction from
+        // `self.peers[idx].endpoint` is needed — that placeholder is wrong
+        // for relay-established peers (their `DataPlane::peer_addr` is a
+        // `server_addr()` stand-in; `endpoint` may hold an unconfirmed
+        // candidate or `None`).
+        match epochs.inbound_open(dg, now_ms) {
             crate::epoch::EpochInbound::None => DispatchOut::None,
             crate::epoch::EpochInbound::Tun(buf) => {
                 self.tun_scratch = buf;
                 DispatchOut::Tun(&self.tun_scratch)
             }
-            crate::epoch::EpochInbound::Send(pkts) => {
-                let Some(dst) = self.peers[idx].endpoint else {
-                    return DispatchOut::None;
-                };
-                self.egress = to_egress(pkts, dst);
+            crate::epoch::EpochInbound::Send(dgs) => {
+                self.egress = dgs;
                 DispatchOut::Udp(&self.egress)
             }
-            crate::epoch::EpochInbound::TunThenSend(buf, pkts) => {
-                let Some(dst) = self.peers[idx].endpoint else {
-                    self.tun_scratch = buf;
-                    return DispatchOut::Tun(&self.tun_scratch);
-                };
+            crate::epoch::EpochInbound::TunThenSend(buf, dgs) => {
                 self.tun_scratch = buf;
-                self.egress = to_egress(pkts, dst);
+                self.egress = dgs;
                 DispatchOut::Both(&self.tun_scratch, &self.egress)
             }
         }
@@ -1168,27 +1155,16 @@ impl PeerManager {
                 match epochs.inbound_open(dg, now_ms) {
                     crate::epoch::EpochInbound::None => None,
                     crate::epoch::EpochInbound::Tun(buf) => Some((Some(buf), Vec::new())),
-                    crate::epoch::EpochInbound::Send(pkts) => Some((None, pkts)),
-                    crate::epoch::EpochInbound::TunThenSend(buf, pkts) => Some((Some(buf), pkts)),
+                    crate::epoch::EpochInbound::Send(dgs) => Some((None, dgs)),
+                    crate::epoch::EpochInbound::TunThenSend(buf, dgs) => Some((Some(buf), dgs)),
                 }
             };
             let Some((tun, udp)) = hit else {
                 continue;
             };
-            // Same `dst` reconstruction as `dispatch_established`: `udp`'s raw
-            // bytes lost their per-datagram `dst`, which was always this
-            // peer's endpoint.
-            let udp: Vec<EgressDatagram> = match self.peers[idx].endpoint {
-                Some(dst) => udp
-                    .into_iter()
-                    .map(|bytes| EgressDatagram {
-                        fate: 0,
-                        dst,
-                        bytes,
-                    })
-                    .collect(),
-                None => Vec::new(),
-            };
+            // `udp` already carries each datagram's real `dst`/`fate` (see
+            // `EpochInbound`); no reconstruction from `self.peers[idx].endpoint`
+            // needed (that placeholder is wrong for relay-established peers).
             return match (tun, udp.is_empty()) {
                 (Some(t), true) => {
                     self.tun_scratch = t;
