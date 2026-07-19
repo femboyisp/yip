@@ -32,10 +32,11 @@ use crate::auth;
 use crate::error::Error;
 use crate::handshake::{
     self, derive_application_keys, derive_handshake_keys, finished_verify_data, parse_server_hello,
-    record_open, record_open_typed, record_seal, transcript_hash, HandshakeKeys, GROUP_X25519,
-    GROUP_X25519MLKEM768,
+    parse_server_hello_shape, record_open, record_open_typed, record_seal, transcript_hash,
+    HandshakeKeys, GROUP_X25519, GROUP_X25519MLKEM768,
 };
 use crate::hello::{self, ClientHelloParams, RandomSource};
+use crate::template::{CapturedFlight, CertChainShape, EncryptedFlightShape, ServerFlightTemplate};
 use ml_kem::kem::Decapsulate;
 use ml_kem::{EncodedSizeUser, KemCore, MlKem768};
 use std::io;
@@ -244,6 +245,8 @@ fn find_finished_end(hs_flight: &[u8]) -> Result<Option<usize>, Error> {
     Ok(None)
 }
 
+/// Handshake message type for `EncryptedExtensions` (RFC 8446 §4.3.1).
+const HS_TYPE_ENCRYPTED_EXTENSIONS: u8 = 0x08;
 /// Handshake message type for `Certificate` (RFC 8446 §4.4.2).
 const HS_TYPE_CERTIFICATE: u8 = 0x0b;
 /// Handshake message type for `CertificateVerify` (RFC 8446 §4.4.3).
@@ -337,12 +340,112 @@ fn scan_cert_flight(hs_flight: &[u8]) -> Result<CertFlightInfo, Error> {
     ))
 }
 
-/// Extracts the first `CertificateEntry`'s raw DER (the leaf) from a
-/// `Certificate` message body (RFC 8446 §4.4.2): `context_len(1) ‖ context
-/// ‖ list_len(3) ‖ [cert_data_len(3) ‖ cert_data ‖ ext_len(2) ‖ ext]…`.
-/// Fail-closed on truncation, an empty list, or a leaf exceeding
-/// [`MAX_LEAF_CERT_DER_LEN`].
-fn certificate_leaf_der(body: &[u8]) -> Result<Vec<u8>, Error> {
+/// REALITY.5a Task 2: what capturing a dest's server flight needs beyond
+/// [`scan_cert_flight`] (which REALITY.4b's verify path already relies on and
+/// which this does not alter) — per-message plaintext lengths (each `4 +
+/// body_len`, the handshake-message length INCLUDING its own 4-byte header —
+/// matching [`crate::template::EncryptedFlightShape`]'s length fields) plus
+/// the full cert chain shape (leaf DER + every subsequent chain cert's DER
+/// verbatim; see [`CertChainShape`]).
+pub struct FlightShapeScan {
+    /// The leaf certificate's raw DER (first `CertificateEntry` in the
+    /// `Certificate` message's cert list).
+    pub leaf_der: Vec<u8>,
+    /// The leaf DER's length + every subsequent chain cert's DER, verbatim.
+    pub cert_chain: CertChainShape,
+    /// `EncryptedExtensions` message length, incl. its 4-byte header.
+    pub ee_len: usize,
+    /// `Certificate` message length, incl. its 4-byte header.
+    pub cert_len: usize,
+    /// `CertificateVerify` message length, incl. its 4-byte header.
+    pub cert_verify_len: usize,
+    /// `Finished` message length, incl. its 4-byte header.
+    pub finished_len: usize,
+}
+
+/// Scans `hs_flight` (see [`find_finished_end`] for its shape) for
+/// REALITY.5a's flight-shape capture: per-message plaintext lengths of
+/// EncryptedExtensions/Certificate/CertificateVerify/Finished, plus the
+/// leaf certificate's DER and every subsequent chain cert's DER verbatim
+/// (see [`certificate_chain_ders`]). Mirrors [`scan_cert_flight`]'s bounded
+/// `while hs_flight.len() >= pos + 4` walk over `msg_type ‖ u24 len ‖ body`,
+/// but records EVERY message's length rather than stopping at the first
+/// `CertificateVerify`. Fail-closed: a missing `Certificate` message,
+/// truncated field, or out-of-bounds value is `Err(Error::RealityVerify(_))`;
+/// every access is bounds-checked (`.get`, never direct indexing past a
+/// validated point) so hostile bytes cannot panic this.
+pub fn scan_flight_shape(hs_flight: &[u8]) -> Result<FlightShapeScan, Error> {
+    let mut pos = 0;
+    let mut leaf_der: Option<Vec<u8>> = None;
+    let mut intermediates_der: Vec<Vec<u8>> = Vec::new();
+    let mut ee_len = 0usize;
+    let mut cert_len = 0usize;
+    let mut cert_verify_len = 0usize;
+    let mut finished_len = 0usize;
+
+    while hs_flight.len() >= pos + 4 {
+        let msg_type = hs_flight[pos];
+        let len = (usize::from(hs_flight[pos + 1]) << 16)
+            | (usize::from(hs_flight[pos + 2]) << 8)
+            | usize::from(hs_flight[pos + 3]);
+        if len > MAX_HANDSHAKE_MSG_LEN {
+            return Err(Error::RealityVerify(
+                "server handshake message exceeds sane length bound",
+            ));
+        }
+        let body_start = pos + 4;
+        let msg_end = body_start + len;
+        let Some(body) = hs_flight.get(body_start..msg_end) else {
+            break; // not fully buffered — cannot happen on an already-complete flight
+        };
+        let total_len = 4 + len;
+
+        match msg_type {
+            HS_TYPE_ENCRYPTED_EXTENSIONS => ee_len = total_len,
+            HS_TYPE_CERTIFICATE => {
+                cert_len = total_len;
+                let (leaf, chain) = certificate_chain_ders(body)?;
+                leaf_der = Some(leaf);
+                intermediates_der = chain;
+            }
+            HS_TYPE_CERTIFICATE_VERIFY => cert_verify_len = total_len,
+            HS_TYPE_FINISHED => finished_len = total_len,
+            _ => {}
+        }
+
+        pos = msg_end;
+    }
+
+    let leaf_der = leaf_der.ok_or(Error::RealityVerify(
+        "server flight is missing a Certificate message",
+    ))?;
+    let leaf_der_len = leaf_der.len();
+
+    Ok(FlightShapeScan {
+        leaf_der,
+        cert_chain: CertChainShape {
+            leaf_der_len,
+            intermediates_der,
+        },
+        ee_len,
+        cert_len,
+        cert_verify_len,
+        finished_len,
+    })
+}
+
+/// Extracts every `CertificateEntry`'s raw DER from a `Certificate` message
+/// body (RFC 8446 §4.4.2): `context_len(1) ‖ context ‖ list_len(3) ‖
+/// [cert_data_len(3) ‖ cert_data ‖ ext_len(2) ‖ ext]…`. Returns
+/// `(leaf_der, intermediates_der)` — the FIRST entry is the leaf, every
+/// SUBSEQUENT entry is returned verbatim, in chain order, as
+/// `intermediates_der`. Fail-closed on truncation, an empty list, or a leaf
+/// exceeding [`MAX_LEAF_CERT_DER_LEN`] — this bound is intentionally NOT
+/// applied to intermediates (real intermediate CA certs can legitimately run
+/// larger than a leaf), which are instead bounded by the already-enforced
+/// [`MAX_HANDSHAKE_MSG_LEN`]/[`MAX_SERVER_FLIGHT_LEN`] on the whole
+/// message/flight.
+fn certificate_chain_ders(body: &[u8]) -> Result<(Vec<u8>, Vec<Vec<u8>>), Error> {
     let ctx_len = usize::from(
         *body
             .first()
@@ -361,21 +464,57 @@ fn certificate_leaf_der(body: &[u8]) -> Result<Vec<u8>, Error> {
         .get(list_start..list_end)
         .ok_or(Error::RealityVerify("truncated Certificate list"))?;
 
-    let cd_len_bytes = list
-        .get(0..3)
+    let mut entries: Vec<Vec<u8>> = Vec::new();
+    let mut i = 0;
+    while let Some(cd_len_bytes) = list.get(i..i + 3) {
+        let cd_len = (usize::from(cd_len_bytes[0]) << 16)
+            | (usize::from(cd_len_bytes[1]) << 8)
+            | usize::from(cd_len_bytes[2]);
+        let cert_start = i + 3;
+        let cert_end = cert_start + cd_len;
+        let cert_data = list
+            .get(cert_start..cert_end)
+            .ok_or(Error::RealityVerify("truncated certificate entry"))?;
+        let ext_len_bytes = list
+            .get(cert_end..cert_end + 2)
+            .ok_or(Error::RealityVerify(
+                "truncated certificate entry extensions",
+            ))?;
+        let ext_len = usize::from(u16::from_be_bytes([ext_len_bytes[0], ext_len_bytes[1]]));
+        let ext_start = cert_end + 2;
+        let ext_end = ext_start + ext_len;
+        if ext_end > list.len() {
+            return Err(Error::RealityVerify(
+                "truncated certificate entry extensions",
+            ));
+        }
+        entries.push(cert_data.to_vec());
+        i = ext_end;
+    }
+
+    let mut iter = entries.into_iter();
+    let leaf = iter
+        .next()
         .ok_or(Error::RealityVerify("empty Certificate list"))?;
-    let cd_len = (usize::from(cd_len_bytes[0]) << 16)
-        | (usize::from(cd_len_bytes[1]) << 8)
-        | usize::from(cd_len_bytes[2]);
-    if cd_len == 0 || cd_len > MAX_LEAF_CERT_DER_LEN {
+    if leaf.is_empty() || leaf.len() > MAX_LEAF_CERT_DER_LEN {
         return Err(Error::RealityVerify(
             "leaf certificate length out of bounds",
         ));
     }
-    let cert_data = list
-        .get(3..3 + cd_len)
-        .ok_or(Error::RealityVerify("truncated leaf certificate"))?;
-    Ok(cert_data.to_vec())
+    Ok((leaf, iter.collect()))
+}
+
+/// Extracts the first `CertificateEntry`'s raw DER (the leaf) from a
+/// `Certificate` message body (RFC 8446 §4.4.2): `context_len(1) ‖ context
+/// ‖ list_len(3) ‖ [cert_data_len(3) ‖ cert_data ‖ ext_len(2) ‖ ext]…`.
+/// Fail-closed on truncation, an empty list, or a leaf exceeding
+/// [`MAX_LEAF_CERT_DER_LEN`]. A thin wrapper over
+/// [`certificate_chain_ders`] (REALITY.5a), which does the identical walk
+/// but also returns any subsequent chain certs; [`scan_cert_flight`] (and,
+/// through it, REALITY.4b's verify path) only ever needs the leaf, so it
+/// keeps calling this narrower name.
+fn certificate_leaf_der(body: &[u8]) -> Result<Vec<u8>, Error> {
+    certificate_chain_ders(body).map(|(leaf, _intermediates)| leaf)
 }
 
 /// Extracts the `signature` field from a `CertificateVerify` message body
@@ -853,6 +992,214 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
         read_pos: 0,
         write_buf: Vec::new(),
         write_off: 0,
+    })
+}
+
+/// REALITY.5a Task 3: probes a REAL `dest` — no REALITY seal, since `dest`
+/// ignores `legacy_session_id` — and captures its server flight's structural
+/// fingerprint: the `ServerHello` shape (ordered extensions, negotiated
+/// suite/group), the encrypted flight's per-record ciphertext-payload
+/// lengths and per-message plaintext lengths, and the leaf/intermediate
+/// certificate DERs. Later REALITY.5 sub-milestones (5b/5c/5d) reproduce this
+/// structure on the relay's authed path.
+///
+/// Crafts the SAME Chrome-150 `ClientHello` [`connect`] would (same
+/// [`hello::craft`] call, same fresh X25519 ephemeral + ML-KEM setup —
+/// reused byte-for-byte below), except `legacy_session_id` is filled with
+/// random bytes instead of a REALITY auth seal: probing the real `dest`
+/// needs no `server_reality_pub`/`short_id`, and `dest` never inspects
+/// `legacy_session_id`'s contents, so the wire fingerprint an observer sees
+/// here matches exactly what [`connect`] sends. Completes the handshake
+/// through the server's `Finished`, but sends neither a client `Finished`
+/// nor reads any application data afterward — this is a probe, not a
+/// connection, so it stops the instant it has what it came for.
+///
+/// A focused SIBLING of [`connect`]: shares [`hello::craft`], the ephemeral
+/// key setup, [`parse_server_hello`]/[`parse_server_hello_shape`],
+/// [`derive_handshake_keys`], [`record_open`], [`find_finished_end`], and
+/// [`scan_flight_shape`], but DUPLICATES `connect`'s ~15-line encrypted-
+/// flight read loop (with one addition: recording each record's pre-decrypt
+/// ciphertext-payload length into `record_lengths`) rather than refactoring
+/// `connect`'s crux security path to share it — see this module's REALITY.5a
+/// Task 3 brief: a probe is not the hot path, so a small, clearly-commented
+/// duplication here is safer than touching `connect`. `connect`'s body is
+/// byte-for-byte unchanged by this function's existence.
+pub async fn capture_dest_flight<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    sni: &str,
+) -> Result<CapturedFlight, Error> {
+    // THE ONE EPHEMERAL KEY, same setup as connect's (see connect's doc
+    // comment) — reused for the TLS key_share/ECDHE only, since there is no
+    // REALITY seal to also key here.
+    let mut eph_priv = [0u8; 32];
+    getrandom::getrandom(&mut eph_priv)?;
+    let secret = x25519_dalek::StaticSecret::from(eph_priv);
+    let eph_pub: [u8; 32] = x25519_dalek::PublicKey::from(&secret).to_bytes();
+
+    // A genuine ML-KEM-768 keypair, exactly as connect's — a real
+    // ML-KEM-strict dest (Cloudflare, Google) validates the encapsulation
+    // key's canonical encoding, so only a genuine key survives probing it.
+    let mut mlkem_rng = MlKemRng::default();
+    let (mlkem_dk, mlkem_ek) = MlKem768::generate(&mut mlkem_rng);
+    mlkem_rng.into_result()?;
+
+    let mut client_random = [0u8; 32];
+    getrandom::getrandom(&mut client_random)?;
+
+    // No REALITY seal: dest ignores legacy_session_id entirely, so a random
+    // 32-byte value stands in for it — still wire-shaped exactly like a real
+    // seal (hello::craft only cares that it fits, not what's inside).
+    let mut legacy_session_id = [0u8; 32];
+    getrandom::getrandom(&mut legacy_session_id)?;
+
+    let params = ClientHelloParams {
+        sni: sni.to_string(),
+        key_share_x25519_pub: eph_pub,
+        key_share_mlkem_ek: mlkem_ek.as_bytes().to_vec(),
+        legacy_session_id,
+        client_random,
+    };
+    let mut rng = OsRng::default();
+    let hello_msg = hello::craft(&params, &mut rng);
+    rng.into_result()?;
+
+    let ch_header = record_header(
+        CONTENT_TYPE_HANDSHAKE,
+        LEGACY_RECORD_VERSION_INITIAL,
+        hello_msg.len(),
+    )?;
+    stream.write_all(&ch_header).await?;
+    stream.write_all(&hello_msg).await?;
+
+    // ServerHello is sent plaintext (record type 0x16) — RFC 8446 §5.1.
+    let (record_type, sh_msg) = read_raw_record(&mut stream).await?;
+    if record_type != CONTENT_TYPE_HANDSHAKE {
+        return Err(Error::Protocol(
+            "expected a plaintext ServerHello handshake record",
+        ));
+    }
+    // The crypto-relevant fields (suite/group/key_share bytes) via
+    // parse_server_hello, and the full structural shape (ordered
+    // extensions) via parse_server_hello_shape — both walk the identical
+    // bounded header, so neither can disagree with the other about what
+    // suite/group was negotiated.
+    let server_hello_info = parse_server_hello(&sh_msg)?;
+    let server_hello_shape = parse_server_hello_shape(&sh_msg)?;
+
+    let mut ch_sh_transcript = Vec::with_capacity(hello_msg.len() + sh_msg.len());
+    ch_sh_transcript.extend_from_slice(&hello_msg);
+    ch_sh_transcript.extend_from_slice(&sh_msg);
+    let transcript_ch_sh = transcript_hash(&ch_sh_transcript, server_hello_info.suite);
+
+    // The (possibly hybrid) ECDHE shared secret — identical branch to
+    // connect's (see connect's doc comment for the group-4588 wire shape).
+    let ecdhe: Vec<u8> = match server_hello_info.group {
+        GROUP_X25519MLKEM768 => {
+            let (ct_bytes, server_x25519_pub) = server_hello_info
+                .server_key_share
+                .split_at(MLKEM768_CIPHERTEXT_LEN);
+            let ciphertext = ct_bytes
+                .try_into()
+                .map_err(|_| handshake::Error::MlKemDecapsulation)?;
+            let mlkem_ss = mlkem_dk
+                .decapsulate(&ciphertext)
+                .map_err(|()| handshake::Error::MlKemDecapsulation)?;
+            let server_x25519_pub: [u8; 32] = server_x25519_pub
+                .try_into()
+                .map_err(|_| handshake::Error::BadKeyShareLength)?;
+            let x25519_ss = secret
+                .diffie_hellman(&x25519_dalek::PublicKey::from(server_x25519_pub))
+                .to_bytes();
+
+            let mut combined = Vec::with_capacity(64);
+            combined.extend_from_slice(&mlkem_ss);
+            combined.extend_from_slice(&x25519_ss);
+            combined
+        }
+        GROUP_X25519 => {
+            let server_x25519_pub: [u8; 32] = server_hello_info
+                .server_key_share
+                .as_slice()
+                .try_into()
+                .map_err(|_| handshake::Error::BadKeyShareLength)?;
+            secret
+                .diffie_hellman(&x25519_dalek::PublicKey::from(server_x25519_pub))
+                .to_bytes()
+                .to_vec()
+        }
+        _ => {
+            return Err(Error::Protocol(
+                "parse_server_hello returned an unexpected key_share group",
+            ))
+        }
+    };
+    let hk: HandshakeKeys =
+        derive_handshake_keys(&ecdhe, &transcript_ch_sh, server_hello_info.suite);
+
+    // Read the server's EncryptedExtensions/Certificate/CertificateVerify/
+    // Finished flight, recording each record's ciphertext-payload length
+    // (the record header's length field, i.e. `payload.len()` BEFORE
+    // `record_open` mutates it in place to strip the tag/padding) into
+    // `record_lengths` as we go. DELIBERATE DUPLICATE of connect's own
+    // flight-read loop (see this function's doc comment) — the only
+    // difference is this extra bookkeeping line; the MAX_SERVER_FLIGHT_LEN
+    // cap below applies identically, since the flight buffer is attacker-
+    // length-controlled here exactly as it is in connect.
+    let mut hs_flight = Vec::new();
+    let mut record_lengths = Vec::new();
+    let mut server_seq = 0u64;
+    let finished_end = loop {
+        let (record_type, mut payload) = read_raw_record(&mut stream).await?;
+        if record_type == CONTENT_TYPE_CHANGE_CIPHER_SPEC {
+            continue;
+        }
+        if record_type != CONTENT_TYPE_APPLICATION_DATA {
+            return Err(Error::Protocol(
+                "expected an encrypted handshake record in the server flight",
+            ));
+        }
+        record_lengths.push(payload.len());
+        let opened = record_open(
+            &hk.server_key,
+            &hk.server_iv,
+            server_seq,
+            server_hello_info.suite,
+            record_type,
+            &mut payload,
+        )?;
+        server_seq = server_seq
+            .checked_add(1)
+            .ok_or(Error::Protocol("server handshake sequence overflow"))?;
+        hs_flight.extend_from_slice(&opened);
+        if hs_flight.len() > MAX_SERVER_FLIGHT_LEN {
+            return Err(Error::Protocol(
+                "server handshake flight exceeds sane bound",
+            ));
+        }
+
+        if let Some(end) = find_finished_end(&hs_flight)? {
+            break end;
+        }
+    };
+    hs_flight.truncate(finished_end);
+
+    // Do NOT send a client Finished or read application data — the probe
+    // has everything it needs the instant the server's Finished is seen.
+    let scan = scan_flight_shape(&hs_flight)?;
+
+    Ok(CapturedFlight {
+        leaf_der: scan.leaf_der,
+        template: ServerFlightTemplate {
+            server_hello: server_hello_shape,
+            encrypted_flight: EncryptedFlightShape {
+                record_lengths,
+                encrypted_extensions_len: scan.ee_len,
+                certificate_len: scan.cert_len,
+                certificate_verify_len: scan.cert_verify_len,
+                finished_len: scan.finished_len,
+            },
+            cert_chain: scan.cert_chain,
+        },
     })
 }
 
@@ -1601,6 +1948,115 @@ mod tests {
         );
     }
 
+    /// Builds a decrypted server flight (`EncryptedExtensions ‖ Certificate
+    /// ‖ CertificateVerify ‖ Finished`, each `type(1) ‖ u24 len ‖ body`) with
+    /// known message lengths, for [`scan_flight_shape`]'s test below. The
+    /// `Certificate` message carries every DER in `certs` (in order) as its
+    /// cert list, each entry `u24 cert_len ‖ cert_der ‖ u16 ext_len(=0)` —
+    /// the exact RFC 8446 §4.4.2 wire format `certificate_chain_ders` walks —
+    /// deliberately independent of `build_certificate_message` (which only
+    /// ever encodes a single leaf entry, for the `scan_cert_flight` tests)
+    /// so this fixture can carry an arbitrary-length chain.
+    fn build_test_server_flight(
+        ee_body: &[u8],
+        certs: &[Vec<u8>],
+        cert_verify_sig_len: usize,
+        finished_len: usize,
+    ) -> Vec<u8> {
+        let mut ee_msg = Vec::new();
+        ee_msg.push(HS_TYPE_ENCRYPTED_EXTENSIONS);
+        let ee_len = u32::try_from(ee_body.len()).unwrap().to_be_bytes();
+        ee_msg.extend_from_slice(&ee_len[1..]);
+        ee_msg.extend_from_slice(ee_body);
+
+        let mut cert_list = Vec::new();
+        for cert in certs {
+            let cd_len = u32::try_from(cert.len()).unwrap().to_be_bytes();
+            cert_list.extend_from_slice(&cd_len[1..]);
+            cert_list.extend_from_slice(cert);
+            cert_list.extend_from_slice(&0u16.to_be_bytes()); // no per-cert extensions
+        }
+        let mut cert_body = Vec::new();
+        cert_body.push(0); // certificate_request_context: empty
+        let list_len = u32::try_from(cert_list.len()).unwrap().to_be_bytes();
+        cert_body.extend_from_slice(&list_len[1..]);
+        cert_body.extend_from_slice(&cert_list);
+
+        let mut cert_msg = Vec::new();
+        cert_msg.push(HS_TYPE_CERTIFICATE);
+        let cert_msg_len = u32::try_from(cert_body.len()).unwrap().to_be_bytes();
+        cert_msg.extend_from_slice(&cert_msg_len[1..]);
+        cert_msg.extend_from_slice(&cert_body);
+
+        let cert_verify_msg = build_certificate_verify_message(&vec![0xCCu8; cert_verify_sig_len]);
+
+        let verify_data = vec![0xABu8; finished_len];
+        let mut finished_msg = Vec::with_capacity(4 + verify_data.len());
+        finished_msg.push(HS_TYPE_FINISHED);
+        let fin_len = u32::try_from(verify_data.len()).unwrap().to_be_bytes();
+        finished_msg.extend_from_slice(&fin_len[1..]);
+        finished_msg.extend_from_slice(&verify_data);
+
+        let mut flight = Vec::new();
+        flight.extend_from_slice(&ee_msg);
+        flight.extend_from_slice(&cert_msg);
+        flight.extend_from_slice(&cert_verify_msg);
+        flight.extend_from_slice(&finished_msg);
+        flight
+    }
+
+    /// REALITY.5a Task 2: `scan_flight_shape` must record each message's
+    /// total wire length (header included) and must split the Certificate
+    /// message's cert list into `leaf_der` (first entry) +
+    /// `intermediates_der` (every subsequent entry, verbatim).
+    #[test]
+    fn scan_flight_shape_records_lengths_and_verbatim_intermediates() {
+        let leaf = vec![0xAAu8; 40];
+        let inter = vec![0xBBu8; 30];
+        let flight = build_test_server_flight(
+            /*ee_body=*/ &[0x00, 0x00], // empty EE
+            /*certs=*/ &[leaf.clone(), inter.clone()], // leaf + 1 intermediate
+            /*cert_verify_sig_len=*/ 70,
+            /*finished_len=*/ 32,
+        );
+        let s = scan_flight_shape(&flight).expect("scan");
+        assert_eq!(s.leaf_der, leaf);
+        assert_eq!(s.cert_chain.leaf_der_len, 40);
+        assert_eq!(s.cert_chain.intermediates_der, vec![inter]); // verbatim
+                                                                 // Per-message lengths include the 4-byte handshake header.
+        assert_eq!(s.ee_len, 4 + 2);
+        assert!(s.cert_len > 0 && s.cert_verify_len > 0 && s.finished_len > 0);
+    }
+
+    /// A leaf-only chain (no intermediates) must yield an empty
+    /// `intermediates_der`, not an error or a spurious entry.
+    #[test]
+    fn scan_flight_shape_leaf_only_chain_has_no_intermediates() {
+        let leaf = vec![0x11u8; 20];
+        let flight = build_test_server_flight(&[0x00, 0x00], std::slice::from_ref(&leaf), 64, 32);
+        let s = scan_flight_shape(&flight).expect("scan");
+        assert_eq!(s.leaf_der, leaf);
+        assert_eq!(s.cert_chain.leaf_der_len, 20);
+        assert!(s.cert_chain.intermediates_der.is_empty());
+    }
+
+    /// A flight missing the `Certificate` message entirely must fail closed,
+    /// not panic or silently return an empty leaf.
+    #[test]
+    fn scan_flight_shape_rejects_flight_without_certificate() {
+        // Only EncryptedExtensions ‖ Finished — no Certificate/CertVerify.
+        let mut flight = Vec::new();
+        flight.extend_from_slice(&[HS_TYPE_ENCRYPTED_EXTENSIONS, 0x00, 0x00, 0x00]);
+        flight.push(HS_TYPE_FINISHED);
+        flight.extend_from_slice(&[0x00, 0x00, 0x20]);
+        flight.extend_from_slice(&[0xABu8; 32]);
+
+        assert!(matches!(
+            scan_flight_shape(&flight),
+            Err(Error::RealityVerify(_))
+        ));
+    }
+
     /// What kind of Certificate/CertificateVerify a mock server presents in
     /// the `connect_verify_*` tests below.
     enum ServerCertBehavior {
@@ -1617,21 +2073,24 @@ mod tests {
     }
 
     /// Builds a wire `Certificate` handshake message (RFC 8446 §4.4.2)
-    /// carrying a single `CertificateEntry` (no per-cert extensions)
-    /// wrapping `leaf_der` — the test-only encoder counterpart of
-    /// `scan_cert_flight`/`certificate_leaf_der`.
-    fn build_certificate_message(leaf_der: &[u8]) -> Vec<u8> {
-        let mut entry = Vec::new();
-        let cd_len = u32::try_from(leaf_der.len()).unwrap().to_be_bytes();
-        entry.extend_from_slice(&cd_len[1..]);
-        entry.extend_from_slice(leaf_der);
-        entry.extend_from_slice(&0u16.to_be_bytes()); // no per-cert extensions
+    /// carrying one `CertificateEntry` (no per-cert extensions) per DER in
+    /// `ders`, in order — the shared test-only encoder counterpart of
+    /// `scan_cert_flight`/`certificate_leaf_der` (single-entry chains) and
+    /// `scan_flight_shape`/`certificate_chain_ders` (multi-entry chains).
+    fn build_certificate_entries_message(ders: &[&[u8]]) -> Vec<u8> {
+        let mut entries = Vec::new();
+        for der in ders {
+            let cd_len = u32::try_from(der.len()).unwrap().to_be_bytes();
+            entries.extend_from_slice(&cd_len[1..]);
+            entries.extend_from_slice(der);
+            entries.extend_from_slice(&0u16.to_be_bytes()); // no per-cert extensions
+        }
 
         let mut body = Vec::new();
         body.push(0); // certificate_request_context: empty
-        let list_len = u32::try_from(entry.len()).unwrap().to_be_bytes();
+        let list_len = u32::try_from(entries.len()).unwrap().to_be_bytes();
         body.extend_from_slice(&list_len[1..]);
-        body.extend_from_slice(&entry);
+        body.extend_from_slice(&entries);
 
         let mut msg = Vec::new();
         msg.push(HS_TYPE_CERTIFICATE);
@@ -1639,6 +2098,28 @@ mod tests {
         msg.extend_from_slice(&len[1..]);
         msg.extend_from_slice(&body);
         msg
+    }
+
+    /// Builds a wire `Certificate` handshake message carrying a single
+    /// `CertificateEntry` wrapping `leaf_der` — the common case used by
+    /// every `connect_verify_*` test that doesn't care about chain shape.
+    fn build_certificate_message(leaf_der: &[u8]) -> Vec<u8> {
+        build_certificate_entries_message(&[leaf_der])
+    }
+
+    /// Builds a wire `Certificate` handshake message carrying TWO
+    /// `CertificateEntry` values, leaf first then `intermediate_der` — the
+    /// shape a real relay's CA-issued chain presents (RFC 8446 §4.4.2
+    /// mandates the same per-entry `extensions` framing on every entry, not
+    /// just the leaf). Exercises the multi-entry walk in
+    /// `certificate_chain_ders` (REALITY.5a Task 2), which the 4b verify
+    /// path (`scan_cert_flight` → `certificate_leaf_der`) now runs through
+    /// on every connection, single- or multi-cert alike.
+    fn build_certificate_message_with_intermediate(
+        leaf_der: &[u8],
+        intermediate_der: &[u8],
+    ) -> Vec<u8> {
+        build_certificate_entries_message(&[leaf_der, intermediate_der])
     }
 
     /// Builds a wire `CertificateVerify` handshake message (RFC 8446
@@ -1686,10 +2167,18 @@ mod tests {
     /// `behavior` must NOT `.await` the returned task's `JoinHandle` (it
     /// would hang forever on the client's CCS/Finished that never arrives);
     /// see the `connect_verify_rejects_*` tests below.
+    ///
+    /// When `include_intermediate` is set, the `Certificate` message carries
+    /// a SECOND `CertificateEntry` after the (still first, still pinned)
+    /// leaf — a dummy but wire-well-formed cert standing in for a real
+    /// relay's intermediate CA cert (REALITY.5a Task 2 review: proves
+    /// `certificate_chain_ders`'s full-chain walk doesn't break 4b
+    /// verification of a genuine multi-cert chain).
     async fn run_mock_tls13_server_with_cert(
         mut io: tokio::io::DuplexStream,
         server_reality_priv: [u8; 32],
         behavior: ServerCertBehavior,
+        include_intermediate: bool,
     ) {
         const SUITE: u16 = 0x1301; // TLS_AES_128_GCM_SHA256
 
@@ -1780,7 +2269,16 @@ mod tests {
         let leaf_der = leaf_der_for_key(&leaf_key);
 
         let ee_msg: [u8; 4] = [0x08, 0x00, 0x00, 0x00]; // EncryptedExtensions, 0-length
-        let certificate_msg = build_certificate_message(&leaf_der);
+        let certificate_msg = if include_intermediate {
+            // A dummy "intermediate": any wire-well-formed CertificateEntry
+            // works per RFC 8446 §4.4.2 — it doesn't need to chain-verify to
+            // the leaf, since REALITY.4b only ever pins the FIRST entry.
+            let intermediate_key = rcgen::KeyPair::generate().unwrap();
+            let intermediate_der = leaf_der_for_key(&intermediate_key);
+            build_certificate_message_with_intermediate(&leaf_der, &intermediate_der)
+        } else {
+            build_certificate_message(&leaf_der)
+        };
 
         // The RFC 8446 §4.4.3 transcript boundary: everything through
         // Certificate, NOT including CertificateVerify.
@@ -1902,6 +2400,7 @@ mod tests {
             server_io,
             server_reality_priv,
             ServerCertBehavior::CorrectBinder,
+            false,
         ));
 
         let mut s = connect(
@@ -1913,6 +2412,51 @@ mod tests {
         )
         .await
         .expect("a correctly-bound relay must verify");
+
+        s.write_all(b"PING").await.unwrap();
+        s.flush().await.unwrap();
+        let mut buf = [0u8; 4];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"PING");
+
+        server_task.await.unwrap();
+    }
+
+    /// REALITY.5a Task 2 review gap: every OTHER `connect_verify_*` test
+    /// uses a single-`CertificateEntry` chain, so the multi-entry parse
+    /// path in `certificate_chain_ders` (which the 4b verify path now runs
+    /// through via `scan_cert_flight` → `certificate_leaf_der`) is never
+    /// exercised by the live verify flow. This mirrors
+    /// `connect_verify_accepts_correct_binder` exactly, except the mock
+    /// server presents a 2-entry chain — the correctly-bound leaf FIRST,
+    /// then a dummy but wire-well-formed intermediate `CertificateEntry`
+    /// (RFC 8446 §4.4.2 framing) appended after it. Verification pins ONLY
+    /// the first entry, so `connect` must still succeed.
+    #[tokio::test]
+    async fn connect_verify_accepts_correct_binder_with_intermediate_chain() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_reality_priv = [7u8; 32];
+        let server_reality_pub = {
+            let secret = x25519_dalek::StaticSecret::from(server_reality_priv);
+            x25519_dalek::PublicKey::from(&secret).to_bytes()
+        };
+
+        let server_task = tokio::spawn(run_mock_tls13_server_with_cert(
+            server_io,
+            server_reality_priv,
+            ServerCertBehavior::CorrectBinder,
+            true,
+        ));
+
+        let mut s = connect(
+            client_io,
+            "example.com",
+            &server_reality_pub,
+            [1u8; 8],
+            true,
+        )
+        .await
+        .expect("a correctly-bound relay presenting leaf+intermediate must still verify");
 
         s.write_all(b"PING").await.unwrap();
         s.flush().await.unwrap();
@@ -1942,6 +2486,7 @@ mod tests {
             server_io,
             server_reality_priv,
             ServerCertBehavior::WrongLeafKey,
+            false,
         ));
 
         let result = connect(
@@ -1976,6 +2521,7 @@ mod tests {
             server_io,
             server_reality_priv,
             ServerCertBehavior::BadSignature,
+            false,
         ));
 
         let result = connect(
@@ -2010,6 +2556,7 @@ mod tests {
             server_io,
             server_reality_priv,
             ServerCertBehavior::WrongLeafKey,
+            false,
         ));
 
         let mut s = connect(
@@ -2029,5 +2576,273 @@ mod tests {
         assert_eq!(&buf, b"PING");
 
         server_task.await.unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // REALITY.5a Task 3: capture_dest_flight
+    // -----------------------------------------------------------------
+
+    /// What [`run_mock_dest_server_with_known_flight`] actually put on the
+    /// wire, for `capture_dest_flight_records_template_from_mock` to assert
+    /// the returned [`CapturedFlight`] against — computed alongside the
+    /// bytes the mock sends rather than duplicated by hand in the test, so
+    /// the two can never silently drift apart.
+    struct KnownFlightFixture {
+        cipher_suite: u16,
+        extensions: Vec<(u16, Vec<u8>)>,
+        key_share_group: u16,
+        leaf_der: Vec<u8>,
+        intermediate_der: Vec<u8>,
+        ee_len: usize,
+        cert_len: usize,
+        cert_verify_len: usize,
+        finished_len: usize,
+        record_lengths: Vec<usize>,
+    }
+
+    /// Plays the dest SERVER role for `capture_dest_flight`'s mock test: a
+    /// `ServerHello` with a deliberately NON-canonical extension order (an
+    /// arbitrary/unknown extension BEFORE `supported_versions`, itself
+    /// before `key_share` — proving the shape capture preserves wire order
+    /// rather than a canonical one), followed by a 2-`CertificateEntry`
+    /// chain (leaf + intermediate) split across TWO encrypted records
+    /// (EncryptedExtensions‖Certificate in the first, CertificateVerify‖
+    /// Finished in the second — proving `record_lengths` captures each
+    /// record's length individually, not just the total). Never reads
+    /// anything after the `ClientHello` — `capture_dest_flight` sends
+    /// neither a `ChangeCipherSpec` nor a client `Finished`, so there is
+    /// nothing more for a dest to receive.
+    async fn run_mock_dest_server_with_known_flight(
+        mut io: tokio::io::DuplexStream,
+    ) -> KnownFlightFixture {
+        const SUITE: u16 = 0x1301; // TLS_AES_128_GCM_SHA256
+
+        // -- ClientHello ------------------------------------------------
+        let (record_type, ch_msg) = read_one_record(&mut io).await;
+        assert_eq!(
+            record_type, CONTENT_TYPE_HANDSHAKE,
+            "ClientHello must arrive as a plaintext handshake record"
+        );
+        let (_client_random, client_x25519_pub) = client_hello_random_and_x25519(&ch_msg);
+
+        // -- ServerHello (group x25519), extensions in a deliberately
+        // non-canonical order ---------------------------------------------
+        let server_secret = x25519_dalek::StaticSecret::from([13u8; 32]);
+        let server_x25519_pub: [u8; 32] = x25519_dalek::PublicKey::from(&server_secret).to_bytes();
+        let ecdhe: Vec<u8> = server_secret
+            .diffie_hellman(&x25519_dalek::PublicKey::from(client_x25519_pub))
+            .to_bytes()
+            .to_vec();
+
+        let mut server_random = [0u8; 32];
+        getrandom::getrandom(&mut server_random).unwrap();
+
+        let mut key_share_entry = Vec::new();
+        key_share_entry.extend_from_slice(&GROUP_X25519.to_be_bytes());
+        key_share_entry.extend_from_slice(&32u16.to_be_bytes());
+        key_share_entry.extend_from_slice(&server_x25519_pub);
+
+        let arbitrary_ext_type: u16 = 0x1234;
+        let arbitrary_ext_body: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
+
+        let mut exts = Vec::new();
+        // Arbitrary extension FIRST — real Chrome/dest never puts an
+        // unrecognized extension ahead of supported_versions, but
+        // parse_server_hello_shape must capture whatever order dest
+        // actually used, not assume a canonical one.
+        exts.extend_from_slice(&arbitrary_ext_type.to_be_bytes());
+        exts.extend_from_slice(
+            &u16::try_from(arbitrary_ext_body.len())
+                .unwrap()
+                .to_be_bytes(),
+        );
+        exts.extend_from_slice(&arbitrary_ext_body);
+        // supported_versions (43): TLS 1.3 only.
+        exts.extend_from_slice(&43u16.to_be_bytes());
+        exts.extend_from_slice(&2u16.to_be_bytes());
+        exts.extend_from_slice(&0x0304u16.to_be_bytes());
+        // key_share (51) LAST.
+        exts.extend_from_slice(&51u16.to_be_bytes());
+        exts.extend_from_slice(&u16::try_from(key_share_entry.len()).unwrap().to_be_bytes());
+        exts.extend_from_slice(&key_share_entry);
+
+        let mut sh_body = Vec::new();
+        sh_body.extend_from_slice(&0x0303u16.to_be_bytes()); // legacy_version
+        sh_body.extend_from_slice(&server_random);
+        sh_body.push(0); // legacy_session_id_echo: empty
+        sh_body.extend_from_slice(&SUITE.to_be_bytes());
+        sh_body.push(0); // legacy_compression_method
+        sh_body.extend_from_slice(&u16::try_from(exts.len()).unwrap().to_be_bytes());
+        sh_body.extend_from_slice(&exts);
+
+        let mut sh_msg = Vec::new();
+        sh_msg.push(0x02); // ServerHello
+        let body_len = u32::try_from(sh_body.len()).unwrap().to_be_bytes();
+        sh_msg.extend_from_slice(&body_len[1..]); // u24
+        sh_msg.extend_from_slice(&sh_body);
+
+        let sh_header =
+            record_header(CONTENT_TYPE_HANDSHAKE, LEGACY_RECORD_VERSION, sh_msg.len()).unwrap();
+        io.write_all(&sh_header).await.unwrap();
+        io.write_all(&sh_msg).await.unwrap();
+
+        // -- Handshake keys, matching capture_dest_flight's own derivation
+        // exactly -----------------------------------------------------------
+        let mut ch_sh_transcript = Vec::with_capacity(ch_msg.len() + sh_msg.len());
+        ch_sh_transcript.extend_from_slice(&ch_msg);
+        ch_sh_transcript.extend_from_slice(&sh_msg);
+        let transcript_ch_sh = transcript_hash(&ch_sh_transcript, SUITE);
+        let hk = derive_handshake_keys(&ecdhe, &transcript_ch_sh, SUITE);
+
+        // -- The known flight: EncryptedExtensions ‖ Certificate(leaf +
+        // intermediate) ‖ CertificateVerify ‖ Finished -----------------------
+        let ee_msg: [u8; 6] = [0x08, 0x00, 0x00, 0x02, 0x00, 0x00]; // EncryptedExtensions, empty ext list
+        let leaf_der = vec![0xAAu8; 50];
+        let intermediate_der = vec![0xBBu8; 35];
+        let certificate_msg =
+            build_certificate_message_with_intermediate(&leaf_der, &intermediate_der);
+        let certificate_verify_msg = build_certificate_verify_message(&[0xCCu8; 70]);
+
+        let verify_data = [0xABu8; 32];
+        let mut finished_msg = Vec::with_capacity(4 + verify_data.len());
+        finished_msg.push(HS_TYPE_FINISHED);
+        finished_msg.extend_from_slice(&[0x00, 0x00, 0x20]); // u24 len = 32
+        finished_msg.extend_from_slice(&verify_data);
+
+        // Split across TWO records: EE‖Certificate in the first,
+        // CertificateVerify‖Finished in the second.
+        let mut chunk1 = Vec::new();
+        chunk1.extend_from_slice(&ee_msg);
+        chunk1.extend_from_slice(&certificate_msg);
+        let mut chunk2 = Vec::new();
+        chunk2.extend_from_slice(&certificate_verify_msg);
+        chunk2.extend_from_slice(&finished_msg);
+
+        let sealed1 = record_seal(
+            &hk.server_key,
+            &hk.server_iv,
+            0,
+            SUITE,
+            CONTENT_TYPE_HANDSHAKE,
+            &chunk1,
+        )
+        .unwrap();
+        let header1 = record_header(
+            CONTENT_TYPE_APPLICATION_DATA,
+            LEGACY_RECORD_VERSION,
+            sealed1.len(),
+        )
+        .unwrap();
+        io.write_all(&header1).await.unwrap();
+        io.write_all(&sealed1).await.unwrap();
+
+        let sealed2 = record_seal(
+            &hk.server_key,
+            &hk.server_iv,
+            1,
+            SUITE,
+            CONTENT_TYPE_HANDSHAKE,
+            &chunk2,
+        )
+        .unwrap();
+        let header2 = record_header(
+            CONTENT_TYPE_APPLICATION_DATA,
+            LEGACY_RECORD_VERSION,
+            sealed2.len(),
+        )
+        .unwrap();
+        io.write_all(&header2).await.unwrap();
+        io.write_all(&sealed2).await.unwrap();
+
+        KnownFlightFixture {
+            cipher_suite: SUITE,
+            extensions: vec![
+                (arbitrary_ext_type, arbitrary_ext_body),
+                (43, 0x0304u16.to_be_bytes().to_vec()),
+                (51, key_share_entry),
+            ],
+            key_share_group: GROUP_X25519,
+            leaf_der,
+            intermediate_der,
+            ee_len: ee_msg.len(),
+            cert_len: certificate_msg.len(),
+            cert_verify_len: certificate_verify_msg.len(),
+            finished_len: finished_msg.len(),
+            record_lengths: vec![sealed1.len(), sealed2.len()],
+        }
+    }
+
+    /// The Task 3 crux: `capture_dest_flight` against a mock dest presenting
+    /// a KNOWN flight (see [`run_mock_dest_server_with_known_flight`]) must
+    /// return a `CapturedFlight` whose every field matches what the mock
+    /// actually sent — ordered extensions (including the deliberately
+    /// non-canonical placement), negotiated suite/group, per-record
+    /// ciphertext lengths, per-message plaintext lengths, and both the leaf
+    /// and intermediate certificate DERs verbatim.
+    #[tokio::test]
+    async fn capture_dest_flight_records_template_from_mock() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(run_mock_dest_server_with_known_flight(server_io));
+
+        let cap = capture_dest_flight(client_io, "example.com")
+            .await
+            .expect("capture against a known-flight mock dest must succeed");
+
+        let fixture = server_task.await.unwrap();
+
+        assert_eq!(cap.template.server_hello.cipher_suite, fixture.cipher_suite);
+        assert_eq!(cap.template.server_hello.extensions, fixture.extensions);
+        assert_eq!(
+            cap.template.server_hello.key_share_group,
+            fixture.key_share_group
+        );
+
+        assert_eq!(
+            cap.template.encrypted_flight.record_lengths,
+            fixture.record_lengths
+        );
+        assert_eq!(
+            cap.template.encrypted_flight.encrypted_extensions_len,
+            fixture.ee_len
+        );
+        assert_eq!(
+            cap.template.encrypted_flight.certificate_len,
+            fixture.cert_len
+        );
+        assert_eq!(
+            cap.template.encrypted_flight.certificate_verify_len,
+            fixture.cert_verify_len
+        );
+        assert_eq!(
+            cap.template.encrypted_flight.finished_len,
+            fixture.finished_len
+        );
+
+        assert_eq!(cap.template.cert_chain.leaf_der_len, fixture.leaf_der.len());
+        assert_eq!(
+            cap.template.cert_chain.intermediates_der,
+            vec![fixture.intermediate_der.clone()]
+        );
+        assert_eq!(cap.leaf_der, fixture.leaf_der);
+    }
+
+    /// Live gate: `capture_dest_flight` against a real dest (Cloudflare)
+    /// must return a plausible, non-empty template. Network-dependent —
+    /// `#[ignore]`d by default; run with `cargo test -p yip-utls --
+    /// --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn capture_dest_flight_cloudflare() {
+        let tcp = tokio::net::TcpStream::connect("cloudflare.com:443")
+            .await
+            .unwrap();
+        let cap = capture_dest_flight(tcp, "cloudflare.com")
+            .await
+            .expect("capture");
+        assert!(cap.template.server_hello.cipher_suite != 0);
+        assert!(!cap.template.server_hello.extensions.is_empty());
+        assert!(cap.template.cert_chain.leaf_der_len > 0);
+        assert!(!cap.template.encrypted_flight.record_lengths.is_empty());
+        assert!(!cap.leaf_der.is_empty());
     }
 }

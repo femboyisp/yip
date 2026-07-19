@@ -174,3 +174,22 @@ REALITY.4 (client wiring) is staged into two PRs (user decision):
   Needs a server-side addition — REALITY.3's forged leaf is self-signed by a throwaway key and does
   NOT bind the shared secret — plus client verification + fallback in `yip_utls`. Security-sensitive;
   gets its own spec.
+
+## REALITY.5 progress + 5a→5b/5c hand-off notes (recorded 2026-07-17)
+
+**REALITY.5a (dest server-flight template capture) — CODE-COMPLETE**, PR pending. `yip_utls::capture_dest_flight`
+(Chrome-faithful probe) captures a `ServerFlightTemplate` per SNI (ServerHello ordered-extension structure +
+encrypted-flight record/message lengths + cert-chain leaf size & verbatim intermediates); `yip-rendezvous`
+unified its dest probe on it (boring→yip_utls) and caches it (`template_for`, dead-code-gated until 5b). Read-only.
+
+**Hand-off notes for 5b/5c (from the 5a whole-branch review — DO NOT lose):**
+- `record_lengths` (ciphertext-payload per record) and the per-message plaintext lengths are **independent** framing
+  knobs — `sum(record_lengths[i] - 17)` can EXCEED `ee_len + cert_len + cert_verify_len + finished_len` when dest
+  coalesces post-`Finished` bytes (NewSessionTicket) or TLS record padding into the final record. 5c must pad to
+  satisfy **both** record-framing AND message-framing, not assume equality. (`record_lengths[i] - 17` = per-record
+  plaintext+padding; 17 = 1 content-type + 16 AEAD tag, all 3 TLS 1.3 suites.)
+- The **middlebox-compat CCS** (a fixed `ChangeCipherSpec` record dest sends after ServerHello, because Chrome sends
+  a non-empty legacy_session_id) is a fixed invariant and is NOT recorded in the template — 5b/5c emit it
+  unconditionally after the ServerHello.
+- `CertChainShape` = forge+pad ONLY the leaf to `leaf_der_len`; append `intermediates_der` verbatim (public CA certs).
+- Consider a record-count cap in the shared flight-read loop eventually (caller-timeout-bounded today).

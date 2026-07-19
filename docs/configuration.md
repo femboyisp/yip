@@ -234,6 +234,12 @@ REALITY.3 design spec for exactly what is and is not copied), and forges a
 leaf with those fields self-signed by a relay-ephemeral key, served from a
 **TLS-1.3-only** `SslAcceptor` (pinning out TLS 1.2 keeps the Certificate
 message encrypted, so the forged identity is never visible to passive DPI).
+This dest probe (REALITY.5a) is the same Chrome-faithful `yip_utls` client
+the relay-dial path uses (`yip_utls::capture_dest_flight`, not a generic
+boring TLS client), and it additionally captures a structural
+`ServerFlightTemplate` (ServerHello shape, encrypted-flight record framing,
+cert-chain sizes) per SNI, cached alongside the stolen fields for later
+REALITY.5 sub-milestones to reproduce dest's flight shape on the authed path.
 An SNI whose fetch fails at startup boots anyway — it simply has no forged
 cert and **degrades to splice-only** for that name (the relay still refuses
 to start only if *every* requested SNI fails to pre-warm). A background task

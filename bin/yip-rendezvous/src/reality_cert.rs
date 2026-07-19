@@ -210,36 +210,44 @@ pub fn extract_fields(leaf: &boring::x509::X509Ref) -> StolenFields {
     }
 }
 
-use boring::ssl::{SslConnector, SslMethod, SslVerifyMode};
+use boring::ssl::SslMethod;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpStream;
+use yip_utls::ServerFlightTemplate;
 
-/// Dial `dest` as a TLS client borrowing `sni`, and extract the peer leaf's
-/// `StolenFields`. Verification is disabled (we only want the presented
-/// bytes, not a trust decision) and the whole dial is bounded by `timeout`
-/// so a black-holed `dest` cannot stall startup/refresh.
+/// Dial `dest` as a TLS client borrowing `sni` via `yip_utls`'s Chrome-
+/// faithful probe ([`yip_utls::capture_dest_flight`] — REALITY.5a Task 4),
+/// and extract both the peer leaf's `StolenFields` (REALITY.3) and the
+/// structural `ServerFlightTemplate` (REALITY.5a) from the SAME connection.
+/// Verification is not performed (we only want the presented bytes, not a
+/// trust decision — `capture_dest_flight` never validates the chain) and the
+/// whole dial is bounded by `timeout` so a black-holed `dest` cannot stall
+/// startup/refresh.
+///
+/// Previously this dialed via `tokio_boring::connect` (a generic boring TLS
+/// client, not Chrome-faithful); unifying on `capture_dest_flight` means the
+/// probe itself now carries the same wire fingerprint the relay's own
+/// REALITY dial uses, AND yields the flight template for free — one
+/// connection, two outputs, rather than two separate dests probes.
 pub async fn fetch_dest_leaf(
     dest: SocketAddr,
     sni: &str,
     timeout: Duration,
-) -> Result<StolenFields, String> {
+) -> Result<(StolenFields, ServerFlightTemplate), String> {
     let dial = async {
         let tcp = TcpStream::connect(dest)
             .await
             .map_err(|e| format!("connect {dest}: {e}"))?;
-        let mut b = SslConnector::builder(SslMethod::tls()).map_err(|e| e.to_string())?;
-        b.set_verify(SslVerifyMode::NONE);
-        let cfg = b.build().configure().map_err(|e| e.to_string())?;
-        let stream = tokio_boring::connect(cfg, sni, tcp)
+        let captured = yip_utls::capture_dest_flight(tcp, sni)
             .await
-            .map_err(|e| format!("tls to {sni}: {e}"))?;
-        let leaf = stream
-            .ssl()
-            .peer_cert_chain()
-            .and_then(|chain| chain.get(0))
-            .ok_or_else(|| "no peer cert".to_owned())?;
-        Ok::<StolenFields, String>(extract_fields(leaf))
+            .map_err(|e| format!("capture flight from {sni}: {e}"))?;
+        let x509 = boring::x509::X509::from_der(&captured.leaf_der)
+            .map_err(|e| format!("parse leaf DER from {sni}: {e}"))?;
+        Ok::<(StolenFields, ServerFlightTemplate), String>((
+            extract_fields(&x509),
+            captured.template,
+        ))
     };
     tokio::time::timeout(timeout, dial)
         .await
@@ -341,6 +349,13 @@ struct CacheEntry {
     /// (REALITY.4b) so `run_reality_conn`'s per-connection re-forge needs no
     /// `dest` re-fetch; see `RealityCertCache::fields_for`.
     fields: Arc<StolenFields>,
+    /// The structural `ServerFlightTemplate` captured by the SAME
+    /// `fetch_dest_leaf` probe that produced `fields` (REALITY.5a Task 4) —
+    /// cached per SNI so later REALITY.5 sub-milestones (5b/5c/5d) can
+    /// reproduce dest's ServerHello/encrypted-flight/cert-chain shape on the
+    /// authed path without a fresh dest dial. Not yet read by any 5a code
+    /// path (`template_for` is dead-code-gated in non-test builds).
+    template: Arc<ServerFlightTemplate>,
     fetched_at: Instant,
 }
 
@@ -373,13 +388,14 @@ impl RealityCertCache {
         let mut entries = HashMap::new();
         for name in server_names {
             match fetch_dest_leaf(dest, name, timeout).await {
-                Ok(fields) => match build_forged_acceptor(&fields, &key) {
+                Ok((fields, template)) => match build_forged_acceptor(&fields, &key) {
                     Ok(acc) => {
                         entries.insert(
                             name.clone(),
                             CacheEntry {
                                 acceptor: Arc::new(acc),
                                 fields: Arc::new(fields),
+                                template: Arc::new(template),
                                 fetched_at: Instant::now(),
                             },
                         );
@@ -428,6 +444,16 @@ impl RealityCertCache {
         g.get(sni).map(|e| Arc::clone(&e.fields))
     }
 
+    /// The cached `ServerFlightTemplate` for `sni`, captured by the same
+    /// probe that produced `fields_for(sni)` — REALITY.5a Task 4. `None`
+    /// means `sni` never pre-warmed (splice-only). Not yet consumed within
+    /// 5a; wired up by REALITY.5b's flight-shape reproduction.
+    #[cfg_attr(not(test), expect(dead_code, reason = "consumed by REALITY.5b"))]
+    pub fn template_for(&self, sni: &str) -> Option<Arc<ServerFlightTemplate>> {
+        let g = self.entries.read().expect("cert cache lock poisoned");
+        g.get(sni).map(|e| Arc::clone(&e.template))
+    }
+
     /// Apply one refresh outcome for `name` to the cache. `new_entry` is
     /// `Some((acceptor, fields))` on full success (fetch AND forge both
     /// succeeded), `None` on ANY refresh failure (fetch failed, or fetch
@@ -438,18 +464,23 @@ impl RealityCertCache {
     fn apply_refresh(
         &self,
         name: &str,
-        new_entry: Option<(Arc<SslAcceptor>, Arc<StolenFields>)>,
+        new_entry: Option<(
+            Arc<SslAcceptor>,
+            Arc<StolenFields>,
+            Arc<ServerFlightTemplate>,
+        )>,
         now: Instant,
         max_stale: Duration,
     ) -> RefreshOutcome {
         let mut g = self.entries.write().expect("cert cache poisoned");
         match new_entry {
-            Some((acceptor, fields)) => {
+            Some((acceptor, fields, template)) => {
                 g.insert(
                     name.to_owned(),
                     CacheEntry {
                         acceptor,
                         fields,
+                        template,
                         fetched_at: now,
                     },
                 );
@@ -490,8 +521,8 @@ impl RealityCertCache {
                 tick.tick().await;
                 for name in &this.server_names {
                     let new_entry = match fetch_dest_leaf(dest, name, timeout).await {
-                        Ok(fields) => match build_forged_acceptor(&fields, &this.key) {
-                            Ok(acc) => Some((Arc::new(acc), Arc::new(fields))),
+                        Ok((fields, template)) => match build_forged_acceptor(&fields, &this.key) {
+                            Ok(acc) => Some((Arc::new(acc), Arc::new(fields), Arc::new(template))),
                             Err(e) => {
                                 eprintln!("reality-cert: refresh {name} forge failed: {e}");
                                 None
@@ -634,10 +665,13 @@ mod tests {
             .unwrap()
             .next()
             .unwrap();
-        let f = fetch_dest_leaf(addr, "cloudflare.com", std::time::Duration::from_secs(10))
-            .await
-            .expect("fetch cloudflare leaf");
-        assert!(f.dns_sans.iter().any(|s| s.contains("cloudflare")));
+        let (fields, template) =
+            fetch_dest_leaf(addr, "cloudflare.com", std::time::Duration::from_secs(10))
+                .await
+                .expect("fetch cloudflare leaf");
+        assert!(fields.dns_sans.iter().any(|s| s.contains("cloudflare")));
+        assert!(!template.server_hello.extensions.is_empty());
+        assert!(template.cert_chain.leaf_der_len > 0);
     }
 
     #[tokio::test]
@@ -734,6 +768,39 @@ mod tests {
         assert!(cache.acceptor_for("not.configured").is_none()); // splice-only
     }
 
+    /// REALITY.5a Task 4: `prewarm` must cache a `ServerFlightTemplate`
+    /// alongside `StolenFields` for each successfully-warmed SNI, captured by
+    /// the same Chrome-faithful probe that produced the fields — one
+    /// connection yields both.
+    #[tokio::test]
+    async fn prewarm_caches_server_flight_template() {
+        let dest = spawn_local_dest().await;
+        let cache = RealityCertCache::prewarm(
+            &["good.test".to_owned()],
+            dest,
+            Duration::from_secs(3600),
+            Duration::from_secs(21600),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("boots with >=1 good SNI");
+
+        let t = cache.template_for("good.test").expect("template cached");
+        assert!(
+            !t.server_hello.extensions.is_empty(),
+            "captured ServerHello must carry at least one extension"
+        );
+        assert!(
+            t.cert_chain.leaf_der_len > 0,
+            "captured cert chain must record a non-empty leaf length"
+        );
+
+        assert!(
+            cache.template_for("not.configured").is_none(),
+            "an unconfigured SNI must have no cached template (splice-only)"
+        );
+    }
+
     #[tokio::test]
     async fn prewarm_fails_only_when_no_sni_prewarms() {
         // An unroutable dest (TEST-NET-1, discard port) fails for every SNI.
@@ -769,10 +836,39 @@ mod tests {
         assert!(cache.acceptor_for("anything.test").is_none());
     }
 
-    /// Build a throwaway forged acceptor (+ the `StolenFields` it was forged
-    /// from) for tests that only care about cache bookkeeping
-    /// (insert/replace/evict), not TLS behavior.
-    fn dummy_entry() -> (Arc<SslAcceptor>, Arc<StolenFields>) {
+    /// A throwaway `ServerFlightTemplate` for tests that only care about
+    /// cache bookkeeping, not the template's actual shape.
+    fn dummy_template() -> ServerFlightTemplate {
+        ServerFlightTemplate {
+            server_hello: yip_utls::ServerHelloShape {
+                cipher_suite: 0x1301,
+                legacy_compression_method: 0,
+                extensions: vec![(0x002b, vec![0x03, 0x04])],
+                key_share_group: 0x001d,
+            },
+            encrypted_flight: yip_utls::EncryptedFlightShape {
+                record_lengths: vec![64],
+                encrypted_extensions_len: 8,
+                certificate_len: 32,
+                certificate_verify_len: 16,
+                finished_len: 36,
+            },
+            cert_chain: yip_utls::CertChainShape {
+                leaf_der_len: 1,
+                intermediates_der: Vec::new(),
+            },
+        }
+    }
+
+    /// Build a throwaway forged acceptor (+ the `StolenFields`/
+    /// `ServerFlightTemplate` it was forged/captured from) for tests that
+    /// only care about cache bookkeeping (insert/replace/evict), not TLS
+    /// behavior.
+    fn dummy_entry() -> (
+        Arc<SslAcceptor>,
+        Arc<StolenFields>,
+        Arc<ServerFlightTemplate>,
+    ) {
         let fields = StolenFields {
             subject_cn: Some("dummy.test".to_owned()),
             dns_sans: vec!["dummy.test".to_owned()],
@@ -787,7 +883,7 @@ mod tests {
         };
         let key = KeyPair::generate().unwrap();
         let acceptor = Arc::new(build_forged_acceptor(&fields, &key).unwrap());
-        (acceptor, Arc::new(fields))
+        (acceptor, Arc::new(fields), Arc::new(dummy_template()))
     }
 
     /// A cache pre-seeded with a single entry for `name` stamped `fetched_at`
@@ -795,13 +891,14 @@ mod tests {
     /// real time, and without any network access.
     fn cache_with_entry(name: &str, fetched_at: Instant) -> RealityCertCache {
         let key = KeyPair::generate().unwrap();
-        let (acceptor, fields) = dummy_entry();
+        let (acceptor, fields, template) = dummy_entry();
         let mut entries = HashMap::new();
         entries.insert(
             name.to_owned(),
             CacheEntry {
                 acceptor,
                 fields,
+                template,
                 fetched_at,
             },
         );
@@ -816,12 +913,12 @@ mod tests {
     fn apply_refresh_full_success_replaces_entry_and_stamps_now() {
         let t0 = Instant::now();
         let cache = cache_with_entry("a.test", t0);
-        let (new_acc, new_fields) = dummy_entry();
+        let (new_acc, new_fields, new_template) = dummy_entry();
         let later = t0 + Duration::from_secs(10);
 
         let outcome = cache.apply_refresh(
             "a.test",
-            Some((Arc::clone(&new_acc), new_fields)),
+            Some((Arc::clone(&new_acc), new_fields, new_template)),
             later,
             Duration::from_secs(3600),
         );

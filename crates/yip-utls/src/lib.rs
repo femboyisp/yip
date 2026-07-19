@@ -9,7 +9,11 @@ pub mod handshake;
 pub mod hello;
 pub mod ja;
 pub mod stream;
+pub mod template;
 pub mod wire;
 
 pub use error::Error;
-pub use stream::{connect, RealityStream};
+pub use stream::{capture_dest_flight, connect, RealityStream};
+pub use template::{
+    CapturedFlight, CertChainShape, EncryptedFlightShape, ServerFlightTemplate, ServerHelloShape,
+};
