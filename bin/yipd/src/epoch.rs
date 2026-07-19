@@ -50,10 +50,28 @@ pub enum EpochInbound {
     TunThenSend(Vec<u8>, Vec<EgressDatagram>),
 }
 
+/// The responder's unconfirmed rekey epoch (§ `EpochSet::install_next`).
+/// Carries not just the derived [`DataPlane`] but the initiator ephemeral
+/// that produced it and the exact `[HandshakeResp]` bytes sent in reply, so
+/// a RETRANSMIT of the same rekey `Init` (identified by that ephemeral) can
+/// be answered idempotently — resend `cached_resp` verbatim, do not mint a
+/// second session (milestone 9a final review, the Critical fix: without
+/// this, a responder that re-ran `start_responder` on every retransmitted
+/// Init produced a NEW session each time, discarding the previous `next`,
+/// while the initiator locks onto the FIRST `[HandshakeResp]` it reads —
+/// the two sides diverge onto different epochs whenever the initiator
+/// retransmits before seeing the first reply (RTT > retry_ms) or a
+/// `[HandshakeResp]` is reordered/duplicated, black-holing the tunnel).
+pub struct NextEpoch {
+    pub(crate) dp: Box<DataPlane>,
+    pub(crate) init_eph: [u8; 32],
+    pub(crate) cached_resp: Vec<u8>,
+}
+
 pub struct EpochSet {
     pub(crate) current: Box<DataPlane>,
     pub(crate) current_created_ms: u64,
-    pub(crate) next: Option<Box<DataPlane>>,
+    pub(crate) next: Option<NextEpoch>,
     pub(crate) previous: Option<Box<DataPlane>>,
     pub(crate) previous_retire_ms: u64,
     pub(crate) rekey: Option<RekeyInFlight>,
@@ -110,12 +128,13 @@ impl EpochSet {
                 self.next
                     .as_mut()
                     .expect("checked is_some")
+                    .dp
                     .on_udp_datagram(dg, now_ms),
             );
             if !matches!(out, EpochInbound::None) {
                 // Confirmed: promote next -> current, old current -> previous.
                 let new = self.next.take().expect("checked is_some");
-                let old = std::mem::replace(&mut self.current, new);
+                let old = std::mem::replace(&mut self.current, new.dp);
                 self.current_created_ms = now_ms;
                 self.previous = Some(old);
                 self.previous_retire_ms = now_ms.saturating_add(PREVIOUS_EPOCH_GRACE_MS);
@@ -142,8 +161,34 @@ impl EpochSet {
 
     /// Responder: a new epoch derived from a received rekey Init, kept for
     /// inbound but NOT used for sending until confirmed (see `inbound_open`).
-    pub fn install_next(&mut self, new_dp: Box<DataPlane>) {
-        self.next = Some(new_dp);
+    /// Replaces any previously-held `next` — callers must only invoke this
+    /// for a GENUINELY new rekey round (a new `init_eph`); a retransmit of
+    /// the same round must be answered via [`Self::next_cached_resp_for`]
+    /// instead (see `NextEpoch`'s doc comment).
+    pub fn install_next(
+        &mut self,
+        new_dp: Box<DataPlane>,
+        init_eph: [u8; 32],
+        cached_resp: Vec<u8>,
+    ) {
+        self.next = Some(NextEpoch {
+            dp: new_dp,
+            init_eph,
+            cached_resp,
+        });
+    }
+
+    /// If `next` was installed from an Init bearing this exact `init_eph`,
+    /// return its cached `[HandshakeResp]` bytes — the idempotent reply for
+    /// a retransmit of that SAME rekey round. `None` if `next` is unset or
+    /// was installed from a DIFFERENT (or no) round, in which case the
+    /// caller must treat the Init as a new round (see `NextEpoch`'s doc
+    /// comment).
+    pub fn next_cached_resp_for(&self, init_eph: &[u8; 32]) -> Option<&[u8]> {
+        self.next
+            .as_ref()
+            .filter(|n| &n.init_eph == init_eph)
+            .map(|n| n.cached_resp.as_slice())
     }
 
     pub fn retire_previous_if_due(&mut self, now_ms: u64) {
@@ -329,7 +374,7 @@ mod tests {
         let (mut peer_new, us_new) = epoch_pair();
         let new_conn_tag = us_new.conn_tag();
 
-        set.install_next(us_new);
+        set.install_next(us_new, [0x11u8; 32], vec![0xEEu8; 4]);
         assert_eq!(set.current().conn_tag(), old_conn_tag, "current unchanged");
         assert!(set.next.is_some());
 
@@ -361,13 +406,46 @@ mod tests {
     }
 
     #[test]
+    fn next_cached_resp_for_matches_only_its_own_init_eph() {
+        // Critical-bug regression (9a final review): `install_next` must
+        // remember WHICH Init round produced `next` (its initiator
+        // ephemeral) and expose the cached resp only for that exact
+        // ephemeral, so a caller can distinguish "retransmit of the SAME
+        // round" (resend cached, don't rebuild) from "a genuinely new
+        // round" (rebuild).
+        let (_peer_old, us_old) = epoch_pair();
+        let mut set = EpochSet::new(us_old, 0);
+
+        let (_peer_new, us_new) = epoch_pair();
+        let eph = [0x77u8; 32];
+        let cached = vec![0xAAu8; 12];
+        set.install_next(us_new, eph, cached.clone());
+
+        assert_eq!(
+            set.next_cached_resp_for(&eph),
+            Some(cached.as_slice()),
+            "the SAME init_eph must hit the cache"
+        );
+        assert_eq!(
+            set.next_cached_resp_for(&[0x88u8; 32]),
+            None,
+            "a DIFFERENT init_eph must miss the cache"
+        );
+
+        // No `next` installed at all: always a miss.
+        let (_peer_bare, us_bare) = epoch_pair();
+        let bare = EpochSet::new(us_bare, 0);
+        assert_eq!(bare.next_cached_resp_for(&eph), None);
+    }
+
+    #[test]
     fn lost_msg2_leaves_both_on_old_no_blackhole() {
         let (mut peer_old, us_old) = epoch_pair();
         let old_conn_tag = us_old.conn_tag();
         let mut set = EpochSet::new(us_old, 0);
 
         let (_peer_new, us_new) = epoch_pair();
-        set.install_next(us_new);
+        set.install_next(us_new, [0x22u8; 32], vec![0xFFu8; 4]);
         assert!(set.next.is_some());
 
         // Never feed a `next` frame (models a lost msg2). Old-epoch frames
