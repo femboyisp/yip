@@ -641,25 +641,23 @@ impl PeerManager {
 
     /// Emit one rekey-related datagram into `self.egress`: relay-wrapped when
     /// `via_relay` (a `relay_wrap` `None` is a clean skip — the rekey just
-    /// retries), else addressed directly to `direct_dst`. Used by the rekey
-    /// cores so the Direct/Relay split lives in exactly one place.
-    fn push_rekey_egress(
-        &mut self,
-        idx: usize,
-        bytes: Vec<u8>,
-        via_relay: bool,
-        direct_dst: SocketAddr,
-    ) {
+    /// retries), else pushed AS-IS. Used by the rekey cores so the
+    /// Direct/Relay split lives in exactly one place.
+    ///
+    /// Takes the full `EgressDatagram` (not bare bytes) so the Direct path
+    /// preserves whatever `fate`/`dst` the caller built — `fate: 0` for
+    /// handshake emits (a Resp/cached-resp has no FEC object), but the REAL
+    /// per-FEC-object `fate` for `rekey_resp_core`'s prime-emit (#91 Task 1
+    /// review, Important). The relay path only ever needs `.bytes` (the
+    /// inner `fate` rides inside the `RelaySend` payload; the outer
+    /// `RelaySend`'s own fate is `relay_wrap`'s, moot for the inner one).
+    fn push_rekey_egress(&mut self, idx: usize, dg: EgressDatagram, via_relay: bool) {
         if via_relay {
-            if let Some(d) = self.relay_wrap(idx, bytes) {
+            if let Some(d) = self.relay_wrap(idx, dg.bytes) {
                 self.egress.push(d);
             }
         } else {
-            self.egress.push(EgressDatagram {
-                fate: 0,
-                dst: direct_dst,
-                bytes,
-            });
+            self.egress.push(dg);
         }
     }
 
@@ -1637,14 +1635,25 @@ impl PeerManager {
         };
 
         if self.peers[idx].cached_resp_init_eph == Some(init_eph) {
-            self.egress.clear();
-            if let Some(resp) = self.peers[idx].cached_resp.clone() {
-                self.push_rekey_egress(idx, resp, via_relay, peer_addr);
-            }
-            return if self.egress.is_empty() {
-                DispatchOut::None
-            } else {
-                DispatchOut::Udp(&self.egress)
+            return match self.peers[idx].cached_resp.clone() {
+                Some(resp) => {
+                    self.egress.clear();
+                    self.push_rekey_egress(
+                        idx,
+                        EgressDatagram {
+                            fate: 0,
+                            dst: peer_addr,
+                            bytes: resp,
+                        },
+                        via_relay,
+                    );
+                    if self.egress.is_empty() {
+                        DispatchOut::None
+                    } else {
+                        DispatchOut::Udp(&self.egress)
+                    }
+                }
+                None => DispatchOut::None,
             };
         }
 
@@ -1654,7 +1663,15 @@ impl PeerManager {
 
         if let Some(cached) = epochs.next_cached_resp_for(&init_eph).map(<[u8]>::to_vec) {
             self.egress.clear();
-            self.push_rekey_egress(idx, cached, via_relay, peer_addr);
+            self.push_rekey_egress(
+                idx,
+                EgressDatagram {
+                    fate: 0,
+                    dst: peer_addr,
+                    bytes: cached,
+                },
+                via_relay,
+            );
             return if self.egress.is_empty() {
                 DispatchOut::None
             } else {
@@ -1666,14 +1683,25 @@ impl PeerManager {
             unreachable!("state cannot change between the two borrows above")
         };
         if !epochs.accept_rekey_init(now_ms, self.rekey_interval_ms) {
-            self.egress.clear();
-            if let Some(resp) = self.peers[idx].cached_resp.clone() {
-                self.push_rekey_egress(idx, resp, via_relay, peer_addr);
-            }
-            return if self.egress.is_empty() {
-                DispatchOut::None
-            } else {
-                DispatchOut::Udp(&self.egress)
+            return match self.peers[idx].cached_resp.clone() {
+                Some(resp) => {
+                    self.egress.clear();
+                    self.push_rekey_egress(
+                        idx,
+                        EgressDatagram {
+                            fate: 0,
+                            dst: peer_addr,
+                            bytes: resp,
+                        },
+                        via_relay,
+                    );
+                    if self.egress.is_empty() {
+                        DispatchOut::None
+                    } else {
+                        DispatchOut::Udp(&self.egress)
+                    }
+                }
+                None => DispatchOut::None,
             };
         }
 
@@ -1695,7 +1723,15 @@ impl PeerManager {
         epochs.install_next(dp, init_eph, resp_pkt.clone());
 
         self.egress.clear();
-        self.push_rekey_egress(idx, resp_pkt, via_relay, peer_addr);
+        self.push_rekey_egress(
+            idx,
+            EgressDatagram {
+                fate: 0,
+                dst: peer_addr,
+                bytes: resp_pkt,
+            },
+            via_relay,
+        );
         if self.egress.is_empty() {
             DispatchOut::None
         } else {
@@ -1902,27 +1938,24 @@ impl PeerManager {
         ));
 
         // Prime the new epoch (BEFORE `dp` moves into `promote_from_rekey`
-        // below), emitting via the helper.
+        // below), emitting via the helper. Clone the FULL `EgressDatagram`s
+        // (not just `.bytes`) so the Direct path preserves the real
+        // per-FEC-object `fate` `dp.on_tun_packet` assigns (byte-identical to
+        // the pre-refactor `.cloned()`) — `push_rekey_egress` relay-wraps
+        // `.bytes` alone for the relay path, so cloning the full datagram
+        // here costs nothing there.
         let pending = std::mem::take(&mut self.peers[idx].pending_tun);
         self.egress.clear();
-        let primed: Vec<Vec<u8>> = if pending.is_empty() {
-            dp.on_tun_packet(&[], now_ms)
-                .iter()
-                .map(|d| d.bytes.clone())
-                .collect()
+        let primed: Vec<EgressDatagram> = if pending.is_empty() {
+            dp.on_tun_packet(&[], now_ms).to_vec()
         } else {
             pending
                 .iter()
-                .flat_map(|inner| {
-                    dp.on_tun_packet(inner, now_ms)
-                        .iter()
-                        .map(|d| d.bytes.clone())
-                        .collect::<Vec<_>>()
-                })
+                .flat_map(|inner| dp.on_tun_packet(inner, now_ms).to_vec())
                 .collect()
         };
-        for bytes in primed {
-            self.push_rekey_egress(idx, bytes, via_relay, peer_addr);
+        for dg in primed {
+            self.push_rekey_egress(idx, dg, via_relay);
         }
 
         let old_tag = {
@@ -3556,6 +3589,82 @@ mod tests {
             DispatchOut::Tun(buf) => assert_eq!(buf, new_payload.as_slice()),
             _ => panic!("expected the new-epoch frame to open via `current`"),
         }
+    }
+
+    /// Regression for the #91 Task 1 review Important finding: the
+    /// prime-emit in `rekey_resp_core` (draining `pending_tun` through the
+    /// NEW epoch's `dp.on_tun_packet(..)`) must preserve each datagram's real
+    /// per-FEC-object `fate` (`sym.object_id`, distinct per queued
+    /// `pending_tun` packet) on the Direct path — NOT hardcode `fate: 0` as
+    /// `push_rekey_egress` does for handshake emits (correct there: a
+    /// Resp/cached-resp has no FEC object). Dropping `fate` to a shared 0
+    /// silently defeats GSO coalescing (`yip_io::gso::partition_fate_safe`
+    /// treats equal `fate` as non-coalescable) for every 2nd+ primed
+    /// datagram — a real GSO-perf divergence from the pre-refactor
+    /// `.cloned()` of the full `EgressDatagram`s, even though it is never an
+    /// FEC-safety violation.
+    #[test]
+    fn rekey_resp_prime_emit_preserves_distinct_fec_fate() {
+        let (mut pm_a, mut pm_b, ep_a, ep_b, kp_a, kp_b) = established_pm_pair(100);
+
+        // Queue 2 distinct TUN packets directly into `pending_tun` — the
+        // field the prime-emit drains — so `rekey_resp_core` primes the new
+        // epoch with 2 separate `dp.on_tun_packet(..)` calls, each of which
+        // allocates a fresh FEC object id (see
+        // `yip_transport::fec::Encoder::encode`, `next_object_id`). A real
+        // in-flight-rekey run only ever gets pending_tun populated while
+        // `Handshaking`/`Idle`, not `Established` — direct field access is
+        // the pragmatic way to drive this Established-peer scenario in a
+        // unit test (an Established peer's own `on_tun` sends straight
+        // through `current`, never touching `pending_tun`).
+        pm_a.peers[0].pending_tun.push(vec![0x11u8; 40]);
+        pm_a.peers[0].pending_tun.push(vec![0x22u8; 40]);
+
+        // Splice a `RekeyInFlight` into A's `EpochSet`, exactly as the
+        // sibling `rekey_resp_promotes_initiator_and_keeps_previous_for_grace`
+        // test does, to drive rekey completion without depending on
+        // `tick`'s glare-winner scheduling.
+        let (hs, init_pkt) =
+            HandshakeState::start_initiator(&kp_a.private, &kp_b.public, &[]).unwrap();
+        {
+            let PeerState::Established(epochs) = &mut pm_a.peers[0].state else {
+                panic!("pm_a must be Established");
+            };
+            epochs.rekey = Some(crate::epoch::RekeyInFlight {
+                hs,
+                init_pkt: init_pkt.clone(),
+                started_ms: 100,
+                last_sent_ms: 100,
+                retry_ms: 1000,
+                target: ep_b,
+            });
+        }
+
+        let resp = resp_bytes(&pm_b.on_udp(ep_a, &init_pkt, 100));
+        assert_eq!(resp.len(), 1, "a genuine rekey Init must produce a Resp");
+
+        // Complete the rekey on A: this drives `rekey_resp_core`'s
+        // prime-emit over the 2 queued `pending_tun` packets.
+        let out = pm_a.on_udp(ep_b, &resp[0], 100);
+        let primed: Vec<EgressDatagram> = match out {
+            DispatchOut::Udp(e) => e.to_vec(),
+            _ => panic!("expected Udp egress (the primed new-epoch frames)"),
+        };
+        assert!(
+            primed.len() >= 2,
+            "2 distinct pending_tun packets must prime at least 2 egress datagrams, got {}",
+            primed.len()
+        );
+
+        let fates: std::collections::HashSet<u16> = primed.iter().map(|d| d.fate).collect();
+        assert!(
+            fates.len() >= 2,
+            "primed datagrams from 2 distinct pending_tun packets must carry DISTINCT FEC \
+             fates (one per FEC object), not all collapsed to a shared value \
+             (fate: 0) — got fates {:?} across {} datagrams",
+            primed.iter().map(|d| d.fate).collect::<Vec<_>>(),
+            primed.len()
+        );
     }
 
     /// `pm`'s Established peer 0's `next` epoch's `conn_tag`, panicking if
