@@ -21,14 +21,9 @@ pub const PREVIOUS_EPOCH_GRACE_MS: u64 = 15_000;
 /// An in-flight initiator rekey handshake, held alongside the live `current`
 /// so the session never pauses. Mirrors `HandshakingState`'s retransmit fields.
 pub struct RekeyInFlight {
-    /// Read by rekey *completion* (initiator `read_response`) in Task 4;
-    /// Task 3 only schedules/retransmits/abandons, so this field is written
-    /// (constructed, and cleared via `EpochSet::rekey = None` on abandon) but
-    /// not yet read here.
-    #[expect(
-        dead_code,
-        reason = "read by rekey completion (initiator read_response) in Task 4"
-    )]
+    /// Read by rekey *completion* (`PeerManager::handle_rekey_resp`'s
+    /// `rk.hs.read_response(dg)`, Task 4). Task 3 only schedules/
+    /// retransmits/abandons.
     pub hs: HandshakeState,
     pub init_pkt: Vec<u8>,
     pub started_ms: u64,
@@ -64,13 +59,6 @@ pub struct EpochSet {
     pub(crate) rekey: Option<RekeyInFlight>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "driven by PeerManager once Task 2/3 wires EpochSet in"
-    )
-)]
 impl EpochSet {
     pub fn new(current: Box<DataPlane>, now_ms: u64) -> Self {
         Self {
