@@ -1030,16 +1030,29 @@ impl PeerManager {
         }
 
         match &self.peers[idx].state {
-            PeerState::Established(_) => match self.peers[idx].cached_resp.clone() {
-                Some(resp) => {
-                    self.egress.clear();
-                    if let Some(d) = self.relay_wrap(idx, resp) {
-                        self.egress.push(d);
-                    }
-                    DispatchOut::Udp(&self.egress)
-                }
-                None => DispatchOut::None,
-            },
+            // Established (9a/relay-path completion, #91 Task 2): route
+            // through the shared core exactly like the direct path's
+            // `handle_handshake_init` does. `rekey_init_core`'s
+            // `cached_resp_init_eph` dedup subsumes the old unconditional
+            // `cached_resp` resend below: a cold-start Init retransmit
+            // (ephemeral matches `cached_resp_init_eph`, set when the Idle
+            // branch below first cached its resp) still resends
+            // `cached_resp` verbatim; a genuine mid-session rekey Init
+            // installs `next` instead.
+            PeerState::Established(_) => {
+                let Some(init_eph) = crate::handshake::init_ephemeral(dg) else {
+                    return DispatchOut::None; // malformed Init
+                };
+                self.rekey_init_core(
+                    idx,
+                    established,
+                    resp_pkt,
+                    init_eph,
+                    now_ms,
+                    self.server_addr(),
+                    true,
+                )
+            }
             PeerState::Handshaking(_) if self.local_pub < self.peers[idx].pubkey => {
                 DispatchOut::None
             }
@@ -1094,6 +1107,15 @@ impl PeerManager {
     /// Relay-path counterpart of [`handle_handshake_resp`]: complete a relayed
     /// `[HandshakeResp]` from peer `idx` and commit `PathKind::Relayed`.
     fn relayed_handshake_resp(&mut self, idx: usize, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
+        // Established with a rekey in flight (#91 Task 2): this is the
+        // relay-path completion of a mid-session rekey — route through the
+        // shared core exactly like the direct path's `handle_rekey_resp`.
+        // An Established peer with NO rekey in flight still falls through
+        // to the check below and drops (unchanged).
+        if matches!(&self.peers[idx].state, PeerState::Established(epochs) if epochs.rekey.is_some())
+        {
+            return self.rekey_resp_core(idx, dg, now_ms, true);
+        }
         if !matches!(self.peers[idx].state, PeerState::Handshaking(_)) {
             return DispatchOut::None;
         }
@@ -4648,6 +4670,288 @@ mod tests {
                     Some(yip_rendezvous::Message::RelaySend { .. })
                 )),
             "the relay attempt keeps retransmitting via the server, unbroken by the stray reply"
+        );
+    }
+
+    // ── #91 Task 2: relay-path rekey completion ─────────────────────────────
+
+    /// Build a `PeerManager` (with a `MockRdv` rendezvous, so `relay_wrap`
+    /// succeeds) whose sole peer is already `Established` AND relay-reached
+    /// (`relay = true`, `path_kind = Relayed`) — mirroring the state
+    /// `relayed_handshake_init`'s own Idle branch commits at cold start,
+    /// without needing a second full `PeerManager` on the "peer" side. The
+    /// `current` epoch is a `fake_established_dataplane` (crypto-agnostic
+    /// stand-in, exactly like `anti_hijack_established_peer_ignores_*`'s
+    /// splice): rekey completion never reads `current`'s own key material,
+    /// only its `conn_tag`/existence, so the fake is sufficient here — the
+    /// GENUINE crypto in each test below is the fresh rekey Init/Resp itself.
+    fn established_relay_pm(
+        rekey_interval_ms: u64,
+    ) -> (
+        PeerManager,
+        yip_crypto::Keypair,
+        yip_crypto::Keypair,
+        u64, // old (current) conn_tag
+    ) {
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
+        pm.rekey_interval_ms = rekey_interval_ms;
+
+        const OLD_TAG: u64 = 0xAAAA_BBBB_CCCC_DDDD;
+        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(OLD_TAG, mock_server())),
+            0,
+        )));
+        pm.by_tag.insert(OLD_TAG, 0);
+        pm.peers[0].relay = true;
+        pm.peers[0].path_kind = Some(PathKind::Relayed);
+
+        (pm, local, peer_kp, OLD_TAG)
+    }
+
+    /// Copy out every `[HandshakeResp]` payload carried inside a
+    /// relay-wrapped (`RelaySend`) egress datagram — the relay-path
+    /// counterpart of `resp_bytes`, which expects the Resp unwrapped (as on
+    /// the direct path).
+    fn relayed_resp_bytes(out: &DispatchOut<'_>) -> Vec<Vec<u8>> {
+        let egress: &[EgressDatagram] = match out {
+            DispatchOut::Udp(e) | DispatchOut::Both(_, e) => e,
+            _ => &[],
+        };
+        egress
+            .iter()
+            .filter_map(|d| match yip_rendezvous::decode(&d.bytes) {
+                Some(yip_rendezvous::Message::RelaySend { payload, .. })
+                    if payload.first() == Some(&(PacketType::HandshakeResp as u8)) =>
+                {
+                    Some(payload)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Wrap `payload` (raw handshake bytes) as a `RelayDeliver` datagram from
+    /// `src_kp`, as the server would forward it — the input side of the
+    /// relay tests below, mirroring `anti_hijack_established_peer_ignores_relayed_handshake_init`.
+    fn relay_deliver(src_kp: &yip_crypto::Keypair, payload: Vec<u8>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::RelayDeliver {
+                src: node_id(&src_kp.public),
+                payload,
+            },
+            &mut buf,
+        );
+        buf
+    }
+
+    #[test]
+    fn relay_rekey_init_retransmit_is_idempotent_new_ephemeral_builds_new_next() {
+        // Relay-path counterpart of
+        // `retransmitted_rekey_init_is_idempotent_new_ephemeral_builds_new_next`:
+        // a relay-Established responder receiving a rekey `Init` through the
+        // relay must dedupe identically — same ephemeral resends the SAME
+        // cached (relay-wrapped) Resp and does NOT mint a second `next`; a
+        // genuinely new ephemeral DOES build a new `next`.
+        let (mut pm, local, peer_kp, _old_tag) = established_relay_pm(100);
+
+        let (_hs1, init_pkt_1) =
+            HandshakeState::start_initiator(&peer_kp.private, &local.public, &[]).unwrap();
+        let buf1 = relay_deliver(&peer_kp, init_pkt_1.clone());
+
+        // First delivery at t=100 (current age 100 >= interval/2 = 50):
+        // installs `next`, replies via the relay.
+        let out1 = pm.on_udp(mock_server(), &buf1, 100);
+        let resp1 = relayed_resp_bytes(&out1);
+        assert_eq!(
+            resp1.len(),
+            1,
+            "a genuine relay rekey Init must produce a relay-wrapped Resp"
+        );
+        let next_tag_1 = next_conn_tag(&pm);
+
+        // RETRANSMIT: identical Init bytes -> identical ephemeral. Must
+        // resend the SAME cached Resp and must NOT rebuild `next`.
+        let out2 = pm.on_udp(mock_server(), &buf1, 150);
+        let resp2 = relayed_resp_bytes(&out2);
+        assert_eq!(
+            resp2, resp1,
+            "a retransmitted relay rekey Init must resend the cached Resp verbatim"
+        );
+        assert_eq!(
+            next_conn_tag(&pm),
+            next_tag_1,
+            "a retransmitted relay rekey Init must NOT mint a second `next` session"
+        );
+
+        // A second retransmit, again: still idempotent.
+        let out3 = pm.on_udp(mock_server(), &buf1, 200);
+        assert_eq!(relayed_resp_bytes(&out3), resp1);
+        assert_eq!(next_conn_tag(&pm), next_tag_1);
+
+        // A GENUINELY NEW Init (fresh ephemeral) DOES build a new `next`,
+        // replacing the old one.
+        let (_hs2, init_pkt_2) =
+            HandshakeState::start_initiator(&peer_kp.private, &local.public, &[]).unwrap();
+        assert_ne!(
+            init_pkt_1, init_pkt_2,
+            "sanity: the two Inits must actually differ"
+        );
+        let buf2 = relay_deliver(&peer_kp, init_pkt_2);
+        let out4 = pm.on_udp(mock_server(), &buf2, 250);
+        let resp4 = relayed_resp_bytes(&out4);
+        assert_eq!(resp4.len(), 1);
+        assert_ne!(
+            resp4, resp1,
+            "a genuinely new relay rekey round must produce a NEW Resp"
+        );
+        assert_ne!(
+            next_conn_tag(&pm),
+            next_tag_1,
+            "a genuinely new relay rekey round must replace `next`"
+        );
+    }
+
+    #[test]
+    fn relay_rekey_resp_completes_and_promotes() {
+        // Relay-path counterpart of
+        // `rekey_resp_promotes_initiator_and_keeps_previous_for_grace`: a
+        // relay-Established peer with a rekey in flight, on receiving the
+        // matching relayed `[HandshakeResp]`, must promote exactly like the
+        // direct path — `current` becomes the new epoch, the old epoch
+        // moves to `previous`, `rekey` clears, and `by_tag` is updated.
+        let (mut pm, local, peer_kp, old_tag) = established_relay_pm(100);
+
+        // Splice a `RekeyInFlight` in as the INITIATOR side (pm's own rekey
+        // attempt), exactly as the direct-path sibling test does.
+        let (hs, init_pkt) =
+            HandshakeState::start_initiator(&local.private, &peer_kp.public, &[]).unwrap();
+        {
+            let PeerState::Established(epochs) = &mut pm.peers[0].state else {
+                panic!("pm must be Established");
+            };
+            epochs.rekey = Some(crate::epoch::RekeyInFlight {
+                hs,
+                init_pkt: init_pkt.clone(),
+                started_ms: 100,
+                last_sent_ms: 100,
+                retry_ms: 1000,
+                target: mock_server(), // unused: the relay path overrides addressing
+            });
+        }
+
+        // The peer's real responder completes the handshake and builds the
+        // matching Resp — mirrors what a genuine peer PeerManager would send.
+        let (_established, resp_pkt, remote_static, _payload) =
+            HandshakeState::start_responder(&peer_kp.private, &init_pkt, &[]).unwrap();
+        assert_eq!(
+            remote_static, local.public,
+            "sanity: Resp matches pm's own Init"
+        );
+
+        let buf = relay_deliver(&peer_kp, resp_pkt);
+        let out = pm.on_udp(mock_server(), &buf, 100);
+
+        // The prime-emit (empty pending_tun -> one bare new-epoch frame) must
+        // go out relay-wrapped, not bare.
+        let egress: &[EgressDatagram] = match &out {
+            DispatchOut::Udp(e) => e,
+            _ => panic!("expected relay-wrapped prime-emit egress"),
+        };
+        assert!(!egress.is_empty(), "the prime-emit must produce egress");
+        assert!(
+            egress.iter().all(|d| matches!(
+                yip_rendezvous::decode(&d.bytes),
+                Some(yip_rendezvous::Message::RelaySend { .. })
+            )),
+            "the prime-emit must be relay-wrapped (RelaySend), not sent bare"
+        );
+
+        let new_tag = established_tag(&pm, 0).unwrap();
+        assert_ne!(new_tag, old_tag, "current must become the NEW epoch");
+        match &pm.peers[0].state {
+            PeerState::Established(epochs) => {
+                assert!(
+                    epochs.rekey.is_none(),
+                    "rekey must be cleared on completion"
+                );
+                assert!(epochs.previous.is_some(), "old epoch must move to previous");
+                assert_eq!(
+                    epochs.previous.as_ref().unwrap().conn_tag(),
+                    old_tag,
+                    "previous must hold the OLD epoch"
+                );
+            }
+            _ => panic!("pm must still be Established"),
+        }
+        assert_eq!(
+            pm.by_tag.get(&new_tag),
+            Some(&0),
+            "by_tag updated for the new conn_tag"
+        );
+        assert_eq!(
+            pm.by_tag.get(&old_tag),
+            None,
+            "by_tag no longer maps the retired old conn_tag"
+        );
+    }
+
+    #[test]
+    fn relay_rekey_emit_is_noop_when_relay_wrap_returns_none() {
+        // Fail-closed regression: if `relay_wrap` cannot emit (no rendezvous
+        // configured), a relay rekey Init at an Established peer must be a
+        // clean no-op — no egress, and `current` is left completely intact.
+        // (No rendezvous means `on_udp` could never route a `RelayDeliver`
+        // here in production; the relay handler is called directly to
+        // exercise the wiring's fail-closed behavior in isolation.)
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let mut pm = PeerManager::new(
+            local.private,
+            local.public,
+            &[peer],
+            TunnelMode::L3Tun,
+            None, // no rendezvous configured
+            None,
+            false,
+        );
+        pm.rekey_interval_ms = 100;
+
+        const OLD_TAG: u64 = 0x1234_5678_9ABC_DEF0;
+        let placeholder: SocketAddr = "203.0.113.1:51821".parse().unwrap();
+        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(OLD_TAG, placeholder)),
+            0,
+        )));
+        pm.by_tag.insert(OLD_TAG, 0);
+        pm.peers[0].relay = true;
+        pm.peers[0].path_kind = Some(PathKind::Relayed);
+
+        let (_hs, init_pkt) =
+            HandshakeState::start_initiator(&peer_kp.private, &local.public, &[]).unwrap();
+
+        assert!(
+            matches!(
+                pm.relayed_handshake_init(0, &init_pkt, 100),
+                DispatchOut::None
+            ),
+            "no rendezvous -> relay_wrap fails -> no egress"
+        );
+
+        assert_eq!(
+            established_tag(&pm, 0),
+            Some(OLD_TAG),
+            "current must remain intact when the relay emit fails"
         );
     }
 
