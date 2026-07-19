@@ -752,14 +752,14 @@ impl PeerManager {
         Some(vec![dg])
     }
 
-    /// Mid-session rekey scheduler (9a Task 3), driven once per tick for an
-    /// `Established` peer `idx` (`relay` mirrors `tick_dispatch`'s
-    /// same-named local — whether `idx` is relay-reached). Starts a fresh
-    /// initiator rekey handshake when due, retransmits one already in
-    /// flight, or abandons it — entirely alongside `epochs.current`, which
-    /// this function never touches: a failed/abandoned rekey is therefore a
-    /// no-op on the live session (fail-closed). Any egress produced is
-    /// pushed onto `self.tick_egress`.
+    /// Mid-session rekey scheduler (9a Task 3, relay-completed in #91 Task
+    /// 3), driven once per tick for an `Established` peer `idx` (`relay`
+    /// mirrors `tick_dispatch`'s same-named local — whether `idx` is
+    /// relay-reached). Starts a fresh initiator rekey handshake when due,
+    /// retransmits one already in flight, or abandons it — entirely
+    /// alongside `epochs.current`, which this function never touches: a
+    /// failed/abandoned rekey is therefore a no-op on the live session
+    /// (fail-closed). Any egress produced is pushed onto `self.tick_egress`.
     ///
     /// Mirrors `begin_handshake`'s initiator construction (same
     /// `cert_payload`, same relay/direct wrap, same `jitter_ms`-derived
@@ -769,6 +769,18 @@ impl PeerManager {
     /// does not transition `PeerState` (the peer stays `Established`) and
     /// does not emit an obfuscation junk burst (Task 3 scope: scheduling
     /// only, not a new decoy shape).
+    ///
+    /// Relay-reached peers (`relay == true`) DO get scheduled here (#91 Task
+    /// 3 removed the earlier gate, now that `rekey_resp_core`/the relay
+    /// handshake handlers complete a relay rekey): the Init is emitted via
+    /// `relay_wrap` (a `RelaySend` to the rendezvous server) instead of a raw
+    /// datagram to a direct endpoint, and `RekeyInFlight.target` is set to
+    /// `self.server_addr()` (nominal — `rekey_resp_core` uses `server_addr()`
+    /// as a relay peer's `peer_addr` too). A `relay_wrap` `None` (no
+    /// rendezvous configured — should not happen for a peer marked `relay`)
+    /// skips *this send only*: `RekeyInFlight` is still installed/retried, so
+    /// the round is not aborted (fail-closed, same spirit as the rest of this
+    /// function).
     fn drive_rekey_schedule(
         &mut self,
         idx: usize,
@@ -776,21 +788,6 @@ impl PeerManager {
         epochs: &mut crate::epoch::EpochSet,
         now_ms: u64,
     ) {
-        // Relay-reached peers: do NOT schedule a mid-session rekey. Rekey
-        // COMPLETION is only wired for the direct handshake handlers
-        // (`handle_handshake_resp`/`handle_handshake_init`'s glare-loser
-        // path) — `relayed_handshake_init`/`relayed_handshake_resp` never
-        // call `promote_from_rekey`/`install_next`. A rekey started here for
-        // a relay peer could therefore never complete: it would retransmit
-        // until `HANDSHAKE_TOTAL_MS`, get abandoned, and — since the epoch
-        // age is still past the threshold — restart on the very next tick,
-        // forever. That's wasted relay bandwidth and a constant ~1 Hz
-        // `[HandshakeInit]` cadence (a DPI fingerprint), for zero benefit
-        // (fail-closed: `current` is never touched either way). Wiring relay
-        // rekey completion is left to a follow-up.
-        if relay {
-            return;
-        }
         if epochs.rekey.is_none() {
             // Glare tiebreak: reuse the EXACT static-key-order comparison
             // `handle_handshake_init`/`relayed_handshake_init` use to decide
@@ -803,14 +800,19 @@ impl PeerManager {
             if !epochs.needs_rekey(now_ms, is_glare_winner, self.rekey_interval_ms) {
                 return;
             }
-            // `relay` peers already returned above, so this is always the
-            // direct path: target this peer's known endpoint.
-            let target = match self.peers[idx].endpoint {
-                Some(ep) => ep,
-                // No known direct endpoint this tick (shouldn't normally
-                // happen for a non-relay Established peer): skip: no
-                // egress, no state change, retried next tick.
-                None => return,
+            // Direct: target this peer's known endpoint (no known endpoint
+            // this tick — shouldn't normally happen for a non-relay
+            // Established peer — skips: no egress, no state change, retried
+            // next tick). Relay: nominal target is the rendezvous server
+            // (`rekey_resp_core` uses `server_addr()` as a relay peer's
+            // `peer_addr` too), and there is no endpoint to be missing.
+            let target = if relay {
+                self.server_addr()
+            } else {
+                match self.peers[idx].endpoint {
+                    Some(ep) => ep,
+                    None => return,
+                }
             };
             let pubkey = self.peers[idx].pubkey;
             let payload = self
@@ -826,11 +828,6 @@ impl PeerManager {
                         return;
                     }
                 };
-            let dg = EgressDatagram {
-                fate: 0,
-                dst: target,
-                bytes: init_pkt.clone(),
-            };
             let retry_ms = if self.obf_key.is_some() {
                 jitter_ms(HANDSHAKE_RETRY_MS)
             } else {
@@ -838,13 +835,27 @@ impl PeerManager {
             };
             epochs.rekey = Some(crate::epoch::RekeyInFlight {
                 hs,
-                init_pkt,
+                init_pkt: init_pkt.clone(),
                 started_ms: now_ms,
                 last_sent_ms: now_ms,
                 retry_ms,
                 target,
             });
-            self.tick_egress.push(dg);
+            if relay {
+                // A `None` (no rendezvous configured — should not happen for
+                // a peer marked `relay`) skips this send only: the round
+                // stays installed above and retries on the next tick's
+                // retransmit arm.
+                if let Some(d) = self.relay_wrap(idx, init_pkt) {
+                    self.tick_egress.push(d);
+                }
+            } else {
+                self.tick_egress.push(EgressDatagram {
+                    fate: 0,
+                    dst: target,
+                    bytes: init_pkt,
+                });
+            }
             return;
         }
 
@@ -875,13 +886,20 @@ impl PeerManager {
             .expect("checked is_some above")
             .init_pkt
             .clone();
-        // `relay` peers already returned above, so this is always the
-        // direct path.
-        let dg = EgressDatagram {
-            fate: 0,
-            dst: target,
-            bytes: pkt,
-        };
+        // Resend the SAME `init_pkt` verbatim, relay-wrapped when `relay`
+        // (a `relay_wrap` `None` skips this send only — the round stays in
+        // flight and retries again next tick), else direct to `target`.
+        if relay {
+            if let Some(d) = self.relay_wrap(idx, pkt) {
+                self.tick_egress.push(d);
+            }
+        } else {
+            self.tick_egress.push(EgressDatagram {
+                fate: 0,
+                dst: target,
+                bytes: pkt,
+            });
+        }
         let new_retry_ms = if self.obf_key.is_some() {
             jitter_ms(HANDSHAKE_RETRY_MS)
         } else {
@@ -891,7 +909,6 @@ impl PeerManager {
             rk.last_sent_ms = now_ms;
             rk.retry_ms = new_retry_ms;
         }
-        self.tick_egress.push(dg);
     }
 
     /// Emit a `lookup(peer_node)` for peer `idx`, debounced to at most one per
@@ -3287,27 +3304,23 @@ mod tests {
     }
 
     /// A relay-reached `Established` peer (`relay == true`, mirroring how
-    /// `relayed_handshake_init`/`relayed_handshake_resp` leave a peer) must
-    /// NOT have a mid-session rekey scheduled by `tick`/`drive_rekey_schedule`,
-    /// even when it is the glare-winner and well past `rekey_interval_ms`.
-    /// Rekey COMPLETION is only wired for the direct handshake handlers
-    /// (`handle_handshake_resp` et al.) — `relayed_handshake_init`/
-    /// `relayed_handshake_resp` never call `promote_from_rekey`/`install_next`
-    /// for a relay session — so a relay rekey scheduled here can never
-    /// complete: it would retransmit for `HANDSHAKE_TOTAL_MS`, get abandoned,
-    /// and (since the epoch age is still past the threshold) immediately
-    /// restart, forever. Contrast with `tick_initiates_rekey_for_established_winner_once`,
-    /// whose otherwise-identical direct peer (`relay == false`) does rekey.
+    /// `relayed_handshake_init`/`relayed_handshake_resp` leave a peer) DOES
+    /// have a mid-session rekey scheduled by `tick`/`drive_rekey_schedule`
+    /// when it is the glare-winner and past `rekey_interval_ms` (#91 Task 3:
+    /// rekey completion is now wired for the relay handshake handlers, so
+    /// the gate that used to suppress relay scheduling is gone). The Init is
+    /// relay-wrapped (`relay_wrap` → a `RelaySend` to the rendezvous server),
+    /// not sent as a raw `[HandshakeInit]` to a direct endpoint. Contrast
+    /// with `tick_initiates_rekey_for_established_winner_once`, whose
+    /// otherwise-identical direct peer (`relay == false`) emits the Init
+    /// un-wrapped.
     #[test]
-    fn tick_does_not_rekey_relay_peer() {
+    fn tick_schedules_rekey_for_relay_winner_via_relay_wrap() {
         let (mut pm, tag, _ep) = pm_with_established_peer([1u8; 32], [2u8; 32], 100);
         pm.peers[0].relay = true;
         // A relay-reached peer routes rekey Inits through `relay_wrap`, which
-        // needs a configured `Rendezvous` to succeed (with none, the pre-fix
-        // code already silently drops the attempt — that would make this
-        // test pass for the wrong reason). Wire up the same `MockRdv` the
-        // rendezvous-wiring tests use so a pre-fix build genuinely emits the
-        // rekey `HandshakeInit` via the relay.
+        // needs a configured `Rendezvous` to succeed. Wire up the same
+        // `MockRdv` the rendezvous-wiring tests use.
         let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         pm.rendezvous = Some(Box::new(MockRdv {
             server: mock_server(),
@@ -3317,40 +3330,36 @@ mod tests {
         // past this test's horizon, so `tick_dispatch`'s periodic
         // registration refresh (a `Register` datagram, wire tag 0 — the same
         // numeric value as `PacketType::HandshakeInit`) never fires and
-        // confounds the `has_handshake_init` assertions below.
+        // confounds the `has_handshake_init`/`has_relayed_handshake_init`
+        // assertions below.
         pm.registered_once = true;
         pm.last_register_ms = 150;
         pm.reg_refresh_ms = u64::MAX;
 
-        // Past the interval (age 150 >= 100): a direct peer would rekey here
-        // (see `tick_initiates_rekey_for_established_winner_once`), but a
-        // relay peer must not.
+        // Past the interval (age 150 >= 100): a relay peer now rekeys here,
+        // just like a direct peer (see
+        // `tick_initiates_rekey_for_established_winner_once`), but the Init
+        // rides inside a relay-wrapped `RelaySend`, not a raw datagram.
         let out = pm.tick(150).map(<[EgressDatagram]>::to_vec);
         assert!(
-            !has_handshake_init(out.as_deref()) && !has_relayed_handshake_init(out.as_deref()),
-            "a relay peer must not emit a rekey HandshakeInit, even as glare-winner past the interval"
+            has_relayed_handshake_init(out.as_deref()),
+            "a relay peer past the interval, as glare-winner, must emit a relay-wrapped rekey HandshakeInit"
+        );
+        assert!(
+            !has_handshake_init(out.as_deref()),
+            "the relay peer's rekey Init must never be sent as a raw (unwrapped) HandshakeInit"
         );
         match &pm.peers[0].state {
             PeerState::Established(epochs) => assert!(
-                epochs.rekey.is_none(),
-                "EpochSet.rekey must stay None for a relay peer: rekey completion isn't wired for the relay handlers"
+                epochs.rekey.is_some(),
+                "EpochSet.rekey must be populated once a relay rekey is in flight"
             ),
             _ => panic!("peer must still be Established"),
         }
         assert_eq!(
             established_tag(&pm, 0),
             Some(tag),
-            "current epoch must be untouched"
-        );
-
-        // A later tick, well past the point a direct peer would have
-        // abandoned-and-restarted a rekey, must still emit nothing.
-        let out2 = pm
-            .tick(150 + HANDSHAKE_TOTAL_MS)
-            .map(<[EgressDatagram]>::to_vec);
-        assert!(
-            !has_handshake_init(out2.as_deref()) && !has_relayed_handshake_init(out2.as_deref()),
-            "a relay peer must not ever start the churn cycle a never-completing rekey would cause"
+            "current epoch must be untouched by scheduling a relay rekey"
         );
     }
 
