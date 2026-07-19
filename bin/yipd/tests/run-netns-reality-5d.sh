@@ -447,7 +447,7 @@ if [ "$WRONG_PING_STATUS" -eq 0 ]; then
     echo "[FAIL] ping A->B succeeded with a WRONG pbk — the relay accepted an unauthenticated connection as a real relay client"
     echo "=== yip5dA (wrong pbk) log ==="
     cat "$LOG_A_WRONG" || true
-    dump_logs
+    # (Not dump_logs: it cats the stale good-run $LOG_A, not $LOG_A_WRONG.)
     exit 1
 fi
 echo "[PASS] ping A->B failed as expected with a wrong pbk (relay spliced to DEST pre-ServerHello, no hand-rolled flight ever emitted, no tunnel formed)"

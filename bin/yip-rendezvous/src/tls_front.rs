@@ -732,6 +732,40 @@ mod tests {
         addr
     }
 
+    /// Like [`spawn_cert_source`], but restricts the acceptor's supported
+    /// groups to X25519 (group `29`) only, so `capture_dest_flight`'s
+    /// Chrome-faithful probe (which offers both X25519MLKEM768/`4588` and
+    /// X25519/`29`) negotiates group `29` — yielding a `ServerFlightTemplate`
+    /// with `key_share_group == 29`. Lets the authed end-to-end test below
+    /// exercise the group-29 server KEX/`select_client_x25519` wiring
+    /// deterministically, independent of which hybrid groups the BoringSSL
+    /// version happens to support.
+    async fn spawn_cert_source_x25519() -> SocketAddr {
+        let dir = unique_tmp_dir("reality-certsrc-x25519");
+        let (cert, key) = write_realistic_leaf(&dir);
+        let mut b = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        b.set_certificate_chain_file(&cert).unwrap();
+        b.set_private_key_file(&key, SslFiletype::PEM).unwrap();
+        b.check_private_key().unwrap();
+        b.set_alpn_protos(b"\x02h2\x08http/1.1").unwrap();
+        // X25519 only ⇒ the probe's hybrid 4588 offer is declined, group 29 wins.
+        b.set_curves_list("X25519").unwrap();
+        let acceptor = Arc::new(b.build());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((tcp, _)) = listener.accept().await {
+                    let acceptor = Arc::clone(&acceptor);
+                    tokio::spawn(async move {
+                        let _ = tokio_boring::accept(&acceptor, tcp).await;
+                    });
+                }
+            }
+        });
+        addr
+    }
+
     /// General REALITY front spinner: parameterized on `priv_key`/`short_ids`/
     /// `server_names` so both the un-authed splice tests (empty `short_ids`/
     /// `server_names` ⇒ no client can ever authenticate) and the REALITY.4b
@@ -742,6 +776,7 @@ mod tests {
         priv_key: [u8; 32],
         short_ids: Vec<[u8; 8]>,
         server_names: Vec<String>,
+        cert_src: SocketAddr,
     ) -> SocketAddr {
         let dir = unique_tmp_dir("reality");
         let (cert, key) = write_self_signed(&dir);
@@ -752,7 +787,6 @@ mod tests {
         // `prewarm` refuses to start with zero warmed names when at least one
         // was requested, so an un-authed-only caller still passes a
         // real-but-irrelevant name here (never reached — auth fails first).
-        let cert_src = spawn_cert_source().await;
         let warm_names = if server_names.is_empty() {
             vec!["cache.test".to_owned()]
         } else {
@@ -792,7 +826,8 @@ mod tests {
     async fn start_reality_front(dest: SocketAddr) -> SocketAddr {
         // No client can authenticate ⇒ everything forwards (empty short_ids
         // AND empty server_names — see `start_reality_front_with`).
-        start_reality_front_with(dest, [7u8; 32], Vec::new(), Vec::new()).await
+        let cert_src = spawn_cert_source().await;
+        start_reality_front_with(dest, [7u8; 32], Vec::new(), Vec::new(), cert_src).await
     }
 
     async fn assert_gets_banner(front: SocketAddr, first_bytes: &[u8], banner: &[u8]) {
@@ -873,9 +908,15 @@ mod tests {
         let short_id = [9u8; 8];
         let sni = "auth.test";
 
-        let front =
-            start_reality_front_with(dest, reality_priv, vec![short_id], vec![sni.to_owned()])
-                .await;
+        let cert_src = spawn_cert_source().await;
+        let front = start_reality_front_with(
+            dest,
+            reality_priv,
+            vec![short_id],
+            vec![sni.to_owned()],
+            cert_src,
+        )
+        .await;
 
         for attempt in 0..2 {
             let tcp = tokio::net::TcpStream::connect(front).await.unwrap();
@@ -887,6 +928,43 @@ mod tests {
                 result.err()
             );
         }
+    }
+
+    /// The authed end-to-end path when `dest` negotiated **group 29 (X25519)**
+    /// rather than the hybrid 4588 — i.e. `select_client_x25519` must feed the
+    /// standalone `0x001d` share (not the 4588 tail) into `emit_server_hello`'s
+    /// server KEX. Deterministically forced by an X25519-only cert source. A
+    /// `verify=on` client must still complete the hand-rolled handshake and
+    /// verify the 4b binding.
+    #[tokio::test]
+    async fn reality_authed_group29_dest_client_verify_succeeds() {
+        let dest = spawn_dest_banner(b"SHOULD-NEVER-BE-SPLICED").await;
+
+        let reality_priv = [77u8; 32];
+        let reality_pub =
+            *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(reality_priv))
+                .as_bytes();
+        let short_id = [3u8; 8];
+        let sni = "group29.test";
+
+        let cert_src = spawn_cert_source_x25519().await;
+        let front = start_reality_front_with(
+            dest,
+            reality_priv,
+            vec![short_id],
+            vec![sni.to_owned()],
+            cert_src,
+        )
+        .await;
+
+        let tcp = tokio::net::TcpStream::connect(front).await.unwrap();
+        let result = yip_utls::connect(tcp, sni, &reality_pub, short_id, true).await;
+        assert!(
+            result.is_ok(),
+            "verify=on client must complete the hand-rolled handshake against a \
+             group-29 dest template: {:?}",
+            result.err()
+        );
     }
 
     // ---- select_client_x25519 (pure decision) ----
