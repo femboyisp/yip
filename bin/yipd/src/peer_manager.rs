@@ -738,6 +738,21 @@ impl PeerManager {
         epochs: &mut crate::epoch::EpochSet,
         now_ms: u64,
     ) {
+        // Relay-reached peers: do NOT schedule a mid-session rekey. Rekey
+        // COMPLETION is only wired for the direct handshake handlers
+        // (`handle_handshake_resp`/`handle_handshake_init`'s glare-loser
+        // path) — `relayed_handshake_init`/`relayed_handshake_resp` never
+        // call `promote_from_rekey`/`install_next`. A rekey started here for
+        // a relay peer could therefore never complete: it would retransmit
+        // until `HANDSHAKE_TOTAL_MS`, get abandoned, and — since the epoch
+        // age is still past the threshold — restart on the very next tick,
+        // forever. That's wasted relay bandwidth and a constant ~1 Hz
+        // `[HandshakeInit]` cadence (a DPI fingerprint), for zero benefit
+        // (fail-closed: `current` is never touched either way). Wiring relay
+        // rekey completion is left to a follow-up.
+        if relay {
+            return;
+        }
         if epochs.rekey.is_none() {
             // Glare tiebreak: reuse the EXACT static-key-order comparison
             // `handle_handshake_init`/`relayed_handshake_init` use to decide
@@ -2994,6 +3009,24 @@ mod tests {
             .any(|d| d.bytes.first() == Some(&(PacketType::HandshakeInit as u8)))
     }
 
+    /// `true` iff `out` carries a rekey `[HandshakeInit]` relay-wrapped in a
+    /// `yip_rendezvous::Message::RelaySend` — i.e. what `relay_wrap` produces
+    /// for a relay-reached peer. Decoding the rendezvous envelope (rather
+    /// than checking the outer byte, as `has_handshake_init` does) matters
+    /// here: `RelaySend`'s own wire tag is 5, but a coincidental Register
+    /// refresh (tag 0, sent once per `tick_dispatch` when a `Rendezvous` is
+    /// freshly configured) would otherwise be misread as a raw
+    /// `[HandshakeInit]` (also discriminant 0) by `has_handshake_init`.
+    fn has_relayed_handshake_init(out: Option<&[EgressDatagram]>) -> bool {
+        out.into_iter().flatten().any(|d| {
+            matches!(
+                yip_rendezvous::decode(&d.bytes),
+                Some(yip_rendezvous::Message::RelaySend { payload, .. })
+                    if payload.first() == Some(&(PacketType::HandshakeInit as u8))
+            )
+        })
+    }
+
     #[test]
     fn tick_initiates_rekey_for_established_winner_once() {
         // local_pub = [1;32] < peer pubkey = [2;32]: local is the
@@ -3033,6 +3066,74 @@ mod tests {
             established_tag(&pm, 0),
             Some(tag),
             "current epoch must remain untouched on the second tick too"
+        );
+    }
+
+    /// A relay-reached `Established` peer (`relay == true`, mirroring how
+    /// `relayed_handshake_init`/`relayed_handshake_resp` leave a peer) must
+    /// NOT have a mid-session rekey scheduled by `tick`/`drive_rekey_schedule`,
+    /// even when it is the glare-winner and well past `rekey_interval_ms`.
+    /// Rekey COMPLETION is only wired for the direct handshake handlers
+    /// (`handle_handshake_resp` et al.) — `relayed_handshake_init`/
+    /// `relayed_handshake_resp` never call `promote_from_rekey`/`install_next`
+    /// for a relay session — so a relay rekey scheduled here can never
+    /// complete: it would retransmit for `HANDSHAKE_TOTAL_MS`, get abandoned,
+    /// and (since the epoch age is still past the threshold) immediately
+    /// restart, forever. Contrast with `tick_initiates_rekey_for_established_winner_once`,
+    /// whose otherwise-identical direct peer (`relay == false`) does rekey.
+    #[test]
+    fn tick_does_not_rekey_relay_peer() {
+        let (mut pm, tag, _ep) = pm_with_established_peer([1u8; 32], [2u8; 32], 100);
+        pm.peers[0].relay = true;
+        // A relay-reached peer routes rekey Inits through `relay_wrap`, which
+        // needs a configured `Rendezvous` to succeed (with none, the pre-fix
+        // code already silently drops the attempt — that would make this
+        // test pass for the wrong reason). Wire up the same `MockRdv` the
+        // rendezvous-wiring tests use so a pre-fix build genuinely emits the
+        // rekey `HandshakeInit` via the relay.
+        let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        pm.rendezvous = Some(Box::new(MockRdv {
+            server: mock_server(),
+            sent,
+        }));
+        // Pre-mark registration done, and push its refresh interval out
+        // past this test's horizon, so `tick_dispatch`'s periodic
+        // registration refresh (a `Register` datagram, wire tag 0 — the same
+        // numeric value as `PacketType::HandshakeInit`) never fires and
+        // confounds the `has_handshake_init` assertions below.
+        pm.registered_once = true;
+        pm.last_register_ms = 150;
+        pm.reg_refresh_ms = u64::MAX;
+
+        // Past the interval (age 150 >= 100): a direct peer would rekey here
+        // (see `tick_initiates_rekey_for_established_winner_once`), but a
+        // relay peer must not.
+        let out = pm.tick(150).map(<[EgressDatagram]>::to_vec);
+        assert!(
+            !has_handshake_init(out.as_deref()) && !has_relayed_handshake_init(out.as_deref()),
+            "a relay peer must not emit a rekey HandshakeInit, even as glare-winner past the interval"
+        );
+        match &pm.peers[0].state {
+            PeerState::Established(epochs) => assert!(
+                epochs.rekey.is_none(),
+                "EpochSet.rekey must stay None for a relay peer: rekey completion isn't wired for the relay handlers"
+            ),
+            _ => panic!("peer must still be Established"),
+        }
+        assert_eq!(
+            established_tag(&pm, 0),
+            Some(tag),
+            "current epoch must be untouched"
+        );
+
+        // A later tick, well past the point a direct peer would have
+        // abandoned-and-restarted a rekey, must still emit nothing.
+        let out2 = pm
+            .tick(150 + HANDSHAKE_TOTAL_MS)
+            .map(<[EgressDatagram]>::to_vec);
+        assert!(
+            !has_handshake_init(out2.as_deref()) && !has_relayed_handshake_init(out2.as_deref()),
+            "a relay peer must not ever start the churn cycle a never-completing rekey would cause"
         );
     }
 
