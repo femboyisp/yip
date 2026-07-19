@@ -237,15 +237,14 @@ async fn run_reality_conn(mut tcp: TcpStream, cfg: &Arc<TlsFrontCfg>) {
         return; // unreachable: caller only takes this branch when Some
     };
 
-    // A stalled read has no buffered bytes to replay — drop, same slowloris
-    // bound the non-REALITY path gets from HANDSHAKE_TIMEOUT.
-    let outcome =
-        match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_first_tls_record(&mut tcp)).await {
-            Ok(outcome) => outcome,
-            Err(_) => return,
-        };
-
-    let rec = match outcome {
+    // `read_first_tls_record` enforces the deadline itself (per read), so a
+    // client that stalls AFTER sending a partial record yields the consumed
+    // bytes as `Passthrough` and gets spliced to `dest` — a real upstream
+    // would likewise hold and answer a half-sent record, not drop it. Only a
+    // connection that produced literally nothing before the deadline is
+    // dropped (`Empty`).
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    let rec = match read_first_tls_record(&mut tcp, deadline).await {
         FirstRecord::Complete(rec) => rec,
         FirstRecord::Passthrough(bytes) => {
             splice_to_dest(tcp, r.dest, &bytes).await;
@@ -362,6 +361,19 @@ async fn run_reality_conn(mut tcp: TcpStream, cfg: &Arc<TlsFrontCfg>) {
                     return;
                 }
 
+                // Load the CertVerify signing key while still pre-write, so its
+                // (unreachable — `dk.pkcs8_der` already parsed as an rcgen KeyPair
+                // above) failure splices rather than drops, keeping every fallible
+                // step on the pre-write/splice side of the commit boundary.
+                let signing_key = match p256::ecdsa::SigningKey::from_pkcs8_der(&dk.pkcs8_der) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        eprintln!("tls-front: reality signing key load failed ({sni}): {e}");
+                        splice_to_dest(tcp, r.dest, &rec).await;
+                        return;
+                    }
+                };
+
                 // --- Commit point: write the ServerHello. From here, DROP on error. ---
                 let mut transcript_ch_sh = Vec::with_capacity(ch_msg.len() + sh_msg.len());
                 transcript_ch_sh.extend_from_slice(ch_msg);
@@ -387,14 +399,6 @@ async fn run_reality_conn(mut tcp: TcpStream, cfg: &Arc<TlsFrontCfg>) {
                     eprintln!("tls-front: reality ServerHello write failed ({sni}): {e}");
                     return;
                 }
-
-                let signing_key = match p256::ecdsa::SigningKey::from_pkcs8_der(&dk.pkcs8_der) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        eprintln!("tls-front: reality signing key load failed ({sni}): {e}");
-                        return;
-                    }
-                };
 
                 let reality_stream = match tokio::time::timeout(
                     HANDSHAKE_TIMEOUT,

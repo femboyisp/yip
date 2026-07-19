@@ -131,17 +131,22 @@ enum Read {
     Short(usize),
 }
 
-/// Fill `buf` from `tcp`, tracking how many bytes were read before a `0`-byte
-/// read (EOF) or an I/O error cuts it short. A read error is treated the same
-/// as EOF here: either way, whatever prefix was consumed is what must be
-/// replayed to preserve REALITY indistinguishability.
-async fn read_full(tcp: &mut TcpStream, buf: &mut [u8]) -> Read {
+/// Fill `buf` from `tcp` by `deadline`, tracking how many bytes were read
+/// before a `0`-byte read (EOF), an I/O error, OR the deadline cuts it short.
+/// EOF, error, and timeout are treated identically: whatever prefix was
+/// consumed is what must be replayed to preserve REALITY indistinguishability
+/// — a real upstream server also just holds a half-sent record. The deadline
+/// is enforced per read (`timeout_at`), so a stall after some bytes still
+/// returns `Short(n)` with `n` intact (a whole-future `timeout` wrapper would
+/// cancel the read and lose `n`).
+async fn read_full(tcp: &mut TcpStream, buf: &mut [u8], deadline: tokio::time::Instant) -> Read {
     let mut n = 0;
     while n < buf.len() {
-        match tcp.read(&mut buf[n..]).await {
-            Ok(0) => return Read::Short(n),
-            Ok(k) => n += k,
-            Err(_) => return Read::Short(n),
+        match tokio::time::timeout_at(deadline, tcp.read(&mut buf[n..])).await {
+            Ok(Ok(0)) => return Read::Short(n),  // EOF
+            Ok(Ok(k)) => n += k,
+            Ok(Err(_)) => return Read::Short(n), // I/O error
+            Err(_) => return Read::Short(n),     // deadline elapsed mid-read
         }
     }
     Read::Full
@@ -162,17 +167,22 @@ async fn read_full(tcp: &mut TcpStream, buf: &mut [u8]) -> Read {
 /// header or body yields `Passthrough` with whatever prefix was consumed, and
 /// only a connection that yielded nothing at all is [`FirstRecord::Empty`].
 ///
-/// Does not itself enforce a timeout: the caller wraps this in
-/// `tokio::time::timeout` (mirroring `HANDSHAKE_TIMEOUT` in
-/// `tls_front.rs`) so a stalled client can't park the read forever.
+/// Enforces its own `deadline` (per read via `timeout_at`, so a stall after
+/// some bytes still returns `Passthrough` with the consumed prefix — a bare
+/// `tokio::time::timeout` wrapper on this whole call would instead cancel the
+/// read and lose those bytes, dropping a connection a real upstream would have
+/// held and answered). Pass `now + HANDSHAKE_TIMEOUT` from `tls_front.rs`.
 ///
 /// A `ClientHello` that is TLS-record-fragmented across multiple records
 /// will only have its first fragment returned here. Task 3 treats an
 /// unparseable/partial hello as un-authed and splices it to the decoy
 /// (fail-safe), so this is acceptable for REALITY.1.
-pub async fn read_first_tls_record(tcp: &mut TcpStream) -> FirstRecord {
+pub async fn read_first_tls_record(
+    tcp: &mut TcpStream,
+    deadline: tokio::time::Instant,
+) -> FirstRecord {
     let mut header = [0u8; 5];
-    match read_full(tcp, &mut header).await {
+    match read_full(tcp, &mut header, deadline).await {
         Read::Short(0) => return FirstRecord::Empty,
         Read::Short(n) => return FirstRecord::Passthrough(header[..n].to_vec()),
         Read::Full => {}
@@ -185,7 +195,7 @@ pub async fn read_first_tls_record(tcp: &mut TcpStream) -> FirstRecord {
     }
 
     let mut body = vec![0u8; len];
-    match read_full(tcp, &mut body).await {
+    match read_full(tcp, &mut body, deadline).await {
         Read::Full => {
             let mut record = header.to_vec();
             record.extend_from_slice(&body);
@@ -237,7 +247,11 @@ mod tests {
             .await
             .expect("write synthetic record");
 
-        let got = read_first_tls_record(&mut reader).await;
+        let got = read_first_tls_record(
+            &mut reader,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await;
         assert!(
             matches!(&got, FirstRecord::Complete(r) if *r == record),
             "must return Complete(header ++ body)"
@@ -249,6 +263,37 @@ mod tests {
             .await
             .expect("extra bytes past the record must remain unread");
         assert_eq!(leftover, extra, "extra bytes must be left untouched");
+    }
+
+    #[tokio::test]
+    async fn read_first_tls_record_partial_then_stall_yields_passthrough_consumed() {
+        // A client that sends a partial record then goes silent (no EOF) must
+        // yield the consumed prefix as Passthrough once the deadline elapses —
+        // NOT be dropped. `writer` stays open (in scope) so there is no EOF;
+        // only the deadline ends the read.
+        let (mut writer, mut reader) = tcp_pair().await;
+
+        // A well-formed 5-byte header claiming a 37-byte body, then only 10 of
+        // those body bytes — then stall.
+        let mut partial = vec![0x16, 0x03, 0x01, 0x00, 37];
+        partial.extend_from_slice(&[0xABu8; 10]);
+        writer.write_all(&partial).await.expect("write partial record");
+
+        let got = read_first_tls_record(
+            &mut reader,
+            tokio::time::Instant::now() + std::time::Duration::from_millis(150),
+        )
+        .await;
+
+        match got {
+            FirstRecord::Passthrough(bytes) => assert_eq!(
+                bytes, partial,
+                "a partial-then-stall must replay exactly the consumed prefix"
+            ),
+            FirstRecord::Complete(_) => panic!("expected Passthrough(consumed), got Complete"),
+            FirstRecord::Empty => panic!("expected Passthrough(consumed), got Empty"),
+        }
+        drop(writer); // keep the connection alive until after the read
     }
 
     #[tokio::test]
@@ -268,7 +313,11 @@ mod tests {
         // fails fast on EOF instead of hanging the test.
         drop(writer);
 
-        let got = read_first_tls_record(&mut reader).await;
+        let got = read_first_tls_record(
+            &mut reader,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await;
         assert!(
             matches!(&got, FirstRecord::Passthrough(b) if *b == header),
             "a length claim above MAX_RECORD_BODY_LEN must yield Passthrough(header only), \
@@ -287,7 +336,11 @@ mod tests {
             .expect("write partial header");
         drop(writer);
 
-        let got = read_first_tls_record(&mut reader).await;
+        let got = read_first_tls_record(
+            &mut reader,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await;
         assert!(
             matches!(&got, FirstRecord::Passthrough(b) if *b == partial_header),
             "EOF partway through the header must yield Passthrough(bytes actually consumed)"
@@ -315,7 +368,11 @@ mod tests {
         let mut expected = header;
         expected.extend_from_slice(partial_body);
 
-        let got = read_first_tls_record(&mut reader).await;
+        let got = read_first_tls_record(
+            &mut reader,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await;
         assert!(
             matches!(&got, FirstRecord::Passthrough(b) if *b == expected),
             "a complete header followed by a truncated body then FIN must yield \
@@ -328,7 +385,11 @@ mod tests {
         let (writer, mut reader) = tcp_pair().await;
         drop(writer);
 
-        let got = read_first_tls_record(&mut reader).await;
+        let got = read_first_tls_record(
+            &mut reader,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await;
         assert!(
             matches!(got, FirstRecord::Empty),
             "an immediate EOF with nothing consumed must yield Empty"
