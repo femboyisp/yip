@@ -79,7 +79,7 @@ use yip_rendezvous::{node_id, NodeId};
 
 use crate::addr::node_addr;
 use crate::config::PeerConfig;
-use crate::dataplane::{conn_tag_from_keys, DataPlane, Outcome};
+use crate::dataplane::{conn_tag_from_keys, DataPlane};
 use crate::handshake::{HandshakeState, PacketType};
 use crate::membership::Membership;
 use crate::mode::TunnelMode;
@@ -177,7 +177,7 @@ enum PeerState {
     /// An initiator handshake is in flight, awaiting `[HandshakeResp]`.
     Handshaking(Box<HandshakingState>),
     /// A completed session; all data-plane traffic routes here.
-    Established(Box<DataPlane>),
+    Established(Box<crate::epoch::EpochSet>),
 }
 
 /// One configured remote peer plus its live handshake/session state.
@@ -872,7 +872,8 @@ impl PeerManager {
                             .map(|d| d.bytes.clone()),
                     );
                 }
-                self.peers[idx].state = PeerState::Established(dp);
+                self.peers[idx].state =
+                    PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, now_ms)));
                 for b in owned {
                     if let Some(d) = self.relay_wrap(idx, b) {
                         self.egress.push(d);
@@ -926,7 +927,8 @@ impl PeerManager {
                             .map(|d| d.bytes.clone()),
                     );
                 }
-                self.peers[idx].state = PeerState::Established(dp);
+                self.peers[idx].state =
+                    PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, now_ms)));
                 for b in owned {
                     if let Some(d) = self.relay_wrap(idx, b) {
                         self.egress.push(d);
@@ -950,17 +952,14 @@ impl PeerManager {
     /// egress it produces (TUN writes still go to the local device).
     fn relayed_data(&mut self, idx: usize, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
         let (tun, udp): (Option<Vec<u8>>, Vec<Vec<u8>>) = {
-            let PeerState::Established(dp) = &mut self.peers[idx].state else {
+            let PeerState::Established(epochs) = &mut self.peers[idx].state else {
                 return DispatchOut::None;
             };
-            match dp.on_udp_datagram(dg, now_ms) {
-                Outcome::None => (None, Vec::new()),
-                Outcome::TunWrite(buf) => (Some(buf.to_vec()), Vec::new()),
-                Outcome::Send(pkts) => (None, pkts.iter().map(|d| d.bytes.clone()).collect()),
-                Outcome::TunWriteThenSend(buf, pkts) => (
-                    Some(buf.to_vec()),
-                    pkts.iter().map(|d| d.bytes.clone()).collect(),
-                ),
+            match epochs.inbound_open(dg, now_ms) {
+                crate::epoch::EpochInbound::None => (None, Vec::new()),
+                crate::epoch::EpochInbound::Tun(buf) => (Some(buf), Vec::new()),
+                crate::epoch::EpochInbound::Send(pkts) => (None, pkts),
+                crate::epoch::EpochInbound::TunThenSend(buf, pkts) => (Some(buf), pkts),
             }
         };
         self.egress.clear();
@@ -1076,14 +1075,52 @@ impl PeerManager {
     /// re-map its `Outcome` into a `DispatchOut`. Returns `DispatchOut::None`
     /// if `idx` is not (or no longer) `Established`.
     fn dispatch_established(&mut self, idx: usize, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
-        let PeerState::Established(dp) = &mut self.peers[idx].state else {
+        let PeerState::Established(epochs) = &mut self.peers[idx].state else {
             return DispatchOut::None;
         };
-        match dp.on_udp_datagram(dg, now_ms) {
-            Outcome::None => DispatchOut::None,
-            Outcome::TunWrite(buf) => DispatchOut::Tun(buf),
-            Outcome::Send(pkts) => DispatchOut::Udp(pkts),
-            Outcome::TunWriteThenSend(buf, pkts) => DispatchOut::Both(buf, pkts),
+        let out = epochs.inbound_open(dg, now_ms);
+        // `EpochInbound::Send`/`TunThenSend` carry raw bytes only (see
+        // `EpochSet::own`): the per-datagram `dst` every `DataPlane` egress
+        // datagram used to carry is dropped there, but it was always the
+        // *same* value — this peer's endpoint (`DataPlane::peer_addr` is
+        // fixed at construction to exactly the address stamped into
+        // `self.peers[idx].endpoint` at that same moment, and neither changes
+        // again while the peer stays `Established`) — so it is losslessly
+        // reconstructed here. `fate` is NOT reconstructed (no longer
+        // recoverable): these datagrams simply forgo GSO fate-coalescing
+        // with each other, which is safe (never miscoalesces) even though
+        // less batched than before.
+        let to_egress = |pkts: Vec<Vec<u8>>, dst: SocketAddr| -> Vec<EgressDatagram> {
+            pkts.into_iter()
+                .map(|bytes| EgressDatagram {
+                    fate: 0,
+                    dst,
+                    bytes,
+                })
+                .collect()
+        };
+        match out {
+            crate::epoch::EpochInbound::None => DispatchOut::None,
+            crate::epoch::EpochInbound::Tun(buf) => {
+                self.tun_scratch = buf;
+                DispatchOut::Tun(&self.tun_scratch)
+            }
+            crate::epoch::EpochInbound::Send(pkts) => {
+                let Some(dst) = self.peers[idx].endpoint else {
+                    return DispatchOut::None;
+                };
+                self.egress = to_egress(pkts, dst);
+                DispatchOut::Udp(&self.egress)
+            }
+            crate::epoch::EpochInbound::TunThenSend(buf, pkts) => {
+                let Some(dst) = self.peers[idx].endpoint else {
+                    self.tun_scratch = buf;
+                    return DispatchOut::Tun(&self.tun_scratch);
+                };
+                self.tun_scratch = buf;
+                self.egress = to_egress(pkts, dst);
+                DispatchOut::Both(&self.tun_scratch, &self.egress)
+            }
         }
     }
 
@@ -1125,20 +1162,32 @@ impl PeerManager {
             .collect();
         for idx in candidates {
             let hit = {
-                let PeerState::Established(dp) = &mut self.peers[idx].state else {
+                let PeerState::Established(epochs) = &mut self.peers[idx].state else {
                     continue;
                 };
-                match dp.on_udp_datagram(dg, now_ms) {
-                    Outcome::None => None,
-                    Outcome::TunWrite(buf) => Some((Some(buf.to_vec()), Vec::new())),
-                    Outcome::Send(pkts) => Some((None, pkts.to_vec())),
-                    Outcome::TunWriteThenSend(buf, pkts) => {
-                        Some((Some(buf.to_vec()), pkts.to_vec()))
-                    }
+                match epochs.inbound_open(dg, now_ms) {
+                    crate::epoch::EpochInbound::None => None,
+                    crate::epoch::EpochInbound::Tun(buf) => Some((Some(buf), Vec::new())),
+                    crate::epoch::EpochInbound::Send(pkts) => Some((None, pkts)),
+                    crate::epoch::EpochInbound::TunThenSend(buf, pkts) => Some((Some(buf), pkts)),
                 }
             };
             let Some((tun, udp)) = hit else {
                 continue;
+            };
+            // Same `dst` reconstruction as `dispatch_established`: `udp`'s raw
+            // bytes lost their per-datagram `dst`, which was always this
+            // peer's endpoint.
+            let udp: Vec<EgressDatagram> = match self.peers[idx].endpoint {
+                Some(dst) => udp
+                    .into_iter()
+                    .map(|bytes| EgressDatagram {
+                        fate: 0,
+                        dst,
+                        bytes,
+                    })
+                    .collect(),
+                None => Vec::new(),
             };
             return match (tun, udp.is_empty()) {
                 (Some(t), true) => {
@@ -1308,7 +1357,8 @@ impl PeerManager {
                     let out = dp.on_tun_packet(inner, now_ms);
                     self.egress.extend(out.iter().cloned());
                 }
-                self.peers[idx].state = PeerState::Established(dp);
+                self.peers[idx].state =
+                    PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, now_ms)));
 
                 DispatchOut::Udp(&self.egress)
             }
@@ -1378,7 +1428,8 @@ impl PeerManager {
                     let out = dp.on_tun_packet(inner, now_ms);
                     self.egress.extend(out.iter().cloned());
                 }
-                self.peers[idx].state = PeerState::Established(dp);
+                self.peers[idx].state =
+                    PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, now_ms)));
 
                 if self.egress.is_empty() {
                     DispatchOut::None
@@ -1849,16 +1900,18 @@ impl PeerManager {
             // peer's datagrams already carry the correct `dst` — return them
             // borrowed, byte-identical to 2a.
             if !self.peers[idx].relay {
-                let PeerState::Established(dp) = &mut self.peers[idx].state else {
+                let PeerState::Established(epochs) = &mut self.peers[idx].state else {
                     unreachable!("just matched Established above");
                 };
-                return dp.on_tun_packet(inner, now_ms);
+                return epochs.current_mut().on_tun_packet(inner, now_ms);
             }
             let owned: Vec<Vec<u8>> = {
-                let PeerState::Established(dp) = &mut self.peers[idx].state else {
+                let PeerState::Established(epochs) = &mut self.peers[idx].state else {
                     unreachable!("just matched Established above");
                 };
-                dp.on_tun_packet(inner, now_ms)
+                epochs
+                    .current_mut()
+                    .on_tun_packet(inner, now_ms)
                     .iter()
                     .map(|d| d.bytes.clone())
                     .collect()
@@ -2035,8 +2088,8 @@ impl PeerManager {
             let relay = self.peers[i].relay;
             let old_state = std::mem::replace(&mut self.peers[i].state, PeerState::Idle);
             let new_state = match old_state {
-                PeerState::Established(mut dp) => {
-                    if let Some(pkts) = dp.tick(now_ms) {
+                PeerState::Established(mut epochs) => {
+                    if let Some(pkts) = epochs.current_mut().tick(now_ms) {
                         if relay {
                             // Relay-reached peer: re-wrap each datagram through
                             // the server. Copy bytes out (borrow ends) then wrap.
@@ -2051,7 +2104,7 @@ impl PeerManager {
                             self.tick_egress.extend(pkts.iter().cloned());
                         }
                     }
-                    PeerState::Established(dp)
+                    PeerState::Established(epochs)
                 }
                 PeerState::Handshaking(mut handshaking)
                     if now_ms.saturating_sub(handshaking.last_sent_ms) >= handshaking.retry_ms =>
@@ -2444,9 +2497,12 @@ mod tests {
         // (the "test seam": direct access to private fields from the child
         // `tests` module).
         const FAKE_TAG: u64 = 0xAAAA_BBBB_CCCC_DDDD;
-        pm.peers[1].state = PeerState::Established(Box::new(fake_established_dataplane(
-            FAKE_TAG,
-            peer_b.endpoint.unwrap(),
+        pm.peers[1].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(
+                FAKE_TAG,
+                peer_b.endpoint.unwrap(),
+            )),
+            0,
         )));
         pm.by_tag.insert(FAKE_TAG, 1);
 
@@ -2546,7 +2602,7 @@ mod tests {
     /// (yet) Established. Used by the handshake state-machine tests below.
     fn established_tag(pm: &PeerManager, idx: usize) -> Option<u64> {
         match &pm.peers[idx].state {
-            PeerState::Established(dp) => Some(dp.conn_tag()),
+            PeerState::Established(epochs) => Some(epochs.current().conn_tag()),
             _ => None,
         }
     }
@@ -3000,8 +3056,10 @@ mod tests {
 
         // Splice in a live Established session reaching `endpoint`.
         const TAG: u64 = 0x0102_0304_0506_0708;
-        pm.peers[0].state =
-            PeerState::Established(Box::new(fake_established_dataplane(TAG, endpoint)));
+        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(TAG, endpoint)),
+            0,
+        )));
         pm.by_tag.insert(TAG, 0);
         pm.peers[0].path_kind = Some(PathKind::Direct);
 
@@ -3138,8 +3196,10 @@ mod tests {
 
         // Splice in a live direct session reaching `endpoint`.
         const TAG: u64 = 0x1122_3344_5566_7788;
-        pm.peers[0].state =
-            PeerState::Established(Box::new(fake_established_dataplane(TAG, endpoint)));
+        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(TAG, endpoint)),
+            0,
+        )));
         pm.by_tag.insert(TAG, 0);
         pm.peers[0].path_kind = Some(PathKind::Direct);
         assert!(!pm.peers[0].relay);
@@ -3767,8 +3827,10 @@ mod tests {
 
         // Splice in a live Established session reaching `committed_ep`.
         const TAG: u64 = 0x0a0b_0c0d_0e0f_1011;
-        pm.peers[0].state =
-            PeerState::Established(Box::new(fake_established_dataplane(TAG, committed_ep)));
+        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(TAG, committed_ep)),
+            0,
+        )));
         pm.by_tag.insert(TAG, 0);
         pm.peers[0].path_kind = Some(PathKind::Direct);
 
@@ -3837,7 +3899,10 @@ mod tests {
             false,
         );
         const TAG: u64 = 0x9988_7766_5544_3322;
-        pm.peers[0].state = PeerState::Established(Box::new(fake_established_dataplane(TAG, src)));
+        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(TAG, src)),
+            0,
+        )));
         pm.by_tag.insert(TAG, 0);
 
         // Valid record → ingested → resolvable.
@@ -3911,8 +3976,10 @@ mod tests {
             false,
         );
         const TAG: u64 = 0x1357_9bdf_2468_ace0;
-        pm.peers[0].state =
-            PeerState::Established(Box::new(fake_established_dataplane(TAG, peer_ep)));
+        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(TAG, peer_ep)),
+            0,
+        )));
         pm.by_tag.insert(TAG, 0);
 
         let member = generate_keypair();
@@ -4103,7 +4170,8 @@ mod tests {
         // sealed frames; give the peer its matching session obf key.
         let (mut init_dp, resp_dp, hp_key, conn_tag) = established_pair(peer_ep);
         let sess = yip_obf::derive_key(&hp_key);
-        pm.peers[0].state = PeerState::Established(Box::new(resp_dp));
+        pm.peers[0].state =
+            PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(resp_dp), 0)));
         pm.peers[0].session_obf_key = Some(sess);
         pm.by_tag.insert(conn_tag, 0);
 
@@ -4275,8 +4343,10 @@ mod tests {
         );
         pm.set_obf_psk(Some([0x66u8; 32]));
 
-        pm.peers[0].state =
-            PeerState::Established(Box::new(fake_established_dataplane(TAG, peer_ep)));
+        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(TAG, peer_ep)),
+            0,
+        )));
         let sess = [0x77u8; 16];
         pm.peers[0].session_obf_key = Some(sess);
         pm.by_tag.insert(TAG, 0);
@@ -4816,8 +4886,10 @@ mod tests {
         }
         pm.set_cover_traffic_ms(cover_traffic_ms);
 
-        pm.peers[0].state =
-            PeerState::Established(Box::new(fake_established_dataplane(TAG, peer_ep)));
+        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(TAG, peer_ep)),
+            0,
+        )));
         let sess = [0xBBu8; 16];
         pm.peers[0].session_obf_key = Some(sess);
         pm.by_tag.insert(TAG, 0);

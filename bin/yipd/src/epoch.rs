@@ -19,13 +19,6 @@ use crate::handshake::HandshakeState;
 pub const REKEY_INTERVAL_MS: u64 = 120_000;
 /// How long the superseded `previous` epoch stays open for inbound after a
 /// switch — generous vs. reordering/loss, bounded so keys don't linger.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "read by PeerManager once Task 2 wires EpochSet in"
-    )
-)]
 pub const PREVIOUS_EPOCH_GRACE_MS: u64 = 15_000;
 
 /// An in-flight initiator rekey handshake, held alongside the live `current`
@@ -46,11 +39,6 @@ pub struct RekeyInFlight {
 /// Owned inbound result (the `PeerManager` demux already copies the borrowed
 /// `Outcome` into owned Vecs at its call sites, so returning owned here is
 /// free — and it sidesteps the multi-epoch borrow-return limitation).
-#[expect(
-    dead_code,
-    reason = "Send/TunThenSend payloads are read by PeerManager's demux once Task 3 wires \
-              EpochSet into the data path; today only Tun/None are exercised by unit tests"
-)]
 pub enum EpochInbound {
     None,
     Tun(Vec<u8>),
@@ -96,10 +84,6 @@ impl EpochSet {
     pub fn current(&self) -> &DataPlane {
         &self.current
     }
-    #[expect(
-        dead_code,
-        reason = "used by PeerManager's outbound path once Task 3 wires EpochSet in"
-    )]
     pub fn current_mut(&mut self) -> &mut DataPlane {
         &mut self.current
     }
