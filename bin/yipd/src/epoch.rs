@@ -377,6 +377,9 @@ mod tests {
         assert!(set.previous.is_some());
         assert_eq!(set.previous.as_ref().unwrap().conn_tag(), old_conn_tag);
         assert_eq!(set.previous_retire_ms, 500 + PREVIOUS_EPOCH_GRACE_MS);
+        // The promotion must REFRESH current_created_ms (the rekey schedule
+        // ages from it) — a stale value here would make `needs_rekey` misfire.
+        assert_eq!(set.current_created_ms, 500, "promotion refreshes epoch age");
 
         // Old-epoch frames still open too, via `previous`.
         let old_payload = vec![0x55u8; 32];
