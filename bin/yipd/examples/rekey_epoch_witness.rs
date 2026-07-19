@@ -116,11 +116,17 @@ fn read_u32(b: &[u8], le: bool) -> u32 {
 /// Supports both byte orders and both micro/nanosecond-timestamp magic
 /// variants (only the byte order matters here -- timestamps are unused).
 fn parse_pcap(data: &[u8]) -> Vec<UdpPkt> {
-    assert!(data.len() >= 24, "pcap file too short for a global header");
+    if data.len() < 24 {
+        eprintln!("rekey_epoch_witness: pcap file too short for a global header");
+        std::process::exit(1);
+    }
     let le = match &data[0..4] {
         [0xd4, 0xc3, 0xb2, 0xa1] | [0x4d, 0x3c, 0xb2, 0xa1] => true,
         [0xa1, 0xb2, 0xc3, 0xd4] | [0xa1, 0xb2, 0x3c, 0x4d] => false,
-        magic => panic!("unrecognized pcap magic: {magic:02x?}"),
+        magic => {
+            eprintln!("rekey_epoch_witness: unrecognized pcap magic: {magic:02x?}");
+            std::process::exit(1);
+        }
     };
     let mut out = Vec::new();
     let mut off = 24usize;
@@ -190,7 +196,10 @@ fn main() {
     }
     let pcap_path = &args[1];
 
-    let data = fs::read(pcap_path).unwrap_or_else(|e| panic!("read {pcap_path}: {e}"));
+    let data = fs::read(pcap_path).unwrap_or_else(|e| {
+        eprintln!("rekey_epoch_witness: read {pcap_path}: {e}");
+        std::process::exit(1);
+    });
     let pkts = parse_pcap(&data);
 
     let mut init_ephemerals: Vec<[u8; 32]> = Vec::new();
