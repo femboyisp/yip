@@ -13,10 +13,6 @@ use yip_io::poll::EgressDatagram;
 
 /// Production rekey cadence (§ Global Constraints). Test-overridden via
 /// `YIP_REKEY_INTERVAL_MS` at `PeerManager` construction.
-#[expect(
-    dead_code,
-    reason = "consumed by PeerManager's rekey scheduler once Task 2 wires EpochSet in"
-)]
 pub const REKEY_INTERVAL_MS: u64 = 120_000;
 /// How long the superseded `previous` epoch stays open for inbound after a
 /// switch — generous vs. reordering/loss, bounded so keys don't linger.
@@ -24,11 +20,15 @@ pub const PREVIOUS_EPOCH_GRACE_MS: u64 = 15_000;
 
 /// An in-flight initiator rekey handshake, held alongside the live `current`
 /// so the session never pauses. Mirrors `HandshakingState`'s retransmit fields.
-#[expect(
-    dead_code,
-    reason = "constructed and its fields read by PeerManager's rekey driver in Task 2"
-)]
 pub struct RekeyInFlight {
+    /// Read by rekey *completion* (initiator `read_response`) in Task 4;
+    /// Task 3 only schedules/retransmits/abandons, so this field is written
+    /// (constructed, and cleared via `EpochSet::rekey = None` on abandon) but
+    /// not yet read here.
+    #[expect(
+        dead_code,
+        reason = "read by rekey completion (initiator read_response) in Task 4"
+    )]
     pub hs: HandshakeState,
     pub init_pkt: Vec<u8>,
     pub started_ms: u64,
@@ -55,13 +55,6 @@ pub enum EpochInbound {
     TunThenSend(Vec<u8>, Vec<EgressDatagram>),
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "constructed by PeerManager once Task 2/3 wires EpochSet in"
-    )
-)]
 pub struct EpochSet {
     pub(crate) current: Box<DataPlane>,
     pub(crate) current_created_ms: u64,
