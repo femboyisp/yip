@@ -8,12 +8,14 @@ use std::time::{Duration, Instant};
 use boring::error::ErrorStack;
 use boring::pkey::PKey;
 use boring::ssl::{SslAcceptor, SslFiletype, SslMethod};
+use p256::pkcs8::DecodePrivateKey as _;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Semaphore};
 use yip_rendezvous::RendezvousServer;
 
-use crate::reality_io::{read_first_tls_record, FirstRecord, PrefixedStream};
+use crate::reality::ClientHelloInfo;
+use crate::reality_io::{read_first_tls_record, FirstRecord};
 
 /// Upper bound on how long a TLS handshake may take before we give up on the
 /// connection. Without this, a client that sends a ClientHello and then
@@ -57,8 +59,10 @@ pub struct RealityCfg {
     pub short_ids: Vec<[u8; 8]>,
     /// Allowed SNIs for the authenticated check; empty accepts any SNI.
     pub server_names: Vec<String>,
-    /// Per-SNI forged acceptors (REALITY.3 §1). `None` from `acceptor_for`
-    /// ⇒ splice-only for that SNI.
+    /// Per-SNI stolen-cert fields + captured flight template (REALITY.3 §1 /
+    /// REALITY.5a). `None` from `fields_for`/`template_for` ⇒ splice-only for
+    /// that SNI; otherwise `run_reality_conn`'s authed branch forges a leaf
+    /// and serves the hand-rolled flight per connection (REALITY.5d).
     pub certs: Arc<crate::reality_cert::RealityCertCache>,
     /// Anti-replay dedup on the auth seal (REALITY.3 §2).
     pub replay: Arc<crate::reality_replay::ReplayGuard>,
@@ -178,6 +182,40 @@ pub async fn run_tls_front(
     }
 }
 
+/// Which client X25519 public key feeds the server-side TLS DH, by negotiated
+/// group: for X25519MLKEM768 (4588) it is the x25519 bundled in the client's
+/// 4588 key_share entry (`key_share_mlkem_x25519`); for X25519 (29) it is the
+/// standalone `0x001d` entry (`key_share_x25519`). Any other group is
+/// unsupported here (P256/P384 + HelloRetryRequest is #84) → `None` → splice.
+fn select_client_x25519(group: u16, info: &ClientHelloInfo) -> Option<[u8; 32]> {
+    match group {
+        4588 => info.key_share_mlkem_x25519,
+        29 => info.key_share_x25519,
+        _ => None,
+    }
+}
+
+/// An OS-CSPRNG-backed [`yip_utls::hello::RandomSource`] for
+/// `emit_server_hello` (mirrors yip_utls's own private `OsRng`: a `getrandom`
+/// bridge that latches the first error so the caller fail-closes instead of
+/// emitting predictable bytes). NEVER seed this — a predictable rng here
+/// makes the ML-KEM encapsulation predictable.
+#[derive(Default)]
+struct OsRandomSource {
+    error: bool,
+}
+
+impl yip_utls::hello::RandomSource for OsRandomSource {
+    fn fill(&mut self, buf: &mut [u8]) {
+        if self.error {
+            return;
+        }
+        if getrandom::getrandom(buf).is_err() {
+            self.error = true;
+        }
+    }
+}
+
 /// The REALITY branch of the per-connection task (`cfg.reality` is `Some`,
 /// checked by the caller): peek the raw `ClientHello` before terminating
 /// TLS, decide REALITY auth fully before acting, then either hand the
@@ -199,15 +237,14 @@ async fn run_reality_conn(mut tcp: TcpStream, cfg: &Arc<TlsFrontCfg>) {
         return; // unreachable: caller only takes this branch when Some
     };
 
-    // A stalled read has no buffered bytes to replay — drop, same slowloris
-    // bound the non-REALITY path gets from HANDSHAKE_TIMEOUT.
-    let outcome =
-        match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_first_tls_record(&mut tcp)).await {
-            Ok(outcome) => outcome,
-            Err(_) => return,
-        };
-
-    let rec = match outcome {
+    // `read_first_tls_record` enforces the deadline itself (per read), so a
+    // client that stalls AFTER sending a partial record yields the consumed
+    // bytes as `Passthrough` and gets spliced to `dest` — a real upstream
+    // would likewise hold and answer a half-sent record, not drop it. Only a
+    // connection that produced literally nothing before the deadline is
+    // dropped (`Empty`).
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    let rec = match read_first_tls_record(&mut tcp, deadline).await {
         FirstRecord::Complete(rec) => rec,
         FirstRecord::Passthrough(bytes) => {
             splice_to_dest(tcp, r.dest, &bytes).await;
@@ -250,42 +287,145 @@ async fn run_reality_conn(mut tcp: TcpStream, cfg: &Arc<TlsFrontCfg>) {
         )?;
         let seal = <[u8; 32]>::try_from(info.legacy_session_id.as_slice()).ok()?;
         let fields = r.certs.fields_for(sni);
-        Some((sni.to_owned(), ts_min, seal, shared, fields))
+        Some((sni.to_owned(), ts_min, seal, shared, fields, info.clone()))
     });
 
-    if let Some((sni, ts_min, seal, shared, Some(fields))) = decision {
+    if let Some((sni, ts_min, seal, shared, Some(fields), info)) = decision {
         match decide_authed(&r.replay, seal, ts_min, now_min, true) {
             Decision::Accept => {
-                // The relay ALWAYS binds: re-forge the leaf per-connection,
-                // signed by the key derived from THIS connection's `shared`
-                // (REALITY.4b) — not the cache's fixed ephemeral key — so the
-                // presented leaf proves possession of `reality_priv` for the
-                // client (Task 2) to pin against.
+                // --- Pre-write: any failure SPLICES (connection still pristine). ---
+                let Some(template) = r.certs.template_for(&sni) else {
+                    splice_to_dest(tcp, r.dest, &rec).await;
+                    return;
+                };
+
+                let group = template.server_hello.key_share_group;
+                let Some(client_x25519) = select_client_x25519(group, &info) else {
+                    splice_to_dest(tcp, r.dest, &rec).await;
+                    return;
+                };
+
+                // The relay ALWAYS binds: derive the leaf-signing key from
+                // THIS connection's `shared` (REALITY.4b) — not a fixed
+                // cache key — so the presented leaf proves possession of
+                // `reality_priv` for the client (Task 2) to pin against.
                 let dk = yip_utls::auth::derive_cert_key(&shared);
-                let acceptor = match crate::reality_cert::build_forged_acceptor_with_pkcs8(
-                    &fields,
-                    &dk.pkcs8_der,
-                ) {
-                    Ok(acc) => acc,
+
+                // Forge the natural leaf (no exact-length padding); SPKI = dk.
+                let leaf_keypair = match rcgen::KeyPair::try_from(dk.pkcs8_der.as_slice()) {
+                    Ok(k) => k,
                     Err(e) => {
-                        eprintln!("tls-front: reality per-connection re-forge failed ({sni}): {e}");
+                        eprintln!("tls-front: reality leaf keypair load failed ({sni}): {e}");
                         splice_to_dest(tcp, r.dest, &rec).await;
                         return;
                     }
                 };
-                let stream = PrefixedStream::new(rec, tcp);
-                match tokio::time::timeout(
+                let forged_leaf_der = match crate::reality_cert::forge_leaf(&fields, &leaf_keypair)
+                {
+                    Ok(cert) => cert.der().as_ref().to_vec(),
+                    Err(e) => {
+                        eprintln!("tls-front: reality forge_leaf failed ({sni}): {e}");
+                        splice_to_dest(tcp, r.dest, &rec).await;
+                        return;
+                    }
+                };
+
+                let ch_msg = match rec.get(5..) {
+                    Some(m) => m,
+                    None => {
+                        splice_to_dest(tcp, r.dest, &rec).await;
+                        return;
+                    }
+                };
+
+                let mut rng = OsRandomSource::default();
+                let (sh_msg, keys) = match yip_utls::server::emit_server_hello(
+                    &template.server_hello,
+                    ch_msg,
+                    &info.legacy_session_id,
+                    &client_x25519,
+                    info.key_share_mlkem_ek.as_deref(),
+                    &mut rng,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("tls-front: reality emit_server_hello failed ({sni}): {e}");
+                        splice_to_dest(tcp, r.dest, &rec).await;
+                        return;
+                    }
+                };
+                if rng.error {
+                    // getrandom failed → fail closed (still pre-write).
+                    eprintln!("tls-front: reality OS rng failed ({sni})");
+                    splice_to_dest(tcp, r.dest, &rec).await;
+                    return;
+                }
+
+                // Load the CertVerify signing key while still pre-write, so its
+                // (unreachable — `dk.pkcs8_der` already parsed as an rcgen KeyPair
+                // above) failure splices rather than drops, keeping every fallible
+                // step on the pre-write/splice side of the commit boundary.
+                let signing_key = match p256::ecdsa::SigningKey::from_pkcs8_der(&dk.pkcs8_der) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        eprintln!("tls-front: reality signing key load failed ({sni}): {e}");
+                        splice_to_dest(tcp, r.dest, &rec).await;
+                        return;
+                    }
+                };
+
+                // --- Commit point: write the ServerHello. From here, DROP on error. ---
+                let mut transcript_ch_sh = Vec::with_capacity(ch_msg.len() + sh_msg.len());
+                transcript_ch_sh.extend_from_slice(ch_msg);
+                transcript_ch_sh.extend_from_slice(&sh_msg);
+
+                let mut sh_record = Vec::with_capacity(5 + sh_msg.len());
+                sh_record.push(0x16); // handshake
+                sh_record.extend_from_slice(&[0x03, 0x03]); // legacy record version
+                                                            // Still pre-write (nothing on the wire yet) → splice. A
+                                                            // ServerHello never exceeds u16, so this is unreachable in
+                                                            // practice, but it keeps the fail-safe boundary honest.
+                let sh_len = match u16::try_from(sh_msg.len()) {
+                    Ok(l) => l,
+                    Err(_) => {
+                        eprintln!("tls-front: reality ServerHello too large ({sni})");
+                        splice_to_dest(tcp, r.dest, &rec).await;
+                        return;
+                    }
+                };
+                sh_record.extend_from_slice(&sh_len.to_be_bytes());
+                sh_record.extend_from_slice(&sh_msg);
+                if let Err(e) = tcp.write_all(&sh_record).await {
+                    eprintln!("tls-front: reality ServerHello write failed ({sni}): {e}");
+                    return;
+                }
+
+                let reality_stream = match tokio::time::timeout(
                     HANDSHAKE_TIMEOUT,
-                    tokio_boring::accept(&acceptor, stream),
+                    yip_utls::stream::serve(
+                        tcp,
+                        &keys,
+                        &template.encrypted_flight,
+                        &template.cert_chain,
+                        &forged_leaf_der,
+                        &signing_key,
+                        &transcript_ch_sh,
+                    ),
                 )
                 .await
                 {
-                    Ok(Ok(s)) => super::conn::handle_connection(s, Arc::clone(cfg)).await,
+                    Ok(Ok(s)) => s,
                     Ok(Err(e)) => {
-                        eprintln!("tls-front: reality forged handshake failed ({sni}): {e}")
+                        eprintln!("tls-front: reality serve failed ({sni}): {e}");
+                        return;
                     }
-                    Err(_) => eprintln!("tls-front: reality forged handshake timed out"),
-                }
+                    Err(_) => {
+                        eprintln!("tls-front: reality serve timed out ({sni})");
+                        return;
+                    }
+                };
+
+                super::conn::handle_connection(reality_stream, Arc::clone(cfg)).await;
                 return;
             }
             Decision::Splice => {} // fall through to splice
@@ -505,6 +645,65 @@ mod tests {
         rec
     }
 
+    /// A self-signed cert/key PEM pair for `relay.test`, like
+    /// `write_self_signed`, but additionally carrying the near-universal
+    /// server-leaf extensions (`KeyUsage:
+    /// digitalSignature|keyEncipherment`, `ExtendedKeyUsage: serverAuth`,
+    /// explicit `BasicConstraints: CA:FALSE`) that
+    /// `reality_cert::extract_fields` always copies into a forged leaf
+    /// regardless of whether the SPECIFIC dest cert actually has them (its
+    /// own doc comment: "a server leaf's usages are near-universal" —
+    /// best-effort mimicry, not conditioned on the real cert's content).
+    /// `write_self_signed`'s bare `rcgen::generate_simple_self_signed` cert
+    /// omits all three (rcgen's own `CertificateParams::default()`:
+    /// `is_ca: NoCa`, empty `key_usages`/`extended_key_usages`) — fine for
+    /// the plain-handshake tests that share it, but a REAL destination
+    /// site's CA-issued leaf virtually always carries these three
+    /// extensions, so using the bare cert as `spawn_cert_source`'s "dest"
+    /// understates the captured leaf's size relative to what `forge_leaf`
+    /// always re-adds, artificially starving `RealityCertCache::prewarm`'s
+    /// captured `record_lengths` slack for the REALITY.5d authed
+    /// end-to-end test below. A test-fixture realism fix, not a production
+    /// behavior change — `forge_leaf`/`extract_fields` are unmodified.
+    fn write_realistic_leaf(dir: &std::path::Path) -> (String, String) {
+        let mut params = rcgen::CertificateParams::new(vec!["relay.test".to_owned()]).unwrap();
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyEncipherment,
+        ];
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        params.is_ca = rcgen::IsCa::ExplicitNoCa;
+        // A real dest leaf virtually always carries a Certificate Transparency
+        // SCT list extension (RFC 6962, OID 1.3.6.1.4.1.11129.2.4.2) —
+        // `StolenFields` deliberately does NOT copy SCTs into the forged leaf
+        // (they are bound to the real CT-log keys and unreproducible by an
+        // ephemeral-key forgery — see `StolenFields`'s doc comment), so a real
+        // forged flight is reliably SMALLER than the real dest flight it must
+        // fit within (`emit_server_flight`'s captured `record_lengths`
+        // budget). Without this, this synthetic test dest's from-scratch
+        // self-signed cert has near-zero slack over the forged leaf (both are
+        // "the same fields, independently ECDSA-self-signed" — the only
+        // delta is a few bytes of DER signature-length jitter), making the
+        // budget check flaky. Filler bytes, not a real SCT — nothing here
+        // ever parses this extension's content.
+        params
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 11129, 2, 4, 2],
+                vec![0u8; 200],
+            ));
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        (
+            cert_path.to_str().unwrap().to_owned(),
+            key_path.to_str().unwrap().to_owned(),
+        )
+    }
+
     /// A local TLS server (self-signed) that answers any SNI — a stand-in
     /// `dest` purely for `RealityCertCache::prewarm` to fetch a leaf from.
     /// Separate from `spawn_dest_banner` (the splice target), which is
@@ -512,12 +711,46 @@ mod tests {
     ///
     /// Multiple `reality_*` tests call `start_reality_front` (and so this
     /// helper) concurrently; `unique_tmp_dir` keeps each call's cert/key
-    /// files distinct so they can't race `write_self_signed` against the
+    /// files distinct so they can't race `write_realistic_leaf` against the
     /// same files (mismatched-pair `KEY_VALUES_MISMATCH` flakes).
     async fn spawn_cert_source() -> SocketAddr {
         let dir = unique_tmp_dir("reality-certsrc");
-        let (cert, key) = write_self_signed(&dir);
+        let (cert, key) = write_realistic_leaf(&dir);
         let acceptor = Arc::new(build_acceptor(&cert, &key).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((tcp, _)) = listener.accept().await {
+                    let acceptor = Arc::clone(&acceptor);
+                    tokio::spawn(async move {
+                        let _ = tokio_boring::accept(&acceptor, tcp).await;
+                    });
+                }
+            }
+        });
+        addr
+    }
+
+    /// Like [`spawn_cert_source`], but restricts the acceptor's supported
+    /// groups to X25519 (group `29`) only, so `capture_dest_flight`'s
+    /// Chrome-faithful probe (which offers both X25519MLKEM768/`4588` and
+    /// X25519/`29`) negotiates group `29` — yielding a `ServerFlightTemplate`
+    /// with `key_share_group == 29`. Lets the authed end-to-end test below
+    /// exercise the group-29 server KEX/`select_client_x25519` wiring
+    /// deterministically, independent of which hybrid groups the BoringSSL
+    /// version happens to support.
+    async fn spawn_cert_source_x25519() -> SocketAddr {
+        let dir = unique_tmp_dir("reality-certsrc-x25519");
+        let (cert, key) = write_realistic_leaf(&dir);
+        let mut b = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        b.set_certificate_chain_file(&cert).unwrap();
+        b.set_private_key_file(&key, SslFiletype::PEM).unwrap();
+        b.check_private_key().unwrap();
+        b.set_alpn_protos(b"\x02h2\x08http/1.1").unwrap();
+        // X25519 only ⇒ the probe's hybrid 4588 offer is declined, group 29 wins.
+        b.set_curves_list("X25519").unwrap();
+        let acceptor = Arc::new(b.build());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -543,6 +776,7 @@ mod tests {
         priv_key: [u8; 32],
         short_ids: Vec<[u8; 8]>,
         server_names: Vec<String>,
+        cert_src: SocketAddr,
     ) -> SocketAddr {
         let dir = unique_tmp_dir("reality");
         let (cert, key) = write_self_signed(&dir);
@@ -553,7 +787,6 @@ mod tests {
         // `prewarm` refuses to start with zero warmed names when at least one
         // was requested, so an un-authed-only caller still passes a
         // real-but-irrelevant name here (never reached — auth fails first).
-        let cert_src = spawn_cert_source().await;
         let warm_names = if server_names.is_empty() {
             vec!["cache.test".to_owned()]
         } else {
@@ -593,7 +826,8 @@ mod tests {
     async fn start_reality_front(dest: SocketAddr) -> SocketAddr {
         // No client can authenticate ⇒ everything forwards (empty short_ids
         // AND empty server_names — see `start_reality_front_with`).
-        start_reality_front_with(dest, [7u8; 32], Vec::new(), Vec::new()).await
+        let cert_src = spawn_cert_source().await;
+        start_reality_front_with(dest, [7u8; 32], Vec::new(), Vec::new(), cert_src).await
     }
 
     async fn assert_gets_banner(front: SocketAddr, first_bytes: &[u8], banner: &[u8]) {
@@ -674,9 +908,15 @@ mod tests {
         let short_id = [9u8; 8];
         let sni = "auth.test";
 
-        let front =
-            start_reality_front_with(dest, reality_priv, vec![short_id], vec![sni.to_owned()])
-                .await;
+        let cert_src = spawn_cert_source().await;
+        let front = start_reality_front_with(
+            dest,
+            reality_priv,
+            vec![short_id],
+            vec![sni.to_owned()],
+            cert_src,
+        )
+        .await;
 
         for attempt in 0..2 {
             let tcp = tokio::net::TcpStream::connect(front).await.unwrap();
@@ -688,6 +928,75 @@ mod tests {
                 result.err()
             );
         }
+    }
+
+    /// The authed end-to-end path when `dest` negotiated **group 29 (X25519)**
+    /// rather than the hybrid 4588 — i.e. `select_client_x25519` must feed the
+    /// standalone `0x001d` share (not the 4588 tail) into `emit_server_hello`'s
+    /// server KEX. Deterministically forced by an X25519-only cert source. A
+    /// `verify=on` client must still complete the hand-rolled handshake and
+    /// verify the 4b binding.
+    #[tokio::test]
+    async fn reality_authed_group29_dest_client_verify_succeeds() {
+        let dest = spawn_dest_banner(b"SHOULD-NEVER-BE-SPLICED").await;
+
+        let reality_priv = [77u8; 32];
+        let reality_pub =
+            *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(reality_priv))
+                .as_bytes();
+        let short_id = [3u8; 8];
+        let sni = "group29.test";
+
+        let cert_src = spawn_cert_source_x25519().await;
+        let front = start_reality_front_with(
+            dest,
+            reality_priv,
+            vec![short_id],
+            vec![sni.to_owned()],
+            cert_src,
+        )
+        .await;
+
+        let tcp = tokio::net::TcpStream::connect(front).await.unwrap();
+        let result = yip_utls::connect(tcp, sni, &reality_pub, short_id, true).await;
+        assert!(
+            result.is_ok(),
+            "verify=on client must complete the hand-rolled handshake against a \
+             group-29 dest template: {:?}",
+            result.err()
+        );
+    }
+
+    // ---- select_client_x25519 (pure decision) ----
+
+    fn info_with_shares(x0: Option<[u8; 32]>, x4588: Option<[u8; 32]>) -> ClientHelloInfo {
+        ClientHelloInfo {
+            sni: Some("example.com".to_string()),
+            client_random: [0u8; 32],
+            legacy_session_id: vec![0u8; 32],
+            key_share_x25519: x0,
+            key_share_mlkem_ek: None,
+            key_share_mlkem_x25519: x4588,
+        }
+    }
+
+    #[test]
+    fn select_client_x25519_by_group() {
+        let info = info_with_shares(Some([1u8; 32]), Some([2u8; 32]));
+        // group 4588 → the 4588-entry tail; group 29 → the 0x001d entry.
+        assert_eq!(select_client_x25519(4588, &info), Some([2u8; 32]));
+        assert_eq!(select_client_x25519(29, &info), Some([1u8; 32]));
+        // unsupported group → None (→ splice).
+        assert_eq!(select_client_x25519(23, &info), None);
+        // missing share for the selected group → None.
+        assert_eq!(
+            select_client_x25519(4588, &info_with_shares(Some([1u8; 32]), None)),
+            None
+        );
+        assert_eq!(
+            select_client_x25519(29, &info_with_shares(None, Some([2u8; 32]))),
+            None
+        );
     }
 
     // ---- decide_authed (pure routing decision) ----

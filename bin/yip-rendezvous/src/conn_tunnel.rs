@@ -19,13 +19,9 @@ const CHANNEL_DEPTH: usize = 64;
 /// malformed frame is seen (fail-closed teardown). `prefix` carries any bytes
 /// already read past the first (Register) frame during classification — a
 /// pipelined second frame in the same TLS read must not be lost.
-pub async fn run_tunnel<S>(
-    mut stream: tokio_boring::SslStream<S>,
-    cfg: Arc<TlsFrontCfg>,
-    node: NodeId,
-    prefix: Vec<u8>,
-) where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+pub async fn run_tunnel<St>(mut stream: St, cfg: Arc<TlsFrontCfg>, node: NodeId, prefix: Vec<u8>)
+where
+    St: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_DEPTH);
     // Keep an identity handle so the exit-time removal below can tell

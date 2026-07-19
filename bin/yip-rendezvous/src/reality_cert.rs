@@ -1,8 +1,14 @@
-//! REALITY.3 §1: the stolen-cert authed acceptor. Fetches the real `dest`
-//! site's live leaf certificate at startup, forges a leaf that mimics its
-//! identity (subject/SAN/validity/serial/keyUsage/EKU/basicConstraints)
-//! signed by a relay-ephemeral key, and serves it from a TLS-1.3-only
-//! `SslAcceptor` — one per configured server_name. The outer TLS is
+//! REALITY.3 §1 / REALITY.5d: the stolen-cert authed path. Fetches the real
+//! `dest` site's live leaf certificate + structural flight template at
+//! startup (`fetch_dest_leaf`, backed by `yip_utls::capture_dest_flight`),
+//! and caches both per configured server_name (`RealityCertCache`). The
+//! relay forges a leaf that mimics the stolen identity
+//! (subject/SAN/validity/serial/keyUsage/EKU/basicConstraints, signed by a
+//! per-connection key derived from that connection's REALITY shared secret —
+//! REALITY.4b) via `forge_leaf`, and `tls_front::run_reality_conn` serves it
+//! per-connection with the hand-rolled TLS 1.3 flight
+//! (`yip_utls::server::emit_server_hello` + `yip_utls::stream::serve` —
+//! REALITY.5b/5c/5d) rather than a generic `SslAcceptor`. The outer TLS is
 //! zero-CA-auth by design, so the forged chain intentionally does not
 //! validate against a public CA; the inner yip handshake is the real
 //! security. See the design spec's §1 + Threat model.
@@ -210,7 +216,6 @@ pub fn extract_fields(leaf: &boring::x509::X509Ref) -> StolenFields {
     }
 }
 
-use boring::ssl::SslMethod;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -254,129 +259,49 @@ pub async fn fetch_dest_leaf(
         .map_err(|_| format!("fetch_dest_leaf({sni}) timed out after {timeout:?}"))?
 }
 
-use boring::pkey::PKey;
-use boring::ssl::{SslAcceptor, SslVersion};
-
-/// Build a TLS-1.3-ONLY `SslAcceptor` presenting a leaf forged from `fields`
-/// and self-signed by `key`. Pinning min-proto to 1.3 keeps the Certificate
-/// message encrypted (spec §1 advisor #2 — TLS 1.2 would send it in
-/// cleartext). ALPN mirrors `build_acceptor`. Shared body for both
-/// `build_forged_acceptor` (the cache's fixed ephemeral key) and
-/// `build_forged_acceptor_with_pkcs8` (REALITY.4b's per-connection
-/// shared-secret-derived key) — the two differ only in where `key` comes
-/// from.
-fn build_forged_acceptor_with_key(
-    fields: &StolenFields,
-    key: &rcgen::KeyPair,
-) -> Result<SslAcceptor, String> {
-    let cert = forge_leaf(fields, key).map_err(|e| format!("forge: {e}"))?;
-    let cert_der = cert.der().as_ref().to_vec();
-    let x509 = boring::x509::X509::from_der(&cert_der).map_err(|e| e.to_string())?;
-    let pkey = PKey::private_key_from_der(&key.serialize_der()).map_err(|e| e.to_string())?;
-
-    let mut b =
-        SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).map_err(|e| e.to_string())?;
-    b.set_min_proto_version(Some(SslVersion::TLS1_3))
-        .map_err(|e| e.to_string())?;
-    b.set_certificate(&x509).map_err(|e| e.to_string())?;
-    b.set_private_key(&pkey).map_err(|e| e.to_string())?;
-    b.check_private_key().map_err(|e| e.to_string())?;
-    b.set_alpn_protos(b"\x02h2\x08http/1.1")
-        .map_err(|e| e.to_string())?;
-    Ok(b.build())
-}
-
-/// Build a TLS-1.3-ONLY `SslAcceptor` presenting the forged leaf, self-signed
-/// by the cache's fixed ephemeral key (REALITY.3). See
-/// `build_forged_acceptor_with_key` for the shared body.
-pub fn build_forged_acceptor(
-    fields: &StolenFields,
-    key: &rcgen::KeyPair,
-) -> Result<SslAcceptor, String> {
-    build_forged_acceptor_with_key(fields, key)
-}
-
-/// Build a TLS-1.3-ONLY `SslAcceptor` whose forged leaf is signed by
-/// `pkcs8_der` (the REALITY.4b shared-secret-derived ECDSA-P256 key,
-/// `yip_utls::auth::derive_cert_key(shared).pkcs8_der`) rather than the
-/// cache's fixed ephemeral key — one built fresh per authed connection so the
-/// presented leaf's public key proves the relay holds `reality_priv` for
-/// THAT connection's `shared` (what the client, Task 2, pins against). Same
-/// field-copying as `build_forged_acceptor` (`build_forged_acceptor_with_key`).
-///
-/// `rcgen::KeyPair`'s `TryFrom<&[u8]>` impl auto-detects the signature
-/// algorithm from PKCS#8 DER (probing Ed25519, then ECDSA-P256, then
-/// ECDSA-P384, then RSA) — `derive_cert_key` always encodes ECDSA-P256, so
-/// this lands on `PKCS_ECDSA_P256_SHA256` deterministically.
-pub fn build_forged_acceptor_with_pkcs8(
-    fields: &StolenFields,
-    pkcs8_der: &[u8],
-) -> Result<SslAcceptor, String> {
-    let key = rcgen::KeyPair::try_from(pkcs8_der).map_err(|e| format!("derived key: {e}"))?;
-    build_forged_acceptor_with_key(fields, &key)
-}
-
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-/// One forged acceptor per configured server_name, plus the ephemeral signing
-/// key and each entry's last-successful-fetch instant (for the staleness
-/// bound). An SNI absent from the map is splice-only (spec §1 degrade rule).
-/// `fetched_at` is now read directly by `RealityCertCache::apply_refresh`
-/// (exercised by its own `#[cfg(test)]` unit tests), so no dead_code
-/// suppression is needed here any more.
+/// The cached stolen-cert material for one configured server_name, plus its
+/// last-successful-fetch instant (for the staleness bound). An SNI absent
+/// from the map is splice-only (spec §1 degrade rule). `fetched_at` is read
+/// directly by `RealityCertCache::apply_refresh` (exercised by its own
+/// `#[cfg(test)]` unit tests), so no dead_code suppression is needed here.
+///
+/// REALITY.5d: no acceptor is built or cached here any more —
+/// `tls_front::run_reality_conn`'s authed branch forges the leaf and serves
+/// the hand-rolled flight per connection, reading only `fields`/`template`.
 struct CacheEntry {
-    /// The fixed-ephemeral-key acceptor (REALITY.3). REALITY.4b's
-    /// `run_reality_conn` no longer serves this directly to a real
-    /// connection — it re-forges a per-connection acceptor from `fields` via
-    /// `build_forged_acceptor_with_pkcs8` instead — so this field is now only
-    /// read by this module's own `acceptor_for`/cache-bookkeeping unit tests.
-    /// Building it at prewarm/refresh time is still meaningful: it proves
-    /// `fields` forges successfully before the SNI is considered "warm".
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "REALITY.4b: run_reality_conn now re-forges per-connection from `fields` \
-                       via build_forged_acceptor_with_pkcs8; `acceptor` is retained (and still \
-                       built, proving `fields` forges) for acceptor_for's own cache-bookkeeping \
-                       unit tests"
-        )
-    )]
-    acceptor: Arc<SslAcceptor>,
-    /// The `StolenFields` this entry's acceptor was forged from — cached
-    /// (REALITY.4b) so `run_reality_conn`'s per-connection re-forge needs no
-    /// `dest` re-fetch; see `RealityCertCache::fields_for`.
+    /// The `StolenFields` this entry was captured from (REALITY.3) — read by
+    /// `RealityCertCache::fields_for` so `run_reality_conn`'s per-connection
+    /// leaf forge needs no `dest` re-fetch.
     fields: Arc<StolenFields>,
     /// The structural `ServerFlightTemplate` captured by the SAME
     /// `fetch_dest_leaf` probe that produced `fields` (REALITY.5a Task 4) —
-    /// cached per SNI so later REALITY.5 sub-milestones (5b/5c/5d) can
-    /// reproduce dest's ServerHello/encrypted-flight/cert-chain shape on the
-    /// authed path without a fresh dest dial. Not yet read by any 5a code
-    /// path (`template_for` is dead-code-gated in non-test builds).
+    /// read by `RealityCertCache::template_for` so `run_reality_conn`'s
+    /// authed branch (REALITY.5d) can reproduce dest's
+    /// ServerHello/encrypted-flight/cert-chain shape without a fresh dest
+    /// dial.
     template: Arc<ServerFlightTemplate>,
     fetched_at: Instant,
 }
 
 pub struct RealityCertCache {
-    /// server_name -> live acceptor. Absent ⇒ splice-only.
+    /// server_name -> cached fields/template. Absent ⇒ splice-only.
     entries: RwLock<HashMap<String, CacheEntry>>,
     /// The set of names we are configured to serve (for refresh iteration).
     server_names: Vec<String>,
-    /// Relay-ephemeral signing key, generated once; reused across refreshes so
-    /// a re-forge for the same name keeps a stable key.
-    key: KeyPair,
 }
 
 impl RealityCertCache {
-    /// Fetch + forge for each server_name. A name whose fetch fails is left
-    /// out of the map (splice-only). Errors if at least one name was
-    /// REQUESTED and not a single one warmed (misconfiguration guard) — but
-    /// an empty `server_names` (the "decoy-only" REALITY config: no SNI is
-    /// ever forged, so `run_reality_conn` splices every connection — same
-    /// spirit as the existing no-short-ids decoy-only mode) is not itself a
-    /// failure and returns a validly-empty cache.
+    /// Fetch for each server_name. A name whose fetch fails is left out of
+    /// the map (splice-only). Errors if at least one name was REQUESTED and
+    /// not a single one warmed (misconfiguration guard) — but an empty
+    /// `server_names` (the "decoy-only" REALITY config: no SNI is ever
+    /// forged, so `run_reality_conn` splices every connection — same spirit
+    /// as the existing no-short-ids decoy-only mode) is not itself a failure
+    /// and returns a validly-empty cache.
     pub async fn prewarm(
         server_names: &[String],
         dest: SocketAddr,
@@ -384,24 +309,19 @@ impl RealityCertCache {
         _max_stale: Duration,
         timeout: Duration,
     ) -> Result<Arc<Self>, String> {
-        let key = KeyPair::generate().map_err(|e| format!("keygen: {e}"))?;
         let mut entries = HashMap::new();
         for name in server_names {
             match fetch_dest_leaf(dest, name, timeout).await {
-                Ok((fields, template)) => match build_forged_acceptor(&fields, &key) {
-                    Ok(acc) => {
-                        entries.insert(
-                            name.clone(),
-                            CacheEntry {
-                                acceptor: Arc::new(acc),
-                                fields: Arc::new(fields),
-                                template: Arc::new(template),
-                                fetched_at: Instant::now(),
-                            },
-                        );
-                    }
-                    Err(e) => eprintln!("reality-cert: forge {name} failed: {e} (splice-only)"),
-                },
+                Ok((fields, template)) => {
+                    entries.insert(
+                        name.clone(),
+                        CacheEntry {
+                            fields: Arc::new(fields),
+                            template: Arc::new(template),
+                            fetched_at: Instant::now(),
+                        },
+                    );
+                }
                 Err(e) => eprintln!("reality-cert: prewarm {name} failed: {e} (splice-only)"),
             }
         }
@@ -411,34 +331,12 @@ impl RealityCertCache {
         Ok(Arc::new(Self {
             entries: RwLock::new(entries),
             server_names: server_names.to_vec(),
-            key,
         }))
     }
 
-    /// The forged acceptor for `sni`, or `None` (⇒ caller splices to dest).
-    /// REALITY.4b: `run_reality_conn` no longer calls this for a real
-    /// connection (it re-forges per-connection via `fields_for` +
-    /// `build_forged_acceptor_with_pkcs8` instead) — kept as a documented
-    /// convenience API, still exercised by this module's own unit tests, the
-    /// same treatment `reality::reality_auth_open` got in REALITY.3.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "REALITY.4b: run_reality_conn re-forges per-connection via fields_for + \
-                       build_forged_acceptor_with_pkcs8 instead of calling this; kept as a \
-                       documented convenience API and still exercised by this module's own unit \
-                       tests"
-        )
-    )]
-    pub fn acceptor_for(&self, sni: &str) -> Option<Arc<SslAcceptor>> {
-        let g = self.entries.read().expect("cert cache lock poisoned");
-        g.get(sni).map(|e| Arc::clone(&e.acceptor))
-    }
-
     /// The cached `StolenFields` for `sni`, or `None` (⇒ caller splices to
-    /// dest) — REALITY.4b's per-connection re-forge reads this instead of
-    /// re-fetching `dest`.
+    /// dest) — `run_reality_conn`'s per-connection leaf forge reads this
+    /// instead of re-fetching `dest`.
     pub fn fields_for(&self, sni: &str) -> Option<Arc<StolenFields>> {
         let g = self.entries.read().expect("cert cache lock poisoned");
         g.get(sni).map(|e| Arc::clone(&e.fields))
@@ -446,39 +344,32 @@ impl RealityCertCache {
 
     /// The cached `ServerFlightTemplate` for `sni`, captured by the same
     /// probe that produced `fields_for(sni)` — REALITY.5a Task 4. `None`
-    /// means `sni` never pre-warmed (splice-only). Not yet consumed within
-    /// 5a; wired up by REALITY.5b's flight-shape reproduction.
-    #[cfg_attr(not(test), expect(dead_code, reason = "consumed by REALITY.5b"))]
+    /// means `sni` never pre-warmed (splice-only). Consumed by
+    /// `run_reality_conn`'s authed branch (REALITY.5d).
     pub fn template_for(&self, sni: &str) -> Option<Arc<ServerFlightTemplate>> {
         let g = self.entries.read().expect("cert cache lock poisoned");
         g.get(sni).map(|e| Arc::clone(&e.template))
     }
 
     /// Apply one refresh outcome for `name` to the cache. `new_entry` is
-    /// `Some((acceptor, fields))` on full success (fetch AND forge both
-    /// succeeded), `None` on ANY refresh failure (fetch failed, or fetch
-    /// succeeded but forge failed). `now`/`max_stale` are injected (rather
-    /// than reading `Instant::now()` internally) so this stays pure and
-    /// unit-testable without real time or network. This is the ONLY place
-    /// cache mutation + the staleness bound (spec §1) are decided.
+    /// `Some((fields, template))` on fetch success, `None` on fetch failure.
+    /// `now`/`max_stale` are injected (rather than reading `Instant::now()`
+    /// internally) so this stays pure and unit-testable without real time or
+    /// network. This is the ONLY place cache mutation + the staleness bound
+    /// (spec §1) are decided.
     fn apply_refresh(
         &self,
         name: &str,
-        new_entry: Option<(
-            Arc<SslAcceptor>,
-            Arc<StolenFields>,
-            Arc<ServerFlightTemplate>,
-        )>,
+        new_entry: Option<(Arc<StolenFields>, Arc<ServerFlightTemplate>)>,
         now: Instant,
         max_stale: Duration,
     ) -> RefreshOutcome {
         let mut g = self.entries.write().expect("cert cache poisoned");
         match new_entry {
-            Some((acceptor, fields, template)) => {
+            Some((fields, template)) => {
                 g.insert(
                     name.to_owned(),
                     CacheEntry {
-                        acceptor,
                         fields,
                         template,
                         fetched_at: now,
@@ -498,14 +389,13 @@ impl RealityCertCache {
     }
 
     /// Background refresh: every `refresh`, re-fetch each name. A tick has
-    /// exactly two outcomes per name: full success (fetch AND forge succeed)
-    /// replaces the acceptor and stamps `fetched_at`; ANY failure (fetch
-    /// failed, or fetch succeeded but forge failed) runs the staleness check
-    /// — keep last-good unless it is now older than `max_stale`, in which
-    /// case drop it (⇒ splice-only) rather than serve an ever-staler forgery
-    /// (spec §1 staleness bound). All cache-mutation/staleness logic lives in
-    /// the pure `apply_refresh` helper; this loop only fetches, forges, and
-    /// logs.
+    /// exactly two outcomes per name: fetch success replaces the cached
+    /// fields/template and stamps `fetched_at`; fetch failure runs the
+    /// staleness check — keep last-good unless it is now older than
+    /// `max_stale`, in which case drop it (⇒ splice-only) rather than serve
+    /// an ever-staler forgery (spec §1 staleness bound). All
+    /// cache-mutation/staleness logic lives in the pure `apply_refresh`
+    /// helper; this loop only fetches and logs.
     pub fn spawn_refresh(
         self: &Arc<Self>,
         dest: SocketAddr,
@@ -521,13 +411,7 @@ impl RealityCertCache {
                 tick.tick().await;
                 for name in &this.server_names {
                     let new_entry = match fetch_dest_leaf(dest, name, timeout).await {
-                        Ok((fields, template)) => match build_forged_acceptor(&fields, &this.key) {
-                            Ok(acc) => Some((Arc::new(acc), Arc::new(fields), Arc::new(template))),
-                            Err(e) => {
-                                eprintln!("reality-cert: refresh {name} forge failed: {e}");
-                                None
-                            }
-                        },
+                        Ok((fields, template)) => Some((Arc::new(fields), Arc::new(template))),
                         Err(_) => None,
                     };
                     let outcome = this.apply_refresh(name, new_entry, Instant::now(), max_stale);
@@ -674,46 +558,6 @@ mod tests {
         assert!(template.cert_chain.leaf_der_len > 0);
     }
 
-    #[tokio::test]
-    async fn forged_acceptor_is_tls13_only_and_presents_copied_subject() {
-        let fields = StolenFields {
-            subject_cn: Some("acc.test".to_owned()),
-            dns_sans: vec!["acc.test".to_owned()],
-            ip_sans: Vec::new(),
-            not_before: time::macros::datetime!(2025-01-01 0:00 UTC),
-            not_after: time::macros::datetime!(2027-01-01 0:00 UTC),
-            serial: vec![0x10],
-            key_usages: vec![rcgen::KeyUsagePurpose::DigitalSignature],
-            eku: vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth],
-            is_ca: false,
-            aia_der: None,
-        };
-        let key = rcgen::KeyPair::generate().unwrap();
-        let acceptor = std::sync::Arc::new(build_forged_acceptor(&fields, &key).unwrap());
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let acc = std::sync::Arc::clone(&acceptor);
-        tokio::spawn(async move {
-            if let Ok((tcp, _)) = listener.accept().await {
-                let _ = tokio_boring::accept(&acc, tcp).await;
-            }
-        });
-
-        // A TLS-1.2-MAX client must FAIL against the 1.3-only acceptor.
-        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut b = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();
-        b.set_verify(boring::ssl::SslVerifyMode::NONE);
-        b.set_max_proto_version(Some(boring::ssl::SslVersion::TLS1_2))
-            .unwrap();
-        let cfg = b.build().configure().unwrap();
-        let res = tokio_boring::connect(cfg, "acc.test", tcp).await;
-        assert!(
-            res.is_err(),
-            "TLS 1.2 client must be rejected by the 1.3-only acceptor"
-        );
-    }
-
     /// Spawn a local TLS server (self-signed) that answers any SNI — stands in
     /// for a real `dest`. Returns its address.
     async fn spawn_local_dest() -> SocketAddr {
@@ -727,8 +571,10 @@ mod tests {
         let key = KeyPair::generate().unwrap();
         let cert = p.self_signed(&key).unwrap();
         let x = boring::x509::X509::from_der(cert.der().as_ref()).unwrap();
-        let pkey = PKey::private_key_from_der(&key.serialize_der()).unwrap();
-        let mut b = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        let pkey = boring::pkey::PKey::private_key_from_der(&key.serialize_der()).unwrap();
+        let mut b =
+            boring::ssl::SslAcceptor::mozilla_intermediate_v5(boring::ssl::SslMethod::tls())
+                .unwrap();
         b.set_certificate(&x).unwrap();
         b.set_private_key(&pkey).unwrap();
         let acc = std::sync::Arc::new(b.build());
@@ -764,8 +610,8 @@ mod tests {
         )
         .await
         .expect("boots with >=1 good SNI");
-        assert!(cache.acceptor_for("good.test").is_some());
-        assert!(cache.acceptor_for("not.configured").is_none()); // splice-only
+        assert!(cache.fields_for("good.test").is_some());
+        assert!(cache.fields_for("not.configured").is_none()); // splice-only
     }
 
     /// REALITY.5a Task 4: `prewarm` must cache a `ServerFlightTemplate`
@@ -833,7 +679,7 @@ mod tests {
         )
         .await
         .expect("empty server_names must boot with an empty cache, not refuse to start");
-        assert!(cache.acceptor_for("anything.test").is_none());
+        assert!(cache.fields_for("anything.test").is_none());
     }
 
     /// A throwaway `ServerFlightTemplate` for tests that only care about
@@ -860,15 +706,10 @@ mod tests {
         }
     }
 
-    /// Build a throwaway forged acceptor (+ the `StolenFields`/
-    /// `ServerFlightTemplate` it was forged/captured from) for tests that
-    /// only care about cache bookkeeping (insert/replace/evict), not TLS
-    /// behavior.
-    fn dummy_entry() -> (
-        Arc<SslAcceptor>,
-        Arc<StolenFields>,
-        Arc<ServerFlightTemplate>,
-    ) {
+    /// Build a throwaway `StolenFields`/`ServerFlightTemplate` pair for tests
+    /// that only care about cache bookkeeping (insert/replace/evict), not the
+    /// content's actual shape.
+    fn dummy_entry() -> (Arc<StolenFields>, Arc<ServerFlightTemplate>) {
         let fields = StolenFields {
             subject_cn: Some("dummy.test".to_owned()),
             dns_sans: vec!["dummy.test".to_owned()],
@@ -881,22 +722,18 @@ mod tests {
             is_ca: false,
             aia_der: None,
         };
-        let key = KeyPair::generate().unwrap();
-        let acceptor = Arc::new(build_forged_acceptor(&fields, &key).unwrap());
-        (acceptor, Arc::new(fields), Arc::new(dummy_template()))
+        (Arc::new(fields), Arc::new(dummy_template()))
     }
 
     /// A cache pre-seeded with a single entry for `name` stamped `fetched_at`
     /// — lets tests drive `apply_refresh` with an injected `now` instead of
     /// real time, and without any network access.
     fn cache_with_entry(name: &str, fetched_at: Instant) -> RealityCertCache {
-        let key = KeyPair::generate().unwrap();
-        let (acceptor, fields, template) = dummy_entry();
+        let (fields, template) = dummy_entry();
         let mut entries = HashMap::new();
         entries.insert(
             name.to_owned(),
             CacheEntry {
-                acceptor,
                 fields,
                 template,
                 fetched_at,
@@ -905,7 +742,6 @@ mod tests {
         RealityCertCache {
             entries: RwLock::new(entries),
             server_names: vec![name.to_owned()],
-            key,
         }
     }
 
@@ -913,19 +749,19 @@ mod tests {
     fn apply_refresh_full_success_replaces_entry_and_stamps_now() {
         let t0 = Instant::now();
         let cache = cache_with_entry("a.test", t0);
-        let (new_acc, new_fields, new_template) = dummy_entry();
+        let (new_fields, new_template) = dummy_entry();
         let later = t0 + Duration::from_secs(10);
 
         let outcome = cache.apply_refresh(
             "a.test",
-            Some((Arc::clone(&new_acc), new_fields, new_template)),
+            Some((new_fields, new_template)),
             later,
             Duration::from_secs(3600),
         );
 
         assert_eq!(outcome, RefreshOutcome::Refreshed);
         assert!(
-            cache.acceptor_for("a.test").is_some(),
+            cache.fields_for("a.test").is_some(),
             "replaced entry must still be served"
         );
         // Stamped at `later`: a failure just 1s after that must NOT be stale
@@ -950,8 +786,8 @@ mod tests {
 
         assert_eq!(outcome, RefreshOutcome::KeptStale);
         assert!(
-            cache.acceptor_for("a.test").is_some(),
-            "last-good acceptor must still be served while within max_stale"
+            cache.fields_for("a.test").is_some(),
+            "last-good entry must still be served while within max_stale"
         );
     }
 
@@ -966,7 +802,7 @@ mod tests {
 
         assert_eq!(outcome, RefreshOutcome::Evicted);
         assert!(
-            cache.acceptor_for("a.test").is_none(),
+            cache.fields_for("a.test").is_none(),
             "stale entry must be evicted ⇒ splice-only"
         );
     }
@@ -1035,74 +871,6 @@ mod tests {
         assert_eq!(
             aia_ext.value, known,
             "forged leaf's AIA extension value must byte-match the stolen one"
-        );
-    }
-
-    /// REALITY.4b: `build_forged_acceptor_with_pkcs8`'s presented leaf's
-    /// public key MUST equal `derive_cert_key(shared).public_sec1` for the
-    /// SAME `shared` the pkcs8 key was derived from — this is the exact
-    /// property the client (Task 2) pins against, so it is the gate for the
-    /// whole per-connection re-forge mechanism, not merely a sanity check.
-    #[tokio::test]
-    async fn build_forged_acceptor_with_pkcs8_leaf_pubkey_matches_derived_key() {
-        let fields = StolenFields {
-            subject_cn: Some("bind.test".to_owned()),
-            dns_sans: vec!["bind.test".to_owned()],
-            ip_sans: Vec::new(),
-            not_before: time::macros::datetime!(2025-01-01 0:00 UTC),
-            not_after: time::macros::datetime!(2027-01-01 0:00 UTC),
-            serial: vec![0x42],
-            key_usages: vec![rcgen::KeyUsagePurpose::DigitalSignature],
-            eku: vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth],
-            is_ca: false,
-            aia_der: None,
-        };
-        let shared = [0x77u8; 32];
-        let dk = yip_utls::auth::derive_cert_key(&shared);
-
-        let acceptor = build_forged_acceptor_with_pkcs8(&fields, &dk.pkcs8_der)
-            .expect("build acceptor from derived pkcs8 key");
-
-        // Extract the leaf the acceptor actually presents, over a real TLS
-        // handshake — not just re-deriving it locally — so this proves what
-        // a real client sees, not just what we intended to build.
-        let acceptor = Arc::new(acceptor);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let acc = Arc::clone(&acceptor);
-        tokio::spawn(async move {
-            if let Ok((tcp, _)) = listener.accept().await {
-                let _ = tokio_boring::accept(&acc, tcp).await;
-            }
-        });
-
-        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut b = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();
-        b.set_verify(boring::ssl::SslVerifyMode::NONE);
-        let cfg = b.build().configure().unwrap();
-        let stream = tokio_boring::connect(cfg, "bind.test", tcp)
-            .await
-            .expect("handshake against the per-connection acceptor must complete");
-        let leaf = stream
-            .ssl()
-            .peer_certificate()
-            .expect("server presents a leaf cert");
-        let leaf_pubkey_der = leaf.public_key().unwrap().public_key_to_der().unwrap();
-
-        // boring's `public_key_to_der` yields a SubjectPublicKeyInfo DER, not
-        // the raw SEC1 point `derive_cert_key` returns — parse it back with
-        // `p256` (already a dependency of `yip_utls::auth`, transitively
-        // available here) and compare the uncompressed SEC1 encodings, which
-        // is the representation-independent way to assert "same public key".
-        use p256::ecdsa::VerifyingKey;
-        use p256::pkcs8::DecodePublicKey;
-        let leaf_vk = VerifyingKey::from_public_key_der(&leaf_pubkey_der)
-            .expect("leaf pubkey is a valid P-256 SPKI");
-        let leaf_sec1 = leaf_vk.to_encoded_point(false).as_bytes().to_vec();
-
-        assert_eq!(
-            leaf_sec1, dk.public_sec1,
-            "the acceptor's presented leaf public key must equal derive_cert_key(shared).public_sec1"
         );
     }
 

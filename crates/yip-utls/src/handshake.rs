@@ -26,8 +26,11 @@ pub const GROUP_X25519: u16 = 0x001d;
 /// this group is `mlkem768_ciphertext(1088) ‖ x25519_public(32)` = 1120
 /// bytes.
 pub const GROUP_X25519MLKEM768: u16 = 4588;
-/// Byte length of an ML-KEM-768 ciphertext (FIPS 203 §7.2).
-const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
+/// Byte length of an ML-KEM-768 ciphertext (FIPS 203 §7.2). `pub(crate)`
+/// so [`crate::server`] (REALITY.5b's server-side KEX, the mirror of this
+/// module's client-side group-4588 handling) can size the server
+/// `key_share`'s ciphertext prefix without duplicating the constant.
+pub(crate) const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
 /// Byte length of an X25519 public value (RFC 7748).
 const X25519_LEN: usize = 32;
 const SUITE_AES_128_GCM_SHA256: u16 = 0x1301;
@@ -476,11 +479,12 @@ fn key_len_for_suite(suite: u16) -> usize {
 
 /// The client/server handshake traffic keys, plus the handshake secret
 /// itself (needed as an input to [`derive_application_keys`]) and the raw
-/// client handshake traffic secret (needed by Task 7's `connect`, via
-/// [`finished_verify_data`], to derive the client `Finished` message).
-/// `handshake_secret`/`client_hs_traffic` are 32 bytes for SHA-256-hash
-/// suites, 48 bytes for `TLS_AES_256_GCM_SHA384` (`0x1302`) — hence `Vec<u8>`
-/// rather than a fixed-size array.
+/// client/server handshake traffic secrets (needed by Task 7's `connect`, via
+/// [`finished_verify_data`], to derive the client `Finished` message, and by
+/// REALITY.5c's server-side logic to derive the server `Finished`'s verify_data).
+/// `handshake_secret`/`client_hs_traffic`/`server_hs_traffic` are 32 bytes for
+/// SHA-256-hash suites, 48 bytes for `TLS_AES_256_GCM_SHA384` (`0x1302`) —
+/// hence `Vec<u8>` rather than a fixed-size array.
 pub struct HandshakeKeys {
     pub client_key: Vec<u8>,
     pub client_iv: [u8; 12],
@@ -489,6 +493,10 @@ pub struct HandshakeKeys {
     pub suite: u16,
     pub handshake_secret: Vec<u8>,
     pub client_hs_traffic: Vec<u8>,
+    /// The server handshake-traffic secret (`s hs traffic`) — the base secret
+    /// for the SERVER `Finished`'s `verify_data` (REALITY.5c). Sibling of
+    /// `client_hs_traffic`; both are 32 bytes (SHA-256) or 48 (SHA-384).
+    pub server_hs_traffic: Vec<u8>,
 }
 
 /// Derives the TLS 1.3 handshake traffic keys from the ECDHE (or hybrid
@@ -553,6 +561,7 @@ pub fn derive_handshake_keys(
         suite,
         handshake_secret,
         client_hs_traffic: c_hs,
+        server_hs_traffic: s_hs,
     }
 }
 
@@ -660,30 +669,29 @@ fn make_nonce(iv: &[u8; 12], seq: u64) -> Nonce {
     Nonce::assume_unique_for_key(nonce_bytes)
 }
 
-/// Seals `plaintext` as a TLS 1.3 protected record, appending `content_type`
-/// as the real (inner) content type before encryption (no additional
-/// padding). AEAD algorithm is selected from the negotiated `suite` (key
-/// length alone cannot disambiguate `TLS_AES_256_GCM_SHA384` from
-/// `TLS_CHACHA20_POLY1305_SHA256` — both use 32-byte keys). Returns the wire
-/// `encrypted_record` body (ciphertext ‖ tag) — the caller prepends the
-/// 5-byte outer record header `[0x17, 0x03, 0x03, len_hi, len_lo]` (`len = `
-/// returned length) itself.
-pub fn record_seal(
+/// Like [`record_seal`], but appends `pad_len` zero bytes of TLS 1.3 record
+/// padding after the inner content-type (RFC 8446 §5.4), so the sealed
+/// record's ciphertext-payload length is exactly
+/// `content.len() + 1 + pad_len + tag_len`. Used by REALITY.5c to frame the
+/// server flight to `dest`'s captured per-record lengths.
+pub fn record_seal_padded(
     key: &[u8],
     iv: &[u8; 12],
     seq: u64,
     suite: u16,
     content_type: u8,
-    plaintext: &[u8],
+    content: &[u8],
+    pad_len: usize,
 ) -> Result<Vec<u8>, Error> {
     let alg = algorithm_for_suite(suite)?;
     let unbound = UnboundKey::new(alg, key).map_err(|_| Error::Crypto)?;
     let less_safe = LessSafeKey::new(unbound);
     let nonce = make_nonce(iv, seq);
 
-    let mut inner = Vec::with_capacity(plaintext.len() + 1);
-    inner.extend_from_slice(plaintext);
+    let mut inner = Vec::with_capacity(content.len() + 1 + pad_len);
+    inner.extend_from_slice(content);
     inner.push(content_type);
+    inner.resize(inner.len() + pad_len, 0u8);
 
     let total_len = inner.len() + alg.tag_len();
     let len_bytes = u16::try_from(total_len)
@@ -702,6 +710,19 @@ pub fn record_seal(
         .map_err(|_| Error::Crypto)?;
 
     Ok(inner)
+}
+
+/// Seals `plaintext` as a TLS 1.3 protected record with no record padding.
+/// Thin wrapper over [`record_seal_padded`] with `pad_len = 0`.
+pub fn record_seal(
+    key: &[u8],
+    iv: &[u8; 12],
+    seq: u64,
+    suite: u16,
+    content_type: u8,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, Error> {
+    record_seal_padded(key, iv, seq, suite, content_type, plaintext, 0)
 }
 
 /// Opens a TLS 1.3 protected record. `record_type` is the *outer* record
@@ -1268,5 +1289,57 @@ mod tests {
             .unwrap_err(),
             Error::EmptyInnerPlaintext
         );
+    }
+
+    #[test]
+    fn handshake_keys_expose_distinct_server_hs_traffic() {
+        let ecdhe = [7u8; 32];
+        let transcript = transcript_hash(b"client-hello||server-hello", SUITE_AES_128_GCM_SHA256);
+        let hk = derive_handshake_keys(&ecdhe, &transcript, SUITE_AES_128_GCM_SHA256);
+        assert!(
+            !hk.server_hs_traffic.is_empty(),
+            "server_hs_traffic must be populated"
+        );
+        assert_eq!(hk.server_hs_traffic.len(), hk.client_hs_traffic.len());
+        assert_ne!(
+            hk.server_hs_traffic, hk.client_hs_traffic,
+            "server and client handshake-traffic secrets must differ"
+        );
+    }
+
+    #[test]
+    fn record_seal_padded_opens_to_content_with_padding_stripped() {
+        let key = [0x42u8; 16];
+        let iv = [0x24u8; 12];
+        let content = b"encrypted-extensions-bytes";
+        let pad_len = 40usize;
+        let sealed = record_seal_padded(
+            &key,
+            &iv,
+            0,
+            SUITE_AES_128_GCM_SHA256,
+            0x16,
+            content,
+            pad_len,
+        )
+        .unwrap();
+        // Ciphertext-payload length is content ‖ content_type(1) ‖ pad ‖ tag(16).
+        assert_eq!(sealed.len(), content.len() + 1 + pad_len + 16);
+        // record_open strips the padding + content-type and recovers the content.
+        let mut payload = sealed.clone();
+        let opened =
+            record_open(&key, &iv, 0, SUITE_AES_128_GCM_SHA256, 0x17, &mut payload).unwrap();
+        assert_eq!(opened, content);
+    }
+
+    #[test]
+    fn record_seal_padded_zero_equals_record_seal() {
+        let key = [0x01u8; 16];
+        let iv = [0x02u8; 12];
+        let content = b"finished-msg";
+        let via_padded =
+            record_seal_padded(&key, &iv, 5, SUITE_AES_128_GCM_SHA256, 0x16, content, 0).unwrap();
+        let via_plain = record_seal(&key, &iv, 5, SUITE_AES_128_GCM_SHA256, 0x16, content).unwrap();
+        assert_eq!(via_padded, via_plain);
     }
 }

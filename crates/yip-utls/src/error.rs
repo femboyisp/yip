@@ -31,6 +31,23 @@ pub enum Error {
     /// CertificateVerify, wrong scheme, or a missing/malformed message). The
     /// caller must treat the relay as unauthenticated and NOT tunnel.
     RealityVerify(&'static str),
+    /// REALITY.5b: the relay's [`crate::server::server_key_share`] was asked
+    /// to key a TLS group it does not implement server-side KEX for (only
+    /// `29`/X25519 and `4588`/X25519MLKEM768 are supported).
+    UnsupportedGroup(u16),
+    /// The forged server flight's plaintext does not fit the captured
+    /// `dest` record framing (`sum(record_lengths[i] - 17)` < flight bytes,
+    /// or a malformed `record_lengths`). REALITY.5c fail-safe: 5d degrades
+    /// this connection to splice-only.
+    FlightTooLarge,
+    /// A hand-rolled TLS 1.3 handshake MESSAGE (or a `CertificateEntry` DER,
+    /// or the `certificate_list`) exceeds the 24-bit length its wire prefix
+    /// can encode (`> 0xFF_FFFF`). Distinct from a record-layer overflow
+    /// ([`crate::handshake::Error::RecordTooLarge`], the AEAD record's u16
+    /// length): this is the message-framing layer. Unreachable with any real
+    /// forged flight (~KiB); guards [`crate::stream::emit_server_flight`]
+    /// against a pathological template.
+    MessageTooLarge,
 }
 
 impl fmt::Display for Error {
@@ -42,6 +59,19 @@ impl fmt::Display for Error {
             Error::Protocol(msg) => write!(f, "REALITY/TLS protocol error: {msg}"),
             Error::Clock => write!(f, "system clock reads before the Unix epoch"),
             Error::RealityVerify(m) => write!(f, "REALITY relay verification failed: {m}"),
+            Error::UnsupportedGroup(g) => write!(f, "REALITY server cannot key TLS group {g}"),
+            Error::FlightTooLarge => {
+                write!(
+                    f,
+                    "REALITY/TLS server flight exceeds the captured dest record framing"
+                )
+            }
+            Error::MessageTooLarge => {
+                write!(
+                    f,
+                    "REALITY/TLS handshake message exceeds its 24-bit length prefix"
+                )
+            }
         }
     }
 }
@@ -52,7 +82,12 @@ impl std::error::Error for Error {
             Error::Io(e) => Some(e),
             Error::Handshake(e) => Some(e),
             Error::Rng(e) => Some(e),
-            Error::Protocol(_) | Error::Clock | Error::RealityVerify(_) => None,
+            Error::Protocol(_)
+            | Error::Clock
+            | Error::RealityVerify(_)
+            | Error::UnsupportedGroup(_)
+            | Error::FlightTooLarge
+            | Error::MessageTooLarge => None,
         }
     }
 }

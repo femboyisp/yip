@@ -8,11 +8,13 @@ pub mod error;
 pub mod handshake;
 pub mod hello;
 pub mod ja;
+pub mod server;
 pub mod stream;
 pub mod template;
 pub mod wire;
 
 pub use error::Error;
+pub use server::server_key_share;
 pub use stream::{capture_dest_flight, connect, RealityStream};
 pub use template::{
     CapturedFlight, CertChainShape, EncryptedFlightShape, ServerFlightTemplate, ServerHelloShape,
