@@ -1225,27 +1225,35 @@ pub struct ServerFlight {
     pub app_keys: ApplicationKeys,
 }
 
+/// The 3-byte big-endian TLS `uint24` length prefix for `n`, guarding the real
+/// `0xFF_FFFF` ceiling (not just `u32::MAX`, which `u32::try_from` alone would
+/// permit and then silently truncate). `Err(MessageTooLarge)` on overflow —
+/// the handshake-MESSAGE framing layer, distinct from the record-layer u16.
+fn u24_len(n: usize) -> Result<[u8; 3], Error> {
+    if n > 0xFF_FFFF {
+        return Err(Error::MessageTooLarge);
+    }
+    let bytes = u32::try_from(n)
+        .map_err(|_| Error::MessageTooLarge)?
+        .to_be_bytes();
+    Ok([bytes[1], bytes[2], bytes[3]])
+}
+
 /// Wrap a handshake-message body as `type ‖ u24 len ‖ body`.
 fn handshake_message(msg_type: u8, body: &[u8]) -> Result<Vec<u8>, Error> {
-    let len = u32::try_from(body.len()).map_err(|_| handshake::Error::RecordTooLarge)?;
-    if body.len() > 0xFF_FFFF {
-        return Err(handshake::Error::RecordTooLarge.into());
-    }
+    let len = u24_len(body.len())?;
     let mut out = Vec::with_capacity(4 + body.len());
     out.push(msg_type);
-    out.extend_from_slice(&len.to_be_bytes()[1..]); // u24
+    out.extend_from_slice(&len); // u24
     out.extend_from_slice(body);
     Ok(out)
 }
 
 /// A single `CertificateEntry`: `u24 cert_data_len ‖ der ‖ u16 ext_len(0)`.
 fn certificate_entry(der: &[u8]) -> Result<Vec<u8>, Error> {
-    let len = u32::try_from(der.len()).map_err(|_| handshake::Error::RecordTooLarge)?;
-    if der.len() > 0xFF_FFFF {
-        return Err(handshake::Error::RecordTooLarge.into());
-    }
+    let len = u24_len(der.len())?;
     let mut out = Vec::with_capacity(3 + der.len() + 2);
-    out.extend_from_slice(&len.to_be_bytes()[1..]); // u24
+    out.extend_from_slice(&len); // u24
     out.extend_from_slice(der);
     out.extend_from_slice(&[0x00, 0x00]); // empty entry extensions
     Ok(out)
@@ -1277,11 +1285,7 @@ pub fn emit_server_flight(
     }
     let mut cert_body = Vec::with_capacity(1 + 3 + cert_list.len());
     cert_body.push(0x00); // certificate_request_context length = 0
-    let list_len = u32::try_from(cert_list.len()).map_err(|_| handshake::Error::RecordTooLarge)?;
-    if cert_list.len() > 0xFF_FFFF {
-        return Err(handshake::Error::RecordTooLarge.into());
-    }
-    cert_body.extend_from_slice(&list_len.to_be_bytes()[1..]); // u24
+    cert_body.extend_from_slice(&u24_len(cert_list.len())?); // u24
     cert_body.extend_from_slice(&cert_list);
     let certificate = handshake_message(0x0b, &cert_body)?;
 
@@ -3381,6 +3385,19 @@ mod tests {
             }
         }
         assert_eq!(types, vec![0x08, 0x0b, 0x0f, 0x14]);
+    }
+
+    #[test]
+    fn u24_len_encodes_and_guards_the_ceiling() {
+        assert_eq!(super::u24_len(0).unwrap(), [0x00, 0x00, 0x00]);
+        assert_eq!(super::u24_len(1).unwrap(), [0x00, 0x00, 0x01]);
+        assert_eq!(super::u24_len(0x01_02_03).unwrap(), [0x01, 0x02, 0x03]);
+        // Exactly the u24 ceiling is allowed; one over → MessageTooLarge.
+        assert_eq!(super::u24_len(0xFF_FFFF).unwrap(), [0xFF, 0xFF, 0xFF]);
+        assert!(matches!(
+            super::u24_len(0x1_00_00_00),
+            Err(Error::MessageTooLarge)
+        ));
     }
 
     #[test]

@@ -40,6 +40,14 @@ pub enum Error {
     /// or a malformed `record_lengths`). REALITY.5c fail-safe: 5d degrades
     /// this connection to splice-only.
     FlightTooLarge,
+    /// A hand-rolled TLS 1.3 handshake MESSAGE (or a `CertificateEntry` DER,
+    /// or the `certificate_list`) exceeds the 24-bit length its wire prefix
+    /// can encode (`> 0xFF_FFFF`). Distinct from a record-layer overflow
+    /// ([`crate::handshake::Error::RecordTooLarge`], the AEAD record's u16
+    /// length): this is the message-framing layer. Unreachable with any real
+    /// forged flight (~KiB); guards [`crate::stream::emit_server_flight`]
+    /// against a pathological template.
+    MessageTooLarge,
 }
 
 impl fmt::Display for Error {
@@ -58,6 +66,9 @@ impl fmt::Display for Error {
                     "REALITY/TLS server flight exceeds the captured dest record framing"
                 )
             }
+            Error::MessageTooLarge => {
+                write!(f, "REALITY/TLS handshake message exceeds its 24-bit length prefix")
+            }
         }
     }
 }
@@ -72,7 +83,8 @@ impl std::error::Error for Error {
             | Error::Clock
             | Error::RealityVerify(_)
             | Error::UnsupportedGroup(_)
-            | Error::FlightTooLarge => None,
+            | Error::FlightTooLarge
+            | Error::MessageTooLarge => None,
         }
     }
 }
