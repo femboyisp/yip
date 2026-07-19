@@ -215,6 +215,12 @@ pub fn run_responder(
 /// uses it to recognize a retransmitted rekey `Init` (same ephemeral as the
 /// round already answered) and reply idempotently instead of minting a
 /// second session.
+/// LOCKSTEP INVARIANT: `1..33` = skip the 1-byte `PacketType::HandshakeInit`
+/// prefix, then the 32-byte Noise-IK `e` token that leads msg1 in the clear.
+/// This offset MUST move in lockstep with `start_initiator`'s framing — if a
+/// future anti-DPI change reshapes the `HandshakeInit` header, this must be
+/// updated too, or it would return wrong-but-well-typed bytes and silently
+/// reintroduce the rekey-convergence bug it exists to prevent.
 pub fn init_ephemeral(init_pkt: &[u8]) -> Option<[u8; 32]> {
     init_pkt.get(1..33)?.try_into().ok()
 }
