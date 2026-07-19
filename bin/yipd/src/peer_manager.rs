@@ -639,6 +639,30 @@ impl PeerManager {
         self.rendezvous.as_mut().map(|r| r.relay(local, node, &raw))
     }
 
+    /// Emit one rekey-related datagram into `self.egress`: relay-wrapped when
+    /// `via_relay` (a `relay_wrap` `None` is a clean skip — the rekey just
+    /// retries), else addressed directly to `direct_dst`. Used by the rekey
+    /// cores so the Direct/Relay split lives in exactly one place.
+    fn push_rekey_egress(
+        &mut self,
+        idx: usize,
+        bytes: Vec<u8>,
+        via_relay: bool,
+        direct_dst: SocketAddr,
+    ) {
+        if via_relay {
+            if let Some(d) = self.relay_wrap(idx, bytes) {
+                self.egress.push(d);
+            }
+        } else {
+            self.egress.push(EgressDatagram {
+                fate: 0,
+                dst: direct_dst,
+                bytes,
+            });
+        }
+    }
+
     /// Start a fresh initiator handshake toward `target` for peer `idx`,
     /// returning the framed egress datagram(s) to send (relay-wrapped when
     /// `via_relay`), the real `HandshakeInit` always last. Transitions the
@@ -1579,47 +1603,77 @@ impl PeerManager {
         now_ms: u64,
         init_eph: [u8; 32],
     ) -> DispatchOut<'_> {
+        self.rekey_init_core(idx, established, resp_pkt, init_eph, now_ms, src, false)
+    }
+
+    /// Shared core for [`handle_rekey_init`] (`via_relay = false`) and its
+    /// relay-path counterpart (#91 Task 2, `via_relay = true`). See
+    /// `handle_rekey_init`'s doc comment above for the four-way dedup/gate
+    /// logic (UNCHANGED here — only `peer_addr` and the emit are
+    /// parameterized by `via_relay`, via [`push_rekey_egress`]).
+    ///
+    /// `direct_src` is the direct-path peer address (`Direct`/`Punched`
+    /// `src`); for the relay path it is unused for addressing (the emit goes
+    /// through `relay_wrap` instead) but is still threaded through so the
+    /// two paths share one signature.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the pre-existing handle_rekey_init parameter set plus via_relay; the params are all distinct handshake-derived values"
+    )]
+    fn rekey_init_core(
+        &mut self,
+        idx: usize,
+        established: Established,
+        resp_pkt: Vec<u8>,
+        init_eph: [u8; 32],
+        now_ms: u64,
+        direct_src: SocketAddr,
+        via_relay: bool,
+    ) -> DispatchOut<'_> {
+        let peer_addr = if via_relay {
+            self.server_addr()
+        } else {
+            direct_src
+        };
+
         if self.peers[idx].cached_resp_init_eph == Some(init_eph) {
-            return match &self.peers[idx].cached_resp {
-                Some(resp) => {
-                    self.egress.clear();
-                    self.egress.push(EgressDatagram {
-                        fate: 0,
-                        dst: src,
-                        bytes: resp.clone(),
-                    });
-                    DispatchOut::Udp(&self.egress)
-                }
-                None => DispatchOut::None,
+            self.egress.clear();
+            if let Some(resp) = self.peers[idx].cached_resp.clone() {
+                self.push_rekey_egress(idx, resp, via_relay, peer_addr);
+            }
+            return if self.egress.is_empty() {
+                DispatchOut::None
+            } else {
+                DispatchOut::Udp(&self.egress)
             };
         }
 
         let PeerState::Established(epochs) = &mut self.peers[idx].state else {
-            unreachable!("handle_rekey_init is only called for an Established peer")
+            unreachable!("rekey_init_core is only called for an Established peer")
         };
 
         if let Some(cached) = epochs.next_cached_resp_for(&init_eph).map(<[u8]>::to_vec) {
             self.egress.clear();
-            self.egress.push(EgressDatagram {
-                fate: 0,
-                dst: src,
-                bytes: cached,
-            });
-            return DispatchOut::Udp(&self.egress);
+            self.push_rekey_egress(idx, cached, via_relay, peer_addr);
+            return if self.egress.is_empty() {
+                DispatchOut::None
+            } else {
+                DispatchOut::Udp(&self.egress)
+            };
         }
 
+        let PeerState::Established(epochs) = &self.peers[idx].state else {
+            unreachable!("state cannot change between the two borrows above")
+        };
         if !epochs.accept_rekey_init(now_ms, self.rekey_interval_ms) {
-            return match &self.peers[idx].cached_resp {
-                Some(resp) => {
-                    self.egress.clear();
-                    self.egress.push(EgressDatagram {
-                        fate: 0,
-                        dst: src,
-                        bytes: resp.clone(),
-                    });
-                    DispatchOut::Udp(&self.egress)
-                }
-                None => DispatchOut::None,
+            self.egress.clear();
+            if let Some(resp) = self.peers[idx].cached_resp.clone() {
+                self.push_rekey_egress(idx, resp, via_relay, peer_addr);
+            }
+            return if self.egress.is_empty() {
+                DispatchOut::None
+            } else {
+                DispatchOut::Udp(&self.egress)
             };
         }
 
@@ -1631,7 +1685,7 @@ impl PeerManager {
             established,
             conn_tag,
             self.mode,
-            src,
+            peer_addr,
             self.obf_key.is_some(),
             self.data_symbol_size,
         ));
@@ -1641,12 +1695,12 @@ impl PeerManager {
         epochs.install_next(dp, init_eph, resp_pkt.clone());
 
         self.egress.clear();
-        self.egress.push(EgressDatagram {
-            fate: 0,
-            dst: src,
-            bytes: resp_pkt,
-        });
-        DispatchOut::Udp(&self.egress)
+        self.push_rekey_egress(idx, resp_pkt, via_relay, peer_addr);
+        if self.egress.is_empty() {
+            DispatchOut::None
+        } else {
+            DispatchOut::Udp(&self.egress)
+        }
     }
 
     /// Handle an incoming `[HandshakeResp]`: either complete an in-flight
@@ -1795,16 +1849,35 @@ impl PeerManager {
     /// inner AEAD/wire `Codec` — DOES rotate correctly: it is rebuilt fresh
     /// inside `DataPlane::new` from this epoch's own `auth_key`/`hp_key`.)
     fn handle_rekey_resp(&mut self, idx: usize, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
+        self.rekey_resp_core(idx, dg, now_ms, false)
+    }
+
+    /// Shared core for [`handle_rekey_resp`] (`via_relay = false`) and its
+    /// relay-path counterpart (#91 Task 2, `via_relay = true`). See
+    /// `handle_rekey_resp`'s doc comment above for the full behavior
+    /// (UNCHANGED here — only `peer_addr` and the prime-emit are
+    /// parameterized by `via_relay`, via [`push_rekey_egress`]).
+    fn rekey_resp_core(
+        &mut self,
+        idx: usize,
+        dg: &[u8],
+        now_ms: u64,
+        via_relay: bool,
+    ) -> DispatchOut<'_> {
         let rk = {
             let PeerState::Established(epochs) = &mut self.peers[idx].state else {
-                unreachable!("handle_rekey_resp is only called for an Established peer")
+                unreachable!("rekey_resp_core is only called for an Established peer")
             };
             match epochs.rekey.take() {
                 Some(rk) => rk,
                 None => return DispatchOut::None,
             }
         };
-        let peer_addr = rk.target;
+        let peer_addr = if via_relay {
+            self.server_addr()
+        } else {
+            rk.target
+        };
 
         let (established, responder_payload) = match rk.hs.read_response(dg) {
             Ok(t) => t,
@@ -1828,18 +1901,28 @@ impl PeerManager {
             self.data_symbol_size,
         ));
 
-        // Prime the new epoch's outbound (see doc comment) BEFORE `dp` is
-        // moved into `promote_from_rekey` below.
+        // Prime the new epoch (BEFORE `dp` moves into `promote_from_rekey`
+        // below), emitting via the helper.
         let pending = std::mem::take(&mut self.peers[idx].pending_tun);
         self.egress.clear();
-        if pending.is_empty() {
-            self.egress
-                .extend(dp.on_tun_packet(&[], now_ms).iter().cloned());
+        let primed: Vec<Vec<u8>> = if pending.is_empty() {
+            dp.on_tun_packet(&[], now_ms)
+                .iter()
+                .map(|d| d.bytes.clone())
+                .collect()
         } else {
-            for inner in &pending {
-                self.egress
-                    .extend(dp.on_tun_packet(inner, now_ms).iter().cloned());
-            }
+            pending
+                .iter()
+                .flat_map(|inner| {
+                    dp.on_tun_packet(inner, now_ms)
+                        .iter()
+                        .map(|d| d.bytes.clone())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        for bytes in primed {
+            self.push_rekey_egress(idx, bytes, via_relay, peer_addr);
         }
 
         let old_tag = {
