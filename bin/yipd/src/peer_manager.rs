@@ -1183,6 +1183,20 @@ impl PeerManager {
                 DispatchOut::None
             }
             PeerState::Idle | PeerState::Handshaking(_) => {
+                // #41: re-admission gate. A tabled mesh peer re-establishing
+                // (its session was dropped by the rekey re-verify or the
+                // liveness sweep) must present a currently-valid cert, else a
+                // revoked member reconnects by static-key match (flapping, not
+                // revocation). Always-admit ROOTS are exempt (as in the #41
+                // sweep). No-op for pure 2a/2b: `responder_cert_ok` returns
+                // `true` when membership is `None`.
+                let is_root = self
+                    .membership
+                    .as_ref()
+                    .is_some_and(|m| m.roots().iter().any(|(pk, _)| *pk == remote_static));
+                if !is_root && !self.responder_cert_ok(&initiator_payload, remote_static) {
+                    return DispatchOut::None;
+                }
                 let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
                 let sess_obf = self.session_obf_key_for(&established.hp_key);
                 // A relay peer's egress is always re-wrapped, so the DataPlane's
@@ -1695,6 +1709,20 @@ impl PeerManager {
             // lazy establishment) or `Handshaking` with the larger key (adopt
             // responder role): admit this session.
             PeerState::Idle | PeerState::Handshaking(_) => {
+                // #41: re-admission gate. A tabled mesh peer re-establishing
+                // (its session was dropped by the rekey re-verify or the
+                // liveness sweep) must present a currently-valid cert, else a
+                // revoked member reconnects by static-key match (flapping, not
+                // revocation). Always-admit ROOTS are exempt (as in the #41
+                // sweep). No-op for pure 2a/2b: `responder_cert_ok` returns
+                // `true` when membership is `None`.
+                let is_root = self
+                    .membership
+                    .as_ref()
+                    .is_some_and(|m| m.roots().iter().any(|(pk, _)| *pk == remote_static));
+                if !is_root && !self.responder_cert_ok(&initiator_payload, remote_static) {
+                    return DispatchOut::None;
+                }
                 let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
                 let sess_obf = self.session_obf_key_for(&established.hp_key);
                 let mut dp = Box::new(DataPlane::new(
@@ -5953,12 +5981,19 @@ mod tests {
             .unwrap()
             .insert(peer.public, (peer.private, peer_sign_seed));
 
-        // Cold-start: the peer completes a direct handshake with `pm`.
-        // Admission is by preconfigured static-key match (`cfg_peer` above),
-        // so no cert is needed on this leg — only the mid-session rekey path
-        // (#41a) re-checks the cert.
-        let (_hs, init_pkt) =
-            HandshakeState::start_initiator(&peer.private, &local.public, &[]).unwrap();
+        // Cold-start: the peer completes a direct handshake with `pm`. Even
+        // though admission is by preconfigured static-key match (`cfg_peer`
+        // above), Task 2b's re-admission gate now also requires a
+        // currently-valid cert on THIS leg (mirroring the real initiator's
+        // `begin_handshake`, which always attaches `own_cert_bytes()` when
+        // membership is enabled) — so mint one here, exactly like a
+        // legitimate, non-revoked member would present.
+        let (_hs, init_pkt) = HandshakeState::start_initiator(
+            &peer.private,
+            &local.public,
+            &valid_cert_bytes(&pm, 0),
+        )
+        .unwrap();
         let out = pm.on_udp(peer_ep, &init_pkt, 0);
         assert!(
             matches!(out, DispatchOut::Udp(_)),
@@ -6005,6 +6040,36 @@ mod tests {
         let ca = test_ca();
         let sign = SigningKey::from_bytes(&sign_seed);
         let cert = mk_cert(&ca, peer_pub, sign.verifying_key().to_bytes());
+        let mut bytes = Vec::new();
+        cert.encode(&mut bytes);
+        bytes
+    }
+
+    /// A CA-signed but EXPIRED cert (encoded) covering `pm.peers[idx]`'s
+    /// static key — what a revoked/non-renewed member would present when
+    /// re-establishing after its session was dropped (#41/Task 2b).
+    /// `not_after: 1` is far enough in the past (wall-clock seconds since the
+    /// UNIX epoch) that it is expired even past `CLOCK_SKEW_SECS`.
+    fn expired_cert_bytes(pm: &PeerManager, idx: usize) -> Vec<u8> {
+        let peer_pub = pm.peers[idx].pubkey;
+        let (_priv, sign_seed) = *peer_test_key_registry()
+            .lock()
+            .unwrap()
+            .get(&peer_pub)
+            .expect("peer keypair registered by pm_mesh_established_peer");
+        let ca = test_ca();
+        let sign = SigningKey::from_bytes(&sign_seed);
+        let mut cert = Cert {
+            version: 1,
+            member_pubkey: peer_pub,
+            member_sign_pubkey: sign.verifying_key().to_bytes(),
+            network_id: TEST_NET,
+            not_before: 0,
+            not_after: 1,
+            tags: vec![],
+            ca_sig: [0u8; 64],
+        };
+        cert.ca_sig = ca.sign(&cert_signing_body(&cert)).to_bytes();
         let mut bytes = Vec::new();
         cert.encode(&mut bytes);
         bytes
@@ -6071,6 +6136,224 @@ mod tests {
             ),
             _ => panic!("valid cert rekeys, no drop"),
         }
+    }
+
+    // ── #41(c)/Task 2b: re-admission gate on cold-start establishment ──────
+    //
+    // Closes the third piece of #41: a revoked (cert-expired, non-renewed)
+    // mesh member whose session was dropped (by the rekey re-verify above, or
+    // the future liveness sweep) stays TABLED in `self.peers`, just `Idle`.
+    // Before this gate, `handle_handshake_init`'s tabled-lookup
+    // (`Some(i) => i`) admitted it back in by static-key match alone — only
+    // the `None`/new-peer path verified a cert — so a revoked member could
+    // flap back in on every cold-start retry instead of staying revoked.
+
+    /// A TABLED mesh peer whose live session was dropped is `Idle` but still
+    /// present by static-key match. Its next cold-start Init, carrying an
+    /// EXPIRED cert, must NOT be re-admitted: no session, no reply, state
+    /// stays `Idle`. Drives the real dispatch path (`on_udp` ->
+    /// `handle_handshake_init`).
+    #[test]
+    fn revoked_tabled_peer_cold_start_reinit_rejected() {
+        let (mut pm, _tag) = pm_mesh_established_peer([5u8; 32], [6u8; 32], 100_000);
+        // Session dropped (as the #41a rekey guard, or the liveness sweep,
+        // would do): the peer stays tabled, reverts to Idle.
+        pm.drop_session(0);
+        assert!(matches!(pm.peers[0].state, PeerState::Idle));
+        assert!(pm.by_tag.is_empty());
+
+        let init = rekey_init_with_payload(&pm, 0, &expired_cert_bytes(&pm, 0));
+        let out = pm.on_udp(peer_src(&pm, 0), &init, 300_000);
+
+        assert!(
+            matches!(out, DispatchOut::None),
+            "an expired cert must not re-admit a tabled peer"
+        );
+        assert!(
+            matches!(pm.peers[0].state, PeerState::Idle),
+            "peer stays Idle: no session was created for the rejected re-init"
+        );
+        assert!(
+            pm.by_tag.is_empty(),
+            "no conn_tag was installed for the rejected re-init"
+        );
+    }
+
+    /// The `is_root` exemption: a peer whose pubkey IS in the signed root set
+    /// is always-admit (mirrors the future liveness sweep's root exemption).
+    /// Its cold-start Init is admitted even though its payload carries no
+    /// cert at all — proving the exemption, not merely a passing cert check.
+    #[test]
+    fn root_exempt_from_readmission_check() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let root = generate_keypair();
+        let root_ep: SocketAddr = "198.51.100.1:51820".parse().unwrap();
+
+        let roots = RootSet {
+            roots: vec![(root.public, root_ep)],
+            version: 1,
+            ca_sig: [0u8; 64],
+        };
+        let own_sign = SigningKey::from_bytes(&[200u8; 32]);
+        let own_cert = mk_cert(&ca, local.public, own_sign.verifying_key().to_bytes());
+        let membership = Membership::new(
+            vec![ca.verifying_key().to_bytes()],
+            TEST_NET,
+            own_cert,
+            own_sign.to_bytes(),
+            roots,
+            vec!["10.0.0.1:51820".parse().unwrap()],
+        );
+        let mut pm = PeerManager::new(
+            local.private,
+            local.public,
+            &[],
+            TunnelMode::L3Tun,
+            None,
+            Some(membership),
+            false,
+        );
+        // `PeerManager::new` auto-admits the root: tabled, Idle.
+        assert_eq!(pm.peers.len(), 1);
+        assert_eq!(pm.peers[0].pubkey, root.public);
+        assert!(matches!(pm.peers[0].state, PeerState::Idle));
+
+        // Cold-start Init from the root, NO cert payload — would fail
+        // `responder_cert_ok` for a non-root peer.
+        let (_hs, init_pkt) =
+            HandshakeState::start_initiator(&root.private, &local.public, &[]).unwrap();
+        let out = pm.on_udp(root_ep, &init_pkt, 0);
+
+        assert_eq!(
+            resp_bytes(&out).len(),
+            1,
+            "the root is admitted despite presenting no cert"
+        );
+        assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+    }
+
+    /// Control: with membership disabled (pure 2a/2b), the re-admission gate
+    /// is a no-op — `responder_cert_ok` returns `true` unconditionally, so a
+    /// configured peer re-establishing from `Idle` behaves byte-identically
+    /// to before this gate existed.
+    #[test]
+    fn readmission_check_is_noop_without_membership() {
+        let local = generate_keypair();
+        let peer = generate_keypair();
+        let peer_ep: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+        let cfg_peer = PeerConfig {
+            public_key: peer.public,
+            endpoint: Some(peer_ep),
+        };
+        let mut pm = PeerManager::new(
+            local.private,
+            local.public,
+            &[cfg_peer],
+            TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
+
+        let (_hs, init1) =
+            HandshakeState::start_initiator(&peer.private, &local.public, &[]).unwrap();
+        let out1 = pm.on_udp(peer_ep, &init1, 0);
+        assert_eq!(resp_bytes(&out1).len(), 1, "initial cold-start establishes");
+        assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+
+        // Drop the session (as a real revocation/liveness event would), then
+        // re-establish from Idle with another empty-payload Init.
+        pm.drop_session(0);
+        assert!(matches!(pm.peers[0].state, PeerState::Idle));
+
+        let (_hs2, init2) =
+            HandshakeState::start_initiator(&peer.private, &local.public, &[]).unwrap();
+        let out2 = pm.on_udp(peer_ep, &init2, 1_000);
+        assert_eq!(
+            resp_bytes(&out2).len(),
+            1,
+            "re-establishment from Idle is unaffected by the gate when membership is None"
+        );
+        assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+    }
+
+    /// Relay-path counterpart of `revoked_tabled_peer_cold_start_reinit_rejected`:
+    /// a TABLED mesh peer reached over the relay, whose session was dropped,
+    /// must not be re-admitted by `relayed_handshake_init`'s Idle|Handshaking
+    /// arm when its cold-start re-Init carries an expired cert.
+    #[test]
+    fn revoked_tabled_relay_peer_cold_start_reinit_rejected() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let peer = generate_keypair();
+
+        let local_sign = SigningKey::from_bytes(&[5u8; 32]);
+        let local_cert = mk_cert(&ca, local.public, local_sign.verifying_key().to_bytes());
+        let membership = Membership::new(
+            vec![ca.verifying_key().to_bytes()],
+            TEST_NET,
+            local_cert,
+            local_sign.to_bytes(),
+            empty_roots(),
+            vec!["10.0.0.1:51820".parse().unwrap()],
+        );
+        let cfg_peer = PeerConfig {
+            public_key: peer.public,
+            endpoint: None,
+        };
+        let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let rdv: Box<dyn Rendezvous> = Box::new(MockRdv {
+            server: mock_server(),
+            sent: sent.clone(),
+        });
+        let mut pm = PeerManager::new(
+            local.private,
+            local.public,
+            &[cfg_peer],
+            TunnelMode::L3Tun,
+            Some(rdv),
+            Some(membership),
+            false,
+        );
+
+        peer_test_key_registry()
+            .lock()
+            .unwrap()
+            .insert(peer.public, (peer.private, [6u8; 32]));
+
+        // Cold-start over the relay: establishes. Task 2b's re-admission gate
+        // requires a currently-valid cert on THIS leg too (mirroring the real
+        // initiator's `begin_handshake`, which always attaches
+        // `own_cert_bytes()` when membership is enabled), so mint one here.
+        let (_hs, init_pkt) = HandshakeState::start_initiator(
+            &peer.private,
+            &local.public,
+            &valid_cert_bytes(&pm, 0),
+        )
+        .unwrap();
+        let out = pm.on_udp(mock_server(), &relay_deliver(&peer, init_pkt), 0);
+        assert!(
+            has_relayed_handshake_resp(&out),
+            "cold-start relayed init must establish"
+        );
+        assert!(pm.peers[0].relay);
+
+        // Session dropped (revocation / sweep); the peer stays tabled, Idle.
+        pm.drop_session(0);
+        assert!(matches!(pm.peers[0].state, PeerState::Idle));
+
+        // A fresh relayed cold-start Init carrying an EXPIRED cert.
+        let expired = expired_cert_bytes(&pm, 0);
+        let (_hs2, reinit_pkt) =
+            HandshakeState::start_initiator(&peer.private, &local.public, &expired).unwrap();
+        let out2 = pm.on_udp(mock_server(), &relay_deliver(&peer, reinit_pkt), 300_000);
+
+        assert!(
+            matches!(out2, DispatchOut::None),
+            "an expired cert must not re-admit a tabled relay peer"
+        );
+        assert!(matches!(pm.peers[0].state, PeerState::Idle));
     }
 
     /// (c) With NO membership configured, `on_tun` to an unknown mesh address is
