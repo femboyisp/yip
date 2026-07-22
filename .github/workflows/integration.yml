@@ -215,6 +215,45 @@ jobs:
             exit 1
           fi
 
+      - name: Run the rekey.91 relay-forced money test under sudo (poll driver)
+        # run-netns-rekey-relay.sh: the run-netns-relay.sh RELAY-FORCED
+        # topology (A/B mutually unreachable except via R's blind relay)
+        # held to the same YIP_REKEY_INTERVAL_MS=2000 cadence as the 9a
+        # direct-path test above. Proves relay-only sessions also rotate
+        # loss-free: (1) relay-forwarded=<N> N>0 (the relay, not a
+        # direct/punched path, carried the traffic), (2) <=1% loss across
+        # ~10 rotations, (3) rekey_epoch_witness (with the opt-in
+        # YIP_WITNESS_UNWRAP_RELAY=1 RelaySend/RelayDeliver envelope
+        # unwrap) reports >=3 distinct completed rekey rounds. Uses the
+        # release yipd and debug yip-rendezvous already built above in
+        # this job.
+        run: |
+          sudo bash bin/yipd/tests/run-netns-rekey-relay.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/rekey-relay-poll.log
+          if grep -q "^SKIP run-netns-rekey-relay" /tmp/rekey-relay-poll.log; then
+            echo "::error::rekey.91 relay money test (poll) skipped — expected root + tcpdump + the built witness tool in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/rekey-relay-poll.log; then
+            echo "::error::rekey.91 relay money test (poll) failed — relay did not carry traffic, loss-free continuity, or on-wire rekey rotation regressed"
+            exit 1
+          fi
+
+      - name: Run the rekey.91 relay-forced money test under sudo (uring driver)
+        run: |
+          sudo -E env YIP_USE_URING=1 bash bin/yipd/tests/run-netns-rekey-relay.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/rekey-relay-uring.log
+          if grep -q "^SKIP run-netns-rekey-relay" /tmp/rekey-relay-uring.log; then
+            echo "::error::rekey.91 relay money test (uring) skipped — expected root + tcpdump + the built witness tool in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/rekey-relay-uring.log; then
+            echo "::error::rekey.91 relay money test (uring) failed — relay did not carry traffic, loss-free continuity, or on-wire rekey rotation regressed"
+            exit 1
+          fi
+
   dpi-undetectability:
     # The anti-DPI undetectability merge gate (3a Task 7): fails the build if
     # a wire/obfuscation change reintroduces a DPI-recognizable fingerprint.

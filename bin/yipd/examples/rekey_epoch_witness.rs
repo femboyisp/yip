@@ -78,10 +78,39 @@
 //! this tool (or any passive observer) can never learn what those N values
 //! actually are.
 //!
+//! # Relay-envelope unwrap (opt-in, `run-netns-rekey-relay.sh`)
+//!
+//! On the relay-forced path (milestone 9a/#91 Task 4), the peer<->relay
+//! veth never carries a bare `[HandshakeInit]`/`[HandshakeResp]` datagram —
+//! `PeerManager::relay_wrap` wraps every relay-routed rekey emission in a
+//! `yip_rendezvous::Message::RelaySend` (client -> server) or
+//! `RelayDeliver` (server -> client) envelope (`crates/yip-rendezvous/src/
+//! proto.rs`). Both envelope kinds prefix the inner yipd datagram with a
+//! fixed-width header: `RelaySend` = `[tag=5][src:16][dst:16][payload..]`
+//! (inner datagram starts at offset 33), `RelayDeliver` =
+//! `[tag=6][src:16][payload..]` (inner datagram starts at offset 17) — see
+//! `proto.rs`'s `encode`/`decode` for `Tag::RelaySend`/`Tag::RelayDeliver`.
+//!
+//! Set `YIP_WITNESS_UNWRAP_RELAY=1` to have this tool strip that envelope
+//! before applying the PacketType+ephemeral logic below: any UDP payload
+//! whose first byte is 5 has bytes `[33..]` treated as the inner datagram;
+//! first byte 6 has bytes `[17..]`; anything else passes through
+//! unchanged. This is OPT-IN and OFF by default — the 9a direct-path
+//! `run-netns-rekey.sh` never sets the env var, so its behavior (parsing
+//! the bare `[PacketType][ephemeral]` prefix directly) is byte-for-byte
+//! unchanged. It is deliberately not auto-detected from the first byte
+//! alone: a bare yipd `PacketType::HandshakeInit`/`HandshakeResp` (0/1) is
+//! disjoint from the relay tags (5/6) today, but a bare `PacketType::Data`
+//! or a future PacketType variant could coincide with 5/6, so auto-sniffing
+//! would be a silent footgun — the caller states which topology it is
+//! running via the env var instead.
+//!
 //! Usage:
 //!   rekey_epoch_witness <pcap>
+//!   YIP_WITNESS_UNWRAP_RELAY=1 rekey_epoch_witness <pcap>
 //!
-//! Output (stdout), consumed by `run-netns-rekey.sh`:
+//! Output (stdout), consumed by `run-netns-rekey.sh` /
+//! `run-netns-rekey-relay.sh`:
 //!   HANDSHAKE_INIT_PKTS=<n>          total captured [HandshakeInit] datagrams
 //!   HANDSHAKE_RESP_PKTS=<n>          total captured [HandshakeResp] datagrams
 //!   DISTINCT_INIT_EPHEMERALS=<n>     distinct cleartext initiator ephemerals
@@ -188,6 +217,30 @@ const TYPE_DATA: u8 = 2;
 /// 1-byte PacketType prefix + 32-byte cleartext Noise ephemeral pubkey.
 const MIN_HANDSHAKE_LEN: usize = 33;
 
+/// `yip_rendezvous::proto::Tag::RelaySend` / `Tag::RelayDeliver` (see
+/// `crates/yip-rendezvous/src/proto.rs`). Only meaningful when the
+/// `YIP_WITNESS_UNWRAP_RELAY` opt-in is set — see the module doc.
+const RELAY_SEND_TAG: u8 = 5;
+const RELAY_DELIVER_TAG: u8 = 6;
+/// `RelaySend` = `[tag:1][src:16][dst:16][payload..]` — inner datagram at 33.
+const RELAY_SEND_INNER_OFFSET: usize = 33;
+/// `RelayDeliver` = `[tag:1][src:16][payload..]` — inner datagram at 17.
+const RELAY_DELIVER_INNER_OFFSET: usize = 17;
+
+/// Strip a `RelaySend`/`RelayDeliver` rendezvous envelope from `payload`,
+/// returning the inner yipd datagram. Only called when the
+/// `YIP_WITNESS_UNWRAP_RELAY` opt-in is enabled. Anything that isn't
+/// recognizably one of those two envelope tags (including a too-short
+/// buffer) passes through unchanged — panic-safe via `.get(..)`, never
+/// indexes past the end.
+fn unwrap_relay_envelope(payload: &[u8]) -> &[u8] {
+    match payload.first() {
+        Some(&RELAY_SEND_TAG) => payload.get(RELAY_SEND_INNER_OFFSET..).unwrap_or(&[]),
+        Some(&RELAY_DELIVER_TAG) => payload.get(RELAY_DELIVER_INNER_OFFSET..).unwrap_or(&[]),
+        _ => payload,
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
@@ -195,6 +248,11 @@ fn main() {
         std::process::exit(2);
     }
     let pcap_path = &args[1];
+    // Opt-in only (see module doc): the 9a direct-path run-netns-rekey.sh
+    // never sets this, so its behavior is byte-for-byte unchanged.
+    let unwrap_relay = env::var("YIP_WITNESS_UNWRAP_RELAY")
+        .map(|v| v == "1")
+        .unwrap_or(false);
 
     let data = fs::read(pcap_path).unwrap_or_else(|e| {
         eprintln!("rekey_epoch_witness: read {pcap_path}: {e}");
@@ -208,11 +266,16 @@ fn main() {
     let mut resp_pkt_count = 0u32;
 
     for p in &pkts {
-        if p.payload.len() < MIN_HANDSHAKE_LEN {
+        let inner: &[u8] = if unwrap_relay {
+            unwrap_relay_envelope(&p.payload)
+        } else {
+            &p.payload
+        };
+        if inner.len() < MIN_HANDSHAKE_LEN {
             continue;
         }
-        let ephemeral: [u8; 32] = p.payload[1..33].try_into().expect("32 bytes");
-        match p.payload[0] {
+        let ephemeral: [u8; 32] = inner[1..33].try_into().expect("32 bytes");
+        match inner[0] {
             TYPE_HANDSHAKE_INIT => {
                 init_pkt_count += 1;
                 if !init_ephemerals.contains(&ephemeral) {
