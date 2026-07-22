@@ -53,7 +53,32 @@ Replace the "`state = Idle; begin_handshake(new_addr)`" re-target pattern at the
 
 **Why this is safe (no new attack surface):** resending the same `init_pkt` is exactly what the retransmit arm already does every `HANDSHAKE_RETRY_MS`; the only change is that the destination/path may differ. A responder that is `Established` replays its `cached_resp` (case 1) and we complete; a responder that never adopted us treats it as a fresh cold-start `Init` and adopts us normally. No responder-side gate (`accept_rekey_init`) is touched, so the 9a anti-hijack posture and the #34 anti-replay question are untouched. Ephemeral reuse remains bounded by the unchanged 90 s `HANDSHAKE_TOTAL_MS` give-up.
 
-**Data flow (the reported #36 scenario, now converging):** A and B rendezvous-only; B adopts responder and is `Established`, but B→A `HandshakeResp` is lost through A's `PUNCH_MS` window. A escalates to relay: `retarget_handshake(idx, server, via_relay = true)` re-points A's in-flight `Handshaking(E1)` at the relay and resends `init_pkt(E1)` relay-wrapped. B receives it, `rekey_init_core` case (1) (`init_eph == cached_resp_init_eph`) replays `cached_resp(E1)` relay-wrapped, A `read_response(E1)` succeeds → A `Established`. Converged.
+**Responder-side relay adoption (required to close the headline scenario).** Ephemeral preservation fixes A's side, but #91's path-consistency gate blocks B's: `relayed_handshake_init`'s `Established` arm only completes when `peers[idx].relay` is already `true`, and B (adopted as responder over *punch*) is `relay == false`, so B fail-closed-drops A's relayed Init instead of replaying `cached_resp`. And even if B replayed, B's egress would stay direct to A's now-dead punch address (the reverse black hole). So the `Established` arm gains one adoption case: **a direct-established peer (`relay == false`) receiving a relayed cold-start RETRANSMIT of the Init that built our session — `init_eph == cached_resp_init_eph` — adopts the relay for our egress (`peers[idx].relay = true`) and lets `rekey_init_core` case (1) replay `cached_resp` over the relay.** So B→A data now flows over the relay too. A relayed Init with a *new* ephemeral (a genuine rekey, or an attack) against a direct peer is NOT adopted — it stays fail-closed (`DispatchOut::None`), preserving #91's guard for the session-churning case. `cached_resp_init_eph` is set only on a responder cold-start, so this applies exactly to the responder-adopter that #36 describes; an initiator-established peer (no cached resp) fails closed.
+
+The adopted arm becomes (replacing the two-arm gate):
+
+```rust
+PeerState::Established(_) => {
+    let Some(init_eph) = crate::handshake::init_ephemeral(dg) else {
+        return DispatchOut::None; // malformed Init
+    };
+    // #36: a relayed cold-start RETRANSMIT of the Init that built our session
+    // means the initiator moved to relay-only — adopt the relay for our egress
+    // so B->A also flows over it (else B keeps sending to A's dead punch addr).
+    if !self.peers[idx].relay && self.peers[idx].cached_resp_init_eph == Some(init_eph) {
+        self.peers[idx].relay = true;
+    }
+    if self.peers[idx].relay {
+        self.rekey_init_core(idx, established, resp_pkt, init_eph, now_ms, self.server_addr(), true)
+    } else {
+        DispatchOut::None // new-ephemeral relayed Init vs a direct peer: #91 fail-closed
+    }
+}
+```
+
+**Security tradeoff (accepted).** An attacker who captures A's original punch Init (E1) can replay it over the relay to force B to adopt the relay for A (a path *downgrade*, direct→relay). This is a mild, bounded DoS — data still reaches the *real* A (`relay_wrap` addresses A's registered node via the server, not the attacker), no hijack — of the same class as the #34 anti-replay gap. Accepted for #36; a full fix rides with #34 (authenticated endpoint). A *rekey* Init arriving over the relay after A moved (new ephemeral, ~120 s later) is a distinct, rarer residual not covered here — it also rides with #34.
+
+**Data flow (the reported #36 scenario, now converging):** A and B rendezvous-only; B adopts responder over punch and is `Established` (`relay == false`, `cached_resp_init_eph == E1`), but B→A `HandshakeResp` is lost through A's `PUNCH_MS` window. A escalates to relay: `retarget_handshake(idx, server, via_relay = true)` re-points A's in-flight `Handshaking(E1)` at the relay and resends `init_pkt(E1)` relay-wrapped. B receives it; the `Established` arm sees `init_eph == cached_resp_init_eph` on a `relay == false` peer → adopts `relay = true` → `rekey_init_core` case (1) replays `cached_resp(E1)` relay-wrapped. A `read_response(E1)` succeeds → A `Established` (relay). Both directions now flow over the relay. Converged.
 
 ### Fix #41 — cert re-verification on rekey + periodic liveness sweep
 
