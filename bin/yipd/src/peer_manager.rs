@@ -1112,21 +1112,53 @@ impl PeerManager {
             // datagrams to the server — black-holing `current`. Fail-closed
             // drop instead; `current` (and the in-flight rekey, if any)
             // stays untouched.
-            PeerState::Established(_) if self.peers[idx].relay => {
+            //
+            // EXCEPTION (#36, responder-side half): a direct peer receiving a
+            // relayed cold-start RETRANSMIT of the exact Init that built its
+            // OWN session (`init_eph == cached_resp_init_eph`) is the
+            // initiator having escalated punch->relay after we already
+            // established over punch — not a spoof/attack scenario, since it
+            // reproduces the very Init we ourselves answered. That single
+            // case adopts the relay below before falling into the same core;
+            // every other relayed Init against a direct peer stays
+            // fail-closed, per the paragraph above.
+            PeerState::Established(_) => {
                 let Some(init_eph) = crate::handshake::init_ephemeral(dg) else {
                     return DispatchOut::None; // malformed Init
                 };
-                self.rekey_init_core(
-                    idx,
-                    established,
-                    resp_pkt,
-                    init_eph,
-                    now_ms,
-                    self.server_addr(),
-                    true,
-                )
+                // #36: a relay==false (direct/punch-established) peer receiving a
+                // relayed cold-start RETRANSMIT of the Init that built our session
+                // (init_eph == cached_resp_init_eph) means the initiator could not
+                // complete our direct/punch reply and has moved to relay-only.
+                // Adopt the relay for OUR egress too, so B->A data also flows over
+                // the relay (else B keeps sending to A's dead punch address — the
+                // reverse black hole); rekey_init_core's case-1 dedup then replays
+                // cached_resp over the relay so A completes with the SAME ephemeral.
+                // A relayed Init with a NEW ephemeral (a genuine rekey, or an
+                // attack) against a direct peer is NOT adopted — it stays
+                // fail-closed, preserving #91's path-consistency guard for the
+                // session-churning case. Accepted tradeoff: an attacker replaying
+                // A's captured original Init forces a direct->relay path DOWNGRADE
+                // (data still reaches the real A via its registered node, no
+                // hijack); a full fix rides with #34 (authenticated endpoint).
+                if !self.peers[idx].relay && self.peers[idx].cached_resp_init_eph == Some(init_eph)
+                {
+                    self.peers[idx].relay = true;
+                }
+                if self.peers[idx].relay {
+                    self.rekey_init_core(
+                        idx,
+                        established,
+                        resp_pkt,
+                        init_eph,
+                        now_ms,
+                        self.server_addr(),
+                        true,
+                    )
+                } else {
+                    DispatchOut::None
+                }
             }
-            PeerState::Established(_) => DispatchOut::None,
             PeerState::Handshaking(_) if self.local_pub < self.peers[idx].pubkey => {
                 DispatchOut::None
             }
@@ -4920,6 +4952,102 @@ mod tests {
             tag_before,
             "current session must be untouched"
         );
+    }
+
+    /// #36 Task 1b: build a responder `PeerManager` that adopted the
+    /// responder role over a DIRECT (non-relayed) path — real
+    /// `cached_resp`/`cached_resp_init_eph`, keyed to initiator A's actual
+    /// ephemeral, and `relay == false` — via a genuine cold-start Noise
+    /// handshake delivered straight to `on_udp` from a direct endpoint
+    /// address (mirroring `duplicate_init_after_established_does_not_tear_down_session`'s
+    /// direct completion, but with a `MockRdv` rendezvous so relay egress
+    /// works afterward). This is the peer state the headline #36 scenario
+    /// leaves B in: A escalated punch->relay after this handshake completed,
+    /// so B is Established-and-direct while A now only reaches it via relay.
+    fn responder_established_direct_for_initiator(
+        now_ms: u64,
+    ) -> (PeerManager, yip_crypto::Keypair, Vec<u8>) {
+        let kp_r = generate_keypair();
+        let kp_a = generate_keypair();
+        let ep_a: SocketAddr = "10.0.0.9:9000".parse().unwrap();
+        let cfg_a = PeerConfig {
+            public_key: kp_a.public,
+            endpoint: Some(ep_a),
+        };
+        let (mut pm_r, _sent) = pm_with_mock_rdv(&kp_r, &[cfg_a]);
+
+        let (_hs, a_init_pkt) =
+            HandshakeState::start_initiator(&kp_a.private, &kp_r.public, &[]).unwrap();
+        let resp1 = resp_bytes(&pm_r.on_udp(ep_a, &a_init_pkt, now_ms));
+        assert_eq!(
+            resp1.len(),
+            1,
+            "cold-start direct init must produce one HandshakeResp"
+        );
+        assert!(
+            established_tag(&pm_r, 0).is_some(),
+            "responder must be Established"
+        );
+        assert!(
+            !pm_r.peers[0].relay,
+            "responder must be direct (not relay) for A"
+        );
+
+        (pm_r, kp_a, a_init_pkt)
+    }
+
+    /// #36 Task 1b (the responder-side half of the headline scenario): a
+    /// peer that adopted the responder role over a DIRECT/punch path
+    /// (`Established`, `relay == false`, holding `cached_resp` for A's
+    /// ephemeral E1) receives a RELAYED cold-start RETRANSMIT of that same
+    /// Init (E1) — A escalated punch->relay and resent its original Init
+    /// unchanged. B must adopt the relay for its own egress (else B keeps
+    /// sending to A's dead punch address — the reverse black hole) and
+    /// replay `cached_resp` over the relay, without churning a new session.
+    #[test]
+    fn direct_established_responder_adopts_relay_on_relayed_cold_start_retransmit() {
+        let (mut pm_r, _kp_a, a_init_pkt) = responder_established_direct_for_initiator(100);
+        let tag_before = established_tag(&pm_r, 0);
+
+        // A escalated to relay and resent the SAME init (E1), relay-wrapped.
+        let relayed = wrap_relay_deliver(&pm_r, &a_init_pkt);
+        let replayed = has_relayed_handshake_resp(&pm_r.on_udp(mock_server(), &relayed, 5_000));
+
+        assert!(
+            pm_r.peers[0].relay,
+            "must adopt the relay for B's own egress"
+        );
+        assert!(replayed, "must replay cached resp over the relay");
+        assert_eq!(
+            established_tag(&pm_r, 0),
+            tag_before,
+            "current session must be untouched (no churn)"
+        );
+    }
+
+    /// #36 Task 1b: the same direct-established peer receiving a RELAYED
+    /// Init with a DIFFERENT ephemeral (a genuine new rekey Init, or an
+    /// attack) must NOT adopt the relay and must fail-closed drop, preserving
+    /// #91's path-consistency guard for the session-churning case.
+    #[test]
+    fn direct_established_responder_ignores_relayed_new_ephemeral_init() {
+        let (mut pm_r, kp_a, _a_init_pkt) = responder_established_direct_for_initiator(100);
+        let local_pub = pm_r.local_pub;
+
+        // A fresh Init from the SAME initiator identity draws a NEW ephemeral.
+        let (_hs2, other_init_pkt) =
+            HandshakeState::start_initiator(&kp_a.private, &local_pub, &[]).unwrap();
+        let relayed = wrap_relay_deliver(&pm_r, &other_init_pkt);
+        let dropped = matches!(
+            pm_r.on_udp(mock_server(), &relayed, 5_000),
+            DispatchOut::None
+        );
+
+        assert!(
+            !pm_r.peers[0].relay,
+            "must NOT adopt relay for a new-ephemeral relayed init"
+        );
+        assert!(dropped, "must fail-closed drop, mirroring #91's guard");
     }
 
     // ── #91 Task 2: relay-path rekey completion ─────────────────────────────
