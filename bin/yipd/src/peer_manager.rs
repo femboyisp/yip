@@ -752,6 +752,48 @@ impl PeerManager {
         Some(vec![dg])
     }
 
+    /// Re-point an in-flight handshake at `new_target` over the given path,
+    /// PRESERVING the Noise ephemeral: resend the existing `init_pkt` rather than
+    /// drawing a fresh one, so a responder that already adopted us on the old path
+    /// completes us via its `cached_resp` (#36). Falls back to a fresh
+    /// `begin_handshake` only when no handshake is in flight (Idle/cold).
+    ///
+    /// `started_ms` is intentionally NOT reset — the `HANDSHAKE_TOTAL_MS` give-up
+    /// clock keeps running across re-targets (a re-target does not buy a fresh
+    /// 90 s). On a `via_relay` re-target `endpoint` is cleared: a late direct
+    /// `[HandshakeResp]` for this same ephemeral must not complete us onto a now
+    /// `relay`-flagged peer (that would mismatch egress — data-plane egress is
+    /// re-wrapped by the `relay` flag, not the stamped dst).
+    fn retarget_handshake(
+        &mut self,
+        idx: usize,
+        new_target: SocketAddr,
+        via_relay: bool,
+        now_ms: u64,
+    ) -> Option<Vec<EgressDatagram>> {
+        let PeerState::Handshaking(h) = &mut self.peers[idx].state else {
+            // No handshake in flight: a fresh attempt is correct here.
+            return self.begin_handshake(idx, new_target, via_relay, now_ms);
+        };
+        h.target = new_target;
+        let init_pkt = h.init_pkt.clone();
+        self.peers[idx].relay = via_relay;
+        if via_relay {
+            self.peers[idx].endpoint = None;
+            return self.relay_wrap(idx, init_pkt).map(|d| vec![d]);
+        }
+        // Direct/Punch re-target: re-stamp `endpoint` to the new candidate, as
+        // `begin_handshake`'s direct branch does — `handle_handshake_resp`
+        // matches an inbound Resp against `peers[idx].endpoint == Some(src)`,
+        // so without this a Resp from the new candidate would not complete us.
+        self.peers[idx].endpoint = Some(new_target);
+        Some(vec![EgressDatagram {
+            fate: 0,
+            dst: new_target,
+            bytes: init_pkt,
+        }])
+    }
+
     /// Mid-session rekey scheduler (9a Task 3, relay-completed in #91 Task
     /// 3), driven once per tick for an `Established` peer `idx` (`relay`
     /// mirrors `tick_dispatch`'s same-named local — whether `idx` is
@@ -2605,45 +2647,21 @@ impl PeerManager {
                 };
                 match self.peers[i].path.advance(now_ms) {
                     PathAction::Relay => {
-                        // Abandon the in-flight direct/punch handshake (drop its
-                        // ephemeral) and begin a relay handshake. `pending_tun`
-                        // is left intact — it drains when the relay session
-                        // completes (strictly better than the 90s-then-clear
-                        // give-up path).
-                        self.peers[i].state = PeerState::Idle;
-                        // Clear the stale direct/punch `endpoint` (the abandoned
-                        // attempt's candidate `C`): a relayed peer routes egress
-                        // via the `relay` flag through `rendezvous.relay`, NOT
-                        // via `endpoint`, and the relay handshake completes
-                        // through the `RdvEvent::Relayed` ->
-                        // `relayed_handshake_resp` path, which does not use
-                        // `endpoint` matching at all. Without this clear, a
-                        // late-arriving direct `[HandshakeResp]` from `C` for the
-                        // abandoned ephemeral (very plausible on a lossy/
-                        // high-latency link — a punch reply just past the
-                        // PUNCH_MS window) would still match this peer in
-                        // `handle_handshake_resp` (`p.endpoint == Some(src) &&
-                        // Handshaking`) and get fed into the *new* relay
-                        // ephemeral's `read_response`, which fails
-                        // cryptographically and silently discards the fresh
-                        // relay attempt (reverting to `Idle` and re-escalating
-                        // forever, since `PathStage` only moves forward). With
-                        // `endpoint` cleared the stray reply matches no peer and
-                        // is dropped harmlessly instead. (Preferring a late punch
-                        // reply over the already-committed relay attempt would be
-                        // a nicer recovery, but is out of 2b scope.)
-                        self.peers[i].endpoint = None;
+                        // Escalate the in-flight direct/punch attempt to the relay, PRESERVING
+                        // the ephemeral (#36): resend the same Init over the relay so a responder
+                        // already Established on the old path completes us via its cached_resp.
+                        // `retarget_handshake` clears `endpoint` (anti-mismatch) as the old
+                        // Idle+begin_handshake path did.
                         let server = self.server_addr();
-                        if let Some(dgs) = self.begin_handshake(i, server, true, now_ms) {
+                        if let Some(dgs) = self.retarget_handshake(i, server, true, now_ms) {
                             self.tick_egress.extend(dgs);
                         }
                         continue;
                     }
                     PathAction::Probe(addr) if addr != target => {
-                        // The SM chose a *different* candidate: re-target by
-                        // abandoning the current attempt and probing `addr`.
-                        self.peers[i].state = PeerState::Idle;
-                        if let Some(dgs) = self.begin_handshake(i, addr, false, now_ms) {
+                        // The SM chose a *different* candidate: re-target the in-flight attempt,
+                        // PRESERVING the ephemeral (#36) instead of abandoning it to a fresh one.
+                        if let Some(dgs) = self.retarget_handshake(i, addr, false, now_ms) {
                             self.tick_egress.extend(dgs);
                         }
                         continue;
@@ -4293,6 +4311,86 @@ mod tests {
         (pm, sent)
     }
 
+    /// Build a `PeerManager` (with a `MockRdv` rendezvous, so relay egress
+    /// works) whose sole peer has a configured direct `endpoint` and has
+    /// already been driven into `Handshaking` on that endpoint (a single TUN
+    /// packet, mirroring `on_tun`'s Idle branch — see
+    /// `punch_handshake_escalates_to_relay_at_punch_window_not_90s` for the
+    /// punch-stage sibling of this setup). Used by the `retarget_handshake`
+    /// tests below (#36 Task 1), which need a `Handshaking` peer holding a
+    /// real in-flight `init_pkt`/ephemeral to re-target.
+    fn pm_handshaking_direct_peer(
+        peer_pubkey: [u8; 32],
+        endpoint: &str,
+        started_ms: u64,
+    ) -> (PeerManager, usize) {
+        let local = generate_keypair();
+        let ep: SocketAddr = endpoint.parse().expect("valid test endpoint");
+        let peer = PeerConfig {
+            public_key: peer_pubkey,
+            endpoint: Some(ep),
+        };
+        let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
+        pm.on_tun(&dummy_tun_pkt(), started_ms);
+        assert!(
+            matches!(pm.peers[0].state, PeerState::Handshaking(_)),
+            "setup must drive the peer into Handshaking on the direct endpoint"
+        );
+        (pm, 0)
+    }
+
+    /// #36 Task 1: `retarget_handshake` must preserve the in-flight Noise
+    /// ephemeral (resend the SAME `init_pkt`) across a path re-target rather
+    /// than minting a fresh one — see the module-level #36 discussion at the
+    /// `PathAction::Relay`/`PathAction::Probe` escalation arms in
+    /// `tick_dispatch`.
+    #[test]
+    fn retarget_handshake_preserves_ephemeral_and_flips_relay() {
+        // A peer mid-handshake toward a direct candidate.
+        let (mut pm, idx) = pm_handshaking_direct_peer([7u8; 32], "10.0.0.9:9000", 100);
+        let (orig_init, orig_started, orig_target) = match &pm.peers[idx].state {
+            PeerState::Handshaking(h) => (h.init_pkt.clone(), h.started_ms, h.target),
+            _ => panic!("peer must be Handshaking"),
+        };
+        let server = pm.server_addr();
+
+        // Re-target to the relay (Punch->Relay escalation).
+        let out = pm
+            .retarget_handshake(idx, server, true, 5_000)
+            .expect("emits an Init");
+
+        // Ephemeral preserved: the resent Init is byte-identical, still Handshaking,
+        // started_ms unchanged (the 90s give-up clock keeps running).
+        match &pm.peers[idx].state {
+            PeerState::Handshaking(h) => {
+                assert_eq!(
+                    h.init_pkt, orig_init,
+                    "init_pkt (ephemeral) must be preserved"
+                );
+                assert_eq!(
+                    h.started_ms, orig_started,
+                    "started_ms must not reset on re-target"
+                );
+                assert_eq!(h.target, server, "target must update to the new path");
+                assert_ne!(h.target, orig_target);
+            }
+            _ => panic!("peer must stay Handshaking"),
+        }
+        assert!(
+            pm.peers[idx].relay,
+            "relay flag must be set for a relay re-target"
+        );
+        assert!(
+            pm.peers[idx].endpoint.is_none(),
+            "relay re-target clears endpoint (anti-mismatch)"
+        );
+        // The emitted datagram is the relay-wrapped Init (a RelaySend), carrying the SAME ephemeral.
+        assert!(
+            has_relayed_handshake_init(Some(&out)),
+            "must emit a relay-wrapped Init"
+        );
+    }
+
     /// (a) A rendezvous-only peer (endpoint `None`) with a rendezvous
     /// configured emits a `Lookup` when TUN traffic first needs it.
     #[test]
@@ -4709,6 +4807,118 @@ mod tests {
                     Some(yip_rendezvous::Message::RelaySend { .. })
                 )),
             "the relay attempt keeps retransmitting via the server, unbroken by the stray reply"
+        );
+    }
+
+    /// `true` iff `out` carries a `[HandshakeResp]` relay-wrapped in a
+    /// `yip_rendezvous::Message::RelaySend` — the relay-path counterpart of
+    /// `has_relayed_handshake_init`, used to assert a responder replayed its
+    /// cached resp over the relay (#36 Task 1, Step 6).
+    fn has_relayed_handshake_resp(out: &DispatchOut<'_>) -> bool {
+        let egress: &[EgressDatagram] = match out {
+            DispatchOut::Udp(e) | DispatchOut::Both(_, e) => e,
+            _ => &[],
+        };
+        egress.iter().any(|d| {
+            matches!(
+                yip_rendezvous::decode(&d.bytes),
+                Some(yip_rendezvous::Message::RelaySend { payload, .. })
+                    if payload.first() == Some(&(PacketType::HandshakeResp as u8))
+            )
+        })
+    }
+
+    /// Wrap `payload` as a `RelayDeliver` sourced from `pm`'s sole configured
+    /// peer (its `node`) — the relay-deliver counterpart of `relay_deliver`
+    /// for a test that already has a single-peer `PeerManager` in hand rather
+    /// than a raw `Keypair`. Used to redeliver an Init as if freshly
+    /// forwarded by the rendezvous server (#36 Task 1, Step 6).
+    fn wrap_relay_deliver(pm: &PeerManager, payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::RelayDeliver {
+                src: pm.peers[0].node,
+                payload: payload.to_vec(),
+            },
+            &mut buf,
+        );
+        buf
+    }
+
+    /// Build a responder `PeerManager` that has genuinely `Established` as
+    /// responder for a fresh initiator A, via a REAL (relayed) cold-start
+    /// Noise handshake — real `cached_resp`/`cached_resp_init_eph`, keyed to
+    /// A's actual ephemeral, and `relay == true` (required by
+    /// `relayed_handshake_init`'s `Established(_) if self.peers[idx].relay`
+    /// gate, #91 final review, for a *subsequent* relayed Init on this peer
+    /// to be admitted at all). This is exactly the state #36's fix depends on
+    /// downstream: a responder holding a `cached_resp` for A's ephemeral that
+    /// a re-targeted (but ephemeral-preserving) retry can complete against.
+    ///
+    /// `local_seed`/`peer_seed` are accepted for a readable, distinguishable
+    /// call shape at each call site; X25519 keys must be real key-exchange
+    /// material for the handshake to actually succeed (there is no
+    /// seeded-keygen primitive in `yip_crypto`), so both keypairs are freshly
+    /// generated with `generate_keypair()` and the seeds are not fed into the
+    /// crypto.
+    fn responder_established_for_initiator(
+        _local_seed: [u8; 32],
+        _peer_seed: [u8; 32],
+        now_ms: u64,
+    ) -> (PeerManager, Vec<u8>) {
+        let kp_r = generate_keypair();
+        let kp_a = generate_keypair();
+        let cfg_a = PeerConfig {
+            public_key: kp_a.public,
+            endpoint: None,
+        };
+        let (mut pm_r, _sent) = pm_with_mock_rdv(&kp_r, &[cfg_a]);
+
+        let (_hs, a_init_pkt) =
+            HandshakeState::start_initiator(&kp_a.private, &kp_r.public, &[]).unwrap();
+        let buf = relay_deliver(&kp_a, a_init_pkt.clone());
+        let out = pm_r.on_udp(mock_server(), &buf, now_ms);
+        assert!(
+            has_relayed_handshake_resp(&out),
+            "cold-start relayed init must produce one relay-wrapped resp"
+        );
+        assert!(
+            established_tag(&pm_r, 0).is_some(),
+            "responder must be Established"
+        );
+        assert!(pm_r.peers[0].relay, "responder must be relay-reached for A");
+
+        (pm_r, a_init_pkt)
+    }
+
+    /// #36 Task 1, Step 6/7: the end-to-end #36 mechanism at the unit level —
+    /// a responder that is `Established` (holding `cached_resp` for
+    /// initiator A's ephemeral E1) replays that resp when the SAME Init (E1)
+    /// arrives again over the relay, rather than churning a new session or
+    /// dropping it. This is the mechanism `retarget_handshake`'s
+    /// ephemeral-preserving re-target relies on: no responder-side change was
+    /// needed for #36 — `rekey_init_core` case 1 (cached_resp_init_eph match)
+    /// already replays.
+    #[test]
+    fn established_responder_completes_retargeted_initiator_via_cached_resp() {
+        // Responder that adopted initiator A and is Established, caching resp for A's ephemeral.
+        let (mut pm_r, a_init_pkt) = responder_established_for_initiator([3u8; 32], [4u8; 32], 100);
+        let tag_before = established_tag(&pm_r, 0);
+
+        // A re-targeted to relay and resent the SAME init (E1). It arrives relay-wrapped.
+        let relayed = wrap_relay_deliver(&pm_r, &a_init_pkt); // src = A's node
+        let out = pm_r.on_udp(mock_server(), &relayed, 5_000);
+
+        // Responder replays its cached resp (a RelaySend) — completing A — and does
+        // NOT churn a new session: current tag unchanged.
+        assert!(
+            has_relayed_handshake_resp(&out),
+            "must replay cached resp over the relay"
+        );
+        assert_eq!(
+            established_tag(&pm_r, 0),
+            tag_before,
+            "current session must be untouched"
         );
     }
 
