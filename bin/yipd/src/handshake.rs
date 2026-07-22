@@ -201,6 +201,30 @@ pub fn run_responder(
     ))
 }
 
+/// The initiator's Noise ephemeral public key: the raw, unencrypted first 32
+/// bytes of msg1 (Noise-IK's leading `e` token) — i.e. `init_pkt[1..33]`
+/// after the 1-byte [`PacketType::HandshakeInit`] prefix. `None` if
+/// `init_pkt` is too short to contain it.
+///
+/// A fresh ephemeral is drawn once per handshake ATTEMPT, in
+/// [`HandshakeState::start_initiator`]'s `write_message` call — a
+/// retransmit of the same attempt resends the identical `init_pkt` bytes
+/// (and therefore the identical `e`), while a genuinely new attempt (a new
+/// cold-start handshake, or a new rekey round) draws a new one. This makes
+/// it a stable, cheap per-round identifier: `PeerManager::handle_rekey_init`
+/// uses it to recognize a retransmitted rekey `Init` (same ephemeral as the
+/// round already answered) and reply idempotently instead of minting a
+/// second session.
+/// LOCKSTEP INVARIANT: `1..33` = skip the 1-byte `PacketType::HandshakeInit`
+/// prefix, then the 32-byte Noise-IK `e` token that leads msg1 in the clear.
+/// This offset MUST move in lockstep with `start_initiator`'s framing — if a
+/// future anti-DPI change reshapes the `HandshakeInit` header, this must be
+/// updated too, or it would return wrong-but-well-typed bytes and silently
+/// reintroduce the rekey-convergence bug it exists to prevent.
+pub fn init_ephemeral(init_pkt: &[u8]) -> Option<[u8; 32]> {
+    init_pkt.get(1..33)?.try_into().ok()
+}
+
 // ── step-functions (in-band handshakes) ────────────────────────────────────────
 
 /// A handshake in progress, driven step-by-step instead of blocking on a
@@ -374,6 +398,29 @@ mod tests {
         // The responder recovers the initiator's static public key — this is
         // what `PeerManager` admission-checks against configured peers.
         assert_eq!(initiator_static, a.public);
+    }
+
+    #[test]
+    fn init_ephemeral_matches_across_identical_retransmits_and_differs_for_new_attempts() {
+        let a = generate_keypair();
+        let b = generate_keypair();
+
+        let (_ha, init_pkt) = HandshakeState::start_initiator(&a.private, &b.public, &[]).unwrap();
+        let eph1a = init_ephemeral(&init_pkt).expect("init_pkt carries a 32-byte ephemeral");
+        // A retransmit resends the SAME bytes verbatim: same ephemeral.
+        let eph1b = init_ephemeral(&init_pkt).expect("init_pkt carries a 32-byte ephemeral");
+        assert_eq!(eph1a, eph1b);
+
+        // A NEW handshake attempt draws a fresh ephemeral.
+        let (_hb, init_pkt2) = HandshakeState::start_initiator(&a.private, &b.public, &[]).unwrap();
+        let eph2 = init_ephemeral(&init_pkt2).expect("init_pkt carries a 32-byte ephemeral");
+        assert_ne!(
+            eph1a, eph2,
+            "a new handshake attempt must draw a new ephemeral"
+        );
+
+        // Too-short input: no panic, just `None`.
+        assert_eq!(init_ephemeral(&[0u8; 10]), None);
     }
 
     #[test]

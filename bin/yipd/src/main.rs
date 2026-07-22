@@ -6,6 +6,7 @@
 mod addr;
 mod config;
 mod dataplane;
+mod epoch;
 mod handshake;
 mod mac_table;
 mod membership;

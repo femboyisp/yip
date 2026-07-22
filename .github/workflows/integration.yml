@@ -176,6 +176,45 @@ jobs:
             fi
           done
 
+      - name: Build the rekey_epoch_witness on-wire proof tool
+        # Standalone example binary (not a #[test]): see its module doc for
+        # why it counts distinct cleartext Noise-IK ephemeral keys rather
+        # than trying to decode session data, which is cryptographically
+        # impossible from a passive capture (forward secrecy).
+        run: cargo build --release -p yipd --example rekey_epoch_witness
+
+      - name: Run the 9a rekey money test under sudo (poll driver)
+        # run-netns-rekey.sh: two yipd peers held to YIP_REKEY_INTERVAL_MS=2000
+        # (~10 rotations over a ~20s ping stream) must show (1) loss-free
+        # continuity across every rotation and (2) >=3 distinct completed
+        # Noise-IK rekey rounds on the wire (the rigorous, non-vacuous proof
+        # that conn_tag rotates per epoch -- see the script's header comment
+        # for the full argument, including why a naive raw-byte diff would be
+        # vacuous and why re-deriving session keys from a passive capture is
+        # cryptographically impossible).
+        run: |
+          sudo bash bin/yipd/tests/run-netns-rekey.sh "$(pwd)/target/release/yipd" | tee /tmp/rekey-poll.log
+          if grep -q "^SKIP run-netns-rekey" /tmp/rekey-poll.log; then
+            echo "::error::9a rekey money test (poll) skipped — expected root + tcpdump + the built witness tool in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/rekey-poll.log; then
+            echo "::error::9a rekey money test (poll) failed — loss-free rotation or on-wire conn_tag rotation regressed"
+            exit 1
+          fi
+
+      - name: Run the 9a rekey money test under sudo (uring driver)
+        run: |
+          sudo -E env YIP_USE_URING=1 bash bin/yipd/tests/run-netns-rekey.sh "$(pwd)/target/release/yipd" | tee /tmp/rekey-uring.log
+          if grep -q "^SKIP run-netns-rekey" /tmp/rekey-uring.log; then
+            echo "::error::9a rekey money test (uring) skipped — expected root + tcpdump + the built witness tool in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/rekey-uring.log; then
+            echo "::error::9a rekey money test (uring) failed — loss-free rotation or on-wire conn_tag rotation regressed"
+            exit 1
+          fi
+
   dpi-undetectability:
     # The anti-DPI undetectability merge gate (3a Task 7): fails the build if
     # a wire/obfuscation change reintroduces a DPI-recognizable fingerprint.

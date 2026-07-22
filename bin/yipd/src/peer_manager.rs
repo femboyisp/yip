@@ -79,8 +79,8 @@ use yip_rendezvous::{node_id, NodeId};
 
 use crate::addr::node_addr;
 use crate::config::PeerConfig;
-use crate::dataplane::{conn_tag_from_keys, DataPlane, Outcome};
-use crate::handshake::{HandshakeState, PacketType};
+use crate::dataplane::{conn_tag_from_keys, DataPlane};
+use crate::handshake::{Established, HandshakeState, PacketType};
 use crate::membership::Membership;
 use crate::mode::TunnelMode;
 use crate::path::{PathAction, PathKind, PathStage, PathState};
@@ -177,7 +177,7 @@ enum PeerState {
     /// An initiator handshake is in flight, awaiting `[HandshakeResp]`.
     Handshaking(Box<HandshakingState>),
     /// A completed session; all data-plane traffic routes here.
-    Established(Box<DataPlane>),
+    Established(Box<crate::epoch::EpochSet>),
 }
 
 /// One configured remote peer plus its live handshake/session state.
@@ -211,6 +211,20 @@ struct Peer {
     /// the responder step again — see `handle_handshake_init`. `None` when we
     /// have no session, or hold one we built as the initiator.
     cached_resp: Option<Vec<u8>>,
+    /// The initiator Noise ephemeral (`handshake::init_ephemeral`) of the
+    /// `[HandshakeInit]` that produced `cached_resp`, i.e. the ORIGINAL
+    /// cold-start (or relayed) `Init` that established the *current*
+    /// session. Set alongside `cached_resp`, `None` under the same
+    /// conditions.
+    ///
+    /// `HANDSHAKE_TOTAL_MS` (90s) is bigger than `REKEY_INTERVAL_MS`/2
+    /// (60s), so a very-late retransmit of this ORIGINAL Init can land
+    /// after `EpochSet::accept_rekey_init` would otherwise treat it as a
+    /// plausible genuine rekey. `handle_rekey_init` checks this field FIRST
+    /// (milestone 9a final review, Important-2) so that case still resends
+    /// `cached_resp` — the cold-start dedup path — rather than being
+    /// misclassified as a rekey round.
+    cached_resp_init_eph: Option<[u8; 32]>,
     /// This peer's self-certifying rendezvous node id (`node_id(pubkey)`),
     /// used to `lookup`/`relay` for it and to demux `RdvEvent`s back to it.
     node: NodeId,
@@ -265,11 +279,26 @@ pub struct PeerManager {
     peers: Vec<Peer>,
     /// `conn_tag -> peers index`, populated whenever a peer reaches
     /// `Established`. Consulted as a fast-path hint by `route_data` (see the
-    /// module doc for why it is not the primary demux mechanism). In 2a a peer
-    /// establishes exactly once (duplicate/retransmitted inits re-send the
-    /// cached reply rather than rebuilding — see `handle_handshake_init`), so
-    /// each peer contributes one entry that never goes stale. M7 rekey will
-    /// rotate `conn_tag`s per epoch and must evict the superseded entry here.
+    /// module doc for why it is not the primary demux mechanism) — a miss or
+    /// a stale entry always falls back to source-address matching, which is
+    /// authoritative, so this map never needs to be perfectly up to date for
+    /// correctness. Pre-9a a peer established exactly once (duplicate/
+    /// retransmitted inits re-send the cached reply rather than rebuilding —
+    /// see `handle_handshake_init`), so each peer contributed one entry that
+    /// never went stale.
+    ///
+    /// 9a rekey rotates `conn_tag` per epoch. The initiator's explicit
+    /// promotion (`PeerManager::handle_rekey_resp`) evicts the superseded
+    /// tag and inserts the new one, since it has direct access to this map.
+    /// The responder's confirmed-switch promotion, however, happens
+    /// automatically inside `EpochSet::inbound_open` (Task 1), which is
+    /// pure/I-O-free and has no access to `PeerManager` fields — so on that
+    /// side the old tag is simply left behind as a harmless dead entry (it
+    /// can never match a live datagram's `conn_tag` bytes again) rather than
+    /// actively evicted. New datagrams under the responder's promoted epoch
+    /// still route correctly via the source-address fallback in
+    /// `route_data` until (if ever) a later inbound datagram happens to
+    /// warm this map's `insert` path for the peer again.
     by_tag: HashMap<u64, usize>,
     /// `node_addr -> peers index`, populated at construction (addresses are
     /// derived from each peer's configured public key and never change).
@@ -350,6 +379,13 @@ pub struct PeerManager {
     /// `PeerManager::new` parameter of the same name; `false` reproduces the
     /// UDP-path Direct→Punch→Relay escalation byte-identically.
     relay_only: bool,
+    /// Mid-session rekey cadence (9a Task 3): an `Established` peer's
+    /// `current` epoch is rekeyed once it is this old (glare-winner side) or
+    /// `2×` this old (loser-fallback side — see `EpochSet::needs_rekey`).
+    /// Defaults to [`crate::epoch::REKEY_INTERVAL_MS`]; overridden via
+    /// `YIP_REKEY_INTERVAL_MS` at construction so netns/unit tests can drive
+    /// the schedule without a multi-minute real-time wait.
+    rekey_interval_ms: u64,
 }
 
 /// MTU budget (bytes) used to size obfuscation padding: handshakes are padded
@@ -418,6 +454,7 @@ impl PeerManager {
                 state: PeerState::Idle,
                 pending_tun: Vec::new(),
                 cached_resp: None,
+                cached_resp_init_eph: None,
                 node,
                 path,
                 path_kind: None,
@@ -450,6 +487,10 @@ impl PeerManager {
             cover_traffic_ms: None,
             data_symbol_size: DEFAULT_DATA_SYMBOL_SIZE,
             relay_only,
+            rekey_interval_ms: std::env::var("YIP_REKEY_INTERVAL_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(crate::epoch::REKEY_INTERVAL_MS),
         };
         // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
         // exactly like configured peers: seed them into the peer table so an
@@ -499,6 +540,7 @@ impl PeerManager {
             state: PeerState::Idle,
             pending_tun: Vec::new(),
             cached_resp: None,
+            cached_resp_init_eph: None,
             node,
             path,
             path_kind: None,
@@ -688,6 +730,148 @@ impl PeerManager {
         Some(vec![dg])
     }
 
+    /// Mid-session rekey scheduler (9a Task 3), driven once per tick for an
+    /// `Established` peer `idx` (`relay` mirrors `tick_dispatch`'s
+    /// same-named local — whether `idx` is relay-reached). Starts a fresh
+    /// initiator rekey handshake when due, retransmits one already in
+    /// flight, or abandons it — entirely alongside `epochs.current`, which
+    /// this function never touches: a failed/abandoned rekey is therefore a
+    /// no-op on the live session (fail-closed). Any egress produced is
+    /// pushed onto `self.tick_egress`.
+    ///
+    /// Mirrors `begin_handshake`'s initiator construction (same
+    /// `cert_payload`, same relay/direct wrap, same `jitter_ms`-derived
+    /// retry cadence as `HandshakingState`'s cold-start retransmit arm in
+    /// `tick_dispatch`) so the rekey `Init` carries no new fingerprint
+    /// distinguishing it from a cold-start one. Unlike `begin_handshake`, it
+    /// does not transition `PeerState` (the peer stays `Established`) and
+    /// does not emit an obfuscation junk burst (Task 3 scope: scheduling
+    /// only, not a new decoy shape).
+    fn drive_rekey_schedule(
+        &mut self,
+        idx: usize,
+        relay: bool,
+        epochs: &mut crate::epoch::EpochSet,
+        now_ms: u64,
+    ) {
+        // Relay-reached peers: do NOT schedule a mid-session rekey. Rekey
+        // COMPLETION is only wired for the direct handshake handlers
+        // (`handle_handshake_resp`/`handle_handshake_init`'s glare-loser
+        // path) — `relayed_handshake_init`/`relayed_handshake_resp` never
+        // call `promote_from_rekey`/`install_next`. A rekey started here for
+        // a relay peer could therefore never complete: it would retransmit
+        // until `HANDSHAKE_TOTAL_MS`, get abandoned, and — since the epoch
+        // age is still past the threshold — restart on the very next tick,
+        // forever. That's wasted relay bandwidth and a constant ~1 Hz
+        // `[HandshakeInit]` cadence (a DPI fingerprint), for zero benefit
+        // (fail-closed: `current` is never touched either way). Wiring relay
+        // rekey completion is left to a follow-up.
+        if relay {
+            return;
+        }
+        if epochs.rekey.is_none() {
+            // Glare tiebreak: reuse the EXACT static-key-order comparison
+            // `handle_handshake_init`/`relayed_handshake_init` use to decide
+            // who adopts the responder role on a simultaneous cold-start
+            // handshake (the smaller public key is the designated
+            // initiator). The same side is the designated rekey initiator;
+            // the other side only rekeys via `needs_rekey`'s loser-fallback
+            // (2x the interval) if the winner never does.
+            let is_glare_winner = self.local_pub < self.peers[idx].pubkey;
+            if !epochs.needs_rekey(now_ms, is_glare_winner, self.rekey_interval_ms) {
+                return;
+            }
+            // `relay` peers already returned above, so this is always the
+            // direct path: target this peer's known endpoint.
+            let target = match self.peers[idx].endpoint {
+                Some(ep) => ep,
+                // No known direct endpoint this tick (shouldn't normally
+                // happen for a non-relay Established peer): skip: no
+                // egress, no state change, retried next tick.
+                None => return,
+            };
+            let pubkey = self.peers[idx].pubkey;
+            let payload = self
+                .membership
+                .as_ref()
+                .map(Membership::own_cert_bytes)
+                .unwrap_or_default();
+            let (hs, init_pkt) =
+                match HandshakeState::start_initiator(&self.local_priv, &pubkey, &payload) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("peer_manager: failed to start rekey handshake: {e}");
+                        return;
+                    }
+                };
+            let dg = EgressDatagram {
+                fate: 0,
+                dst: target,
+                bytes: init_pkt.clone(),
+            };
+            let retry_ms = if self.obf_key.is_some() {
+                jitter_ms(HANDSHAKE_RETRY_MS)
+            } else {
+                HANDSHAKE_RETRY_MS
+            };
+            epochs.rekey = Some(crate::epoch::RekeyInFlight {
+                hs,
+                init_pkt,
+                started_ms: now_ms,
+                last_sent_ms: now_ms,
+                retry_ms,
+                target,
+            });
+            self.tick_egress.push(dg);
+            return;
+        }
+
+        // A rekey is already in flight: retransmit (same cadence as
+        // `HandshakingState`'s cold-start arm) or abandon it once
+        // `HANDSHAKE_TOTAL_MS` elapses. `current` is never touched by either
+        // path — abandoning just clears `epochs.rekey`, leaving the live
+        // session exactly as it was; `needs_rekey` tries again next interval.
+        let (started_ms, last_sent_ms, retry_ms, target) = {
+            let rekey = epochs.rekey.as_ref().expect("checked is_some above");
+            (
+                rekey.started_ms,
+                rekey.last_sent_ms,
+                rekey.retry_ms,
+                rekey.target,
+            )
+        };
+        if now_ms.saturating_sub(started_ms) >= HANDSHAKE_TOTAL_MS {
+            epochs.rekey = None;
+            return;
+        }
+        if now_ms.saturating_sub(last_sent_ms) < retry_ms {
+            return;
+        }
+        let pkt = epochs
+            .rekey
+            .as_ref()
+            .expect("checked is_some above")
+            .init_pkt
+            .clone();
+        // `relay` peers already returned above, so this is always the
+        // direct path.
+        let dg = EgressDatagram {
+            fate: 0,
+            dst: target,
+            bytes: pkt,
+        };
+        let new_retry_ms = if self.obf_key.is_some() {
+            jitter_ms(HANDSHAKE_RETRY_MS)
+        } else {
+            HANDSHAKE_RETRY_MS
+        };
+        if let Some(rk) = epochs.rekey.as_mut() {
+            rk.last_sent_ms = now_ms;
+            rk.retry_ms = new_retry_ms;
+        }
+        self.tick_egress.push(dg);
+    }
+
     /// Emit a `lookup(peer_node)` for peer `idx`, debounced to at most one per
     /// [`LOOKUP_INTERVAL_MS`]. Returns `None` if throttled or no rendezvous.
     fn maybe_lookup(&mut self, idx: usize, now_ms: u64) -> Option<EgressDatagram> {
@@ -854,6 +1038,7 @@ impl PeerManager {
 
                 self.peers[idx].session_obf_key = sess_obf;
                 self.peers[idx].cached_resp = Some(resp_pkt.clone());
+                self.peers[idx].cached_resp_init_eph = crate::handshake::init_ephemeral(dg);
                 self.peers[idx].relay = true;
                 self.peers[idx].path.committed(PathKind::Relayed);
                 self.peers[idx].path_kind = Some(PathKind::Relayed);
@@ -872,7 +1057,8 @@ impl PeerManager {
                             .map(|d| d.bytes.clone()),
                     );
                 }
-                self.peers[idx].state = PeerState::Established(dp);
+                self.peers[idx].state =
+                    PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, now_ms)));
                 for b in owned {
                     if let Some(d) = self.relay_wrap(idx, b) {
                         self.egress.push(d);
@@ -926,7 +1112,8 @@ impl PeerManager {
                             .map(|d| d.bytes.clone()),
                     );
                 }
-                self.peers[idx].state = PeerState::Established(dp);
+                self.peers[idx].state =
+                    PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, now_ms)));
                 for b in owned {
                     if let Some(d) = self.relay_wrap(idx, b) {
                         self.egress.push(d);
@@ -946,21 +1133,26 @@ impl PeerManager {
     }
 
     /// Relay-path counterpart of the `Data`/`Control` demux: dispatch a relayed
-    /// data-plane datagram to peer `idx`'s `DataPlane` and relay-wrap any UDP
-    /// egress it produces (TUN writes still go to the local device).
+    /// data-plane datagram to peer `idx`'s `EpochSet` (via `inbound_open`) and
+    /// relay-wrap any UDP egress it produces (TUN writes still go to the local
+    /// device). Relay egress always goes through `relay_wrap`, so only the
+    /// `EpochInbound::Send`/`TunThenSend` payload bytes are needed here — the
+    /// real `dst`/`fate` on each `EgressDatagram` are irrelevant for a
+    /// relayed peer (the actual wire destination is the relay server).
     fn relayed_data(&mut self, idx: usize, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
         let (tun, udp): (Option<Vec<u8>>, Vec<Vec<u8>>) = {
-            let PeerState::Established(dp) = &mut self.peers[idx].state else {
+            let PeerState::Established(epochs) = &mut self.peers[idx].state else {
                 return DispatchOut::None;
             };
-            match dp.on_udp_datagram(dg, now_ms) {
-                Outcome::None => (None, Vec::new()),
-                Outcome::TunWrite(buf) => (Some(buf.to_vec()), Vec::new()),
-                Outcome::Send(pkts) => (None, pkts.iter().map(|d| d.bytes.clone()).collect()),
-                Outcome::TunWriteThenSend(buf, pkts) => (
-                    Some(buf.to_vec()),
-                    pkts.iter().map(|d| d.bytes.clone()).collect(),
-                ),
+            match epochs.inbound_open(dg, now_ms) {
+                crate::epoch::EpochInbound::None => (None, Vec::new()),
+                crate::epoch::EpochInbound::Tun(buf) => (Some(buf), Vec::new()),
+                crate::epoch::EpochInbound::Send(dgs) => {
+                    (None, dgs.iter().map(|d| d.bytes.clone()).collect())
+                }
+                crate::epoch::EpochInbound::TunThenSend(buf, dgs) => {
+                    (Some(buf), dgs.iter().map(|d| d.bytes.clone()).collect())
+                }
             }
         };
         self.egress.clear();
@@ -1072,18 +1264,35 @@ impl PeerManager {
             .position(|p| p.endpoint == Some(src) && matches!(p.state, PeerState::Established(_)))
     }
 
-    /// Dispatch a `Data`/`Control` datagram to peer `idx`'s `DataPlane` and
-    /// re-map its `Outcome` into a `DispatchOut`. Returns `DispatchOut::None`
-    /// if `idx` is not (or no longer) `Established`.
+    /// Dispatch a `Data`/`Control` datagram to peer `idx`'s `EpochSet` (via
+    /// `inbound_open`) and re-map its `EpochInbound` into a `DispatchOut`.
+    /// Returns `DispatchOut::None` if `idx` is not (or no longer)
+    /// `Established`.
     fn dispatch_established(&mut self, idx: usize, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
-        let PeerState::Established(dp) = &mut self.peers[idx].state else {
+        let PeerState::Established(epochs) = &mut self.peers[idx].state else {
             return DispatchOut::None;
         };
-        match dp.on_udp_datagram(dg, now_ms) {
-            Outcome::None => DispatchOut::None,
-            Outcome::TunWrite(buf) => DispatchOut::Tun(buf),
-            Outcome::Send(pkts) => DispatchOut::Udp(pkts),
-            Outcome::TunWriteThenSend(buf, pkts) => DispatchOut::Both(buf, pkts),
+        // `EpochInbound::Send`/`TunThenSend` carry the full `EgressDatagram`
+        // (real `dst` + `fate`), so no reconstruction from
+        // `self.peers[idx].endpoint` is needed — that placeholder is wrong
+        // for relay-established peers (their `DataPlane::peer_addr` is a
+        // `server_addr()` stand-in; `endpoint` may hold an unconfirmed
+        // candidate or `None`).
+        match epochs.inbound_open(dg, now_ms) {
+            crate::epoch::EpochInbound::None => DispatchOut::None,
+            crate::epoch::EpochInbound::Tun(buf) => {
+                self.tun_scratch = buf;
+                DispatchOut::Tun(&self.tun_scratch)
+            }
+            crate::epoch::EpochInbound::Send(dgs) => {
+                self.egress = dgs;
+                DispatchOut::Udp(&self.egress)
+            }
+            crate::epoch::EpochInbound::TunThenSend(buf, dgs) => {
+                self.tun_scratch = buf;
+                self.egress = dgs;
+                DispatchOut::Both(&self.tun_scratch, &self.egress)
+            }
         }
     }
 
@@ -1125,21 +1334,22 @@ impl PeerManager {
             .collect();
         for idx in candidates {
             let hit = {
-                let PeerState::Established(dp) = &mut self.peers[idx].state else {
+                let PeerState::Established(epochs) = &mut self.peers[idx].state else {
                     continue;
                 };
-                match dp.on_udp_datagram(dg, now_ms) {
-                    Outcome::None => None,
-                    Outcome::TunWrite(buf) => Some((Some(buf.to_vec()), Vec::new())),
-                    Outcome::Send(pkts) => Some((None, pkts.to_vec())),
-                    Outcome::TunWriteThenSend(buf, pkts) => {
-                        Some((Some(buf.to_vec()), pkts.to_vec()))
-                    }
+                match epochs.inbound_open(dg, now_ms) {
+                    crate::epoch::EpochInbound::None => None,
+                    crate::epoch::EpochInbound::Tun(buf) => Some((Some(buf), Vec::new())),
+                    crate::epoch::EpochInbound::Send(dgs) => Some((None, dgs)),
+                    crate::epoch::EpochInbound::TunThenSend(buf, dgs) => Some((Some(buf), dgs)),
                 }
             };
             let Some((tun, udp)) = hit else {
                 continue;
             };
+            // `udp` already carries each datagram's real `dst`/`fate` (see
+            // `EpochInbound`); no reconstruction from `self.peers[idx].endpoint`
+            // needed (that placeholder is wrong for relay-established peers).
             return match (tun, udp.is_empty()) {
                 (Some(t), true) => {
                     self.tun_scratch = t;
@@ -1233,28 +1443,28 @@ impl PeerManager {
         // it unconditionally would silently rekey. Branch on our current state
         // with that in mind.
         match &self.peers[idx].state {
-            // Already have a live session: this `Init` is a duplicate, a
-            // retransmit after our earlier reply was lost, or a peer restart.
-            // Never tear down the running session (2a has no rekey — a rebuilt
-            // session would strand a peer that stays on the old keys and drops
-            // the new reply). Re-send the cached `[HandshakeResp]` verbatim so a
-            // peer still handshaking (its reply was lost) completes on the SAME
-            // session; a peer already established harmlessly ignores it. Discard
-            // the freshly-built `established`/`resp_pkt`.
-            PeerState::Established(_) => match &self.peers[idx].cached_resp {
-                Some(resp) => {
-                    self.egress.clear();
-                    self.egress.push(EgressDatagram {
-                        fate: 0,
-                        dst: src,
-                        bytes: resp.clone(),
-                    });
-                    DispatchOut::Udp(&self.egress)
-                }
-                // We hold this session as the initiator (no cached reply): a new
-                // `Init` from the peer is a restart/rekey, deferred to M7.
-                None => DispatchOut::None,
-            },
+            // Already `Established` (9a): this `Init` is either (a) a
+            // duplicate/retransmit of the ORIGINAL completing handshake
+            // (peer hasn't seen our reply yet) or a peer restart, or (b) a
+            // genuine mid-session rekey `Init` from the peer
+            // (`drive_rekey_schedule`'s counterpart on their side).
+            // `EpochSet::accept_rekey_init` is the discriminator: a rekey
+            // can only legitimately arrive once `current` is at least
+            // `interval/2` old, so anything younger is (a) — handled
+            // exactly as before rekey existed (9a Task 4 must not regress
+            // this). `handle_rekey_init` owns the (b) path.
+            //
+            // `init_eph`: `start_responder` above already parsed `dg`'s
+            // msg1 successfully, and Noise-IK's msg1 leads with the
+            // unencrypted `e` token, so `dg[1..33]` is guaranteed present —
+            // this is the same per-round identity `handle_rekey_init` uses
+            // to deduplicate retransmitted Inits (9a final review).
+            PeerState::Established(_) => {
+                let init_eph = crate::handshake::init_ephemeral(dg).expect(
+                    "start_responder already parsed dg's msg1; its leading 32 bytes are `e`",
+                );
+                self.handle_rekey_init(idx, src, established, resp_pkt, now_ms, init_eph)
+            }
             // Glare: both sides initiated simultaneously (e.g. the TUN's IPv6
             // autoconf multicast races the peer's traffic at startup). Break
             // the tie deterministically by static-key order so both converge on
@@ -1283,6 +1493,7 @@ impl PeerManager {
                 self.peers[idx].session_obf_key = sess_obf;
                 self.peers[idx].endpoint = Some(src); // learn the observed endpoint
                 self.peers[idx].cached_resp = Some(resp_pkt.clone());
+                self.peers[idx].cached_resp_init_eph = crate::handshake::init_ephemeral(dg);
                 self.by_tag.insert(dp.conn_tag(), idx);
                 // Commit the path we completed over. `src` is a direct address
                 // (this arm is only reached for non-relayed inits — relayed
@@ -1308,22 +1519,154 @@ impl PeerManager {
                     let out = dp.on_tun_packet(inner, now_ms);
                     self.egress.extend(out.iter().cloned());
                 }
-                self.peers[idx].state = PeerState::Established(dp);
+                self.peers[idx].state =
+                    PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, now_ms)));
 
                 DispatchOut::Udp(&self.egress)
             }
         }
     }
 
-    /// Handle an incoming `[HandshakeResp]`: find the `Handshaking` peer
-    /// whose endpoint matches `src`, resume via `read_response`, transition
-    /// to `Established`, and drain any buffered `pending_tun`.
+    /// Rekey (9a Task 4) counterpart of the `Established(_)` arm in
+    /// `handle_handshake_init`: `established`/`resp_pkt` were already built
+    /// by the SAME `start_responder` call (and this peer already passed
+    /// admission — it was found by static-key match, not by cert) at the
+    /// top of `handle_handshake_init`, so there is no re-verification to do
+    /// here. `init_eph` is that Init's Noise ephemeral
+    /// (`handshake::init_ephemeral`) — the per-round identity used below to
+    /// tell a RETRANSMIT of an already-answered round from a genuinely new
+    /// one.
+    ///
+    /// In order:
+    ///
+    /// 1. `init_eph` matches `cached_resp_init_eph` (Important-2, 9a final
+    ///    review): this Init is a retransmit of the ORIGINAL cold-start (or
+    ///    relayed) Init that established the *current* session — possible
+    ///    even past `interval/2` since `HANDSHAKE_TOTAL_MS` (90s) exceeds it
+    ///    (60s). Resend `cached_resp` verbatim; never build a rekey `next`
+    ///    off it.
+    /// 2. `init_eph` matches the ephemeral behind the currently-held `next`
+    ///    (the Critical fix, 9a final review): this Init is a retransmit of
+    ///    a rekey round already answered — e.g. the initiator retransmitted
+    ///    before seeing our first `[HandshakeResp]` (RTT > retry_ms), or a
+    ///    `[HandshakeResp]` was reordered/duplicated in flight. Resend that
+    ///    round's cached resp verbatim and do NOT mint a second session:
+    ///    minting a fresh one here would discard the `next` the initiator is
+    ///    about to promote to, stranding the two sides on different epochs
+    ///    (initiator locks onto the FIRST `[HandshakeResp]` it reads and
+    ///    never revisits later ones) and black-holing the tunnel.
+    /// 3. `!EpochSet::accept_rekey_init`: `current` is too young for this to
+    ///    plausibly be a genuine rekey. Falls back to the pre-9a behavior
+    ///    (re-send the cached `[HandshakeResp]` verbatim if we hold one;
+    ///    otherwise ignore, no reply). This is what keeps
+    ///    `duplicate_init_after_established_does_not_tear_down_session`
+    ///    green: that regression fires at `now_ms == current_created_ms`,
+    ///    always younger than `interval/2`. The freshly-built
+    ///    `established`/`resp_pkt` are discarded on this path — installing
+    ///    them would silently rekey off a mere retransmit.
+    /// 4. Otherwise: a genuinely NEW rekey round. Install `established` as
+    ///    the responder's unconfirmed `next` epoch, keyed by `init_eph`
+    ///    (`EpochSet::install_next`) — `current` is untouched, so this side
+    ///    keeps SENDING on the old epoch. The responder's own switch happens
+    ///    later, automatically, inside `EpochSet::inbound_open` (Task 1) on
+    ///    the first inbound frame that authenticates under `next`.
+    fn handle_rekey_init(
+        &mut self,
+        idx: usize,
+        src: SocketAddr,
+        established: Established,
+        resp_pkt: Vec<u8>,
+        now_ms: u64,
+        init_eph: [u8; 32],
+    ) -> DispatchOut<'_> {
+        if self.peers[idx].cached_resp_init_eph == Some(init_eph) {
+            return match &self.peers[idx].cached_resp {
+                Some(resp) => {
+                    self.egress.clear();
+                    self.egress.push(EgressDatagram {
+                        fate: 0,
+                        dst: src,
+                        bytes: resp.clone(),
+                    });
+                    DispatchOut::Udp(&self.egress)
+                }
+                None => DispatchOut::None,
+            };
+        }
+
+        let PeerState::Established(epochs) = &mut self.peers[idx].state else {
+            unreachable!("handle_rekey_init is only called for an Established peer")
+        };
+
+        if let Some(cached) = epochs.next_cached_resp_for(&init_eph).map(<[u8]>::to_vec) {
+            self.egress.clear();
+            self.egress.push(EgressDatagram {
+                fate: 0,
+                dst: src,
+                bytes: cached,
+            });
+            return DispatchOut::Udp(&self.egress);
+        }
+
+        if !epochs.accept_rekey_init(now_ms, self.rekey_interval_ms) {
+            return match &self.peers[idx].cached_resp {
+                Some(resp) => {
+                    self.egress.clear();
+                    self.egress.push(EgressDatagram {
+                        fate: 0,
+                        dst: src,
+                        bytes: resp.clone(),
+                    });
+                    DispatchOut::Udp(&self.egress)
+                }
+                None => DispatchOut::None,
+            };
+        }
+
+        // NOTE: `session_obf_key` (the outer anti-DPI wrap key, keyed off
+        // `hp_key`) is intentionally left untouched here — see the doc
+        // comment on `handle_rekey_resp`.
+        let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
+        let dp = Box::new(DataPlane::new(
+            established,
+            conn_tag,
+            self.mode,
+            src,
+            self.obf_key.is_some(),
+            self.data_symbol_size,
+        ));
+        let PeerState::Established(epochs) = &mut self.peers[idx].state else {
+            unreachable!("state cannot change between the two borrows above")
+        };
+        epochs.install_next(dp, init_eph, resp_pkt.clone());
+
+        self.egress.clear();
+        self.egress.push(EgressDatagram {
+            fate: 0,
+            dst: src,
+            bytes: resp_pkt,
+        });
+        DispatchOut::Udp(&self.egress)
+    }
+
+    /// Handle an incoming `[HandshakeResp]`: either complete an in-flight
+    /// rekey for an already-`Established` peer (9a Task 4), or — the
+    /// cold-start path — find the `Handshaking` peer whose endpoint matches
+    /// `src`, resume via `read_response`, transition to `Established`, and
+    /// drain any buffered `pending_tun`.
     fn handle_handshake_resp(
         &mut self,
         src: SocketAddr,
         dg: &[u8],
         now_ms: u64,
     ) -> DispatchOut<'_> {
+        if let Some(idx) = self.peers.iter().position(|p| {
+            p.endpoint == Some(src)
+                && matches!(&p.state, PeerState::Established(epochs) if epochs.rekey.is_some())
+        }) {
+            return self.handle_rekey_resp(idx, dg, now_ms);
+        }
+
         let Some(idx) = self
             .peers
             .iter()
@@ -1378,7 +1721,8 @@ impl PeerManager {
                     let out = dp.on_tun_packet(inner, now_ms);
                     self.egress.extend(out.iter().cloned());
                 }
-                self.peers[idx].state = PeerState::Established(dp);
+                self.peers[idx].state =
+                    PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, now_ms)));
 
                 if self.egress.is_empty() {
                     DispatchOut::None
@@ -1393,6 +1737,126 @@ impl PeerManager {
                 // `on_tun` call will start a fresh handshake.
                 DispatchOut::None
             }
+        }
+    }
+
+    /// Complete an in-flight rekey handshake for an `Established` peer `idx`
+    /// (initiator side of the WireGuard-style confirmed switch, 9a Task 4)
+    /// on receipt of the matching `[HandshakeResp]`.
+    ///
+    /// `HandshakeState::read_response` consumes the handshake BY VALUE, so
+    /// the `RekeyInFlight` is taken out of `epochs.rekey` first — after
+    /// that, `epochs.rekey` is `None` regardless of what happens next, so
+    /// every early return below is already a fail-closed no-op: `current`
+    /// is untouched and `drive_rekey_schedule`'s `needs_rekey` will try
+    /// again at the next interval.
+    ///
+    /// KNOWN LIMITATION (9a final review, Important-1), left as-is on
+    /// purpose: `epochs.rekey.take()` runs BEFORE `rk.hs.read_response(dg)`
+    /// below, so a delayed/duplicate/spoofed-src `[HandshakeResp]` that
+    /// fails to `read_response` (wrong bytes, replayed old Resp, or a
+    /// same-endpoint attacker's garbage — UDP has no source authentication)
+    /// silently ABANDONS the in-flight rekey rather than just ignoring the
+    /// bad datagram and letting the real Resp complete it later. This is a
+    /// rekey-*liveness* DoS only: `current` is never touched (fail-closed
+    /// per the constraint above), so the live session survives untouched —
+    /// only the rotation is denied, and `drive_rekey_schedule` starts a
+    /// fresh rekey attempt next interval. The clean fix would be to `clone`
+    /// `rk.hs`, try `read_response` on the clone, and only `take()`/clear
+    /// `rekey` on success — but `snow::HandshakeState` (which
+    /// `yip_crypto::Handshake`/`crate::handshake::HandshakeState` wrap) is
+    /// NOT `Clone` (it owns `Box<dyn Dh>`/`Box<dyn Random>` trait objects),
+    /// so that fix is not available without hand-rolling handshake state
+    /// duplication in `yip-crypto` — out of scope here. An off-path
+    /// attacker that can spoof this peer's endpoint as `src` can therefore
+    /// repeatedly deny rekey rotation (never break the tunnel); closing that
+    /// rides with the #34 authenticated-endpoint work (verifying `src`
+    /// against the session before acting on it).
+    ///
+    /// On success: builds the new epoch's `DataPlane` exactly like
+    /// cold-start completion, promotes it via `EpochSet::promote_from_rekey`
+    /// (switching `current` immediately — the initiator already knows the
+    /// responder installed this epoch, since it just sent the `Resp`), and
+    /// emits one outbound frame on the NEW epoch (draining `pending_tun`, or
+    /// a bare empty-payload frame if none is queued) so the responder
+    /// observes a `next`-epoch datagram and confirms its own switch inside
+    /// `EpochSet::inbound_open` (Task 1).
+    ///
+    /// `session_obf_key` (the outer anti-DPI wrap key, keyed off `hp_key`)
+    /// is intentionally left untouched across the promotion: it is derived
+    /// once at cold start and shared by both peers for the connection's
+    /// lifetime. The responder's own confirmed-switch promotion happens
+    /// entirely inside `EpochSet::inbound_open`, which has no access to
+    /// `PeerManager`/`Peer` fields — so it has no way to resync
+    /// `session_obf_key` on that side. Rotating it here, on the initiator
+    /// side only, would desync the two peers' outer-wrap keys rather than
+    /// fix anything; leaving it alone keeps both sides on the one key they
+    /// already agree on. (The security-relevant per-epoch key material — the
+    /// inner AEAD/wire `Codec` — DOES rotate correctly: it is rebuilt fresh
+    /// inside `DataPlane::new` from this epoch's own `auth_key`/`hp_key`.)
+    fn handle_rekey_resp(&mut self, idx: usize, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
+        let rk = {
+            let PeerState::Established(epochs) = &mut self.peers[idx].state else {
+                unreachable!("handle_rekey_resp is only called for an Established peer")
+            };
+            match epochs.rekey.take() {
+                Some(rk) => rk,
+                None => return DispatchOut::None,
+            }
+        };
+        let peer_addr = rk.target;
+
+        let (established, responder_payload) = match rk.hs.read_response(dg) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("peer_manager: rekey read_response failed: {e}");
+                return DispatchOut::None;
+            }
+        };
+        if !self.responder_cert_ok(&responder_payload, self.peers[idx].pubkey) {
+            eprintln!("peer_manager: rekey responder cert rejected");
+            return DispatchOut::None;
+        }
+
+        let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
+        let mut dp = Box::new(DataPlane::new(
+            established,
+            conn_tag,
+            self.mode,
+            peer_addr,
+            self.obf_key.is_some(),
+            self.data_symbol_size,
+        ));
+
+        // Prime the new epoch's outbound (see doc comment) BEFORE `dp` is
+        // moved into `promote_from_rekey` below.
+        let pending = std::mem::take(&mut self.peers[idx].pending_tun);
+        self.egress.clear();
+        if pending.is_empty() {
+            self.egress
+                .extend(dp.on_tun_packet(&[], now_ms).iter().cloned());
+        } else {
+            for inner in &pending {
+                self.egress
+                    .extend(dp.on_tun_packet(inner, now_ms).iter().cloned());
+            }
+        }
+
+        let old_tag = {
+            let PeerState::Established(epochs) = &mut self.peers[idx].state else {
+                unreachable!("state cannot change between the borrows above")
+            };
+            let old_tag = epochs.current().conn_tag();
+            epochs.promote_from_rekey(dp, now_ms);
+            old_tag
+        };
+        self.by_tag.remove(&old_tag);
+        self.by_tag.insert(conn_tag, idx);
+
+        if self.egress.is_empty() {
+            DispatchOut::None
+        } else {
+            DispatchOut::Udp(&self.egress)
         }
     }
 
@@ -1849,16 +2313,18 @@ impl PeerManager {
             // peer's datagrams already carry the correct `dst` — return them
             // borrowed, byte-identical to 2a.
             if !self.peers[idx].relay {
-                let PeerState::Established(dp) = &mut self.peers[idx].state else {
+                let PeerState::Established(epochs) = &mut self.peers[idx].state else {
                     unreachable!("just matched Established above");
                 };
-                return dp.on_tun_packet(inner, now_ms);
+                return epochs.current_mut().on_tun_packet(inner, now_ms);
             }
             let owned: Vec<Vec<u8>> = {
-                let PeerState::Established(dp) = &mut self.peers[idx].state else {
+                let PeerState::Established(epochs) = &mut self.peers[idx].state else {
                     unreachable!("just matched Established above");
                 };
-                dp.on_tun_packet(inner, now_ms)
+                epochs
+                    .current_mut()
+                    .on_tun_packet(inner, now_ms)
                     .iter()
                     .map(|d| d.bytes.clone())
                     .collect()
@@ -2035,8 +2501,10 @@ impl PeerManager {
             let relay = self.peers[i].relay;
             let old_state = std::mem::replace(&mut self.peers[i].state, PeerState::Idle);
             let new_state = match old_state {
-                PeerState::Established(mut dp) => {
-                    if let Some(pkts) = dp.tick(now_ms) {
+                PeerState::Established(mut epochs) => {
+                    epochs.retire_previous_if_due(now_ms);
+                    self.drive_rekey_schedule(i, relay, &mut epochs, now_ms);
+                    if let Some(pkts) = epochs.current_mut().tick(now_ms) {
                         if relay {
                             // Relay-reached peer: re-wrap each datagram through
                             // the server. Copy bytes out (borrow ends) then wrap.
@@ -2051,7 +2519,7 @@ impl PeerManager {
                             self.tick_egress.extend(pkts.iter().cloned());
                         }
                     }
-                    PeerState::Established(dp)
+                    PeerState::Established(epochs)
                 }
                 PeerState::Handshaking(mut handshaking)
                     if now_ms.saturating_sub(handshaking.last_sent_ms) >= handshaking.retry_ms =>
@@ -2444,9 +2912,12 @@ mod tests {
         // (the "test seam": direct access to private fields from the child
         // `tests` module).
         const FAKE_TAG: u64 = 0xAAAA_BBBB_CCCC_DDDD;
-        pm.peers[1].state = PeerState::Established(Box::new(fake_established_dataplane(
-            FAKE_TAG,
-            peer_b.endpoint.unwrap(),
+        pm.peers[1].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(
+                FAKE_TAG,
+                peer_b.endpoint.unwrap(),
+            )),
+            0,
         )));
         pm.by_tag.insert(FAKE_TAG, 1);
 
@@ -2546,7 +3017,7 @@ mod tests {
     /// (yet) Established. Used by the handshake state-machine tests below.
     fn established_tag(pm: &PeerManager, idx: usize) -> Option<u64> {
         match &pm.peers[idx].state {
-            PeerState::Established(dp) => Some(dp.conn_tag()),
+            PeerState::Established(epochs) => Some(epochs.current().conn_tag()),
             _ => None,
         }
     }
@@ -2569,6 +3040,642 @@ mod tests {
     /// routes it to the sole peer regardless of contents).
     fn dummy_tun_pkt() -> Vec<u8> {
         vec![0x45u8; 40]
+    }
+
+    // ── 9a Task 3: mid-session rekey scheduling ─────────────────────────────
+
+    /// Build a `PeerManager` with a single already-`Established` peer (via
+    /// `fake_established_dataplane`, spliced in like
+    /// `routes_inner_dst_to_owning_peer_and_demuxes_by_tag` does), its
+    /// `EpochSet.current_created_ms` pinned to `0`, and `rekey_interval_ms`
+    /// overridden to `interval_ms` (bypassing the real
+    /// `YIP_REKEY_INTERVAL_MS`/120s cadence so tests don't need a multi-minute
+    /// wait). `local_pub`/peer `public_key` are chosen by the caller so the
+    /// glare-winner tiebreak (`local_pub < peer.pubkey`) lands as intended.
+    fn pm_with_established_peer(
+        local_pub: [u8; 32],
+        peer_pubkey: [u8; 32],
+        interval_ms: u64,
+    ) -> (PeerManager, u64, SocketAddr) {
+        let ep: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+        let cfg = PeerConfig {
+            public_key: peer_pubkey,
+            endpoint: Some(ep),
+        };
+        let mut pm = PeerManager::new(
+            [7u8; 32],
+            local_pub,
+            &[cfg],
+            TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
+        pm.rekey_interval_ms = interval_ms;
+        const FAKE_TAG: u64 = 0x1234_5678_9abc_def0;
+        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(FAKE_TAG, ep)),
+            0,
+        )));
+        pm.by_tag.insert(FAKE_TAG, 0);
+        (pm, FAKE_TAG, ep)
+    }
+
+    /// `true` iff `out` (a `tick` return) carries a `[HandshakeInit]` datagram.
+    fn has_handshake_init(out: Option<&[EgressDatagram]>) -> bool {
+        out.into_iter()
+            .flatten()
+            .any(|d| d.bytes.first() == Some(&(PacketType::HandshakeInit as u8)))
+    }
+
+    /// `true` iff `out` carries a rekey `[HandshakeInit]` relay-wrapped in a
+    /// `yip_rendezvous::Message::RelaySend` — i.e. what `relay_wrap` produces
+    /// for a relay-reached peer. Decoding the rendezvous envelope (rather
+    /// than checking the outer byte, as `has_handshake_init` does) matters
+    /// here: `RelaySend`'s own wire tag is 5, but a coincidental Register
+    /// refresh (tag 0, sent once per `tick_dispatch` when a `Rendezvous` is
+    /// freshly configured) would otherwise be misread as a raw
+    /// `[HandshakeInit]` (also discriminant 0) by `has_handshake_init`.
+    fn has_relayed_handshake_init(out: Option<&[EgressDatagram]>) -> bool {
+        out.into_iter().flatten().any(|d| {
+            matches!(
+                yip_rendezvous::decode(&d.bytes),
+                Some(yip_rendezvous::Message::RelaySend { payload, .. })
+                    if payload.first() == Some(&(PacketType::HandshakeInit as u8))
+            )
+        })
+    }
+
+    #[test]
+    fn tick_initiates_rekey_for_established_winner_once() {
+        // local_pub = [1;32] < peer pubkey = [2;32]: local is the
+        // glare-winner (the smaller static key), exactly the comparison
+        // `handle_handshake_init`/`relayed_handshake_init` use to decide who
+        // adopts the initiator role on a cold-start glare.
+        let (mut pm, tag, _ep) = pm_with_established_peer([1u8; 32], [2u8; 32], 100);
+
+        // Past the interval (age 150 >= 100): tick emits a HandshakeInit and
+        // schedules a rekey, WITHOUT touching the live `current` epoch.
+        let out = pm.tick(150).map(<[EgressDatagram]>::to_vec);
+        assert!(
+            has_handshake_init(out.as_deref()),
+            "winner past the interval must emit a rekey HandshakeInit"
+        );
+        assert_eq!(
+            established_tag(&pm, 0),
+            Some(tag),
+            "current epoch must be untouched by scheduling a rekey"
+        );
+        match &pm.peers[0].state {
+            PeerState::Established(epochs) => assert!(
+                epochs.rekey.is_some(),
+                "EpochSet.rekey must be populated once a rekey is in flight"
+            ),
+            _ => panic!("peer must still be Established"),
+        }
+
+        // A second tick shortly after, before the rekey completes: one rekey
+        // in flight already, so `needs_rekey` must suppress a second Init.
+        let out2 = pm.tick(160).map(<[EgressDatagram]>::to_vec);
+        assert!(
+            !has_handshake_init(out2.as_deref()),
+            "a rekey already in flight must not emit a second HandshakeInit"
+        );
+        assert_eq!(
+            established_tag(&pm, 0),
+            Some(tag),
+            "current epoch must remain untouched on the second tick too"
+        );
+    }
+
+    /// A relay-reached `Established` peer (`relay == true`, mirroring how
+    /// `relayed_handshake_init`/`relayed_handshake_resp` leave a peer) must
+    /// NOT have a mid-session rekey scheduled by `tick`/`drive_rekey_schedule`,
+    /// even when it is the glare-winner and well past `rekey_interval_ms`.
+    /// Rekey COMPLETION is only wired for the direct handshake handlers
+    /// (`handle_handshake_resp` et al.) — `relayed_handshake_init`/
+    /// `relayed_handshake_resp` never call `promote_from_rekey`/`install_next`
+    /// for a relay session — so a relay rekey scheduled here can never
+    /// complete: it would retransmit for `HANDSHAKE_TOTAL_MS`, get abandoned,
+    /// and (since the epoch age is still past the threshold) immediately
+    /// restart, forever. Contrast with `tick_initiates_rekey_for_established_winner_once`,
+    /// whose otherwise-identical direct peer (`relay == false`) does rekey.
+    #[test]
+    fn tick_does_not_rekey_relay_peer() {
+        let (mut pm, tag, _ep) = pm_with_established_peer([1u8; 32], [2u8; 32], 100);
+        pm.peers[0].relay = true;
+        // A relay-reached peer routes rekey Inits through `relay_wrap`, which
+        // needs a configured `Rendezvous` to succeed (with none, the pre-fix
+        // code already silently drops the attempt — that would make this
+        // test pass for the wrong reason). Wire up the same `MockRdv` the
+        // rendezvous-wiring tests use so a pre-fix build genuinely emits the
+        // rekey `HandshakeInit` via the relay.
+        let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        pm.rendezvous = Some(Box::new(MockRdv {
+            server: mock_server(),
+            sent,
+        }));
+        // Pre-mark registration done, and push its refresh interval out
+        // past this test's horizon, so `tick_dispatch`'s periodic
+        // registration refresh (a `Register` datagram, wire tag 0 — the same
+        // numeric value as `PacketType::HandshakeInit`) never fires and
+        // confounds the `has_handshake_init` assertions below.
+        pm.registered_once = true;
+        pm.last_register_ms = 150;
+        pm.reg_refresh_ms = u64::MAX;
+
+        // Past the interval (age 150 >= 100): a direct peer would rekey here
+        // (see `tick_initiates_rekey_for_established_winner_once`), but a
+        // relay peer must not.
+        let out = pm.tick(150).map(<[EgressDatagram]>::to_vec);
+        assert!(
+            !has_handshake_init(out.as_deref()) && !has_relayed_handshake_init(out.as_deref()),
+            "a relay peer must not emit a rekey HandshakeInit, even as glare-winner past the interval"
+        );
+        match &pm.peers[0].state {
+            PeerState::Established(epochs) => assert!(
+                epochs.rekey.is_none(),
+                "EpochSet.rekey must stay None for a relay peer: rekey completion isn't wired for the relay handlers"
+            ),
+            _ => panic!("peer must still be Established"),
+        }
+        assert_eq!(
+            established_tag(&pm, 0),
+            Some(tag),
+            "current epoch must be untouched"
+        );
+
+        // A later tick, well past the point a direct peer would have
+        // abandoned-and-restarted a rekey, must still emit nothing.
+        let out2 = pm
+            .tick(150 + HANDSHAKE_TOTAL_MS)
+            .map(<[EgressDatagram]>::to_vec);
+        assert!(
+            !has_handshake_init(out2.as_deref()) && !has_relayed_handshake_init(out2.as_deref()),
+            "a relay peer must not ever start the churn cycle a never-completing rekey would cause"
+        );
+    }
+
+    #[test]
+    fn tick_rekey_loser_waits_for_2x_interval() {
+        // local_pub = [3;32] > peer pubkey = [2;32]: local is the
+        // glare-LOSER, so it only rekeys via the fallback at 2x the interval.
+        let (mut pm, tag, _ep) = pm_with_established_peer([3u8; 32], [2u8; 32], 100);
+
+        // Past 1x the interval only: the loser must NOT rekey yet.
+        let out = pm.tick(150).map(<[EgressDatagram]>::to_vec);
+        assert!(
+            !has_handshake_init(out.as_deref()),
+            "a glare-loser must not rekey before 2x the interval"
+        );
+        match &pm.peers[0].state {
+            PeerState::Established(epochs) => {
+                assert!(epochs.rekey.is_none(), "no rekey should be scheduled yet")
+            }
+            _ => panic!("peer must still be Established"),
+        }
+
+        // Past 2x the interval: the loser-fallback fires.
+        let out2 = pm.tick(250).map(<[EgressDatagram]>::to_vec);
+        assert!(
+            has_handshake_init(out2.as_deref()),
+            "a glare-loser must rekey once past 2x the interval"
+        );
+        assert_eq!(established_tag(&pm, 0), Some(tag));
+    }
+
+    #[test]
+    fn tick_rekey_retransmits_same_init_after_retry_ms() {
+        let (mut pm, tag, ep) = pm_with_established_peer([1u8; 32], [2u8; 32], 100);
+
+        let out = pm.tick(100).map(<[EgressDatagram]>::to_vec).unwrap();
+        let first_init = out
+            .iter()
+            .find(|d| d.bytes.first() == Some(&(PacketType::HandshakeInit as u8)))
+            .expect("rekey Init on the triggering tick")
+            .bytes
+            .clone();
+
+        // Before HANDSHAKE_RETRY_MS (obf off => exactly 1000ms) elapses: no
+        // retransmit.
+        let mid = pm.tick(100 + HANDSHAKE_RETRY_MS - 1).map(|s| s.to_vec());
+        assert!(
+            !has_handshake_init(mid.as_deref()),
+            "must not retransmit before retry_ms elapses"
+        );
+
+        // At/after retry_ms: the SAME init_pkt is retransmitted (same
+        // ephemeral, so a responder's cached reply — if any — stays valid).
+        let out2 = pm
+            .tick(100 + HANDSHAKE_RETRY_MS)
+            .map(<[EgressDatagram]>::to_vec)
+            .unwrap();
+        let retransmit = out2
+            .iter()
+            .find(|d| d.bytes.first() == Some(&(PacketType::HandshakeInit as u8)) && d.dst == ep)
+            .expect("retransmitted rekey Init");
+        assert_eq!(
+            retransmit.bytes, first_init,
+            "retransmit must resend the exact same Init bytes"
+        );
+        assert_eq!(established_tag(&pm, 0), Some(tag));
+    }
+
+    #[test]
+    fn tick_rekey_abandoned_after_handshake_total_ms_keeps_current() {
+        let (mut pm, tag, _ep) = pm_with_established_peer([1u8; 32], [2u8; 32], 100);
+
+        pm.tick(100);
+        match &pm.peers[0].state {
+            PeerState::Established(epochs) => assert!(epochs.rekey.is_some()),
+            _ => panic!("peer must still be Established"),
+        }
+
+        // The whole HANDSHAKE_TOTAL_MS window elapses without completing:
+        // the rekey is abandoned, but `current` (the live session) is a
+        // no-op survivor — untouched.
+        pm.tick(100 + HANDSHAKE_TOTAL_MS);
+        match &pm.peers[0].state {
+            PeerState::Established(epochs) => assert!(
+                epochs.rekey.is_none(),
+                "an abandoned rekey must clear EpochSet.rekey"
+            ),
+            _ => panic!("peer must still be Established"),
+        }
+        assert_eq!(
+            established_tag(&pm, 0),
+            Some(tag),
+            "abandoning a rekey must be a no-op on the live current epoch"
+        );
+    }
+
+    // ── 9a Task 4: rekey handshake completion wiring ────────────────────────
+
+    /// Build two real `PeerManager`s and drive them through a cold-start
+    /// handshake (A initiates) so both land `Established` on the SAME
+    /// session, with `rekey_interval_ms` set to `interval_ms` on both.
+    /// Returns `(pm_a, pm_b, ep_a, ep_b, kp_a, kp_b)`.
+    fn established_pm_pair(
+        interval_ms: u64,
+    ) -> (
+        PeerManager,
+        PeerManager,
+        SocketAddr,
+        SocketAddr,
+        yip_crypto::Keypair,
+        yip_crypto::Keypair,
+    ) {
+        let kp_a = generate_keypair();
+        let kp_b = generate_keypair();
+        let ep_a: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+        let ep_b: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+        let cfg_b = PeerConfig {
+            public_key: kp_b.public,
+            endpoint: Some(ep_b),
+        };
+        let cfg_a = PeerConfig {
+            public_key: kp_a.public,
+            endpoint: Some(ep_a),
+        };
+        let mut pm_a = PeerManager::new(
+            kp_a.private,
+            kp_a.public,
+            &[cfg_b],
+            TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
+        let mut pm_b = PeerManager::new(
+            kp_b.private,
+            kp_b.public,
+            &[cfg_a],
+            TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
+        pm_a.rekey_interval_ms = interval_ms;
+        pm_b.rekey_interval_ms = interval_ms;
+
+        let init = pm_a.on_tun(&dummy_tun_pkt(), 0)[0].bytes.clone();
+        let resp = resp_bytes(&pm_b.on_udp(ep_a, &init, 0));
+        assert_eq!(resp.len(), 1, "cold-start init must produce one resp");
+        pm_a.on_udp(ep_b, &resp[0], 0);
+        assert!(established_tag(&pm_a, 0).is_some());
+        assert_eq!(established_tag(&pm_a, 0), established_tag(&pm_b, 0));
+
+        (pm_a, pm_b, ep_a, ep_b, kp_a, kp_b)
+    }
+
+    #[test]
+    fn rekey_resp_promotes_initiator_and_keeps_previous_for_grace() {
+        let (mut pm_a, mut pm_b, ep_a, ep_b, kp_a, kp_b) = established_pm_pair(100);
+        let old_tag = established_tag(&pm_a, 0).unwrap();
+
+        // Capture an OLD-epoch frame (B -> A) sealed on B's still-untouched
+        // `current`, to prove after the switch that `previous` still opens
+        // it (the grace window).
+        let old_payload = vec![0xAAu8; 24];
+        let old_frame = pm_b.on_tun(&old_payload, 50)[0].bytes.clone();
+        assert_eq!(old_frame[0], PacketType::Data as u8);
+
+        // Drive a rekey `Init` directly (bypassing `tick`'s glare-winner
+        // scheduling, which depends on the random keypair ordering — Task 4
+        // is only exercising the COMPLETION wiring, already covered
+        // separately by Task 3's scheduling tests) by splicing a
+        // `RekeyInFlight` into A's `EpochSet`, exactly as
+        // `drive_rekey_schedule` would have.
+        let (hs, init_pkt) =
+            HandshakeState::start_initiator(&kp_a.private, &kp_b.public, &[]).unwrap();
+        {
+            let PeerState::Established(epochs) = &mut pm_a.peers[0].state else {
+                panic!("pm_a must be Established");
+            };
+            epochs.rekey = Some(crate::epoch::RekeyInFlight {
+                hs,
+                init_pkt: init_pkt.clone(),
+                started_ms: 100,
+                last_sent_ms: 100,
+                retry_ms: 1000,
+                target: ep_b,
+            });
+        }
+
+        // B (current old enough: age 100 >= interval/2 = 50) accepts the
+        // rekey Init, installs `next`, and replies — `current` untouched.
+        let resp = resp_bytes(&pm_b.on_udp(ep_a, &init_pkt, 100));
+        assert_eq!(resp.len(), 1, "a genuine rekey Init must produce a Resp");
+        assert_eq!(
+            established_tag(&pm_b, 0),
+            Some(old_tag),
+            "B's current must stay on the old epoch until confirmed"
+        );
+        match &pm_b.peers[0].state {
+            PeerState::Established(epochs) => assert!(epochs.next.is_some()),
+            _ => panic!("pm_b must still be Established"),
+        }
+
+        // A completes: read_response promotes `current` to the NEW epoch
+        // immediately, moves the OLD epoch to `previous`, and clears
+        // `epochs.rekey`.
+        let out = pm_a.on_udp(ep_b, &resp[0], 100);
+        let confirm_frames: Vec<Vec<u8>> = match &out {
+            DispatchOut::Udp(e) => e.iter().map(|d| d.bytes.clone()).collect(),
+            _ => panic!("expected Udp egress (the new-epoch confirm frame)"),
+        };
+        assert!(
+            !confirm_frames.is_empty(),
+            "A must emit at least one NEW-epoch frame so B can confirm the switch"
+        );
+
+        let new_tag = established_tag(&pm_a, 0).unwrap();
+        assert_ne!(new_tag, old_tag, "current must become the NEW epoch");
+        match &pm_a.peers[0].state {
+            PeerState::Established(epochs) => {
+                assert!(
+                    epochs.rekey.is_none(),
+                    "rekey must be cleared on completion"
+                );
+                assert!(epochs.previous.is_some(), "old epoch must move to previous");
+                assert_eq!(
+                    epochs.previous.as_ref().unwrap().conn_tag(),
+                    old_tag,
+                    "previous must hold the OLD epoch"
+                );
+            }
+            _ => panic!("pm_a must still be Established"),
+        }
+
+        // OLD-epoch frame (captured before the switch) still opens via
+        // `previous`.
+        match pm_a.on_udp(ep_b, &old_frame, 101) {
+            DispatchOut::Tun(buf) => assert_eq!(buf, old_payload.as_slice()),
+            _ => panic!("expected the old-epoch frame to open via `previous`"),
+        }
+
+        // Feed A's confirm frame(s) to B: B's `EpochSet::inbound_open`
+        // (Task 1) authenticates under `next`, promoting it there too.
+        for f in &confirm_frames {
+            pm_b.on_udp(ep_a, f, 101);
+        }
+        assert_eq!(
+            established_tag(&pm_b, 0),
+            Some(new_tag),
+            "B must have confirmed the switch to the SAME new epoch"
+        );
+
+        // NEW-epoch frame (B -> A, now both on `current`) opens via
+        // `current`.
+        let new_payload = vec![0xBBu8; 24];
+        let new_frame = pm_b.on_tun(&new_payload, 101)[0].bytes.clone();
+        match pm_a.on_udp(ep_b, &new_frame, 102) {
+            DispatchOut::Tun(buf) => assert_eq!(buf, new_payload.as_slice()),
+            _ => panic!("expected the new-epoch frame to open via `current`"),
+        }
+    }
+
+    /// `pm`'s Established peer 0's `next` epoch's `conn_tag`, panicking if
+    /// there is no `next` installed. Test helper for the retransmit-dedup
+    /// regressions below.
+    fn next_conn_tag(pm: &PeerManager) -> u64 {
+        match &pm.peers[0].state {
+            PeerState::Established(epochs) => epochs
+                .next
+                .as_ref()
+                .expect("next must be installed")
+                .dp
+                .conn_tag(),
+            _ => panic!("peer must be Established"),
+        }
+    }
+
+    #[test]
+    fn retransmitted_rekey_init_is_idempotent_new_ephemeral_builds_new_next() {
+        // Critical-bug regression (9a final review): the responder must
+        // treat a retransmit of the SAME rekey `Init` (identical bytes,
+        // hence identical Noise ephemeral) as a no-op — resend the cached
+        // Resp, do NOT mint a second `next` session. A genuinely NEW Init
+        // (fresh ephemeral) must still build a new `next`, replacing the
+        // old one.
+        let (_pm_a, mut pm_b, ep_a, _ep_b, kp_a, kp_b) = established_pm_pair(100);
+
+        let (_hs1, init_pkt_1) =
+            HandshakeState::start_initiator(&kp_a.private, &kp_b.public, &[]).unwrap();
+
+        // First delivery: B installs `next`, replies.
+        let resp1 = resp_bytes(&pm_b.on_udp(ep_a, &init_pkt_1, 100));
+        assert_eq!(resp1.len(), 1, "a genuine rekey Init must produce a Resp");
+        let next_tag_1 = next_conn_tag(&pm_b);
+
+        // RETRANSMIT: the exact same Init bytes again, later. Must resend
+        // the SAME cached Resp and must NOT rebuild `next`.
+        let resp2 = resp_bytes(&pm_b.on_udp(ep_a, &init_pkt_1, 150));
+        assert_eq!(
+            resp2, resp1,
+            "a retransmitted rekey Init must resend the cached Resp verbatim"
+        );
+        assert_eq!(
+            next_conn_tag(&pm_b),
+            next_tag_1,
+            "a retransmitted rekey Init must NOT mint a second `next` session"
+        );
+
+        // A second retransmit, again: still idempotent.
+        let resp3 = resp_bytes(&pm_b.on_udp(ep_a, &init_pkt_1, 200));
+        assert_eq!(resp3, resp1);
+        assert_eq!(next_conn_tag(&pm_b), next_tag_1);
+
+        // A GENUINELY NEW Init (fresh ephemeral) — e.g. the initiator gave
+        // up on round 1 and started a new round — DOES build a new `next`,
+        // replacing the old one.
+        let (_hs2, init_pkt_2) =
+            HandshakeState::start_initiator(&kp_a.private, &kp_b.public, &[]).unwrap();
+        assert_ne!(
+            init_pkt_1, init_pkt_2,
+            "sanity: the two Inits must actually differ"
+        );
+        let resp4 = resp_bytes(&pm_b.on_udp(ep_a, &init_pkt_2, 250));
+        assert_eq!(resp4.len(), 1);
+        assert_ne!(
+            resp4, resp1,
+            "a genuinely new rekey round must produce a NEW Resp"
+        );
+        assert_ne!(
+            next_conn_tag(&pm_b),
+            next_tag_1,
+            "a genuinely new rekey round must replace `next`"
+        );
+    }
+
+    #[test]
+    fn rekey_init_retransmit_before_resp_converges_on_one_session() {
+        // Critical-bug end-to-end regression (9a final review): under RTT >
+        // retry_ms, the initiator retransmits its rekey Init before it has
+        // seen the responder's first Resp. Pre-fix, the responder minted a
+        // FRESH session on every Init it saw — including retransmits — so
+        // the initiator (which locks onto the FIRST Resp it reads) and the
+        // responder (now holding a DIFFERENT `next`) diverged onto two
+        // different epochs and the tunnel black-holed. Post-fix, both sides
+        // converge on ONE session regardless.
+        let (mut pm_a, mut pm_b, ep_a, ep_b, kp_a, kp_b) = established_pm_pair(100);
+
+        // Splice a `RekeyInFlight` into A directly (as
+        // `rekey_resp_promotes_initiator_and_keeps_previous_for_grace`
+        // does), so the SAME `init_pkt` bytes can be "retransmitted" to B
+        // by simply calling `on_udp` twice.
+        let (hs, init_pkt) =
+            HandshakeState::start_initiator(&kp_a.private, &kp_b.public, &[]).unwrap();
+        {
+            let PeerState::Established(epochs) = &mut pm_a.peers[0].state else {
+                panic!("pm_a must be Established");
+            };
+            epochs.rekey = Some(crate::epoch::RekeyInFlight {
+                hs,
+                init_pkt: init_pkt.clone(),
+                started_ms: 100,
+                last_sent_ms: 100,
+                retry_ms: 1000,
+                target: ep_b,
+            });
+        }
+
+        // B receives Init #1 (t=100): installs `next`, replies Resp1.
+        let resp1 = resp_bytes(&pm_b.on_udp(ep_a, &init_pkt, 100));
+        assert_eq!(resp1.len(), 1);
+        let next_tag_after_init1 = next_conn_tag(&pm_b);
+
+        // High RTT: A retransmits the IDENTICAL Init before it has seen
+        // Resp1. B must reply with the SAME cached Resp and must NOT
+        // rebuild `next`.
+        let resp2 = resp_bytes(&pm_b.on_udp(ep_a, &init_pkt, 101));
+        assert_eq!(
+            resp2, resp1,
+            "a retransmitted rekey Init must be answered with the cached Resp verbatim"
+        );
+        assert_eq!(
+            next_conn_tag(&pm_b),
+            next_tag_after_init1,
+            "a retransmitted rekey Init must NOT mint a second `next` session"
+        );
+
+        // Resp1 (produced by the FIRST Init) finally reaches A. A promotes
+        // to the epoch B actually still holds as `next` (unchanged across
+        // the retransmit) — the two sides converge on ONE session.
+        let out = pm_a.on_udp(ep_b, &resp1[0], 102);
+        let confirm_frames: Vec<Vec<u8>> = match &out {
+            DispatchOut::Udp(e) => e.iter().map(|d| d.bytes.clone()).collect(),
+            _ => panic!("expected Udp egress (the new-epoch confirm frame)"),
+        };
+        let a_new_tag = established_tag(&pm_a, 0).unwrap();
+        assert_eq!(
+            a_new_tag, next_tag_after_init1,
+            "A must promote to the SAME epoch B is holding as `next`"
+        );
+
+        // A's confirm frame lets B's own `inbound_open` promote too.
+        for f in &confirm_frames {
+            pm_b.on_udp(ep_a, f, 103);
+        }
+        assert_eq!(
+            established_tag(&pm_b, 0),
+            Some(a_new_tag),
+            "both sides must converge on the SAME session despite the Init retransmit"
+        );
+    }
+
+    #[test]
+    fn rekey_init_on_established_installs_next_without_switching_send() {
+        let (mut pm_a, mut pm_b, ep_a, ep_b, kp_a, kp_b) = established_pm_pair(100);
+        let old_tag_a = established_tag(&pm_a, 0).unwrap();
+        let old_tag_b = established_tag(&pm_b, 0).unwrap();
+
+        // Too-fresh: A's `current` was just established at t=0, well under
+        // interval/2 = 50. B's rekey Init must be IGNORED outright — no
+        // `next` installed, no Resp. (A was the cold-start INITIATOR, so it
+        // holds no `cached_resp` — unlike B, testing this on A isolates the
+        // pure `accept_rekey_init`-false-ignore path from the separate
+        // cached-resp-retransmit fallback, which
+        // `duplicate_init_after_established_does_not_tear_down_session`
+        // already covers.)
+        let (_hs_early, init_pkt_early) =
+            HandshakeState::start_initiator(&kp_b.private, &kp_a.public, &[]).unwrap();
+        match pm_a.on_udp(ep_b, &init_pkt_early, 10) {
+            DispatchOut::None => {}
+            _ => panic!("too-fresh rekey Init must be ignored: no Resp"),
+        }
+        match &pm_a.peers[0].state {
+            PeerState::Established(epochs) => assert!(
+                epochs.next.is_none(),
+                "too-fresh current must never install `next`"
+            ),
+            _ => panic!("pm_a must still be Established"),
+        }
+        assert_eq!(established_tag(&pm_a, 0), Some(old_tag_a));
+
+        // Old enough (t=100 >= 50): a genuine rekey Init installs `next`,
+        // replies with a Resp, and leaves `current` untouched (B keeps
+        // sending on the OLD epoch).
+        let (_hs, init_pkt) =
+            HandshakeState::start_initiator(&kp_a.private, &kp_b.public, &[]).unwrap();
+        let resp = resp_bytes(&pm_b.on_udp(ep_a, &init_pkt, 100));
+        assert_eq!(resp.len(), 1, "an admitted rekey Init must produce a Resp");
+        match &pm_b.peers[0].state {
+            PeerState::Established(epochs) => {
+                assert!(epochs.next.is_some(), "next must be installed");
+            }
+            _ => panic!("pm_b must still be Established"),
+        }
+        assert_eq!(
+            established_tag(&pm_b, 0),
+            Some(old_tag_b),
+            "current must be UNCHANGED — B still sends on the old epoch"
+        );
+
+        // B still sends on the OLD epoch (current untouched): a frame it
+        // emits now still carries the OLD tag.
+        let still_old = pm_b.on_tun(&dummy_tun_pkt(), 100);
+        assert_eq!(still_old[0].bytes[0], PacketType::Data as u8);
     }
 
     #[test]
@@ -2685,6 +3792,64 @@ mod tests {
             resp2, resp1,
             "duplicate init must re-send the cached HandshakeResp verbatim"
         );
+    }
+
+    #[test]
+    fn cold_start_init_retransmit_past_interval_half_resends_original_not_rekey() {
+        // Important-2 regression (9a final review): `HANDSHAKE_TOTAL_MS`
+        // (90s) exceeds `REKEY_INTERVAL_MS`/2, so a retransmit of the
+        // ORIGINAL cold-start Init can legitimately still be in flight once
+        // `EpochSet::accept_rekey_init` alone would treat any Init as a
+        // plausible rekey. It must still be recognized (by ephemeral match
+        // against `cached_resp_init_eph`) as the SAME cold-start round and
+        // answered with the original cached reply — never misclassified as
+        // a rekey round, which would install a spurious `next`.
+        let kp_r = generate_keypair();
+        let kp_i = generate_keypair();
+        let ep_i: SocketAddr = "10.0.0.20:2000".parse().unwrap();
+        let cfg_i = PeerConfig {
+            public_key: kp_i.public,
+            endpoint: Some(ep_i),
+        };
+        let mut pm_r = PeerManager::new(
+            kp_r.private,
+            kp_r.public,
+            &[cfg_i],
+            TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
+        pm_r.rekey_interval_ms = 100; // interval/2 = 50, well under the retransmit's t=70
+
+        let (_hs, init_pkt) =
+            HandshakeState::start_initiator(&kp_i.private, &kp_r.public, &[]).unwrap();
+
+        let resp1 = resp_bytes(&pm_r.on_udp(ep_i, &init_pkt, 0));
+        assert_eq!(resp1.len(), 1, "first init must produce one HandshakeResp");
+        let tag1 = established_tag(&pm_r, 0).expect("responder must be Established");
+
+        // Retransmit of the SAME cold-start Init, arriving at t=70 — past
+        // interval/2 (50), so `accept_rekey_init` alone would consider it a
+        // plausible rekey. It is NOT: it must resend the cached original
+        // reply and must NOT install a `next`.
+        let resp2 = resp_bytes(&pm_r.on_udp(ep_i, &init_pkt, 70));
+        assert_eq!(
+            resp2, resp1,
+            "a cold-start retransmit past interval/2 must still resend the ORIGINAL cached resp"
+        );
+        assert_eq!(
+            established_tag(&pm_r, 0),
+            Some(tag1),
+            "current must be unchanged"
+        );
+        match &pm_r.peers[0].state {
+            PeerState::Established(epochs) => assert!(
+                epochs.next.is_none(),
+                "a cold-start retransmit must NOT install a rekey `next`"
+            ),
+            _ => panic!("responder must stay Established"),
+        }
     }
 
     #[test]
@@ -3000,8 +4165,10 @@ mod tests {
 
         // Splice in a live Established session reaching `endpoint`.
         const TAG: u64 = 0x0102_0304_0506_0708;
-        pm.peers[0].state =
-            PeerState::Established(Box::new(fake_established_dataplane(TAG, endpoint)));
+        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(TAG, endpoint)),
+            0,
+        )));
         pm.by_tag.insert(TAG, 0);
         pm.peers[0].path_kind = Some(PathKind::Direct);
 
@@ -3138,8 +4305,10 @@ mod tests {
 
         // Splice in a live direct session reaching `endpoint`.
         const TAG: u64 = 0x1122_3344_5566_7788;
-        pm.peers[0].state =
-            PeerState::Established(Box::new(fake_established_dataplane(TAG, endpoint)));
+        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(TAG, endpoint)),
+            0,
+        )));
         pm.by_tag.insert(TAG, 0);
         pm.peers[0].path_kind = Some(PathKind::Direct);
         assert!(!pm.peers[0].relay);
@@ -3767,8 +4936,10 @@ mod tests {
 
         // Splice in a live Established session reaching `committed_ep`.
         const TAG: u64 = 0x0a0b_0c0d_0e0f_1011;
-        pm.peers[0].state =
-            PeerState::Established(Box::new(fake_established_dataplane(TAG, committed_ep)));
+        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(TAG, committed_ep)),
+            0,
+        )));
         pm.by_tag.insert(TAG, 0);
         pm.peers[0].path_kind = Some(PathKind::Direct);
 
@@ -3837,7 +5008,10 @@ mod tests {
             false,
         );
         const TAG: u64 = 0x9988_7766_5544_3322;
-        pm.peers[0].state = PeerState::Established(Box::new(fake_established_dataplane(TAG, src)));
+        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(TAG, src)),
+            0,
+        )));
         pm.by_tag.insert(TAG, 0);
 
         // Valid record → ingested → resolvable.
@@ -3911,8 +5085,10 @@ mod tests {
             false,
         );
         const TAG: u64 = 0x1357_9bdf_2468_ace0;
-        pm.peers[0].state =
-            PeerState::Established(Box::new(fake_established_dataplane(TAG, peer_ep)));
+        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(TAG, peer_ep)),
+            0,
+        )));
         pm.by_tag.insert(TAG, 0);
 
         let member = generate_keypair();
@@ -4103,7 +5279,8 @@ mod tests {
         // sealed frames; give the peer its matching session obf key.
         let (mut init_dp, resp_dp, hp_key, conn_tag) = established_pair(peer_ep);
         let sess = yip_obf::derive_key(&hp_key);
-        pm.peers[0].state = PeerState::Established(Box::new(resp_dp));
+        pm.peers[0].state =
+            PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(resp_dp), 0)));
         pm.peers[0].session_obf_key = Some(sess);
         pm.by_tag.insert(conn_tag, 0);
 
@@ -4275,8 +5452,10 @@ mod tests {
         );
         pm.set_obf_psk(Some([0x66u8; 32]));
 
-        pm.peers[0].state =
-            PeerState::Established(Box::new(fake_established_dataplane(TAG, peer_ep)));
+        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(TAG, peer_ep)),
+            0,
+        )));
         let sess = [0x77u8; 16];
         pm.peers[0].session_obf_key = Some(sess);
         pm.by_tag.insert(TAG, 0);
@@ -4816,8 +5995,10 @@ mod tests {
         }
         pm.set_cover_traffic_ms(cover_traffic_ms);
 
-        pm.peers[0].state =
-            PeerState::Established(Box::new(fake_established_dataplane(TAG, peer_ep)));
+        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(TAG, peer_ep)),
+            0,
+        )));
         let sess = [0xBBu8; 16];
         pm.peers[0].session_obf_key = Some(sess);
         pm.by_tag.insert(TAG, 0);
