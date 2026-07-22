@@ -3,6 +3,8 @@
 //! `bin/yip-rendezvous` loop owns the socket and the clock.
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::proto::{Message, NodeId};
 
@@ -45,7 +47,12 @@ pub struct RendezvousServer {
     regs: HashMap<NodeId, Reg>,
     rates: HashMap<SocketAddr, Rate>,
     tls_seen: HashMap<NodeId, TlsSeen>,
-    forwarded: u64,
+    /// Blind-relay forward count. An `Arc<AtomicU64>` (not a bare `u64`) so a
+    /// front that lives OUTSIDE this mutex-guarded struct — the TLS tunnel in
+    /// `bin/yip-rendezvous/src/conn_tunnel.rs` — can bump the SAME counter via
+    /// a cloned handle ([`forwarded_handle`](Self::forwarded_handle)) without
+    /// acquiring the global `server` mutex per relayed frame (#68).
+    forwarded: Arc<AtomicU64>,
 }
 
 impl RendezvousServer {
@@ -54,12 +61,22 @@ impl RendezvousServer {
             regs: HashMap::new(),
             rates: HashMap::new(),
             tls_seen: HashMap::new(),
-            forwarded: 0,
+            forwarded: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub fn forwarded_count(&self) -> u64 {
-        self.forwarded
+        self.forwarded.load(Ordering::Relaxed)
+    }
+
+    /// A cheap clone of the shared forward-count handle, so a front that does
+    /// not hold this struct behind the `server` mutex — the TLS tunnel
+    /// (`bin/yip-rendezvous/src/conn_tunnel.rs`) — can bump the SAME counter
+    /// lock-free (#68). The returned handle and this server's `forwarded` are
+    /// one allocation; a `fetch_add` through either is visible via
+    /// [`forwarded_count`](Self::forwarded_count).
+    pub fn forwarded_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.forwarded)
     }
 
     /// Record one relayed hop that happened OUTSIDE `handle`'s own
@@ -72,8 +89,8 @@ impl RendezvousServer {
     /// the UDP-facing relay half. Same best-effort semantics as the UDP
     /// path's own increment: counted when a live destination route was
     /// found and delivery was attempted, not gated on confirmed receipt.
-    pub fn record_relay_forward(&mut self) {
-        self.forwarded += 1;
+    pub fn record_relay_forward(&self) {
+        self.forwarded.fetch_add(1, Ordering::Relaxed);
     }
 
     /// True iff `node` has a live (unexpired) registration. Used by the TLS
@@ -214,7 +231,7 @@ impl RendezvousServer {
                 payload,
             } => match self.regs.get(&dst) {
                 Some(reg) if reg.expiry_ms > now_ms => {
-                    self.forwarded += 1;
+                    self.record_relay_forward();
                     vec![(
                         reg.addr,
                         Message::RelayDeliver {

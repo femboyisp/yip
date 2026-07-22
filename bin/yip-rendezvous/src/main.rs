@@ -471,6 +471,9 @@ async fn main() -> std::io::Result<()> {
         let acceptor = Arc::new(acceptor);
         let tcp = tokio::net::TcpListener::bind(&tcp_addr).await?;
         eprintln!("yip-rendezvous TLS front listening on {tcp_addr} (tcp)");
+        // One-time (off the hot path): clone the shared forward-count handle
+        // so the TLS front bumps the counter lock-free per frame (#68).
+        let forwarded = server.lock().await.forwarded_handle();
         let cfg = Arc::new(tls_front::TlsFrontCfg {
             server: Arc::clone(&server),
             obf_key,
@@ -481,6 +484,7 @@ async fn main() -> std::io::Result<()> {
             // Trojan front's behavior byte-identical.
             reality: reality_cfg,
             max_conns: reality_max_inflight,
+            forwarded,
         });
         tokio::spawn(tls_front::run_tls_front(tcp, acceptor, cfg));
     }

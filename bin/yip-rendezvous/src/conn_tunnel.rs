@@ -120,11 +120,14 @@ async fn route(msg: Message, cfg: &TlsFrontCfg) {
             // is drop-on-full/closed and can never wedge.
             let _ = tx.try_send(frame);
             // Count this hop on the SAME `forwarded` counter the UDP path's
-            // `RendezvousServer::handle` increments (`cfg.server` is the
-            // identical `Arc<Mutex<RendezvousServer>>` main.rs hands to both
-            // fronts) — see `record_relay_forward`'s doc comment for why
-            // this is needed: this path never calls `handle` at all.
-            cfg.server.lock().await.record_relay_forward();
+            // `RendezvousServer::handle` increments — but via the lock-free
+            // shared handle (`cfg.forwarded` is the identical `Arc<AtomicU64>`
+            // as the server's own `forwarded`), so a relayed frame no longer
+            // takes the global `server` mutex just to bump a `u64` (#68). This
+            // path never calls `handle` at all, so without this the TLS-relay
+            // hop would be invisible to `forwarded_count`.
+            cfg.forwarded
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
     // Register refreshes and other control messages on an established tunnel
@@ -145,14 +148,22 @@ mod tests {
     }
 
     fn test_cfg(obf_key: [u8; 16]) -> Arc<TlsFrontCfg> {
+        // Extract the shared forward-count handle from the SAME server before
+        // wrapping it in the mutex, so `cfg.forwarded` and the server's inner
+        // `forwarded` are one allocation (#68) — this is exactly the property
+        // `pipelined_prefix_frame_is_routed` asserts (a TLS route bumps
+        // `cfg.forwarded`, and `server.forwarded_count()` must observe it).
+        let server = RendezvousServer::new(0);
+        let forwarded = server.forwarded_handle();
         Arc::new(TlsFrontCfg {
-            server: Arc::new(Mutex::new(RendezvousServer::new(0))),
+            server: Arc::new(Mutex::new(server)),
             obf_key,
             decoy: None,
             base: Instant::now(),
             routes: Arc::new(Mutex::new(HashMap::new())),
             reality: None,
             max_conns: 1024,
+            forwarded,
         })
     }
 

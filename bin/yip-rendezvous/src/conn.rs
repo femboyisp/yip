@@ -316,8 +316,11 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
+        let server = RendezvousServer::new(0);
+        let forwarded = server.forwarded_handle();
         let cfg = Arc::new(TlsFrontCfg {
-            server: Arc::new(tokio::sync::Mutex::new(RendezvousServer::new(0))),
+            server: Arc::new(tokio::sync::Mutex::new(server)),
+            forwarded,
             obf_key: yip_obf::derive_key(&[4u8; 32]),
             decoy: Some(decoy_addr),
             base: std::time::Instant::now(),
