@@ -1142,7 +1142,9 @@ impl PeerManager {
                 // loses its session within a rekey interval instead of at process
                 // restart. Checked before the #36 adoption so a revoked peer is
                 // never adopted onto the relay.
-                if !self.responder_cert_ok(&initiator_payload, remote_static) {
+                if !self.is_root(remote_static)
+                    && !self.responder_cert_ok(&initiator_payload, remote_static)
+                {
                     self.drop_session(idx);
                     return DispatchOut::None;
                 }
@@ -1190,11 +1192,9 @@ impl PeerManager {
                 // revocation). Always-admit ROOTS are exempt (as in the #41
                 // sweep). No-op for pure 2a/2b: `responder_cert_ok` returns
                 // `true` when membership is `None`.
-                let is_root = self
-                    .membership
-                    .as_ref()
-                    .is_some_and(|m| m.roots().iter().any(|(pk, _)| *pk == remote_static));
-                if !is_root && !self.responder_cert_ok(&initiator_payload, remote_static) {
+                if !self.is_root(remote_static)
+                    && !self.responder_cert_ok(&initiator_payload, remote_static)
+                {
                     return DispatchOut::None;
                 }
                 let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
@@ -1579,6 +1579,16 @@ impl PeerManager {
         }
     }
 
+    /// Whether `pk` is an always-admit root (in the signed root set). Roots are
+    /// exempt from cert-based revocation — they are trusted via the root set, not
+    /// a member cert (revoke a root by removing it from the root set). `false`
+    /// when membership is disabled.
+    fn is_root(&self, pk: [u8; 32]) -> bool {
+        self.membership
+            .as_ref()
+            .is_some_and(|m| m.roots().iter().any(|(rpk, _)| *rpk == pk))
+    }
+
     /// Tear down a peer's live session: remove every `conn_tag` it holds
     /// (current + any in-flight `next` + grace `previous`) from `by_tag`, and
     /// revert the peer to `Idle`. Idempotent for a non-Established peer.
@@ -1685,7 +1695,9 @@ impl PeerManager {
                 // (mesh mode). A revoked/expired member presenting a stale cert
                 // loses its session within a rekey interval instead of at process
                 // restart.
-                if !self.responder_cert_ok(&initiator_payload, remote_static) {
+                if !self.is_root(remote_static)
+                    && !self.responder_cert_ok(&initiator_payload, remote_static)
+                {
                     self.drop_session(idx);
                     return DispatchOut::None;
                 }
@@ -1716,11 +1728,9 @@ impl PeerManager {
                 // revocation). Always-admit ROOTS are exempt (as in the #41
                 // sweep). No-op for pure 2a/2b: `responder_cert_ok` returns
                 // `true` when membership is `None`.
-                let is_root = self
-                    .membership
-                    .as_ref()
-                    .is_some_and(|m| m.roots().iter().any(|(pk, _)| *pk == remote_static));
-                if !is_root && !self.responder_cert_ok(&initiator_payload, remote_static) {
+                if !self.is_root(remote_static)
+                    && !self.responder_cert_ok(&initiator_payload, remote_static)
+                {
                     return DispatchOut::None;
                 }
                 let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
@@ -6231,6 +6241,78 @@ mod tests {
             "the root is admitted despite presenting no cert"
         );
         assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+    }
+
+    /// Task 2's rekey re-verify must exempt roots exactly like Task 2b's
+    /// re-admission gate does: an always-admit ROOT that is `Established`
+    /// and receives a further `[HandshakeInit]` with an EMPTY (no-cert)
+    /// payload — exactly what `root_exempt_from_readmission_check` proves a
+    /// root is allowed to present — must NOT have its live session torn
+    /// down. This arm also handles ordinary Init retransmits (lost Resp)
+    /// and peer restarts, not just genuine rekeys, so this is reachable in
+    /// normal operation. Before the fix, the rekey re-verify arm lacked the
+    /// `is_root` bypass the re-admission gate has, so a certless root's
+    /// session was wrongly dropped the moment any Init arrived from it.
+    #[test]
+    fn root_established_not_dropped_on_certless_rekey_init() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let root = generate_keypair();
+        let root_ep: SocketAddr = "198.51.100.1:51820".parse().unwrap();
+
+        let roots = RootSet {
+            roots: vec![(root.public, root_ep)],
+            version: 1,
+            ca_sig: [0u8; 64],
+        };
+        let own_sign = SigningKey::from_bytes(&[200u8; 32]);
+        let own_cert = mk_cert(&ca, local.public, own_sign.verifying_key().to_bytes());
+        let membership = Membership::new(
+            vec![ca.verifying_key().to_bytes()],
+            TEST_NET,
+            own_cert,
+            own_sign.to_bytes(),
+            roots,
+            vec!["10.0.0.1:51820".parse().unwrap()],
+        );
+        let mut pm = PeerManager::new(
+            local.private,
+            local.public,
+            &[],
+            TunnelMode::L3Tun,
+            None,
+            Some(membership),
+            false,
+        );
+        pm.rekey_interval_ms = 100_000;
+
+        // Cold-start Init from the root, NO cert payload — admitted by the
+        // Task 2b exemption (mirrors `root_exempt_from_readmission_check`).
+        let (_hs, init_pkt) =
+            HandshakeState::start_initiator(&root.private, &local.public, &[]).unwrap();
+        let out = pm.on_udp(root_ep, &init_pkt, 0);
+        assert_eq!(resp_bytes(&out).len(), 1, "root cold-start admitted");
+        assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+        let tag = established_tag(&pm, 0).expect("root established");
+
+        // A further `[HandshakeInit]` from the root (fresh ephemeral — an
+        // ordinary retransmit-of-a-different-round or a genuine rekey,
+        // either reachable in normal operation), again carrying an EMPTY
+        // (no-cert) payload, arriving well past interval/2.
+        let (_hs2, init_pkt2) =
+            HandshakeState::start_initiator(&root.private, &local.public, &[]).unwrap();
+        let _out2 = pm.on_udp(root_ep, &init_pkt2, 200_000);
+
+        assert!(
+            matches!(pm.peers[0].state, PeerState::Established(_)),
+            "the root's session must NOT be dropped: roots are exempt from \
+             cert-based revocation on rekey re-verify, same as the Task 2b gate"
+        );
+        assert_eq!(
+            established_tag(&pm, 0),
+            Some(tag),
+            "by_tag / established_tag unchanged — no drop_session teardown occurred"
+        );
     }
 
     /// Control: with membership disabled (pure 2a/2b), the re-admission gate
