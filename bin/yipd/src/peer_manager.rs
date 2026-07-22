@@ -239,8 +239,14 @@ struct Peer {
     /// Whether this peer is currently reached via the relay (server) rather
     /// than directly: every egress datagram for it (handshake and data plane)
     /// is wrapped through `rendezvous.relay`. Set on a Relay-stage probe or on
-    /// admitting a relayed handshake; only mutated while the peer is
-    /// non-`Established` (anti-hijack).
+    /// admitting a relayed handshake. Mutated while the peer is
+    /// non-`Established` (anti-hijack), with ONE deliberate exception: the #36
+    /// responder-side adoption in `relayed_handshake_init` flips it to `true`
+    /// for an Established peer that receives a relayed cold-start RETRANSMIT of
+    /// the Init that built our session (`cached_resp_init_eph` match) — the
+    /// initiator has moved to relay-only, so we adopt the relay for our egress
+    /// too. That path can never redirect egress to an attacker (`relay_wrap`
+    /// addresses the peer's fixed registered node), only downgrade the path.
     relay: bool,
     /// When we last emitted a `lookup` for this peer (debounces `NeedLookup`);
     /// `None` until the first lookup is sent.
@@ -776,6 +782,11 @@ impl PeerManager {
             return self.begin_handshake(idx, new_target, via_relay, now_ms);
         };
         h.target = new_target;
+        // Reset the retransmit clock to `now_ms` so the retransmit arm does not
+        // fire an immediate redundant copy of the Init we resend here (which
+        // would also break the anti-DPI timing jitter): the re-targeted Init
+        // IS this interval's send.
+        h.last_sent_ms = now_ms;
         let init_pkt = h.init_pkt.clone();
         self.peers[idx].relay = via_relay;
         if via_relay {
@@ -4402,6 +4413,10 @@ mod tests {
                 assert_eq!(
                     h.started_ms, orig_started,
                     "started_ms must not reset on re-target"
+                );
+                assert_eq!(
+                    h.last_sent_ms, 5_000,
+                    "last_sent_ms resets to now so no immediate redundant retransmit"
                 );
                 assert_eq!(h.target, server, "target must update to the new path");
                 assert_ne!(h.target, orig_target);
