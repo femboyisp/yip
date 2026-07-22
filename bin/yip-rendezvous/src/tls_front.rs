@@ -89,6 +89,12 @@ pub struct TlsFrontCfg {
     /// front (I1, slowloris hardening — see `run_tls_front`). Callers outside
     /// this module default to `1024`.
     pub max_conns: usize,
+    /// A lock-free handle to the shared blind-relay forward counter
+    /// ([`RendezvousServer::forwarded_handle`]). `conn_tunnel::route` bumps it
+    /// with a relaxed `fetch_add` per relayed frame instead of taking the
+    /// `server` mutex (#68); it is the SAME allocation as the server's own
+    /// `forwarded`, so `server.forwarded_count()` still reflects TLS hops.
+    pub forwarded: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Build a server TLS acceptor from PEM cert-chain + key files, configured to
@@ -583,8 +589,11 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
+        let server = RendezvousServer::new(0);
+        let forwarded = server.forwarded_handle();
         let cfg = Arc::new(TlsFrontCfg {
-            server: Arc::new(Mutex::new(RendezvousServer::new(0))),
+            server: Arc::new(Mutex::new(server)),
+            forwarded,
             obf_key: [0u8; 16],
             decoy: None,
             base: Instant::now(),
@@ -803,8 +812,11 @@ mod tests {
         .expect("prewarm at least one SNI against the local cert source");
         let replay = Arc::new(crate::reality_replay::ReplayGuard::new(0, 65536));
 
+        let server = RendezvousServer::new(0);
+        let forwarded = server.forwarded_handle();
         let cfg = Arc::new(TlsFrontCfg {
-            server: Arc::new(Mutex::new(RendezvousServer::new(0))),
+            server: Arc::new(Mutex::new(server)),
+            forwarded,
             obf_key: [0u8; 16],
             decoy: None,
             base: Instant::now(),
