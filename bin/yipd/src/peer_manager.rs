@@ -1087,7 +1087,7 @@ impl PeerManager {
             .as_ref()
             .map(Membership::own_cert_bytes)
             .unwrap_or_default();
-        let (established, resp_pkt, remote_static, _initiator_payload) =
+        let (established, resp_pkt, remote_static, initiator_payload) =
             match HandshakeState::start_responder(&self.local_priv, dg, &resp_payload) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1137,6 +1137,15 @@ impl PeerManager {
                 let Some(init_eph) = crate::handshake::init_ephemeral(dg) else {
                     return DispatchOut::None; // malformed Init
                 };
+                // #41: a mid-session rekey Init must carry a currently-valid cert
+                // (mesh mode). A revoked/expired member presenting a stale cert
+                // loses its session within a rekey interval instead of at process
+                // restart. Checked before the #36 adoption so a revoked peer is
+                // never adopted onto the relay.
+                if !self.responder_cert_ok(&initiator_payload, remote_static) {
+                    self.drop_session(idx);
+                    return DispatchOut::None;
+                }
                 // #36: a relay==false (direct/punch-established) peer receiving a
                 // relayed cold-start RETRANSMIT of the Init that built our session
                 // (init_eph == cached_resp_init_eph) means the initiator could not
@@ -1556,6 +1565,30 @@ impl PeerManager {
         }
     }
 
+    /// Tear down a peer's live session: remove every `conn_tag` it holds
+    /// (current + any in-flight `next` + grace `previous`) from `by_tag`, and
+    /// revert the peer to `Idle`. Idempotent for a non-Established peer.
+    /// Re-admission is guarded by the cold-start cert check, so a revoked
+    /// peer cannot re-establish.
+    fn drop_session(&mut self, idx: usize) {
+        let tags: Vec<u64> = if let PeerState::Established(epochs) = &self.peers[idx].state {
+            let mut t = vec![epochs.current.conn_tag()];
+            if let Some(n) = epochs.next.as_ref() {
+                t.push(n.dp.conn_tag());
+            }
+            if let Some(p) = epochs.previous.as_ref() {
+                t.push(p.conn_tag());
+            }
+            t
+        } else {
+            Vec::new()
+        };
+        for tag in tags {
+            self.by_tag.remove(&tag);
+        }
+        self.peers[idx].state = PeerState::Idle;
+    }
+
     fn handle_handshake_init(
         &mut self,
         src: SocketAddr,
@@ -1634,6 +1667,14 @@ impl PeerManager {
             // Fail-closed drop instead, mirroring the guard in
             // `relayed_handshake_init`; `current` stays untouched.
             PeerState::Established(_) if !self.peers[idx].relay => {
+                // #41: a mid-session rekey Init must carry a currently-valid cert
+                // (mesh mode). A revoked/expired member presenting a stale cert
+                // loses its session within a rekey interval instead of at process
+                // restart.
+                if !self.responder_cert_ok(&initiator_payload, remote_static) {
+                    self.drop_session(idx);
+                    return DispatchOut::None;
+                }
                 let init_eph = crate::handshake::init_ephemeral(dg).expect(
                     "start_responder already parsed dg's msg1; its leading 32 bytes are `e`",
                 );
@@ -5841,6 +5882,194 @@ mod tests {
             assert!(matches!(pm.on_udp(src, &init_pkt, 0), DispatchOut::None));
             assert!(pm.peers.is_empty(), "untrusted-CA cert ⇒ no admission");
             assert!(pm.by_tag.is_empty());
+        }
+    }
+
+    // ── #41(a): re-verify the cert on a mid-session rekey Init ─────────────
+    //
+    // A registry mapping a peer's data-plane pubkey to its private key +
+    // Ed25519 signing-key seed, populated by `pm_mesh_established_peer` and
+    // read by `rekey_init_with_payload`/`valid_cert_bytes` so those helpers
+    // can mint further datagrams "from" that peer without threading its
+    // keys through every call site (the verbatim test bodies only pass
+    // `&pm`). Keyed (not thread-local) so it's safe under parallel test
+    // execution.
+    type PeerTestKeyRegistry =
+        std::sync::Mutex<std::collections::HashMap<[u8; 32], ([u8; 32], [u8; 32])>>;
+
+    fn peer_test_key_registry() -> &'static PeerTestKeyRegistry {
+        static REG: std::sync::OnceLock<PeerTestKeyRegistry> = std::sync::OnceLock::new();
+        REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    /// Build a mesh (`membership: Some`) `PeerManager` with a single peer
+    /// already `Established` over a direct (non-relay) cold-start handshake,
+    /// for exercising the #41(a) rekey cert-reverification guard.
+    /// `local_sign_seed`/`peer_sign_seed` seed the local/peer Ed25519
+    /// signing keys embedded in their CA-signed certs (mirrors
+    /// `membership_for`'s `[200u8; 32]` pattern); `interval_ms` becomes
+    /// `pm.rekey_interval_ms`, so a rekey Init at a `now_ms` far past
+    /// `interval_ms / 2` is accepted by `EpochSet::accept_rekey_init`. The
+    /// peer's data-plane keypair is generated fresh and stashed in the
+    /// registry above (keyed by its pubkey).
+    fn pm_mesh_established_peer(
+        local_sign_seed: [u8; 32],
+        peer_sign_seed: [u8; 32],
+        interval_ms: u64,
+    ) -> (PeerManager, u64) {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let peer = generate_keypair();
+        let peer_ep: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+
+        let local_sign = SigningKey::from_bytes(&local_sign_seed);
+        let local_cert = mk_cert(&ca, local.public, local_sign.verifying_key().to_bytes());
+        let membership = Membership::new(
+            vec![ca.verifying_key().to_bytes()],
+            TEST_NET,
+            local_cert,
+            local_sign.to_bytes(),
+            empty_roots(),
+            vec!["10.0.0.1:51820".parse().unwrap()],
+        );
+
+        let cfg_peer = PeerConfig {
+            public_key: peer.public,
+            endpoint: Some(peer_ep),
+        };
+        let mut pm = PeerManager::new(
+            local.private,
+            local.public,
+            &[cfg_peer],
+            TunnelMode::L3Tun,
+            None,
+            Some(membership),
+            false,
+        );
+        pm.rekey_interval_ms = interval_ms;
+
+        peer_test_key_registry()
+            .lock()
+            .unwrap()
+            .insert(peer.public, (peer.private, peer_sign_seed));
+
+        // Cold-start: the peer completes a direct handshake with `pm`.
+        // Admission is by preconfigured static-key match (`cfg_peer` above),
+        // so no cert is needed on this leg — only the mid-session rekey path
+        // (#41a) re-checks the cert.
+        let (_hs, init_pkt) =
+            HandshakeState::start_initiator(&peer.private, &local.public, &[]).unwrap();
+        let out = pm.on_udp(peer_ep, &init_pkt, 0);
+        assert!(
+            matches!(out, DispatchOut::Udp(_)),
+            "cold-start init must produce a resp and establish the session"
+        );
+
+        let tag = established_tag(&pm, 0).expect("pm established with the peer");
+        (pm, tag)
+    }
+
+    /// The endpoint `pm` learned/was configured with for peer `idx`.
+    fn peer_src(pm: &PeerManager, idx: usize) -> SocketAddr {
+        pm.peers[idx]
+            .endpoint
+            .expect("peer has a learned/configured endpoint")
+    }
+
+    /// A `[HandshakeInit] ++ msg1` datagram "from" `pm.peers[idx]` (using its
+    /// private key stashed by `pm_mesh_established_peer`), carrying `payload`
+    /// as the msg1 app payload — the slot `responder_cert_ok` reads the cert
+    /// from on a rekey Init.
+    fn rekey_init_with_payload(pm: &PeerManager, idx: usize, payload: &[u8]) -> Vec<u8> {
+        let peer_pub = pm.peers[idx].pubkey;
+        let (peer_priv, _sign_seed) = *peer_test_key_registry()
+            .lock()
+            .unwrap()
+            .get(&peer_pub)
+            .expect("peer keypair registered by pm_mesh_established_peer");
+        let (_hs, init_pkt) =
+            HandshakeState::start_initiator(&peer_priv, &pm.local_pub, payload).unwrap();
+        init_pkt
+    }
+
+    /// A freshly-minted, currently-valid CA-signed cert (encoded) covering
+    /// `pm.peers[idx]`'s static key — what a non-revoked member would present
+    /// on a rekey Init.
+    fn valid_cert_bytes(pm: &PeerManager, idx: usize) -> Vec<u8> {
+        let peer_pub = pm.peers[idx].pubkey;
+        let (_priv, sign_seed) = *peer_test_key_registry()
+            .lock()
+            .unwrap()
+            .get(&peer_pub)
+            .expect("peer keypair registered by pm_mesh_established_peer");
+        let ca = test_ca();
+        let sign = SigningKey::from_bytes(&sign_seed);
+        let cert = mk_cert(&ca, peer_pub, sign.verifying_key().to_bytes());
+        let mut bytes = Vec::new();
+        cert.encode(&mut bytes);
+        bytes
+    }
+
+    /// A rekey Init whose payload is NOT a currently-valid cert (mesh mode)
+    /// must drop the session (revert to `Idle`, purge `by_tag`, no reply)
+    /// instead of completing the rekey — else a revoked/expired member keeps
+    /// its live session until process restart (#41).
+    #[test]
+    fn rekey_init_with_invalid_cert_drops_session() {
+        // Mesh Established peer, current old enough that accept_rekey_init would pass.
+        let (mut pm, tag) =
+            pm_mesh_established_peer([5u8; 32], [6u8; 32], /*age past interval/2*/ 100_000);
+        assert_eq!(established_tag(&pm, 0), Some(tag));
+
+        // A rekey Init from that peer carrying an INVALID cert payload (membership on).
+        let init = rekey_init_with_payload(&pm, 0, /*payload=*/ b"not-a-valid-cert");
+        let out = match pm.on_udp(peer_src(&pm, 0), &init, 200_000) {
+            DispatchOut::Udp(e) | DispatchOut::Both(_, e) => Some(e),
+            _ => None,
+        }
+        .map(<[EgressDatagram]>::to_vec);
+
+        // Session dropped: Idle, by_tag entry gone, no resp emitted.
+        assert!(
+            matches!(pm.peers[0].state, PeerState::Idle),
+            "invalid-cert rekey drops the session"
+        );
+        assert!(
+            !pm.by_tag.values().any(|&i| i == 0),
+            "the peer's conn_tag is removed from by_tag"
+        );
+        assert!(
+            out.is_none_or(|o| o.is_empty()),
+            "no resp for a revoked rekey"
+        );
+    }
+
+    /// Control for the test above: a VALID cert on the rekey Init still
+    /// rekeys normally — the #41a guard must be a no-op on the legitimate
+    /// path.
+    #[test]
+    fn rekey_init_with_valid_cert_still_rekeys() {
+        let (mut pm, tag) = pm_mesh_established_peer([5u8; 32], [6u8; 32], 100_000);
+        let init = rekey_init_with_payload(&pm, 0, &valid_cert_bytes(&pm, 0));
+        let out = pm.on_udp(peer_src(&pm, 0), &init, 200_000);
+        let resp = resp_bytes(&out);
+        assert_eq!(
+            resp.len(),
+            1,
+            "a genuine rekey Init with a valid cert must produce a Resp, proving the \
+             rekey actually proceeded rather than merely not dropping"
+        );
+        assert_eq!(
+            established_tag(&pm, 0),
+            Some(tag),
+            "current stays on the OLD epoch until the initiator confirms (9a Task 4)"
+        );
+        match &pm.peers[0].state {
+            PeerState::Established(epochs) => assert!(
+                epochs.next.is_some(),
+                "the valid-cert rekey Init installed a next epoch"
+            ),
+            _ => panic!("valid cert rekeys, no drop"),
         }
     }
 
