@@ -226,13 +226,6 @@ pub fn init_ephemeral(init_pkt: &[u8]) -> Option<[u8; 32]> {
 }
 
 /// TAI64N label length: 8-byte seconds + 4-byte nanoseconds.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into the handshake paths by a later anti-replay.34 task"
-    )
-)]
 pub const TAI64N_LEN: usize = 12;
 
 /// The current wall clock as a TAI64N label: big-endian `2^62 + unix_secs`
@@ -242,13 +235,6 @@ pub const TAI64N_LEN: usize = 12;
 /// time) with no persisted state. A clock that jumps backwards yields a label
 /// that a peer with a higher last-accepted label will reject — the WireGuard
 /// behavior, accepted.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into the handshake paths by a later anti-replay.34 task"
-    )
-)]
 pub fn now_tai64n() -> [u8; TAI64N_LEN] {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -263,13 +249,6 @@ pub fn now_tai64n() -> [u8; TAI64N_LEN] {
 
 /// Build the msg1 Noise payload: the anti-replay TAI64N label followed by the
 /// (optional) membership cert. Empty `cert` (2a/2b) yields a 12-byte payload.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into the handshake paths by a later anti-replay.34 task"
-    )
-)]
 pub fn frame_init_payload(cert: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(TAI64N_LEN + cert.len());
     out.extend_from_slice(&now_tai64n());
@@ -279,13 +258,6 @@ pub fn frame_init_payload(cert: &[u8]) -> Vec<u8> {
 
 /// Split a received msg1 payload into `(ts_label, cert_remainder)`.
 /// `None` (fail-closed) if it is shorter than the 12-byte label.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into the handshake paths by a later anti-replay.34 task"
-    )
-)]
 pub fn parse_init_payload(payload: &[u8]) -> Option<([u8; TAI64N_LEN], &[u8])> {
     let ts: [u8; TAI64N_LEN] = payload.get(..TAI64N_LEN)?.try_into().ok()?;
     Some((ts, &payload[TAI64N_LEN..]))

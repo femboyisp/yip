@@ -702,11 +702,15 @@ impl PeerManager {
         // Present our CA-signed membership cert as msg1's Noise payload so the
         // responder can admit us by cert (2c). Empty when membership is None —
         // byte-identical to 2a/2b.
-        let payload = self
+        let cert = self
             .membership
             .as_ref()
             .map(Membership::own_cert_bytes)
             .unwrap_or_default();
+        // #34: frame the msg1 payload as [ts || cert] so the responder can
+        // reject stale replays (Task 3 adds the freshness gate; this task
+        // only establishes the wire format).
+        let payload = crate::handshake::frame_init_payload(&cert);
         let (hs, init_pkt) =
             match HandshakeState::start_initiator(&self.local_priv, &pubkey, &payload) {
                 Ok(t) => t,
@@ -875,11 +879,13 @@ impl PeerManager {
                 }
             };
             let pubkey = self.peers[idx].pubkey;
-            let payload = self
+            let cert = self
                 .membership
                 .as_ref()
                 .map(Membership::own_cert_bytes)
                 .unwrap_or_default();
+            // #34: frame the msg1 payload as [ts || cert] (see begin_handshake).
+            let payload = crate::handshake::frame_init_payload(&cert);
             let (hs, init_pkt) =
                 match HandshakeState::start_initiator(&self.local_priv, &pubkey, &payload) {
                     Ok(t) => t,
@@ -1106,6 +1112,15 @@ impl PeerManager {
             return DispatchOut::None;
         }
 
+        // #34: the msg1 payload is [ts || cert]. Split the anti-replay label
+        // off; the cert remainder is what admission checks. Too short to hold
+        // the label ⇒ malformed ⇒ fail closed.
+        let Some((_init_ts, initiator_cert)) =
+            crate::handshake::parse_init_payload(&initiator_payload)
+        else {
+            return DispatchOut::None;
+        };
+
         match &self.peers[idx].state {
             // Established (9a/relay-path completion, #91 Task 2): route
             // through the shared core exactly like the direct path's
@@ -1150,7 +1165,7 @@ impl PeerManager {
                 // restart. Checked before the #36 adoption so a revoked peer is
                 // never adopted onto the relay.
                 if !self.is_root(remote_static)
-                    && !self.responder_cert_ok(&initiator_payload, remote_static)
+                    && !self.responder_cert_ok(initiator_cert, remote_static)
                 {
                     self.drop_session(idx);
                     return DispatchOut::None;
@@ -1200,7 +1215,7 @@ impl PeerManager {
                 // sweep). No-op for pure 2a/2b: `responder_cert_ok` returns
                 // `true` when membership is `None`.
                 if !self.is_root(remote_static)
-                    && !self.responder_cert_ok(&initiator_payload, remote_static)
+                    && !self.responder_cert_ok(initiator_cert, remote_static)
                 {
                     return DispatchOut::None;
                 }
@@ -1645,6 +1660,15 @@ impl PeerManager {
                 }
             };
 
+        // #34: the msg1 payload is [ts || cert]. Split the anti-replay label
+        // off; the cert remainder is what admission checks. Too short to hold
+        // the label ⇒ malformed ⇒ fail closed.
+        let Some((_init_ts, initiator_cert)) =
+            crate::handshake::parse_init_payload(&initiator_payload)
+        else {
+            return DispatchOut::None;
+        };
+
         // Admission: a configured/root/already-admitted peer (static-key match)
         // OR — with membership enabled — the initiator presented a valid
         // CA-signed cert covering its static key (`remote_static`). A cert-admit
@@ -1656,7 +1680,7 @@ impl PeerManager {
             Some(i) => i,
             None => {
                 let cert_admits = self.membership.as_ref().is_some_and(|m| {
-                    Cert::decode(&initiator_payload)
+                    Cert::decode(initiator_cert)
                         .is_some_and(|cert| m.verify_cert(&cert, &remote_static, now_secs()))
                 });
                 if !cert_admits {
@@ -1707,7 +1731,7 @@ impl PeerManager {
                 // loses its session within a rekey interval instead of at process
                 // restart.
                 if !self.is_root(remote_static)
-                    && !self.responder_cert_ok(&initiator_payload, remote_static)
+                    && !self.responder_cert_ok(initiator_cert, remote_static)
                 {
                     self.drop_session(idx);
                     return DispatchOut::None;
@@ -1740,7 +1764,7 @@ impl PeerManager {
                 // sweep). No-op for pure 2a/2b: `responder_cert_ok` returns
                 // `true` when membership is `None`.
                 if !self.is_root(remote_static)
-                    && !self.responder_cert_ok(&initiator_payload, remote_static)
+                    && !self.responder_cert_ok(initiator_cert, remote_static)
                 {
                     return DispatchOut::None;
                 }
@@ -3330,8 +3354,12 @@ mod tests {
 
         // A valid HandshakeInit from a real, but unconfigured, key.
         let stranger = generate_keypair();
-        let (_hs, init_pkt) =
-            HandshakeState::start_initiator(&stranger.private, &local_kp.public, &[]).unwrap();
+        let (_hs, init_pkt) = HandshakeState::start_initiator(
+            &stranger.private,
+            &local_kp.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
 
         let src: SocketAddr = "203.0.113.5:5".parse().unwrap();
         match pm.on_udp(src, &init_pkt, 0) {
@@ -3744,8 +3772,12 @@ mod tests {
         // separately by Task 3's scheduling tests) by splicing a
         // `RekeyInFlight` into A's `EpochSet`, exactly as
         // `drive_rekey_schedule` would have.
-        let (hs, init_pkt) =
-            HandshakeState::start_initiator(&kp_a.private, &kp_b.public, &[]).unwrap();
+        let (hs, init_pkt) = HandshakeState::start_initiator(
+            &kp_a.private,
+            &kp_b.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
         {
             let PeerState::Established(epochs) = &mut pm_a.peers[0].state else {
                 panic!("pm_a must be Established");
@@ -3866,8 +3898,12 @@ mod tests {
         // sibling `rekey_resp_promotes_initiator_and_keeps_previous_for_grace`
         // test does, to drive rekey completion without depending on
         // `tick`'s glare-winner scheduling.
-        let (hs, init_pkt) =
-            HandshakeState::start_initiator(&kp_a.private, &kp_b.public, &[]).unwrap();
+        let (hs, init_pkt) = HandshakeState::start_initiator(
+            &kp_a.private,
+            &kp_b.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
         {
             let PeerState::Established(epochs) = &mut pm_a.peers[0].state else {
                 panic!("pm_a must be Established");
@@ -3934,8 +3970,12 @@ mod tests {
         // old one.
         let (_pm_a, mut pm_b, ep_a, _ep_b, kp_a, kp_b) = established_pm_pair(100);
 
-        let (_hs1, init_pkt_1) =
-            HandshakeState::start_initiator(&kp_a.private, &kp_b.public, &[]).unwrap();
+        let (_hs1, init_pkt_1) = HandshakeState::start_initiator(
+            &kp_a.private,
+            &kp_b.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
 
         // First delivery: B installs `next`, replies.
         let resp1 = resp_bytes(&pm_b.on_udp(ep_a, &init_pkt_1, 100));
@@ -3963,8 +4003,12 @@ mod tests {
         // A GENUINELY NEW Init (fresh ephemeral) — e.g. the initiator gave
         // up on round 1 and started a new round — DOES build a new `next`,
         // replacing the old one.
-        let (_hs2, init_pkt_2) =
-            HandshakeState::start_initiator(&kp_a.private, &kp_b.public, &[]).unwrap();
+        let (_hs2, init_pkt_2) = HandshakeState::start_initiator(
+            &kp_a.private,
+            &kp_b.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
         assert_ne!(
             init_pkt_1, init_pkt_2,
             "sanity: the two Inits must actually differ"
@@ -3998,8 +4042,12 @@ mod tests {
         // `rekey_resp_promotes_initiator_and_keeps_previous_for_grace`
         // does), so the SAME `init_pkt` bytes can be "retransmitted" to B
         // by simply calling `on_udp` twice.
-        let (hs, init_pkt) =
-            HandshakeState::start_initiator(&kp_a.private, &kp_b.public, &[]).unwrap();
+        let (hs, init_pkt) = HandshakeState::start_initiator(
+            &kp_a.private,
+            &kp_b.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
         {
             let PeerState::Established(epochs) = &mut pm_a.peers[0].state else {
                 panic!("pm_a must be Established");
@@ -4072,8 +4120,12 @@ mod tests {
         // cached-resp-retransmit fallback, which
         // `duplicate_init_after_established_does_not_tear_down_session`
         // already covers.)
-        let (_hs_early, init_pkt_early) =
-            HandshakeState::start_initiator(&kp_b.private, &kp_a.public, &[]).unwrap();
+        let (_hs_early, init_pkt_early) = HandshakeState::start_initiator(
+            &kp_b.private,
+            &kp_a.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
         match pm_a.on_udp(ep_b, &init_pkt_early, 10) {
             DispatchOut::None => {}
             _ => panic!("too-fresh rekey Init must be ignored: no Resp"),
@@ -4090,8 +4142,12 @@ mod tests {
         // Old enough (t=100 >= 50): a genuine rekey Init installs `next`,
         // replies with a Resp, and leaves `current` untouched (B keeps
         // sending on the OLD epoch).
-        let (_hs, init_pkt) =
-            HandshakeState::start_initiator(&kp_a.private, &kp_b.public, &[]).unwrap();
+        let (_hs, init_pkt) = HandshakeState::start_initiator(
+            &kp_a.private,
+            &kp_b.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
         let resp = resp_bytes(&pm_b.on_udp(ep_a, &init_pkt, 100));
         assert_eq!(resp.len(), 1, "an admitted rekey Init must produce a Resp");
         match &pm_b.peers[0].state {
@@ -4209,8 +4265,12 @@ mod tests {
         );
 
         // The initiator's HandshakeInit (built out-of-band, as if received).
-        let (_hs, init_pkt) =
-            HandshakeState::start_initiator(&kp_i.private, &kp_r.public, &[]).unwrap();
+        let (_hs, init_pkt) = HandshakeState::start_initiator(
+            &kp_i.private,
+            &kp_r.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
 
         // First delivery establishes the responder session; capture its reply.
         let resp1 = resp_bytes(&pm_r.on_udp(ep_i, &init_pkt, 0));
@@ -4256,8 +4316,12 @@ mod tests {
         );
         pm_r.rekey_interval_ms = 100; // interval/2 = 50, well under the retransmit's t=70
 
-        let (_hs, init_pkt) =
-            HandshakeState::start_initiator(&kp_i.private, &kp_r.public, &[]).unwrap();
+        let (_hs, init_pkt) = HandshakeState::start_initiator(
+            &kp_i.private,
+            &kp_r.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
 
         let resp1 = resp_bytes(&pm_r.on_udp(ep_i, &init_pkt, 0));
         assert_eq!(resp1.len(), 1, "first init must produce one HandshakeResp");
@@ -4834,8 +4898,12 @@ mod tests {
 
         // A valid HandshakeInit from the peer, delivered THROUGH the relay
         // (RelayDeliver from the server, src = peer node).
-        let (_hs, init_pkt) =
-            HandshakeState::start_initiator(&peer_kp.private, &local.public, &[]).unwrap();
+        let (_hs, init_pkt) = HandshakeState::start_initiator(
+            &peer_kp.private,
+            &local.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
         let mut buf = Vec::new();
         yip_rendezvous::encode(
             &yip_rendezvous::Message::RelayDeliver {
@@ -5041,8 +5109,12 @@ mod tests {
         };
         let (mut pm_r, _sent) = pm_with_mock_rdv(&kp_r, &[cfg_a]);
 
-        let (_hs, a_init_pkt) =
-            HandshakeState::start_initiator(&kp_a.private, &kp_r.public, &[]).unwrap();
+        let (_hs, a_init_pkt) = HandshakeState::start_initiator(
+            &kp_a.private,
+            &kp_r.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
         let buf = relay_deliver(&kp_a, a_init_pkt.clone());
         let out = pm_r.on_udp(mock_server(), &buf, now_ms);
         assert!(
@@ -5111,8 +5183,12 @@ mod tests {
         };
         let (mut pm_r, _sent) = pm_with_mock_rdv(&kp_r, &[cfg_a]);
 
-        let (_hs, a_init_pkt) =
-            HandshakeState::start_initiator(&kp_a.private, &kp_r.public, &[]).unwrap();
+        let (_hs, a_init_pkt) = HandshakeState::start_initiator(
+            &kp_a.private,
+            &kp_r.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
         let resp1 = resp_bytes(&pm_r.on_udp(ep_a, &a_init_pkt, now_ms));
         assert_eq!(
             resp1.len(),
@@ -5170,8 +5246,12 @@ mod tests {
         let local_pub = pm_r.local_pub;
 
         // A fresh Init from the SAME initiator identity draws a NEW ephemeral.
-        let (_hs2, other_init_pkt) =
-            HandshakeState::start_initiator(&kp_a.private, &local_pub, &[]).unwrap();
+        let (_hs2, other_init_pkt) = HandshakeState::start_initiator(
+            &kp_a.private,
+            &local_pub,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
         let relayed = wrap_relay_deliver(&pm_r, &other_init_pkt);
         let dropped = matches!(
             pm_r.on_udp(mock_server(), &relayed, 5_000),
@@ -5273,8 +5353,12 @@ mod tests {
         // genuinely new ephemeral DOES build a new `next`.
         let (mut pm, local, peer_kp, _old_tag) = established_relay_pm(100);
 
-        let (_hs1, init_pkt_1) =
-            HandshakeState::start_initiator(&peer_kp.private, &local.public, &[]).unwrap();
+        let (_hs1, init_pkt_1) = HandshakeState::start_initiator(
+            &peer_kp.private,
+            &local.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
         let buf1 = relay_deliver(&peer_kp, init_pkt_1.clone());
 
         // First delivery at t=100 (current age 100 >= interval/2 = 50):
@@ -5309,8 +5393,12 @@ mod tests {
 
         // A GENUINELY NEW Init (fresh ephemeral) DOES build a new `next`,
         // replacing the old one.
-        let (_hs2, init_pkt_2) =
-            HandshakeState::start_initiator(&peer_kp.private, &local.public, &[]).unwrap();
+        let (_hs2, init_pkt_2) = HandshakeState::start_initiator(
+            &peer_kp.private,
+            &local.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
         assert_ne!(
             init_pkt_1, init_pkt_2,
             "sanity: the two Inits must actually differ"
@@ -5342,8 +5430,12 @@ mod tests {
 
         // Splice a `RekeyInFlight` in as the INITIATOR side (pm's own rekey
         // attempt), exactly as the direct-path sibling test does.
-        let (hs, init_pkt) =
-            HandshakeState::start_initiator(&local.private, &peer_kp.public, &[]).unwrap();
+        let (hs, init_pkt) = HandshakeState::start_initiator(
+            &local.private,
+            &peer_kp.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
         {
             let PeerState::Established(epochs) = &mut pm.peers[0].state else {
                 panic!("pm must be Established");
@@ -5433,8 +5525,12 @@ mod tests {
 
         // Splice a `RekeyInFlight` in as the INITIATOR side (pm's own rekey
         // attempt), exactly as the relay-path sibling test does.
-        let (hs, init_pkt) =
-            HandshakeState::start_initiator(&local.private, &peer_kp.public, &[]).unwrap();
+        let (hs, init_pkt) = HandshakeState::start_initiator(
+            &local.private,
+            &peer_kp.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
         {
             let PeerState::Established(epochs) = &mut pm.peers[0].state else {
                 panic!("pm must be Established");
@@ -5538,8 +5634,12 @@ mod tests {
         pm.peers[0].relay = true;
         pm.peers[0].path_kind = Some(PathKind::Relayed);
 
-        let (_hs, init_pkt) =
-            HandshakeState::start_initiator(&peer_kp.private, &local.public, &[]).unwrap();
+        let (_hs, init_pkt) = HandshakeState::start_initiator(
+            &peer_kp.private,
+            &local.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
 
         assert!(
             matches!(
@@ -5903,9 +6003,12 @@ mod tests {
             );
             let mut cert_bytes = Vec::new();
             cert.encode(&mut cert_bytes);
-            let (_hs, init_pkt) =
-                HandshakeState::start_initiator(&stranger.private, &local.public, &cert_bytes)
-                    .unwrap();
+            let (_hs, init_pkt) = HandshakeState::start_initiator(
+                &stranger.private,
+                &local.public,
+                &crate::handshake::frame_init_payload(&cert_bytes),
+            )
+            .unwrap();
 
             let replies = resp_bytes(&pm.on_udp(src, &init_pkt, 0));
             assert_eq!(replies.len(), 1, "a valid cert is admitted and replied to");
@@ -5927,8 +6030,12 @@ mod tests {
                 Some(membership_for(&ca, local.public)),
                 false,
             );
-            let (_hs, init_pkt) =
-                HandshakeState::start_initiator(&stranger.private, &local.public, &[]).unwrap();
+            let (_hs, init_pkt) = HandshakeState::start_initiator(
+                &stranger.private,
+                &local.public,
+                &crate::handshake::frame_init_payload(&[]),
+            )
+            .unwrap();
             assert!(matches!(pm.on_udp(src, &init_pkt, 0), DispatchOut::None));
             assert!(pm.peers.is_empty(), "no cert ⇒ no admission");
             assert!(pm.by_tag.is_empty());
@@ -5955,11 +6062,90 @@ mod tests {
             );
             let mut cert_bytes = Vec::new();
             bad_cert.encode(&mut cert_bytes);
+            let (_hs, init_pkt) = HandshakeState::start_initiator(
+                &stranger.private,
+                &local.public,
+                &crate::handshake::frame_init_payload(&cert_bytes),
+            )
+            .unwrap();
+            assert!(matches!(pm.on_udp(src, &init_pkt, 0), DispatchOut::None));
+            assert!(pm.peers.is_empty(), "untrusted-CA cert ⇒ no admission");
+            assert!(pm.by_tag.is_empty());
+        }
+    }
+
+    /// #34 Task 2: the msg1 payload is now `[ts || cert]`. A properly framed
+    /// Init (built via `frame_init_payload`, exactly as the real initiator's
+    /// `begin_handshake`/`drive_rekey_schedule` now do) still recovers the
+    /// cert remainder after the responder strips the 12-byte ts label, and
+    /// admits/establishes exactly as before the wire format changed.
+    ///
+    /// The negative counterpart proves the framing is actually enforced on
+    /// the consume side, not merely a no-op: an Init carrying a RAW cert with
+    /// NO ts prefix (the pre-#34 wire format) no longer admits, because the
+    /// responder's parse consumes the cert's own leading 12 bytes as the ts
+    /// label, corrupting the cert remainder handed to `Cert::decode`.
+    #[test]
+    fn framed_init_payload_still_establishes_and_admits_by_cert() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let src: SocketAddr = "203.0.113.5:5".parse().unwrap();
+
+        let stranger = generate_keypair();
+        let stranger_sign = SigningKey::from_bytes(&[220u8; 32]);
+        let cert = mk_cert(
+            &ca,
+            stranger.public,
+            stranger_sign.verifying_key().to_bytes(),
+        );
+        let mut cert_bytes = Vec::new();
+        cert.encode(&mut cert_bytes);
+
+        // ── properly framed [ts || cert] → admitted + establishes ──
+        {
+            let mut pm = PeerManager::new(
+                local.private,
+                local.public,
+                &[],
+                TunnelMode::L3Tun,
+                None,
+                Some(membership_for(&ca, local.public)),
+                false,
+            );
+            let framed = crate::handshake::frame_init_payload(&cert_bytes);
+            let (_hs, init_pkt) =
+                HandshakeState::start_initiator(&stranger.private, &local.public, &framed).unwrap();
+
+            let replies = resp_bytes(&pm.on_udp(src, &init_pkt, 0));
+            assert_eq!(
+                replies.len(),
+                1,
+                "a framed [ts || cert] Init is admitted and replied to"
+            );
+            assert_eq!(pm.peers.len(), 1, "the cert-verified member was admitted");
+            assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+        }
+
+        // ── raw (unframed) cert, no ts prefix → NOT admitted ──
+        {
+            let mut pm = PeerManager::new(
+                local.private,
+                local.public,
+                &[],
+                TunnelMode::L3Tun,
+                None,
+                Some(membership_for(&ca, local.public)),
+                false,
+            );
             let (_hs, init_pkt) =
                 HandshakeState::start_initiator(&stranger.private, &local.public, &cert_bytes)
                     .unwrap();
-            assert!(matches!(pm.on_udp(src, &init_pkt, 0), DispatchOut::None));
-            assert!(pm.peers.is_empty(), "untrusted-CA cert ⇒ no admission");
+            assert!(
+                matches!(pm.on_udp(src, &init_pkt, 0), DispatchOut::None),
+                "an unframed raw-cert Init must no longer admit: the responder mis-reads \
+                 its leading 12 bytes as the ts label, corrupting the cert remainder"
+            );
+            assert!(pm.peers.is_empty(), "no admission from an unframed payload");
             assert!(pm.by_tag.is_empty());
         }
     }
@@ -6042,7 +6228,7 @@ mod tests {
         let (_hs, init_pkt) = HandshakeState::start_initiator(
             &peer.private,
             &local.public,
-            &valid_cert_bytes(&pm, 0),
+            &crate::handshake::frame_init_payload(&valid_cert_bytes(&pm, 0)),
         )
         .unwrap();
         let out = pm.on_udp(peer_ep, &init_pkt, 0);
@@ -6064,8 +6250,9 @@ mod tests {
 
     /// A `[HandshakeInit] ++ msg1` datagram "from" `pm.peers[idx]` (using its
     /// private key stashed by `pm_mesh_established_peer`), carrying `payload`
-    /// as the msg1 app payload — the slot `responder_cert_ok` reads the cert
-    /// from on a rekey Init.
+    /// as the msg1 app CERT payload — the slot `responder_cert_ok` reads the
+    /// cert from on a rekey Init. `payload` is framed as `[ts || payload]`
+    /// (#34), mirroring what a real initiator (`drive_rekey_schedule`) sends.
     fn rekey_init_with_payload(pm: &PeerManager, idx: usize, payload: &[u8]) -> Vec<u8> {
         let peer_pub = pm.peers[idx].pubkey;
         let (peer_priv, _sign_seed) = *peer_test_key_registry()
@@ -6073,8 +6260,9 @@ mod tests {
             .unwrap()
             .get(&peer_pub)
             .expect("peer keypair registered by pm_mesh_established_peer");
+        let framed = crate::handshake::frame_init_payload(payload);
         let (_hs, init_pkt) =
-            HandshakeState::start_initiator(&peer_priv, &pm.local_pub, payload).unwrap();
+            HandshakeState::start_initiator(&peer_priv, &pm.local_pub, &framed).unwrap();
         init_pkt
     }
 
@@ -6272,8 +6460,12 @@ mod tests {
 
         // Cold-start Init from the root, NO cert payload — would fail
         // `responder_cert_ok` for a non-root peer.
-        let (_hs, init_pkt) =
-            HandshakeState::start_initiator(&root.private, &local.public, &[]).unwrap();
+        let (_hs, init_pkt) = HandshakeState::start_initiator(
+            &root.private,
+            &local.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
         let out = pm.on_udp(root_ep, &init_pkt, 0);
 
         assert_eq!(
@@ -6329,8 +6521,12 @@ mod tests {
 
         // Cold-start Init from the root, NO cert payload — admitted by the
         // Task 2b exemption (mirrors `root_exempt_from_readmission_check`).
-        let (_hs, init_pkt) =
-            HandshakeState::start_initiator(&root.private, &local.public, &[]).unwrap();
+        let (_hs, init_pkt) = HandshakeState::start_initiator(
+            &root.private,
+            &local.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
         let out = pm.on_udp(root_ep, &init_pkt, 0);
         assert_eq!(resp_bytes(&out).len(), 1, "root cold-start admitted");
         assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
@@ -6340,8 +6536,12 @@ mod tests {
         // ordinary retransmit-of-a-different-round or a genuine rekey,
         // either reachable in normal operation), again carrying an EMPTY
         // (no-cert) payload, arriving well past interval/2.
-        let (_hs2, init_pkt2) =
-            HandshakeState::start_initiator(&root.private, &local.public, &[]).unwrap();
+        let (_hs2, init_pkt2) = HandshakeState::start_initiator(
+            &root.private,
+            &local.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
         let _out2 = pm.on_udp(root_ep, &init_pkt2, 200_000);
 
         assert!(
@@ -6379,8 +6579,12 @@ mod tests {
             false,
         );
 
-        let (_hs, init1) =
-            HandshakeState::start_initiator(&peer.private, &local.public, &[]).unwrap();
+        let (_hs, init1) = HandshakeState::start_initiator(
+            &peer.private,
+            &local.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
         let out1 = pm.on_udp(peer_ep, &init1, 0);
         assert_eq!(resp_bytes(&out1).len(), 1, "initial cold-start establishes");
         assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
@@ -6390,8 +6594,12 @@ mod tests {
         pm.drop_session(0);
         assert!(matches!(pm.peers[0].state, PeerState::Idle));
 
-        let (_hs2, init2) =
-            HandshakeState::start_initiator(&peer.private, &local.public, &[]).unwrap();
+        let (_hs2, init2) = HandshakeState::start_initiator(
+            &peer.private,
+            &local.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
         let out2 = pm.on_udp(peer_ep, &init2, 1_000);
         assert_eq!(
             resp_bytes(&out2).len(),
@@ -6452,7 +6660,7 @@ mod tests {
         let (_hs, init_pkt) = HandshakeState::start_initiator(
             &peer.private,
             &local.public,
-            &valid_cert_bytes(&pm, 0),
+            &crate::handshake::frame_init_payload(&valid_cert_bytes(&pm, 0)),
         )
         .unwrap();
         let out = pm.on_udp(mock_server(), &relay_deliver(&peer, init_pkt), 0);
@@ -6468,8 +6676,12 @@ mod tests {
 
         // A fresh relayed cold-start Init carrying an EXPIRED cert.
         let expired = expired_cert_bytes(&pm, 0);
-        let (_hs2, reinit_pkt) =
-            HandshakeState::start_initiator(&peer.private, &local.public, &expired).unwrap();
+        let (_hs2, reinit_pkt) = HandshakeState::start_initiator(
+            &peer.private,
+            &local.public,
+            &crate::handshake::frame_init_payload(&expired),
+        )
+        .unwrap();
         let out2 = pm.on_udp(mock_server(), &relay_deliver(&peer, reinit_pkt), 300_000);
 
         assert!(
@@ -6513,8 +6725,12 @@ mod tests {
         );
         let mut cert_bytes = Vec::new();
         cert.encode(&mut cert_bytes);
-        let (_hs, init_pkt) =
-            HandshakeState::start_initiator(&stranger.private, &local.public, &cert_bytes).unwrap();
+        let (_hs, init_pkt) = HandshakeState::start_initiator(
+            &stranger.private,
+            &local.public,
+            &crate::handshake::frame_init_payload(&cert_bytes),
+        )
+        .unwrap();
         let src: SocketAddr = "203.0.113.5:5".parse().unwrap();
         assert!(matches!(pm.on_udp(src, &init_pkt, 0), DispatchOut::None));
         assert!(pm.peers.is_empty());
@@ -7018,8 +7234,12 @@ mod tests {
         let obf_key = yip_obf::derive_key(&psk);
 
         // A real [HandshakeInit]‖msg1, obfuscated with the network key.
-        let (_hs, init_pkt) =
-            HandshakeState::start_initiator(&kp_i.private, &kp_r.public, &[]).unwrap();
+        let (_hs, init_pkt) = HandshakeState::start_initiator(
+            &kp_i.private,
+            &kp_r.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
         assert_eq!(init_pkt[0], PacketType::HandshakeInit as u8);
         let wrapped = yip_obf::obfuscate(
             &obf_key,
@@ -7445,8 +7665,12 @@ mod tests {
             false,
         );
         // No set_obf_psk ⇒ obfuscation disabled.
-        let (_hs, init_pkt) =
-            HandshakeState::start_initiator(&kp_i.private, &kp_r.public, &[]).unwrap();
+        let (_hs, init_pkt) = HandshakeState::start_initiator(
+            &kp_i.private,
+            &kp_r.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
         let resp = resp_bytes(&pm.on_udp(ep_i, &init_pkt, 0));
         assert_eq!(resp.len(), 1, "one plaintext HandshakeResp is emitted");
         assert_eq!(
