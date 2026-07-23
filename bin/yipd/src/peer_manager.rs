@@ -1278,7 +1278,9 @@ impl PeerManager {
         };
         match handshaking.hs.read_response(dg) {
             Ok((established, responder_payload)) => {
-                if !self.responder_cert_ok(&responder_payload, self.peers[idx].pubkey) {
+                if !self.is_root(self.peers[idx].pubkey)
+                    && !self.responder_cert_ok(&responder_payload, self.peers[idx].pubkey)
+                {
                     eprintln!("peer_manager: relayed responder cert rejected");
                     return DispatchOut::None;
                 }
@@ -2014,7 +2016,9 @@ impl PeerManager {
 
         match handshaking.hs.read_response(dg) {
             Ok((established, responder_payload)) => {
-                if !self.responder_cert_ok(&responder_payload, self.peers[idx].pubkey) {
+                if !self.is_root(self.peers[idx].pubkey)
+                    && !self.responder_cert_ok(&responder_payload, self.peers[idx].pubkey)
+                {
                     // Responder failed to prove membership: do not establish.
                     // State was already reverted to `Idle`; `pending_tun` stays
                     // queued for the next attempt.
@@ -2164,7 +2168,9 @@ impl PeerManager {
                 return DispatchOut::None;
             }
         };
-        if !self.responder_cert_ok(&responder_payload, self.peers[idx].pubkey) {
+        if !self.is_root(self.peers[idx].pubkey)
+            && !self.responder_cert_ok(&responder_payload, self.peers[idx].pubkey)
+        {
             eprintln!("peer_manager: rekey responder cert rejected");
             return DispatchOut::None;
         }
@@ -6814,6 +6820,72 @@ mod tests {
                 "untrusted-CA responder cert ⇒ session must not establish, reverts to Idle"
             );
         }
+    }
+
+    /// #96 — symmetry with the init-side gates: an always-admit ROOT
+    /// responder is exempt from the responder-cert check. A root is trusted
+    /// via the signed root set, not a member cert (you revoke a root by
+    /// removing it from the root set), so an initiator completing a handshake
+    /// with a root establishes even if the root's msg2 carries no valid cert.
+    #[test]
+    fn initiator_admits_root_responder_despite_missing_cert() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let root = generate_keypair();
+        let root_ep: SocketAddr = "198.51.100.7:51820".parse().unwrap();
+        let cfg = PeerConfig {
+            public_key: root.public,
+            endpoint: Some(root_ep),
+        };
+        let roots = RootSet {
+            roots: vec![(root.public, root_ep)],
+            version: 1,
+            ca_sig: [0u8; 64],
+        };
+        let own_sign = SigningKey::from_bytes(&[200u8; 32]);
+        let own_cert = mk_cert(&ca, local.public, own_sign.verifying_key().to_bytes());
+        let membership = Membership::new(
+            vec![ca.verifying_key().to_bytes()],
+            TEST_NET,
+            own_cert,
+            own_sign.to_bytes(),
+            roots,
+            vec!["10.0.0.1:51820".parse().unwrap()],
+        );
+        let mut pm = PeerManager::new(
+            local.private,
+            local.public,
+            std::slice::from_ref(&cfg),
+            TunnelMode::L3Tun,
+            None,
+            Some(membership),
+            false,
+        );
+        let idx = pm
+            .peers
+            .iter()
+            .position(|p| p.pubkey == root.public)
+            .expect("root is a peer");
+
+        // We initiate toward the root.
+        let init_out = pm.on_tun(&dummy_tun_pkt(), 0).to_vec();
+        let init_pkt = init_out
+            .iter()
+            .find(|d| d.dst == root_ep)
+            .map(|d| d.bytes.clone())
+            .expect("an Init toward the root");
+        assert!(matches!(pm.peers[idx].state, PeerState::Handshaking(_)));
+
+        // The root responds with NO cert in msg2 — rejected for a non-root
+        // peer, but the root is exempt.
+        let (_established, resp_pkt, _remote_static, _initiator_payload) =
+            HandshakeState::start_responder(&root.private, &init_pkt, &[]).unwrap();
+        let _ = pm.on_udp(root_ep, &resp_pkt, 0);
+
+        assert!(
+            matches!(pm.peers[idx].state, PeerState::Established(_)),
+            "a root responder is admitted despite a missing cert (is_root exemption)"
+        );
     }
 
     // ── anti-DPI obfuscation (3a Task 3) ──────────────────────────────────
