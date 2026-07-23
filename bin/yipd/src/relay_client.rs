@@ -104,7 +104,8 @@ impl Counter {
 pub(crate) fn build_register(obf_key: &[u8; 16], node: NodeId, counter: u64) -> Vec<u8> {
     let mut plain = Vec::new();
     encode(&Message::Register { node, counter }, &mut plain);
-    let env = yip_obf::obfuscate(obf_key, yip_obf::RDV_TYPE, &plain, 0);
+    let env = yip_obf::obfuscate(obf_key, yip_obf::RDV_TYPE, &plain, 0)
+        .expect("Register body is a small fixed-shape RDV message, always fits u16");
     let mut out = Vec::new();
     crate::tls::frame_datagram(&env, &mut out).expect("register envelope within frame cap");
     out
@@ -1017,7 +1018,8 @@ mod tests {
                 },
                 &mut plain,
             );
-            let env = yip_obf::obfuscate(&obf_key, yip_obf::RDV_TYPE, &plain, 0);
+            let env = yip_obf::obfuscate(&obf_key, yip_obf::RDV_TYPE, &plain, 0)
+                .expect("small fixed-shape test body fits u16");
             let mut wire = Vec::new();
             frame_datagram(&env, &mut wire).expect("frame relay-deliver envelope");
             blocking_write_all_tls(&mut stream, &wire);
@@ -1134,7 +1136,8 @@ mod tests {
             let mut body = vec![0u8; len];
             read_exact_ssl(&mut tls, &mut body);
             // Send an inbound obf'd datagram, framed, and hold the conn open briefly.
-            let deliver = yip_obf::obfuscate(&server_obf, yip_obf::RDV_TYPE, b"inbound-proof", 0);
+            let deliver = yip_obf::obfuscate(&server_obf, yip_obf::RDV_TYPE, b"inbound-proof", 0)
+                .expect("small fixed-shape test body fits u16");
             let mut framed = Vec::new();
             crate::tls::frame_datagram(&deliver, &mut framed).expect("frame");
             blocking_write_all_tls(&mut tls, &framed);

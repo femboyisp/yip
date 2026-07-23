@@ -47,7 +47,8 @@ fn wrap_reply(obf_key: Option<&[u8; 16]>, reply: &Message) -> Vec<u8> {
     let mut out = Vec::new();
     encode(reply, &mut out);
     match obf_key {
-        Some(key) => yip_obf::obfuscate(key, yip_obf::RDV_TYPE, &out, random_pad(OBF_PAD_MAX)),
+        Some(key) => yip_obf::obfuscate(key, yip_obf::RDV_TYPE, &out, random_pad(OBF_PAD_MAX))
+            .expect("rendezvous reply body is a small fixed-shape Message, always fits u16"),
         None => out,
     }
 }
@@ -62,7 +63,8 @@ pub(crate) const TLS_FRAME_CAP: usize = 2048;
 pub(crate) fn frame_obf(obf_key: &[u8; 16], msg: &Message) -> Vec<u8> {
     let mut plain = Vec::new();
     encode(msg, &mut plain);
-    let env = yip_obf::obfuscate(obf_key, yip_obf::RDV_TYPE, &plain, random_pad(OBF_PAD_MAX));
+    let env = yip_obf::obfuscate(obf_key, yip_obf::RDV_TYPE, &plain, random_pad(OBF_PAD_MAX))
+        .expect("rendezvous message body is a small fixed-shape Message, always fits u16");
     let mut out = Vec::with_capacity(2 + env.len());
     let len = u16::try_from(env.len()).unwrap_or(u16::MAX);
     out.extend_from_slice(&len.to_be_bytes());
@@ -674,7 +676,8 @@ mod obf_tests {
         let mut plain = Vec::new();
         encode(&msg, &mut plain);
 
-        let wrapped = yip_obf::obfuscate(&key, yip_obf::RDV_TYPE, &plain, 12);
+        let wrapped = yip_obf::obfuscate(&key, yip_obf::RDV_TYPE, &plain, 12)
+            .expect("small test body fits u16");
         let (ptype, body) = yip_obf::deobfuscate(&key, &wrapped).expect("round-trips");
         assert_eq!(ptype, yip_obf::RDV_TYPE);
         assert_eq!(
@@ -700,7 +703,8 @@ mod obf_tests {
         let mut plain = Vec::new();
         encode(&msg, &mut plain);
 
-        let wrapped = yip_obf::obfuscate(&key, yip_obf::RDV_TYPE, &plain, 0);
+        let wrapped = yip_obf::obfuscate(&key, yip_obf::RDV_TYPE, &plain, 0)
+            .expect("small test body fits u16");
         let (ptype, body) = yip_obf::deobfuscate(&key, &wrapped).expect("round-trips");
         assert_eq!(ptype, yip_obf::RDV_TYPE);
         match yip_rendezvous::decode(&body) {
@@ -729,7 +733,8 @@ mod obf_tests {
         let mut plain = Vec::new();
         encode(&msg, &mut plain);
 
-        let wrapped = yip_obf::obfuscate(&k1, yip_obf::RDV_TYPE, &plain, 8);
+        let wrapped = yip_obf::obfuscate(&k1, yip_obf::RDV_TYPE, &plain, 8)
+            .expect("small test body fits u16");
         match yip_obf::deobfuscate(&k2, &wrapped) {
             None => {}
             Some((ptype, body)) => {
@@ -757,7 +762,10 @@ mod obf_tests {
 
         let n = 512usize;
         let dgs: Vec<Vec<u8>> = (0..n)
-            .map(|_| yip_obf::obfuscate(&key, yip_obf::RDV_TYPE, &plain, 4))
+            .map(|_| {
+                yip_obf::obfuscate(&key, yip_obf::RDV_TYPE, &plain, 4)
+                    .expect("small test body fits u16")
+            })
             .collect();
         let len = dgs[0].len();
         for pos in 0..len {
