@@ -26,8 +26,25 @@ use yip_membership::{node_addr, node_id, Cert, GossipMsg, NodeId, Record, RootSe
 /// Cert validity is widened by this many WALL-CLOCK seconds on both ends to
 /// tolerate clock skew between nodes (matches the `yip-ca`/`yip-membership`
 /// convention of an explicit, small, documented skew rather than an
-/// unbounded one).
+/// unbounded one). Production default; see [`clock_skew_secs`] for the
+/// test-only env override.
 const CLOCK_SKEW_SECS: u64 = 300;
+
+/// The cert-validity clock-skew widening (seconds), read once from
+/// `YIP_CERT_SKEW_SECS` (default [`CLOCK_SKEW_SECS`] = 300). Overridable only
+/// so netns tests can make a cert expire in seconds instead of waiting out the
+/// 5-minute production grace; production leaves the var unset. Cached, so the
+/// value is stable for the process's lifetime (a mid-run change cannot shrink
+/// an already-honored validity window).
+fn clock_skew_secs() -> u64 {
+    static SKEW: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SKEW.get_or_init(|| {
+        std::env::var("YIP_CERT_SKEW_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(CLOCK_SKEW_SECS)
+    })
+}
 
 /// Minimum spacing, in MONOTONIC milliseconds, between digests emitted by
 /// `tick_digest` — pure gossip-chattiness control, unrelated to cert clocks.
@@ -167,7 +184,7 @@ impl Membership {
             &self.network_id,
             static_key,
             now,
-            CLOCK_SKEW_SECS,
+            clock_skew_secs(),
         )
         .is_ok()
     }
@@ -200,7 +217,7 @@ impl Membership {
         let mut changed = self.sweep_expired(now);
 
         if rec
-            .verify(&self.ca_pubkeys, &self.network_id, now, CLOCK_SKEW_SECS)
+            .verify(&self.ca_pubkeys, &self.network_id, now, clock_skew_secs())
             .is_ok()
         {
             changed |= self.insert_if_newer(rec);
@@ -357,7 +374,7 @@ impl Membership {
                     &self.network_id,
                     &rec.cert.member_pubkey,
                     now,
-                    CLOCK_SKEW_SECS,
+                    clock_skew_secs(),
                 )
                 .is_err()
             })

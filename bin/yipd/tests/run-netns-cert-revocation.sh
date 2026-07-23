@@ -39,17 +39,16 @@
 # This test does not (and cannot, from the outside) distinguish which one
 # fires first — either is a correct #41 fix; the observable is the same.
 #
-# ── CRITICAL TIMING NOTE: CLOCK_SKEW_SECS, not just cert validity ──
+# ── TIMING NOTE: cert-validity clock-skew widening ──
 # `bin/yipd/src/membership.rs` widens EVERY cert-validity check (both
-# mechanisms above) by a hardcoded `CLOCK_SKEW_SECS = 300` (5 minutes) —
-# a cert is not treated as expired until `now > cert.not_after + 300`, and
-# this constant is NOT configurable via env (unlike `YIP_REKEY_INTERVAL_MS`).
-# A test that only waits `cert_secs + rekey_interval + a small margin` after
-# minting will observe NO drop and fail confusingly. This script's post-
-# expiry wait is `CERT_A_SECS + CLOCK_SKEW_SECS(300) + REKEY_INTERVAL_S +
-# MARGIN` — i.e. the test genuinely takes several minutes past establishment
-# by design, not by accident. If `CLOCK_SKEW_SECS` in membership.rs ever
-# changes, update `CLOCK_SKEW_SECS` below to match.
+# mechanisms above) by a clock-skew grace — production `CLOCK_SKEW_SECS = 300`
+# (5 minutes), so a cert is not treated as expired until
+# `now > cert.not_after + 300`. Waiting that out would make this test take
+# >5 minutes, so it sets `YIP_CERT_SKEW_SECS` (an env override the daemon
+# reads, like `YIP_REKEY_INTERVAL_MS`) to a few seconds. The observable-drop
+# time is therefore `CERT_A_SECS + YIP_CERT_SKEW_SECS + REKEY_INTERVAL_S +
+# MARGIN` past minting (~90s total). The `CLOCK_SKEW_SECS` value below MUST
+# equal the exported `YIP_CERT_SKEW_SECS` so the wait math matches the daemon.
 #
 # Assertions (any failure is non-zero exit, [PASS]/[FAIL] markers):
 #   1. discovery: A's config has no `[peer]` block / no knowledge of B's key
@@ -61,9 +60,12 @@
 #   4. no re-admission: a further generous ping window still FAILS — A's
 #      expired cert is refused by the re-admission gate on any subsequent
 #      handshake attempt, not just coincidentally not-yet-retried.
-# BOTH drivers (reads YIP_USE_URING from the caller's env; `ip netns exec`,
-# unlike `sudo`, does not clear the environment, so it flows through to the
-# daemons unmodified).
+# The script supports both drivers (reads YIP_USE_URING from the caller's env;
+# `ip netns exec`, unlike `sudo`, does not clear the environment, so it flows
+# through to the daemons unmodified). CI runs it POLL-ONLY, matching its fork
+# source run-netns-discovery.sh: gossip discovery convergence is flaky under
+# io_uring, and #41's cert-revocation logic (sweep / re-admission gate) is
+# driver-agnostic — the poll run exercises it identically.
 set -euo pipefail
 
 YIPD="${1:?Usage: $0 <yipd-binary> <yip-ca-binary> <yip-rendezvous-binary>}"
@@ -102,9 +104,11 @@ PORT="51820"
 TUN_DEV="yip0"
 NETWORK_ID="c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
 
-# `bin/yipd/src/membership.rs`'s hardcoded, non-configurable clock-skew
-# widening -- see the header comment above. Keep in sync with that constant.
-CLOCK_SKEW_SECS=300
+# the daemon's cert-validity clock-skew widening. Production defaults to 300s
+# (5 min), which would force this test to wait >5 min for a cert to expire;
+# `YIP_CERT_SKEW_SECS` (exported to the daemons below) overrides it to this
+# small value so the expiry wait is bounded to seconds. Keep the two in sync.
+CLOCK_SKEW_SECS=3
 # A's cert validity window (seconds). Generous enough to comfortably cover
 # netns/CA setup + daemon startup + TUN wait + gossip discovery warm-up
 # (run-netns-discovery.sh documents up to a 60s budget for that warm-up)
@@ -116,6 +120,9 @@ CERT_A_SECS=60
 DROP_MARGIN_SECS=20
 YIP_REKEY_INTERVAL_MS=2000
 REKEY_INTERVAL_SECS=$((YIP_REKEY_INTERVAL_MS / 1000))
+# Override the daemon's cert-validity skew (default 300s) so the cert expires
+# in seconds, not minutes. Exported to every daemon below.
+YIP_CERT_SKEW_SECS=$CLOCK_SKEW_SECS
 
 PID_A=""
 PID_B=""
@@ -247,6 +254,7 @@ setup_leg "$NS_R" "$VETH_R_H" "$VETH_R_N" "$IP_R"
 
 # ── 4. start daemons: seed root first, then A and B, at a fast rekey cadence ──
 export YIP_REKEY_INTERVAL_MS
+export YIP_CERT_SKEW_SECS
 
 LOG_A="$TMPDIR_TEST/yipA.log"
 LOG_B="$TMPDIR_TEST/yipB.log"
@@ -347,12 +355,26 @@ if [ "$REMAINING" -lt 10 ]; then
     exit 1
 fi
 echo "[test] pinging ${ADDR_B} from yipRevA (expect discovery+handshake, then success, while A's cert is valid)"
-set +e
-ip netns exec "$NS_A" ping -6 -c 20 -W 2 "$ADDR_B"
-PING_STATUS=$?
-set -e
-if [ "$PING_STATUS" -ne 0 ]; then
-    echo "[FAIL] ping A->B did not converge (exit $PING_STATUS) — could not establish A<->B before cert expiry"
+# Poll rather than one-shot: mesh discovery (register -> gossip -> handshake)
+# takes a variable number of GOSSIP_INTERVAL_MS (~5s) rounds and is slower on a
+# loaded CI runner. Retry until a short ping burst converges, up to a deadline
+# 5s before the cert expires (so the "still valid" invariant holds when it
+# succeeds). This is the fix for the CI failure where a single 20-ping window
+# raced discovery and lost.
+ESTABLISHED=0
+while :; do
+    NOW=$(date +%s)
+    if [ "$NOW" -ge "$((EXPIRY_TIME - 5))" ]; then
+        break
+    fi
+    if ip netns exec "$NS_A" ping -6 -c 3 -W 2 "$ADDR_B" >/dev/null 2>&1; then
+        ESTABLISHED=1
+        break
+    fi
+    sleep 1
+done
+if [ "$ESTABLISHED" -ne 1 ]; then
+    echo "[FAIL] ping A->B did not converge — could not establish A<->B before cert expiry"
     dump_logs
     exit 1
 fi
