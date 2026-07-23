@@ -254,6 +254,87 @@ jobs:
             exit 1
           fi
 
+      - name: Run the hardening.36 path-switch convergence money test under sudo (poll driver)
+        # run-netns-pathswitch-rehandshake.sh: proves the #36 fix -- a
+        # Punch->Relay path re-target must not draw a fresh Noise ephemeral.
+        # Forks run-netns-relay.sh's RELAY-FORCED topology (A/B mutually
+        # unreachable except via R's blind relay) so every session is forced
+        # through punch->escalate->relay; asserts (1) A converges over the
+        # relay, (2) relay-forwarded=<N> N>0, (3) rekey_epoch_witness (with
+        # the opt-in YIP_WITNESS_UNWRAP_RELAY=1 envelope unwrap, filtered to
+        # A's own outbound traffic) reports exactly 1 distinct cleartext
+        # Init ephemeral across >=2 captured Init datagrams -- the rigorous,
+        # on-wire, non-vacuous proof that the retarget resent the SAME Init
+        # rather than cold-starting. Uses the release yipd and debug
+        # yip-rendezvous already built above in this job.
+        run: |
+          sudo bash bin/yipd/tests/run-netns-pathswitch-rehandshake.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/pathswitch-poll.log
+          if grep -q "^SKIP run-netns-pathswitch-rehandshake" /tmp/pathswitch-poll.log; then
+            echo "::error::hardening.36 path-switch money test (poll) skipped — expected root + tcpdump + the built witness tool in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/pathswitch-poll.log; then
+            echo "::error::hardening.36 path-switch money test (poll) failed — A did not converge over the relay, or drew a fresh ephemeral across the retarget"
+            exit 1
+          fi
+
+      - name: Run the hardening.36 path-switch convergence money test under sudo (uring driver)
+        run: |
+          sudo -E env YIP_USE_URING=1 bash bin/yipd/tests/run-netns-pathswitch-rehandshake.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/pathswitch-uring.log
+          if grep -q "^SKIP run-netns-pathswitch-rehandshake" /tmp/pathswitch-uring.log; then
+            echo "::error::hardening.36 path-switch money test (uring) skipped — expected root + tcpdump + the built witness tool in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/pathswitch-uring.log; then
+            echo "::error::hardening.36 path-switch money test (uring) failed — A did not converge over the relay, or drew a fresh ephemeral across the retarget"
+            exit 1
+          fi
+
+      - name: Run the hardening.41 cert-revocation money test under sudo (poll driver)
+        # run-netns-cert-revocation.sh: proves the #41 fix -- a revoked
+        # (cert-expired) mesh member loses its session within a bounded
+        # window of expiry (not just at process restart) and cannot
+        # re-establish. Forks run-netns-discovery.sh's gossip-based mesh
+        # topology (required: the periodic cert-liveness sweep reads a
+        # peer's cert from the gossip-populated directory, not static
+        # config). NOTE: this test's own wait is dominated by
+        # membership.rs's hardcoded CLOCK_SKEW_SECS=300 grace window (see
+        # the script's header comment) -- it genuinely takes several minutes
+        # by design. Uses the release yipd and debug yip-ca/yip-rendezvous
+        # already built above in this job.
+        run: |
+          sudo bash bin/yipd/tests/run-netns-cert-revocation.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-ca" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/cert-revocation-poll.log
+          if grep -q "^SKIP run-netns-cert-revocation" /tmp/cert-revocation-poll.log; then
+            echo "::error::hardening.41 cert-revocation money test (poll) skipped — expected root in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/cert-revocation-poll.log; then
+            echo "::error::hardening.41 cert-revocation money test (poll) failed — a revoked peer's session was not dropped, or it was allowed to re-establish"
+            exit 1
+          fi
+
+      - name: Run the hardening.41 cert-revocation money test under sudo (uring driver)
+        run: |
+          sudo -E env YIP_USE_URING=1 bash bin/yipd/tests/run-netns-cert-revocation.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-ca" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/cert-revocation-uring.log
+          if grep -q "^SKIP run-netns-cert-revocation" /tmp/cert-revocation-uring.log; then
+            echo "::error::hardening.41 cert-revocation money test (uring) skipped — expected root in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/cert-revocation-uring.log; then
+            echo "::error::hardening.41 cert-revocation money test (uring) failed — a revoked peer's session was not dropped, or it was allowed to re-establish"
+            exit 1
+          fi
+
   dpi-undetectability:
     # The anti-DPI undetectability merge gate (3a Task 7): fails the build if
     # a wire/obfuscation change reintroduces a DPI-recognizable fingerprint.

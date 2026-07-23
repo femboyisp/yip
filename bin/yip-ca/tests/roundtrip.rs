@@ -106,6 +106,50 @@ fn cert_issued_by_yip_ca_verifies_in_yip_membership() {
 }
 
 #[test]
+fn sign_cert_secs_flag_overrides_days_with_exact_seconds_validity() {
+    let key = genkey();
+
+    let member_hex = "66".repeat(32);
+    let member_sign_hex = "77".repeat(32);
+    let network_hex = "88".repeat(16);
+
+    let cert_out = run(&[
+        "sign-cert",
+        "--member",
+        &member_hex,
+        "--member-sign",
+        &member_sign_hex,
+        "--network",
+        &network_hex,
+        // --days is still required by the parser but must be ignored once
+        // --secs is present -- pick an outlandish days value to prove that.
+        "--days",
+        "365",
+        "--secs",
+        "5",
+        "--ca-private",
+        &key.ca_private,
+    ]);
+    let cert_bytes = hex_decode(cert_out.trim());
+    let cert = Cert::decode(&cert_bytes).expect("emitted cert decodes");
+
+    assert_eq!(
+        cert.not_after - cert.not_before,
+        5,
+        "--secs 5 must produce an exact 5-second validity window, not 365 days"
+    );
+
+    let member_pubkey: [u8; 32] = hex_decode(&member_hex).try_into().unwrap();
+    let network_id: [u8; 16] = hex_decode(&network_hex).try_into().unwrap();
+    let ca_pub: [u8; 32] = hex_decode(&key.ca_public).try_into().unwrap();
+    let now = now_secs();
+    assert_eq!(
+        verify_cert(&cert, &[ca_pub], &network_id, &member_pubkey, now, 0),
+        Ok(())
+    );
+}
+
+#[test]
 fn rootset_issued_by_yip_ca_verifies_in_yip_membership() {
     let key = genkey();
 
