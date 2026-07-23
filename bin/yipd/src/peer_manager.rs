@@ -1609,10 +1609,24 @@ impl PeerManager {
     /// Retransmit/`cached_resp` paths do NOT call this — they replay
     /// idempotently without a freshness check (see `rekey_init_core`'s
     /// dedup cases 1/2).
+    ///
+    /// On refusal this logs a single-line stderr marker (same bare
+    /// `eprintln!` convention as this file's other handshake-rejection
+    /// notices, e.g. "peer_manager: relayed responder cert rejected") so a
+    /// black-box observer (the netns money tests) can confirm a replay was
+    /// actually refused here rather than by some other gate. The marker
+    /// carries no packet contents and changes no wire format — the ts still
+    /// rides only inside the encrypted msg1 payload.
     fn accept_fresh_init(&self, idx: usize, ts: &[u8; 12]) -> bool {
         match self.peers[idx].last_accepted_init_ts {
             None => true,
-            Some(last) => *ts > last,
+            Some(last) => {
+                let fresh = *ts > last;
+                if !fresh {
+                    eprintln!("peer_manager: stale/replayed Init refused (freshness gate)");
+                }
+                fresh
+            }
         }
     }
 

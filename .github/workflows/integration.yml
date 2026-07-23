@@ -255,18 +255,22 @@ jobs:
           fi
 
       - name: Run the hardening.36 path-switch convergence money test under sudo (poll driver)
-        # run-netns-pathswitch-rehandshake.sh: proves the #36 fix -- a
-        # Punch->Relay path re-target must not draw a fresh Noise ephemeral.
-        # Forks run-netns-relay.sh's RELAY-FORCED topology (A/B mutually
+        # run-netns-pathswitch-rehandshake.sh: proves the #36 INVERSION
+        # (anti-replay.34 Task 4) -- a Punch->Relay path re-target now
+        # legitimately draws a FRESH Noise ephemeral instead of preserving
+        # the in-flight one, and the session still converges because the
+        # responder rebuilds on the fresh, freshness-gated Init. Forks
+        # run-netns-relay.sh's RELAY-FORCED topology (A/B mutually
         # unreachable except via R's blind relay) so every session is forced
         # through punch->escalate->relay; asserts (1) A converges over the
-        # relay, (2) relay-forwarded=<N> N>0, (3) rekey_epoch_witness (with
-        # the opt-in YIP_WITNESS_UNWRAP_RELAY=1 envelope unwrap, filtered to
-        # A's own outbound traffic) reports exactly 1 distinct cleartext
-        # Init ephemeral across >=2 captured Init datagrams -- the rigorous,
-        # on-wire, non-vacuous proof that the retarget resent the SAME Init
-        # rather than cold-starting. Uses the release yipd and debug
-        # yip-rendezvous already built above in this job.
+        # relay with >=98% steady-state delivery, (2) relay-forwarded=<N>
+        # N>0, (3) rekey_epoch_witness (with the opt-in
+        # YIP_WITNESS_UNWRAP_RELAY=1 envelope unwrap, filtered to A's own
+        # outbound traffic) reports >=2 distinct cleartext Init ephemerals
+        # across >=2 captured Init datagrams -- the rigorous, on-wire,
+        # non-vacuous proof that the retarget drew a fresh ephemeral rather
+        # than preserving the punch attempt's. Uses the release yipd and
+        # debug yip-rendezvous already built above in this job.
         run: |
           sudo bash bin/yipd/tests/run-netns-pathswitch-rehandshake.sh \
             "$(pwd)/target/release/yipd" \
@@ -276,7 +280,7 @@ jobs:
             exit 1
           fi
           if grep -q "\[FAIL\]" /tmp/pathswitch-poll.log; then
-            echo "::error::hardening.36 path-switch money test (poll) failed — A did not converge over the relay, or drew a fresh ephemeral across the retarget"
+            echo "::error::hardening.36 path-switch money test (poll) failed — A did not converge over the relay, or the retarget did not draw a fresh ephemeral"
             exit 1
           fi
 
@@ -290,7 +294,53 @@ jobs:
             exit 1
           fi
           if grep -q "\[FAIL\]" /tmp/pathswitch-uring.log; then
-            echo "::error::hardening.36 path-switch money test (uring) failed — A did not converge over the relay, or drew a fresh ephemeral across the retarget"
+            echo "::error::hardening.36 path-switch money test (uring) failed — A did not converge over the relay, or the retarget did not draw a fresh ephemeral"
+            exit 1
+          fi
+
+      - name: Install tshark
+        # run-netns-replay-hijack.sh (below) uses tshark to extract a
+        # captured [HandshakeInit] datagram's raw UDP payload for replay --
+        # unlike tcpdump (preinstalled on the runner image), tshark is not
+        # guaranteed present, so install it explicitly.
+        # DEBIAN_FRONTEND=noninteractive: tshark's postinst otherwise prompts
+        # (debconf) to ask whether non-superusers may capture packets; this
+        # job always invokes it via sudo anyway, so the prompt is moot.
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
+
+      - name: Run the anti-replay.34 endpoint-hijack/restart money test under sudo (poll driver)
+        # run-netns-replay-hijack.sh: proves the #34 freshness gate end-to-end
+        # -- a captured-and-replayed HandshakeInit from an off-path attacker
+        # (a fourth netns, S) cannot redirect B's learned endpoint for A
+        # (steady ping A->B stays <=1% loss across the replay), B's stderr
+        # shows the replay was actually refused by the freshness gate, and a
+        # genuine restart of A (fresh ephemeral + newer wall-clock ts) still
+        # recovers within a bounded ping window. Uses the release yipd and
+        # debug yip-rendezvous already built above in this job.
+        run: |
+          sudo bash bin/yipd/tests/run-netns-replay-hijack.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/replay-hijack-poll.log
+          if grep -q "^SKIP run-netns-replay-hijack" /tmp/replay-hijack-poll.log; then
+            echo "::error::anti-replay.34 endpoint-hijack/restart money test (poll) skipped — expected root + tcpdump/tshark in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/replay-hijack-poll.log; then
+            echo "::error::anti-replay.34 endpoint-hijack/restart money test (poll) failed — the replay redirected B's endpoint for A, was not refused by the freshness gate, or A's restart did not recover"
+            exit 1
+          fi
+
+      - name: Run the anti-replay.34 endpoint-hijack/restart money test under sudo (uring driver)
+        run: |
+          sudo -E env YIP_USE_URING=1 bash bin/yipd/tests/run-netns-replay-hijack.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/replay-hijack-uring.log
+          if grep -q "^SKIP run-netns-replay-hijack" /tmp/replay-hijack-uring.log; then
+            echo "::error::anti-replay.34 endpoint-hijack/restart money test (uring) skipped — expected root + tcpdump/tshark in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/replay-hijack-uring.log; then
+            echo "::error::anti-replay.34 endpoint-hijack/restart money test (uring) failed — the replay redirected B's endpoint for A, was not refused by the freshness gate, or A's restart did not recover"
             exit 1
           fi
 
