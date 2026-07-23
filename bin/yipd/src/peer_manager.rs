@@ -782,53 +782,6 @@ impl PeerManager {
         Some(vec![dg])
     }
 
-    /// Re-point an in-flight handshake at `new_target` over the given path,
-    /// PRESERVING the Noise ephemeral: resend the existing `init_pkt` rather than
-    /// drawing a fresh one, so a responder that already adopted us on the old path
-    /// completes us via its `cached_resp` (#36). Falls back to a fresh
-    /// `begin_handshake` only when no handshake is in flight (Idle/cold).
-    ///
-    /// `started_ms` is intentionally NOT reset — the `HANDSHAKE_TOTAL_MS` give-up
-    /// clock keeps running across re-targets (a re-target does not buy a fresh
-    /// 90 s). On a `via_relay` re-target `endpoint` is cleared: a late direct
-    /// `[HandshakeResp]` for this same ephemeral must not complete us onto a now
-    /// `relay`-flagged peer (that would mismatch egress — data-plane egress is
-    /// re-wrapped by the `relay` flag, not the stamped dst).
-    fn retarget_handshake(
-        &mut self,
-        idx: usize,
-        new_target: SocketAddr,
-        via_relay: bool,
-        now_ms: u64,
-    ) -> Option<Vec<EgressDatagram>> {
-        let PeerState::Handshaking(h) = &mut self.peers[idx].state else {
-            // No handshake in flight: a fresh attempt is correct here.
-            return self.begin_handshake(idx, new_target, via_relay, now_ms);
-        };
-        h.target = new_target;
-        // Reset the retransmit clock to `now_ms` so the retransmit arm does not
-        // fire an immediate redundant copy of the Init we resend here (which
-        // would also break the anti-DPI timing jitter): the re-targeted Init
-        // IS this interval's send.
-        h.last_sent_ms = now_ms;
-        let init_pkt = h.init_pkt.clone();
-        self.peers[idx].relay = via_relay;
-        if via_relay {
-            self.peers[idx].endpoint = None;
-            return self.relay_wrap(idx, init_pkt).map(|d| vec![d]);
-        }
-        // Direct/Punch re-target: re-stamp `endpoint` to the new candidate, as
-        // `begin_handshake`'s direct branch does — `handle_handshake_resp`
-        // matches an inbound Resp against `peers[idx].endpoint == Some(src)`,
-        // so without this a Resp from the new candidate would not complete us.
-        self.peers[idx].endpoint = Some(new_target);
-        Some(vec![EgressDatagram {
-            fate: 0,
-            dst: new_target,
-            bytes: init_pkt,
-        }])
-    }
-
     /// Mid-session rekey scheduler (9a Task 3, relay-completed in #91 Task
     /// 3), driven once per tick for an `Established` peer `idx` (`relay`
     /// mirrors `tick_dispatch`'s same-named local — whether `idx` is
@@ -1159,15 +1112,11 @@ impl PeerManager {
             // drop instead; `current` (and the in-flight rekey, if any)
             // stays untouched.
             //
-            // EXCEPTION (#36, responder-side half): a direct peer receiving a
-            // relayed cold-start RETRANSMIT of the exact Init that built its
-            // OWN session (`init_eph == cached_resp_init_eph`) is the
-            // initiator having escalated punch->relay after we already
-            // established over punch — not a spoof/attack scenario, since it
-            // reproduces the very Init we ourselves answered. That single
-            // case adopts the relay below before falling into the same core;
-            // every other relayed Init against a direct peer stays
-            // fail-closed, per the paragraph above.
+            // #34 (retires #36): a direct/punch-established (relay==false)
+            // peer receiving a relayed Init now adopts the relay only for a
+            // FRESH new-ephemeral Init — never for a bare retransmit of the
+            // Init that built its own session. See the freshness-gated
+            // adoption block below.
             PeerState::Established(_) => {
                 let Some(init_eph) = crate::handshake::init_ephemeral(dg) else {
                     return DispatchOut::None; // malformed Init
@@ -1175,30 +1124,44 @@ impl PeerManager {
                 // #41: a mid-session rekey Init must carry a currently-valid cert
                 // (mesh mode). A revoked/expired member presenting a stale cert
                 // loses its session within a rekey interval instead of at process
-                // restart. Checked before the #36 adoption so a revoked peer is
-                // never adopted onto the relay.
+                // restart. Checked before the #34/#36 adoption so a revoked peer
+                // is never adopted onto the relay.
                 if !self.is_root(remote_static)
                     && !self.responder_cert_ok(initiator_cert, remote_static)
                 {
                     self.drop_session(idx);
                     return DispatchOut::None;
                 }
-                // #36: a relay==false (direct/punch-established) peer receiving a
-                // relayed cold-start RETRANSMIT of the Init that built our session
-                // (init_eph == cached_resp_init_eph) means the initiator could not
-                // complete our direct/punch reply and has moved to relay-only.
-                // Adopt the relay for OUR egress too, so B->A data also flows over
-                // the relay (else B keeps sending to A's dead punch address — the
-                // reverse black hole); rekey_init_core's case-1 dedup then replays
-                // cached_resp over the relay so A completes with the SAME ephemeral.
-                // A relayed Init with a NEW ephemeral (a genuine rekey, or an
-                // attack) against a direct peer is NOT adopted — it stays
-                // fail-closed, preserving #91's path-consistency guard for the
-                // session-churning case. Accepted tradeoff: an attacker replaying
-                // A's captured original Init forces a direct->relay path DOWNGRADE
-                // (data still reaches the real A via its registered node, no
-                // hijack); a full fix rides with #34 (authenticated endpoint).
-                if !self.peers[idx].relay && self.peers[idx].cached_resp_init_eph == Some(init_eph)
+                // #34/#36: a direct-established (relay==false) peer receiving a
+                // relayed FRESH new-ephemeral Init means the initiator escalated
+                // punch->relay (or restarted) with a fresh Init — adopt the relay
+                // for our egress and rebuild. Freshness-gated (accept_fresh_init),
+                // so a REPLAY (stale ts) is refused → no downgrade. A seen-ephemeral
+                // relayed Init is a retransmit of the escalation Init we already
+                // adopted+answered (this peer is then already relay==true) and is
+                // replayed by rekey_init_core's cached_resp dedup. The #91
+                // path-consistency guard is preserved: a direct peer never
+                // completes a relayed Init unless it adopts the relay here.
+                //
+                // `last_accepted_init_ts.is_some()` is REQUIRED here (not present
+                // in earlier drafts of this gate): a peer that reached `Established`
+                // as the INITIATOR of its own direct session (it sent the cold-start
+                // Init and completed on the responder's `[HandshakeResp]`) never
+                // accepted an inbound Init from this peer, so `last_accepted_init_ts`
+                // stays `None` — and `accept_fresh_init` treats "no baseline yet" as
+                // always-fresh (by design, for genuine cold-start admission). Without
+                // this guard that same "no baseline" reading would let ANY fresh
+                // relayed Init hijack such a peer onto the relay, reintroducing
+                // exactly the #91 anti-hijack hole
+                // (`anti_hijack_established_peer_ignores_relayed_handshake_init`) —
+                // the adoption exception only ever applied to a peer that
+                // *previously responded* to a direct/punch Init (cached_resp_init_eph
+                // + last_accepted_init_ts set together), never to an initiator-only
+                // session.
+                if !self.peers[idx].relay
+                    && self.peers[idx].last_accepted_init_ts.is_some()
+                    && self.peers[idx].cached_resp_init_eph != Some(init_eph)
+                    && self.accept_fresh_init(idx, &init_ts)
                 {
                     self.peers[idx].relay = true;
                 }
@@ -2853,21 +2816,32 @@ impl PeerManager {
                 };
                 match self.peers[i].path.advance(now_ms) {
                     PathAction::Relay => {
-                        // Escalate the in-flight direct/punch attempt to the relay, PRESERVING
-                        // the ephemeral (#36): resend the same Init over the relay so a responder
-                        // already Established on the old path completes us via its cached_resp.
-                        // `retarget_handshake` clears `endpoint` (anti-mismatch) as the old
-                        // Idle+begin_handshake path did.
+                        // #34: escalate the in-flight direct/punch attempt to the relay by
+                        // sending a FRESH Init (new ephemeral + fresh ts) instead of
+                        // preserving the old one (#36, inverted). The responder now
+                        // REBUILDS on a fresh new-ephemeral relayed Init — freshness-gated
+                        // in `relayed_handshake_init` — so preserving the ephemeral to hit a
+                        // stale `cached_resp` is no longer necessary, and a captured replay
+                        // of an old Init can no longer force a relay downgrade (the closed
+                        // #36 tradeoff). `endpoint` is cleared (anti-mismatch, Fix-pass-2,
+                        // as the removed `retarget_handshake` did): a late direct
+                        // `[HandshakeResp]` for the abandoned punch candidate must not match
+                        // this now-relay-flagged peer.
                         let server = self.server_addr();
-                        if let Some(dgs) = self.retarget_handshake(i, server, true, now_ms) {
+                        self.peers[i].state = PeerState::Idle;
+                        self.peers[i].endpoint = None;
+                        if let Some(dgs) = self.begin_handshake(i, server, true, now_ms) {
                             self.tick_egress.extend(dgs);
                         }
                         continue;
                     }
                     PathAction::Probe(addr) if addr != target => {
-                        // The SM chose a *different* candidate: re-target the in-flight attempt,
-                        // PRESERVING the ephemeral (#36) instead of abandoning it to a fresh one.
-                        if let Some(dgs) = self.retarget_handshake(i, addr, false, now_ms) {
+                        // #34: the SM chose a *different* candidate — re-target with a
+                        // FRESH Init (new ephemeral + fresh ts), same inversion as the
+                        // `Relay` arm above. `begin_handshake`'s direct branch re-stamps
+                        // `endpoint` to `addr` itself.
+                        self.peers[i].state = PeerState::Idle;
+                        if let Some(dgs) = self.begin_handshake(i, addr, false, now_ms) {
                             self.tick_egress.extend(dgs);
                         }
                         continue;
@@ -5045,46 +5019,51 @@ mod tests {
         (pm, 0)
     }
 
-    /// #36 Task 1: `retarget_handshake` must preserve the in-flight Noise
-    /// ephemeral (resend the SAME `init_pkt`) across a path re-target rather
-    /// than minting a fresh one — see the module-level #36 discussion at the
-    /// `PathAction::Relay`/`PathAction::Probe` escalation arms in
-    /// `tick_dispatch`.
+    /// #34 Task 4: retires #36's ephemeral-preservation hack. A path
+    /// re-target of an in-flight `Handshaking` attempt now sends a FRESH
+    /// Init (new ephemeral, drawn by `begin_handshake` off a fresh
+    /// `Idle` state) instead of resending the old `init_pkt` — the inverse
+    /// of the removed `retarget_handshake_preserves_ephemeral_and_flips_relay`.
+    /// The old #36 concern (a fresh ephemeral orphans the responder's
+    /// `cached_resp`) is resolved on the responder side instead: it REBUILDS
+    /// on a fresh new-ephemeral relayed Init (see
+    /// `direct_established_responder_adopts_relay_on_fresh_relayed_init_and_rebuilds`),
+    /// so preserving the ephemeral here is no longer necessary.
     #[test]
-    fn retarget_handshake_preserves_ephemeral_and_flips_relay() {
+    fn path_switch_sends_fresh_init_and_responder_rebuilds() {
         // A peer mid-handshake toward a direct candidate.
         let (mut pm, idx) = pm_handshaking_direct_peer([7u8; 32], "10.0.0.9:9000", 100);
-        let (orig_init, orig_started, orig_target) = match &pm.peers[idx].state {
-            PeerState::Handshaking(h) => (h.init_pkt.clone(), h.started_ms, h.target),
+        let (orig_init, orig_target) = match &pm.peers[idx].state {
+            PeerState::Handshaking(h) => (h.init_pkt.clone(), h.target),
             _ => panic!("peer must be Handshaking"),
         };
+        let orig_eph =
+            crate::handshake::init_ephemeral(&orig_init).expect("valid Init carries an ephemeral");
         let server = pm.server_addr();
 
-        // Re-target to the relay (Punch->Relay escalation).
+        // Re-target to the relay (Punch->Relay escalation): the #34 arm resets
+        // to `Idle` (clearing `endpoint`, anti-mismatch) and calls
+        // `begin_handshake`, exactly like the production `PathAction::Relay`
+        // arm in `tick_dispatch`.
+        pm.peers[idx].state = PeerState::Idle;
+        pm.peers[idx].endpoint = None;
         let out = pm
-            .retarget_handshake(idx, server, true, 5_000)
+            .begin_handshake(idx, server, true, 5_000)
             .expect("emits an Init");
 
-        // Ephemeral preserved: the resent Init is byte-identical, still Handshaking,
-        // started_ms unchanged (the 90s give-up clock keeps running).
+        // A FRESH ephemeral is drawn — NOT the byte-identical resend #36 used to do.
         match &pm.peers[idx].state {
             PeerState::Handshaking(h) => {
-                assert_eq!(
-                    h.init_pkt, orig_init,
-                    "init_pkt (ephemeral) must be preserved"
-                );
-                assert_eq!(
-                    h.started_ms, orig_started,
-                    "started_ms must not reset on re-target"
-                );
-                assert_eq!(
-                    h.last_sent_ms, 5_000,
-                    "last_sent_ms resets to now so no immediate redundant retransmit"
+                let new_eph = crate::handshake::init_ephemeral(&h.init_pkt)
+                    .expect("valid Init carries an ephemeral");
+                assert_ne!(
+                    new_eph, orig_eph,
+                    "path switch must draw a FRESH ephemeral, not resend the old Init (#34 inverts #36)"
                 );
                 assert_eq!(h.target, server, "target must update to the new path");
                 assert_ne!(h.target, orig_target);
             }
-            _ => panic!("peer must stay Handshaking"),
+            _ => panic!("peer must be Handshaking again after the fresh begin_handshake"),
         }
         assert!(
             pm.peers[idx].relay,
@@ -5094,7 +5073,7 @@ mod tests {
             pm.peers[idx].endpoint.is_none(),
             "relay re-target clears endpoint (anti-mismatch)"
         );
-        // The emitted datagram is the relay-wrapped Init (a RelaySend), carrying the SAME ephemeral.
+        // The emitted datagram is the relay-wrapped Init (a RelaySend), carrying the NEW ephemeral.
         assert!(
             has_relayed_handshake_init(Some(&out)),
             "must emit a relay-wrapped Init"
@@ -5686,52 +5665,90 @@ mod tests {
         (pm_r, kp_a, a_init_pkt)
     }
 
-    /// #36 Task 1b (the responder-side half of the headline scenario): a
-    /// peer that adopted the responder role over a DIRECT/punch path
-    /// (`Established`, `relay == false`, holding `cached_resp` for A's
-    /// ephemeral E1) receives a RELAYED cold-start RETRANSMIT of that same
-    /// Init (E1) — A escalated punch->relay and resent its original Init
-    /// unchanged. B must adopt the relay for its own egress (else B keeps
+    /// #34 Task 4 (retires #36): a peer that adopted the responder role over
+    /// a DIRECT/punch path (`Established`, `relay == false`) receives a
+    /// RELAYED FRESH new-ephemeral Init — the initiator escalated
+    /// punch->relay and sent a FRESH Init (#34 inverts #36's ephemeral
+    /// preservation, so this is no longer a byte-identical retransmit of the
+    /// original). B adopts the relay for its own egress (else B keeps
     /// sending to A's dead punch address — the reverse black hole) and
-    /// replay `cached_resp` over the relay, without churning a new session.
+    /// REBUILDS: `rekey_init_core` installs a fresh `next` epoch (a
+    /// genuinely new session round, not a `cached_resp` replay) and advances
+    /// `last_accepted_init_ts`.
     #[test]
-    fn direct_established_responder_adopts_relay_on_relayed_cold_start_retransmit() {
-        let (mut pm_r, _kp_a, a_init_pkt) = responder_established_direct_for_initiator(100);
-        let tag_before = established_tag(&pm_r, 0);
+    fn direct_established_responder_adopts_relay_on_fresh_relayed_init_and_rebuilds() {
+        let (mut pm_r, kp_a, _a_init_pkt) = responder_established_direct_for_initiator(100);
+        let local_pub = pm_r.local_pub;
+        let tag_before = established_tag(&pm_r, 0).expect("responder established");
+        let last_ts = pm_r.peers[0]
+            .last_accepted_init_ts
+            .expect("cold-start Init recorded a ts");
 
-        // A escalated to relay and resent the SAME init (E1), relay-wrapped.
-        let relayed = wrap_relay_deliver(&pm_r, &a_init_pkt);
-        let replayed = has_relayed_handshake_resp(&pm_r.on_udp(mock_server(), &relayed, 5_000));
+        // A escalated punch->relay with a FRESH Init: new ephemeral, fresh ts.
+        let t_fresh = newer_ts(last_ts);
+        let (_hs2, fresh_init_pkt) = HandshakeState::start_initiator(
+            &kp_a.private,
+            &local_pub,
+            &init_payload_with_ts(t_fresh, &[]),
+        )
+        .unwrap();
+        let relayed = wrap_relay_deliver(&pm_r, &fresh_init_pkt);
+        let out = pm_r.on_udp(mock_server(), &relayed, 5_000);
 
+        assert!(
+            has_relayed_handshake_resp(&out),
+            "must reply with a relay-wrapped Resp"
+        );
         assert!(
             pm_r.peers[0].relay,
             "must adopt the relay for B's own egress"
         );
-        assert!(replayed, "must replay cached resp over the relay");
         assert_eq!(
             established_tag(&pm_r, 0),
-            tag_before,
-            "current session must be untouched (no churn)"
+            Some(tag_before),
+            "current epoch stays untouched (rekey semantics: B keeps sending on it \
+             until the initiator confirms the new one)"
+        );
+        match &pm_r.peers[0].state {
+            PeerState::Established(epochs) => assert!(
+                epochs.next.is_some(),
+                "a fresh new-ephemeral Init must REBUILD: install a new `next` epoch, \
+                 not replay a cached_resp"
+            ),
+            _ => panic!("must stay Established"),
+        }
+        assert_eq!(
+            pm_r.peers[0].last_accepted_init_ts,
+            Some(t_fresh),
+            "last_accepted_init_ts must advance to the fresh label"
         );
     }
 
-    /// #36 Task 1b: the same direct-established peer receiving a RELAYED
-    /// Init with a DIFFERENT ephemeral (a genuine new rekey Init, or an
-    /// attack) must NOT adopt the relay and must fail-closed drop, preserving
-    /// #91's path-consistency guard for the session-churning case.
+    /// #34 Task 4 (retires #36): the same direct-established peer receiving
+    /// a RELAYED Init with a DIFFERENT ephemeral but a STALE ts (not
+    /// strictly newer than what we already accepted from this peer) must NOT
+    /// adopt the relay and must NOT rebuild — `accept_fresh_init` refuses it
+    /// before `relay` is ever flipped. This is the downgrade #36 used to
+    /// accept as a tradeoff (an attacker replaying a captured old Init could
+    /// force a direct->relay downgrade); #34 closes it.
     #[test]
     fn direct_established_responder_ignores_relayed_new_ephemeral_init() {
         let (mut pm_r, kp_a, _a_init_pkt) = responder_established_direct_for_initiator(100);
         let local_pub = pm_r.local_pub;
+        let tag_before = established_tag(&pm_r, 0).expect("responder established");
+        let last_ts = pm_r.peers[0]
+            .last_accepted_init_ts
+            .expect("cold-start Init recorded a ts");
 
-        // A fresh Init from the SAME initiator identity draws a NEW ephemeral.
-        let (_hs2, other_init_pkt) = HandshakeState::start_initiator(
+        // A relayed Init with a NEW ephemeral but a STALE ts (<= last accepted) — a replay.
+        let t_stale = older_ts(last_ts);
+        let (_hs2, stale_init_pkt) = HandshakeState::start_initiator(
             &kp_a.private,
             &local_pub,
-            &crate::handshake::frame_init_payload(&[]),
+            &init_payload_with_ts(t_stale, &[]),
         )
         .unwrap();
-        let relayed = wrap_relay_deliver(&pm_r, &other_init_pkt);
+        let relayed = wrap_relay_deliver(&pm_r, &stale_init_pkt);
         let dropped = matches!(
             pm_r.on_udp(mock_server(), &relayed, 5_000),
             DispatchOut::None
@@ -5739,9 +5756,19 @@ mod tests {
 
         assert!(
             !pm_r.peers[0].relay,
-            "must NOT adopt relay for a new-ephemeral relayed init"
+            "must NOT adopt relay for a stale-ts relayed init — the downgrade is closed"
         );
-        assert!(dropped, "must fail-closed drop, mirroring #91's guard");
+        assert!(dropped, "must fail-closed drop, no reply");
+        assert_eq!(
+            established_tag(&pm_r, 0),
+            Some(tag_before),
+            "must NOT rebuild: current session untouched"
+        );
+        assert_eq!(
+            pm_r.peers[0].last_accepted_init_ts,
+            Some(last_ts),
+            "last_accepted_init_ts must not change on a rejected Init"
+        );
     }
 
     // ── #91 Task 2: relay-path rekey completion ─────────────────────────────
