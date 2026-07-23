@@ -1569,15 +1569,17 @@ impl PeerManager {
 
     // ── handshake admission ───────────────────────────────────────────────
 
-    /// Handle an incoming `[HandshakeInit]`: run the responder step, admit
-    /// only if the recovered static key matches a *configured* peer, and on
-    /// admission transition that peer to `Established` (learning its
-    /// endpoint from `src`) and drain any buffered `pending_tun`.
-    /// Whether a responder's msg2 cert payload admits the peer whose static key
-    /// is `peer_pub`. With membership disabled the payload is ignored (returns
-    /// `true` — byte-identical to 2a/2b). With membership enabled the payload
-    /// must decode to a `Cert` that `verify_cert`s against `peer_pub` at the
-    /// current wall clock — mutual membership proof.
+    /// Whether a handshake `payload` carries a cert that admits the peer whose
+    /// static key is `peer_pub`. With membership disabled the payload is
+    /// ignored (returns `true` — byte-identical to 2a/2b). With membership
+    /// enabled the payload must decode to a `Cert` that `verify_cert`s against
+    /// `peer_pub` at the current wall clock.
+    ///
+    /// Named for its original use — the initiator checking the responder's
+    /// msg2 cert — but the check is symmetric and this branch also invokes it
+    /// against the *initiator's* msg1 cert: the #41 rekey re-verify and
+    /// re-admission gate (`is_root`-exempt) pass the initiator's cert +
+    /// `remote_static`. Roots are exempted by the caller (`is_root`), not here.
     fn responder_cert_ok(&self, payload: &[u8], peer_pub: [u8; 32]) -> bool {
         match self.membership.as_ref() {
             None => true,
