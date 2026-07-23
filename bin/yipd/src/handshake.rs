@@ -225,6 +225,72 @@ pub fn init_ephemeral(init_pkt: &[u8]) -> Option<[u8; 32]> {
     init_pkt.get(1..33)?.try_into().ok()
 }
 
+/// TAI64N label length: 8-byte seconds + 4-byte nanoseconds.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "wired into the handshake paths by a later anti-replay.34 task"
+    )
+)]
+pub const TAI64N_LEN: usize = 12;
+
+/// The current wall clock as a TAI64N label: big-endian `2^62 + unix_secs`
+/// (8 bytes) followed by big-endian nanoseconds (4 bytes). Big-endian so that
+/// a lexicographic byte comparison of two labels is chronological. Wall-clock
+/// based, so it survives a peer restart (a fresh Init is always newer in real
+/// time) with no persisted state. A clock that jumps backwards yields a label
+/// that a peer with a higher last-accepted label will reject — the WireGuard
+/// behavior, accepted.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "wired into the handshake paths by a later anti-replay.34 task"
+    )
+)]
+pub fn now_tai64n() -> [u8; TAI64N_LEN] {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs().wrapping_add(1u64 << 62);
+    let nanos = now.subsec_nanos();
+    let mut out = [0u8; TAI64N_LEN];
+    out[..8].copy_from_slice(&secs.to_be_bytes());
+    out[8..].copy_from_slice(&nanos.to_be_bytes());
+    out
+}
+
+/// Build the msg1 Noise payload: the anti-replay TAI64N label followed by the
+/// (optional) membership cert. Empty `cert` (2a/2b) yields a 12-byte payload.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "wired into the handshake paths by a later anti-replay.34 task"
+    )
+)]
+pub fn frame_init_payload(cert: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(TAI64N_LEN + cert.len());
+    out.extend_from_slice(&now_tai64n());
+    out.extend_from_slice(cert);
+    out
+}
+
+/// Split a received msg1 payload into `(ts_label, cert_remainder)`.
+/// `None` (fail-closed) if it is shorter than the 12-byte label.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "wired into the handshake paths by a later anti-replay.34 task"
+    )
+)]
+pub fn parse_init_payload(payload: &[u8]) -> Option<([u8; TAI64N_LEN], &[u8])> {
+    let ts: [u8; TAI64N_LEN] = payload.get(..TAI64N_LEN)?.try_into().ok()?;
+    Some((ts, &payload[TAI64N_LEN..]))
+}
+
 // ── step-functions (in-band handshakes) ────────────────────────────────────────
 
 /// A handshake in progress, driven step-by-step instead of blocking on a
@@ -490,5 +556,38 @@ mod tests {
             Ok(_) => panic!("expected error but initiator succeeded"),
         }
         let _ = faker.join();
+    }
+
+    #[test]
+    fn tai64n_is_big_endian_monotonic_and_roundtrips() {
+        // frame/parse roundtrip: ts prefix split from the cert remainder.
+        let cert = b"a-cert-blob";
+        let framed = frame_init_payload(cert);
+        assert_eq!(framed.len(), TAI64N_LEN + cert.len());
+        let (ts, rest) = parse_init_payload(&framed).expect("parses");
+        assert_eq!(rest, cert);
+        assert_eq!(&framed[..TAI64N_LEN], &ts);
+
+        // empty cert (2a/2b): payload is exactly the 12-byte ts.
+        let framed_empty = frame_init_payload(&[]);
+        assert_eq!(framed_empty.len(), TAI64N_LEN);
+        let (_ts, rest) = parse_init_payload(&framed_empty).expect("parses");
+        assert!(rest.is_empty());
+
+        // big-endian so lexicographic byte-compare is chronological: a later
+        // wall-clock ts compares strictly greater than an earlier one.
+        let earlier = now_tai64n();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let later = now_tai64n();
+        assert!(
+            later > earlier,
+            "TAI64N must increase with wall-clock and byte-compare"
+        );
+    }
+
+    #[test]
+    fn parse_init_payload_rejects_short_payload() {
+        assert!(parse_init_payload(&[0u8; TAI64N_LEN - 1]).is_none());
+        assert!(parse_init_payload(&[]).is_none());
     }
 }
