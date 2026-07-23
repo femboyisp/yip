@@ -218,13 +218,24 @@ struct Peer {
     /// conditions.
     ///
     /// `HANDSHAKE_TOTAL_MS` (90s) is bigger than `REKEY_INTERVAL_MS`/2
-    /// (60s), so a very-late retransmit of this ORIGINAL Init can land
-    /// after `EpochSet::accept_rekey_init` would otherwise treat it as a
-    /// plausible genuine rekey. `handle_rekey_init` checks this field FIRST
-    /// (milestone 9a final review, Important-2) so that case still resends
-    /// `cached_resp` — the cold-start dedup path — rather than being
-    /// misclassified as a rekey round.
+    /// (60s), so a very-late retransmit of this ORIGINAL Init can carry the
+    /// SAME `ts` as when it was first accepted — not strictly newer than
+    /// `last_accepted_init_ts`, so `PeerManager::accept_fresh_init` (#34)
+    /// alone would reject it as stale. `handle_rekey_init` checks this field
+    /// FIRST (milestone 9a final review, Important-2) so that case still
+    /// resends `cached_resp` — the cold-start dedup path — rather than being
+    /// misclassified as a rekey round or dropped as a replay.
     cached_resp_init_eph: Option<[u8; 32]>,
+    /// #34 anti-replay: the greatest TAI64N label (`handshake::parse_init_payload`'s
+    /// `ts`) accepted in a session-building Init from this peer — i.e. one
+    /// that either admitted a cold-start (`Idle`/`Handshaking` → `Established`)
+    /// or installed a mid-session rekey `next` epoch. In-memory only (not
+    /// persisted across process restart); gates both session rebuild/rekey
+    /// (`PeerManager::accept_fresh_init`) and endpoint learning. `None` until
+    /// the first such Init is accepted, and — deliberately — NEVER reset by
+    /// `drop_session`: a peer that is dropped and later re-establishes must
+    /// still reject a replay of an Init from before the drop.
+    last_accepted_init_ts: Option<[u8; 12]>,
     /// This peer's self-certifying rendezvous node id (`node_id(pubkey)`),
     /// used to `lookup`/`relay` for it and to demux `RdvEvent`s back to it.
     node: NodeId,
@@ -467,6 +478,7 @@ impl PeerManager {
                 pending_tun: Vec::new(),
                 cached_resp: None,
                 cached_resp_init_eph: None,
+                last_accepted_init_ts: None,
                 node,
                 path,
                 path_kind: None,
@@ -554,6 +566,7 @@ impl PeerManager {
             pending_tun: Vec::new(),
             cached_resp: None,
             cached_resp_init_eph: None,
+            last_accepted_init_ts: None,
             node,
             path,
             path_kind: None,
@@ -1115,7 +1128,7 @@ impl PeerManager {
         // #34: the msg1 payload is [ts || cert]. Split the anti-replay label
         // off; the cert remainder is what admission checks. Too short to hold
         // the label ⇒ malformed ⇒ fail closed.
-        let Some((_init_ts, initiator_cert)) =
+        let Some((init_ts, initiator_cert)) =
             crate::handshake::parse_init_payload(&initiator_payload)
         else {
             return DispatchOut::None;
@@ -1195,7 +1208,7 @@ impl PeerManager {
                         established,
                         resp_pkt,
                         init_eph,
-                        now_ms,
+                        init_ts,
                         self.server_addr(),
                         true,
                     )
@@ -1219,6 +1232,15 @@ impl PeerManager {
                 {
                     return DispatchOut::None;
                 }
+                // #34: same freshness gate as the direct cold-start arm below.
+                // A relay peer doesn't learn an `endpoint` (its egress is
+                // always relay-wrapped, keyed off `relay`/`server_addr`, not a
+                // direct address) but still records `last_accepted_init_ts` on
+                // a fresh accept, so a later direct-path replay of an old Init
+                // against this same peer can't rebuild a session either.
+                if !self.accept_fresh_init(idx, &init_ts) {
+                    return DispatchOut::None;
+                }
                 let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
                 let sess_obf = self.session_obf_key_for(&established.hp_key);
                 // A relay peer's egress is always re-wrapped, so the DataPlane's
@@ -1236,6 +1258,7 @@ impl PeerManager {
                 self.peers[idx].session_obf_key = sess_obf;
                 self.peers[idx].cached_resp = Some(resp_pkt.clone());
                 self.peers[idx].cached_resp_init_eph = crate::handshake::init_ephemeral(dg);
+                self.peers[idx].last_accepted_init_ts = Some(init_ts);
                 self.peers[idx].relay = true;
                 self.peers[idx].path.committed(PathKind::Relayed);
                 self.peers[idx].path_kind = Some(PathKind::Relayed);
@@ -1615,6 +1638,21 @@ impl PeerManager {
             .is_some_and(|m| m.roots().iter().any(|(rpk, _)| *rpk == pk))
     }
 
+    /// #34 anti-replay: whether `ts` is strictly newer than the greatest
+    /// label we have accepted in a session-building Init from peer `idx` (or
+    /// this is the first such Init). Gates both session rebuild/rekey
+    /// (`rekey_init_core`) and endpoint learning (the cold-start establish
+    /// arms of `handle_handshake_init`/`relayed_handshake_init`).
+    /// Retransmit/`cached_resp` paths do NOT call this — they replay
+    /// idempotently without a freshness check (see `rekey_init_core`'s
+    /// dedup cases 1/2).
+    fn accept_fresh_init(&self, idx: usize, ts: &[u8; 12]) -> bool {
+        match self.peers[idx].last_accepted_init_ts {
+            None => true,
+            Some(last) => *ts > last,
+        }
+    }
+
     /// Tear down a peer's live session: remove every `conn_tag` it holds
     /// (current + any in-flight `next` + grace `previous`) from `by_tag`, and
     /// revert the peer to `Idle`. Idempotent for a non-Established peer.
@@ -1663,7 +1701,7 @@ impl PeerManager {
         // #34: the msg1 payload is [ts || cert]. Split the anti-replay label
         // off; the cert remainder is what admission checks. Too short to hold
         // the label ⇒ malformed ⇒ fail closed.
-        let Some((_init_ts, initiator_cert)) =
+        let Some((init_ts, initiator_cert)) =
             crate::handshake::parse_init_payload(&initiator_payload)
         else {
             return DispatchOut::None;
@@ -1707,11 +1745,13 @@ impl PeerManager {
             // (peer hasn't seen our reply yet) or a peer restart, or (b) a
             // genuine mid-session rekey `Init` from the peer
             // (`drive_rekey_schedule`'s counterpart on their side).
-            // `EpochSet::accept_rekey_init` is the discriminator: a rekey
-            // can only legitimately arrive once `current` is at least
-            // `interval/2` old, so anything younger is (a) — handled
-            // exactly as before rekey existed (9a Task 4 must not regress
-            // this). `handle_rekey_init` owns the (b) path.
+            // `PeerManager::accept_fresh_init` (#34) is the discriminator: a
+            // rekey Init's `ts` must be strictly newer than the greatest
+            // label we have ever accepted from this peer, else it is (a) — a
+            // retransmit/replay/backwards-clock peer — handled by
+            // `handle_rekey_init`'s cached-resp dedup (case 1/2) when it IS a
+            // retransmit, or silently dropped otherwise. `handle_rekey_init`
+            // owns the (b) path.
             //
             // `init_eph`: `start_responder` above already parsed `dg`'s
             // msg1 successfully, and Noise-IK's msg1 leads with the
@@ -1739,7 +1779,7 @@ impl PeerManager {
                 let init_eph = crate::handshake::init_ephemeral(dg).expect(
                     "start_responder already parsed dg's msg1; its leading 32 bytes are `e`",
                 );
-                self.handle_rekey_init(idx, src, established, resp_pkt, now_ms, init_eph)
+                self.handle_rekey_init(idx, src, established, resp_pkt, init_ts, init_eph)
             }
             PeerState::Established(_) => DispatchOut::None,
             // Glare: both sides initiated simultaneously (e.g. the TUN's IPv6
@@ -1768,6 +1808,16 @@ impl PeerManager {
                 {
                     return DispatchOut::None;
                 }
+                // #34: gate endpoint learning on a fresh accept. A cold-start
+                // (Idle) peer's first-ever Init is always fresh
+                // (`last_accepted_init_ts` is `None`); a peer that reached
+                // `Idle` again after `drop_session` (revocation/liveness/
+                // give-up) still remembers the greatest label it ever
+                // accepted, so a replayed OLD Init cannot resurrect it and
+                // hijack `endpoint` toward a spoofed source.
+                if !self.accept_fresh_init(idx, &init_ts) {
+                    return DispatchOut::None;
+                }
                 let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
                 let sess_obf = self.session_obf_key_for(&established.hp_key);
                 let mut dp = Box::new(DataPlane::new(
@@ -1781,6 +1831,7 @@ impl PeerManager {
 
                 self.peers[idx].session_obf_key = sess_obf;
                 self.peers[idx].endpoint = Some(src); // learn the observed endpoint
+                self.peers[idx].last_accepted_init_ts = Some(init_ts);
                 self.peers[idx].cached_resp = Some(resp_pkt.clone());
                 self.peers[idx].cached_resp_init_eph = crate::handshake::init_ephemeral(dg);
                 self.by_tag.insert(dp.conn_tag(), idx);
@@ -1844,31 +1895,38 @@ impl PeerManager {
     ///    about to promote to, stranding the two sides on different epochs
     ///    (initiator locks onto the FIRST `[HandshakeResp]` it reads and
     ///    never revisits later ones) and black-holing the tunnel.
-    /// 3. `!EpochSet::accept_rekey_init`: `current` is too young for this to
-    ///    plausibly be a genuine rekey. Falls back to the pre-9a behavior
-    ///    (re-send the cached `[HandshakeResp]` verbatim if we hold one;
-    ///    otherwise ignore, no reply). This is what keeps
+    /// 3. `!self.accept_fresh_init(idx, &init_ts)` (#34): `init_ts` is not
+    ///    strictly newer than the greatest label we have accepted from this
+    ///    peer in a session-building Init — a stale/replayed Init, or a
+    ///    backwards-clock peer. SILENT DROP (`DispatchOut::None`): unlike the
+    ///    retired age gate, this does NOT fall back to resending
+    ///    `cached_resp` — a stale-ts Init is either an attacker replay or a
+    ///    clock regression, and either way it gets no reply. Case 1 above
+    ///    (`cached_resp_init_eph` match) already answers the legitimate "same
+    ///    round, arrived again" case — with the SAME ts as when it was first
+    ///    accepted — before this point is ever reached, so this only fires
+    ///    for a genuinely DIFFERENT (new-ephemeral) Init whose ts fails to
+    ///    advance. This keeps
     ///    `duplicate_init_after_established_does_not_tear_down_session`
-    ///    green: that regression fires at `now_ms == current_created_ms`,
-    ///    always younger than `interval/2`. The freshly-built
-    ///    `established`/`resp_pkt` are discarded on this path — installing
-    ///    them would silently rekey off a mere retransmit.
-    /// 4. Otherwise: a genuinely NEW rekey round. Install `established` as
-    ///    the responder's unconfirmed `next` epoch, keyed by `init_eph`
-    ///    (`EpochSet::install_next`) — `current` is untouched, so this side
-    ///    keeps SENDING on the old epoch. The responder's own switch happens
-    ///    later, automatically, inside `EpochSet::inbound_open` (Task 1) on
-    ///    the first inbound frame that authenticates under `next`.
+    ///    green via case 1's dedup, not this gate.
+    /// 4. Otherwise: a genuinely NEW, fresh-ts rekey round. Install
+    ///    `established` as the responder's unconfirmed `next` epoch, keyed by
+    ///    `init_eph` (`EpochSet::install_next`) — `current` is untouched, so
+    ///    this side keeps SENDING on the old epoch. Record
+    ///    `last_accepted_init_ts = init_ts` (#34) so a later replay of this
+    ///    same round's ts can never be re-accepted. The responder's own
+    ///    switch happens later, automatically, inside `EpochSet::inbound_open`
+    ///    (Task 1) on the first inbound frame that authenticates under `next`.
     fn handle_rekey_init(
         &mut self,
         idx: usize,
         src: SocketAddr,
         established: Established,
         resp_pkt: Vec<u8>,
-        now_ms: u64,
+        init_ts: [u8; 12],
         init_eph: [u8; 32],
     ) -> DispatchOut<'_> {
-        self.rekey_init_core(idx, established, resp_pkt, init_eph, now_ms, src, false)
+        self.rekey_init_core(idx, established, resp_pkt, init_eph, init_ts, src, false)
     }
 
     /// Shared core for [`handle_rekey_init`] (`via_relay = false`) and its
@@ -1891,7 +1949,7 @@ impl PeerManager {
         established: Established,
         resp_pkt: Vec<u8>,
         init_eph: [u8; 32],
-        now_ms: u64,
+        init_ts: [u8; 12],
         direct_src: SocketAddr,
         via_relay: bool,
     ) -> DispatchOut<'_> {
@@ -1946,30 +2004,14 @@ impl PeerManager {
             };
         }
 
-        let PeerState::Established(epochs) = &self.peers[idx].state else {
-            unreachable!("state cannot change between the two borrows above")
-        };
-        if !epochs.accept_rekey_init(now_ms, self.rekey_interval_ms) {
-            return match self.peers[idx].cached_resp.clone() {
-                Some(resp) => {
-                    self.egress.clear();
-                    self.push_rekey_egress(
-                        idx,
-                        EgressDatagram {
-                            fate: 0,
-                            dst: peer_addr,
-                            bytes: resp,
-                        },
-                        via_relay,
-                    );
-                    if self.egress.is_empty() {
-                        DispatchOut::None
-                    } else {
-                        DispatchOut::Udp(&self.egress)
-                    }
-                }
-                None => DispatchOut::None,
-            };
+        // #34: `init_ts` must be strictly newer than the greatest label we
+        // have ever accepted from this peer, else this is a stale/replayed
+        // Init (or a backwards-clock peer) — silently dropped, no reply. See
+        // `handle_rekey_init`'s doc comment (case 3) for why this is a
+        // silent drop rather than the retired age gate's cached-resp
+        // fallback.
+        if !self.accept_fresh_init(idx, &init_ts) {
+            return DispatchOut::None;
         }
 
         // NOTE: `session_obf_key` (the outer anti-DPI wrap key, keyed off
@@ -1988,6 +2030,9 @@ impl PeerManager {
             unreachable!("state cannot change between the two borrows above")
         };
         epochs.install_next(dp, init_eph, resp_pkt.clone());
+        // #34: record the accepted label so a replay of this same round (or
+        // anything older) can never be re-accepted.
+        self.peers[idx].last_accepted_init_ts = Some(init_ts);
 
         self.egress.clear();
         self.push_rekey_egress(
@@ -3436,6 +3481,37 @@ mod tests {
         vec![0x45u8; 40]
     }
 
+    // ── #34: handshake anti-replay test helpers ─────────────────────────────
+
+    /// Build a msg1 app payload `[ts || cert]` with an EXPLICIT, caller-chosen
+    /// `ts` label — the test-only counterpart of `handshake::frame_init_payload`
+    /// (which always stamps `now_tai64n()`), needed to hand-craft stale/fresh
+    /// Inits deterministically.
+    fn init_payload_with_ts(ts: [u8; crate::handshake::TAI64N_LEN], cert: &[u8]) -> Vec<u8> {
+        let mut out = ts.to_vec();
+        out.extend_from_slice(cert);
+        out
+    }
+
+    /// One second OLDER than `ts` (TAI64N is big-endian seconds ++ nanos, so
+    /// decrementing the leading 8-byte seconds field yields a label that
+    /// compares strictly less, lexicographically, regardless of the nanos
+    /// suffix).
+    fn older_ts(ts: [u8; crate::handshake::TAI64N_LEN]) -> [u8; crate::handshake::TAI64N_LEN] {
+        let secs = u64::from_be_bytes(ts[..8].try_into().unwrap());
+        let mut out = ts;
+        out[..8].copy_from_slice(&(secs - 1).to_be_bytes());
+        out
+    }
+
+    /// One second NEWER than `ts` — see `older_ts`.
+    fn newer_ts(ts: [u8; crate::handshake::TAI64N_LEN]) -> [u8; crate::handshake::TAI64N_LEN] {
+        let secs = u64::from_be_bytes(ts[..8].try_into().unwrap());
+        let mut out = ts;
+        out[..8].copy_from_slice(&(secs + 1).to_be_bytes());
+        out
+    }
+
     // ── 9a Task 3: mid-session rekey scheduling ─────────────────────────────
 
     /// Build a `PeerManager` with a single already-`Established` peer (via
@@ -4107,45 +4183,59 @@ mod tests {
     }
 
     #[test]
-    fn rekey_init_on_established_installs_next_without_switching_send() {
+    fn rekey_init_freshness_gate_replaces_age_gate() {
+        // #34: `current`'s age is no longer the discriminator for whether a
+        // NEW-ephemeral Init against an Established peer is a genuine rekey
+        // — the retired `EpochSet::accept_rekey_init` age gate is replaced by
+        // `PeerManager::accept_fresh_init`'s ts freshness check. This test
+        // used to assert the OPPOSITE for its first case (a rekey Init
+        // arriving well under interval/2 was REJECTED); that assertion is
+        // now wrong by design (a fresh-ts Init completes regardless of
+        // `current`'s age), so it is rewritten here per the #34 admission
+        // change rather than left red.
         let (mut pm_a, mut pm_b, ep_a, ep_b, kp_a, kp_b) = established_pm_pair(100);
         let old_tag_a = established_tag(&pm_a, 0).unwrap();
         let old_tag_b = established_tag(&pm_b, 0).unwrap();
 
-        // Too-fresh: A's `current` was just established at t=0, well under
-        // interval/2 = 50. B's rekey Init must be IGNORED outright — no
-        // `next` installed, no Resp. (A was the cold-start INITIATOR, so it
-        // holds no `cached_resp` — unlike B, testing this on A isolates the
-        // pure `accept_rekey_init`-false-ignore path from the separate
-        // cached-resp-retransmit fallback, which
-        // `duplicate_init_after_established_does_not_tear_down_session`
-        // already covers.)
+        // A never admitted an inbound Init (it was the cold-start
+        // INITIATOR), so its `last_accepted_init_ts` is `None`: the very
+        // first Init it receives is always fresh and completes — even at
+        // t=10, well under the OLD interval/2 = 50 threshold that used to
+        // gate this.
+        let t_b = crate::handshake::now_tai64n();
         let (_hs_early, init_pkt_early) = HandshakeState::start_initiator(
             &kp_b.private,
             &kp_a.public,
-            &crate::handshake::frame_init_payload(&[]),
+            &init_payload_with_ts(t_b, &[]),
         )
         .unwrap();
-        match pm_a.on_udp(ep_b, &init_pkt_early, 10) {
-            DispatchOut::None => {}
-            _ => panic!("too-fresh rekey Init must be ignored: no Resp"),
-        }
+        let resp_early = resp_bytes(&pm_a.on_udp(ep_b, &init_pkt_early, 10));
+        assert_eq!(
+            resp_early.len(),
+            1,
+            "a fresh-ts new-ephemeral Init must complete regardless of current's age"
+        );
         match &pm_a.peers[0].state {
-            PeerState::Established(epochs) => assert!(
-                epochs.next.is_none(),
-                "too-fresh current must never install `next`"
-            ),
+            PeerState::Established(epochs) => {
+                assert!(epochs.next.is_some(), "next must be installed")
+            }
             _ => panic!("pm_a must still be Established"),
         }
         assert_eq!(established_tag(&pm_a, 0), Some(old_tag_a));
+        assert_eq!(pm_a.peers[0].last_accepted_init_ts, Some(t_b));
 
-        // Old enough (t=100 >= 50): a genuine rekey Init installs `next`,
-        // replies with a Resp, and leaves `current` untouched (B keeps
-        // sending on the OLD epoch).
+        // B DOES have a baseline (it admitted A's cold-start Init). A
+        // fresh-ts rekey Init from A installs `next`, replies with a Resp,
+        // and leaves `current` untouched (B keeps sending on the OLD epoch)
+        // — exactly like before, just gated on `ts` now instead of age.
+        let last_b = pm_b.peers[0]
+            .last_accepted_init_ts
+            .expect("B admitted A's cold-start Init");
+        let t_fresh = newer_ts(last_b);
         let (_hs, init_pkt) = HandshakeState::start_initiator(
             &kp_a.private,
             &kp_b.public,
-            &crate::handshake::frame_init_payload(&[]),
+            &init_payload_with_ts(t_fresh, &[]),
         )
         .unwrap();
         let resp = resp_bytes(&pm_b.on_udp(ep_a, &init_pkt, 100));
@@ -4161,11 +4251,245 @@ mod tests {
             Some(old_tag_b),
             "current must be UNCHANGED — B still sends on the old epoch"
         );
+        assert_eq!(pm_b.peers[0].last_accepted_init_ts, Some(t_fresh));
 
-        // B still sends on the OLD epoch (current untouched): a frame it
-        // emits now still carries the OLD tag.
-        let still_old = pm_b.on_tun(&dummy_tun_pkt(), 100);
+        // A STALE-ts new-ephemeral Init (older than the label B just
+        // accepted) is dropped outright, no matter how much later in wall
+        // time it arrives — `current`'s age is irrelevant either way.
+        let t_stale = older_ts(t_fresh);
+        let (_hs2, init_pkt_stale) = HandshakeState::start_initiator(
+            &kp_a.private,
+            &kp_b.public,
+            &init_payload_with_ts(t_stale, &[]),
+        )
+        .unwrap();
+        match pm_b.on_udp(ep_a, &init_pkt_stale, 100_000) {
+            DispatchOut::None => {}
+            _ => panic!("a stale-ts rekey Init must be dropped"),
+        }
+        assert_eq!(
+            pm_b.peers[0].last_accepted_init_ts,
+            Some(t_fresh),
+            "a rejected Init must not move last_accepted_init_ts"
+        );
+
+        // B still sends on the OLD epoch (current untouched throughout): a
+        // frame it emits now still carries the OLD tag.
+        let still_old = pm_b.on_tun(&dummy_tun_pkt(), 100_000);
         assert_eq!(still_old[0].bytes[0], PacketType::Data as u8);
+    }
+
+    #[test]
+    fn stale_replayed_init_is_rejected_and_endpoint_unchanged() {
+        // #34: an Established peer that already accepted an Init at ts T1
+        // must reject a NEW-ephemeral Init carrying an OLDER ts T0 < T1 —
+        // even from a SPOOFED source address — as a silent drop: `current`
+        // untouched, the learned `endpoint` untouched, `last_accepted_init_ts`
+        // untouched.
+        let kp_r = generate_keypair();
+        let kp_i = generate_keypair();
+        let ep_i: SocketAddr = "10.0.0.30:3000".parse().unwrap();
+        let cfg_i = PeerConfig {
+            public_key: kp_i.public,
+            endpoint: Some(ep_i),
+        };
+        let mut pm_r = PeerManager::new(
+            kp_r.private,
+            kp_r.public,
+            &[cfg_i],
+            TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
+        pm_r.rekey_interval_ms = 100;
+
+        let t1 = crate::handshake::now_tai64n();
+        let (_hs1, init_pkt_1) = HandshakeState::start_initiator(
+            &kp_i.private,
+            &kp_r.public,
+            &init_payload_with_ts(t1, &[]),
+        )
+        .unwrap();
+        let resp1 = resp_bytes(&pm_r.on_udp(ep_i, &init_pkt_1, 0));
+        assert_eq!(resp1.len(), 1, "first fresh Init must establish");
+        let tag1 = established_tag(&pm_r, 0).unwrap();
+        assert_eq!(pm_r.peers[0].endpoint, Some(ep_i));
+        assert_eq!(pm_r.peers[0].last_accepted_init_ts, Some(t1));
+
+        // A NEW-ephemeral Init (distinct from init_pkt_1) carrying an OLDER
+        // ts, arriving from a spoofed source, routes through the Established
+        // (rekey) arm — `rekey_init_core`'s freshness gate must drop it.
+        let t0 = older_ts(t1);
+        let (_hs2, init_pkt_2) = HandshakeState::start_initiator(
+            &kp_i.private,
+            &kp_r.public,
+            &init_payload_with_ts(t0, &[]),
+        )
+        .unwrap();
+        let spoofed: SocketAddr = "203.0.113.66:6".parse().unwrap();
+        match pm_r.on_udp(spoofed, &init_pkt_2, 100) {
+            DispatchOut::None => {}
+            _ => panic!("a stale-ts new-ephemeral Init must be silently dropped"),
+        }
+        assert_eq!(
+            established_tag(&pm_r, 0),
+            Some(tag1),
+            "current must be untouched by a rejected Init"
+        );
+        assert_eq!(
+            pm_r.peers[0].endpoint,
+            Some(ep_i),
+            "endpoint must not change on a rejected Init"
+        );
+        assert_eq!(
+            pm_r.peers[0].last_accepted_init_ts,
+            Some(t1),
+            "last_accepted_init_ts must not change on a rejected Init"
+        );
+    }
+
+    #[test]
+    fn fresh_new_ephemeral_init_rebuilds_and_relearns_endpoint() {
+        // #34: a peer that was Established, got dropped back to `Idle` (e.g.
+        // a #41 cert-revocation sweep or the liveness sweep), but still
+        // remembers the greatest ts it ever accepted, correctly REBUILDS on
+        // a genuinely fresh-ts cold-start Init: new epoch, endpoint relearned
+        // from the new source, `last_accepted_init_ts` advances — while the
+        // old session's `by_tag` entry (evicted at drop time) stays gone.
+        let kp_r = generate_keypair();
+        let kp_i = generate_keypair();
+        let ep_i: SocketAddr = "10.0.0.31:3100".parse().unwrap();
+        let cfg_i = PeerConfig {
+            public_key: kp_i.public,
+            endpoint: Some(ep_i),
+        };
+        let mut pm_r = PeerManager::new(
+            kp_r.private,
+            kp_r.public,
+            &[cfg_i],
+            TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
+
+        let t1 = crate::handshake::now_tai64n();
+        let (_hs1, init_pkt_1) = HandshakeState::start_initiator(
+            &kp_i.private,
+            &kp_r.public,
+            &init_payload_with_ts(t1, &[]),
+        )
+        .unwrap();
+        let resp1 = resp_bytes(&pm_r.on_udp(ep_i, &init_pkt_1, 0));
+        assert_eq!(resp1.len(), 1);
+        let old_tag = established_tag(&pm_r, 0).unwrap();
+        assert!(pm_r.by_tag.contains_key(&old_tag));
+
+        // Drop the session: reverts to Idle, evicts by_tag — but
+        // `last_accepted_init_ts` is in-memory and survives (never reset by
+        // `drop_session`).
+        pm_r.drop_session(0);
+        assert!(matches!(pm_r.peers[0].state, PeerState::Idle));
+        assert!(
+            !pm_r.by_tag.contains_key(&old_tag),
+            "drop_session must evict the old tag"
+        );
+        assert_eq!(
+            pm_r.peers[0].last_accepted_init_ts,
+            Some(t1),
+            "last_accepted_init_ts survives drop_session"
+        );
+
+        // A genuinely fresh-ts NEW-ephemeral cold-start Init from a NEW
+        // source address rebuilds the session.
+        let t2 = newer_ts(t1);
+        let new_src: SocketAddr = "10.0.0.32:3200".parse().unwrap();
+        let (_hs2, init_pkt_2) = HandshakeState::start_initiator(
+            &kp_i.private,
+            &kp_r.public,
+            &init_payload_with_ts(t2, &[]),
+        )
+        .unwrap();
+        let resp2 = resp_bytes(&pm_r.on_udp(new_src, &init_pkt_2, 200));
+        assert_eq!(
+            resp2.len(),
+            1,
+            "a fresh-ts cold-start Init must rebuild the session"
+        );
+        let new_tag = established_tag(&pm_r, 0).unwrap();
+        assert_ne!(new_tag, old_tag);
+        assert!(pm_r.by_tag.contains_key(&new_tag));
+        assert!(
+            !pm_r.by_tag.contains_key(&old_tag),
+            "the old tag must stay evicted"
+        );
+        assert_eq!(
+            pm_r.peers[0].endpoint,
+            Some(new_src),
+            "endpoint must be relearned from the new source"
+        );
+        assert_eq!(
+            pm_r.peers[0].last_accepted_init_ts,
+            Some(t2),
+            "last_accepted_init_ts must advance to the new label"
+        );
+    }
+
+    #[test]
+    fn retransmit_still_replays_cached_resp_regardless_of_ts() {
+        // #34: a retransmit of the SAME Init (identical ephemeral == identical
+        // ts) is recognized by the pre-existing `cached_resp_init_eph` dedup
+        // — checked BEFORE the ts freshness gate — so it still replays
+        // `cached_resp` verbatim and never rejects or mutates `endpoint`/
+        // `last_accepted_init_ts`, even though its ts is NOT strictly newer
+        // than itself (retransmit != rebuild).
+        let kp_r = generate_keypair();
+        let kp_i = generate_keypair();
+        let ep_i: SocketAddr = "10.0.0.33:3300".parse().unwrap();
+        let cfg_i = PeerConfig {
+            public_key: kp_i.public,
+            endpoint: Some(ep_i),
+        };
+        let mut pm_r = PeerManager::new(
+            kp_r.private,
+            kp_r.public,
+            &[cfg_i],
+            TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
+
+        let t1 = crate::handshake::now_tai64n();
+        let (_hs1, init_pkt) = HandshakeState::start_initiator(
+            &kp_i.private,
+            &kp_r.public,
+            &init_payload_with_ts(t1, &[]),
+        )
+        .unwrap();
+        let resp1 = resp_bytes(&pm_r.on_udp(ep_i, &init_pkt, 0));
+        assert_eq!(resp1.len(), 1);
+        let tag1 = established_tag(&pm_r, 0).unwrap();
+
+        // Retransmit: EXACT same bytes (same ephemeral, same ts), delivered
+        // much later.
+        let resp2 = resp_bytes(&pm_r.on_udp(ep_i, &init_pkt, 500));
+        assert_eq!(
+            resp2, resp1,
+            "a retransmit must resend the cached Resp verbatim"
+        );
+        assert_eq!(
+            established_tag(&pm_r, 0),
+            Some(tag1),
+            "current must be untouched by a retransmit"
+        );
+        assert_eq!(pm_r.peers[0].endpoint, Some(ep_i));
+        assert_eq!(
+            pm_r.peers[0].last_accepted_init_ts,
+            Some(t1),
+            "last_accepted_init_ts must not change on a retransmit"
+        );
     }
 
     #[test]
@@ -4292,12 +4616,14 @@ mod tests {
     fn cold_start_init_retransmit_past_interval_half_resends_original_not_rekey() {
         // Important-2 regression (9a final review): `HANDSHAKE_TOTAL_MS`
         // (90s) exceeds `REKEY_INTERVAL_MS`/2, so a retransmit of the
-        // ORIGINAL cold-start Init can legitimately still be in flight once
-        // `EpochSet::accept_rekey_init` alone would treat any Init as a
-        // plausible rekey. It must still be recognized (by ephemeral match
+        // ORIGINAL cold-start Init can legitimately still be in flight well
+        // past interval/2. It must still be recognized (by ephemeral match
         // against `cached_resp_init_eph`) as the SAME cold-start round and
-        // answered with the original cached reply — never misclassified as
-        // a rekey round, which would install a spurious `next`.
+        // answered with the original cached reply — never misclassified as a
+        // rekey round (which would install a spurious `next`) or, post-#34,
+        // dropped as stale (the retransmit's `ts` equals — not exceeds —
+        // `last_accepted_init_ts`, so the ephemeral dedup MUST run before the
+        // freshness gate is ever consulted; see `rekey_init_core`'s case 1).
         let kp_r = generate_keypair();
         let kp_i = generate_keypair();
         let ep_i: SocketAddr = "10.0.0.20:2000".parse().unwrap();
@@ -4328,9 +4654,8 @@ mod tests {
         let tag1 = established_tag(&pm_r, 0).expect("responder must be Established");
 
         // Retransmit of the SAME cold-start Init, arriving at t=70 — past
-        // interval/2 (50), so `accept_rekey_init` alone would consider it a
-        // plausible rekey. It is NOT: it must resend the cached original
-        // reply and must NOT install a `next`.
+        // interval/2 (50). It is NOT a plausible rekey: it must resend the
+        // cached original reply and must NOT install a `next`.
         let resp2 = resp_bytes(&pm_r.on_udp(ep_i, &init_pkt, 70));
         assert_eq!(
             resp2, resp1,
@@ -6173,10 +6498,12 @@ mod tests {
     /// `local_sign_seed`/`peer_sign_seed` seed the local/peer Ed25519
     /// signing keys embedded in their CA-signed certs (mirrors
     /// `membership_for`'s `[200u8; 32]` pattern); `interval_ms` becomes
-    /// `pm.rekey_interval_ms`, so a rekey Init at a `now_ms` far past
-    /// `interval_ms / 2` is accepted by `EpochSet::accept_rekey_init`. The
-    /// peer's data-plane keypair is generated fresh and stashed in the
-    /// registry above (keyed by its pubkey).
+    /// `pm.rekey_interval_ms` (kept as a parameter for parity with the other
+    /// #41 rekey fixtures, though #34's freshness gate — not `current`'s age
+    /// — is what actually admits the rekey Inits these tests craft below,
+    /// via real `now_tai64n()` timestamps that are always fresher than the
+    /// cold-start's). The peer's data-plane keypair is generated fresh and
+    /// stashed in the registry above (keyed by its pubkey).
     fn pm_mesh_established_peer(
         local_sign_seed: [u8; 32],
         peer_sign_seed: [u8; 32],
@@ -6320,7 +6647,9 @@ mod tests {
     /// its live session until process restart (#41).
     #[test]
     fn rekey_init_with_invalid_cert_drops_session() {
-        // Mesh Established peer, current old enough that accept_rekey_init would pass.
+        // Mesh Established peer; `rekey_init_with_payload` crafts each rekey
+        // Init with a real, later `now_tai64n()` ts, so #34's freshness gate
+        // admits it regardless of `interval_ms`.
         let (mut pm, tag) =
             pm_mesh_established_peer([5u8; 32], [6u8; 32], /*age past interval/2*/ 100_000);
         assert_eq!(established_tag(&pm, 0), Some(tag));
