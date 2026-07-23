@@ -392,6 +392,12 @@ pub struct PeerManager {
     /// `YIP_REKEY_INTERVAL_MS` at construction so netns/unit tests can drive
     /// the schedule without a multi-minute real-time wait.
     rekey_interval_ms: u64,
+    /// MONOTONIC milliseconds at which `tick_dispatch` last ran the #41 cert-
+    /// liveness sweep (see there). `0` until the first sweep; throttles the
+    /// sweep to at most once per `rekey_interval_ms`, since each swept peer
+    /// costs an Ed25519 `verify_cert` and `tick` can run far more often than
+    /// that on the busy-poll path.
+    last_cert_sweep_ms: u64,
 }
 
 /// MTU budget (bytes) used to size obfuscation padding: handshakes are padded
@@ -497,6 +503,7 @@ impl PeerManager {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(crate::epoch::REKEY_INTERVAL_MS),
+            last_cert_sweep_ms: 0,
         };
         // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
         // exactly like configured peers: seed them into the peer table so an
@@ -2946,6 +2953,32 @@ impl PeerManager {
                     bytes,
                 });
                 self.peers[i].last_cover_ms = now_ms;
+            }
+        }
+
+        // ── #41 cert-liveness sweep: drop any Established mesh peer whose cert has
+        // expired / been revoked (roots exempt), so a revoked member loses its
+        // session within a rekey interval rather than at process restart. Throttled
+        // to once per rekey interval (verify_cert is not free). No-op when membership
+        // is disabled (pure 2a/2b).
+        if self.membership.is_some()
+            && now_ms.saturating_sub(self.last_cert_sweep_ms) >= self.rekey_interval_ms
+        {
+            self.last_cert_sweep_ms = now_ms;
+            let now_s = now_secs();
+            let m = self.membership.as_ref().expect("checked is_some above");
+            let stale: Vec<usize> = self
+                .peers
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| {
+                    matches!(p.state, PeerState::Established(_))
+                        && !m.member_cert_valid(&p.pubkey, now_s)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            for i in stale {
+                self.drop_session(i);
             }
         }
 
@@ -7680,6 +7713,141 @@ mod tests {
         assert!(
             out.is_none(),
             "a relay-reached peer must not receive a cover datagram, even when idle"
+        );
+    }
+
+    // ── #41(b): periodic cert-liveness sweep ────────────────────────────────
+
+    /// Build a mesh (`membership: Some`) `PeerManager` with TWO already-
+    /// `Established` (direct, non-relay) peers spliced in directly (like
+    /// `pm_with_established_peer`), whose mesh membership directory holds an
+    /// EXPIRED cert record for `expired_peer_pub` (peer 0) and a currently-
+    /// valid one for `valid_peer_pub` (peer 1) — the #41(b) sweep fixture.
+    /// Returns `(pm, established_tag_for_peer_1)`.
+    fn pm_mesh_two_established_one_expired(
+        expired_peer_pub: [u8; 32],
+        valid_peer_pub: [u8; 32],
+    ) -> (PeerManager, u64) {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let local_sign = SigningKey::from_bytes(&[230u8; 32]);
+        let local_cert = mk_cert(&ca, local.public, local_sign.verifying_key().to_bytes());
+        let mut membership = Membership::new(
+            vec![ca.verifying_key().to_bytes()],
+            TEST_NET,
+            local_cert,
+            local_sign.to_bytes(),
+            empty_roots(),
+            vec!["10.0.0.1:51820".parse().unwrap()],
+        );
+
+        // Peer 0's directory record: a cert that's ALREADY expired
+        // (`not_after: 1`) — inserted at `now=0`, when its `[0, 1)` window is
+        // (just barely) still open, so `ingest_record` accepts it; never
+        // re-swept, so it stays in the directory holding its now-expired cert.
+        let expired_sign = SigningKey::from_bytes(&[231u8; 32]);
+        let mut expired_cert = Cert {
+            version: 1,
+            member_pubkey: expired_peer_pub,
+            member_sign_pubkey: expired_sign.verifying_key().to_bytes(),
+            network_id: TEST_NET,
+            not_before: 0,
+            not_after: 1,
+            tags: vec![],
+            ca_sig: [0u8; 64],
+        };
+        expired_cert.ca_sig = ca.sign(&cert_signing_body(&expired_cert)).to_bytes();
+        let mut expired_rec = Record {
+            node_id: yip_membership::node_id(&expired_peer_pub),
+            cert: expired_cert,
+            endpoints: vec!["10.0.0.2:2000".parse().unwrap()],
+            seq: 1,
+            sig: [0u8; 64],
+        };
+        let body = record_signing_body(&expired_rec);
+        expired_rec.sig = record_sign(&body, &expired_sign.to_bytes());
+        assert!(membership.ingest_record(expired_rec, 0));
+
+        // Peer 1's directory record: an ordinary far-future-valid record.
+        let valid_rec = mk_record(
+            &ca,
+            232,
+            valid_peer_pub,
+            vec!["10.0.0.3:3000".parse().unwrap()],
+            1,
+        );
+        assert!(membership.ingest_record(valid_rec, 0));
+
+        let cfg0 = PeerConfig {
+            public_key: expired_peer_pub,
+            endpoint: Some("10.0.0.2:2000".parse().unwrap()),
+        };
+        let cfg1 = PeerConfig {
+            public_key: valid_peer_pub,
+            endpoint: Some("10.0.0.3:3000".parse().unwrap()),
+        };
+        let mut pm = PeerManager::new(
+            local.private,
+            local.public,
+            &[cfg0, cfg1],
+            TunnelMode::L3Tun,
+            None,
+            Some(membership),
+            false,
+        );
+        pm.rekey_interval_ms = 100_000;
+
+        const TAG0: u64 = 0xAAAA_0000_0000_0001;
+        const TAG1: u64 = 0xBBBB_0000_0000_0002;
+        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(
+                TAG0,
+                "10.0.0.2:2000".parse().unwrap(),
+            )),
+            0,
+        )));
+        pm.by_tag.insert(TAG0, 0);
+        pm.peers[1].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(
+                TAG1,
+                "10.0.0.3:3000".parse().unwrap(),
+            )),
+            0,
+        )));
+        pm.by_tag.insert(TAG1, 1);
+
+        (pm, TAG1)
+    }
+
+    #[test]
+    fn tick_sweep_drops_established_peer_with_expired_cert() {
+        // Two Established mesh peers: peer 0's directory cert is expired, peer 1's is valid.
+        let (mut pm, tag1) = pm_mesh_two_established_one_expired([1u8; 32], [2u8; 32]);
+        pm.tick(500_000); // a tick past the sweep cadence, now_secs shows peer 0 expired
+        assert!(
+            matches!(pm.peers[0].state, PeerState::Idle),
+            "expired-cert peer's session is dropped"
+        );
+        assert!(
+            !pm.by_tag.values().any(|&i| i == 0),
+            "its conn_tag is removed"
+        );
+        assert_eq!(
+            established_tag(&pm, 1),
+            Some(tag1),
+            "the valid peer is untouched"
+        );
+    }
+
+    #[test]
+    fn tick_sweep_is_noop_without_membership() {
+        // Pure 2a/2b: no membership -> no sweep, Established peers untouched.
+        let (mut pm, tag, _ep) = pm_with_established_peer([1u8; 32], [2u8; 32], 100);
+        pm.tick(500_000);
+        assert_eq!(
+            established_tag(&pm, 0),
+            Some(tag),
+            "membership-off: sweep is a no-op"
         );
     }
 }

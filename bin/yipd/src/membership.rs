@@ -290,6 +290,22 @@ impl Membership {
         &self.roots.roots
     }
 
+    /// Whether `pubkey` is still an admissible member at wall-clock `now`:
+    /// `true` if it is an always-admit root, OR the directory holds a valid
+    /// (unexpired, verifying) cert for it. `false` only when a non-root member's
+    /// record was evicted (expired) or its cert no longer verifies — i.e.
+    /// revoked-by-non-renewal. Folding the root check in here keeps roots exempt
+    /// from the #41 liveness sweep (they have no directory-cert dependency).
+    pub fn member_cert_valid(&self, pubkey: &[u8; 32], now: u64) -> bool {
+        if self.roots.roots.iter().any(|(pk, _)| pk == pubkey) {
+            return true;
+        }
+        match self.directory.get(&node_id(pubkey)) {
+            Some(rec) => self.verify_cert(&rec.cert, pubkey, now),
+            None => false,
+        }
+    }
+
     // ── internal helpers ───────────────────────────────────────────────
 
     /// Unconditionally (re-)insert `rec` into both indices.
@@ -711,6 +727,95 @@ mod tests {
         let mut expected = Vec::new();
         own_cert.encode(&mut expected);
         assert_eq!(m.own_cert_bytes(), expected);
+    }
+
+    // ── #41(b): `member_cert_valid` ─────────────────────────────────────────
+
+    /// Build a `Membership` with: a live directory record (`live_pubkey`), a
+    /// root (`root_pubkey`, in the `RootSet`, no directory dependency), and
+    /// an expired-cert member (`expired_pubkey`) — inserted while its cert
+    /// was still valid (window `[100, 200)`, at `ingest` time `now=150`) so
+    /// `ingest_record` accepts it, but never re-swept, so it is still present
+    /// in the directory (holding its now-expired cert) at the returned `now`.
+    /// Returns `(membership, live_pubkey, root_pubkey, expired_pubkey, now)`.
+    fn membership_with_live_root_and_expired() -> (Membership, [u8; 32], [u8; 32], [u8; 32], u64) {
+        let ca = ca_key(1);
+        let net = [7u8; 16];
+
+        let root_pubkey = [200u8; 32];
+        let roots = RootSet {
+            roots: vec![(root_pubkey, "10.0.0.99:51820".parse().unwrap())],
+            version: 0,
+            ca_sig: [0u8; 64],
+        };
+
+        let own_member_pk = [10u8; 32];
+        let own_sign_key = SigningKey::from_bytes(&[11u8; 32]);
+        let own_sign_pub = own_sign_key.verifying_key().to_bytes();
+        let own_cert = make_cert(&ca, own_member_pk, own_sign_pub, net, 0, 1_000_000);
+        let ca_pub = ca.verifying_key().to_bytes();
+        let mut m = Membership::new(
+            vec![ca_pub],
+            net,
+            own_cert,
+            own_sign_key.to_bytes(),
+            roots,
+            vec!["10.0.0.1:51820".parse().unwrap()],
+        );
+
+        // A live member: valid essentially forever.
+        let live_pubkey = [20u8; 32];
+        let live_sign_key = SigningKey::from_bytes(&[21u8; 32]);
+        let live_sign_pub = live_sign_key.verifying_key().to_bytes();
+        let live_cert = make_cert(&ca, live_pubkey, live_sign_pub, net, 0, 1_000_000);
+        let live_rec = build_signed_record(
+            live_cert,
+            vec!["192.0.2.1:1111".parse().unwrap()],
+            1,
+            &live_sign_key.to_bytes(),
+        );
+        assert!(m.ingest_record(live_rec, 500));
+
+        // An expired member: window [100, 200) — insert while valid (now=150).
+        let expired_pubkey = [30u8; 32];
+        let expired_sign_key = SigningKey::from_bytes(&[31u8; 32]);
+        let expired_sign_pub = expired_sign_key.verifying_key().to_bytes();
+        let expired_cert = make_cert(&ca, expired_pubkey, expired_sign_pub, net, 100, 200);
+        let expired_rec = build_signed_record(
+            expired_cert,
+            vec!["192.0.2.2:2222".parse().unwrap()],
+            1,
+            &expired_sign_key.to_bytes(),
+        );
+        assert!(m.ingest_record(expired_rec, 150));
+
+        // now: well past expired_cert's not_after(200) + CLOCK_SKEW_SECS(300)
+        // = 500, but well within live_cert's window (not_after 1_000_000).
+        let now = 900u64;
+        (m, live_pubkey, root_pubkey, expired_pubkey, now)
+    }
+
+    #[test]
+    fn member_cert_valid_tracks_directory_and_roots() {
+        let (m, live_pubkey, root_pubkey, expired_pubkey, now) =
+            membership_with_live_root_and_expired();
+        assert!(
+            m.member_cert_valid(&live_pubkey, now),
+            "a live directory record is valid"
+        );
+        assert!(
+            m.member_cert_valid(&root_pubkey, now),
+            "a root is always admissible (exempt)"
+        );
+        assert!(
+            !m.member_cert_valid(&expired_pubkey, now),
+            "an expired/absent member is invalid"
+        );
+        let never_seen = [0xAAu8; 32];
+        assert!(
+            !m.member_cert_valid(&never_seen, now),
+            "an unknown non-root member is invalid"
+        );
     }
 
     // (i) Fix-pass (Task 6): a `PullRequest` naming more `node_id`s than fit
