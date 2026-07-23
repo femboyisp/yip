@@ -43,8 +43,13 @@ fn usage() -> String {
     "usage: yip-ca <genkey|sign-cert|sign-roots> [args]\n\
      \n\
      yip-ca genkey\n\
-     yip-ca sign-cert --member <hex32> --member-sign <hex32> --network <hex16> --days <N> [--ca-private <hex>]\n\
+     yip-ca sign-cert --member <hex32> --member-sign <hex32> --network <hex16> (--days <N> | --secs <N>) [--ca-private <hex>]\n\
      yip-ca sign-roots --roots <file> --version <N> [--ca-private <hex>]\n\
+     \n\
+     Exactly one of --days/--secs sets the cert's validity window: --days N\n\
+     is N*86400 seconds, --secs N is exactly N seconds (overrides --days if\n\
+     both are given). --secs is meant for minting short-lived certs in\n\
+     revocation tests.\n\
      \n\
      If --ca-private is omitted, the CA private key hex is read from stdin."
         .to_string()
@@ -67,19 +72,28 @@ fn cmd_sign_cert(args: &[String]) -> Result<(), String> {
     let member_pubkey = fixed32(&hex_decode(require(&flags, "member")?)?, "member")?;
     let member_sign_pubkey = fixed32(&hex_decode(require(&flags, "member-sign")?)?, "member-sign")?;
     let network_id = fixed16(&hex_decode(require(&flags, "network")?)?, "network")?;
-    let days_str = require(&flags, "days")?;
-    let days: u64 = days_str
-        .parse()
-        .map_err(|e| format!("bad --days {days_str:?}: {e}"))?;
     let ca_key = load_ca_private(flags.get("ca-private").map(String::as_str))?;
 
     let not_before = now_secs()?;
-    let validity = days
-        .checked_mul(SECS_PER_DAY)
-        .ok_or_else(|| "--days too large: overflow computing validity window".to_string())?;
+    // `--secs`, when present, overrides `--days`: an exact-seconds validity
+    // window instead of a whole-days one. Used to mint short-lived certs for
+    // revocation tests. Exactly one of the two must be given.
+    let validity = match (flags.get("secs"), flags.get("days")) {
+        (Some(secs_str), _) => secs_str
+            .parse::<u64>()
+            .map_err(|e| format!("bad --secs {secs_str:?}: {e}"))?,
+        (None, Some(days_str)) => {
+            let days: u64 = days_str
+                .parse()
+                .map_err(|e| format!("bad --days {days_str:?}: {e}"))?;
+            days.checked_mul(SECS_PER_DAY)
+                .ok_or_else(|| "--days too large: overflow computing validity window".to_string())?
+        }
+        (None, None) => return Err("missing required --days (or --secs)".to_string()),
+    };
     let not_after = not_before
         .checked_add(validity)
-        .ok_or_else(|| "--days too large: overflow computing not_after".to_string())?;
+        .ok_or_else(|| "validity window too large: overflow computing not_after".to_string())?;
 
     let mut cert = Cert {
         version: 1,
