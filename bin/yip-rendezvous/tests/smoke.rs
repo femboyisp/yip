@@ -50,7 +50,9 @@ fn wait_until_listening(listen: &str, key: Option<&[u8; 16]>) {
         &mut plain,
     );
     let on_wire = match key {
-        Some(k) => yip_obf::obfuscate(k, yip_obf::RDV_TYPE, &plain, 6),
+        Some(k) => {
+            yip_obf::obfuscate(k, yip_obf::RDV_TYPE, &plain, 6).expect("small test body fits u16")
+        }
         None => plain.clone(),
     };
     let mut rx = [0u8; 2048];
@@ -194,7 +196,8 @@ fn register_lookup_relay_over_udp_with_obf_psk() {
     let send_wrapped = |sock: &UdpSocket, msg: &Message| {
         let mut plain = Vec::new();
         encode(msg, &mut plain);
-        let wrapped = yip_obf::obfuscate(&key, yip_obf::RDV_TYPE, &plain, 6);
+        let wrapped = yip_obf::obfuscate(&key, yip_obf::RDV_TYPE, &plain, 6)
+            .expect("small test body fits u16");
         sock.send(&wrapped).unwrap();
     };
     let recv_wrapped = |sock: &UdpSocket, rx: &mut [u8]| -> Message {

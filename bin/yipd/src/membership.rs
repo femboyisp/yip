@@ -61,6 +61,22 @@ const GOSSIP_INTERVAL_MS: u64 = 5_000;
 /// messages instead of emitting one oversized one.
 const MAX_GOSSIP_RECORDS_PER_REPLY: usize = 32;
 
+/// Max `(node_id, seq)` entries carried in a single `GossipMsg::Digest`
+/// emitted by `tick_digest` (#44). Each entry encodes as `NodeId(16) +
+/// seq(8) = 24` bytes. A directory larger than this cap is split across
+/// multiple `Digest` messages (mirrors `MAX_GOSSIP_RECORDS_PER_REPLY` for
+/// `Records`), instead of one unboundedly large digest — which, at ≥~2731
+/// entries, would encode past 65535 bytes and make `yip_obf::obfuscate`'s
+/// `u16` body-length cast fail (fail-soft as of #44, but still unshippable),
+/// and which in any case cannot converge once it exceeds the network MTU.
+///
+/// Sized so one whole obfuscated digest datagram stays comfortably under
+/// `peer_manager::OBF_MTU_BUDGET` (1200 bytes):
+///   `PacketType`(1) + `Digest` tag(1) + count(2) + 40 entries × 24
+///     + obf envelope (nonce 8 + type 1 + body_len 2 = 11) + IP/UDP (~28)
+///   = 1 + 1 + 2 + 960 + 11 + 28 = 1003, well under 1200.
+const MAX_GOSSIP_DIGEST_ENTRIES: usize = 40;
+
 /// The `seq` a node's own record starts at. Zero is fine: `ingest_record`'s
 /// seq-supersession means any received record for our own `node_id` with a
 /// higher seq would be a stale/duplicate broadcast of ourselves, which is
@@ -275,16 +291,23 @@ impl Membership {
     }
 
     /// A debounced `Digest` of the whole local directory, to send to gossip
-    /// partners. `now_ms` is MONOTONIC milliseconds — used purely to space
-    /// digests at least `GOSSIP_INTERVAL_MS` (jittered ±25% per fire when
-    /// `obf_on`, see `digest_ms`) apart; it is never compared against a
+    /// partners — split into one or more `GossipMsg::Digest` messages of at
+    /// most `MAX_GOSSIP_DIGEST_ENTRIES` entries each (#44), so a large
+    /// directory neither exceeds the MTU nor risks the obf envelope's `u16`
+    /// body-length cap. `now_ms` is MONOTONIC milliseconds — used purely to
+    /// space digests at least `GOSSIP_INTERVAL_MS` (jittered ±25% per fire
+    /// when `obf_on`, see `digest_ms`) apart; it is never compared against a
     /// cert's validity window. `obf_on` is the caller's
     /// `PeerManager::obf_key.is_some()`; when false `digest_ms` stays exactly
     /// `GOSSIP_INTERVAL_MS` forever (byte-identical obf-off timing).
-    pub fn tick_digest(&mut self, now_ms: u64, obf_on: bool) -> Option<GossipMsg> {
+    ///
+    /// Returns an empty `Vec` both when debounced (too soon since the last
+    /// fire) and when the directory is empty — never a `Vec` containing an
+    /// empty `Digest`.
+    pub fn tick_digest(&mut self, now_ms: u64, obf_on: bool) -> Vec<GossipMsg> {
         if let Some(last) = self.last_digest_ms {
             if now_ms.saturating_sub(last) < self.digest_ms {
-                return None;
+                return Vec::new();
             }
         }
         self.last_digest_ms = Some(now_ms);
@@ -298,7 +321,10 @@ impl Membership {
             .iter()
             .map(|(nid, r)| (*nid, r.seq))
             .collect();
-        Some(GossipMsg::Digest(entries))
+        entries
+            .chunks(MAX_GOSSIP_DIGEST_ENTRIES)
+            .map(|chunk| GossipMsg::Digest(chunk.to_vec()))
+            .collect()
     }
 
     /// The signed bootstrap root set (pubkey + reachable address), for
@@ -643,13 +669,20 @@ mod tests {
         let secs = 500u64;
 
         // Round 1: both emit a digest of what they know (just themselves).
-        let da = a
-            .tick_digest(now_ms, false)
-            .expect("first digest always fires");
+        // Each directory holds only its own record (well under
+        // MAX_GOSSIP_DIGEST_ENTRIES), so `tick_digest` fires exactly one
+        // `Digest`.
+        let da = {
+            let mut da = a.tick_digest(now_ms, false);
+            assert_eq!(da.len(), 1, "first digest always fires, as one chunk");
+            da.remove(0)
+        };
         now_ms += GOSSIP_INTERVAL_MS;
-        let db = b
-            .tick_digest(now_ms, false)
-            .expect("first digest always fires");
+        let db = {
+            let mut db = b.tick_digest(now_ms, false);
+            assert_eq!(db.len(), 1, "first digest always fires, as one chunk");
+            db.remove(0)
+        };
 
         // Each peer reacts to the other's digest with a PullRequest for
         // what it's missing.
@@ -892,5 +925,94 @@ mod tests {
         for nid in &ids {
             assert!(got_ids.contains(nid), "missing requested record {nid:?}");
         }
+    }
+
+    // (j) #44 fix: a directory holding more than `MAX_GOSSIP_DIGEST_ENTRIES`
+    // records must not produce one unboundedly large `Digest` (which, once
+    // obfuscated, panics `yip_obf::obfuscate`'s `u16` length cast, and which
+    // in any case can't converge because it exceeds the MTU). `tick_digest`
+    // must instead split into multiple capped `Digest` messages whose union
+    // still covers every directory node_id exactly once.
+    #[test]
+    fn tick_digest_chunks_large_directory() {
+        let ca = ca_key(1);
+        let net = [7u8; 16];
+        let (mut m, own_nid) = fresh_membership(&ca, net, 10);
+
+        let member_sign_key = SigningKey::from_bytes(&[201u8; 32]);
+        let member_sign_pub = member_sign_key.verifying_key().to_bytes();
+
+        // Own record is already in the directory; mint enough additional
+        // records to push the total strictly past the per-chunk cap.
+        let extra = MAX_GOSSIP_DIGEST_ENTRIES * 2 + 5;
+        let mut expected_ids = std::collections::HashSet::new();
+        expected_ids.insert(own_nid);
+        for i in 0..extra {
+            let mut member_pk = [0u8; 32];
+            let idx = u16::try_from(i).expect("test count fits u16");
+            member_pk[0..2].copy_from_slice(&(100 + idx).to_be_bytes());
+            let cert = make_cert(&ca, member_pk, member_sign_pub, net, 0, 1_000_000);
+            let endpoints = vec![format!("192.0.2.1:{}", 10_000 + i).parse().unwrap()];
+            let rec = build_signed_record(cert, endpoints, 1, &member_sign_key.to_bytes());
+            expected_ids.insert(rec.node_id);
+            assert!(m.ingest_record(rec, 500));
+        }
+
+        // Past the debounce, so the digest fires.
+        let digests = m.tick_digest(1_000, false);
+        assert!(
+            digests.len() > 1,
+            "a directory larger than one chunk must split across multiple Digest messages"
+        );
+
+        let mut got_ids = std::collections::HashSet::new();
+        for msg in &digests {
+            match msg {
+                GossipMsg::Digest(entries) => {
+                    assert!(
+                        entries.len() <= MAX_GOSSIP_DIGEST_ENTRIES,
+                        "each Digest message must respect the per-chunk cap"
+                    );
+                    for (nid, _seq) in entries {
+                        got_ids.insert(*nid);
+                    }
+                }
+                other => panic!("expected Digest, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            got_ids, expected_ids,
+            "the union of all Digest chunks must cover every directory node_id exactly once"
+        );
+    }
+
+    // (k) a directory under the cap still yields exactly ONE digest, and an
+    // empty/too-soon debounce yields an empty Vec (not a lone empty Digest).
+    #[test]
+    fn tick_digest_single_chunk_under_cap_and_debounced_empty() {
+        let ca = ca_key(1);
+        let net = [7u8; 16];
+        let (mut m, _own_nid) = fresh_membership(&ca, net, 10);
+
+        // Own record only: well under the cap.
+        let digests = m.tick_digest(1_000, false);
+        assert_eq!(
+            digests.len(),
+            1,
+            "a directory under the cap yields exactly one Digest"
+        );
+        match &digests[0] {
+            GossipMsg::Digest(entries) => assert_eq!(entries.len(), 1),
+            other => panic!("expected Digest, got {other:?}"),
+        }
+
+        // Immediately again (before GOSSIP_INTERVAL_MS elapses): debounced,
+        // so no digest at all (empty Vec, not a Vec containing an empty
+        // Digest).
+        let debounced = m.tick_digest(1_001, false);
+        assert!(
+            debounced.is_empty(),
+            "a too-soon re-tick must yield an empty Vec"
+        );
     }
 }
