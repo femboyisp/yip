@@ -4437,6 +4437,85 @@ mod tests {
     }
 
     #[test]
+    fn stale_replayed_cold_start_init_does_not_hijack_endpoint() {
+        // #34 hijack fix, defensive direction: the sibling of
+        // `fresh_new_ephemeral_init_rebuilds_and_relearns_endpoint`. A peer
+        // that was Established (endpoint learned = `ep_i`), dropped back to
+        // `Idle`, still remembers `last_accepted_init_ts = t1`. A captured
+        // OLD Init (or any new-ephemeral Init with ts <= t1) replayed from a
+        // SPOOFED source must be rejected by the `Idle` arm's
+        // `accept_fresh_init` guard BEFORE it ever reaches the
+        // `endpoint = Some(src)` line — proving the guard actually gates
+        // endpoint learning, not just session admission. Without Step 3's
+        // gate, this scenario would silently redirect the peer's `endpoint`
+        // to the attacker's spoofed address.
+        let kp_r = generate_keypair();
+        let kp_i = generate_keypair();
+        let ep_i: SocketAddr = "10.0.0.34:3400".parse().unwrap();
+        let cfg_i = PeerConfig {
+            public_key: kp_i.public,
+            endpoint: Some(ep_i),
+        };
+        let mut pm_r = PeerManager::new(
+            kp_r.private,
+            kp_r.public,
+            &[cfg_i],
+            TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
+
+        let t1 = crate::handshake::now_tai64n();
+        let (_hs1, init_pkt_1) = HandshakeState::start_initiator(
+            &kp_i.private,
+            &kp_r.public,
+            &init_payload_with_ts(t1, &[]),
+        )
+        .unwrap();
+        let resp1 = resp_bytes(&pm_r.on_udp(ep_i, &init_pkt_1, 0));
+        assert_eq!(resp1.len(), 1);
+        assert_eq!(pm_r.peers[0].endpoint, Some(ep_i));
+
+        pm_r.drop_session(0);
+        assert!(matches!(pm_r.peers[0].state, PeerState::Idle));
+        assert_eq!(pm_r.peers[0].last_accepted_init_ts, Some(t1));
+
+        // A NEW-ephemeral Init with ts <= t1, replayed from an attacker's
+        // SPOOFED source address (not `ep_i`).
+        let t0 = older_ts(t1);
+        let (_hs2, init_pkt_2) = HandshakeState::start_initiator(
+            &kp_i.private,
+            &kp_r.public,
+            &init_payload_with_ts(t0, &[]),
+        )
+        .unwrap();
+        let spoofed: SocketAddr = "203.0.113.77:7".parse().unwrap();
+        match pm_r.on_udp(spoofed, &init_pkt_2, 200) {
+            DispatchOut::None => {}
+            _ => panic!("a stale-ts cold-start Init must be silently dropped"),
+        }
+        assert!(
+            matches!(pm_r.peers[0].state, PeerState::Idle),
+            "a rejected cold-start Init must not admit a session"
+        );
+        assert_eq!(
+            pm_r.peers[0].endpoint,
+            Some(ep_i),
+            "endpoint must NOT be hijacked toward the spoofed source"
+        );
+        assert_eq!(
+            pm_r.peers[0].last_accepted_init_ts,
+            Some(t1),
+            "last_accepted_init_ts must not change on a rejected Init"
+        );
+        assert!(
+            pm_r.by_tag.is_empty(),
+            "no session (hence no conn_tag) must have been admitted"
+        );
+    }
+
+    #[test]
     fn retransmit_still_replays_cached_resp_regardless_of_ts() {
         // #34: a retransmit of the SAME Init (identical ephemeral == identical
         // ts) is recognized by the pre-existing `cached_resp_init_eph` dedup
