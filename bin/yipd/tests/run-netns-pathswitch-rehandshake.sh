@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# The hardening.36 money test: proves the #36 fix end-to-end — a Punch->Relay
-# path re-target must NOT draw a fresh Noise ephemeral, or the relayed
-# retransmit black-holes against a responder that already adopted the
-# session.
+# The hardening.36 money test: proves the #36 INVERSION (anti-replay.34 Task
+# 4) end-to-end — a Punch->Relay path re-target now legitimately draws a
+# FRESH Noise ephemeral (state -> Idle -> begin_handshake) instead of
+# preserving the in-flight one, and the session still CONVERGES because the
+# responder rebuilds on the fresh Init (freshness-gated, #34 Task 3) rather
+# than relying on ephemeral preservation to avoid a black hole.
 #
 # Usage: run-netns-pathswitch-rehandshake.sh <path-to-yipd-binary> <path-to-yip-rendezvous-binary>
 #
@@ -10,9 +12,12 @@
 # The brief's headline scenario is: A and B rendezvous-only; B adopts the
 # responder role and goes Established over a DIRECT punch reply, but that
 # reply is lost through A's punch window, so A escalates to the relay while
-# B is already direct-established — testing BOTH halves of the fix (A's
-# ephemeral preservation across the retarget, AND B's responder-side relay
-# adoption on the relayed cold-start retransmit).
+# B is already direct-established. Pre-#34, this needed ephemeral
+# PRESERVATION across the retarget (the original #36 fix) so the responder's
+# `cached_resp` dedup would recognize the relayed retry. Post-#34, the
+# responder instead REBUILDS on a fresh-ephemeral, fresh-ts Init (Task 3's
+# freshness gate + Task 4's fresh-Init inversion), so preservation is no
+# longer needed for convergence — and no longer happens.
 #
 # Deterministically dropping "only B->A's first resp, through exactly the
 # punch window" is impractical to construct in netns (it requires
@@ -22,66 +27,72 @@
 # (three netns A/B/R; R does not forward IPv4, so A and B are mutually
 # unreachable and can only ever converge via R's blind relay) — this forces
 # EVERY session, including the very first one, through the punch->escalate
-# ->relay path, and asserts A converges over the relay carrying the SAME
-# ephemeral it started with (Task 1's fix). It does not exercise Task 2's
-# responder-side relay adoption (B never gets far enough into a direct punch
-# to adopt anything in this topology — punch delivery is unconditionally
-# dropped by R's lack of forwarding), but that half is covered by the
-# `direct_established_responder_adopts_relay_on_relayed_cold_start_retransmit`
-# unit test in bin/yipd/src/peer_manager.rs.
+# ->relay path, and asserts A converges over the relay. It does not exercise
+# Task 4's responder-side relay adoption in isolation (B never gets far
+# enough into a direct punch to adopt anything in this topology — punch
+# delivery is unconditionally dropped by R's lack of forwarding), but that
+# half is covered by the freshness-gated-rebuild unit tests in
+# bin/yipd/src/peer_manager.rs.
 #
-# ── proving "the SAME ephemeral" on the wire, not just from source ──
+# ── proving "a FRESH ephemeral" on the wire, not just from source ──
 # `bin/yipd/examples/rekey_epoch_witness` (built alongside yipd; see step 0
 # below) counts DISTINCT cleartext Noise-IK ephemeral public keys across
 # captured [HandshakeInit] datagrams — cleartext because Noise_IK's leading
 # token on message 1 is `e`, unencrypted (see the tool's own module doc and
-# run-netns-rekey.sh's header for the full argument). Pre-fix, a Punch->Relay
-# retarget drew a FRESH ephemeral for the relayed resend; post-fix it resends
-# the SAME `init_pkt` byte-for-byte. So: capture every datagram A itself
+# run-netns-rekey.sh's header for the full argument). Post-#34/#36-inversion,
+# a Punch->Relay retarget goes `state = Idle; begin_handshake(..)`, drawing a
+# NEW ephemeral for the relayed resend instead of resending the punch
+# attempt's `init_pkt` byte-for-byte. So: capture every datagram A itself
 # SENDS (both its raw, silently-dropped punch attempt AND its later
 # RelaySend-wrapped escalation retry — `YIP_WITNESS_UNWRAP_RELAY=1`, the same
 # opt-in run-netns-rekey-relay.sh uses, strips the RelaySend/RelayDeliver
 # envelope before applying the witness's cleartext-ephemeral logic; a
 # non-relay-tagged datagram, like A's raw punch attempt, passes through
-# unchanged and is still counted) and assert exactly ONE distinct INIT
-# ephemeral appears. Two would mean a cold restart drew a new one — the #36
-# regression this test exists to catch.
+# unchanged and is still counted) and assert AT LEAST TWO distinct INIT
+# ephemerals appear. Exactly one would mean the retarget reused the punch
+# attempt's ephemeral — the OLD #36 behavior, now itself the regression this
+# inverted test exists to catch (a preserved ephemeral means the escalation
+# is a bare retransmit the freshness gate would refuse as stale on a replay,
+# reopening the downgrade #34 Task 4 closes).
 #
 # ── why the capture is restricted to A's own outbound traffic ──
 # Neither peer has a static `endpoint=`/`initiate=` field (config.rs's
-# `initiate` key is now a documented no-op — Task 5 removed it), so on a cold
-# start BOTH A and B independently attempt to become the initiator
-# ("startup-glare"). `handle_handshake_init`'s tie-break
-# (`self.local_pub < self.peers[idx].pubkey`) makes the SMALLER public key
-# the persistent initiator; the larger-pubkey side sends at most one
-# abortive attempt of its own before deferring and completing as responder
-# instead. An UNFILTERED capture on A's veth would therefore also see B's
-# relayed loser-attempt arrive as a `RelayDeliver` addressed to A (R forwards
-# it), which the witness tool would count as a second, unrelated INIT
-# ephemeral — a false positive with nothing to do with #36. Two
-# countermeasures close this: (1) keys are generated in a retry loop until
-# `PUB_A < PUB_B`, so A is deterministically the persistent initiator (the
-# one that actually performs the punch->escalate dance this test is about);
-# (2) the tcpdump capture filters `src host $IP_A`, so only datagrams A
-# itself transmits (its own raw punch Init, its own relay-wrapped retry) are
-# captured — B's inbound `RelayDeliver` traffic to A is excluded. Losing the
-# Resp side of the capture this way means `COMPLETED_ROUNDS` isn't
-# meaningful here (no [HandshakeResp] ever originates at A); this script
-# instead gates on DISTINCT_INIT_EPHEMERALS (the actual #36 proof) plus
+# `initiate` key is a documented no-op), so on a cold start BOTH A and B
+# independently attempt to become the initiator ("startup-glare").
+# `handle_handshake_init`'s tie-break (`self.local_pub <
+# self.peers[idx].pubkey`) makes the SMALLER public key the persistent
+# initiator; the larger-pubkey side sends at most one abortive attempt of its
+# own before deferring and completing as responder instead. An UNFILTERED
+# capture on A's veth would therefore also see B's relayed loser-attempt
+# arrive as a `RelayDeliver` addressed to A (R forwards it), which the
+# witness tool would count as an extra, unrelated INIT ephemeral — a false
+# positive with nothing to do with #36. Two countermeasures close this: (1)
+# keys are generated in a retry loop until `PUB_A < PUB_B`, so A is
+# deterministically the persistent initiator (the one that actually performs
+# the punch->escalate dance this test is about); (2) the tcpdump capture
+# filters `src host $IP_A`, so only datagrams A itself transmits (its own raw
+# punch Init, its own relay-wrapped retry) are captured — B's inbound
+# `RelayDeliver` traffic to A is excluded. Losing the Resp side of the
+# capture this way means `COMPLETED_ROUNDS` isn't meaningful here (no
+# [HandshakeResp] ever originates at A); this script instead gates on
+# DISTINCT_INIT_EPHEMERALS>=2 (the #36-inversion proof) plus
 # HANDSHAKE_INIT_PKTS>=2 (non-vacuity: proves both a punch attempt AND a
 # relay retransmit were actually observed, not just one lucky send) and
 # leans on the ping convergence + relay-forwarded assertions below for "it
 # actually completed".
 #
 # Assertions (any failure is non-zero exit, [PASS]/[FAIL] markers):
-#   1. convergence: ping -6 -c 20 -W 2 A->B succeeds (tolerating the same
-#      ~PUNCH_MS warm-up loss run-netns-relay.sh documents) — the headline
-#      #36 claim: A converges instead of black-holing.
+#   1. convergence: ping -6 -c 50 -W 2 A->B over the relay succeeds with
+#      >=98% delivery (tolerating the same ~PUNCH_MS warm-up loss
+#      run-netns-relay.sh documents) — the headline #36-inversion claim: A
+#      still converges, now via rebuild rather than preservation.
 #   2. relay_forwarded: R's stderr shows `relay-forwarded=<N>`, N>0 — the
 #      blind relay, not a direct/punched path, carried the traffic.
-#   3. ephemeral preservation: rekey_epoch_witness (YIP_WITNESS_UNWRAP_RELAY=1)
-#      on a src-host-$IP_A-filtered capture reports exactly 1 distinct INIT
-#      ephemeral across >=2 captured HandshakeInit datagrams.
+#   3. fresh-ephemeral escalation: rekey_epoch_witness
+#      (YIP_WITNESS_UNWRAP_RELAY=1) on a src-host-$IP_A-filtered capture
+#      reports >=2 distinct INIT ephemerals across >=2 captured
+#      HandshakeInit datagrams — proving the retarget drew a fresh ephemeral
+#      instead of preserving the punch attempt's.
 set -euo pipefail
 
 YIPD="${1:?Usage: $0 <yipd-binary> <yip-rendezvous-binary>}"
@@ -340,19 +351,48 @@ assign_mesh "$NS_B" "$ADDR_B"
 # ── 9. ping A->B, tolerating warm-up loss while the path escalates to relay ──
 # Same tolerance run-netns-relay.sh documents: ~PUNCH_MS (5s) of unavoidable
 # warm-up while the path state machine escalates from a silently-dropped
-# direct punch to the blind relay. This IS the headline #36 assertion: with
-# the fix, A converges instead of black-holing.
+# direct punch to the blind relay. This proves initial convergence (with the
+# #36 inversion, A still converges instead of black-holing, now via rebuild
+# rather than ephemeral preservation) without the fixed warm-up window
+# skewing a delivery percentage.
 echo "[test] pinging ${ADDR_B} from yipPswA (expect escalate-to-relay warm-up loss, then success)"
 set +e
 ip netns exec "$NS_A" ping -6 -c 20 -W 2 "$ADDR_B"
 PING_STATUS=$?
 set -e
 if [ "$PING_STATUS" -ne 0 ]; then
-    echo "[FAIL] ping A->B did not converge (exit $PING_STATUS) — #36 regression: A black-holed"
+    echo "[FAIL] ping A->B did not converge (exit $PING_STATUS) — #36-inversion regression: A black-holed"
     dump_logs
     exit 1
 fi
 echo "[PASS] ping A->B converged over the relay"
+
+# ── 9b. steady-state continuity, now that warm-up is over ──────────────────
+# A fresh, stricter ping burst AFTER the path has already converged (step 9
+# above): with the escalation's one-time warm-up loss out of the way, this
+# is the ">=98% delivery" convergence bar the anti-replay.34 plan calls for
+# — proving the rebuilt (fresh-ephemeral) relay session is fully stable, not
+# just "received at least one reply".
+STEADY_PING_LOG="$TMPDIR_TEST/steady_ping.log"
+echo "[test] steady-state ping ${ADDR_B} from yipPswA (post-convergence, >=98% delivery required)"
+set +e
+ip netns exec "$NS_A" ping -6 -i 0.2 -c 50 -W 1 "$ADDR_B" >"$STEADY_PING_LOG" 2>&1
+set -e
+cat "$STEADY_PING_LOG"
+LOSS_PCT="$(grep -oE '[0-9]+(\.[0-9]+)?% packet loss' "$STEADY_PING_LOG" | grep -oE '^[0-9]+(\.[0-9]+)?' || true)"
+if [ -z "$LOSS_PCT" ]; then
+    echo "[FAIL] convergence: could not parse packet loss from the steady-state ping output"
+    dump_logs
+    exit 1
+fi
+echo "[metric] convergence: steady-state packet loss = ${LOSS_PCT}%"
+if awk "BEGIN {exit ($LOSS_PCT <= 2.0) ? 0 : 1}"; then
+    echo "[PASS] convergence: ${LOSS_PCT}% loss (<=2%, i.e. >=98% delivery) in steady state over the relay"
+else
+    echo "[FAIL] convergence: ${LOSS_PCT}% loss (>2%, i.e. <98% delivery) — #36-inversion regression"
+    dump_logs
+    exit 1
+fi
 
 # ── 10. stop the capture ──────────────────────────────────────────────────────
 sleep 0.3
@@ -380,9 +420,9 @@ if [ -z "${FINAL_COUNT:-}" ] || [ "$FINAL_COUNT" -eq 0 ]; then
 fi
 echo "[PASS] relay-forwarded=${FINAL_COUNT} (>0): the blind relay carried the traffic"
 
-# ── assertion: ephemeral preservation — the #36 headline proof ──────────────
+# ── assertion: fresh-ephemeral escalation — the #36-inversion headline proof ──
 if [ ! -s "$PCAP" ]; then
-    echo "[FAIL] ephemeral preservation: capture is empty or missing at $PCAP"
+    echo "[FAIL] fresh-ephemeral escalation: capture is empty or missing at $PCAP"
     dump_logs
     exit 1
 fi
@@ -395,29 +435,35 @@ INIT_PKTS="$(grep -oE '^HANDSHAKE_INIT_PKTS=[0-9]+' "$WITNESS_LOG" | cut -d= -f2
 DISTINCT_INIT="$(grep -oE '^DISTINCT_INIT_EPHEMERALS=[0-9]+' "$WITNESS_LOG" | cut -d= -f2)"
 
 if [ -z "$INIT_PKTS" ] || [ -z "$DISTINCT_INIT" ]; then
-    echo "[FAIL] ephemeral preservation: could not parse rekey_epoch_witness output"
+    echo "[FAIL] fresh-ephemeral escalation: could not parse rekey_epoch_witness output"
     dump_logs
     exit 1
 fi
 
 # Non-vacuity: must have actually observed both the raw punch attempt and at
-# least one relay-wrapped escalation retry -- else "1 distinct ephemeral"
-# would trivially hold because only one Init was ever sent at all.
+# least one relay-wrapped escalation retry -- else ">=2 distinct ephemerals"
+# couldn't even be structurally possible with fewer than 2 Inits observed.
 if [ "$INIT_PKTS" -lt 2 ]; then
-    echo "[FAIL] ephemeral preservation: only $INIT_PKTS Init packet(s) captured from A (need >=2: punch attempt + relay retry) — test is vacuous, not proof"
+    echo "[FAIL] fresh-ephemeral escalation: only $INIT_PKTS Init packet(s) captured from A (need >=2: punch attempt + relay retry) — test is vacuous, not proof"
     dump_logs
     exit 1
 fi
 
-# The money assertion: exactly one distinct cleartext ephemeral across every
-# Init A itself sent (punch attempt + relay-wrapped retry/retries). Two would
-# mean the retarget drew a fresh ephemeral -- the #36 regression.
-if [ "$DISTINCT_INIT" -eq 1 ]; then
-    echo "[PASS] ephemeral preservation: $INIT_PKTS Init packets from A, all sharing the SAME ephemeral (no cold-start churn across the punch->relay retarget)"
+# The money assertion (INVERTED from the pre-#34 test): at least two distinct
+# cleartext ephemerals across every Init A itself sent (punch attempt +
+# relay-wrapped retry/retries) -- proving the punch->relay retarget drew a
+# FRESH ephemeral (Task 4's `state = Idle; begin_handshake(..)`) rather than
+# reusing the punch attempt's. Exactly one would mean the OLD #36 behavior
+# (ephemeral preservation) is still happening, which is now itself the
+# regression: a preserved ephemeral is a bare retransmit the freshness gate
+# would refuse as stale on a genuine replay, reopening the downgrade #34
+# Task 4 closed.
+if [ "$DISTINCT_INIT" -ge 2 ]; then
+    echo "[PASS] fresh-ephemeral escalation: $INIT_PKTS Init packets from A, $DISTINCT_INIT distinct ephemerals (punch attempt + a freshly-drawn relay retry, no #36-preservation regression)"
 else
-    echo "[FAIL] ephemeral preservation: $DISTINCT_INIT distinct Init ephemerals from A (need exactly 1) — the punch->relay retarget drew a fresh ephemeral, reproducing #36"
+    echo "[FAIL] fresh-ephemeral escalation: only $DISTINCT_INIT distinct Init ephemeral(s) from A (need >=2) — the punch->relay retarget reused the punch attempt's ephemeral, reproducing the OLD #36 behavior"
     dump_logs
     exit 1
 fi
 
-echo "[PASS] run-netns-pathswitch-rehandshake: A converged over the relay, carrying the SAME ephemeral throughout"
+echo "[PASS] run-netns-pathswitch-rehandshake: A converged over the relay (>=98% steady-state delivery) via a freshly-drawn escalation ephemeral"
