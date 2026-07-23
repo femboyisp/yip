@@ -4515,6 +4515,81 @@ mod tests {
         );
     }
 
+    /// Relay-path counterpart of
+    /// `stale_replayed_cold_start_init_does_not_hijack_endpoint`: the same
+    /// #34 freshness gate, `if !self.accept_fresh_init(idx, &init_ts) {
+    /// return DispatchOut::None; }`, guards `relayed_handshake_init`'s own
+    /// `Idle | Handshaking` arm (~line 1241), not just the direct path's.
+    /// A relay-reached peer that was `Established`, dropped back to `Idle`,
+    /// still remembers `last_accepted_init_ts = t1`. A captured OLD Init
+    /// (new ephemeral, ts <= t1) redelivered over the relay must be rejected
+    /// BEFORE it re-admits a session, exactly like the direct-path sibling —
+    /// proving the gate is wired into the relay cold-start arm too, not only
+    /// `handle_handshake_init`'s.
+    #[test]
+    fn stale_replayed_relayed_cold_start_init_is_rejected() {
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let cfg_peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let (mut pm, _sent) = pm_with_mock_rdv(&local, &[cfg_peer]);
+
+        // Cold-start over the relay with a genuine ts `t1`: establishes and
+        // records `last_accepted_init_ts`.
+        let t1 = crate::handshake::now_tai64n();
+        let (_hs1, init_pkt_1) = HandshakeState::start_initiator(
+            &peer_kp.private,
+            &local.public,
+            &init_payload_with_ts(t1, &[]),
+        )
+        .unwrap();
+        let out1 = pm.on_udp(mock_server(), &relay_deliver(&peer_kp, init_pkt_1), 0);
+        assert!(
+            has_relayed_handshake_resp(&out1),
+            "a genuine relayed cold-start Init must establish"
+        );
+        assert!(pm.peers[0].relay, "sanity: the peer adopted the relay path");
+        assert_eq!(pm.peers[0].last_accepted_init_ts, Some(t1));
+
+        // Drop the session: reverts to Idle, evicts by_tag — but
+        // `last_accepted_init_ts` (and `relay`) are in-memory and survive
+        // (never reset by `drop_session`), same as the direct-path sibling.
+        pm.drop_session(0);
+        assert!(matches!(pm.peers[0].state, PeerState::Idle));
+        assert_eq!(pm.peers[0].last_accepted_init_ts, Some(t1));
+
+        // A NEW-ephemeral Init with ts < t1, redelivered over the relay (as
+        // a captured/replayed datagram forwarded by the rendezvous server).
+        let t0 = older_ts(t1);
+        let (_hs2, init_pkt_2) = HandshakeState::start_initiator(
+            &peer_kp.private,
+            &local.public,
+            &init_payload_with_ts(t0, &[]),
+        )
+        .unwrap();
+        let out2 = pm.on_udp(mock_server(), &relay_deliver(&peer_kp, init_pkt_2), 200);
+
+        match out2 {
+            DispatchOut::None => {}
+            _ => panic!("a stale-ts relayed cold-start Init must be silently dropped"),
+        }
+        assert!(
+            matches!(pm.peers[0].state, PeerState::Idle),
+            "a rejected relayed cold-start Init must not admit a session"
+        );
+        assert_eq!(
+            pm.peers[0].last_accepted_init_ts,
+            Some(t1),
+            "last_accepted_init_ts must not change on a rejected relayed Init"
+        );
+        assert!(
+            pm.by_tag.is_empty(),
+            "no session (hence no conn_tag) must have been admitted"
+        );
+    }
+
     #[test]
     fn retransmit_still_replays_cached_resp_regardless_of_ts() {
         // #34: a retransmit of the SAME Init (identical ephemeral == identical
