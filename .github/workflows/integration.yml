@@ -414,6 +414,44 @@ jobs:
             exit 1
           fi
 
+      - name: Run the rdv.37 registration-hijack money test under sudo (poll driver)
+        # run-netns-registration-hijack.sh: proves the #37 fix -- a ROOTED
+        # (mesh-mode, --roots/--network-id) standalone yip-rendezvous server
+        # refuses a forged, unsigned `Register` claiming an established
+        # member's (A's) node_id from a third, uncertified netns (S), and
+        # B<->A stays reachable (<=1% loss) throughout the attack. Forks
+        # run-netns-discovery.sh's CA/cert/roots minting and
+        # run-netns-punch.sh's rendezvous-only `[peer]` config style; new in
+        # this milestone is combining full mesh-cert config with a rooted
+        # standalone rendezvous server (no gossip root at all).
+        #
+        # POLL DRIVER ONLY: the property under test (the forged Register's
+        # refusal) lives entirely in the rendezvous SERVER
+        # (crates/yip-rendezvous/src/server.rs's `handle`, the
+        # `roots_cfg.is_some()` drop) -- plain tokio, no yipd I/O driver
+        # involved, so `YIP_USE_URING` cannot change that assertion's
+        # outcome. The only uring-sensitive part of this script is A/B's
+        # signed-registration + Lookup establishment timing, which is the
+        # same discovery-convergence risk run-netns-discovery.sh /
+        # run-netns-cert-revocation.sh already document as flaky under
+        # io_uring -- so, like cert-revocation.sh, this runs poll-only rather
+        # than add a spurious-failure vector for zero additional coverage of
+        # the actual security property. Uses the release yipd and debug
+        # yip-ca/yip-rendezvous already built above in this job.
+        run: |
+          sudo bash bin/yipd/tests/run-netns-registration-hijack.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-ca" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/registration-hijack-poll.log
+          if grep -q "^SKIP run-netns-registration-hijack" /tmp/registration-hijack-poll.log; then
+            echo "::error::rdv.37 registration-hijack money test (poll) skipped — expected root in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/registration-hijack-poll.log; then
+            echo "::error::rdv.37 registration-hijack money test (poll) failed — the rooted server accepted a forged registration, or it disrupted B<->A connectivity"
+            exit 1
+          fi
+
   dpi-undetectability:
     # The anti-DPI undetectability merge gate (3a Task 7): fails the build if
     # a wire/obfuscation change reintroduces a DPI-recognizable fingerprint.
