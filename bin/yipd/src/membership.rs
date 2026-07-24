@@ -96,6 +96,16 @@ pub struct Membership {
     /// concern, not a reason to panic — an expired own cert is still
     /// returned as-is and left for the peer to reject.
     own_cert: Cert,
+    /// This node's own currently-known reachable endpoints, kept
+    /// independent of `directory`/`own_record` for the same reason as
+    /// `own_cert` — `sign_registration` (#37 Task 4) mints fresh
+    /// registration `Record`s from this without depending on directory
+    /// churn.
+    own_endpoints: Vec<SocketAddr>,
+    /// This node's record-signing private key, kept so `sign_registration`
+    /// (#37 Task 4) can mint fresh, freshly-`seq`'d registration `Record`s
+    /// on demand without re-deriving/re-plumbing the key from the caller.
+    sign_priv: [u8; 32],
     /// WALL-CLOCK-seconds timestamp is not stored here; only the MONOTONIC
     /// millisecond mark of the last digest we emitted, for `tick_digest`'s
     /// debounce.
@@ -146,6 +156,7 @@ impl Membership {
     ) -> Self {
         let own_node_id = node_id(&own_cert.member_pubkey);
         let own_cert_stored = own_cert.clone();
+        let own_endpoints_stored = own_endpoints.clone();
         let own_record = build_signed_record(own_cert, own_endpoints, INITIAL_SEQ, &own_sign_priv);
 
         let mut m = Membership {
@@ -156,11 +167,44 @@ impl Membership {
             roots,
             own_node_id,
             own_cert: own_cert_stored,
+            own_endpoints: own_endpoints_stored,
+            sign_priv: own_sign_priv,
             last_digest_ms: None,
             digest_ms: GOSSIP_INTERVAL_MS,
         };
         m.insert_record(own_record);
         m
+    }
+
+    /// This node's own `node_id` (derived from its member pubkey).
+    pub fn own_node_id(&self) -> NodeId {
+        self.own_node_id
+    }
+
+    /// Mint a fresh, self-signed registration `Record` at `seq` (the
+    /// rendezvous freshness counter). Reuses the gossip record machinery —
+    /// same cert, same endpoints, monotonic `seq` — so the registration and
+    /// the gossip directory entry are the same signed object (#37).
+    pub fn sign_registration(&self, seq: u64) -> Record {
+        build_signed_record(
+            self.own_cert.clone(),
+            self.own_endpoints.clone(),
+            seq,
+            &self.sign_priv,
+        )
+    }
+
+    /// Verify a registration/directory `Record` against our own roots +
+    /// network, at wall-clock `now_secs`. True iff the cert chains to a
+    /// root, the record signature is valid, and the `node_id` binds the
+    /// cert (squatting closed). Mirrors `bin/yip-rendezvous`'s own
+    /// `roots.roots.iter().map(|(pk, _)| *pk)` convention: the signed
+    /// `RootSet`'s member pubkeys double as the trusted CA set for this
+    /// verification (#37).
+    pub fn verify_record(&self, r: &Record, now_secs: u64) -> bool {
+        let ca_pubkeys: Vec<[u8; 32]> = self.roots.roots.iter().map(|(pk, _)| *pk).collect();
+        r.verify(&ca_pubkeys, &self.network_id, now_secs, clock_skew_secs())
+            .is_ok()
     }
 
     /// Directory lookup by mesh address, via the `node_addr -> node_id`
@@ -892,5 +936,68 @@ mod tests {
         for nid in &ids {
             assert!(got_ids.contains(nid), "missing requested record {nid:?}");
         }
+    }
+
+    // ── #37 Task 4: `sign_registration` / `verify_record` ───────────────
+
+    /// Build a fresh `Membership` whose `roots` (the `RootSet` consulted by
+    /// `verify_record`, mirroring `bin/yip-rendezvous`'s own
+    /// `roots.roots.iter().map(|(pk, _)| *pk)` convention) contains the
+    /// trusted CA's own pubkey as a root entry — so a record minted under
+    /// that CA verifies against `m.verify_record`.
+    fn test_membership() -> Membership {
+        let ca = ca_key(1);
+        let net = [7u8; 16];
+        let ca_pub = ca.verifying_key().to_bytes();
+        let roots = RootSet {
+            roots: vec![(ca_pub, "10.0.0.99:51820".parse().unwrap())],
+            version: 0,
+            ca_sig: [0u8; 64],
+        };
+
+        let own_member_pk = [10u8; 32];
+        let own_sign_key = SigningKey::from_bytes(&[11u8; 32]);
+        let own_sign_pub = own_sign_key.verifying_key().to_bytes();
+        let own_cert = make_cert(&ca, own_member_pk, own_sign_pub, net, 0, 1_000_000);
+        Membership::new(
+            vec![ca_pub],
+            net,
+            own_cert,
+            own_sign_key.to_bytes(),
+            roots,
+            vec!["10.0.0.1:51820".parse().unwrap()],
+        )
+    }
+
+    fn now_secs() -> u64 {
+        500
+    }
+
+    /// Build a `Record` signed under a CA UNRELATED to `test_membership`'s
+    /// trusted root — must be rejected by `verify_record`.
+    fn record_signed_by_unrelated_ca() -> Record {
+        let unrelated_ca = ca_key(200);
+        let net = [7u8; 16];
+        let member_pk = [123u8; 32];
+        let member_sign_key = SigningKey::from_bytes(&[124u8; 32]);
+        let member_sign_pub = member_sign_key.verifying_key().to_bytes();
+        let cert = make_cert(&unrelated_ca, member_pk, member_sign_pub, net, 0, 1_000_000);
+        let endpoints = vec!["192.0.2.77:7777".parse().unwrap()];
+        build_signed_record(cert, endpoints, 1, &member_sign_key.to_bytes())
+    }
+
+    #[test]
+    fn sign_registration_is_verifiable_against_own_roots() {
+        let m = test_membership();
+        let rec = m.sign_registration(5);
+        assert_eq!(rec.node_id, m.own_node_id());
+        assert!(m.verify_record(&rec, now_secs()));
+    }
+
+    #[test]
+    fn verify_record_rejects_foreign_ca() {
+        let m = test_membership();
+        let foreign = record_signed_by_unrelated_ca();
+        assert!(!m.verify_record(&foreign, now_secs()));
     }
 }
