@@ -344,6 +344,44 @@ jobs:
             exit 1
           fi
 
+      - name: Run the roaming.m2 NAT-rebind money test under sudo (poll driver)
+        # run-netns-roaming.sh: proves M2 authenticated endpoint roaming
+        # end-to-end. A direct, obfuscation-on peer A changes its on-wire
+        # source address mid-session (a NAT rebind: A binds 0.0.0.0 and the
+        # script adds a second address + flips the route's preferred source,
+        # so A's session/keys/conn_tag are untouched). B must relearn A's
+        # endpoint from an authenticated, non-replayed inbound packet AND
+        # redirect its egress there (endpoint alone is insufficient: egress is
+        # stamped from the epoch's peer_addr), so a steady ping A->B stays
+        # <=1% loss across the rebind. Uses the release yipd and debug
+        # yip-rendezvous already built above in this job.
+        run: |
+          sudo bash bin/yipd/tests/run-netns-roaming.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/roaming-poll.log
+          if grep -q "^SKIP run-netns-roaming" /tmp/roaming-poll.log; then
+            echo "::error::roaming.m2 NAT-rebind money test (poll) skipped — expected root + TUN in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/roaming-poll.log; then
+            echo "::error::roaming.m2 NAT-rebind money test (poll) failed — B did not recover A's roamed, obfuscated source across the mid-session rebind"
+            exit 1
+          fi
+
+      - name: Run the roaming.m2 NAT-rebind money test under sudo (uring driver)
+        run: |
+          sudo -E env YIP_USE_URING=1 bash bin/yipd/tests/run-netns-roaming.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/roaming-uring.log
+          if grep -q "^SKIP run-netns-roaming" /tmp/roaming-uring.log; then
+            echo "::error::roaming.m2 NAT-rebind money test (uring) skipped — expected root + TUN in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/roaming-uring.log; then
+            echo "::error::roaming.m2 NAT-rebind money test (uring) failed — B did not recover A's roamed, obfuscated source across the mid-session rebind"
+            exit 1
+          fi
+
       - name: Run the hardening.41 cert-revocation money test under sudo (poll driver)
         # run-netns-cert-revocation.sh: proves the #41 fix -- a revoked
         # (cert-expired) mesh member loses its session within a bounded
