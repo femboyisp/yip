@@ -6,7 +6,17 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use yip_membership::Record;
+
 use crate::proto::{Message, NodeId};
+
+/// Clock-skew grace applied when verifying a `RegisterSigned` record's
+/// embedded cert/signature window. Mirrors `bin/yipd/src/membership.rs`'s
+/// `CLOCK_SKEW_SECS` production default (300s / `YIP_CERT_SKEW_SECS`
+/// override) — this crate has no access to that binary-local constant, so
+/// the value is duplicated here rather than reused; keep the two in sync by
+/// hand if the #41 default ever changes.
+const REGISTRATION_SKEW_SECS: u64 = 300;
 
 /// Registration lifetime; clients refresh well within this.
 pub const REG_TTL_MS: u64 = 60_000;
@@ -26,6 +36,11 @@ struct Reg {
     addr: SocketAddr,
     expiry_ms: u64,
     last_counter: u64,
+    /// The signed directory record backing this registration, when it
+    /// arrived via `RegisterSigned` and verified. `None` for a legacy
+    /// unsigned `Register` (rootless servers only) — `Lookup` then serves
+    /// `record: None` in `PeerInfo`, same as before this task.
+    record: Option<Record>,
 }
 
 struct Rate {
@@ -53,6 +68,13 @@ pub struct RendezvousServer {
     /// a cloned handle ([`forwarded_handle`](Self::forwarded_handle)) without
     /// acquiring the global `server` mutex per relayed frame (#68).
     forwarded: Arc<AtomicU64>,
+    /// `Some((ca_pubkeys, network_id))` when this server is running "rooted"
+    /// (mesh mode): `RegisterSigned` records are verified against these
+    /// roots before being trusted, and legacy unsigned `Register` is
+    /// dropped outright (a mesh must not accept an unauthenticated
+    /// registration). `None` (via [`new`](Self::new)) is the rootless/legacy
+    /// mode, byte-identical to pre-#37 behavior.
+    roots_cfg: Option<(Vec<[u8; 32]>, [u8; 16])>,
 }
 
 impl RendezvousServer {
@@ -62,6 +84,20 @@ impl RendezvousServer {
             rates: HashMap::new(),
             tls_seen: HashMap::new(),
             forwarded: Arc::new(AtomicU64::new(0)),
+            roots_cfg: None,
+        }
+    }
+
+    /// A rooted (mesh-mode) server: `RegisterSigned` records are verified
+    /// against `ca_pubkeys`/`network_id`, and legacy unsigned `Register` is
+    /// dropped (see [`roots_cfg`](Self::roots_cfg)).
+    pub fn new_with_roots(_now_ms: u64, ca_pubkeys: Vec<[u8; 32]>, network_id: [u8; 16]) -> Self {
+        Self {
+            regs: HashMap::new(),
+            rates: HashMap::new(),
+            tls_seen: HashMap::new(),
+            forwarded: Arc::new(AtomicU64::new(0)),
+            roots_cfg: Some((ca_pubkeys, network_id)),
         }
     }
 
@@ -162,6 +198,13 @@ impl RendezvousServer {
                 addr: src,
                 expiry_ms: now_ms.saturating_add(REG_TTL_MS),
                 last_counter: counter,
+                // Every insert (fresh or counter-advancing refresh) starts
+                // with no record here; the `RegisterSigned` arm in `handle`
+                // sets it via `get_mut` immediately after this call
+                // succeeds, so the record always tracks the latest
+                // verified registration rather than lingering from a
+                // previous one.
+                record: None,
             },
         );
         true
@@ -189,18 +232,58 @@ impl RendezvousServer {
     }
 
     /// Process one received message; return datagrams to send as `(dst, msg)`.
+    /// `now_ms` is the monotonic clock used for TTL/rate-limit bookkeeping
+    /// (unchanged from before this task); `now_secs` is WALL-CLOCK seconds,
+    /// used ONLY to validate a `RegisterSigned` record's embedded cert
+    /// window — the two are intentionally distinct clocks and must not be
+    /// conflated (a monotonic clock has no relation to a cert's
+    /// `not_before`/`not_after`, which are wall-clock UNIX timestamps).
     pub fn handle(
         &mut self,
         src: SocketAddr,
         msg: Message,
         now_ms: u64,
+        now_secs: u64,
     ) -> Vec<(SocketAddr, Message)> {
         if !self.rate_ok(src, now_ms) {
             return Vec::new();
         }
         match msg {
             Message::Register { node, counter } => {
+                // A rooted (mesh) server requires every registration to be
+                // signed and verified against its roots; an unauthenticated
+                // legacy `Register` is dropped outright rather than trusted.
+                if self.roots_cfg.is_some() {
+                    return Vec::new();
+                }
                 self.register_if_fresh(node, counter, src, now_ms);
+                Vec::new()
+            }
+            Message::RegisterSigned { record } => {
+                let Some((ca_pubkeys, network_id)) = self.roots_cfg.as_ref() else {
+                    // Rootless server: `RegisterSigned` has no roots to
+                    // verify against, so it is meaningless here — drop
+                    // rather than trust it unverified.
+                    return Vec::new();
+                };
+                if record
+                    .verify(ca_pubkeys, network_id, now_secs, REGISTRATION_SKEW_SECS)
+                    .is_err()
+                {
+                    // Forged signature, expired/not-yet-valid cert, untrusted
+                    // CA, or a node_id that doesn't match the signer's own
+                    // key (squatting) — drop; no store, no reply, and
+                    // crucially no touch of any EXISTING registration under
+                    // this node_id (an attacker can't clobber a victim's
+                    // real entry with a record that fails verification).
+                    return Vec::new();
+                }
+                let node = record.node_id;
+                if self.register_if_fresh(node, record.seq, src, now_ms) {
+                    if let Some(reg) = self.regs.get_mut(&node) {
+                        reg.record = Some(record);
+                    }
+                }
                 Vec::new()
             }
             Message::Lookup { node } => match self.regs.get(&node) {
@@ -211,10 +294,7 @@ impl RendezvousServer {
                         Message::PeerInfo {
                             node,
                             reflexive: peer_addr,
-                            // TODO(#37 task 2): serve the stored signed
-                            // `Record` here once the server verifies and
-                            // stores registrations.
-                            record: None,
+                            record: reg.record.clone(),
                         },
                     )];
                     // Tell the looked-up peer to punch back toward the requester.
@@ -251,9 +331,6 @@ impl RendezvousServer {
             | Message::NotFound { .. }
             | Message::PunchHint { .. }
             | Message::RelayDeliver { .. } => Vec::new(),
-            // TODO(#37 task 2): verify against roots and store; dropped for
-            // now (codec-only in this task).
-            Message::RegisterSigned { .. } => Vec::new(),
         }
     }
 }
@@ -262,10 +339,20 @@ impl RendezvousServer {
 mod tests {
     use super::*;
     use crate::proto::{node_id, Message};
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand_core::OsRng;
     use std::net::SocketAddr;
+    use yip_membership::Cert;
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    /// Wall-clock seconds for `handle`'s `now_secs` param. The pre-#37 tests
+    /// below never touch cert/record validity, so any monotone value works;
+    /// reusing the test's `now_ms` value keeps each call site simple.
+    fn now_secs(t: u64) -> u64 {
+        t
     }
 
     /// Synthesize a distinct `SocketAddr` from an index, without relying on
@@ -291,11 +378,17 @@ mod tests {
                 counter: 1,
             },
             0,
+            now_secs(0),
         );
         assert!(out.is_empty(), "register produces no reply");
         // B looks up A: gets A's reflexive via PeerInfo, and A gets a PunchHint
         // carrying B's reflexive.
-        let out = s.handle(addr("203.0.113.9:52000"), Message::Lookup { node: a }, 10);
+        let out = s.handle(
+            addr("203.0.113.9:52000"),
+            Message::Lookup { node: a },
+            10,
+            now_secs(10),
+        );
         // one reply to B (PeerInfo), one to A (PunchHint)
         assert!(out.iter().any(|(d, m)| *d == addr("203.0.113.9:52000")
             && matches!(m, Message::PeerInfo { node, reflexive, .. } if *node == a && *reflexive == addr("198.51.100.7:41000"))));
@@ -307,7 +400,12 @@ mod tests {
     fn lookup_unregistered_returns_notfound() {
         let mut s = RendezvousServer::new(0);
         let a = node_id(&[1u8; 32]);
-        let out = s.handle(addr("203.0.113.9:52000"), Message::Lookup { node: a }, 0);
+        let out = s.handle(
+            addr("203.0.113.9:52000"),
+            Message::Lookup { node: a },
+            0,
+            now_secs(0),
+        );
         assert_eq!(
             out,
             vec![(addr("203.0.113.9:52000"), Message::NotFound { node: a })]
@@ -325,12 +423,14 @@ mod tests {
                 counter: 1,
             },
             0,
+            now_secs(0),
         );
         s.sweep(REG_TTL_MS + 1);
         let out = s.handle(
             addr("203.0.113.9:52000"),
             Message::Lookup { node: a },
             REG_TTL_MS + 2,
+            now_secs(REG_TTL_MS + 2),
         );
         assert!(matches!(out.as_slice(), [(_, Message::NotFound { .. })]));
     }
@@ -347,6 +447,7 @@ mod tests {
                 counter: 1,
             },
             0,
+            now_secs(0),
         ); // A registered
            // B relays a payload to A -> A gets RelayDeliver{src=B, payload}.
         let out = s.handle(
@@ -357,6 +458,7 @@ mod tests {
                 payload: vec![9, 9],
             },
             5,
+            now_secs(5),
         );
         assert_eq!(
             out,
@@ -384,6 +486,7 @@ mod tests {
                 payload: vec![1],
             },
             0,
+            now_secs(0),
         );
         assert!(out.is_empty());
         assert_eq!(s.forwarded_count(), 0);
@@ -397,7 +500,9 @@ mod tests {
         // Exceed the per-window cap; excess Lookups must produce no replies.
         let mut replies = 0;
         for _ in 0..(MAX_MSGS_PER_WINDOW + 10) {
-            replies += s.handle(src, Message::Lookup { node: a }, 0).len();
+            replies += s
+                .handle(src, Message::Lookup { node: a }, 0, now_secs(0))
+                .len();
         }
         // Only up to the cap are serviced (each serviced Lookup -> 1 NotFound).
         assert!(
@@ -413,7 +518,7 @@ mod tests {
         // Comfortably below MAX_RATE_ENTRIES: exercises normal growth and
         // confirms the map only ever holds one entry per distinct source.
         for i in 0..2_000u32 {
-            s.handle(synth_addr(i), Message::Lookup { node: a }, 0);
+            s.handle(synth_addr(i), Message::Lookup { node: a }, 0, now_secs(0));
         }
         assert_eq!(s.rates.len(), 2_000);
         assert!(s.rates.len() <= MAX_RATE_ENTRIES);
@@ -432,6 +537,7 @@ mod tests {
                 counter: 5,
             },
             0,
+            now_secs(0),
         );
         assert!(s.is_registered(&n, 0), "counter 5 accepted");
         // Replay at counter 5 is rejected: a Lookup still resolves to the
@@ -444,8 +550,9 @@ mod tests {
                 counter: 5,
             },
             1,
+            now_secs(1),
         );
-        let out = s.handle(a, Message::Lookup { node: n }, 2);
+        let out = s.handle(a, Message::Lookup { node: n }, 2, now_secs(2));
         match &out[0].1 {
             Message::PeerInfo { reflexive, .. } => assert_eq!(*reflexive, a),
             other => panic!("expected PeerInfo, got {other:?}"),
@@ -458,8 +565,9 @@ mod tests {
                 counter: 6,
             },
             3,
+            now_secs(3),
         );
-        let out = s.handle(a, Message::Lookup { node: n }, 4);
+        let out = s.handle(a, Message::Lookup { node: n }, 4, now_secs(4));
         match &out[0].1 {
             Message::PeerInfo { reflexive, .. } => assert_eq!(*reflexive, a2),
             other => panic!("expected PeerInfo, got {other:?}"),
@@ -540,7 +648,12 @@ mod tests {
         );
 
         // The UDP path must have no idea this node exists.
-        let out = s.handle(addr("203.0.113.9:52000"), Message::Lookup { node }, 0);
+        let out = s.handle(
+            addr("203.0.113.9:52000"),
+            Message::Lookup { node },
+            0,
+            now_secs(0),
+        );
         assert_eq!(
             out,
             vec![(addr("203.0.113.9:52000"), Message::NotFound { node })],
@@ -584,13 +697,15 @@ mod tests {
                     src: n,
                     payload: vec![1, 2, 3]
                 },
-                0
+                0,
+                now_secs(0),
             )
             .is_empty(),
             "RelayDeliver is server->client only"
         );
         assert!(
-            s.handle(a, Message::NotFound { node: n }, 0).is_empty(),
+            s.handle(a, Message::NotFound { node: n }, 0, now_secs(0))
+                .is_empty(),
             "NotFound is server->client only"
         );
     }
@@ -604,15 +719,21 @@ mod tests {
         let n = node_id(&[4u8; 32]);
         // Exhaust the window at t=0 (Lookups return NotFound but still count).
         for _ in 0..MAX_MSGS_PER_WINDOW {
-            s.handle(a, Message::Lookup { node: n }, 0);
+            s.handle(a, Message::Lookup { node: n }, 0, now_secs(0));
         }
         assert!(
-            s.handle(a, Message::Lookup { node: n }, 0).is_empty(),
+            s.handle(a, Message::Lookup { node: n }, 0, now_secs(0))
+                .is_empty(),
             "over budget within the window ⇒ dropped"
         );
         assert!(
-            !s.handle(a, Message::Lookup { node: n }, RATE_WINDOW_MS)
-                .is_empty(),
+            !s.handle(
+                a,
+                Message::Lookup { node: n },
+                RATE_WINDOW_MS,
+                now_secs(RATE_WINDOW_MS)
+            )
+            .is_empty(),
             "window reset after RATE_WINDOW_MS ⇒ reply flows again"
         );
     }
@@ -643,7 +764,7 @@ mod tests {
         // so it would return a NotFound reply) and the map would grow past
         // the cap.
         let new_src = addr("198.51.100.50:9000");
-        let out = s.handle(new_src, Message::Lookup { node: a }, 0);
+        let out = s.handle(new_src, Message::Lookup { node: a }, 0, now_secs(0));
         assert!(out.is_empty(), "new source over capacity must be dropped");
         assert_eq!(
             s.rates.len(),
@@ -654,10 +775,260 @@ mod tests {
         // An already-tracked source must still be serviced normally even
         // while the map is at capacity.
         let existing_src = synth_addr(0);
-        let out = s.handle(existing_src, Message::Lookup { node: a }, 0);
+        let out = s.handle(existing_src, Message::Lookup { node: a }, 0, now_secs(0));
         assert!(
             !out.is_empty(),
             "already-tracked source must still be serviced"
         );
+    }
+
+    // ── #37 task 2: RegisterSigned verification + rooted/rootless mode ──
+
+    /// A fixed, deterministic CA signing key shared by every helper below.
+    /// `valid_registration` and `registration_for_other_member` each need to
+    /// mint an INDEPENDENTLY-signed cert under the SAME trusted CA (so a
+    /// squatting attempt has a genuinely valid cert chain, just a mismatched
+    /// `node_id`), and threading a real private key through the brief's
+    /// `registration_for_other_member(ca_pub, ..)` signature (public key
+    /// only) isn't possible — a deterministic shared key sidesteps that
+    /// without changing the helper signatures.
+    fn ca_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x42u8; 32])
+    }
+
+    /// Mint a CA-signed `Cert` for `member_pubkey`/`member_sign_pub`, wide
+    /// open (`not_before: 0, not_after: u64::MAX`) so it validates under any
+    /// `now_secs` these tests use (mirrors `bin/yipd/src/peer_manager.rs`'s
+    /// `mk_cert` test helper).
+    fn mk_cert(
+        ca: &SigningKey,
+        member_pubkey: [u8; 32],
+        member_sign_pub: [u8; 32],
+        network_id: [u8; 16],
+    ) -> Cert {
+        let mut c = Cert {
+            version: 1,
+            member_pubkey,
+            member_sign_pubkey: member_sign_pub,
+            network_id,
+            not_before: 0,
+            not_after: u64::MAX,
+            tags: vec![],
+            ca_sig: [0u8; 64],
+        };
+        c.ca_sig = ca
+            .sign(&yip_membership::cert::cert_signing_body(&c))
+            .to_bytes();
+        c
+    }
+
+    /// Build and sign a `Record` whose `node_id` correctly derives from
+    /// `cert.member_pubkey` (mirrors `bin/yipd/src/membership.rs`'s
+    /// `build_signed_record` test helper).
+    fn build_signed_record(
+        cert: Cert,
+        endpoints: Vec<SocketAddr>,
+        seq: u64,
+        member_sign_priv: &[u8; 32],
+    ) -> Record {
+        let mut r = Record {
+            node_id: node_id(&cert.member_pubkey),
+            cert,
+            endpoints,
+            seq,
+            sig: [0u8; 64],
+        };
+        let body = yip_membership::record::record_signing_body(&r);
+        r.sig = yip_membership::record::sign(&body, member_sign_priv);
+        r
+    }
+
+    /// Mint a fresh, validly-signed `Record` under a fresh member key,
+    /// plus the CA pubkey/network_id needed to verify it and the reflexive
+    /// `SocketAddr` the registration arrives from.
+    fn valid_registration() -> ([u8; 32], [u8; 16], Record, SocketAddr) {
+        let ca = ca_signing_key();
+        let ca_pub = ca.verifying_key().to_bytes();
+        let network_id = [7u8; 16];
+        let member_pub = [1u8; 32];
+        let member_sign_key = SigningKey::generate(&mut OsRng);
+        let member_sign_pub = member_sign_key.verifying_key().to_bytes();
+        let cert = mk_cert(&ca, member_pub, member_sign_pub, network_id);
+        let member_sign_priv: [u8; 32] = member_sign_key.to_bytes();
+        let rec = build_signed_record(cert, vec![addr("192.0.2.1:9")], 1, &member_sign_priv);
+        (ca_pub, network_id, rec, addr("198.51.100.42:41000"))
+    }
+
+    /// Mint a Record signed by a DIFFERENT (but still validly CA-issued)
+    /// member key that CLAIMS `claim_node_id` — the target's node_id —
+    /// rather than the one that actually derives from its own
+    /// `cert.member_pubkey`. A genuinely valid cert chain and a genuinely
+    /// valid signature, but `record.node_id != node_id(cert.member_pubkey)`:
+    /// exactly the squatting case `Record::verify` closes. `seq` is set
+    /// STRICTLY GREATER than the victim's so `register_if_fresh`'s
+    /// freshness gate alone would have accepted this record — isolating
+    /// that it's the node_id-binding check in `verify`, not staleness, that
+    /// saves the victim.
+    fn registration_for_other_member(
+        ca_pub: [u8; 32],
+        network_id: [u8; 16],
+        claim_node_id: NodeId,
+    ) -> Record {
+        let ca = ca_signing_key();
+        assert_eq!(
+            ca.verifying_key().to_bytes(),
+            ca_pub,
+            "test helper CA must match the CA `valid_registration` used"
+        );
+        let attacker_pub = [2u8; 32]; // distinct from valid_registration's member
+        let attacker_sign_key = SigningKey::generate(&mut OsRng);
+        let attacker_sign_pub = attacker_sign_key.verifying_key().to_bytes();
+        let cert = mk_cert(&ca, attacker_pub, attacker_sign_pub, network_id);
+        let mut r = Record {
+            node_id: claim_node_id, // squatting: claims someone else's node_id
+            cert,
+            endpoints: vec![addr("203.0.113.66:9")],
+            seq: 2, // > victim's seq (1)
+            sig: [0u8; 64],
+        };
+        let body = yip_membership::record::record_signing_body(&r);
+        let attacker_sign_priv: [u8; 32] = attacker_sign_key.to_bytes();
+        r.sig = yip_membership::record::sign(&body, &attacker_sign_priv);
+        r
+    }
+
+    #[test]
+    fn rooted_server_accepts_valid_signed_register_and_serves_it() {
+        let (ca_pub, network_id, rec, member_src) = valid_registration();
+        let mut s = RendezvousServer::new_with_roots(0, vec![ca_pub], network_id);
+        let _ = s.handle(
+            member_src,
+            Message::RegisterSigned {
+                record: rec.clone(),
+            },
+            0,
+            now_secs(0),
+        );
+        let out = s.handle(
+            addr("203.0.113.9:5"),
+            Message::Lookup { node: rec.node_id },
+            10,
+            now_secs(10),
+        );
+        assert!(out.iter().any(|(_, m)| matches!(m,
+            Message::PeerInfo { reflexive, record: Some(r), .. }
+                if *reflexive == member_src && r.node_id == rec.node_id)));
+    }
+
+    #[test]
+    fn rooted_server_rejects_forged_signature() {
+        let (ca_pub, network_id, mut rec, member_src) = valid_registration();
+        rec.sig[0] ^= 0xFF; // corrupt the signature
+        let mut s = RendezvousServer::new_with_roots(0, vec![ca_pub], network_id);
+        let _ = s.handle(
+            member_src,
+            Message::RegisterSigned {
+                record: rec.clone(),
+            },
+            0,
+            now_secs(0),
+        );
+        // Not stored → lookup yields NotFound.
+        let out = s.handle(
+            addr("203.0.113.9:5"),
+            Message::Lookup { node: rec.node_id },
+            10,
+            now_secs(10),
+        );
+        assert!(out
+            .iter()
+            .all(|(_, m)| !matches!(m, Message::PeerInfo { .. })));
+    }
+
+    #[test]
+    fn rooted_server_rejects_overwrite_by_non_holder() {
+        // Victim registers; attacker sends RegisterSigned for the victim's
+        // node_id signed by a DIFFERENT (valid-CA) member key → node_id !=
+        // node_id(attacker cert) → rejected.
+        let (ca_pub, network_id, victim, victim_src) = valid_registration();
+        let attacker = registration_for_other_member(ca_pub, network_id, victim.node_id);
+        let mut s = RendezvousServer::new_with_roots(0, vec![ca_pub], network_id);
+        let _ = s.handle(
+            victim_src,
+            Message::RegisterSigned {
+                record: victim.clone(),
+            },
+            0,
+            now_secs(0),
+        );
+        let _ = s.handle(
+            addr("203.0.113.66:9"),
+            Message::RegisterSigned { record: attacker },
+            1,
+            now_secs(1),
+        );
+        let out = s.handle(
+            addr("203.0.113.9:5"),
+            Message::Lookup {
+                node: victim.node_id,
+            },
+            2,
+            now_secs(2),
+        );
+        assert!(
+            out.iter()
+                .any(|(_, m)| matches!(m, Message::PeerInfo { reflexive, .. } if *reflexive == victim_src)),
+            "victim's real registration must survive the overwrite attempt"
+        );
+    }
+
+    #[test]
+    fn rooted_server_drops_legacy_unsigned_register() {
+        let (ca_pub, network_id, _rec, _src) = valid_registration();
+        let mut s = RendezvousServer::new_with_roots(0, vec![ca_pub], network_id);
+        let _ = s.handle(
+            addr("203.0.113.66:9"),
+            Message::Register {
+                node: [1u8; 16],
+                counter: 9,
+            },
+            0,
+            now_secs(0),
+        );
+        let out = s.handle(
+            addr("203.0.113.9:5"),
+            Message::Lookup { node: [1u8; 16] },
+            1,
+            now_secs(1),
+        );
+        assert!(
+            out.iter()
+                .all(|(_, m)| !matches!(m, Message::PeerInfo { .. })),
+            "a rooted (mesh) server must not accept unsigned registrations"
+        );
+    }
+
+    #[test]
+    fn rootless_server_keeps_legacy_register() {
+        let mut s = RendezvousServer::new(0); // no roots
+        let a = [1u8; 16];
+        let _ = s.handle(
+            addr("198.51.100.7:41000"),
+            Message::Register {
+                node: a,
+                counter: 1,
+            },
+            0,
+            now_secs(0),
+        );
+        let out = s.handle(
+            addr("203.0.113.9:5"),
+            Message::Lookup { node: a },
+            1,
+            now_secs(1),
+        );
+        assert!(out
+            .iter()
+            .any(|(_, m)| matches!(m, Message::PeerInfo { .. })));
     }
 }

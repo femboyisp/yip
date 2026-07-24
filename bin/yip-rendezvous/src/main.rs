@@ -503,6 +503,15 @@ async fn run_udp(
 ) -> std::io::Result<()> {
     let now_ms =
         |base: Instant| -> u64 { u64::try_from(base.elapsed().as_millis()).unwrap_or(u64::MAX) };
+    // WALL-CLOCK seconds, used ONLY by `handle`'s `RegisterSigned` verify
+    // path to check a cert's `not_before`/`not_after` window — distinct
+    // from `now_ms`'s monotonic `Instant`-based clock used for TTL/rate.
+    let now_secs = || -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    };
     let mut rx = [0u8; 2048];
     let mut sweep =
         tokio::time::interval_at(tokio::time::Instant::now() + SWEEP_INTERVAL, SWEEP_INTERVAL);
@@ -516,7 +525,7 @@ async fn run_udp(
                 if let Some(msg) = decode_inbound(obf_key.as_ref(), &rx[..n]) {
                     let replies = {
                         let mut s = server.lock().await;
-                        s.handle(src, msg, now_ms(base))
+                        s.handle(src, msg, now_ms(base), now_secs())
                     };
                     for (dst, reply) in replies {
                         let wire = wrap_reply(obf_key.as_ref(), &reply);
