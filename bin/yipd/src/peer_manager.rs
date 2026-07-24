@@ -350,6 +350,12 @@ pub struct PeerManager {
     /// promptly rather than waiting a full [`REG_REFRESH_MS`] interval — the
     /// loop clock starts at 0).
     registered_once: bool,
+    /// Monotonic freshness counter for signed registrations (#37 Task 5):
+    /// bumped every time `tick_dispatch` emits a registration, and passed to
+    /// `Membership::sign_registration` when membership is configured. Never
+    /// reset for the process's lifetime, so a captured `RegisterSigned` can
+    /// never be replayed to look fresher than a subsequent one.
+    reg_seq: u64,
     /// Reused scratch for `on_udp`/`on_tun` return values.
     egress: Vec<EgressDatagram>,
     /// Reused scratch for `tick`'s return value.
@@ -503,6 +509,7 @@ impl PeerManager {
             last_register_ms: 0,
             reg_refresh_ms: REG_REFRESH_MS,
             registered_once: false,
+            reg_seq: 0,
             egress: Vec::new(),
             tick_egress: Vec::new(),
             tun_scratch: Vec::new(),
@@ -995,10 +1002,22 @@ impl PeerManager {
             None => return DispatchOut::None,
         };
         match ev {
-            RdvEvent::PeerCandidate { node, addr } => {
-                if let Some(&idx) = self.by_node.get(&node) {
-                    if !matches!(self.peers[idx].state, PeerState::Established(_)) {
-                        self.peers[idx].path.on_peer_candidate(addr, now_ms);
+            RdvEvent::PeerCandidate { node, addr, record } => {
+                // Mesh mode (membership configured): a candidate carrying a
+                // record must verify against our roots before we act on it —
+                // an unverifiable/forged record drops the candidate entirely
+                // (no probe). Non-mesh (no membership) or a candidate with no
+                // record (legacy server) keeps today's unauthenticated
+                // behavior (#37 Task 5).
+                let record_ok = match (self.membership.as_ref(), &record) {
+                    (Some(m), Some(r)) => m.verify_record(r, now_secs()),
+                    _ => true,
+                };
+                if record_ok {
+                    if let Some(&idx) = self.by_node.get(&node) {
+                        if !matches!(self.peers[idx].state, PeerState::Established(_)) {
+                            self.peers[idx].path.on_peer_candidate(addr, now_ms);
+                        }
                     }
                 }
                 DispatchOut::None
@@ -2860,8 +2879,17 @@ impl PeerManager {
                 || now_ms.saturating_sub(self.last_register_ms) >= self.reg_refresh_ms)
         {
             let node = self.local_node_id;
+            // Mesh mode (membership configured): mint a fresh signed
+            // registration record at the current `reg_seq` so the server can
+            // verify authenticity instead of trusting an unauthenticated
+            // `counter` (#37 Task 5). Non-mesh keeps the legacy `Register`.
+            let signed = self
+                .membership
+                .as_ref()
+                .map(|m| m.sign_registration(self.reg_seq));
+            self.reg_seq = self.reg_seq.saturating_add(1);
             if let Some(r) = self.rendezvous.as_mut() {
-                if let Some(dg) = r.register(node) {
+                if let Some(dg) = r.register(node, signed) {
                     self.tick_egress.push(dg);
                 }
             }
@@ -5001,9 +5029,20 @@ mod tests {
     }
 
     impl Rendezvous for MockRdv {
-        fn register(&mut self, node: NodeId) -> Option<EgressDatagram> {
-            // counter bumped per-registration in 3c.4; 0 is accepted as first-seen
-            Some(self.to_server(yip_rendezvous::Message::Register { node, counter: 0 }))
+        fn register(
+            &mut self,
+            node: NodeId,
+            signed: Option<yip_membership::Record>,
+        ) -> Option<EgressDatagram> {
+            match signed {
+                Some(record) => {
+                    Some(self.to_server(yip_rendezvous::Message::RegisterSigned { record }))
+                }
+                // counter bumped per-registration in 3c.4; 0 is accepted as first-seen
+                None => {
+                    Some(self.to_server(yip_rendezvous::Message::Register { node, counter: 0 }))
+                }
+            }
         }
         fn lookup(&mut self, node: NodeId) -> EgressDatagram {
             self.to_server(yip_rendezvous::Message::Lookup { node })
@@ -5018,10 +5057,13 @@ mod tests {
         fn parse(&self, dg: &[u8]) -> RdvEvent {
             match yip_rendezvous::decode(dg) {
                 Some(yip_rendezvous::Message::PeerInfo {
-                    node, reflexive, ..
+                    node,
+                    reflexive,
+                    record,
                 }) => RdvEvent::PeerCandidate {
                     node,
                     addr: reflexive,
+                    record: record.map(Box::new),
                 },
                 Some(yip_rendezvous::Message::PunchHint { node, reflexive }) => RdvEvent::PunchTo {
                     node,
@@ -5064,6 +5106,35 @@ mod tests {
             TunnelMode::L3Tun,
             Some(rdv),
             None,
+            false,
+        );
+        (pm, sent)
+    }
+
+    /// Like `pm_with_mock_rdv`, but with `membership` configured (mesh
+    /// mode) — used by the `PeerCandidate`-record-verification tests (#37
+    /// Task 5), which need the `MockRdv` to decode a real `PeerInfo.record`
+    /// AND a `Membership` to verify it against.
+    fn pm_with_mock_rdv_and_membership(
+        local: &yip_crypto::Keypair,
+        peers: &[PeerConfig],
+        membership: Membership,
+    ) -> (
+        PeerManager,
+        std::rc::Rc<std::cell::RefCell<Vec<yip_rendezvous::Message>>>,
+    ) {
+        let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let rdv: Box<dyn Rendezvous> = Box::new(MockRdv {
+            server: mock_server(),
+            sent: sent.clone(),
+        });
+        let pm = PeerManager::new(
+            local.private,
+            local.public,
+            peers,
+            TunnelMode::L3Tun,
+            Some(rdv),
+            Some(membership),
             false,
         );
         (pm, sent)
@@ -5235,6 +5306,135 @@ mod tests {
             "the datagram to the candidate is a handshake Init"
         );
         assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    }
+
+    /// Build a mesh (`membership: Some`) `Membership` for `local_pub` trusting
+    /// `ca`, whose `roots` names `ca`'s own pubkey — the convention
+    /// `Membership::verify_record` relies on (it treats `roots.roots`'
+    /// pubkeys as the trusted CA set, mirroring `bin/yip-rendezvous`'s own
+    /// rooted-server convention). Shared by the two `PeerCandidate`-record
+    /// verification tests below (#37 Task 5).
+    fn membership_trusting_ca_via_roots(ca: &SigningKey, local_pub: [u8; 32]) -> Membership {
+        let ca_pub = ca.verifying_key().to_bytes();
+        let own_sign = SigningKey::from_bytes(&[201u8; 32]);
+        let own_cert = mk_cert(ca, local_pub, own_sign.verifying_key().to_bytes());
+        let roots = RootSet {
+            roots: vec![(ca_pub, "10.0.0.99:51820".parse().unwrap())],
+            version: 0,
+            ca_sig: [0u8; 64],
+        };
+        Membership::new(
+            vec![ca_pub],
+            TEST_NET,
+            own_cert,
+            own_sign.to_bytes(),
+            roots,
+            vec!["10.0.0.1:51820".parse().unwrap()],
+        )
+    }
+
+    /// #37 Task 5: a `PeerCandidate` carrying a record that VERIFIES against
+    /// our membership roots is accepted — the candidate is set and a
+    /// subsequent tick probes it with a handshake `Init`, exactly like the
+    /// no-record (`peer_candidate_then_tick_probes_candidate_with_init`)
+    /// case above.
+    #[test]
+    fn peer_candidate_with_valid_signed_record_is_accepted_and_probed() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let membership = membership_trusting_ca_via_roots(&ca, local.public);
+        let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[peer], membership);
+
+        let candidate: SocketAddr = "198.51.100.7:41000".parse().unwrap();
+        let valid_rec = mk_record(&ca, 55, peer_kp.public, vec![candidate], 1);
+        let mut buf = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PeerInfo {
+                node: node_id(&peer_kp.public),
+                reflexive: candidate,
+                record: Some(valid_rec),
+            },
+            &mut buf,
+        );
+        assert!(matches!(
+            pm.on_udp(mock_server(), &buf, 0),
+            DispatchOut::None
+        ));
+        assert_eq!(
+            pm.peers[0].path.candidate(),
+            Some(candidate),
+            "a validly-signed record must set the candidate"
+        );
+
+        let out = pm.tick(1).map(<[_]>::to_vec).unwrap_or_default();
+        let init = out
+            .iter()
+            .find(|d| d.dst == candidate)
+            .expect("a handshake Init is emitted toward the verified candidate");
+        assert_eq!(
+            init.bytes[0],
+            PacketType::HandshakeInit as u8,
+            "the datagram to the candidate is a handshake Init"
+        );
+        assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    }
+
+    /// #37 Task 5: a `PeerCandidate` carrying a record that FAILS
+    /// `verify_record` (signed by a CA outside our membership roots — a
+    /// forged/foreign record) must be DROPPED: no candidate is set and no
+    /// probe is ever sent toward it, even after a tick. This is the
+    /// discriminating half of the pair — it genuinely rejects, it doesn't
+    /// just happen to also pass.
+    #[test]
+    fn peer_candidate_with_invalid_record_is_dropped_no_probe() {
+        let ca = test_ca();
+        let foreign_ca = SigningKey::from_bytes(&[177u8; 32]); // NOT in this membership's roots
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let membership = membership_trusting_ca_via_roots(&ca, local.public);
+        let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[peer], membership);
+
+        let candidate: SocketAddr = "198.51.100.7:41000".parse().unwrap();
+        // Signed under `foreign_ca`, not the trusted `ca` — a forged record
+        // claiming to be `peer_kp`'s.
+        let forged = mk_record(&foreign_ca, 55, peer_kp.public, vec![candidate], 1);
+        let mut buf = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PeerInfo {
+                node: node_id(&peer_kp.public),
+                reflexive: candidate,
+                record: Some(forged),
+            },
+            &mut buf,
+        );
+        assert!(matches!(
+            pm.on_udp(mock_server(), &buf, 0),
+            DispatchOut::None
+        ));
+        assert_eq!(
+            pm.peers[0].path.candidate(),
+            None,
+            "an unverifiable record must NOT set the candidate"
+        );
+
+        let out = pm.tick(1).map(<[_]>::to_vec).unwrap_or_default();
+        assert!(
+            !out.iter().any(|d| d.dst == candidate),
+            "no probe may be sent toward a candidate carrying an unverifiable record"
+        );
+        assert!(
+            matches!(pm.peers[0].state, PeerState::Idle),
+            "the peer must stay Idle: the forged candidate was never acted on"
+        );
     }
 
     /// (c) With NO rendezvous configured, a peer with a direct endpoint behaves

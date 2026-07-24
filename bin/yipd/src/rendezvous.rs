@@ -6,6 +6,7 @@
 use std::net::SocketAddr;
 
 use yip_io::poll::EgressDatagram;
+use yip_membership::Record;
 use yip_rendezvous::{decode, encode, Message, NodeId};
 
 /// A parsed inbound rendezvous datagram, normalized for the path SM.
@@ -14,8 +15,18 @@ use yip_rendezvous::{decode, encode, Message, NodeId};
 /// path state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RdvEvent {
-    /// The server told us where a peer is (answer to our `lookup`).
-    PeerCandidate { node: NodeId, addr: SocketAddr },
+    /// The server told us where a peer is (answer to our `lookup`). `record`
+    /// is the peer's signed directory record when the server has one on file
+    /// (mesh mode) — `parse` cannot verify it (no roots), so it is surfaced
+    /// as-is for `PeerManager` to verify against `Membership::verify_record`
+    /// before acting on the candidate (#37 Task 5). Boxed: `Record` (a `Cert`
+    /// plus endpoints/sig) is far larger than the other variants, and
+    /// clippy's `large_enum_variant` flags an unboxed `Option<Record>` here.
+    PeerCandidate {
+        node: NodeId,
+        addr: SocketAddr,
+        record: Option<Box<Record>>,
+    },
     /// The server asked us to punch toward a peer that looked us up.
     PunchTo { node: NodeId, addr: SocketAddr },
     /// A relayed tunnel datagram from `src`; `payload` is fed to the peer path.
@@ -34,8 +45,12 @@ pub enum RdvEvent {
 pub trait Rendezvous {
     /// Emit a registration datagram, or `None` if registration is handled
     /// elsewhere (the 3c.4 relay thread sends `Register` itself). UDP impls
-    /// return `Some`.
-    fn register(&mut self, node: NodeId) -> Option<EgressDatagram>;
+    /// return `Some`. `signed` is `Some(record)` when the caller (mesh mode,
+    /// membership configured) has minted a fresh signed registration record
+    /// via `Membership::sign_registration` — emitted as `RegisterSigned`.
+    /// `None` (non-mesh) falls back to the legacy unauthenticated `Register`
+    /// (#37 Task 5).
+    fn register(&mut self, node: NodeId, signed: Option<Record>) -> Option<EgressDatagram>;
     fn lookup(&mut self, node: NodeId) -> EgressDatagram;
     fn relay(&mut self, src: NodeId, dst: NodeId, payload: &[u8]) -> EgressDatagram;
     fn parse(&self, dg: &[u8]) -> RdvEvent;
@@ -67,9 +82,12 @@ impl ConfiguredServerRendezvous {
 }
 
 impl Rendezvous for ConfiguredServerRendezvous {
-    fn register(&mut self, node: NodeId) -> Option<EgressDatagram> {
-        // counter bumped per-registration in 3c.4; 0 is accepted as first-seen
-        Some(self.to_server(&Message::Register { node, counter: 0 }))
+    fn register(&mut self, node: NodeId, signed: Option<Record>) -> Option<EgressDatagram> {
+        match signed {
+            Some(record) => Some(self.to_server(&Message::RegisterSigned { record })),
+            // counter bumped per-registration in 3c.4; 0 is accepted as first-seen
+            None => Some(self.to_server(&Message::Register { node, counter: 0 })),
+        }
     }
     fn lookup(&mut self, node: NodeId) -> EgressDatagram {
         self.to_server(&Message::Lookup { node })
@@ -83,14 +101,14 @@ impl Rendezvous for ConfiguredServerRendezvous {
     }
     fn parse(&self, dg: &[u8]) -> RdvEvent {
         match decode(dg) {
-            // TODO(#37 task 5): surface `record` to the caller so
-            // `PeerManager` can verify it against membership roots before
-            // probing (codec-only in task 1).
             Some(Message::PeerInfo {
-                node, reflexive, ..
+                node,
+                reflexive,
+                record,
             }) => RdvEvent::PeerCandidate {
                 node,
                 addr: reflexive,
+                record: record.map(Box::new),
             },
             Some(Message::PunchHint { node, reflexive }) => RdvEvent::PunchTo {
                 node,
@@ -129,7 +147,7 @@ impl TlsRelayRendezvous {
 }
 
 impl Rendezvous for TlsRelayRendezvous {
-    fn register(&mut self, _node: NodeId) -> Option<EgressDatagram> {
+    fn register(&mut self, _node: NodeId, _signed: Option<Record>) -> Option<EgressDatagram> {
         None // the relay thread owns Register (first-on-connect + keepalive)
     }
     fn lookup(&mut self, _node: NodeId) -> EgressDatagram {
@@ -166,7 +184,7 @@ mod tests {
     fn register_targets_server_with_our_node_id() {
         let mut r = ConfiguredServerRendezvous::new(server());
         let me = node_id(&[1u8; 32]);
-        let dg = r.register(me).expect("UDP register is always Some");
+        let dg = r.register(me, None).expect("UDP register is always Some");
         assert_eq!(dg.dst, server());
         assert_eq!(
             yip_rendezvous::decode(&dg.bytes),
@@ -174,6 +192,74 @@ mod tests {
                 node: me,
                 counter: 0
             })
+        );
+    }
+
+    /// Decode an `EgressDatagram`'s bytes as a rendezvous `Message` (test
+    /// helper mirroring `register`/`relay`'s wire framing).
+    fn decode_to_server(dg: &EgressDatagram) -> Option<Message> {
+        yip_rendezvous::decode(&dg.bytes)
+    }
+
+    /// Build a decode-valid `Record` whose `node_id` is exactly `node` (a
+    /// test fixture, not a correctly-derived-from-pubkey record — `register`
+    /// passes `signed` through unverified, so only the wire round-trip
+    /// matters here). Mirrors `yip-rendezvous/src/proto.rs`'s own
+    /// `sample_record` fixture, with deterministic (non-OsRng) keys since
+    /// `yipd`'s dev-deps don't pull in `rand_core`.
+    fn sample_record_with_node(node: NodeId) -> Record {
+        use ed25519_dalek::{Signer, SigningKey};
+        use yip_membership::cert::cert_signing_body;
+        use yip_membership::record::{record_signing_body, sign};
+        use yip_membership::Cert;
+
+        let ca = SigningKey::from_bytes(&[9u8; 32]);
+        let member_pubkey = [1u8; 32];
+        let member_sign_key = SigningKey::from_bytes(&[2u8; 32]);
+        let member_sign_pubkey = member_sign_key.verifying_key().to_bytes();
+        let network_id = [7u8; 16];
+
+        let mut cert = Cert {
+            version: 1,
+            member_pubkey,
+            member_sign_pubkey,
+            network_id,
+            not_before: 100,
+            not_after: 200,
+            tags: vec![],
+            ca_sig: [0u8; 64],
+        };
+        cert.ca_sig = ca.sign(&cert_signing_body(&cert)).to_bytes();
+
+        let mut record = Record {
+            node_id: node,
+            cert,
+            endpoints: vec!["192.0.2.1:8080".parse().unwrap()],
+            seq: 1,
+            sig: [0u8; 64],
+        };
+        let body = record_signing_body(&record);
+        record.sig = sign(&body, &member_sign_key.to_bytes());
+        record
+    }
+
+    #[test]
+    fn register_emits_signed_when_record_present() {
+        let mut r = ConfiguredServerRendezvous::new(server());
+        let me = [3u8; 16];
+        let rec = sample_record_with_node(me);
+        let dg = r.register(me, Some(rec.clone())).expect("Some");
+        let msg = decode_to_server(&dg);
+        assert!(matches!(msg, Some(Message::RegisterSigned { record }) if record.node_id == me));
+    }
+
+    #[test]
+    fn register_falls_back_to_unsigned_without_record() {
+        let mut r = ConfiguredServerRendezvous::new(server());
+        let me = [3u8; 16];
+        let dg = r.register(me, None).expect("Some");
+        assert!(
+            matches!(decode_to_server(&dg), Some(Message::Register { node, .. }) if node == me)
         );
     }
 
@@ -227,7 +313,7 @@ mod tests {
             &mut buf,
         );
         assert!(
-            matches!(r.parse(&buf), RdvEvent::PeerCandidate { node, addr } if node == n && addr == a)
+            matches!(r.parse(&buf), RdvEvent::PeerCandidate { node, addr, record } if node == n && addr == a && record.is_none())
         );
         buf.clear();
         encode(
@@ -260,7 +346,7 @@ mod tests {
         let mut r = TlsRelayRendezvous::new(addr);
         let n = node_id(&[7u8; 32]);
         assert!(
-            r.register(n).is_none(),
+            r.register(n, None).is_none(),
             "thread owns Register on the TLS path"
         );
         let dg = r.relay(node_id(&[1u8; 32]), n, b"payload");
