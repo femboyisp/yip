@@ -2470,9 +2470,14 @@ impl PeerManager {
     /// Order (matches the addendum):
     /// (a) If `src` is a known `Established` peer, try that peer's
     ///     `session_obf_key`; accept only `Data`/`Control`/`Gossip`.
-    /// (b) Otherwise (or if (a) did not yield one of those types), try the
-    ///     network `obf_key`; accept only `HandshakeInit`/`HandshakeResp` — this
-    ///     covers a brand-new peer's `Init` AND a re-handshake from a known src.
+    /// (a') Otherwise (the peer may have roamed to a new source), trial every
+    ///     `Established` peer's `session_obf_key` in turn; accept only
+    ///     `Data`/`Control`/`Gossip` — mirrors `handle_data_or_control`'s
+    ///     plaintext roaming fallback loop, one layer up.
+    /// (b) Otherwise (or if (a)/(a') did not yield one of those types), try
+    ///     the network `obf_key`; accept only `HandshakeInit`/`HandshakeResp`
+    ///     — this covers a brand-new peer's `Init` AND a re-handshake from a
+    ///     known src.
     ///
     /// A wrong key yields `None` or a garbage `(ptype, body)`; the type-set
     /// filters and, ultimately, the inner Noise/AEAD/frame verify make every
@@ -2489,6 +2494,30 @@ impl PeerManager {
             if let Some((ptype, body)) = yip_obf::deobfuscate(&key, dg) {
                 if ptype == yip_obf::JUNK_TYPE {
                     return None; // idle-cover decoy: inert, dropped, no fall-through
+                }
+                if ptype == PacketType::Data as u8
+                    || ptype == PacketType::Control as u8
+                    || ptype == PacketType::Gossip as u8
+                {
+                    return Some(reassemble(ptype, &body));
+                }
+            }
+        }
+        // (a') Roaming fallback: no endpoint match, but the datagram may be a
+        // roamed Established peer's Data/Control/Gossip under its session key.
+        // Trial each Established peer's session key; a wrong key yields None or a
+        // garbage type that the type-set + inner verify drop safely (same
+        // invariant as `handle_data_or_control`'s plaintext roaming loop).
+        for p in &self.peers {
+            if !matches!(p.state, PeerState::Established(_)) {
+                continue;
+            }
+            let Some(key) = p.session_obf_key else {
+                continue;
+            };
+            if let Some((ptype, body)) = yip_obf::deobfuscate(&key, dg) {
+                if ptype == yip_obf::JUNK_TYPE {
+                    return None;
                 }
                 if ptype == PacketType::Data as u8
                     || ptype == PacketType::Control as u8
@@ -7847,6 +7876,79 @@ mod tests {
         // No peer disturbed.
         assert!(matches!(pm.peers[0].state, PeerState::Idle));
         assert!(pm.by_tag.is_empty());
+    }
+
+    // ── M2 roaming: deobf_ingress trial fallback ────────────────────────────
+
+    /// Build an obf-on `PeerManager` with a single `Established` peer at a
+    /// known endpoint and a known `session_obf_key`, plus a plaintext
+    /// `[Data][body]` datagram as `deobf_ingress` would return it — the
+    /// shared fixture for the roaming trial-fallback tests below.
+    fn established_obf_peer_with_data() -> (PeerManager, [u8; 16], Vec<u8>) {
+        const TAG: u64 = 0x9999_1111_2222_3333;
+        let peer_ep: SocketAddr = "10.0.0.30:3030".parse().unwrap();
+        let peer = peer_cfg(30, "10.0.0.30:3030");
+        let mut pm = PeerManager::new(
+            [31u8; 32],
+            [32u8; 32],
+            &[peer],
+            TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
+        pm.set_obf_psk(Some([0xCCu8; 32]));
+
+        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(TAG, peer_ep)),
+            0,
+        )));
+        let sess = [0xDDu8; 16];
+        pm.peers[0].session_obf_key = Some(sess);
+        pm.by_tag.insert(TAG, 0);
+
+        let mut plaintext = vec![PacketType::Data as u8];
+        plaintext.extend_from_slice(&[0x55u8; 40]);
+        (pm, sess, plaintext)
+    }
+
+    /// With obfuscation on, a `Data` datagram obfuscated under an
+    /// `Established` peer's session key, but arriving from a source that does
+    /// NOT match that peer's recorded `endpoint` (the peer roamed to a new
+    /// NAT mapping), still deobfuscates: step (a)'s endpoint fast-path misses,
+    /// but the (a') roaming trial fallback tries every `Established` peer's
+    /// session key and finds this one.
+    #[test]
+    fn deobf_finds_roamed_peer_session_key_by_trial() {
+        let (pm, sess, plaintext) = established_obf_peer_with_data();
+        let obf = yip_obf::obfuscate(&sess, PacketType::Data as u8, &plaintext[1..], 0);
+        let roamed: SocketAddr = "198.51.100.231:41111".parse().unwrap();
+        assert_ne!(
+            pm.peers[0].endpoint,
+            Some(roamed),
+            "fixture invariant: the roamed src must not match the peer's endpoint"
+        );
+
+        let out = pm.deobf_ingress(roamed, &obf);
+        assert_eq!(
+            out.as_deref(),
+            Some(plaintext.as_slice()),
+            "roamed peer's data must deobfuscate via the trial fallback"
+        );
+    }
+
+    /// A datagram that decodes under no known key at all — not the (a)
+    /// endpoint match, not the (a') trial over `Established` peers' session
+    /// keys, not the (b) network key — is dropped, never mis-dispatched.
+    #[test]
+    fn deobf_trial_does_not_accept_foreign_datagram() {
+        let (pm, _sess, _plaintext) = established_obf_peer_with_data();
+        let garbage = vec![0xABu8; 64];
+        let src: SocketAddr = "203.0.113.9:9".parse().unwrap();
+        assert!(
+            pm.deobf_ingress(src, &garbage).is_none(),
+            "a datagram under no known session key must not deobfuscate"
+        );
     }
 
     /// (3b-a) `build_junk()` produces a PLAINTEXT `[JUNK_TYPE][body]`
