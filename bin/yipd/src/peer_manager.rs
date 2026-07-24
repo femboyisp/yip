@@ -1009,8 +1009,18 @@ impl PeerManager {
                 // (no probe). Non-mesh (no membership) or a candidate with no
                 // record (legacy server) keeps today's unauthenticated
                 // behavior (#37 Task 5).
+                //
+                // The record must also be FOR the peer we resolved: `verify_record`
+                // proves the record is a valid member record (cert chains to a
+                // root, signature valid, node_id binds its own cert), but the
+                // outer `PeerInfo.node` and `record.node_id` are independent on
+                // the wire. Binding them here stops a server from answering
+                // `Lookup(Y)` with a genuine record belonging to some other
+                // member X — otherwise a valid-but-wrong-identity record would
+                // pass and let the server steer a probe for Y at an arbitrary
+                // address.
                 let record_ok = match (self.membership.as_ref(), &record) {
-                    (Some(m), Some(r)) => m.verify_record(r, now_secs()),
+                    (Some(m), Some(r)) => r.node_id == node && m.verify_record(r, now_secs()),
                     _ => true,
                 };
                 if record_ok {
@@ -5435,6 +5445,52 @@ mod tests {
             matches!(pm.peers[0].state, PeerState::Idle),
             "the peer must stay Idle: the forged candidate was never acted on"
         );
+    }
+
+    #[test]
+    fn peer_candidate_with_valid_record_for_wrong_node_is_dropped() {
+        // A record can be a GENUINE, trusted-CA member record and still be the
+        // wrong one: the server answered Lookup(peer) with a valid record that
+        // belongs to some OTHER member. `verify_record` passes it (it's real),
+        // so the node_id binding is what must drop it.
+        let ca = test_ca();
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let other_kp = generate_keypair(); // a different, validly-certed member
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let membership = membership_trusting_ca_via_roots(&ca, local.public);
+        let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[peer], membership);
+
+        let candidate: SocketAddr = "198.51.100.7:41000".parse().unwrap();
+        // Validly signed by the TRUSTED ca — but for `other_kp`, not `peer_kp`.
+        let wrong_id = mk_record(&ca, 55, other_kp.public, vec![candidate], 1);
+        let mut buf = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PeerInfo {
+                node: node_id(&peer_kp.public),
+                reflexive: candidate,
+                record: Some(wrong_id),
+            },
+            &mut buf,
+        );
+        assert!(matches!(
+            pm.on_udp(mock_server(), &buf, 0),
+            DispatchOut::None
+        ));
+        assert_eq!(
+            pm.peers[0].path.candidate(),
+            None,
+            "a valid record binding a DIFFERENT identity must NOT set the candidate",
+        );
+        let out = pm.tick(1).map(<[_]>::to_vec).unwrap_or_default();
+        assert!(
+            !out.iter().any(|d| d.dst == candidate),
+            "no probe toward a candidate whose record binds a different identity",
+        );
+        assert!(matches!(pm.peers[0].state, PeerState::Idle));
     }
 
     /// (c) With NO rendezvous configured, a peer with a direct endpoint behaves
