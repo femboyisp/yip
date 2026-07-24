@@ -109,7 +109,9 @@ fn register_lookup_relay_over_udp() {
     let mut rx = [0u8; 2048];
     let (n, _) = b.recv_from(&mut rx).expect("B receives PeerInfo");
     match decode(&rx[..n]) {
-        Some(Message::PeerInfo { node, reflexive }) => {
+        Some(Message::PeerInfo {
+            node, reflexive, ..
+        }) => {
             assert_eq!(node, a_id);
             assert_eq!(reflexive, a.local_addr().unwrap());
         }
@@ -231,7 +233,9 @@ fn register_lookup_relay_over_udp_with_obf_psk() {
     send_wrapped(&b, &Message::Lookup { node: a_id });
     let mut rx = [0u8; 2048];
     match recv_wrapped(&b, &mut rx) {
-        Message::PeerInfo { node, reflexive } => {
+        Message::PeerInfo {
+            node, reflexive, ..
+        } => {
             assert_eq!(node, a_id);
             assert_eq!(reflexive, a.local_addr().unwrap());
         }

@@ -5017,12 +5017,12 @@ mod tests {
         }
         fn parse(&self, dg: &[u8]) -> RdvEvent {
             match yip_rendezvous::decode(dg) {
-                Some(yip_rendezvous::Message::PeerInfo { node, reflexive }) => {
-                    RdvEvent::PeerCandidate {
-                        node,
-                        addr: reflexive,
-                    }
-                }
+                Some(yip_rendezvous::Message::PeerInfo {
+                    node, reflexive, ..
+                }) => RdvEvent::PeerCandidate {
+                    node,
+                    addr: reflexive,
+                },
                 Some(yip_rendezvous::Message::PunchHint { node, reflexive }) => RdvEvent::PunchTo {
                     node,
                     addr: reflexive,
@@ -5210,6 +5210,7 @@ mod tests {
             &yip_rendezvous::Message::PeerInfo {
                 node: node_id(&peer_kp.public),
                 reflexive: candidate,
+                record: None,
             },
             &mut buf,
         );
@@ -5298,6 +5299,7 @@ mod tests {
             &yip_rendezvous::Message::PeerInfo {
                 node: node_id(&peer_kp.public),
                 reflexive: hijack,
+                record: None,
             },
             &mut buf,
         );
@@ -5354,6 +5356,7 @@ mod tests {
             &yip_rendezvous::Message::PeerInfo {
                 node: node_id(&peer_kp.public),
                 reflexive: candidate,
+                record: None,
             },
             &mut buf,
         );
@@ -5495,6 +5498,7 @@ mod tests {
             &yip_rendezvous::Message::PeerInfo {
                 node: node_id(&peer_kp.public),
                 reflexive: candidate,
+                record: None,
             },
             &mut buf,
         );
@@ -6320,6 +6324,7 @@ mod tests {
             &yip_rendezvous::Message::PeerInfo {
                 node: node_id(&peer_kp.public),
                 reflexive: candidate,
+                record: None,
             },
             &mut buf,
         );
@@ -8413,6 +8418,7 @@ mod tests {
             &yip_rendezvous::Message::PeerInfo {
                 node: node_id(&peer_kp.public),
                 reflexive: candidate,
+                record: None,
             },
             &mut plain,
         );
@@ -8474,6 +8480,7 @@ mod tests {
             &yip_rendezvous::Message::PeerInfo {
                 node: node_id(&peer_kp.public),
                 reflexive: candidate,
+                record: None,
             },
             &mut plain,
         );

@@ -83,7 +83,12 @@ impl Rendezvous for ConfiguredServerRendezvous {
     }
     fn parse(&self, dg: &[u8]) -> RdvEvent {
         match decode(dg) {
-            Some(Message::PeerInfo { node, reflexive }) => RdvEvent::PeerCandidate {
+            // TODO(#37 task 5): surface `record` to the caller so
+            // `PeerManager` can verify it against membership roots before
+            // probing (codec-only in task 1).
+            Some(Message::PeerInfo {
+                node, reflexive, ..
+            }) => RdvEvent::PeerCandidate {
                 node,
                 addr: reflexive,
             },
@@ -217,6 +222,7 @@ mod tests {
             &Message::PeerInfo {
                 node: n,
                 reflexive: a,
+                record: None,
             },
             &mut buf,
         );

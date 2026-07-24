@@ -211,6 +211,10 @@ impl RendezvousServer {
                         Message::PeerInfo {
                             node,
                             reflexive: peer_addr,
+                            // TODO(#37 task 2): serve the stored signed
+                            // `Record` here once the server verifies and
+                            // stores registrations.
+                            record: None,
                         },
                     )];
                     // Tell the looked-up peer to punch back toward the requester.
@@ -247,6 +251,9 @@ impl RendezvousServer {
             | Message::NotFound { .. }
             | Message::PunchHint { .. }
             | Message::RelayDeliver { .. } => Vec::new(),
+            // TODO(#37 task 2): verify against roots and store; dropped for
+            // now (codec-only in this task).
+            Message::RegisterSigned { .. } => Vec::new(),
         }
     }
 }
@@ -291,7 +298,7 @@ mod tests {
         let out = s.handle(addr("203.0.113.9:52000"), Message::Lookup { node: a }, 10);
         // one reply to B (PeerInfo), one to A (PunchHint)
         assert!(out.iter().any(|(d, m)| *d == addr("203.0.113.9:52000")
-            && matches!(m, Message::PeerInfo { node, reflexive } if *node == a && *reflexive == addr("198.51.100.7:41000"))));
+            && matches!(m, Message::PeerInfo { node, reflexive, .. } if *node == a && *reflexive == addr("198.51.100.7:41000"))));
         assert!(out.iter().any(|(d, m)| *d == addr("198.51.100.7:41000")
             && matches!(m, Message::PunchHint { reflexive, .. } if *reflexive == addr("203.0.113.9:52000"))));
     }
