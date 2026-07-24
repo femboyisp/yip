@@ -96,6 +96,20 @@ impl EpochSet {
         &mut self.current
     }
 
+    /// Point every live epoch's egress at `addr` — WireGuard-style roaming after
+    /// the peer's authenticated source moved (M2). Applies to `current`, the
+    /// unconfirmed `next`, and the grace `previous`, so a roam is not undone by a
+    /// pending or recently-rotated epoch.
+    pub fn set_peer_addr(&mut self, addr: std::net::SocketAddr) {
+        self.current.set_peer_addr(addr);
+        if let Some(n) = self.next.as_mut() {
+            n.dp.set_peer_addr(addr);
+        }
+        if let Some(p) = self.previous.as_mut() {
+            p.set_peer_addr(addr);
+        }
+    }
+
     /// Convert a borrowed `Outcome` into the owned `EpochInbound` (same copies
     /// the caller already performed). Returns `None` for `Outcome::None`.
     fn own(outcome: Outcome<'_>) -> EpochInbound {

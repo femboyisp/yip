@@ -216,6 +216,16 @@ impl DataPlane {
         self.conn_tag
     }
 
+    /// Redirect this data plane's egress to a new peer address — WireGuard-style
+    /// roaming, after the peer's authenticated source moved (M2). Every
+    /// subsequently-built egress datagram (data, ARQ retransmit, tick feedback)
+    /// is stamped with `addr`. Callers gate this on a cryptographically
+    /// authenticated, non-replayed inbound packet, so it cannot be steered by a
+    /// spoofed source.
+    pub fn set_peer_addr(&mut self, addr: SocketAddr) {
+        self.peer_addr = addr;
+    }
+
     /// Seal `inner`, FEC-encode, frame each symbol, and return the resulting
     /// egress datagrams as a borrow of an internal reused scratch buffer.
     ///

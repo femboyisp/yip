@@ -1466,13 +1466,23 @@ impl PeerManager {
 
     /// WireGuard-style roaming: after a datagram has AUTHENTICATED and passed
     /// the replay window (a non-`None` `inbound_open`), point a direct peer's
-    /// `endpoint` at the observed source. A `relay` peer's `endpoint` is a
-    /// rendezvous placeholder and must not roam. Gated on `src` differing so
-    /// steady-state traffic is a no-op. This never runs for an unauthenticated
-    /// Init (that path does not call `inbound_open`), preserving #34.
+    /// `endpoint` at the observed source AND redirect its egress there. A
+    /// `relay` peer's `endpoint` is a rendezvous placeholder and must not roam.
+    /// Gated on `src` differing so steady-state traffic is a no-op. This never
+    /// runs for an unauthenticated Init (that path does not call `inbound_open`),
+    /// preserving #34.
+    ///
+    /// Updating `endpoint` alone heals ingress demux/deobfuscation, but egress
+    /// datagrams are stamped from each epoch's `DataPlane::peer_addr` (not
+    /// `endpoint`), so the roam must also be pushed into the live `EpochSet` or
+    /// return traffic keeps targeting the peer's stale (post-rebind, dead)
+    /// address.
     fn relearn_endpoint(&mut self, idx: usize, src: SocketAddr) {
         if !self.peers[idx].relay && self.peers[idx].endpoint != Some(src) {
             self.peers[idx].endpoint = Some(src);
+            if let PeerState::Established(epochs) = &mut self.peers[idx].state {
+                epochs.set_peer_addr(src);
+            }
         }
     }
 
@@ -8849,6 +8859,41 @@ mod tests {
             pm_r.peers[0].endpoint,
             Some(new_src),
             "endpoint must follow an authenticated packet from a new source",
+        );
+    }
+
+    #[test]
+    fn roam_redirects_egress_to_the_new_source() {
+        // Relearning `endpoint` alone is a half-fix: egress datagrams are
+        // stamped from the `EpochSet`'s `DataPlane::peer_addr`, not `endpoint`.
+        // After an authenticated roam, the responder's OWN outbound data must
+        // target the new source, or return traffic keeps hitting the peer's
+        // stale (post-rebind, dead) address.
+        let (mut pm_i, mut pm_r, old_ep) = established_pair_for_roaming();
+
+        // Pre-roam: pm_r's egress targets the original endpoint.
+        let before = pm_r.on_tun(&dummy_tun_pkt(), 500).to_vec();
+        assert_eq!(
+            before[0].dst, old_ep,
+            "egress targets the original endpoint"
+        );
+
+        // pm_i sends an authenticated Data packet from a NEW source; pm_r roams.
+        let data = pm_i.on_tun(&dummy_tun_pkt(), 0).to_vec();
+        let dg = data[0].bytes.clone();
+        let new_src: SocketAddr = "198.51.100.222:60000".parse().unwrap();
+        assert_ne!(new_src, old_ep);
+        let out = pm_r.on_udp(new_src, &dg, 1_000);
+        assert!(
+            !matches!(out, DispatchOut::None),
+            "the roam packet must authenticate"
+        );
+
+        // Post-roam: pm_r's egress now targets the new source (not just `endpoint`).
+        let after = pm_r.on_tun(&dummy_tun_pkt(), 2_000).to_vec();
+        assert_eq!(
+            after[0].dst, new_src,
+            "egress must follow the roam to the new source, not the stale addr",
         );
     }
 
