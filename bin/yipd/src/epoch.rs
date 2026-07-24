@@ -100,6 +100,14 @@ impl EpochSet {
     /// the peer's authenticated source moved (M2). Applies to `current`, the
     /// unconfirmed `next`, and the grace `previous`, so a roam is not undone by a
     /// pending or recently-rotated epoch.
+    ///
+    /// Also redirects any in-flight rekey's `target`: a `RekeyInFlight` captured
+    /// its `target` from the pre-roam `endpoint`, and when it completes,
+    /// `rekey_resp_core`/`rekey_init_core` stamp the promoted epoch's `peer_addr`
+    /// from that `target`. Without this the roam would be undone on the next
+    /// rekey completion (a fresh black hole until the following rekey), and it
+    /// would not self-heal because `relearn_endpoint` only fires when the
+    /// observed `src` differs from the already-updated `endpoint`.
     pub fn set_peer_addr(&mut self, addr: std::net::SocketAddr) {
         self.current.set_peer_addr(addr);
         if let Some(n) = self.next.as_mut() {
@@ -107,6 +115,9 @@ impl EpochSet {
         }
         if let Some(p) = self.previous.as_mut() {
             p.set_peer_addr(addr);
+        }
+        if let Some(rk) = self.rekey.as_mut() {
+            rk.target = addr;
         }
     }
 
@@ -519,5 +530,32 @@ mod tests {
         // Loser: doesn't trigger until 2x the interval (fallback).
         assert!(!set.needs_rekey(1500, false, interval));
         assert!(set.needs_rekey(2000, false, interval));
+    }
+
+    #[test]
+    fn set_peer_addr_redirects_current_and_in_flight_rekey() {
+        let (_peer, us) = epoch_pair();
+        let mut set = EpochSet::new(us, 0);
+        let old: SocketAddr = "203.0.113.9:1".parse().unwrap();
+        let new: SocketAddr = "198.51.100.7:41000".parse().unwrap();
+        // A rekey is in flight, its target captured from the pre-roam endpoint.
+        set.rekey = Some(rekey_in_flight(old));
+
+        set.set_peer_addr(new);
+
+        // The in-flight rekey's target follows the roam, so the epoch it
+        // promotes will egress to the new source (not the stale one).
+        assert_eq!(
+            set.rekey.as_ref().unwrap().target,
+            new,
+            "an in-flight rekey's target must follow the roam",
+        );
+        // And the current epoch's egress is redirected too.
+        let dg = set
+            .current_mut()
+            .on_tun_packet(&[0x60, 0, 0, 0, 0, 0, 0, 64], 1)
+            .to_vec();
+        assert!(!dg.is_empty());
+        assert_eq!(dg[0].dst, new, "current epoch egress must follow the roam");
     }
 }
