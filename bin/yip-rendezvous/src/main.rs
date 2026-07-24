@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use tls_front::RealityCfg;
+use yip_membership::RootSet;
 use yip_rendezvous::{decode, encode, Message, RendezvousServer};
 
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
@@ -130,6 +131,69 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
     }
 }
 
+/// Decode a 32-char hex string into 16 bytes (`--network-id <hex32>`).
+/// Mirrors `yipd::config::hex_to_16` — kept local to this binary for the same
+/// reason as `hex_to_32`/`hex_to_8` above (separate crates).
+fn hex_to_16(hex: &str) -> Result<[u8; 16], String> {
+    if hex.len() != 32 {
+        return Err(format!("expected 32 hex chars, got {}", hex.len()));
+    }
+    let mut out = [0u8; 16];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+/// Decode an arbitrary-length hex string into bytes — the `--roots <path>`
+/// file contents (a `RootSet::encode` blob is variable-length, unlike the
+/// fixed-size 32/16/8-byte keys the other `hex_to_*` helpers handle). Mirrors
+/// `yipd::config::hex_decode_vec`.
+fn hex_decode_vec(hex: &str) -> Result<Vec<u8>, String> {
+    if !hex.len().is_multiple_of(2) {
+        return Err("odd-length hex string".to_string());
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    for chunk in hex.as_bytes().chunks(2) {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+/// Build the mesh-mode roots config (CA pubkeys + network id) from the raw
+/// `--roots` file contents (hex-encoded `RootSet::encode`, one line — same
+/// artifact `yipd` loads, see `bin/yipd/src/config.rs::load_roots_file`) and
+/// the raw `--network-id` hex string.
+///
+/// Pure (no I/O) so it is unit-testable directly: decodes the root set,
+/// derives the CA pubkeys from its own entries
+/// (`roots.roots.iter().map(|(pk, _)| *pk)`), verifies the root set is
+/// self-consistent (`RootSet::verify_rootset`, signed by one of its own CA
+/// keys — mirrors `yipd`'s config-load verification), and parses the network
+/// id. Any failure returns a `String` describing what's wrong; callers must
+/// fail loudly (exit), never fall back to rootless.
+fn roots_cfg_from(
+    roots_hex: &str,
+    network_id_hex: &str,
+) -> Result<(Vec<[u8; 32]>, [u8; 16]), String> {
+    let bytes = hex_decode_vec(roots_hex.trim())?;
+    let roots = RootSet::decode(&bytes).ok_or_else(|| "failed to decode root set".to_string())?;
+    let ca_pubkeys: Vec<[u8; 32]> = roots.roots.iter().map(|(pk, _)| *pk).collect();
+    if !roots.verify_rootset(&ca_pubkeys) {
+        return Err(
+            "root set signature does not verify against its own CA pubkeys (self-consistency \
+             check failed)"
+                .to_string(),
+        );
+    }
+    let network_id = hex_to_16(network_id_hex).map_err(|e| format!("invalid --network-id: {e}"))?;
+    Ok((ca_pubkeys, network_id))
+}
+
 /// If `port` is a canonical VPN/tunnel default port that DPI port-matches,
 /// return the protocol it makes the relay look like; `None` for a plausible
 /// port. Mirrors `yipd::config::fingerprinted_vpn_port` — kept local to this
@@ -168,9 +232,12 @@ fn usage_exit() -> ! {
          [--reality-dest <host:port> --reality-private-key <hex64> \
          [--reality-short-id <hex16>]... [--reality-server-name <name>]... \
          [--reality-cert-refresh-secs <secs>] [--reality-cert-max-stale-secs <secs>] \
-         [--reality-replay-max-bucket <n>] [--reality-max-inflight <n>]]]\n\
+         [--reality-replay-max-bucket <n>] [--reality-max-inflight <n>]]] \
+         [--roots <path> --network-id <hex32>]\n\
          (--reality-dest supersedes --decoy when both are set; --tls-cert/--tls-key are \
-         optional when --reality-dest is set — REALITY forges its own per-SNI cert)\n\
+         optional when --reality-dest is set — REALITY forges its own per-SNI cert; \
+         --roots/--network-id are both-or-neither and switch the server into mesh mode, \
+         requiring every registration to carry a verified signed record)\n\
          e.g. 0.0.0.0:51821"
     );
     std::process::exit(2);
@@ -204,6 +271,13 @@ async fn main() -> std::io::Result<()> {
     let mut reality_cert_max_stale_secs: u64 = 21600;
     let mut reality_replay_max_bucket: usize = 16384;
     let mut reality_max_inflight: usize = 1024;
+    // Mesh mode (rdv.37 Task 3), both opt-in and both-or-neither: a signed
+    // `RootSet` file (`--roots`) plus the mesh network id (`--network-id`)
+    // switch the server from legacy rootless registration to
+    // `RendezvousServer::new_with_roots`, which requires every registration
+    // to carry a verified `RegisterSigned` record.
+    let mut roots_path: Option<String> = None;
+    let mut network_id_hex: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -332,6 +406,20 @@ async fn main() -> std::io::Result<()> {
                     std::process::exit(2);
                 });
             }
+            "--roots" => {
+                let Some(v) = args.next() else {
+                    eprintln!("--roots requires a path argument");
+                    std::process::exit(2);
+                };
+                roots_path = Some(v);
+            }
+            "--network-id" => {
+                let Some(v) = args.next() else {
+                    eprintln!("--network-id requires a 32-char hex argument");
+                    std::process::exit(2);
+                };
+                network_id_hex = Some(v);
+            }
             _ if listen.is_none() => listen = Some(arg),
             other => {
                 eprintln!("unexpected argument: {other}");
@@ -431,10 +519,47 @@ async fn main() -> std::io::Result<()> {
         );
     }
 
+    // Mesh mode (rdv.37 Task 3): `--roots` and `--network-id` are
+    // both-or-neither — an operator passing only one clearly wants mesh and
+    // silently falling back to rootless would be a security downgrade, so
+    // that mismatch is rejected up front, before any network I/O.
+    let mesh_cfg: Option<(Vec<[u8; 32]>, [u8; 16])> = match (roots_path, network_id_hex) {
+        (Some(path), Some(net_hex)) => {
+            let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                eprintln!("failed to read --roots file {path:?}: {e}");
+                std::process::exit(2);
+            });
+            let cfg = roots_cfg_from(&contents, &net_hex).unwrap_or_else(|e| {
+                eprintln!("fatal: invalid --roots/--network-id: {e}");
+                std::process::exit(1);
+            });
+            eprintln!(
+                "yip-rendezvous: mesh mode ({} root{})",
+                cfg.0.len(),
+                if cfg.0.len() == 1 { "" } else { "s" }
+            );
+            Some(cfg)
+        }
+        (None, None) => None,
+        (Some(_), None) => {
+            eprintln!("--roots requires --network-id (mesh mode needs both)");
+            std::process::exit(2);
+        }
+        (None, Some(_)) => {
+            eprintln!("--network-id requires --roots (mesh mode needs both)");
+            std::process::exit(2);
+        }
+    };
+
     // Millisecond clock from a monotonic base (Instant), so `now_ms` never goes
     // backwards and needs no wall clock.
     let base = Instant::now();
-    let server = Arc::new(Mutex::new(RendezvousServer::new(0)));
+    let server = Arc::new(Mutex::new(match mesh_cfg {
+        None => RendezvousServer::new(0),
+        Some((ca_pubkeys, network_id)) => {
+            RendezvousServer::new_with_roots(0, ca_pubkeys, network_id)
+        }
+    }));
 
     let sock = tokio::net::UdpSocket::bind(&listen).await?;
     eprintln!("yip-rendezvous listening on {listen} (udp)");
@@ -600,6 +725,63 @@ mod cli_tests {
     #[test]
     fn hex_to_8_non_hex() {
         assert!(hex_to_8("012345678zabcdef").is_err());
+    }
+}
+
+/// `--roots`/`--network-id` mesh-mode construction: covers `hex_to_16` and
+/// the pure `roots_cfg_from` failure paths directly. The positive
+/// (successfully-verifying, real CA-signed root set) path is exercised as a
+/// real-binary smoke check instead — building a signed `RootSet` here would
+/// need ed25519 signing dev-dependencies for a single assertion already
+/// covered end-to-end by `crates/yip-rendezvous/src/server.rs`'s
+/// `rooted_server_*` tests plus the `yip-ca`-generated smoke fixture (see
+/// `task-3-report.md`).
+#[cfg(test)]
+mod roots_cfg_tests {
+    use super::{hex_to_16, roots_cfg_from};
+
+    /// A valid 32-char hex string decodes to the expected 16 bytes.
+    #[test]
+    fn hex_to_16_valid() {
+        assert_eq!(
+            hex_to_16("00112233445566778899aabbccddeeff"),
+            Ok([
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff
+            ])
+        );
+    }
+
+    /// Wrong-length input (too short / too long) is rejected.
+    #[test]
+    fn hex_to_16_wrong_length() {
+        assert!(hex_to_16("00112233445566778899aabbccddeef").is_err()); // 31 chars
+        assert!(hex_to_16("00112233445566778899aabbccddeeff00").is_err()); // 34 chars
+    }
+
+    /// Non-hex characters are rejected.
+    #[test]
+    fn hex_to_16_non_hex() {
+        assert!(hex_to_16("0011223344556677889zaabbccddeeff").is_err());
+    }
+
+    /// Garbage (non-hex) `--roots` file contents are rejected before any
+    /// `RootSet::decode` is attempted.
+    #[test]
+    fn roots_cfg_from_bad_hex_is_rejected() {
+        let err = roots_cfg_from("not hex at all", "00112233445566778899aabbccddeeff").unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    /// Well-formed hex that isn't a valid `RootSet` encoding is rejected.
+    /// (`roots_cfg_from` decodes+verifies the root set before ever touching
+    /// `--network-id`, so a malformed network-id string can't be reached
+    /// from here with an undecodable/unverified root set — that final step
+    /// is already covered directly by the `hex_to_16_*` tests above.)
+    #[test]
+    fn roots_cfg_from_undecodable_roots_is_rejected() {
+        let err = roots_cfg_from("deadbeef", "00112233445566778899aabbccddeeff").unwrap_err();
+        assert!(err.contains("decode"), "error names the failure: {err}");
     }
 }
 

@@ -11,6 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 yip-rendezvous = { path = "../../crates/yip-rendezvous" }
+# rdv.37 Task 3: `--roots`/`--network-id` load a signed `RootSet` (same
+# artifact `yipd` loads) to run this server in mesh mode — RootSet is not
+# re-exported by the `yip-rendezvous` lib crate, so this binary needs the
+# direct dependency.
+yip-membership = { path = "../../crates/yip-membership" }
 yip-obf = { path = "../../crates/yip-obf" }
 yip-utls = { path = "../../crates/yip-utls" }
 getrandom = "0.2"
