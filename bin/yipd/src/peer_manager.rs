@@ -1464,11 +1464,29 @@ impl PeerManager {
             .position(|p| p.endpoint == Some(src) && matches!(p.state, PeerState::Established(_)))
     }
 
+    /// WireGuard-style roaming: after a datagram has AUTHENTICATED and passed
+    /// the replay window (a non-`None` `inbound_open`), point a direct peer's
+    /// `endpoint` at the observed source. A `relay` peer's `endpoint` is a
+    /// rendezvous placeholder and must not roam. Gated on `src` differing so
+    /// steady-state traffic is a no-op. This never runs for an unauthenticated
+    /// Init (that path does not call `inbound_open`), preserving #34.
+    fn relearn_endpoint(&mut self, idx: usize, src: SocketAddr) {
+        if !self.peers[idx].relay && self.peers[idx].endpoint != Some(src) {
+            self.peers[idx].endpoint = Some(src);
+        }
+    }
+
     /// Dispatch a `Data`/`Control` datagram to peer `idx`'s `EpochSet` (via
     /// `inbound_open`) and re-map its `EpochInbound` into a `DispatchOut`.
     /// Returns `DispatchOut::None` if `idx` is not (or no longer)
     /// `Established`.
-    fn dispatch_established(&mut self, idx: usize, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
+    fn dispatch_established(
+        &mut self,
+        idx: usize,
+        src: SocketAddr,
+        dg: &[u8],
+        now_ms: u64,
+    ) -> DispatchOut<'_> {
         let PeerState::Established(epochs) = &mut self.peers[idx].state else {
             return DispatchOut::None;
         };
@@ -1478,7 +1496,12 @@ impl PeerManager {
         // for relay-established peers (their `DataPlane::peer_addr` is a
         // `server_addr()` stand-in; `endpoint` may hold an unconfirmed
         // candidate or `None`).
-        match epochs.inbound_open(dg, now_ms) {
+        let opened = epochs.inbound_open(dg, now_ms);
+        if !matches!(opened, crate::epoch::EpochInbound::None) {
+            // Authenticated + non-replayed (M2 roaming) — safe to roam.
+            self.relearn_endpoint(idx, src);
+        }
+        match opened {
             crate::epoch::EpochInbound::None => DispatchOut::None,
             crate::epoch::EpochInbound::Tun(buf) => {
                 self.tun_scratch = buf;
@@ -1509,7 +1532,7 @@ impl PeerManager {
             if dg[0] == PacketType::Data as u8 {
                 self.peers[idx].last_activity_ms = now_ms;
             }
-            return self.dispatch_established(idx, dg, now_ms);
+            return self.dispatch_established(idx, src, dg, now_ms);
         }
         // No address/tag match at all (e.g. the peer roamed) — try every
         // Established peer's codec once each. Safe (see module doc): a
@@ -1547,6 +1570,8 @@ impl PeerManager {
             let Some((tun, udp)) = hit else {
                 continue;
             };
+            // Authenticated + non-replayed (M2 roaming) — safe to roam.
+            self.relearn_endpoint(idx, src);
             // `udp` already carries each datagram's real `dst`/`fate` (see
             // `EpochInbound`); no reconstruction from `self.peers[idx].endpoint`
             // needed (that placeholder is wrong for relay-established peers).
@@ -8672,4 +8697,144 @@ mod tests {
             "membership-off: sweep is a no-op"
         );
     }
+
+    // ── M2 Task 1: endpoint roaming on authenticated inbound ────────────────
+
+    /// Build a two-`PeerManager` Established pair via `established_pm_pair`
+    /// (a large `rekey_interval_ms` so `on_tun`'s drive-rekey-schedule never
+    /// fires), returning `(pm_i, pm_r, old_ep)`: `pm_i` is the initiator
+    /// (sends data), `pm_r` is the responder whose `peers[0].endpoint` is
+    /// under test, and `old_ep` is `pm_r`'s currently-learned address for
+    /// `pm_i` (`established_pm_pair`'s `ep_a`).
+    fn established_pair_for_roaming() -> (PeerManager, PeerManager, SocketAddr) {
+        let (pm_i, pm_r, ep_i, _ep_r, _kp_i, _kp_r) = established_pm_pair(1_000_000);
+        assert_eq!(pm_r.peers[0].endpoint, Some(ep_i));
+        (pm_i, pm_r, ep_i)
+    }
+
+    #[test]
+    fn authenticated_data_from_new_src_roams_endpoint() {
+        // Two direct peers, established; pm_r.peers[0].endpoint == old_ep.
+        let (mut pm_i, mut pm_r, old_ep) = established_pair_for_roaming();
+
+        // The initiator sends a real Data packet; capture its on-wire bytes.
+        // (Systematic FEC may emit extra parity datagrams alongside the
+        // source symbol at index 0 — the source symbol alone is a complete,
+        // independently-reconstructable frame, exactly like the existing
+        // `rekey_resp_promotes_initiator_and_keeps_previous_for_grace` test's
+        // use of `on_tun(..)[0]`.)
+        let data = pm_i.on_tun(&dummy_tun_pkt(), 0).to_vec();
+        assert_eq!(data[0].bytes[0], PacketType::Data as u8);
+        let dg = data[0].bytes.clone();
+
+        let new_src: SocketAddr = "198.51.100.222:60000".parse().unwrap();
+        assert_ne!(new_src, old_ep);
+
+        // Deliver from the NEW source. For real (masked) traffic `dg[1..9]`
+        // is per-datagram garbage (see the module doc), so `by_tag` misses,
+        // and `new_src != endpoint` so the address match misses too —
+        // `route_data` returns `None` and this is handled by the OTHER
+        // authenticated-decrypt site, the roaming fallback loop in
+        // `handle_data_or_control` (same site `replayed_data_from_spoofed_src_does_not_roam_endpoint`
+        // exercises for the rejection case). The datagram still
+        // authenticates there via `inbound_open`.
+        let out = pm_r.on_udp(new_src, &dg, 1_000);
+        assert!(
+            !matches!(out, DispatchOut::None),
+            "a genuine Data datagram must authenticate"
+        );
+        assert_eq!(
+            pm_r.peers[0].endpoint,
+            Some(new_src),
+            "endpoint must follow an authenticated packet from a new source",
+        );
+    }
+
+    #[test]
+    fn replayed_data_from_spoofed_src_does_not_roam_endpoint() {
+        let (mut pm_i, mut pm_r, old_ep) = established_pair_for_roaming();
+        let data = pm_i.on_tun(&dummy_tun_pkt(), 0).to_vec();
+        let dg = data[0].bytes.clone();
+
+        // First delivery from the legit endpoint authenticates and is
+        // consumed (advances the replay window). `src == old_ep` matches
+        // `route_data`'s address check directly, reaching
+        // `dispatch_established`.
+        let out1_is_none = matches!(pm_r.on_udp(old_ep, &dg, 1_000), DispatchOut::None);
+        assert!(!out1_is_none, "the first delivery must authenticate");
+        assert_eq!(pm_r.peers[0].endpoint, Some(old_ep));
+
+        // REPLAY the exact same datagram from a spoofed source: `dg[1..9]`
+        // is masked per-datagram (see the module doc), so it does not match
+        // `by_tag`, and `spoof != old_ep` so it does not match by address
+        // either — `route_data` returns `None` and this exercises the OTHER
+        // authenticated-decrypt site, the roaming fallback loop in
+        // `handle_data_or_control`. The replay window there must reject it —
+        // this must fail if the replay were (incorrectly) accepted.
+        let spoof: SocketAddr = "203.0.113.66:5555".parse().unwrap();
+        let out2_is_none = matches!(pm_r.on_udp(spoof, &dg, 1_001), DispatchOut::None);
+        assert!(
+            out2_is_none,
+            "a replayed datagram must be rejected, not accepted"
+        );
+        assert_eq!(
+            pm_r.peers[0].endpoint,
+            Some(old_ep),
+            "a replayed packet must not move the endpoint"
+        );
+    }
+
+    #[test]
+    fn dispatch_established_relearns_endpoint_directly() {
+        // The `route_data` address-match path always calls
+        // `dispatch_established` with `src == endpoint` (by construction of
+        // the match), so `on_udp` alone can never exercise
+        // `dispatch_established`'s own relearn call with a DIFFERING `src` —
+        // real masked traffic that roams is only ever caught by the fallback
+        // loop (see `authenticated_data_from_new_src_roams_endpoint`'s
+        // comment). This test calls `dispatch_established` directly (it's a
+        // private inherent method, reachable from `mod tests`) with a src
+        // that differs from the learned endpoint, proving that authenticated-
+        // decrypt site's own relearn call (added per the brief as
+        // defense-in-depth for a future/hand-built `by_tag` hit) is wired
+        // correctly, independent of which routing path reaches it.
+        let (mut pm_i, mut pm_r, old_ep) = established_pair_for_roaming();
+        let dg = pm_i.on_tun(&dummy_tun_pkt(), 0).to_vec()[0].bytes.clone();
+        let new_src: SocketAddr = "198.51.100.7:5000".parse().unwrap();
+        assert_ne!(new_src, old_ep);
+
+        let out_is_none = matches!(
+            pm_r.dispatch_established(0, new_src, &dg, 1_000),
+            DispatchOut::None
+        );
+        assert!(!out_is_none, "a genuine Data datagram must authenticate");
+        assert_eq!(
+            pm_r.peers[0].endpoint,
+            Some(new_src),
+            "dispatch_established's own relearn call must move the endpoint"
+        );
+    }
+
+    #[test]
+    fn relay_peer_endpoint_does_not_roam() {
+        // A relay-established peer (`established_relay_pm`: `relay = true`,
+        // `endpoint` is whatever placeholder the config left it as).
+        // `relearn_endpoint` must be a no-op regardless of `src`.
+        let (mut pm, _local, _peer_kp, _old_tag) = established_relay_pm(100);
+        assert!(pm.peers[0].relay);
+        let placeholder = pm.peers[0].endpoint;
+
+        pm.relearn_endpoint(0, "198.51.100.9:7000".parse().unwrap());
+
+        assert_eq!(
+            pm.peers[0].endpoint, placeholder,
+            "a relay peer's endpoint must never roam"
+        );
+    }
+
+    // #34 preservation: an unauthenticated Init from a spoofed source against
+    // an Established responder still must not move `endpoint` — M2 does not
+    // touch the Init path (it never calls `inbound_open`), so the existing
+    // guard covers this; see `stale_replayed_cold_start_init_does_not_hijack_endpoint`
+    // and `stale_replayed_init_is_rejected_and_endpoint_unchanged` above.
 }
