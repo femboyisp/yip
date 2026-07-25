@@ -2332,13 +2332,17 @@ impl PeerManager {
             .iter()
             .any(|p| matches!(p.state, PeerState::Established(_)));
 
-        // Debounced digest (spacing handled inside `tick_digest`).
+        // Debounced digest (spacing handled inside `tick_digest`), chunked
+        // (#44) into one or more `GossipMsg::Digest` messages when the
+        // directory exceeds `MAX_GOSSIP_DIGEST_ENTRIES` — send each chunk to
+        // every gossip target exactly as a single digest was sent before.
         let obf_on = self.obf_key.is_some();
-        if let Some(digest) = self
+        let digests: Vec<GossipMsg> = self
             .membership
             .as_mut()
-            .and_then(|m| m.tick_digest(now_ms, obf_on))
-        {
+            .map(|m| m.tick_digest(now_ms, obf_on))
+            .unwrap_or_default();
+        for digest in digests {
             let mut bytes = Vec::new();
             bytes.push(PacketType::Gossip as u8);
             digest.encode(&mut bytes);
@@ -2493,27 +2497,46 @@ impl PeerManager {
     /// dedicated `yip_obf::RDV_TYPE` and the network `obf_key` (the server is
     /// never an `Established` peer, so it has no session key). Only called on
     /// the obfuscation-enabled path.
-    fn obf_egress(&self, dgs: &mut [EgressDatagram]) {
+    ///
+    /// Takes `&mut Vec` (not `&mut [_]`) so a datagram whose body can't fit
+    /// the obf envelope's `u16` length field (#44 fail-soft: `obfuscate`
+    /// returns `None` instead of panicking) can be dropped from `dgs`
+    /// outright — unshippable, not merely emptied — rather than left behind
+    /// as a stray zero-length datagram. `tick_gossip`'s digest chunking
+    /// already keeps every gossip datagram well under this cap, so in
+    /// practice this is defense-in-depth, not the expected path.
+    fn obf_egress(&self, dgs: &mut Vec<EgressDatagram>) {
         let server = self.rendezvous.as_ref().map(|r| r.server_addr());
-        for d in dgs.iter_mut() {
+        dgs.retain_mut(|d| {
             if d.bytes.is_empty() {
-                continue;
+                return true;
             }
             if Some(d.dst) == server {
                 let Some(key) = self.obf_key else {
-                    continue;
+                    return true;
                 };
                 let pad = random_pad(obf_pad_max(yip_obf::RDV_TYPE, d.bytes.len() + 1));
-                d.bytes = yip_obf::obfuscate(&key, yip_obf::RDV_TYPE, &d.bytes, pad);
-                continue;
+                return match yip_obf::obfuscate(&key, yip_obf::RDV_TYPE, &d.bytes, pad) {
+                    Some(wrapped) => {
+                        d.bytes = wrapped;
+                        true
+                    }
+                    None => false,
+                };
             }
             let ptype = d.bytes[0];
             let Some(key) = self.obf_key_for_egress(d.dst, ptype) else {
-                continue;
+                return true;
             };
             let pad = random_pad(obf_pad_max(ptype, d.bytes.len()));
-            d.bytes = yip_obf::obfuscate(&key, ptype, &d.bytes[1..], pad);
-        }
+            match yip_obf::obfuscate(&key, ptype, &d.bytes[1..], pad) {
+                Some(wrapped) => {
+                    d.bytes = wrapped;
+                    true
+                }
+                None => false,
+            }
+        });
     }
 
     /// Wrap `udp` egress and re-materialize a `DispatchOut` from the owned
@@ -6972,7 +6995,8 @@ mod tests {
         let mut recovered: Option<Vec<u8>> = None;
         for dg in &dgs {
             assert_eq!(dg.bytes[0], PacketType::Data as u8);
-            let wrapped = yip_obf::obfuscate(&sess, PacketType::Data as u8, &dg.bytes[1..], 0);
+            let wrapped = yip_obf::obfuscate(&sess, PacketType::Data as u8, &dg.bytes[1..], 0)
+                .expect("small test body fits u16");
             // The wire datagram carries no plaintext PacketType prefix.
             assert_ne!(
                 wrapped[0],
@@ -7026,7 +7050,8 @@ mod tests {
             PacketType::HandshakeInit as u8,
             &init_pkt[1..],
             32,
-        );
+        )
+        .expect("small test body fits u16");
 
         // Arrives from a fresh source address (unknown / not Established). Step
         // (a) finds no session key; step (b) unmasks the handshake via obf_psk.
@@ -7142,7 +7167,8 @@ mod tests {
         // `obf_egress` on the real egress path); reproduce that one wrap by
         // hand here to get wire-format bytes for `on_udp`'s ingress test.
         let plain = pm.build_junk();
-        let junk = yip_obf::obfuscate(&sess, yip_obf::JUNK_TYPE, &plain[1..], 0);
+        let junk = yip_obf::obfuscate(&sess, yip_obf::JUNK_TYPE, &plain[1..], 0)
+            .expect("small test body fits u16");
         let before_tag = pm.by_tag.get(&TAG).copied();
 
         let out = pm.on_udp(peer_ep, &junk, 0);
@@ -7182,7 +7208,8 @@ mod tests {
         // Same rationale as the session-keyed test above: `build_junk()` is
         // plaintext, so wrap it once by hand to get wire-format bytes.
         let plain = pm.build_junk();
-        let junk = yip_obf::obfuscate(&obf_key, yip_obf::JUNK_TYPE, &plain[1..], 0);
+        let junk = yip_obf::obfuscate(&obf_key, yip_obf::JUNK_TYPE, &plain[1..], 0)
+            .expect("small test body fits u16");
         let src: SocketAddr = "203.0.113.55:5555".parse().unwrap();
         assert!(matches!(pm.on_udp(src, &junk, 0), DispatchOut::None));
         assert!(matches!(pm.peers[0].state, PeerState::Idle));
@@ -7535,7 +7562,8 @@ mod tests {
         // Wrong key: dropped, no candidate learned (rendezvous-only peer
         // starts in Punching with no candidate address set).
         let wrong_key = yip_obf::derive_key(&[0x67u8; 32]);
-        let wrapped_wrong = yip_obf::obfuscate(&wrong_key, yip_obf::RDV_TYPE, &plain, 0);
+        let wrapped_wrong = yip_obf::obfuscate(&wrong_key, yip_obf::RDV_TYPE, &plain, 0)
+            .expect("small test body fits u16");
         assert!(matches!(
             pm.on_udp(mock_server(), &wrapped_wrong, 0),
             DispatchOut::None
@@ -7543,7 +7571,8 @@ mod tests {
         assert_eq!(pm.peers[0].path.candidate(), None);
 
         // Right key, wrong ptype: dropped, no candidate learned.
-        let wrapped_wrong_type = yip_obf::obfuscate(&obf_key, PacketType::Data as u8, &plain, 0);
+        let wrapped_wrong_type = yip_obf::obfuscate(&obf_key, PacketType::Data as u8, &plain, 0)
+            .expect("small test body fits u16");
         assert!(matches!(
             pm.on_udp(mock_server(), &wrapped_wrong_type, 0),
             DispatchOut::None
@@ -7551,7 +7580,8 @@ mod tests {
         assert_eq!(pm.peers[0].path.candidate(), None);
 
         // Right key, right type: recovers the PeerInfo and sets the candidate.
-        let wrapped = yip_obf::obfuscate(&obf_key, yip_obf::RDV_TYPE, &plain, 5);
+        let wrapped = yip_obf::obfuscate(&obf_key, yip_obf::RDV_TYPE, &plain, 5)
+            .expect("small test body fits u16");
         assert!(matches!(
             pm.on_udp(mock_server(), &wrapped, 0),
             DispatchOut::None

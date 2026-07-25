@@ -216,7 +216,8 @@ mod tests {
     fn framed_register(obf_key: &[u8; 16], node: yip_rendezvous::NodeId, counter: u64) -> Vec<u8> {
         let mut plain = Vec::new();
         encode(&Message::Register { node, counter }, &mut plain);
-        let env = yip_obf::obfuscate(obf_key, yip_obf::RDV_TYPE, &plain, 0);
+        let env = yip_obf::obfuscate(obf_key, yip_obf::RDV_TYPE, &plain, 0)
+            .expect("small test body fits u16");
         let mut framed = Vec::new();
         framed.extend_from_slice(&u16::try_from(env.len()).unwrap().to_be_bytes());
         framed.extend_from_slice(&env);
