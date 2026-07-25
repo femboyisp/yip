@@ -7713,11 +7713,17 @@ mod tests {
         for dg in &dgs {
             assert_eq!(dg.bytes[0], PacketType::Data as u8);
             let wrapped = yip_obf::obfuscate(&sess, PacketType::Data as u8, &dg.bytes[1..], 0);
-            // The wire datagram carries no plaintext PacketType prefix.
+            // The wire datagram carries no plaintext PacketType prefix and no
+            // constant signature a DPI box could match: a second obfuscation of
+            // the SAME (type, body) differs (fresh random nonce → different
+            // keystream). Asserting a *single* wire byte differs from the
+            // plaintext type is 1/256-flaky (the leading nonce byte can equal
+            // it by chance); comparing two full wrappings is deterministic
+            // (collision ≈ 2^-64) and captures the actual anti-DPI property.
+            let wrapped2 = yip_obf::obfuscate(&sess, PacketType::Data as u8, &dg.bytes[1..], 0);
             assert_ne!(
-                wrapped[0],
-                PacketType::Data as u8,
-                "type byte must be masked"
+                wrapped, wrapped2,
+                "obfuscation must randomize the wire form (no constant signature)"
             );
             if let DispatchOut::Tun(buf) = pm.on_udp(peer_ep, &wrapped, 1) {
                 recovered = Some(buf.to_vec());
