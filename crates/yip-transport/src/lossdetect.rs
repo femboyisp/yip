@@ -373,6 +373,83 @@ mod tests {
         );
     }
 
+    /// `c == resolved_below` exactly must NOT be a no-op — it must still be
+    /// inserted into `resolved_set` and advance the watermark. Kills the
+    /// `replace < with <=/== in LossDetector::mark_resolved` mutants (line
+    /// 113): both wrongly treat `c == resolved_below` as "already resolved,
+    /// nothing to do", silently dropping the resolution.
+    #[test]
+    fn mark_resolved_at_watermark_boundary_is_not_a_noop() {
+        let mut d = LossDetector::new(5, 1024);
+        d.mark_resolved(0); // resolved_below starts at 0; c == resolved_below
+        assert_eq!(
+            d.resolved_below, 1,
+            "marking c == resolved_below must advance the watermark past it, \
+             not silently return"
+        );
+    }
+
+    /// `resolved_set` must stay bounded to exactly `window` entries across
+    /// repeated marks — not over (mutant `<`, TIMEOUT: an infinite eviction
+    /// loop once the set drains) and not under (mutants `==`/`>=`, which
+    /// evict one entry too many). `window = 1` is deliberately chosen: after
+    /// any insert, `resolved_set.len() >= 1`, so the mutated `<` condition
+    /// (`len < window` = `len < 1`) is always false and never loops — this
+    /// distinguishes all three mutants without ever hanging.
+    #[test]
+    fn resolved_set_bounded_to_window_across_multiple_marks() {
+        let mut d = LossDetector::new(5, 1); // window = 1
+        d.mark_resolved(10);
+        d.mark_resolved(20); // distinct, non-adjacent -> watermark stays 0
+        assert_eq!(
+            d.resolved_set.len(),
+            1,
+            "resolved_set must stay bounded to window (1) after a second mark"
+        );
+        assert!(
+            d.resolved_set.contains_key(&20),
+            "the most recent entry must be kept, the oldest evicted"
+        );
+    }
+
+    /// The very first `on_seen` call must set `seen_any` and record
+    /// `high_counter`. Kills the `delete ! in LossDetector::on_seen` mutant
+    /// (line 151): deleting the `!` makes the init guard `if self.seen_any`,
+    /// which is never true on a fresh detector, so `seen_any` is never set —
+    /// `report()` would then always show `high_counter == 0`.
+    #[test]
+    fn on_seen_first_call_sets_seen_any_and_high_counter() {
+        let mut d = LossDetector::new(5, 1024);
+        d.on_seen(7, 0);
+        let r = d.report(100);
+        assert_eq!(
+            r.high_counter, 7,
+            "high_counter must reflect the first-seen counter, proving \
+             seen_any was actually set on the first call"
+        );
+    }
+
+    /// The pending set must stay bounded to exactly `window` entries across
+    /// repeated `on_seen` calls — the same `window = 1` technique as above
+    /// distinguishes the `>=` (MISSED) and `<` (TIMEOUT) mutants on
+    /// `enforce_window` (line 179) without ever hanging: after any insert,
+    /// `pending.len() >= 1`, so `len < 1` is always false.
+    #[test]
+    fn pending_set_bounded_to_window_across_multiple_seens() {
+        let mut d = LossDetector::new(100, 1); // window = 1, generous grace
+        d.on_seen(0, 0);
+        d.on_seen(1, 0); // sequential -> no implied-gap entries, just 2 counters
+        assert_eq!(
+            d.pending.len(),
+            1,
+            "pending set must stay bounded to window (1) after a second on_seen"
+        );
+        assert!(
+            d.pending.contains_key(&1),
+            "the most recent (newest) entry must be kept, the oldest evicted"
+        );
+    }
+
     /// A counter that was previously reported as missing must not be re-reported
     /// if a very late symbol for it arrives (on_seen called after report promoted it).
     #[test]

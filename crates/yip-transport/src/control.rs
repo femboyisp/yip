@@ -134,6 +134,59 @@ mod tests {
         assert!(c.repair_count(1) >= 1, "realtime keeps proactive repair");
     }
 
+    /// At the exact boundary `loss == target_residual + ratio`, the "losing
+    /// more than we can repair" branch must NOT fire (only `loss >
+    /// target_residual + ratio` should). Kills the `>` -> `>=` mutant (line 50).
+    #[test]
+    fn observe_loss_boundary_at_exact_threshold_does_not_jump() {
+        let mut c = AdaptiveController::new(FlowClass::Default.params()); // ratio=0.10
+        let start = c.ratio();
+        let boundary = 0.001 + start; // target_residual (0.001) + ratio
+        c.observe_loss(boundary);
+        assert_eq!(
+            c.ratio(),
+            start,
+            "loss exactly at the threshold must not trigger the jump-up branch"
+        );
+    }
+
+    /// The threshold is `target_residual + ratio`, not `target_residual *
+    /// ratio`. Kills the `+` -> `*` mutant (line 50): pick a loss value that is
+    /// above the (tiny) product but below the (larger) sum, so only the
+    /// mutant's `*` version would wrongly trigger the jump-up branch.
+    #[test]
+    fn observe_loss_threshold_uses_sum_not_product() {
+        let mut c = AdaptiveController::new(FlowClass::Default.params()); // ratio=0.10
+        let start = c.ratio();
+        // product = 0.001 * 0.10 = 0.0001; sum = 0.001 + 0.10 = 0.101.
+        // loss = 0.02 is > product but not > sum, and not <= target_residual (0.001).
+        c.observe_loss(0.02);
+        assert_eq!(
+            c.ratio(),
+            start,
+            "loss below the sum threshold must leave ratio unchanged \
+             (mutant using target_residual * ratio would wrongly jump up)"
+        );
+    }
+
+    /// A single decay step from a non-negligible ratio must decay smoothly
+    /// (ratio * 0.9), not snap straight to the floor. Kills the `<=` -> `>`
+    /// mutant (line 57): that mutant inverts the snap condition so ANY decay
+    /// step where `decayed > EPSILON` (i.e. almost always) snaps to the floor
+    /// immediately instead of decaying gradually.
+    #[test]
+    fn single_decay_step_does_not_snap_to_floor_early() {
+        let mut c = AdaptiveController::new_for(FlowClass::Bulk.params()); // ratio=0.05, arq=true, floor=0.0
+        c.observe_loss(0.0); // one clean-link decay step
+        let expected = 0.05 * 0.9; // 0.045, far above f32::EPSILON
+        assert!(
+            (c.ratio() - expected).abs() < 1e-6,
+            "one decay step must land at ratio*0.9 ({expected}), got {}; \
+             the buggy mutant snaps straight to the floor (0.0) instead",
+            c.ratio()
+        );
+    }
+
     #[test]
     fn snaps_up_on_loss_even_from_zero() {
         let mut c = AdaptiveController::new_for(FlowClass::Bulk.params());

@@ -229,6 +229,30 @@ mod tests {
         assert_eq!(out.as_deref(), Some(ciphertext.as_slice()));
     }
 
+    /// `bulk_repair_ratio` must return the Bulk controller's actual live ratio.
+    /// Kills the `replace ... with 0.0/1.0/-1.0` mutants (line 192): the
+    /// initial Bulk ratio (0.05) is none of those constants, and it must also
+    /// move when loss is observed.
+    #[test]
+    fn bulk_repair_ratio_reflects_controller_state() {
+        let mut t = Transport::new(vec![], 1200);
+        let initial = FlowClass::Bulk.params().initial_repair_ratio;
+        assert!(
+            (t.bulk_repair_ratio() - initial).abs() < 1e-6,
+            "initial bulk_repair_ratio must equal the class's initial ratio ({initial}), got {}",
+            t.bulk_repair_ratio()
+        );
+        t.observe_loss(FlowClass::Bulk, 0.5);
+        assert!(
+            t.bulk_repair_ratio() > initial,
+            "bulk_repair_ratio must rise after observed loss, got {}",
+            t.bulk_repair_ratio()
+        );
+        assert_ne!(t.bulk_repair_ratio(), 0.0);
+        assert_ne!(t.bulk_repair_ratio(), 1.0);
+        assert_ne!(t.bulk_repair_ratio(), -1.0);
+    }
+
     #[test]
     fn observe_loss_routes_to_correct_class_controller() {
         let mut t = Transport::new(vec![], 1200);
