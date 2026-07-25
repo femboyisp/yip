@@ -166,11 +166,16 @@ Mid-session NAT rebind now recovers on the first authenticated packet from the n
 
 ## Compatibility
 
-- **#37** adds `RegisterSigned` (new tag) and an optional trailing `record` on `PeerInfo`,
-  leaving the legacy `Register`/no-record `PeerInfo` encodings untouched — non-mesh is
-  byte-identical to today. Mesh deployments bump the rendezvous server and clients together;
-  a mesh-mode ⇄ rootless-server mismatch fails closed (the expected message is dropped, no
-  registration) rather than silently accepting unsigned registers.
+- **#37** adds `RegisterSigned` (new tag) and an optional trailing `record` on `PeerInfo`.
+  The legacy `Register` message is untouched (byte-identical). `PeerInfo` gains one
+  trailing record-presence byte (`0x00` when absent), so a rootless/non-mesh `Lookup` reply
+  is one byte longer than before — **wire-compatible, not literally byte-identical**: legacy
+  decoders ignore the trailing byte, and the reverse (a legacy no-byte datagram) decodes as
+  `record: None`. The single byte is on the control-plane reply only, masks to random under
+  obfuscation, and carries no anti-DPI signature. Mesh deployments bump the rendezvous
+  server and clients together; a mesh-mode ⇄ rootless-server mismatch fails closed (the
+  expected message is dropped, no registration) rather than silently accepting unsigned
+  registers.
 - **M2** is internal; no wire or format change; non-mesh and mesh behave identically.
 
 ## Testing

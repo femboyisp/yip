@@ -2545,8 +2545,14 @@ impl PeerManager {
         // (a') Roaming fallback: no endpoint match, but the datagram may be a
         // roamed Established peer's Data/Control/Gossip under its session key.
         // Trial each Established peer's session key; a wrong key yields None or a
-        // garbage type that the type-set + inner verify drop safely (same
-        // invariant as `handle_data_or_control`'s plaintext roaming loop).
+        // garbage type that the type-set + the downstream inner Noise/AEAD verify
+        // drop safely. NOTE: `deobfuscate` is an unauthenticated keystream XOR, so
+        // a wrong key CAN spuriously produce a Data/Control/Gossip type here — the
+        // authenticated gate is downstream (`inbound_open`/`route_data`), unlike
+        // `handle_data_or_control`'s plaintext loop which is itself AEAD-gated. A
+        // genuine roamed datagram is therefore dropped with tiny probability when
+        // an interfering peer's trial false-positives; FEC/ARQ absorb it, and the
+        // endpoint self-heals on the next datagram that reaches (a).
         for p in &self.peers {
             if !matches!(p.state, PeerState::Established(_)) {
                 continue;
