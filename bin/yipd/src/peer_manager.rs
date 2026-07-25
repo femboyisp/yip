@@ -350,6 +350,12 @@ pub struct PeerManager {
     /// promptly rather than waiting a full [`REG_REFRESH_MS`] interval — the
     /// loop clock starts at 0).
     registered_once: bool,
+    /// Monotonic freshness counter for signed registrations (#37 Task 5):
+    /// bumped every time `tick_dispatch` emits a registration, and passed to
+    /// `Membership::sign_registration` when membership is configured. Never
+    /// reset for the process's lifetime, so a captured `RegisterSigned` can
+    /// never be replayed to look fresher than a subsequent one.
+    reg_seq: u64,
     /// Reused scratch for `on_udp`/`on_tun` return values.
     egress: Vec<EgressDatagram>,
     /// Reused scratch for `tick`'s return value.
@@ -503,6 +509,7 @@ impl PeerManager {
             last_register_ms: 0,
             reg_refresh_ms: REG_REFRESH_MS,
             registered_once: false,
+            reg_seq: 0,
             egress: Vec::new(),
             tick_egress: Vec::new(),
             tun_scratch: Vec::new(),
@@ -995,10 +1002,32 @@ impl PeerManager {
             None => return DispatchOut::None,
         };
         match ev {
-            RdvEvent::PeerCandidate { node, addr } => {
-                if let Some(&idx) = self.by_node.get(&node) {
-                    if !matches!(self.peers[idx].state, PeerState::Established(_)) {
-                        self.peers[idx].path.on_peer_candidate(addr, now_ms);
+            RdvEvent::PeerCandidate { node, addr, record } => {
+                // Mesh mode (membership configured): a candidate carrying a
+                // record must verify against our roots before we act on it —
+                // an unverifiable/forged record drops the candidate entirely
+                // (no probe). Non-mesh (no membership) or a candidate with no
+                // record (legacy server) keeps today's unauthenticated
+                // behavior (#37 Task 5).
+                //
+                // The record must also be FOR the peer we resolved: `verify_record`
+                // proves the record is a valid member record (cert chains to a
+                // root, signature valid, node_id binds its own cert), but the
+                // outer `PeerInfo.node` and `record.node_id` are independent on
+                // the wire. Binding them here stops a server from answering
+                // `Lookup(Y)` with a genuine record belonging to some other
+                // member X — otherwise a valid-but-wrong-identity record would
+                // pass and let the server steer a probe for Y at an arbitrary
+                // address.
+                let record_ok = match (self.membership.as_ref(), &record) {
+                    (Some(m), Some(r)) => r.node_id == node && m.verify_record(r, now_secs()),
+                    _ => true,
+                };
+                if record_ok {
+                    if let Some(&idx) = self.by_node.get(&node) {
+                        if !matches!(self.peers[idx].state, PeerState::Established(_)) {
+                            self.peers[idx].path.on_peer_candidate(addr, now_ms);
+                        }
                     }
                 }
                 DispatchOut::None
@@ -1464,11 +1493,39 @@ impl PeerManager {
             .position(|p| p.endpoint == Some(src) && matches!(p.state, PeerState::Established(_)))
     }
 
+    /// WireGuard-style roaming: after a datagram has AUTHENTICATED and passed
+    /// the replay window (a non-`None` `inbound_open`), point a direct peer's
+    /// `endpoint` at the observed source AND redirect its egress there. A
+    /// `relay` peer's `endpoint` is a rendezvous placeholder and must not roam.
+    /// Gated on `src` differing so steady-state traffic is a no-op. This never
+    /// runs for an unauthenticated Init (that path does not call `inbound_open`),
+    /// preserving #34.
+    ///
+    /// Updating `endpoint` alone heals ingress demux/deobfuscation, but egress
+    /// datagrams are stamped from each epoch's `DataPlane::peer_addr` (not
+    /// `endpoint`), so the roam must also be pushed into the live `EpochSet` or
+    /// return traffic keeps targeting the peer's stale (post-rebind, dead)
+    /// address.
+    fn relearn_endpoint(&mut self, idx: usize, src: SocketAddr) {
+        if !self.peers[idx].relay && self.peers[idx].endpoint != Some(src) {
+            self.peers[idx].endpoint = Some(src);
+            if let PeerState::Established(epochs) = &mut self.peers[idx].state {
+                epochs.set_peer_addr(src);
+            }
+        }
+    }
+
     /// Dispatch a `Data`/`Control` datagram to peer `idx`'s `EpochSet` (via
     /// `inbound_open`) and re-map its `EpochInbound` into a `DispatchOut`.
     /// Returns `DispatchOut::None` if `idx` is not (or no longer)
     /// `Established`.
-    fn dispatch_established(&mut self, idx: usize, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
+    fn dispatch_established(
+        &mut self,
+        idx: usize,
+        src: SocketAddr,
+        dg: &[u8],
+        now_ms: u64,
+    ) -> DispatchOut<'_> {
         let PeerState::Established(epochs) = &mut self.peers[idx].state else {
             return DispatchOut::None;
         };
@@ -1478,7 +1535,12 @@ impl PeerManager {
         // for relay-established peers (their `DataPlane::peer_addr` is a
         // `server_addr()` stand-in; `endpoint` may hold an unconfirmed
         // candidate or `None`).
-        match epochs.inbound_open(dg, now_ms) {
+        let opened = epochs.inbound_open(dg, now_ms);
+        if !matches!(opened, crate::epoch::EpochInbound::None) {
+            // Authenticated + non-replayed (M2 roaming) — safe to roam.
+            self.relearn_endpoint(idx, src);
+        }
+        match opened {
             crate::epoch::EpochInbound::None => DispatchOut::None,
             crate::epoch::EpochInbound::Tun(buf) => {
                 self.tun_scratch = buf;
@@ -1509,7 +1571,7 @@ impl PeerManager {
             if dg[0] == PacketType::Data as u8 {
                 self.peers[idx].last_activity_ms = now_ms;
             }
-            return self.dispatch_established(idx, dg, now_ms);
+            return self.dispatch_established(idx, src, dg, now_ms);
         }
         // No address/tag match at all (e.g. the peer roamed) — try every
         // Established peer's codec once each. Safe (see module doc): a
@@ -1547,6 +1609,8 @@ impl PeerManager {
             let Some((tun, udp)) = hit else {
                 continue;
             };
+            // Authenticated + non-replayed (M2 roaming) — safe to roam.
+            self.relearn_endpoint(idx, src);
             // `udp` already carries each datagram's real `dst`/`fate` (see
             // `EpochInbound`); no reconstruction from `self.peers[idx].endpoint`
             // needed (that placeholder is wrong for relay-established peers).
@@ -2449,9 +2513,14 @@ impl PeerManager {
     /// Order (matches the addendum):
     /// (a) If `src` is a known `Established` peer, try that peer's
     ///     `session_obf_key`; accept only `Data`/`Control`/`Gossip`.
-    /// (b) Otherwise (or if (a) did not yield one of those types), try the
-    ///     network `obf_key`; accept only `HandshakeInit`/`HandshakeResp` — this
-    ///     covers a brand-new peer's `Init` AND a re-handshake from a known src.
+    /// (a') Otherwise (the peer may have roamed to a new source), trial every
+    ///     `Established` peer's `session_obf_key` in turn; accept only
+    ///     `Data`/`Control`/`Gossip` — mirrors `handle_data_or_control`'s
+    ///     plaintext roaming fallback loop, one layer up.
+    /// (b) Otherwise (or if (a)/(a') did not yield one of those types), try
+    ///     the network `obf_key`; accept only `HandshakeInit`/`HandshakeResp`
+    ///     — this covers a brand-new peer's `Init` AND a re-handshake from a
+    ///     known src.
     ///
     /// A wrong key yields `None` or a garbage `(ptype, body)`; the type-set
     /// filters and, ultimately, the inner Noise/AEAD/frame verify make every
@@ -2468,6 +2537,36 @@ impl PeerManager {
             if let Some((ptype, body)) = yip_obf::deobfuscate(&key, dg) {
                 if ptype == yip_obf::JUNK_TYPE {
                     return None; // idle-cover decoy: inert, dropped, no fall-through
+                }
+                if ptype == PacketType::Data as u8
+                    || ptype == PacketType::Control as u8
+                    || ptype == PacketType::Gossip as u8
+                {
+                    return Some(reassemble(ptype, &body));
+                }
+            }
+        }
+        // (a') Roaming fallback: no endpoint match, but the datagram may be a
+        // roamed Established peer's Data/Control/Gossip under its session key.
+        // Trial each Established peer's session key; a wrong key yields None or a
+        // garbage type that the type-set + the downstream inner Noise/AEAD verify
+        // drop safely. NOTE: `deobfuscate` is an unauthenticated keystream XOR, so
+        // a wrong key CAN spuriously produce a Data/Control/Gossip type here — the
+        // authenticated gate is downstream (`inbound_open`/`route_data`), unlike
+        // `handle_data_or_control`'s plaintext loop which is itself AEAD-gated. A
+        // genuine roamed datagram is therefore dropped with tiny probability when
+        // an interfering peer's trial false-positives; FEC/ARQ absorb it, and the
+        // endpoint self-heals on the next datagram that reaches (a).
+        for p in &self.peers {
+            if !matches!(p.state, PeerState::Established(_)) {
+                continue;
+            }
+            let Some(key) = p.session_obf_key else {
+                continue;
+            };
+            if let Some((ptype, body)) = yip_obf::deobfuscate(&key, dg) {
+                if ptype == yip_obf::JUNK_TYPE {
+                    return None;
                 }
                 if ptype == PacketType::Data as u8
                     || ptype == PacketType::Control as u8
@@ -2819,8 +2918,17 @@ impl PeerManager {
                 || now_ms.saturating_sub(self.last_register_ms) >= self.reg_refresh_ms)
         {
             let node = self.local_node_id;
+            // Mesh mode (membership configured): mint a fresh signed
+            // registration record at the current `reg_seq` so the server can
+            // verify authenticity instead of trusting an unauthenticated
+            // `counter` (#37 Task 5). Non-mesh keeps the legacy `Register`.
+            let signed = self
+                .membership
+                .as_ref()
+                .map(|m| m.sign_registration(self.reg_seq));
+            self.reg_seq = self.reg_seq.saturating_add(1);
             if let Some(r) = self.rendezvous.as_mut() {
-                if let Some(dg) = r.register(node) {
+                if let Some(dg) = r.register(node, signed) {
                     self.tick_egress.push(dg);
                 }
             }
@@ -4960,9 +5068,20 @@ mod tests {
     }
 
     impl Rendezvous for MockRdv {
-        fn register(&mut self, node: NodeId) -> Option<EgressDatagram> {
-            // counter bumped per-registration in 3c.4; 0 is accepted as first-seen
-            Some(self.to_server(yip_rendezvous::Message::Register { node, counter: 0 }))
+        fn register(
+            &mut self,
+            node: NodeId,
+            signed: Option<yip_membership::Record>,
+        ) -> Option<EgressDatagram> {
+            match signed {
+                Some(record) => {
+                    Some(self.to_server(yip_rendezvous::Message::RegisterSigned { record }))
+                }
+                // counter bumped per-registration in 3c.4; 0 is accepted as first-seen
+                None => {
+                    Some(self.to_server(yip_rendezvous::Message::Register { node, counter: 0 }))
+                }
+            }
         }
         fn lookup(&mut self, node: NodeId) -> EgressDatagram {
             self.to_server(yip_rendezvous::Message::Lookup { node })
@@ -4976,12 +5095,15 @@ mod tests {
         }
         fn parse(&self, dg: &[u8]) -> RdvEvent {
             match yip_rendezvous::decode(dg) {
-                Some(yip_rendezvous::Message::PeerInfo { node, reflexive }) => {
-                    RdvEvent::PeerCandidate {
-                        node,
-                        addr: reflexive,
-                    }
-                }
+                Some(yip_rendezvous::Message::PeerInfo {
+                    node,
+                    reflexive,
+                    record,
+                }) => RdvEvent::PeerCandidate {
+                    node,
+                    addr: reflexive,
+                    record: record.map(Box::new),
+                },
                 Some(yip_rendezvous::Message::PunchHint { node, reflexive }) => RdvEvent::PunchTo {
                     node,
                     addr: reflexive,
@@ -5023,6 +5145,35 @@ mod tests {
             TunnelMode::L3Tun,
             Some(rdv),
             None,
+            false,
+        );
+        (pm, sent)
+    }
+
+    /// Like `pm_with_mock_rdv`, but with `membership` configured (mesh
+    /// mode) — used by the `PeerCandidate`-record-verification tests (#37
+    /// Task 5), which need the `MockRdv` to decode a real `PeerInfo.record`
+    /// AND a `Membership` to verify it against.
+    fn pm_with_mock_rdv_and_membership(
+        local: &yip_crypto::Keypair,
+        peers: &[PeerConfig],
+        membership: Membership,
+    ) -> (
+        PeerManager,
+        std::rc::Rc<std::cell::RefCell<Vec<yip_rendezvous::Message>>>,
+    ) {
+        let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let rdv: Box<dyn Rendezvous> = Box::new(MockRdv {
+            server: mock_server(),
+            sent: sent.clone(),
+        });
+        let pm = PeerManager::new(
+            local.private,
+            local.public,
+            peers,
+            TunnelMode::L3Tun,
+            Some(rdv),
+            Some(membership),
             false,
         );
         (pm, sent)
@@ -5169,6 +5320,7 @@ mod tests {
             &yip_rendezvous::Message::PeerInfo {
                 node: node_id(&peer_kp.public),
                 reflexive: candidate,
+                record: None,
             },
             &mut buf,
         );
@@ -5193,6 +5345,181 @@ mod tests {
             "the datagram to the candidate is a handshake Init"
         );
         assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    }
+
+    /// Build a mesh (`membership: Some`) `Membership` for `local_pub` trusting
+    /// `ca`, whose `roots` names `ca`'s own pubkey — the convention
+    /// `Membership::verify_record` relies on (it treats `roots.roots`'
+    /// pubkeys as the trusted CA set, mirroring `bin/yip-rendezvous`'s own
+    /// rooted-server convention). Shared by the two `PeerCandidate`-record
+    /// verification tests below (#37 Task 5).
+    fn membership_trusting_ca_via_roots(ca: &SigningKey, local_pub: [u8; 32]) -> Membership {
+        let ca_pub = ca.verifying_key().to_bytes();
+        let own_sign = SigningKey::from_bytes(&[201u8; 32]);
+        let own_cert = mk_cert(ca, local_pub, own_sign.verifying_key().to_bytes());
+        let roots = RootSet {
+            roots: vec![(ca_pub, "10.0.0.99:51820".parse().unwrap())],
+            version: 0,
+            ca_sig: [0u8; 64],
+        };
+        Membership::new(
+            vec![ca_pub],
+            TEST_NET,
+            own_cert,
+            own_sign.to_bytes(),
+            roots,
+            vec!["10.0.0.1:51820".parse().unwrap()],
+        )
+    }
+
+    /// #37 Task 5: a `PeerCandidate` carrying a record that VERIFIES against
+    /// our membership roots is accepted — the candidate is set and a
+    /// subsequent tick probes it with a handshake `Init`, exactly like the
+    /// no-record (`peer_candidate_then_tick_probes_candidate_with_init`)
+    /// case above.
+    #[test]
+    fn peer_candidate_with_valid_signed_record_is_accepted_and_probed() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let membership = membership_trusting_ca_via_roots(&ca, local.public);
+        let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[peer], membership);
+
+        let candidate: SocketAddr = "198.51.100.7:41000".parse().unwrap();
+        let valid_rec = mk_record(&ca, 55, peer_kp.public, vec![candidate], 1);
+        let mut buf = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PeerInfo {
+                node: node_id(&peer_kp.public),
+                reflexive: candidate,
+                record: Some(valid_rec),
+            },
+            &mut buf,
+        );
+        assert!(matches!(
+            pm.on_udp(mock_server(), &buf, 0),
+            DispatchOut::None
+        ));
+        assert_eq!(
+            pm.peers[0].path.candidate(),
+            Some(candidate),
+            "a validly-signed record must set the candidate"
+        );
+
+        let out = pm.tick(1).map(<[_]>::to_vec).unwrap_or_default();
+        let init = out
+            .iter()
+            .find(|d| d.dst == candidate)
+            .expect("a handshake Init is emitted toward the verified candidate");
+        assert_eq!(
+            init.bytes[0],
+            PacketType::HandshakeInit as u8,
+            "the datagram to the candidate is a handshake Init"
+        );
+        assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    }
+
+    /// #37 Task 5: a `PeerCandidate` carrying a record that FAILS
+    /// `verify_record` (signed by a CA outside our membership roots — a
+    /// forged/foreign record) must be DROPPED: no candidate is set and no
+    /// probe is ever sent toward it, even after a tick. This is the
+    /// discriminating half of the pair — it genuinely rejects, it doesn't
+    /// just happen to also pass.
+    #[test]
+    fn peer_candidate_with_invalid_record_is_dropped_no_probe() {
+        let ca = test_ca();
+        let foreign_ca = SigningKey::from_bytes(&[177u8; 32]); // NOT in this membership's roots
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let membership = membership_trusting_ca_via_roots(&ca, local.public);
+        let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[peer], membership);
+
+        let candidate: SocketAddr = "198.51.100.7:41000".parse().unwrap();
+        // Signed under `foreign_ca`, not the trusted `ca` — a forged record
+        // claiming to be `peer_kp`'s.
+        let forged = mk_record(&foreign_ca, 55, peer_kp.public, vec![candidate], 1);
+        let mut buf = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PeerInfo {
+                node: node_id(&peer_kp.public),
+                reflexive: candidate,
+                record: Some(forged),
+            },
+            &mut buf,
+        );
+        assert!(matches!(
+            pm.on_udp(mock_server(), &buf, 0),
+            DispatchOut::None
+        ));
+        assert_eq!(
+            pm.peers[0].path.candidate(),
+            None,
+            "an unverifiable record must NOT set the candidate"
+        );
+
+        let out = pm.tick(1).map(<[_]>::to_vec).unwrap_or_default();
+        assert!(
+            !out.iter().any(|d| d.dst == candidate),
+            "no probe may be sent toward a candidate carrying an unverifiable record"
+        );
+        assert!(
+            matches!(pm.peers[0].state, PeerState::Idle),
+            "the peer must stay Idle: the forged candidate was never acted on"
+        );
+    }
+
+    #[test]
+    fn peer_candidate_with_valid_record_for_wrong_node_is_dropped() {
+        // A record can be a GENUINE, trusted-CA member record and still be the
+        // wrong one: the server answered Lookup(peer) with a valid record that
+        // belongs to some OTHER member. `verify_record` passes it (it's real),
+        // so the node_id binding is what must drop it.
+        let ca = test_ca();
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let other_kp = generate_keypair(); // a different, validly-certed member
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let membership = membership_trusting_ca_via_roots(&ca, local.public);
+        let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[peer], membership);
+
+        let candidate: SocketAddr = "198.51.100.7:41000".parse().unwrap();
+        // Validly signed by the TRUSTED ca — but for `other_kp`, not `peer_kp`.
+        let wrong_id = mk_record(&ca, 55, other_kp.public, vec![candidate], 1);
+        let mut buf = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PeerInfo {
+                node: node_id(&peer_kp.public),
+                reflexive: candidate,
+                record: Some(wrong_id),
+            },
+            &mut buf,
+        );
+        assert!(matches!(
+            pm.on_udp(mock_server(), &buf, 0),
+            DispatchOut::None
+        ));
+        assert_eq!(
+            pm.peers[0].path.candidate(),
+            None,
+            "a valid record binding a DIFFERENT identity must NOT set the candidate",
+        );
+        let out = pm.tick(1).map(<[_]>::to_vec).unwrap_or_default();
+        assert!(
+            !out.iter().any(|d| d.dst == candidate),
+            "no probe toward a candidate whose record binds a different identity",
+        );
+        assert!(matches!(pm.peers[0].state, PeerState::Idle));
     }
 
     /// (c) With NO rendezvous configured, a peer with a direct endpoint behaves
@@ -5257,6 +5584,7 @@ mod tests {
             &yip_rendezvous::Message::PeerInfo {
                 node: node_id(&peer_kp.public),
                 reflexive: hijack,
+                record: None,
             },
             &mut buf,
         );
@@ -5313,6 +5641,7 @@ mod tests {
             &yip_rendezvous::Message::PeerInfo {
                 node: node_id(&peer_kp.public),
                 reflexive: candidate,
+                record: None,
             },
             &mut buf,
         );
@@ -5454,6 +5783,7 @@ mod tests {
             &yip_rendezvous::Message::PeerInfo {
                 node: node_id(&peer_kp.public),
                 reflexive: candidate,
+                record: None,
             },
             &mut buf,
         );
@@ -6279,6 +6609,7 @@ mod tests {
             &yip_rendezvous::Message::PeerInfo {
                 node: node_id(&peer_kp.public),
                 reflexive: candidate,
+                record: None,
             },
             &mut buf,
         );
@@ -7856,6 +8187,80 @@ mod tests {
         assert!(pm.by_tag.is_empty());
     }
 
+    // ── M2 roaming: deobf_ingress trial fallback ────────────────────────────
+
+    /// Build an obf-on `PeerManager` with a single `Established` peer at a
+    /// known endpoint and a known `session_obf_key`, plus a plaintext
+    /// `[Data][body]` datagram as `deobf_ingress` would return it — the
+    /// shared fixture for the roaming trial-fallback tests below.
+    fn established_obf_peer_with_data() -> (PeerManager, [u8; 16], Vec<u8>) {
+        const TAG: u64 = 0x9999_1111_2222_3333;
+        let peer_ep: SocketAddr = "10.0.0.30:3030".parse().unwrap();
+        let peer = peer_cfg(30, "10.0.0.30:3030");
+        let mut pm = PeerManager::new(
+            [31u8; 32],
+            [32u8; 32],
+            &[peer],
+            TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
+        pm.set_obf_psk(Some([0xCCu8; 32]));
+
+        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+            Box::new(fake_established_dataplane(TAG, peer_ep)),
+            0,
+        )));
+        let sess = [0xDDu8; 16];
+        pm.peers[0].session_obf_key = Some(sess);
+        pm.by_tag.insert(TAG, 0);
+
+        let mut plaintext = vec![PacketType::Data as u8];
+        plaintext.extend_from_slice(&[0x55u8; 40]);
+        (pm, sess, plaintext)
+    }
+
+    /// With obfuscation on, a `Data` datagram obfuscated under an
+    /// `Established` peer's session key, but arriving from a source that does
+    /// NOT match that peer's recorded `endpoint` (the peer roamed to a new
+    /// NAT mapping), still deobfuscates: step (a)'s endpoint fast-path misses,
+    /// but the (a') roaming trial fallback tries every `Established` peer's
+    /// session key and finds this one.
+    #[test]
+    fn deobf_finds_roamed_peer_session_key_by_trial() {
+        let (pm, sess, plaintext) = established_obf_peer_with_data();
+        let obf = yip_obf::obfuscate(&sess, PacketType::Data as u8, &plaintext[1..], 0)
+            .expect("small test body fits u16");
+        let roamed: SocketAddr = "198.51.100.231:41111".parse().unwrap();
+        assert_ne!(
+            pm.peers[0].endpoint,
+            Some(roamed),
+            "fixture invariant: the roamed src must not match the peer's endpoint"
+        );
+
+        let out = pm.deobf_ingress(roamed, &obf);
+        assert_eq!(
+            out.as_deref(),
+            Some(plaintext.as_slice()),
+            "roamed peer's data must deobfuscate via the trial fallback"
+        );
+    }
+
+    /// A datagram that decodes under no known key at all — not the (a)
+    /// endpoint match, not the (a') trial over `Established` peers' session
+    /// keys, not the (b) network key — is dropped, never mis-dispatched.
+    #[test]
+    fn deobf_trial_does_not_accept_foreign_datagram() {
+        let (pm, _sess, _plaintext) = established_obf_peer_with_data();
+        let garbage = vec![0xABu8; 64];
+        let src: SocketAddr = "203.0.113.9:9".parse().unwrap();
+        assert!(
+            pm.deobf_ingress(src, &garbage).is_none(),
+            "a datagram under no known session key must not deobfuscate"
+        );
+    }
+
     /// (3b-a) `build_junk()` produces a PLAINTEXT `[JUNK_TYPE][body]`
     /// datagram, `JUNK_MIN_LEN..=JUNK_MAX_LEN` bytes of body — it must NOT
     /// pre-obfuscate, since the caller's `obf_egress` pass wraps it exactly
@@ -8310,6 +8715,7 @@ mod tests {
             &yip_rendezvous::Message::PeerInfo {
                 node: node_id(&peer_kp.public),
                 reflexive: candidate,
+                record: None,
             },
             &mut plain,
         );
@@ -8374,6 +8780,7 @@ mod tests {
             &yip_rendezvous::Message::PeerInfo {
                 node: node_id(&peer_kp.public),
                 reflexive: candidate,
+                record: None,
             },
             &mut plain,
         );
@@ -8709,4 +9116,179 @@ mod tests {
             "membership-off: sweep is a no-op"
         );
     }
+
+    // ── M2 Task 1: endpoint roaming on authenticated inbound ────────────────
+
+    /// Build a two-`PeerManager` Established pair via `established_pm_pair`
+    /// (a large `rekey_interval_ms` so `on_tun`'s drive-rekey-schedule never
+    /// fires), returning `(pm_i, pm_r, old_ep)`: `pm_i` is the initiator
+    /// (sends data), `pm_r` is the responder whose `peers[0].endpoint` is
+    /// under test, and `old_ep` is `pm_r`'s currently-learned address for
+    /// `pm_i` (`established_pm_pair`'s `ep_a`).
+    fn established_pair_for_roaming() -> (PeerManager, PeerManager, SocketAddr) {
+        let (pm_i, pm_r, ep_i, _ep_r, _kp_i, _kp_r) = established_pm_pair(1_000_000);
+        assert_eq!(pm_r.peers[0].endpoint, Some(ep_i));
+        (pm_i, pm_r, ep_i)
+    }
+
+    #[test]
+    fn authenticated_data_from_new_src_roams_endpoint() {
+        // Two direct peers, established; pm_r.peers[0].endpoint == old_ep.
+        let (mut pm_i, mut pm_r, old_ep) = established_pair_for_roaming();
+
+        // The initiator sends a real Data packet; capture its on-wire bytes.
+        // (Systematic FEC may emit extra parity datagrams alongside the
+        // source symbol at index 0 — the source symbol alone is a complete,
+        // independently-reconstructable frame, exactly like the existing
+        // `rekey_resp_promotes_initiator_and_keeps_previous_for_grace` test's
+        // use of `on_tun(..)[0]`.)
+        let data = pm_i.on_tun(&dummy_tun_pkt(), 0).to_vec();
+        assert_eq!(data[0].bytes[0], PacketType::Data as u8);
+        let dg = data[0].bytes.clone();
+
+        let new_src: SocketAddr = "198.51.100.222:60000".parse().unwrap();
+        assert_ne!(new_src, old_ep);
+
+        // Deliver from the NEW source. For real (masked) traffic `dg[1..9]`
+        // is per-datagram garbage (see the module doc), so `by_tag` misses,
+        // and `new_src != endpoint` so the address match misses too —
+        // `route_data` returns `None` and this is handled by the OTHER
+        // authenticated-decrypt site, the roaming fallback loop in
+        // `handle_data_or_control` (same site `replayed_data_from_spoofed_src_does_not_roam_endpoint`
+        // exercises for the rejection case). The datagram still
+        // authenticates there via `inbound_open`.
+        let out = pm_r.on_udp(new_src, &dg, 1_000);
+        assert!(
+            !matches!(out, DispatchOut::None),
+            "a genuine Data datagram must authenticate"
+        );
+        assert_eq!(
+            pm_r.peers[0].endpoint,
+            Some(new_src),
+            "endpoint must follow an authenticated packet from a new source",
+        );
+    }
+
+    #[test]
+    fn roam_redirects_egress_to_the_new_source() {
+        // Relearning `endpoint` alone is a half-fix: egress datagrams are
+        // stamped from the `EpochSet`'s `DataPlane::peer_addr`, not `endpoint`.
+        // After an authenticated roam, the responder's OWN outbound data must
+        // target the new source, or return traffic keeps hitting the peer's
+        // stale (post-rebind, dead) address.
+        let (mut pm_i, mut pm_r, old_ep) = established_pair_for_roaming();
+
+        // Pre-roam: pm_r's egress targets the original endpoint.
+        let before = pm_r.on_tun(&dummy_tun_pkt(), 500).to_vec();
+        assert_eq!(
+            before[0].dst, old_ep,
+            "egress targets the original endpoint"
+        );
+
+        // pm_i sends an authenticated Data packet from a NEW source; pm_r roams.
+        let data = pm_i.on_tun(&dummy_tun_pkt(), 0).to_vec();
+        let dg = data[0].bytes.clone();
+        let new_src: SocketAddr = "198.51.100.222:60000".parse().unwrap();
+        assert_ne!(new_src, old_ep);
+        let out = pm_r.on_udp(new_src, &dg, 1_000);
+        assert!(
+            !matches!(out, DispatchOut::None),
+            "the roam packet must authenticate"
+        );
+
+        // Post-roam: pm_r's egress now targets the new source (not just `endpoint`).
+        let after = pm_r.on_tun(&dummy_tun_pkt(), 2_000).to_vec();
+        assert_eq!(
+            after[0].dst, new_src,
+            "egress must follow the roam to the new source, not the stale addr",
+        );
+    }
+
+    #[test]
+    fn replayed_data_from_spoofed_src_does_not_roam_endpoint() {
+        let (mut pm_i, mut pm_r, old_ep) = established_pair_for_roaming();
+        let data = pm_i.on_tun(&dummy_tun_pkt(), 0).to_vec();
+        let dg = data[0].bytes.clone();
+
+        // First delivery from the legit endpoint authenticates and is
+        // consumed (advances the replay window). `src == old_ep` matches
+        // `route_data`'s address check directly, reaching
+        // `dispatch_established`.
+        let out1_is_none = matches!(pm_r.on_udp(old_ep, &dg, 1_000), DispatchOut::None);
+        assert!(!out1_is_none, "the first delivery must authenticate");
+        assert_eq!(pm_r.peers[0].endpoint, Some(old_ep));
+
+        // REPLAY the exact same datagram from a spoofed source: `dg[1..9]`
+        // is masked per-datagram (see the module doc), so it does not match
+        // `by_tag`, and `spoof != old_ep` so it does not match by address
+        // either — `route_data` returns `None` and this exercises the OTHER
+        // authenticated-decrypt site, the roaming fallback loop in
+        // `handle_data_or_control`. The replay window there must reject it —
+        // this must fail if the replay were (incorrectly) accepted.
+        let spoof: SocketAddr = "203.0.113.66:5555".parse().unwrap();
+        let out2_is_none = matches!(pm_r.on_udp(spoof, &dg, 1_001), DispatchOut::None);
+        assert!(
+            out2_is_none,
+            "a replayed datagram must be rejected, not accepted"
+        );
+        assert_eq!(
+            pm_r.peers[0].endpoint,
+            Some(old_ep),
+            "a replayed packet must not move the endpoint"
+        );
+    }
+
+    #[test]
+    fn dispatch_established_relearns_endpoint_directly() {
+        // The `route_data` address-match path always calls
+        // `dispatch_established` with `src == endpoint` (by construction of
+        // the match), so `on_udp` alone can never exercise
+        // `dispatch_established`'s own relearn call with a DIFFERING `src` —
+        // real masked traffic that roams is only ever caught by the fallback
+        // loop (see `authenticated_data_from_new_src_roams_endpoint`'s
+        // comment). This test calls `dispatch_established` directly (it's a
+        // private inherent method, reachable from `mod tests`) with a src
+        // that differs from the learned endpoint, proving that authenticated-
+        // decrypt site's own relearn call (added per the brief as
+        // defense-in-depth for a future/hand-built `by_tag` hit) is wired
+        // correctly, independent of which routing path reaches it.
+        let (mut pm_i, mut pm_r, old_ep) = established_pair_for_roaming();
+        let dg = pm_i.on_tun(&dummy_tun_pkt(), 0).to_vec()[0].bytes.clone();
+        let new_src: SocketAddr = "198.51.100.7:5000".parse().unwrap();
+        assert_ne!(new_src, old_ep);
+
+        let out_is_none = matches!(
+            pm_r.dispatch_established(0, new_src, &dg, 1_000),
+            DispatchOut::None
+        );
+        assert!(!out_is_none, "a genuine Data datagram must authenticate");
+        assert_eq!(
+            pm_r.peers[0].endpoint,
+            Some(new_src),
+            "dispatch_established's own relearn call must move the endpoint"
+        );
+    }
+
+    #[test]
+    fn relay_peer_endpoint_does_not_roam() {
+        // A relay-established peer (`established_relay_pm`: `relay = true`,
+        // `endpoint` is whatever placeholder the config left it as).
+        // `relearn_endpoint` must be a no-op regardless of `src`.
+        let (mut pm, _local, _peer_kp, _old_tag) = established_relay_pm(100);
+        assert!(pm.peers[0].relay);
+        let placeholder = pm.peers[0].endpoint;
+
+        pm.relearn_endpoint(0, "198.51.100.9:7000".parse().unwrap());
+
+        assert_eq!(
+            pm.peers[0].endpoint, placeholder,
+            "a relay peer's endpoint must never roam"
+        );
+    }
+
+    // #34 preservation: an unauthenticated Init from a spoofed source against
+    // an Established responder still must not move `endpoint` — M2 does not
+    // touch the Init path (it never calls `inbound_open`), so the existing
+    // guard covers this; see `stale_replayed_cold_start_init_does_not_hijack_endpoint`
+    // and `stale_replayed_init_is_rejected_and_endpoint_unchanged` above.
 }

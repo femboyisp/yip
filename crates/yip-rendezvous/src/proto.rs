@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2sVar;
+use yip_membership::Record;
 
 /// Domain separation so node-id can't collide with the mesh-address derivation.
 const DOMAIN: &[u8] = b"yip-rdv-v1";
@@ -31,6 +32,7 @@ enum Tag {
     PunchHint = 4,
     RelaySend = 5,
     RelayDeliver = 6,
+    RegisterSigned = 7,
 }
 
 /// A rendezvous/relay control message. See the 2b spec for direction/semantics.
@@ -49,6 +51,10 @@ pub enum Message {
     PeerInfo {
         node: NodeId,
         reflexive: SocketAddr,
+        /// The requested node's signed directory record, when the relay has
+        /// one on file. `None` for legacy datagrams (no trailing presence
+        /// byte) or when no record is available.
+        record: Option<Record>,
     },
     NotFound {
         node: NodeId,
@@ -66,6 +72,34 @@ pub enum Message {
         src: NodeId,
         payload: Vec<u8>,
     },
+    /// A self-authenticating registration: the relay verifies `record`
+    /// itself rather than trusting an unauthenticated `counter`.
+    RegisterSigned {
+        record: Record,
+    },
+}
+
+/// Encode `record` onto `out` as a big-endian `u16` length prefix followed
+/// by its `Record::encode` bytes, mirroring how `record_signing_body`
+/// length-prefixes the embedded cert (`Record::decode` requires an exact
+/// slice, so a self-delimiting length prefix is required to embed one
+/// record inside another message).
+fn put_record(out: &mut Vec<u8>, record: &Record) {
+    let mut bytes = Vec::new();
+    record.encode(&mut bytes);
+    let len = u16::try_from(bytes.len()).expect("record fits in u16");
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(&bytes);
+}
+
+/// Parse a length-prefixed record from the front of `buf`. Returns the
+/// record and the number of bytes consumed, or `None` if the length prefix,
+/// slice, or record contents are invalid/truncated (fail-closed).
+fn take_record(buf: &[u8]) -> Option<(Record, usize)> {
+    let len = usize::from(u16::from_be_bytes(buf.get(..2)?.try_into().ok()?));
+    let record_bytes = buf.get(2..2 + len)?;
+    let record = Record::decode(record_bytes)?;
+    Some((record, 2 + len))
 }
 
 fn put_addr(out: &mut Vec<u8>, addr: &SocketAddr) {
@@ -112,10 +146,21 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) {
             out.push(Tag::Lookup as u8);
             out.extend_from_slice(node);
         }
-        Message::PeerInfo { node, reflexive } => {
+        Message::PeerInfo {
+            node,
+            reflexive,
+            record,
+        } => {
             out.push(Tag::PeerInfo as u8);
             out.extend_from_slice(node);
             put_addr(out, reflexive);
+            match record {
+                Some(r) => {
+                    out.push(1);
+                    put_record(out, r);
+                }
+                None => out.push(0),
+            }
         }
         Message::NotFound { node } => {
             out.push(Tag::NotFound as u8);
@@ -136,6 +181,10 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) {
             out.push(Tag::RelayDeliver as u8);
             out.extend_from_slice(src);
             out.extend_from_slice(payload);
+        }
+        Message::RegisterSigned { record } => {
+            out.push(Tag::RegisterSigned as u8);
+            put_record(out, record);
         }
     }
 }
@@ -158,8 +207,24 @@ pub fn decode(buf: &[u8]) -> Option<Message> {
         }),
         t if t == Tag::PeerInfo as u8 => {
             let node = node16(rest)?;
-            let (reflexive, _) = take_addr(rest.get(16..)?)?;
-            Some(Message::PeerInfo { node, reflexive })
+            let (reflexive, used) = take_addr(rest.get(16..)?)?;
+            let after_addr = rest.get(16 + used..)?;
+            let record = match after_addr.first() {
+                Some(0) => None,
+                Some(1) => {
+                    let (record, _) = take_record(after_addr.get(1..)?)?;
+                    Some(record)
+                }
+                Some(_) => return None,
+                // No trailing presence byte: a legacy datagram. Treat as
+                // `None` for backward compatibility.
+                None => None,
+            };
+            Some(Message::PeerInfo {
+                node,
+                reflexive,
+                record,
+            })
         }
         t if t == Tag::PunchHint as u8 => {
             let node = node16(rest)?;
@@ -181,6 +246,10 @@ pub fn decode(buf: &[u8]) -> Option<Message> {
                 src,
                 payload: rest.get(16..)?.to_vec(),
             })
+        }
+        t if t == Tag::RegisterSigned as u8 => {
+            let (record, _) = take_record(rest)?;
+            Some(Message::RegisterSigned { record })
         }
         _ => None,
     }
@@ -230,10 +299,12 @@ mod tests {
         roundtrip(Message::PeerInfo {
             node: n,
             reflexive: v4,
+            record: None,
         });
         roundtrip(Message::PeerInfo {
             node: n,
             reflexive: v6,
+            record: None,
         });
         roundtrip(Message::NotFound { node: n });
         roundtrip(Message::PunchHint {
@@ -260,10 +331,15 @@ mod tests {
             &Message::PeerInfo {
                 node: [2u8; 16],
                 reflexive: "1.2.3.4:5".parse().unwrap(),
+                record: None,
             },
             &mut buf,
         );
-        buf.truncate(buf.len() - 1);
+        // Cut 2 bytes: the trailing `record: None` presence byte plus the
+        // last byte of the port, so the address itself is genuinely
+        // truncated (not just the presence byte, which legacy decode
+        // tolerates).
+        buf.truncate(buf.len() - 2);
         assert_eq!(decode(&buf), None); // truncated addr
     }
 
@@ -285,6 +361,117 @@ mod tests {
         let mut buf = vec![0u8]; // Tag::Register
         buf.extend_from_slice(&[9u8; 16]);
         buf.extend_from_slice(&[0u8; 4]);
+        assert_eq!(decode(&buf), None);
+    }
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// Build a decode-valid `Record`: a CA-signed `Cert` binding a member
+    /// key, and the record itself signed with the member's record-signing
+    /// key. Mirrors `yip_membership::record`'s own `make_signed_record` test
+    /// fixture (not exposed outside that crate, so reconstructed here).
+    fn sample_record() -> Record {
+        use ed25519_dalek::{Signer, SigningKey};
+        use rand_core::OsRng;
+        use yip_membership::cert::cert_signing_body;
+        use yip_membership::record::{record_signing_body, sign};
+        use yip_membership::{node_id, Cert};
+
+        let ca = SigningKey::generate(&mut OsRng);
+        let member_pubkey = [1u8; 32];
+        let member_sign_key = SigningKey::generate(&mut OsRng);
+        let member_sign_pubkey = member_sign_key.verifying_key().to_bytes();
+        let network_id = [7u8; 16];
+
+        let mut cert = Cert {
+            version: 1,
+            member_pubkey,
+            member_sign_pubkey,
+            network_id,
+            not_before: 100,
+            not_after: 200,
+            tags: vec![],
+            ca_sig: [0u8; 64],
+        };
+        cert.ca_sig = ca.sign(&cert_signing_body(&cert)).to_bytes();
+
+        let mut record = Record {
+            node_id: node_id(&member_pubkey),
+            cert,
+            endpoints: vec![addr("192.0.2.1:8080")],
+            seq: 1,
+            sig: [0u8; 64],
+        };
+        let body = record_signing_body(&record);
+        record.sig = sign(
+            &body,
+            member_sign_key.to_bytes().as_ref().try_into().unwrap(),
+        );
+        record
+    }
+
+    #[test]
+    fn register_signed_roundtrips() {
+        let rec = sample_record();
+        roundtrip(Message::RegisterSigned { record: rec });
+    }
+
+    #[test]
+    fn peerinfo_with_record_roundtrips() {
+        roundtrip(Message::PeerInfo {
+            node: [7u8; 16],
+            reflexive: addr("198.51.100.7:41000"),
+            record: Some(sample_record()),
+        });
+    }
+
+    #[test]
+    fn peerinfo_without_record_roundtrips_and_is_backward_compatible() {
+        roundtrip(Message::PeerInfo {
+            node: [7u8; 16],
+            reflexive: addr("198.51.100.7:41000"),
+            record: None,
+        });
+    }
+
+    #[test]
+    fn peerinfo_legacy_datagram_with_no_presence_byte_decodes_as_none() {
+        // A legacy encoder that predates the `record` field never writes the
+        // trailing presence byte at all. Decode must still accept it and
+        // treat it as `record: None`.
+        let mut buf = vec![Tag::PeerInfo as u8];
+        buf.extend_from_slice(&[7u8; 16]); // node
+        put_addr(&mut buf, &addr("198.51.100.7:41000")); // no presence byte after
+        assert_eq!(
+            decode(&buf),
+            Some(Message::PeerInfo {
+                node: [7u8; 16],
+                reflexive: addr("198.51.100.7:41000"),
+                record: None,
+            })
+        );
+    }
+
+    #[test]
+    fn register_signed_length_prefix_exceeding_buffer_is_none() {
+        // A `RegisterSigned` whose u16 length prefix claims more bytes than
+        // are actually present must fail closed, not panic.
+        let mut buf = vec![Tag::RegisterSigned as u8];
+        buf.extend_from_slice(&0xFFFFu16.to_be_bytes()); // claims 65535 bytes
+        buf.extend_from_slice(&[0u8; 4]); // far fewer bytes actually follow
+        assert_eq!(decode(&buf), None);
+    }
+
+    #[test]
+    fn peerinfo_record_length_prefix_exceeding_buffer_is_none() {
+        let mut buf = vec![Tag::PeerInfo as u8];
+        buf.extend_from_slice(&[7u8; 16]); // node
+        put_addr(&mut buf, &addr("198.51.100.7:41000"));
+        buf.push(1); // presence byte: record follows
+        buf.extend_from_slice(&0xFFFFu16.to_be_bytes()); // claims 65535 bytes
+        buf.extend_from_slice(&[0u8; 4]); // far fewer bytes actually follow
         assert_eq!(decode(&buf), None);
     }
 }

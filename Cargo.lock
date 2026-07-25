@@ -2084,6 +2084,9 @@ name = "yip-rendezvous"
 version = "0.1.0"
 dependencies = [
  "blake2",
+ "ed25519-dalek",
+ "rand_core 0.6.4",
+ "yip-membership",
 ]
 
 [[package]]
@@ -2099,6 +2102,7 @@ dependencies = [
  "tokio-boring",
  "x25519-dalek",
  "x509-parser",
+ "yip-membership",
  "yip-obf",
  "yip-rendezvous",
  "yip-utls",
