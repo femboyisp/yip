@@ -211,13 +211,6 @@ impl EpochSet {
             age >= interval_ms.saturating_mul(2)
         }
     }
-
-    /// Responder guard: ignore a rekey Init that arrives against a very fresh
-    /// `current` (< interval/2 old) — bounds attacker-induced speculative
-    /// handshakes without full timestamp anti-replay (#34).
-    pub fn accept_rekey_init(&self, now_ms: u64, interval_ms: u64) -> bool {
-        now_ms.saturating_sub(self.current_created_ms) >= interval_ms / 2
-    }
 }
 
 #[cfg(test)]
@@ -512,15 +505,5 @@ mod tests {
         // Loser: doesn't trigger until 2x the interval (fallback).
         assert!(!set.needs_rekey(1500, false, interval));
         assert!(set.needs_rekey(2000, false, interval));
-    }
-
-    #[test]
-    fn accept_rekey_init_ignores_too_fresh_current() {
-        let (_peer, us) = epoch_pair();
-        let set = EpochSet::new(us, 0);
-        let interval = 1000u64;
-
-        assert!(!set.accept_rekey_init(400, interval));
-        assert!(set.accept_rekey_init(500, interval));
     }
 }
