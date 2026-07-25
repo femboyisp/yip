@@ -110,9 +110,15 @@ fn random_nonce() -> [u8; NONCE_LEN] {
 }
 
 /// Wrap `(ptype, body)` with `pad_len` random trailing padding bytes.
-pub fn obfuscate(key: &[u8; 16], ptype: u8, body: &[u8], pad_len: usize) -> Vec<u8> {
+///
+/// Returns `None` — instead of panicking — when `body.len()` exceeds
+/// `u16::MAX` and so cannot fit the envelope's `body_len` field (#44: a
+/// wire-facing daemon function must never panic on an oversized body, e.g.
+/// an unbounded gossip digest; the caller is expected to bound/chunk its
+/// input, but this is the fail-soft backstop).
+pub fn obfuscate(key: &[u8; 16], ptype: u8, body: &[u8], pad_len: usize) -> Option<Vec<u8>> {
     let nonce = random_nonce();
-    let body_len = u16::try_from(body.len()).expect("body fits u16");
+    let body_len = u16::try_from(body.len()).ok()?;
     // plaintext region: type(1) ‖ body_len(2) ‖ body ‖ padding
     let mut region = Vec::with_capacity(3 + body.len() + pad_len);
     region.push(ptype);
@@ -126,7 +132,7 @@ pub fn obfuscate(key: &[u8; 16], ptype: u8, body: &[u8], pad_len: usize) -> Vec<
     let mut out = Vec::with_capacity(NONCE_LEN + region.len());
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&region);
-    out
+    Some(out)
 }
 
 /// Recover `(ptype, body)`, or `None` if too short / length-inconsistent.
@@ -154,7 +160,7 @@ mod tests {
     #[test]
     fn round_trips_type_and_body() {
         let key = derive_key(b"network-secret");
-        let dg = obfuscate(&key, 2, b"hello world payload", 17);
+        let dg = obfuscate(&key, 2, b"hello world payload", 17).expect("small test body fits u16");
         let (ptype, body) = deobfuscate(&key, &dg).expect("round-trips");
         assert_eq!(ptype, 2);
         assert_eq!(body, b"hello world payload");
@@ -164,7 +170,7 @@ mod tests {
     fn wrong_key_does_not_recover_body() {
         let k1 = derive_key(b"secret-a");
         let k2 = derive_key(b"secret-b");
-        let dg = obfuscate(&k1, 2, b"the real body", 8);
+        let dg = obfuscate(&k1, 2, b"the real body", 8).expect("small test body fits u16");
         // Wrong key yields either None (inconsistent length) or a garbage body,
         // but MUST NOT recover the real (ptype=2, "the real body").
         match deobfuscate(&k2, &dg) {
@@ -182,7 +188,9 @@ mod tests {
         let key = derive_key(b"k");
         let n = 512usize;
         let dgs: Vec<Vec<u8>> = (0..n)
-            .map(|_| obfuscate(&key, 2, b"same body every time", 4))
+            .map(|_| {
+                obfuscate(&key, 2, b"same body every time", 4).expect("small test body fits u16")
+            })
             .collect();
         let len = dgs[0].len();
         for pos in 0..len {
@@ -200,7 +208,7 @@ mod tests {
         let key = derive_key(b"k");
         assert_eq!(deobfuscate(&key, &[]), None);
         assert_eq!(deobfuscate(&key, &[0u8; 3]), None); // < MIN_ENVELOPE
-        let mut dg = obfuscate(&key, 1, b"abc", 5);
+        let mut dg = obfuscate(&key, 1, b"abc", 5).expect("small test body fits u16");
         dg.truncate(dg.len() - 1); // corrupt length consistency
                                    // Must not panic; returns None or a shorter/garbage body, never OOB.
         let _ = deobfuscate(&key, &dg);
@@ -209,8 +217,8 @@ mod tests {
     #[test]
     fn pad_len_changes_size_but_not_recovered_body() {
         let key = derive_key(b"k");
-        let a = obfuscate(&key, 0, b"x", 0);
-        let b = obfuscate(&key, 0, b"x", 200);
+        let a = obfuscate(&key, 0, b"x", 0).expect("small test body fits u16");
+        let b = obfuscate(&key, 0, b"x", 200).expect("small test body fits u16");
         assert!(b.len() > a.len());
         assert_eq!(deobfuscate(&key, &a).unwrap().1, b"x");
         assert_eq!(deobfuscate(&key, &b).unwrap().1, b"x");
@@ -250,12 +258,28 @@ mod tests {
     }
 
     #[test]
+    fn obfuscate_is_fail_soft_on_oversized_body() {
+        // Bug #44: `obfuscate` used to `.expect("body fits u16")` on the
+        // length cast, so a body > u16::MAX (e.g. an unbounded full-directory
+        // gossip digest) panicked the daemon. It must instead fail soft.
+        let key = derive_key(b"k");
+        let oversized = vec![0u8; 65536]; // 65536 > u16::MAX (65535)
+        assert_eq!(
+            obfuscate(&key, 2, &oversized, 0),
+            None,
+            "a body that cannot fit the u16 length field must yield None, not panic"
+        );
+        // A normal small body still round-trips as Some(..).
+        assert!(obfuscate(&key, 2, b"small body", 0).is_some());
+    }
+
+    #[test]
     fn junk_datagram_deobfuscates_to_junk_type() {
         let key = derive_key(b"net");
         let mut r = XorShift64::from_getrandom();
         let mut body = [0u8; 128];
         r.fill(&mut body);
-        let dg = obfuscate(&key, JUNK_TYPE, &body, 7);
+        let dg = obfuscate(&key, JUNK_TYPE, &body, 7).expect("small test body fits u16");
         let (pt, _b) = deobfuscate(&key, &dg).expect("round-trips");
         assert_eq!(pt, JUNK_TYPE);
     }
