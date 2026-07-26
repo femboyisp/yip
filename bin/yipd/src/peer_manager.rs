@@ -168,6 +168,16 @@ struct HandshakingState {
     /// probe). Retransmits target this address (or are relay-wrapped when the
     /// peer is `relay`).
     target: SocketAddr,
+    /// Whether this in-flight `Init` was drawn for the RELAY path (`begin_handshake`'s
+    /// `via_relay`). This records the fact directly rather than inferring it from
+    /// `target`/`server_addr()` (which can drift). The punch->relay escalation arm
+    /// in `tick_dispatch` only fires for a *direct/punch* in-flight Init
+    /// (`!via_relay`), so a Punch attempt whose `relay` flag was set externally
+    /// (an inbound relayed packet, `on_relayed`) still redraws a FRESH ephemeral
+    /// on escalation instead of preserving the punch one (issue #116). A Relay
+    /// Init (`via_relay`) is left to the retransmit arm — never re-escalated into
+    /// an ephemeral-churn loop.
+    via_relay: bool,
 }
 
 /// One remote peer's handshake/session state.
@@ -768,6 +778,7 @@ impl PeerManager {
             retries: 0,
             init_pkt,
             target,
+            via_relay,
         }));
         // Direct-path junk burst (Task 3): obfuscation on, not relayed. The
         // relay path keeps its single-datagram shape — relay-path junk would
@@ -2944,16 +2955,26 @@ impl PeerManager {
         for i in 0..self.peers.len() {
             // ── proactive escalation of an in-flight direct/punch handshake ──
             // With a rendezvous configured, keep driving the path SM while a
-            // *non-relay* handshake is in flight (pure-2a peers set no
+            // *direct/punch* handshake is in flight (pure-2a peers set no
             // rendezvous and never enter this block, so they cannot regress).
             // The probed candidate's window may have elapsed; escalate NOW
             // rather than retransmitting a doomed Init for the full
             // HANDSHAKE_TOTAL_MS. Escalation supersedes the 2a retransmit arm
             // below — we `continue`, so a peer is never both retransmitted (old
             // target) AND escalated in the same tick.
+            //
+            // #116: gated on `!via_relay` (is this in-flight Init a direct/punch
+            // one?), NOT on `!peers[i].relay`. The `relay` flag can be set by an
+            // inbound relayed packet (`on_relayed`) BEFORE our own punch->relay
+            // escalation timer fires; the old `!relay` guard then skipped this
+            // arm and the retransmit arm re-wrapped the SAME punch ephemeral over
+            // the relay — preserving it (the pre-#36-inversion behavior the #34
+            // freshness gate closes). Keying on the in-flight Init's own
+            // `via_relay` instead makes the escalation redraw a FRESH ephemeral
+            // regardless of when `relay` flipped, while a Relay Init (via_relay)
+            // is still left to the retransmit arm (no ephemeral-churn loop).
             if self.rendezvous.is_some()
-                && !self.peers[i].relay
-                && matches!(self.peers[i].state, PeerState::Handshaking(_))
+                && matches!(self.peers[i].state, PeerState::Handshaking(ref h) if !h.via_relay)
             {
                 let target = match &self.peers[i].state {
                     PeerState::Handshaking(h) => h.target,
@@ -2985,7 +3006,16 @@ impl PeerManager {
                         // FRESH Init (new ephemeral + fresh ts), same inversion as the
                         // `Relay` arm above. `begin_handshake`'s direct branch re-stamps
                         // `endpoint` to `addr` itself.
+                        //
+                        // #116: this arm can now run with `relay == true` (the guard
+                        // above keys on `!via_relay`, not `!relay`). We are re-targeting
+                        // to a *direct* candidate, so clear `relay` — otherwise the bare
+                        // direct Init we send here would be inconsistent with a set
+                        // `relay` flag (the egress-wrap mismatch flagged near the Idle
+                        // branch). The SM re-escalates to the relay after the punch
+                        // window if the direct candidate also fails, redrawing again.
                         self.peers[i].state = PeerState::Idle;
+                        self.peers[i].relay = false;
                         if let Some(dgs) = self.begin_handshake(i, addr, false, now_ms) {
                             self.tick_egress.extend(dgs);
                         }
@@ -5691,6 +5721,116 @@ mod tests {
         // The escalation flipped the peer onto the relay, still handshaking.
         assert!(pm.peers[0].relay, "peer is now relay-reached");
         assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    }
+
+    /// (e') #116 regression: the punch->relay retarget must draw a FRESH
+    /// ephemeral even when `relay` was ALREADY set (by an inbound relayed packet
+    /// from the peer, `on_relayed`) before our own escalation timer fired. The
+    /// pre-fix escalation arm was gated on `!peers[i].relay`, so if that race
+    /// went the other way the arm was skipped and the retransmit arm re-wrapped
+    /// the SAME punch ephemeral over the relay — preserving it, reproducing the
+    /// pre-#36-inversion behavior the freshness gate (#34) exists to close. This
+    /// is the intermittent `DISTINCT_INIT_EPHEMERALS=1` failure of
+    /// run-netns-pathswitch-rehandshake.sh. Fails against the pre-fix code.
+    #[test]
+    fn punch_relay_retarget_draws_fresh_ephemeral_even_if_relay_flag_preset() {
+        use crate::path::PUNCH_MS;
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None, // rendezvous-only: starts in the Punching stage
+        };
+        let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
+
+        // Learn a reflexive candidate and tick into Handshaking on the punch
+        // probe (dst = candidate), holding punch ephemeral E1.
+        let candidate: SocketAddr = "198.51.100.7:41000".parse().unwrap();
+        let mut buf = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PeerInfo {
+                node: node_id(&peer_kp.public),
+                reflexive: candidate,
+                record: None,
+            },
+            &mut buf,
+        );
+        assert!(matches!(
+            pm.on_udp(mock_server(), &buf, 0),
+            DispatchOut::None
+        ));
+        let out = pm.tick(1).map(<[_]>::to_vec).unwrap_or_default();
+        let punch_init = out
+            .iter()
+            .find(|d| {
+                d.dst == candidate && d.bytes.first() == Some(&(PacketType::HandshakeInit as u8))
+            })
+            .expect("punch Init is probed toward the candidate");
+        let e1 = crate::handshake::init_ephemeral(&punch_init.bytes).expect("E1 ephemeral");
+        assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+
+        // RACE: a relayed packet from the peer arrives BEFORE our punch->relay
+        // escalation timer fires, flipping `relay = true` while we still hold the
+        // punch ephemeral E1 (models `on_relayed`'s non-Established relay-adopt).
+        pm.peers[0].relay = true;
+
+        // Escalate just past the punch window. The relay-wrapped Init MUST carry
+        // a fresh ephemeral E2 != E1, not a re-wrapped retransmit of E1.
+        let out = pm.tick(PUNCH_MS + 2).map(<[_]>::to_vec).unwrap_or_default();
+        let relay_init = out
+            .iter()
+            .find_map(|d| {
+                if d.dst != mock_server() {
+                    return None;
+                }
+                match yip_rendezvous::decode(&d.bytes) {
+                    Some(yip_rendezvous::Message::RelaySend { payload, .. })
+                        if payload.first() == Some(&(PacketType::HandshakeInit as u8)) =>
+                    {
+                        Some(payload)
+                    }
+                    _ => None,
+                }
+            })
+            .expect("a relay-wrapped Init is emitted on escalation");
+        let e2 = crate::handshake::init_ephemeral(&relay_init).expect("E2 ephemeral");
+        assert_ne!(
+            e1, e2,
+            "punch->relay retarget must draw a FRESH ephemeral even when the relay \
+             flag was preset by an inbound relayed packet — a preserved punch \
+             ephemeral reopens the #34 downgrade (issue #116)"
+        );
+
+        // No churn: now that the in-flight Init IS a relay Init (via_relay), the
+        // NEXT tick past the retry interval must RETRANSMIT E2 (same ephemeral),
+        // not draw yet another fresh E3 — the escalation arm must not re-fire on a
+        // handshake already on the relay.
+        let out = pm
+            .tick(PUNCH_MS + 2 + HANDSHAKE_RETRY_MS + 1)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
+        let relay_retx = out
+            .iter()
+            .find_map(|d| {
+                if d.dst != mock_server() {
+                    return None;
+                }
+                match yip_rendezvous::decode(&d.bytes) {
+                    Some(yip_rendezvous::Message::RelaySend { payload, .. })
+                        if payload.first() == Some(&(PacketType::HandshakeInit as u8)) =>
+                    {
+                        Some(payload)
+                    }
+                    _ => None,
+                }
+            })
+            .expect("a relay-wrapped Init retransmit is emitted");
+        let e3 = crate::handshake::init_ephemeral(&relay_retx).expect("retransmit ephemeral");
+        assert_eq!(
+            e2, e3,
+            "a relay Init already in flight must be RETRANSMITTED (same ephemeral), \
+             not re-escalated into a fresh ephemeral every tick"
+        );
     }
 
     /// (f) Anti-hijack over the relay: an `RdvEvent::Relayed` HandshakeInit whose
