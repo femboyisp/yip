@@ -47,10 +47,15 @@ short-RTT / regional paths and aggregate / many-parallel-flow traffic, where the
 regime a 4% MAC saving ~= +50 Mbps, and larger codec-path wins scale directly.
 They do NOT help the high-RTT single-flow case (window-bound).
 
-**Caveat:** veth has no real NIC, so absolute Gbps is optimistic — a real NIC
-adds its own ceiling. But the per-core processing ceiling is real and still
+**Caveat (NIC):** veth has no real NIC, so absolute Gbps is optimistic — a real
+NIC adds its own ceiling. But the per-core processing ceiling is real and still
 binds a fast-NIC / high-parallelism box. The finding (a CPU regime exists) is a
 strong positive despite the optimistic absolute number.
+
+**Caveat (measurement):** `rx_cores` is `utime+stime` from `/proc/PID/stat`, which
+excludes softirq / kernel-side receive work not charged to the yipd pid. True
+per-core cost is therefore *higher* than reported — which only strengthens the
+"saturated" conclusion (0.96–0.98 is already at the ceiling).
 
 ## Where the RX core actually goes (next step if pursuing #4)
 
