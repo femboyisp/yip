@@ -236,6 +236,18 @@ pub(super) fn established_pm_pair(
     (pm_a, pm_b, ep_a, ep_b, kp_a, kp_b)
 }
 
+/// Build a two-`PeerManager` Established pair via `established_pm_pair`
+/// (a large `rekey_interval_ms` so `on_tun`'s drive-rekey-schedule never
+/// fires), returning `(pm_i, pm_r, old_ep)`: `pm_i` is the initiator
+/// (sends data), `pm_r` is the responder whose `peers[0].endpoint` is
+/// under test, and `old_ep` is `pm_r`'s currently-learned address for
+/// `pm_i` (`established_pm_pair`'s `ep_a`).
+pub(super) fn established_pair_for_roaming() -> (PeerManager, PeerManager, SocketAddr) {
+    let (pm_i, pm_r, ep_i, _ep_r, _kp_i, _kp_r) = established_pm_pair(1_000_000);
+    assert_eq!(pm_r.peers[0].endpoint, Some(ep_i));
+    (pm_i, pm_r, ep_i)
+}
+
 /// `pm`'s Established peer 0's `next` epoch's `conn_tag`, panicking if
 /// there is no `next` installed. Test helper for the retransmit-dedup
 /// regressions below.
