@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/femboyisp/yip/security/advisories/new
+    about: Report privately. Do NOT open a public issue for a security bug — see SECURITY.md.

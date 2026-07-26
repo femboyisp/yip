@@ -9,8 +9,8 @@ How to run yip's test suites and measure its performance. Two layers:
   `tc netem` comparisons against kernel WireGuard, OpenVPN, and n2n.
 
 Most integration tests and all benchmarks need **root** (they create network
-namespaces and TUN/TAP devices) and a **release** `yipd` (debug RaptorQ is
-~75× slower and misrepresents results).
+namespaces and TUN/TAP devices) and a **release** `yipd` (a debug build of the
+FEC path is ~75× slower and misrepresents results).
 
 ---
 
@@ -123,8 +123,13 @@ port-matches to WireGuard regardless of payload) and enforces:
   protocol — the flow must be `Unknown`;
 - **(b)** no `NDPI_OBFUSCATED_TRAFFIC` risk flag;
 - **(c)** `NDPI_SUSPICIOUS_ENTROPY` is *reported but not gated* — high-entropy
-  payloads inherently trip it (WireGuard does too); suppressing it needs
-  TLS/QUIC mimicry, a later milestone.
+  payloads inherently trip it (WireGuard does too) for the plain `obf_psk`
+  wire format exercised by this oracle. Suppressing it means dressing the
+  flow as a real protocol: yip ships `transport=quic`, `transport=tls`, and
+  an Xray-REALITY relay-dial transport for exactly this (see
+  [`docs/configuration.md`](configuration.md#transport-mode-optional)); those
+  transports have their own dedicated classification tests
+  (`quic_classified_as_quic`, the REALITY netns suite) rather than this oracle.
 
 CI runs this as the `dpi-undetectability` job against a pinned nDPI commit.
 
@@ -142,11 +147,19 @@ cargo bench -p yip-bench
 
 | Bench | Typical median | Measures |
 |---|---|---|
-| `aead_seal_1300` | ~2.0 µs | ChaCha20-Poly1305 seal, 1300-byte payload |
-| `aead_open_1300` | ~4.0 µs | seal **+** open together (open alone ≈ 2 µs) |
+| `aead_seal_1300` | ~0.63 µs | ChaCha20-Poly1305 seal (`ring` backend), 1300-byte payload |
+| `aead_open_1300` | ~1.28 µs | seal **+** open together (open alone ≈ 0.65 µs) |
 | `wire_frame_1300` | ~0.5 µs | header + auth tag + keyed header-protection |
 | `wire_deframe_1300` | ~0.55 µs | the inverse |
-| `transport_encode_1300` | ~24 µs | RaptorQ FEC encode (the dominant per-packet cost) |
+| `transport_encode_1300` | ~0.32 µs | Reed–Solomon FEC encode over GF(256), Default class R=1 (P+Q XOR scheme, the common steady-state path); ARQ-eligible/Bulk classes and R=2 use the general Cauchy scheme, ~1.3 µs |
+
+Numbers above are the current ones as of the throughput-optimization passes
+(RS-codec swap, P+Q fast path, `ring` AEAD); see
+[`crates/yip-bench/RESULTS.md`](../crates/yip-bench/RESULTS.md) for the full
+before/after history and methodology. `transport_encode_1300` in particular
+went through several rounds: ~26 µs (original RaptorQ) → ~1.3 µs (RS,
+general Cauchy scheme, #50) → ~0.32 µs (P+Q XOR fast path for the common
+R=1 case, #51).
 
 ### yip vs WireGuard/OpenVPN/n2n under loss (`tc netem`)
 
