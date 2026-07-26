@@ -7,3 +7,13 @@
 
 # Locally-built benchmark contender binaries (UDPspeeder etc.)
 .bench-tools/
+
+# Agent tooling (local only)
+/.claude/
+/CLAUDE.md
+
+# Internal process artifacts + local-only working docs (kept on disk, out of the repo)
+/docs/superpowers/
+/docs/2026-07-25-project-review-and-roadmap.md
+/docs/nlnet-application.md
+/docs/2026-07-15-field-report-as214806-backbone.md

@@ -23,19 +23,28 @@ Environment: Linux 6.18 · AMD Ryzen 5 7640U · `cargo bench -p yip-bench`
 
 | Benchmark | Median ns/op | Notes |
 |---|---|---|
-| `aead_seal_1300` | ~1 957 ns | ChaCha20-Poly1305 seal, 1300-byte payload |
-| `aead_open_1300` | ~3 930 ns | **seal + open** (counter must advance to avoid replay rejection); open alone ≈ 2 µs |
+| `aead_seal_1300` | ~634 ns | ChaCha20-Poly1305 seal (`ring` backend), 1300-byte payload |
+| `aead_open_1300` | ~1 284 ns | **seal + open** (counter must advance to avoid replay rejection); open alone ≈ 0.65 µs |
 | `wire_frame_1300` | ~512 ns | Header serialise + SipHash auth tag + keyed header-protection XOR |
 | `wire_deframe_1300` | ~553 ns | Inverse of frame |
-| `transport_encode_1300` | ~24 028 ns | RaptorQ FEC encode (classify → object-encode, includes repair-symbol generation) |
+| `transport_encode_1300` | ~320 ns | Reed–Solomon FEC encode over GF(256), Default class R=1 (P+Q XOR scheme — the common steady-state path); ARQ-eligible/Bulk classes and R=2 use the general Cauchy scheme instead, ~1.3 µs |
+
+> [!NOTE]
+> These figures are current as of the P+Q fast-path and `ring`-AEAD passes.
+> `transport_encode_1300` in particular has moved twice: the original RaptorQ
+> encoder measured **~24 028 ns**; the #50 swap to a hand-rolled systematic
+> Reed–Solomon codec over GF(256) (general Cauchy scheme) brought it to
+> **~1.3 µs**; the #51 P+Q fast path (a pure-XOR "RAID-5" row for the common
+> R=1 case) brought the default-class path further down to **~320 ns**. See
+> `RESULTS.md` for the full before/after history on each pass.
 
 ### Honesty note on `aead_open_1300`
 
-The 3 930 ns figure measures **seal then open** in a single Criterion iteration.
+The ~1 284 ns figure measures **seal then open** in a single Criterion iteration.
 The benchmark does this because the AEAD session maintains a sliding anti-replay
 window keyed on the sender's nonce counter: replaying the same ciphertext without
 advancing the counter would be rejected as a replay attack.  The true cost of
-`open` alone is approximately **2 µs** (the 3 930 ns minus the ~1 957 ns seal).
+`open` alone is approximately **0.65 µs** (the ~1 284 ns minus the ~634 ns seal).
 The benchmark comment in `benches/hotpath.rs` explains this in detail.
 
 ---
@@ -44,7 +53,7 @@ The benchmark comment in `benches/hotpath.rs` explains this in detail.
 
 The headline result:
 
-> **yip's RaptorQ FEC recovers nearly all injected packet loss — for a ~0.2 ms
+> **yip's RS FEC recovers nearly all injected packet loss — for a ~0.2 ms
 > latency premium over WireGuard — while WireGuard, which has no FEC, passes the
 > loss straight through.**
 
@@ -54,7 +63,7 @@ RTT tracks WireGuard's to within ~0.2 ms (both dominated by the 10 ms netem
 delay), so the FEC encode/decode pipeline is effectively free on the wire.
 
 > **Build note (important):** these figures require a **release** `yipd`.  yipd's
-> RaptorQ data path is ~75× slower compiled without optimizations (the GF(256)
+> FEC data path is ~75× slower compiled without optimizations (the GF(256)
 > matrix math dominates), which throttles throughput to a few Mbit/s and adds
 > ~2 ms of per-packet latency — entirely a build-mode artifact, not FEC cost.  The
 > harness and CI now build `--release`, so the comparison against in-kernel
@@ -101,7 +110,7 @@ a timeout or failure records 0 MB/s rather than failing the harness.  `scp` laye
 its own SSH AEAD on top of *both* tunnels equally, so the SSH crypto cost cancels
 out of the comparison — what differs is how each tunnel carries TCP under loss.
 
-The thesis: yip's RaptorQ FEC masks loss from TCP (so throughput holds), while
+The thesis: yip's RS FEC masks loss from TCP (so throughput holds), while
 WireGuard's TCP sees real retransmits + congestion backoff (so it collapses).
 
 ### Measured table (release `yipd`)
@@ -161,7 +170,7 @@ the receiver) across three transports under the same netem loss:
 
 - **bare-link** — straight veth, no FEC (the loss floor)
 - **UDPspeeder** — Reed-Solomon FEC forwarder, `f20:10` (20 source : 10 repair)
-- **yip** — RaptorQ-FEC tunnel (release `yipd`)
+- **yip** — RS-FEC tunnel (release `yipd`)
 
 A pure-UDP blaster is required because iperf3 needs a TCP control channel even in
 `-u` mode, so it cannot traverse a UDP-only forwarder like UDPspeeder.
@@ -182,7 +191,7 @@ ends (kernel 6.18, AMD Ryzen 5 7640U):
 The bare-link column is the control: it delivers ~`100 − loss`% exactly, proving
 the netem impairment is real. Both FEC transports then recover almost all of it.
 UDPspeeder's fixed-block `f20:10` Reed-Solomon recovered **100%** at both 5% and
-10% loss here; yip's RaptorQ recovered **99.8%** and **99.0%** — within a hair of
+10% loss here; yip's RS FEC recovered **99.8%** and **99.0%** — within a hair of
 perfect. The takeaway is that yip is in the same league as the purpose-built
 FEC forwarder on raw loss recovery, while *also* being a full encrypted L2/L3 VPN
 (UDPspeeder is only a loss-hiding UDP relay with no tunneling or crypto of its
@@ -198,7 +207,7 @@ sets up each full-IP tunnel in its own netns pair and, at each loss rate, runs
 `ping -c 50 -i 0.1` (effective loss + RTT) and `iperf3 -c <tun> -t 8` (TCP
 Mbit/s). The contenders:
 
-- **yip** — RaptorQ-FEC tunnel (release `yipd`), inner MTU 1184
+- **yip** — RS-FEC tunnel (release `yipd`), inner MTU 1184
 - **WireGuard** — in-kernel, no FEC
 - **OpenVPN** — TLS p2p TUN, **AES-256-GCM** (AEAD) via peer-fingerprint mode
   (self-signed EC certs, no PKI) — its real deployed data channel, not legacy CBC
@@ -254,7 +263,7 @@ Two stories, the same one yip is built to tell:
    yip holds 21.9 Mbit/s while every no-FEC tunnel collapses to ~3.3 Mbit/s
    (yip ~7×). At 10% the gap widens: yip 8.9 Mbit/s vs WireGuard 1.05, n2n 1.44,
    OpenVPN 1.18. The ping column tells the same story — yip's effective loss stays
-   at ~2% while the no-FEC tunnels swing to 6–32% because RaptorQ repair symbols
+   at ~2% while the no-FEC tunnels swing to 6–32% because RS repair symbols
    reconstruct the drops before TCP ever sees them. yip *resists* loss; the
    FEC-less tunnels *succumb* to it. RTT is within ~0.3 ms across all four (the
    10 ms netem delay dominates), so FEC adds no meaningful latency.
@@ -271,7 +280,7 @@ cheap on a clean fast path where every tunnel is fast enough.
   interval (~5 s of traffic).  The effective-loss figures at low injected rates
   can vary by ±1–3 % between runs.  More pings (e.g. 1000) would tighten this.
 - **Build mode:** all end-to-end (netns) figures require a **release** `yipd`; the
-  harness and CI build `--release`.  A debug binary is ~75× slower on the RaptorQ
+  harness and CI build `--release`.  A debug binary is ~75× slower on the FEC
   path and produces meaningless throughput/latency numbers (see the build note
   above).  The Criterion hot-path micro-benchmarks are always release.
 - **iperf3 throughput:** a committed iperf3 TCP sweep (`run-iperf-compare.sh`,
@@ -300,7 +309,7 @@ Environment: Linux 6.18 · AMD Ryzen 5 7640U · release build
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| symbols/packet | 2.00 | RaptorQ output (1200-byte symbols per 1200-byte sealed packet) |
+| symbols/packet | 2.00 | RS output (1200-byte symbols per 1200-byte sealed packet) |
 | encode | 24.2 µs/packet | **Dominant cost** — FEC encode (object-encode + repair generation) |
 | decode (approx) | 0.8 µs/packet | Per-symbol decode cost; recovers with first successful symbol |
 | decoded ok | 5000/5000 | 100% recovery on clean path (as expected) |
@@ -380,7 +389,7 @@ re-arms FEC the instant loss is reported. Measured UDP delivery under `tc netem`
 | 5     | 94.7       | 99.7      |
 | 10    | 89.9       | 99.0      |
 
-Reactive ARQ retransmits `Bulk` objects the receiver NACKs, using fresh RaptorQ
+Reactive ARQ retransmits `Bulk` objects the receiver NACKs, using fresh RS
 repair symbols that carry the original object id (so the receiver tops up its
 existing decoder). The retransmit codec is unit-proven (`repair_object` completes
 an object delivered only one symbol short), the daemon wiring was reviewed for

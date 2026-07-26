@@ -20,16 +20,21 @@ tunnel to a full obfuscated mesh. For the exhaustive key/flag reference see
 ## What yip is
 
 yip is a low-latency P2P mesh VPN. It gives you an encrypted L3 (IP/TUN) or L2
-(Ethernet/TAP) tunnel between peers over a UDP transport with **RaptorQ forward
-error correction** — so packet loss is recovered without retransmission, keeping
-latency flat under loss where plain tunnels spike. On top of the data plane it
-adds a decentralized control plane (self-certifying addresses, gossip
-discovery, NAT traversal, relay) and opt-in anti-DPI obfuscation.
+(Ethernet/TAP) tunnel between peers over a UDP transport with **systematic
+Reed–Solomon forward error correction** over GF(256) — so packet loss is
+recovered without retransmission, keeping latency flat under loss where plain
+tunnels spike. On top of the data plane it adds a decentralized control plane
+(self-certifying addresses, gossip discovery, NAT traversal, relay) and opt-in
+anti-DPI obfuscation.
 
 What's implemented today: the data plane + FEC, multi-peer routing,
 self-certifying addresses, rendezvous/hole-punch/relay, CA-gated mesh
-discovery, and `obf_psk` traffic obfuscation. Traffic-analysis defense,
-TLS-mimicry, and multi-platform hardening are future sub-projects.
+discovery, `obf_psk` traffic obfuscation, and an Xray-REALITY TLS-mimicry
+transport. The session layer does handshake anti-replay (TAI64N timestamps),
+signed rendezvous registration, AEAD-authenticated endpoint roaming, and
+~120 s session rekey. Traffic-analysis defense (DAITA-style padding/timing,
+optional onion routing) and multi-core/multi-platform hardening are future
+sub-projects — see the sub-project table in `README.md` for exact status.
 
 ---
 
@@ -43,7 +48,11 @@ cargo build --release --workspace     # yipd, yip-ca, yip-rendezvous, all crates
 
 The binaries land in `target/release/`: `yipd` (the daemon), `yip-ca` (offline
 CA), `yip-rendezvous` (rendezvous/relay server). Use the **release** build for
-anything performance-sensitive — debug RaptorQ is ~75× slower.
+anything performance-sensitive — a debug build of the FEC path is ~75× slower.
+
+> [!NOTE]
+> If you build with the REALITY TLS-mimicry transport, a C toolchain and
+> `cmake` must be present — that crate links BoringSSL.
 
 Creating TUN/TAP devices and configuring namespaces needs root (or
 `CAP_NET_ADMIN`); the examples below use `sudo`.
@@ -290,11 +299,19 @@ yip-rendezvous 0.0.0.0:51821 --obf-psk 00112233445566778899aabbccddeeff001122334
   adversary who learns it can recognize and block yip traffic, but **still
   cannot decrypt it** — that requires breaking Noise. The PSK gates
   *unblockability*, not confidentiality.
-- **Not yet covered by 3a:** the payload is high-entropy (as all encrypted
-  traffic is), so nDPI's *entropy* heuristic still fires — defeating that needs
-  TLS/QUIC mimicry (a later milestone). And a VPN-associated **listen port**
-  (e.g. 51820) is itself a fingerprint independent of payload — prefer a neutral
-  or plausible port.
+- **Not covered by `obf_psk` alone:** the payload is high-entropy (as all
+  encrypted traffic is), so nDPI's *entropy* heuristic still fires against a
+  raw obfuscated UDP flow. Defeating that needs TLS mimicry — yip ships an
+  Xray-REALITY relay-dial transport for this (real TLS handshake, JA4-pinned
+  ClientHello, active-probe-resistant, splices unauthenticated connections to
+  a real upstream), configured via `rendezvous=reality://…` — see
+  [`docs/configuration.md`](configuration.md#reality-relay-dial-client-rendezvousrealityhostportpbksidsni-reality4a).
+  There's also a lighter `transport=tls` peer-data costume for last-resort
+  TCP-only networks. And a VPN-associated **listen port** (e.g. 51820) is
+  itself a fingerprint independent of payload — prefer a neutral or plausible
+  port.
+- **Not yet defended at all:** traffic analysis / statistical DPI (packet-size
+  and timing fingerprints). That's sub-project #4 and has not started.
 
 ---
 
