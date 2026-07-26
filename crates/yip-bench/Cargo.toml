@@ -13,9 +13,17 @@ yip-crypto = { path = "../yip-crypto" }
 criterion = "0.5.1"
 yip-wire = { path = "../yip-wire" }
 yip-transport = { path = "../yip-transport" }
+blake3 = "1.8.5"
+siphasher = "1.0.3"
 
 [[bench]]
 name = "hotpath"
+harness = false
+
+# Spike for #58: compare per-symbol MAC candidates for the yip-wire coverage-auth
+# tag (SipHash-2-4 today). Measure on the target box before any wire change.
+[[bench]]
+name = "mac_candidates"
 harness = false
 
 [lints]
