@@ -30,6 +30,20 @@ until 0.1.0.
   roaming model), including the in-flight-rekey and relay-adoption edge
   cases. Exercised end-to-end by netns tests asserting a forged registration
   is refused and the legitimate node stays reachable.
+- **Punch→relay escalation always draws a fresh ephemeral (#116, PR #117).**
+  The `#34` freshness gate requires a Punch→Relay path re-target to draw a
+  **fresh** Noise ephemeral; a preserved (retransmitted) ephemeral is a bare
+  replay a captured `Init` could ride to force a relay downgrade. The
+  escalation only redrew when it fired *before* the peer was flagged
+  relay-reached — but an inbound relayed packet (`on_relayed`) can set that
+  flag first, and the old guard then skipped the escalation and retransmitted
+  the **same** punch ephemeral over the relay. This was intermittent and
+  race-dependent (the path-switch money test failed on `main` whenever the
+  relayed packet won the race). The escalation now keys on the in-flight
+  `Init`'s own relay origin rather than the peer's relay flag, so a fresh
+  ephemeral is drawn regardless of when the flag flipped, while a relay `Init`
+  already in flight is still merely retransmitted (no ephemeral churn).
+  Covered by a deterministic regression test.
 
 ### Added
 - Classical session rekey + epoch handling (milestone 9a, #9, PR #90):
@@ -190,6 +204,14 @@ until 0.1.0.
 - Gossip digest chunking (#44, PR #98): the mesh gossip digest is now
   chunked, and its obfuscation degrades fail-soft, instead of panicking once
   a mesh grows past a single-datagram digest size.
+- io_uring loopback recycle tests hardened against default socket buffers
+  (PR #113): the recv-buffer and send-slot recycle tests now interleave
+  send+drain (bounded in-flight window) instead of blasting all datagrams
+  first, so they no longer fail on a box with a default
+  `net.core.rmem_default`. The old pattern asserted `>256` datagrams
+  round-trip but relied on the kernel buffering that many at once; the default
+  ~208 KB receive buffer holds only ~230 small datagrams, so the assert
+  failed deterministically on stock-configured machines.
 
 ### Changed
 - Rendezvous relay-forward counter moved off the server's mutex onto a
