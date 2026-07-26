@@ -210,6 +210,64 @@ mod tests {
         assert_eq!(parsed.key.proto, 17);
     }
 
+    /// A policy rule must match only when BOTH `proto` and `dst_port` agree.
+    /// Kills the `&&` -> `||` mutant (line 66): a rule matching only proto
+    /// (not port) must NOT win when only the port matches (or vice versa).
+    #[test]
+    fn policy_rule_requires_both_proto_and_port_to_match() {
+        let mut c = Classifier::new(vec![PolicyRule {
+            proto: Some(6), // TCP, packet below is UDP (17) -> proto mismatch
+            dst_port: Some(5000),
+            class: FlowClass::Bulk,
+        }]);
+        // proto mismatches (17 != 6) but dst_port matches (5000); DSCP is 0 (no
+        // DSCP match either), so a correct implementation falls through to the
+        // heuristic on a cold flow -> Default. The `||` mutant would treat the
+        // dst_port-only match as a hit and wrongly return Bulk.
+        assert_eq!(
+            c.classify(&ipv4(0, 17, 5000), false, 0),
+            FlowClass::Default,
+            "rule must require BOTH proto and port to match, not either"
+        );
+    }
+
+    /// DSCP CS1/AF11..AF13 (8, 10, 12, 14) must map to Bulk. Kills the `delete
+    /// match arm 8 | 10 | 12 | 14` mutant (line 74): deleting the arm would let
+    /// these DSCP values fall through to the heuristic/default path instead.
+    #[test]
+    fn dscp_bulk_marks_map_to_bulk() {
+        let mut c = Classifier::new(vec![]);
+        for dscp in [8u8, 10, 12, 14] {
+            assert_eq!(
+                c.classify(&ipv4(dscp, 17, 5000), false, 0),
+                FlowClass::Bulk,
+                "DSCP {dscp} must classify as Bulk"
+            );
+        }
+    }
+
+    /// `parse_ip` must actually strip the 14-byte Ethernet header and parse the
+    /// inner IPv4 packet when `l2 = true` and the ethertype is 0x0800. Kills
+    /// the `delete match arm 0x0800 | 0x86DD` mutant (line 93): deleting the
+    /// arm makes `parse_ip` return `None` for every L2 frame, regardless of
+    /// ethertype, so `classify` would always fall back to `Default`.
+    #[test]
+    fn l2_ethernet_ipv4_frame_is_parsed_and_classified() {
+        let mut c = Classifier::new(vec![]);
+        let mut frame = vec![0u8; 14 + 24]; // Ethernet header + minimal IPv4
+        frame[12] = 0x08;
+        frame[13] = 0x00; // ethertype 0x0800 (IPv4)
+        let ip = &mut frame[14..];
+        ip[0] = 0x45; // v4, IHL 5
+        ip[1] = 46 << 2; // DSCP 46 (EF) -> Realtime
+        ip[9] = 17; // UDP
+        assert_eq!(
+            c.classify(&frame, true, 0),
+            FlowClass::Realtime,
+            "L2 frame with ethertype 0x0800 must be parsed as IPv4 and classified via DSCP"
+        );
+    }
+
     #[test]
     fn heuristic_classifies_unmarked_small_flow_after_warmup() {
         let mut c = Classifier::new(vec![]);

@@ -428,6 +428,46 @@ mod tests {
         assert_eq!(re.push(&sym(MAX_OBJECT_SIZE + 1, 0, 1200)), None);
     }
 
+    /// K >= 255 (no GF(256) codeword room) must be rejected by `build`'s guard,
+    /// yielding no symbols. Kills the `replace || with && in FecEncoder::build`
+    /// mutant (line 119): under `&&`, `k==0 || k>=255` becomes impossible to
+    /// satisfy (both can never be true at once), so the guard never fires,
+    /// and `max_repair = 255 - k` would underflow/panic for k >= 255.
+    #[test]
+    fn build_rejects_k_at_or_above_255() {
+        let params = crate::FlowParams {
+            symbol_size: 1,
+            initial_repair_ratio: 0.0,
+            deadline: std::time::Duration::from_millis(1),
+            arq: false,
+        };
+        let mut enc = FecEncoder::new();
+        let ct = vec![0u8; 300]; // symbol_size=1 -> K = 300 >= 255
+        let syms = enc.encode(&ct, params, 0);
+        assert!(
+            syms.is_empty(),
+            "K >= 255 must yield no symbols, not panic/overflow"
+        );
+    }
+
+    /// The repair count must be capped at exactly `255 - k`, not some other
+    /// arithmetic combination. Kills the `replace - with +/in FecEncoder::build`
+    /// mutants (line 122): request far more repair than fits, and check the
+    /// resulting symbol count matches `k + (255 - k) = 255` exactly.
+    #[test]
+    fn build_caps_repair_at_255_minus_k() {
+        let params = FlowClass::Bulk.params();
+        let ct = vec![0x11u8; 2400]; // K = 2
+        let mut enc = FecEncoder::new();
+        let syms = enc.encode(&ct, params, 1000); // way more than max_repair
+        assert_eq!(
+            syms.len(),
+            255,
+            "total symbols must be k + (255 - k) = 255 when repair is requested \
+             far beyond capacity"
+        );
+    }
+
     #[test]
     fn rejects_wrong_codec_tag() {
         let mut re = FecReassembler::new(1200, 64);
@@ -581,5 +621,196 @@ mod tests {
         let mut s = sym(2400, 0, 1200);
         s.payload_id[3] = 9; // unknown scheme id
         assert_eq!(re.push(&s), None);
+    }
+
+    /// `in_flight` must report the exact number of in-progress objects, not a
+    /// constant. Kills the `replace FecReassembler::in_flight -> usize with 1`
+    /// mutant (line 192).
+    #[test]
+    fn in_flight_reports_exact_count() {
+        let params = FlowClass::Default.params();
+        let mut enc = FecEncoder::new();
+        let mut re = FecReassembler::new(params.symbol_size, 64);
+        assert_eq!(
+            re.in_flight(),
+            0,
+            "fresh reassembler has no in-flight objects"
+        );
+        let a = enc.encode(
+            b"first partial object needing 2+ symbols to complete!",
+            params,
+            0,
+        );
+        let b = enc.encode(
+            b"second partial object needing 2+ symbols to complete",
+            params,
+            0,
+        );
+        re.push(&a[0]);
+        re.push(&b[0]);
+        assert_eq!(
+            re.in_flight(),
+            2,
+            "two distinct partial objects must both be tracked"
+        );
+    }
+
+    /// A symbol implying `object_size > MAX_OBJECT_SIZE` must be rejected
+    /// (returning `None`) even when enough valid-looking shards are supplied
+    /// to otherwise complete a decode. Kills the `replace || with && in
+    /// FecReassembler::push` mutant (line 199, col 36 — under `&&` the guard
+    /// can never fire since `object_size == 0` and `object_size > MAX` are
+    /// mutually exclusive) and the `replace > with == in ...push` mutant
+    /// (line 199, col 58 — `262_145 == 262_144` is false, so a `==` mutant
+    /// would also wrongly accept this oversized value). The `>=` variant at
+    /// the same column is killed by the boundary test below.
+    #[test]
+    fn oversized_object_guard_rejects_before_touching_shards() {
+        let symbol_size: u16 = 65535; // max u16, minimizes K for a > MAX_OBJECT_SIZE object
+        let object_size = MAX_OBJECT_SIZE + 1; // 262_145: just over the cap
+        let mut re = FecReassembler::new(symbol_size, 64);
+        let k = 5usize; // ceil(262_145 / 65_535) = 5
+        let mut out = None;
+        for i in 0..k {
+            let s = Symbol {
+                object_id: 0,
+                object_size,
+                payload_id: pack_payload_id(u16::try_from(i).unwrap(), crate::rs::SCHEME_CAUCHY),
+                data: vec![0u8; usize::from(symbol_size)],
+            };
+            out = out.or(re.push(&s));
+        }
+        assert!(
+            out.is_none(),
+            "object_size > MAX_OBJECT_SIZE must be rejected before any shard \
+             is accepted, even when enough shards are supplied to decode"
+        );
+    }
+
+    /// `object_size` exactly AT the cap (`MAX_OBJECT_SIZE`) must be ACCEPTED,
+    /// not rejected. Kills the `replace > with ==/>= in FecReassembler::push`
+    /// mutants (line 199, col 58): both wrongly treat the exact boundary value
+    /// as over-cap.
+    #[test]
+    fn object_size_exactly_at_max_is_accepted() {
+        let symbol_size: u16 = 65535;
+        let object_size = MAX_OBJECT_SIZE; // exactly at the cap
+        let mut re = FecReassembler::new(symbol_size, 64);
+        let k = 5usize; // ceil(262_144 / 65_535) = 5
+        let mut out = None;
+        for i in 0..k {
+            let s = Symbol {
+                object_id: 0,
+                object_size,
+                payload_id: pack_payload_id(u16::try_from(i).unwrap(), crate::rs::SCHEME_CAUCHY),
+                data: vec![0u8; usize::from(symbol_size)],
+            };
+            out = out.or(re.push(&s));
+        }
+        assert!(
+            out.is_some(),
+            "object_size exactly at MAX_OBJECT_SIZE must be accepted, not rejected"
+        );
+    }
+
+    /// A symbol implying K >= 255 must be rejected before any per-object state
+    /// is allocated. Kills the `replace || with && in FecReassembler::push`
+    /// mutant (line 210): under `&&`, the (unreachable, given object_size != 0)
+    /// `k == 0` conjunct neutralizes the whole guard, so the K >= 255 case is
+    /// never rejected and an oversized object gets a map entry.
+    #[test]
+    fn oversized_k_guard_prevents_state_allocation() {
+        let mut re = FecReassembler::new(1, 64); // symbol_size=1 -> tiny symbols inflate K
+        let s = Symbol {
+            object_id: 0,
+            object_size: 300, // valid (<= MAX_OBJECT_SIZE), but K = 300 >= 255
+            payload_id: pack_payload_id(0, crate::rs::SCHEME_CAUCHY),
+            data: vec![0u8; 1],
+        };
+        let out = re.push(&s);
+        assert!(out.is_none(), "K >= 255 must be rejected");
+        assert_eq!(
+            re.in_flight(),
+            0,
+            "a symbol implying K >= 255 must be rejected before any object \
+             state is allocated"
+        );
+    }
+
+    /// A Cauchy repair symbol at index >= K+2 is entirely valid (Cauchy has no
+    /// such restriction — only P+Q does) and must decode correctly. Kills the
+    /// `replace == with != in FecReassembler::push` mutant (line 214): under
+    /// `!=`, the guard wrongly starts rejecting high-index CAUCHY symbols
+    /// (the `scheme == Pq` restriction was meant to apply only to Pq).
+    #[test]
+    fn cauchy_repair_index_ge_k_plus_2_is_accepted() {
+        let params = FlowClass::Bulk.params(); // ARQ class -> always Cauchy
+        let ct: Vec<u8> = (0..2400u32)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect(); // K=2
+        let mut enc = FecEncoder::new();
+        let syms = enc.encode(&ct, params, 4); // K=2, R=4 (Cauchy) -> indices 0..5
+        assert_eq!(syms.len(), 6);
+        assert!(syms
+            .iter()
+            .all(|s| s.payload_id[3] == crate::rs::SCHEME_CAUCHY));
+        let mut re = FecReassembler::new(params.symbol_size, 64);
+        let mut out = None;
+        // Only the two highest-index repair symbols (indices 4,5 = K+2, K+3):
+        // both are >= K+2, exercising the guard for a Cauchy (not Pq) scheme,
+        // where it must NOT reject.
+        for s in syms.iter().skip(4) {
+            out = out.or(re.push(s));
+        }
+        assert_eq!(
+            out.as_deref(),
+            Some(ct.as_slice()),
+            "Cauchy repair symbols at index >= K+2 are valid and must decode"
+        );
+    }
+
+    /// For K=1 P+Q, the Q row lives at index K+1 (=2), which must NOT be
+    /// wrongly rejected. Kills the `replace + with * in FecReassembler::push`
+    /// mutant (line 214): for K=1, `K+2 == 3` (correct: index 2 < 3, accepted)
+    /// but `K*2 == 2` (mutant: index 2 >= 2, wrongly rejected).
+    #[test]
+    fn pq_k1_q_row_index_not_wrongly_rejected_by_arithmetic() {
+        let params = FlowClass::Default.params(); // non-ARQ -> eligible for Pq at r in {1,2}
+        let ct = vec![0xABu8; 500]; // fits in one symbol -> K=1
+        let mut enc = FecEncoder::new();
+        let syms = enc.encode(&ct, params, 2); // K=1, R=2 (Pq): indices 0(src),1(P),2(Q)
+        assert_eq!(syms.len(), 3);
+        assert!(syms.iter().all(|s| s.payload_id[3] == crate::rs::SCHEME_PQ));
+        let mut re = FecReassembler::new(params.symbol_size, 64);
+        // Feed ONLY the Q row (index 2 = K+1); it's the sole shard needed (K=1).
+        let out = re.push(&syms[2]);
+        assert_eq!(
+            out.as_deref(),
+            Some(ct.as_slice()),
+            "the K+1 (Q) row for K=1 must be accepted, not wrongly rejected by \
+             a K+2-vs-K*2 arithmetic mutant"
+        );
+    }
+
+    /// Under churn well past `max_objects`, `in_flight()` must settle at
+    /// exactly `max_objects`, not collapse below it. Kills the `replace >= with
+    /// < in FecReassembler::push` mutant (line 219): that mutant evicts on
+    /// every insert except when truly at capacity, so `in_flight()` collapses
+    /// to 1 instead of staying pinned at `max_objects`.
+    #[test]
+    fn in_flight_stays_pinned_at_max_objects_under_churn() {
+        let params = FlowClass::Default.params();
+        let mut enc = FecEncoder::new();
+        let mut re = FecReassembler::new(params.symbol_size, 2); // cap 2
+        for i in 0u8..5 {
+            let ct = vec![i; 1200]; // K=1 each; distinct content -> distinct object_id
+            let syms = enc.encode(&ct, params, 0);
+            re.push(&syms[0]);
+        }
+        assert_eq!(
+            re.in_flight(),
+            2,
+            "in_flight must settle at exactly max_objects (2) after churning past capacity"
+        );
     }
 }

@@ -155,6 +155,92 @@ mod tests {
         assert!(b.len() <= 16);
     }
 
+    /// `len()`/`is_empty()` must reflect the exact state, not a constant.
+    /// Kills the `replace RetxBuffer::len -> usize with 1` (line 44) and
+    /// `replace RetxBuffer::is_empty -> bool with true/false` (line 49)
+    /// mutants: an empty buffer and a 3-entry buffer are both distinguishable
+    /// from "always 1"/"always true"/"always false".
+    #[test]
+    fn len_and_is_empty_reflect_exact_state() {
+        let mut b = RetxBuffer::new(1024, 1_000_000);
+        assert_eq!(b.len(), 0);
+        assert!(b.is_empty());
+        b.put(1, vec![1], FlowClass::Bulk, 0, 0);
+        b.put(2, vec![2], FlowClass::Bulk, 0, 0);
+        b.put(3, vec![3], FlowClass::Bulk, 0, 0);
+        assert_eq!(
+            b.len(),
+            3,
+            "len must reflect the exact number of distinct entries"
+        );
+        assert!(!b.is_empty(), "non-empty buffer must not report is_empty");
+    }
+
+    /// At exact capacity, each additional distinct `put` must evict exactly
+    /// one entry, keeping `len()` pinned at `max`. Kills the `replace >= with
+    /// < in RetxBuffer::put` mutant (line 79): that mutant evicts on every
+    /// put except when truly at capacity, collapsing `len()` to 1.
+    #[test]
+    fn put_eviction_keeps_len_pinned_at_capacity() {
+        let mut b = RetxBuffer::new(2, 1_000_000);
+        for c in 0..5u64 {
+            b.put(c, vec![0u8], FlowClass::Bulk, 0, c);
+        }
+        assert_eq!(
+            b.len(),
+            2,
+            "buffer must settle at exactly `max` entries after repeated puts past capacity"
+        );
+    }
+
+    /// `get` at exactly `age == ttl_ms` must still succeed (only `age >
+    /// ttl_ms` expires). Kills the `replace > with >= in RetxBuffer::get`
+    /// mutant (line 104).
+    #[test]
+    fn get_accepts_exact_ttl_boundary_age() {
+        let mut b = RetxBuffer::new(1024, 100); // ttl_ms = 100
+        b.put(1, vec![9], FlowClass::Bulk, 0, 0);
+        assert!(
+            b.get(1, 100).is_some(),
+            "age exactly == ttl_ms must still be considered valid, not expired"
+        );
+        assert!(b.get(1, 101).is_none(), "age > ttl_ms must be expired");
+    }
+
+    /// A stale entry (age exactly == ttl_ms) must NOT be evicted (only age >
+    /// ttl_ms expires). Kills the `replace > with ==/>= in
+    /// RetxBuffer::evict_expired` mutants (line 116): both wrongly treat the
+    /// exact boundary as expired.
+    #[test]
+    fn evict_expired_boundary_not_evicted_at_exact_ttl() {
+        let mut b = RetxBuffer::new(1024, 100); // ttl_ms = 100
+        b.put(1, vec![1], FlowClass::Bulk, 0, 0);
+        // triggers evict_expired(100) for entry 1, whose age is exactly 100
+        b.put(2, vec![2], FlowClass::Bulk, 0, 100);
+        assert_eq!(
+            b.len(),
+            2,
+            "age exactly == ttl_ms must NOT be evicted (only age > ttl_ms expires)"
+        );
+    }
+
+    /// A far-stale entry must actually be evicted. Kills the `replace
+    /// RetxBuffer::evict_expired with ()` mutant (line 112 — a no-op body
+    /// would never evict anything) and the `replace > with < in
+    /// RetxBuffer::evict_expired` mutant (line 116 — that mutant treats
+    /// "clearly expired" as "not expired").
+    #[test]
+    fn evict_expired_actually_removes_far_stale_entries() {
+        let mut b = RetxBuffer::new(1024, 100); // ttl_ms = 100
+        b.put(1, vec![1], FlowClass::Bulk, 0, 0);
+        b.put(2, vec![2], FlowClass::Bulk, 0, 100_000); // way past ttl
+        assert_eq!(
+            b.len(),
+            1,
+            "far-stale entry must be evicted by TTL, leaving only the fresh one"
+        );
+    }
+
     #[test]
     fn retx_duplicate_put_no_phantom_entry() {
         let mut b = RetxBuffer::new(10, 2_000_000);

@@ -114,6 +114,36 @@ mod tests {
         assert!(LossReport::decode(&[0u8; 5]).is_none()); // shorter than the 14-byte header
     }
 
+    /// A 14-byte input (exactly the header length, zero missing entries) must
+    /// be ACCEPTED, not rejected. Kills the `replace < with <= in
+    /// LossReport::decode` mutant on `bytes.len() < 14`: that mutant would
+    /// reject an exact-14-byte header even though it's structurally valid.
+    #[test]
+    fn loss_report_decode_accepts_exact_header_length() {
+        let bytes = [0u8; 14]; // delivered=0, high_counter=0, n_missing=0
+        let got = LossReport::decode(&bytes).expect("exact 14-byte header must decode");
+        assert_eq!(got.delivered_count, 0);
+        assert_eq!(got.high_counter, 0);
+        assert!(got.missing.is_empty());
+    }
+
+    /// Every byte of each decoded `missing` u64 must come from its correct
+    /// wire position. Kills the `replace + with -/* in LossReport::decode`
+    /// mutants on `bytes[offset + N]` (any N): using distinct, non-repeating
+    /// byte values in every position of every missing entry means corrupting
+    /// any single offset arithmetic operation changes the decoded value.
+    #[test]
+    fn loss_report_decode_reads_every_missing_byte_from_correct_offset() {
+        let r = LossReport {
+            delivered_count: 7,
+            high_counter: 99,
+            missing: vec![0x0102_0304_0506_0708u64, 0x1112_1314_1516_1718u64],
+        };
+        let bytes = r.encode();
+        let got = LossReport::decode(&bytes).expect("decodes");
+        assert_eq!(got.missing, r.missing);
+    }
+
     #[test]
     fn loss_report_encode_caps_missing_at_max_nack() {
         let r = LossReport {

@@ -5,24 +5,111 @@
 # the original code.  Each entry is a regexp matched against the full mutant
 # name (file:line:col: description).
 #
-# Three mutations have been proven equivalent and are excluded here:
+# NOTE: `ReplayWindow` was split into `check` (read-only) and `commit`
+# (mutating) methods in #34 (handshake-anti-replay). The old combined
+# `check_and_set` is now test-only and just delegates to the two; it no
+# longer contains the `!`/`|` logic the original two exclusions below
+# targeted, so those entries have been re-pointed at `commit`, where the
+# logic actually lives now.
 #
-# 1. `delete ! in ReplayWindow::check_and_set` (lib.rs ~line 53)
-#    The first-packet init path and the default advance/else paths produce
-#    identical (latest, bitmap) state for every u64 counter value, because
-#    u64 counters are never below the default `latest = 0`.
+# Ten mutations have been proven equivalent and are excluded here:
 #
-# 2. `replace | with ^ in ReplayWindow::check_and_set` (lib.rs ~line 64)
+# 1. `replace | with ^ in ReplayWindow::commit` (yip-crypto/src/lib.rs ~line 95)
 #    The advance path computes `(bitmap << shift) | 1` with shift ≥ 1.
 #    Because shift ≥ 1, bit-0 of `bitmap << shift` is always 0, so
 #    `| 1` and `^ 1` produce the same result.
 #
-# 3. `replace < with <= in keystream` (lib.rs ~line 63)
+# 2. `replace > with >= in ReplayWindow::commit` (yip-crypto/src/lib.rs ~line 90)
+#    When `counter == latest`, the original `>` takes the `else` branch
+#    (diff = latest - counter = 0, so `bitmap |= 1 << 0`, latest unchanged).
+#    The mutated `>=` takes the `if` branch instead: shift = counter - latest
+#    = 0, so `bitmap = (bitmap << 0) | 1 = bitmap | 1` (identical to the else
+#    branch), and `latest = counter` is a no-op since counter already equals
+#    latest. Both branches produce the identical final (latest, bitmap) state.
+#
+# 3. `replace < with <= in keystream` (yip-wire/src/lib.rs ~line 63)
 #    The extra loop iteration produced by `<=` appends an 8-byte SipHash
 #    block that is immediately discarded by the unconditional `truncate(n)`
 #    below the loop.  The returned slice is identical in both cases.
+#    (yip-obf/src/lib.rs has a structurally identical `keystream` with the
+#    same equivalent `<`/`<=` mutant; that crate isn't in the mutants package
+#    list, so it's moot in practice, but the same proof applies there too.)
+#
+# 4. `replace | with ^ in parse_ip` (yip-transport/src/classify.rs ~line 112)
+#    `tc = (byte0 & 0x0F) << 4 | (byte1 >> 4)`. The left operand only ever has
+#    bits 4-7 set (a nibble shifted left by 4); the right operand only ever
+#    has bits 0-3 set (a nibble from `>> 4` on a u8, promoted to u16). The two
+#    operands never share a set bit, so bitwise OR and XOR are identical for
+#    every possible byte pair.
+#
+# 5. `replace > with >= in FecEncoder::build` (yip-transport/src/fec.rs ~line 143)
+#    `if r > 0 { ...call rs::encode_repair(&source, r, scheme)... }`. Here `r`
+#    is a `usize`, so `r >= 0` is a tautology (always true) -- the guard
+#    becomes unconditional. But calling `encode_repair(source, 0, scheme)` is
+#    already a safe, observable no-op: it builds `repair = vec![...; 0]` (an
+#    empty Vec) and its loop runs zero times, so it returns an empty Vec
+#    either way. Whether the call happens (mutant) or is skipped (original),
+#    the appended repair-symbol count is 0 in both cases: identical output.
+#
+# 6. `replace < with <= in split_source` (yip-transport/src/fec.rs ~line 59)
+#    `if start < ciphertext.len() { shard[..end-start].copy_from_slice(...) }`.
+#    The one extra case let through by `<=` is `start == ciphertext.len()`
+#    exactly, where `end = (start + sym).min(len) = len = start`, so
+#    `end - start == 0` and the copy is `shard[..0].copy_from_slice(&[])` --
+#    a zero-length copy, a documented no-op. Identical output either way.
+#
+# 7. `replace < with > in FecReassembler::push` (yip-transport/src/fec.rs
+#    ~line 249) -- `if state.shards.len() < state.k { return None; }`. This
+#    branch (len > k) is unreachable in every reachable execution: `push`
+#    accepts at most one new distinct symbol_index per call, decode is
+#    attempted as soon as `shards.len()` first reaches `state.k`, and RS-v1's
+#    Cauchy/P+Q generator rows are MDS (proven in `rs.rs`'s
+#    `exhaustive_k_of_k_plus_r_decodes_both_schemes` and
+#    `pq_recovers_every_two_erasures`): ANY `k` distinct row indices (source
+#    unit vectors and/or repair rows, keyed by the HashMap so duplicates never
+#    accumulate) form an invertible submatrix. So decode always succeeds the
+#    instant `shards.len()` reaches `k`, `state.done` is set, and the
+#    done-check at the top of `push` blocks any further growth -- `len` can
+#    never exceed `k`, so `> k` and `< k` (both false) are indistinguishable.
+# 8. `replace > with >= in LossDetector::on_seen` (yip-transport/src/lossdetect.rs
+#    ~line 160) -- `if counter > self.high_counter { let gap_start =
+#    self.high_counter + 1; for c in gap_start..counter { ... } high_counter =
+#    counter; }`. `>` and `>=` differ ONLY when `counter == high_counter`. At
+#    that exact value: `gap_start = high_counter + 1 = counter + 1`, so the
+#    range `gap_start..counter` is empty either way (start > end), and
+#    `self.high_counter = counter` is a no-op (already equal). The line
+#    unconditionally following the guard (`pending.entry(counter).or_insert`)
+#    runs regardless of whether the guard fired. So entering vs. not entering
+#    the block is byte-for-byte identical when counter == high_counter, and
+#    `>`/`>=` never differ for any other input. Empirically confirmed: hand-
+#    applying this mutation and running the full yip-transport suite (109
+#    tests, including the new boundary-style tests added for this file)
+#    produces zero failures.
+#
+# 9. `replace + with * in LossDetector::on_seen` (yip-transport/src/lossdetect.rs
+#    ~line 162) -- `let gap_start = self.high_counter + 1;` (only reached when
+#    `counter > self.high_counter`, so `high_counter` here is the OLD value
+#    before this call updates it). Every time `high_counter` is ever set (in
+#    either the first-packet branch or this branch), the SAME call always also
+#    inserts that value into `pending` in the same statement/block. So by
+#    construction, the old `high_counter` is always in exactly one of two
+#    states by the time a later call reads it: still in `pending` (in which
+#    case `pending.entry(old_high_counter).or_insert(..)` -- the mutant's one
+#    extra loop iteration over `old_high_counter` itself -- is a no-op,
+#    already present) or resolved (`is_resolved` guards the insert, skipping
+#    it). Either way, mutating `+1` to `*1` (i.e. starting the gap one index
+#    early, at `high_counter` itself instead of `high_counter + 1`) can never
+#    change the observable `pending`/`resolved_set` contents. Empirically
+#    confirmed the same way as item 8: zero test failures under the applied
+#    mutation.
 exclude_re = [
-    "delete ! in ReplayWindow::check_and_set",
-    "replace \\| with \\^ in ReplayWindow::check_and_set",
+    "replace \\| with \\^ in ReplayWindow::commit",
+    "replace > with >= in ReplayWindow::commit",
     "replace < with <= in keystream",
+    "replace \\| with \\^ in parse_ip",
+    "replace > with >= in FecEncoder::build",
+    "replace < with <= in split_source",
+    "replace < with > in FecReassembler::push",
+    "replace > with >= in LossDetector::on_seen",
+    "replace \\+ with \\* in LossDetector::on_seen",
 ]

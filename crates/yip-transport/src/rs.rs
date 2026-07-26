@@ -295,6 +295,73 @@ mod tests {
         }
     }
 
+    /// An out-of-range index (>= 256) in `received` must be silently ignored,
+    /// never cause an out-of-bounds `seen[idx]` panic. Kills the `replace ||
+    /// with && in decode_source` mutant at the first `||` (idx>=255 with
+    /// bytes.len()!=shard_len): under `&&`, an out-of-range idx with a
+    /// correctly-sized shard no longer short-circuits, and falls through to
+    /// `seen[idx]` with idx >= 256, indexing past the 256-entry array.
+    #[test]
+    fn decode_source_ignores_out_of_range_index_without_panic() {
+        let len = 8;
+        let bogus = vec![0u8; len]; // correct length, but idx way out of range
+        let received: Vec<(u16, &[u8])> = vec![(1000u16, bogus.as_slice())];
+        assert_eq!(
+            decode_source(2, len, &received, Scheme::Cauchy),
+            None,
+            "out-of-range index must be ignored (not enough valid shards), not panic"
+        );
+    }
+
+    /// A true duplicate index (same idx submitted twice) must be deduplicated
+    /// — first occurrence wins, and a later genuinely-distinct index must
+    /// still be collected. Kills the `replace || with && in decode_source`
+    /// mutant at the second `||` (... || seen[idx]): under `&&`, an
+    /// already-seen index is no longer skipped, so a duplicate silently
+    /// overwrites data and crowds out a real, distinct shard.
+    #[test]
+    fn decode_source_skips_true_duplicate_indices_not_just_high_ones() {
+        let len = 4;
+        let data_a = vec![0xAAu8; len]; // first occurrence of idx 0 -> must win
+        let data_b = vec![0xBBu8; len]; // duplicate idx 0 -> must be ignored
+        let data_c = vec![0xCCu8; len]; // genuine idx 1 -> must be collected
+        let received: Vec<(u16, &[u8])> = vec![
+            (0u16, data_a.as_slice()),
+            (0u16, data_b.as_slice()),
+            (1u16, data_c.as_slice()),
+        ];
+        let got = decode_source(2, len, &received, Scheme::Cauchy)
+            .expect("first-occurrence dedup + one genuine shard decodes k=2");
+        assert_eq!(
+            got[0], data_a,
+            "first occurrence of idx 0 must win over a later duplicate"
+        );
+        assert_eq!(
+            got[1], data_c,
+            "genuine idx 1 must be collected, not crowded out by a duplicate"
+        );
+    }
+
+    /// Fewer than K distinct shards must be rejected even when every provided
+    /// index happens to be < K (which would otherwise silently qualify for
+    /// the systematic fast-path copy and fabricate the missing shard(s) as
+    /// zero bytes). Kills the `replace < with > in decode_source` mutant
+    /// (line 117): `rows.len()` can never exceed `k` by construction (the
+    /// collection loop breaks at exactly `k`), so `rows.len() > k` is always
+    /// false — under that mutant the "not enough shards" guard never fires.
+    #[test]
+    fn decode_source_rejects_fewer_than_k_shards_even_via_fast_path() {
+        let len = 4;
+        let data = vec![0x11u8; len];
+        let received: Vec<(u16, &[u8])> = vec![(0u16, data.as_slice())]; // only 1 of 2 needed
+        assert_eq!(
+            decode_source(2, len, &received, Scheme::Cauchy),
+            None,
+            "fewer than K shards must be rejected, not silently zero-filled \
+             via the idx<K fast path"
+        );
+    }
+
     /// A SCHEME_PQ repair index with m>=2 is invalid → decode returns None (no panic).
     #[test]
     fn pq_rejects_repair_row_ge_2() {

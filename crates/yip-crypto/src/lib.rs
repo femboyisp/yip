@@ -604,6 +604,44 @@ mod tests {
         assert_ne!(ini.channel_binding(), [0u8; 32]);
     }
 
+    /// `channel_binding` must be a genuine, transcript-dependent hash — not a
+    /// constant. Kills the `replace channel_binding -> [u8; 32] with [1; 32]`
+    /// mutant (line 207): two independently-keyed handshakes must derive
+    /// DIFFERENT bindings, and neither may equal the all-ones constant.
+    #[test]
+    fn channel_binding_is_transcript_dependent_not_constant() {
+        fn complete_binding() -> [u8; 32] {
+            let resp_kp = generate_keypair();
+            let init_kp = generate_keypair();
+            let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
+            let mut res = Handshake::responder(&resp_kp.private).unwrap();
+            let m1 = ini.write_message(&[]).unwrap();
+            let _ = res.read_message(&m1).unwrap();
+            let m2 = res.write_message(&[]).unwrap();
+            let _ = ini.read_message(&m2).unwrap();
+            assert!(ini.is_finished() && res.is_finished());
+            let binding = ini.channel_binding();
+            assert_eq!(binding, res.channel_binding());
+            binding
+        }
+
+        let binding_a = complete_binding();
+        let binding_b = complete_binding();
+        assert_ne!(
+            binding_a, [1u8; 32],
+            "channel_binding must not be the constant [1; 32]"
+        );
+        assert_ne!(
+            binding_b, [1u8; 32],
+            "channel_binding must not be the constant [1; 32]"
+        );
+        assert_ne!(
+            binding_a, binding_b,
+            "two independent handshakes (different keys/transcripts) must \
+             derive different channel bindings"
+        );
+    }
+
     #[test]
     fn ik_handshake_completes_and_authenticates_initiator() {
         let resp_kp = generate_keypair();

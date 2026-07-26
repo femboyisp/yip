@@ -200,6 +200,196 @@ mod tests {
         );
     }
 
+    /// `len()` must report the exact count, not a constant. Kills the
+    /// `replace FlowTable::len -> usize with 0/1` mutants (line 44).
+    #[test]
+    fn len_reports_exact_flow_count() {
+        let mut t = FlowTable::new(1024, 10_000);
+        assert_eq!(t.len(), 0);
+        t.observe(&key(1), 100, 0);
+        t.observe(&key(2), 100, 0);
+        t.observe(&key(3), 100, 0);
+        assert_eq!(
+            t.len(),
+            3,
+            "len must reflect the exact number of tracked flows"
+        );
+    }
+
+    /// `is_empty()` must reflect actual emptiness in both directions. Kills the
+    /// `replace FlowTable::is_empty -> bool with true/false` mutants (line 49).
+    #[test]
+    fn is_empty_reflects_actual_state() {
+        let mut t = FlowTable::new(1024, 10_000);
+        assert!(t.is_empty(), "freshly-created table must be empty");
+        t.observe(&key(1), 100, 0);
+        assert!(
+            !t.is_empty(),
+            "table with one tracked flow must not be empty"
+        );
+    }
+
+    /// Pins the EWMA update formula (`alpha * size + (1-alpha) * old`) exactly.
+    /// Kills the `replace * with + in FlowTable::observe` mutant (line 61):
+    /// either multiplication turned into addition changes the numeric result.
+    #[test]
+    fn ewma_formula_is_precise() {
+        let mut t = FlowTable::new(1024, 10_000);
+        let k = key(1);
+        t.observe(&k, 100, 0); // first sample: ewma_size := 100.0 exactly
+        t.observe(&k, 200, 1); // ewma = 0.25*200 + 0.75*100 = 125.0
+        let stat = t.map.get(&k).expect("flow present");
+        assert!(
+            (stat.ewma_size - 125.0).abs() < 1e-3,
+            "expected ewma_size == 125.0, got {}",
+            stat.ewma_size
+        );
+    }
+
+    /// At exact capacity, inserting one more distinct flow must evict exactly
+    /// one entry, keeping `len()` pinned at `max` (not drifting below it).
+    /// Kills the `replace >= with < in FlowTable::observe` mutant (line 66):
+    /// that mutant evicts on every insert except when truly at capacity,
+    /// causing `len()` to collapse to 1 instead of staying at `max`.
+    #[test]
+    fn eviction_keeps_len_pinned_at_capacity() {
+        let mut t = FlowTable::new(2, 10_000);
+        for p in 0..5u16 {
+            t.observe(&key(8000 + p), 100, u64::from(p));
+        }
+        assert_eq!(
+            t.len(),
+            2,
+            "table must settle at exactly `max` entries after repeated inserts past capacity"
+        );
+    }
+
+    /// `stat.packets < MIN_PACKETS` boundary: exactly `MIN_PACKETS` (4) small,
+    /// frequent packets must already be classified (not held back one more
+    /// packet). Kills the `replace < with <= in FlowTable::classify` mutant
+    /// (line 96).
+    #[test]
+    fn exactly_min_packets_is_classified() {
+        let mut t = FlowTable::new(1024, 10_000);
+        let k = key(1);
+        for i in 0..4u64 {
+            t.observe(&k, 80, i * 5); // small, 5ms apart -> frequent
+        }
+        assert_eq!(
+            t.classify(&k),
+            Some(FlowClass::Realtime),
+            "exactly MIN_PACKETS (4) packets must already be classified, not held back"
+        );
+    }
+
+    /// `ewma_size > LARGE_BYTES` boundary: exactly `LARGE_BYTES` (1000.0) must
+    /// NOT be classified as Bulk (needs to exceed, not just reach). Kills the
+    /// `replace > with >= in FlowTable::classify` mutant (line 99).
+    #[test]
+    fn ewma_exactly_large_bytes_is_not_bulk() {
+        let mut t = FlowTable::new(1024, 10_000);
+        let k = key(1);
+        for i in 0..4u64 {
+            t.observe(&k, 1000, i); // constant size -> ewma stays exactly 1000.0
+        }
+        assert_eq!(
+            t.classify(&k),
+            None,
+            "ewma_size exactly at LARGE_BYTES (1000.0) must not classify as Bulk"
+        );
+    }
+
+    /// `ewma_size < SMALL_BYTES` boundary: exactly `SMALL_BYTES` (256.0) must
+    /// NOT take the small-packet Realtime path. Kills the `replace < with <=
+    /// in FlowTable::classify` mutant (line 102).
+    #[test]
+    fn ewma_exactly_small_bytes_is_not_realtime() {
+        let mut t = FlowTable::new(1024, 10_000);
+        let k = key(1);
+        for i in 0..4u64 {
+            t.observe(&k, 256, i); // constant size -> ewma stays exactly 256.0, frequent
+        }
+        assert_eq!(
+            t.classify(&k),
+            None,
+            "ewma_size exactly at SMALL_BYTES (256.0) must not classify as Realtime"
+        );
+    }
+
+    /// Pins the rate-check formula `packets * 1000 >= MIN_RATE_PPS *
+    /// duration_ms` exactly, distinguishing it from a `+`-mutated variant on
+    /// either operand. Kills `replace * with + in FlowTable::classify` (line 108).
+    #[test]
+    fn rate_formula_is_precise_not_additive() {
+        let mut t = FlowTable::new(1024, 10_000);
+        // packets=5, duration_ms=1000: original 5*1000=5000 >= 20*1000=20000 is
+        // FALSE (not frequent -> None). A `packets + 1000` mutant would compute
+        // 5+1000=1005 >= 20000 (still false, doesn't distinguish this operand),
+        // but a `MIN_RATE_PPS + duration_ms` mutant computes 5000 >= 20+1000=1020
+        // (TRUE), flipping the result to Some(Realtime).
+        let k1 = key(1);
+        for i in 0..5u64 {
+            t.observe(&k1, 80, if i == 4 { 1000 } else { 0 });
+        }
+        assert_eq!(
+            t.classify(&k1),
+            None,
+            "packets=5 over 1000ms must be below the rate threshold (not frequent)"
+        );
+
+        // packets=5, duration_ms=200: original 5*1000=5000 >= 20*200=4000 is
+        // TRUE (frequent -> Realtime). A `packets + 1000` mutant computes
+        // 5+1000=1005 >= 20*200=4000 (FALSE), flipping the result to None.
+        let k2 = key(2);
+        for i in 0..5u64 {
+            t.observe(&k2, 80, if i == 4 { 200 } else { 0 });
+        }
+        assert_eq!(
+            t.classify(&k2),
+            Some(FlowClass::Realtime),
+            "packets=5 over 200ms must be above the rate threshold (frequent)"
+        );
+    }
+
+    /// `evict_expired` must actually remove stale entries. Kills the
+    /// `replace FlowTable::evict_expired with ()` mutant (line 117): a no-op
+    /// body would leave expired flows in the table forever.
+    #[test]
+    fn evict_expired_actually_evicts_stale_entries() {
+        let mut t = FlowTable::new(1024, 100); // ttl_ms = 100
+        t.observe(&key(1), 80, 0);
+        // Observe a distinct key far past the TTL of the first; evict_expired
+        // (called at the top of `observe`) must drop the stale entry first.
+        t.observe(&key(2), 80, 100_000);
+        assert_eq!(
+            t.len(),
+            1,
+            "stale entry must be evicted by TTL, leaving only the fresh one"
+        );
+    }
+
+    /// At the exact TTL boundary (`age == ttl_ms`), an entry must NOT be
+    /// evicted (only `age > ttl_ms` expires it). Kills the `replace > with
+    /// ==/>= in FlowTable::evict_expired` mutants (line 121): either mutant
+    /// would wrongly evict-and-reinsert the same key at the exact boundary,
+    /// observably resetting its packet count back to 1.
+    #[test]
+    fn evict_expired_boundary_not_evicted_at_exact_ttl() {
+        let mut t = FlowTable::new(1024, 100); // ttl_ms = 100
+        let k = key(1);
+        t.observe(&k, 80, 0); // packets = 1
+        t.observe(&k, 80, 100); // age == ttl_ms exactly; must update in place
+        let stat = t
+            .map
+            .get(&k)
+            .expect("must still be present at exact ttl boundary");
+        assert_eq!(
+            stat.packets, 2,
+            "second observe at the exact TTL boundary must update the same \
+             entry (packets=2), not wrongly evict-and-reinsert (packets=1)"
+        );
+    }
+
     #[test]
     fn order_stays_bounded_under_churn() {
         let max = 64usize;
