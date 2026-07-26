@@ -152,7 +152,7 @@ There is no `--help`; running with no arguments prints the usage above.
 The standalone rendezvous + blind-relay server (no TUN, no tunnel keys).
 
 ```
-yip-rendezvous <listen-addr> [--obf-psk <hex64>]
+yip-rendezvous <listen-addr> [--obf-psk <hex64>] [--roots <path> --network-id <hex32>]
 yip-rendezvous <listen-addr> --obf-psk <hex64> \
                --listen-tcp <addr> --tls-cert <path> --tls-key <path> [--decoy <addr>]
 yip-rendezvous <listen-addr> --obf-psk <hex64> \
@@ -166,6 +166,14 @@ yip-rendezvous --version | -V
 
 - `<listen-addr>` — UDP bind address, e.g. `0.0.0.0:51821`.
 - `--obf-psk <hex64>` — obfuscated networks (must match the nodes' `obf_psk`).
+- `--roots <path> --network-id <hex32>` — **both-or-neither**; switches the
+  server into **mesh mode** (rendezvous milestone #37), rejecting any
+  registration that doesn't carry a valid signed `Record` verified against the
+  root set's CA keys. `--roots` takes the same CA-signed root-set file `yip-ca
+  sign-roots` produces (see the `yip-ca` CLI below); `--network-id` is the
+  16-byte network id, 32 hex chars. Closes registration-squatting/overwrite on
+  the plain UDP rendezvous path — without it, the server accepts any
+  registration and trusts self-reported endpoints.
 
 It logs `relay-forwarded=<N>` to stderr every 5 s (how many datagrams the blind
 relay has forwarded — 0 means everything went direct/hole-punched).

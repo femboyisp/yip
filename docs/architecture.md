@@ -15,12 +15,18 @@ This is a navigational summary. The authoritative design lives in the specs and 
 ## Project shape
 
 yip is decomposed into five sub-projects, built in order. Each is independently testable and ships
-on its own; later sub-projects layer onto the data plane through stable trait interfaces.
+on its own; later sub-projects layer onto the data plane through stable trait interfaces. #1–#3 are
+merged (#3 partially — obfuscation and REALITY TLS-mimicry are in, DAITA-style padding is not); #4
+and #5 have not started. See the sub-project table in `README.md` for the authoritative status.
 
 ```
                  ┌─────────────────────────────────────────────┐
- #4 DAITA /      │  per-flow anonymity dial (optional onion)    │
- anonymity       └─────────────────────────────────────────────┘
+ #5 multi-core / │  multi-queue sharding · macOS/Windows ·      │
+ multi-platform  │  AF_XDP relay tier                           │
+                 └─────────────────────────────────────────────┘
+                 ┌─────────────────────────────────────────────┐
+ #4 traffic-     │  DAITA-style padding/timing · optional onion │
+ analysis        └─────────────────────────────────────────────┘
                  ┌─────────────────────────────────────────────┐
  #3 anti-DPI     │  obfuscating link layer (impl of `Link`)     │
                  └─────────────────────────────────────────────┘
@@ -29,8 +35,8 @@ on its own; later sub-projects layer onto the data plane through stable trait in
  plane           └─────────────────────────────────────────────┘
                  ┌─────────────────────────────────────────────┐
  #1 DATA PLANE   │  device ↔ transport ↔ crypto ↔ wire ↔ io     │  ← built first
- (this repo's    │  (TUN/TAP) (RaptorQ) (Noise) (frame) (uring) │
-  current focus) └─────────────────────────────────────────────┘
+                 │  (TUN/TAP) (RS-FEC)  (Noise) (frame) (epoll) │
+                 └─────────────────────────────────────────────┘
 ```
 
 ## Data-plane pipeline (sub-project #1)
@@ -44,9 +50,9 @@ swappable without touching the protocol.
 TUN/TAP frame
   → classify (DSCP/5-tuple → FlowClass: policy → DSCP → heuristic → default)   [yip-transport]
   → seal     (AEAD-encrypt the inner frame end-to-end)                          [yip-crypto]
-  → encode   (RaptorQ-encode the ciphertext → symbols)                          [yip-transport]
+  → encode   (RS-encode the ciphertext → symbols, GF(256) Cauchy or P+Q)        [yip-transport]
   → frame    (keyed header-protection + coverage-auth, one symbol per datagram) [yip-wire]
-  → send     (io_uring ring / AF_XDP)                                           [yip-io]
+  → send     (epoll `PollDriver`, batched `sendmmsg`/GSO; io_uring opt-in)      [yip-io]
 ```
 
 **Ingress** reverses it: `recv → deframe (auth + deprotect) → decode (object complete?) → open →
@@ -54,14 +60,20 @@ write`.
 
 ### Why this is low-latency
 
-Crypto is latency-irrelevant (~0.5–2 µs/packet). The real cost in a userspace tunnel is syscalls,
-kernel/user copies, and async scheduling jitter. yip attacks that with a single `io_uring` ring
-servicing both the UDP socket and the TUN/TAP fd (busy-polled), and an AF_XDP zero-copy backend for
-bare metal — closing most of the gap to kernel WireGuard. RaptorQ recovers loss *proactively*, so
-there is no retransmit round-trip and p99 latency stays flat under loss.
+Crypto is latency-irrelevant (~0.5–2 µs/packet after the `ring` ChaCha20-Poly1305 swap; see
+`crates/yip-bench/RESULTS.md`). The real cost in a userspace tunnel is syscalls, kernel/user
+copies, and scheduling jitter. yip attacks that with a single-threaded `epoll`-driven event loop
+(the default `PollDriver`) that batches sends with `sendmmsg`/`UDP_SEGMENT` (GSO) and reads bursts
+with `recvmmsg`; an opt-in `io_uring` driver (`YIP_USE_URING=1`) trades a core for lower RTT on
+bare metal with adaptive busy-polling. AF_XDP zero-copy is sub-project #5 and has not started. The
+Reed–Solomon FEC recovers loss *proactively* (no retransmit round-trip needed for the common case),
+so p99 latency stays flat under loss; a thin reactive ARQ backstops residual loss on ARQ-eligible
+flows.
 
 ## Conventions
 
-See `CLAUDE.md` and the [Mullvad coding guidelines](https://github.com/mullvad/mullvadvpn-app).
-Highlights: workspace lint set with `-D warnings`; no `as` numeric casts; `#![forbid(unsafe_code)]`
-everywhere except `yip-io`; ≥90 % coverage on logic crates; pinned dependency versions.
+See `CLAUDE.md` and the
+[coding guidelines](https://github.com/mullvad/mullvadvpn-app/blob/main/CODING_GUIDELINES.md) yip
+follows. Highlights: workspace lint set with `-D warnings`; no `as` numeric casts;
+`#![forbid(unsafe_code)]` everywhere except `yip-io`; ≥90 % coverage on logic crates; pinned
+dependency versions.

@@ -5,7 +5,67 @@ All notable changes to this project are documented here, following
 
 ## [Unreleased]
 
+No release has been cut yet — everything below is tracked under `[Unreleased]`
+until 0.1.0.
+
+### Security
+- **Handshake anti-replay + authenticated endpoint (#34, PR #99).** The
+  Noise-IK `msg1` now frames a TAI64N timestamp alongside the existing cert
+  inside the encrypted handshake payload; a freshness-gate check replaces the
+  old age gate, and a peer's endpoint is learned **only from a fresh `Init`**.
+  This closes an endpoint-hijack-via-replay vector: a captured `Init` replayed
+  later could previously rebuild session state and redirect a peer's outbound
+  traffic. The earlier #36 cold-start relay-rebuild path is retired in favor
+  of this freshness gate (a stale/replayed `Init` is rejected outright rather
+  than triggering a rebuild).
+- **Signed rendezvous registration + authenticated endpoint roaming (#37 +
+  M2, PR #100).** A `yip-rendezvous` server started with `--roots
+  <path> --network-id <hex32>` now enters mesh mode and rejects any
+  registration that doesn't carry a `RegisterSigned` record verified against
+  the root set's CA keys — closing registration-squatting/overwrite, where an
+  unauthenticated actor could previously claim another node's rendezvous slot
+  and redirect its traffic. Endpoint roaming (M2) is now itself
+  authenticated: a peer's stored endpoint updates only after an inbound
+  datagram passes AEAD authentication and the anti-replay window (WireGuard's
+  roaming model), including the in-flight-rekey and relay-adoption edge
+  cases. Exercised end-to-end by netns tests asserting a forged registration
+  is refused and the legitimate node stays reachable.
+
 ### Added
+- Classical session rekey + epoch handling (milestone 9a, #9, PR #90):
+  established sessions now rotate keys roughly every **~120 s** via a
+  winner-initiates, one-in-flight rekey exchange (`EpochSet`:
+  current/next/previous epochs, WireGuard-style confirmed-switch), with the
+  losing side falling back cleanly on a race. Visible on the wire as a
+  connection-tag rotation; verified with a loss-free netns rotation test.
+- Relay-path rekey completion (#91, PR #92): the 9a rekey exchange, until now
+  gated off for relayed peers, completes over the blind relay too
+  (`relayed_handshake_init`/`relayed_handshake_resp` cores), preserving FEC
+  fate tagging through the relay wrap/unwrap. Previously a relayed session
+  simply never rekeyed.
+- **REALITY.3–5d** (PR #83, PR #88 — PR #88's branch is named "follow-up
+  cleanups" but actually carries REALITY.5b–5d): the Xray-REALITY relay
+  transport's authenticated-serving path is now feature-complete. REALITY.3
+  finished the server's stolen-cert forging (AIA extension copying, a
+  per-SNI anti-replay guard on the auth seal, `--reality-cert-refresh-secs`/
+  `--reality-cert-max-stale-secs` staleness bounds). REALITY.4a/4b wired up
+  the `yipd` client side: `rendezvous=reality://host:port?pbk=&sid=&sni=`
+  dials the relay with a Chrome-faithful crafted ClientHello, and `verify=`
+  (default `on`) adds explicit client-side relay verification (pinned leaf
+  key + `CertificateVerify` check derived from the shared seal secret) so a
+  wrong `pbk`/relay key fails closed with a long jittered backoff instead of
+  hammering the wrong host. REALITY.5a–5d then replaced the relay's
+  authed-connection TLS serving with a hand-rolled, byte-matching TLS 1.3
+  server flight (`yip-utls`'s `RealityStream`) built from a captured template
+  of the real destination's own handshake shape — **dropping BoringSSL
+  forged acceptors from the authed-serve path** (BoringSSL/`cmake` remain a
+  build dependency overall, for the unauthenticated-splice path and
+  `transport=tls`). Exercised end-to-end by `run-netns-reality-relay.sh` and
+  `run-netns-reality-5d.sh`, including wrong-`pbk` and wrong-relay-key
+  negative tests. See `docs/configuration.md` for the full `reality://` /
+  `--reality-*` flag reference.
+- `#59` MTU-aware packetization investigation findings + measurement tooling
+  (PR #94) — **documentation/investigation only**, no code or wire change.
 - REALITY.2 (anti-DPI): new pure-Rust `yip-utls` crate — a uTLS-equivalent
   REALITY client that crafts a **byte-faithful latest-Chrome (150) ClientHello**
   (with our own X25519 `key_share` and a REALITY auth seal in `legacy_session_id`)
@@ -116,7 +176,26 @@ All notable changes to this project are documented here, following
   modules: `feedback` (`LossReport`), `lossdetect` (`LossDetector`), `retxbuf`
   (`RetxBuffer`), plus `Transport::repair_object`.
 
+### Fixed
+- Session-lifecycle hardening (#36 path-switch re-handshake + #41 cert
+  revocation, PR #95): a path-switch (roaming) no longer discards the
+  in-flight handshake ephemeral, both initiator- and responder-side relay
+  adoption are covered for a relayed cold-start retransmit, and mesh peers
+  now get a periodic cert-liveness sweep plus a re-verify-on-rekey-`Init`
+  gate (both exempting root nodes) — so a revoked member's session no longer
+  silently keeps working until its next full handshake.
+- Root-exempt responder-cert checks (PR #97): responder-side cert checks now
+  exempt root nodes symmetrically with the initiator-side gates — a root
+  could previously fail a check the initiator side already exempted it from.
+- Gossip digest chunking (#44, PR #98): the mesh gossip digest is now
+  chunked, and its obfuscation degrades fail-soft, instead of panicking once
+  a mesh grows past a single-datagram digest size.
+
 ### Changed
+- Rendezvous relay-forward counter moved off the server's mutex onto a
+  shared `AtomicU64` (#68, PR #93) — a pure perf fix (removes lock
+  contention on the hot forwarding path under load); no behavior change to
+  the `relay-forwarded=<N>` log line.
 - **Relicensed from MPL-2.0 to AGPL-3.0-or-later**, copyright FEMBOY CYBER NETWORKS
   LLC. The AGPL network-use clause (§13) means anyone running a modified `yip` as a
   network service must offer their users the corresponding source — privacy
