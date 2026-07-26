@@ -273,13 +273,19 @@ jobs:
         # debug yip-rendezvous already built above in this job.
         #
         # POLL DRIVER ONLY: the punch->relay escalation is driven by discovery
-        # + path-SM timers, whose convergence within the fixed capture window
-        # is flaky under the uring driver in CI (the escalation Init can miss
-        # the window, yielding only 1 captured ephemeral) -- the same
-        # discovery-timing sensitivity that already makes run-netns-discovery.sh
-        # and run-netns-cert-revocation.sh poll-only here. The retarget logic
-        # is driver-independent (verified on both drivers locally), so uring
-        # adds only flakiness with no extra coverage.
+        # + path-SM timers, and this test shares the discovery-timing sensitivity
+        # that already makes run-netns-discovery.sh and run-netns-cert-revocation.sh
+        # poll-only here.
+        #
+        # NOTE (#116): a prior "only 1 captured ephemeral" flake on this gate was
+        # NOT a capture-window miss — it was a real intermittent bug where the
+        # punch->relay retarget reused the punch ephemeral if an inbound relayed
+        # packet set `relay` before our own escalation timer fired. Fixed by
+        # keying the escalation on the in-flight Init's `via_relay` rather than
+        # the `relay` flag; a deterministic unit test
+        # (punch_relay_retarget_draws_fresh_ephemeral_even_if_relay_flag_preset)
+        # now covers it. The retarget logic is driver-independent, so uring adds
+        # only timing flakiness with no extra coverage.
         run: |
           sudo bash bin/yipd/tests/run-netns-pathswitch-rehandshake.sh \
             "$(pwd)/target/release/yipd" \
