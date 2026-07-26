@@ -1505,18 +1505,31 @@ mod tests {
             }
         };
 
+        // Interleave send and drain so the kernel UDP receive buffer never has to
+        // hold more than `WINDOW` datagrams at once. Recycling of the `RING_BUFS`
+        // provided-buffer pool is proven by round-tripping far MORE than
+        // `RING_BUFS` datagrams *through* the pool — not by buffering that many
+        // simultaneously. Blasting all of them first relied on the kernel holding
+        // `> RING_BUFS` at once, but the default `net.core.rmem_default` (~208 KB)
+        // only holds ~230 small datagrams (per-skb truesize overhead), so that
+        // pattern dropped below `RING_BUFS` and failed on stock-configured boxes.
         let total = 384_usize;
+        const WINDOW: usize = 64;
         let mut sent_payloads = Vec::with_capacity(total);
-        for i in 0..total {
-            let payload = format!("uring-echo-{i}").into_bytes();
-            a.send(&payload).expect("send test datagram");
-            sent_payloads.push(payload);
-        }
-
         let mut got = Vec::with_capacity(total);
         let mut recv_buf = [0_u8; MAX_WIRE_DATAGRAM];
+        let mut next_to_send = 0_usize;
         let mut stall = 0_usize;
-        for _ in 0..4000 {
+        for _ in 0..8000 {
+            // Refill the in-flight window: cap unacked datagrams at `WINDOW`
+            // (far under the ~230 the recv buffer holds), so nothing is dropped.
+            while next_to_send < total && next_to_send < got.len() + WINDOW {
+                let payload = format!("uring-echo-{next_to_send}").into_bytes();
+                a.send(&payload).expect("send test datagram");
+                sent_payloads.push(payload);
+                next_to_send += 1;
+            }
+
             driver.poll_once(&mut dispatch).expect("poll_once succeeds");
 
             let before = got.len();
@@ -1530,10 +1543,10 @@ mod tests {
             if got.len() >= total {
                 break;
             }
-            // No-progress early exit once the burst has drained (a small kernel
-            // recv buffer caps how many survive, so `got.len()` may never reach
-            // `total`) — keeps the test fast while still round-tripping well over
-            // `RING_BUFS`.
+            // No-progress early exit: once the window has filled, no further
+            // `got` progress means a rare drop stalled it. Stop instead of
+            // spinning the full poll budget — we still round-trip well over
+            // `RING_BUFS` before any such stall, so the assert below holds.
             if got.len() == before {
                 stall += 1;
                 if stall >= 200 {
@@ -1550,14 +1563,12 @@ mod tests {
             libc::close(tun_wr);
         }
 
-        // All datagrams are sent before the driver drains, so the kernel UDP
-        // receive buffer and the bounded send table legitimately drop a machine-
-        // dependent fraction under load — requiring `got.len() == total` made
-        // this flaky/stalling locally. This test's real point is recv-buffer
-        // *recycling*: round-tripping more datagrams than the `RING_BUFS`
-        // provided-buffer pool holds proves buffers were reprovided and reused.
-        // A genuine buffer leak stalls throughput at <= `RING_BUFS`, so this
-        // still fails on it. (Integer comparison; no float, no `as`.)
+        // Send and drain are interleaved (bounded `WINDOW`), so nothing is
+        // dropped and `got` reaches `total` on any box. The test's real point is
+        // recv-buffer *recycling*: round-tripping more datagrams than the
+        // `RING_BUFS` provided-buffer pool holds proves buffers were reprovided
+        // and reused. A genuine buffer leak stalls throughput at <= `RING_BUFS`,
+        // so this still fails on it. (Integer comparison; no float, no `as`.)
         assert!(
             got.len() > RING_BUFS,
             "expected more than RING_BUFS={RING_BUFS} datagrams to round-trip \
@@ -1914,16 +1925,25 @@ mod tests {
             }
         };
 
+        // Interleave send and drain (bounded `WINDOW`) so the kernel UDP receive
+        // buffer never has to hold more than `WINDOW` datagrams at once. Blasting
+        // all `SEND_SLOTS * 3` first relied on the kernel buffering `> SEND_SLOTS`
+        // simultaneously, but the default `net.core.rmem_default` (~208 KB) only
+        // holds ~230 small datagrams, so that pattern dropped below `SEND_SLOTS`
+        // and failed on stock-configured boxes.
         let total = SEND_SLOTS * 3;
-        for i in 0..total {
-            let payload = format!("slot-reuse-{i}").into_bytes();
-            a.send(&payload).expect("send test datagram");
-        }
-
+        const WINDOW: usize = 64;
         let mut recv_buf = [0_u8; MAX_WIRE_DATAGRAM];
         let mut received = 0_usize;
+        let mut next_to_send = 0_usize;
         let mut stall = 0_usize;
-        for _ in 0..6000 {
+        for _ in 0..8000 {
+            while next_to_send < total && next_to_send < received + WINDOW {
+                let payload = format!("slot-reuse-{next_to_send}").into_bytes();
+                a.send(&payload).expect("send test datagram");
+                next_to_send += 1;
+            }
+
             driver.poll_once(&mut dispatch).expect("poll_once succeeds");
             let before = received;
             loop {
@@ -1936,11 +1956,9 @@ mod tests {
             if received >= total {
                 break;
             }
-            // No-progress early exit: once the burst has fully drained (a small
-            // kernel recv buffer legitimately caps how many datagrams survive, so
-            // `received` may never reach `total`), stop instead of spinning the
-            // full poll budget of idle 10 ms waits — keeps the test fast on any
-            // box while still round-tripping well over `SEND_SLOTS`.
+            // No-progress early exit: once the window has filled, no further
+            // `received` progress means a rare drop stalled it. Stop instead of
+            // spinning the full poll budget of idle 10 ms waits.
             if received == before {
                 stall += 1;
                 if stall >= 200 {
@@ -1951,15 +1969,12 @@ mod tests {
             }
         }
 
-        // All `total = SEND_SLOTS * 3` datagrams are sent before the driver
-        // drains, so the kernel UDP receive buffer and the bounded in-flight
-        // send table legitimately drop a large, machine-dependent fraction under
-        // load — requiring `received == total` made this flaky/stalling locally.
-        // This test's real point is send-slot *reuse*: round-tripping more
-        // datagrams than the fixed `SEND_SLOTS` table can hold at once proves the
-        // table was reused, and the `in_flight_used_count() == 0` check below
-        // proves it drained. A genuine slot leak caps throughput at <=
-        // `SEND_SLOTS` and leaves the table non-empty, so both asserts still
+        // Send and drain are interleaved (bounded `WINDOW`), so `received`
+        // reaches `total` on any box. The test's real point is send-slot *reuse*:
+        // round-tripping more datagrams than the fixed `SEND_SLOTS` table can hold
+        // at once proves the table was reused, and the `in_flight_used_count() ==
+        // 0` check below proves it drained. A genuine slot leak caps throughput at
+        // <= `SEND_SLOTS` and leaves the table non-empty, so both asserts still
         // fail on it. (Integer comparison; no float, no `as`.)
         assert!(
             received > SEND_SLOTS,
