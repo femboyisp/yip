@@ -128,8 +128,17 @@ impl LossDetector {
         // This is safe because entries below `resolved_below` are captured by
         // the watermark; here we evict entries that are above the watermark but
         // old enough that we are unlikely to see late duplicates for them.
+        //
+        // The `pop_first().is_none()` guard is a hard stop once the map is
+        // drained: under correct `>` semantics it never fires (the loop only
+        // runs while `len() > window >= 0`, so the map is always non-empty on
+        // entry), but it caps the loop to at most `resolved_set.len()`
+        // iterations under any other comparison, instead of spinning forever
+        // popping an already-empty map.
         while self.resolved_set.len() > self.window {
-            self.resolved_set.pop_first();
+            if self.resolved_set.pop_first().is_none() {
+                break;
+            }
         }
     }
 
@@ -175,9 +184,17 @@ impl LossDetector {
     }
 
     /// Enforce the window bound on the pending set, evicting smallest keys.
+    ///
+    /// The `pop_first().is_none()` guard mirrors the one in
+    /// [`mark_resolved`](Self::mark_resolved): it never fires under correct
+    /// `>` semantics, but caps the loop to at most `pending.len()`
+    /// iterations under any other comparison, instead of spinning forever
+    /// popping an already-empty map.
     fn enforce_window(&mut self) {
         while self.pending.len() > self.window {
-            self.pending.pop_first();
+            if self.pending.pop_first().is_none() {
+                break;
+            }
         }
     }
 
