@@ -161,6 +161,40 @@ went through several rounds: ~26 µs (original RaptorQ) → ~1.3 µs (RS,
 general Cauchy scheme, #50) → ~0.32 µs (P+Q XOR fast path for the common
 R=1 case, #51).
 
+### MAC-candidate spike (#58)
+
+A Criterion micro-bench comparing keyed-MAC candidates for the `yip-wire`
+coverage-auth tag over the real covered region (header‖symbol, 8-byte tag):
+
+```sh
+cargo bench -p yip-bench --bench mac_candidates
+```
+
+SipHash-1-3 is ~45 % cheaper than today's SipHash-2-4 at packet size; keyed
+BLAKE3 is ~2.5× **slower** at a 1.4 KB symbol (its SIMD advantage needs
+KB–MB inputs). Measured on the EPYC target box and a dev box. The saving is
+real but third-tier behind TUN-write and AEAD, and only helps in the
+CPU-bound regime below — so #58 stays parked. Full write-up:
+[`crates/yip-bench/mac-candidates-58.md`](../crates/yip-bench/mac-candidates-58.md).
+
+### CPU-bound-regime spike (#4 go/no-go)
+
+Determines whether the yip receiver can become CPU-bound or is always
+RTT/window-bound. Pins the receiving `yipd` to one core (models the 1-core
+target), sweeps netem RTT, and records throughput + the pinned core's
+utilization (needs root):
+
+```sh
+sudo bash crates/yip-bench/tests/run-cpu-regime.sh target/release/yipd
+```
+
+A CPU-bound regime **exists**: under a UDP blast the single core saturates and
+caps at ~1.2 Gbps at every RTT; TCP is CPU-bound at low RTT and window-bound at
+high RTT. So the "CPU wins don't move throughput" observation was specific to
+the 24 ms single-flow WAN path — the #4 CPU work pays off for short-RTT /
+aggregate-parallel traffic. Full write-up:
+[`crates/yip-bench/cpu-bound-regime.md`](../crates/yip-bench/cpu-bound-regime.md).
+
 ### yip vs WireGuard/OpenVPN/n2n under loss (`tc netem`)
 
 The comparison tests in `crates/yip-bench/tests/netem_bench.rs` set up tunnels
