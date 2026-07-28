@@ -24,12 +24,43 @@
 //! power limit and DVFS clock-droop at high N must not be mistaken for
 //! sharding/SMT contention.
 //!
+//! Task 3 (level 2) swaps the in-process loopback of level 1 for a REAL
+//! `SO_REUSEPORT` UDP delivery path: `n` sockets bound to the same
+//! `127.0.0.1:PORT`, each owned by a core-pinned receiver thread, fed by a
+//! separate blaster thread group (pinned to a disjoint core set) sending
+//! from many distinct source sockets so the kernel's 4-tuple hash is what
+//! decides which receiver socket each datagram lands on -- confirming both
+//! that `SO_REUSEPORT` actually spreads load across the `n` sockets
+//! (`imbalance_ratio` near 1.0) and that the `recv()` syscall + deframe +
+//! FEC-decode path scales the way level 1's in-process chain did.
+//!
+//! Level 2 deliberately measures deframe + FEC-decode throughput, NOT the
+//! full `open()`-included chain: the blaster's AEAD session is independent
+//! of every receiver's session (each `Worker` establishes its own handshake
+//! pair, and per this file's "never share a Session/Worker across threads"
+//! rule the blaster cannot borrow a specific receiver's session either), so
+//! `open()` is expected to reject every datagram on a key mismatch -- not a
+//! replay-window false reject, a hard decrypt failure. `Worker::receive`
+//! still attempts `open()` (so a real acceptance would be visible/reported),
+//! but level 2's byte-counting falls back to the FEC-decoded ciphertext
+//! length whenever `open()` doesn't succeed, per the task brief's documented
+//! fallback. The wire codec's coverage-auth key, unlike the AEAD session, is
+//! a fixed constant baked into every `Worker::new()` (`Codec::new([1u8; 16],
+//! [2u8; 16])`), so deframing across independently-constructed `Worker`s
+//! (receiver vs. blaster) works fine -- that's what makes the SO_REUSEPORT
+//! delivery path exercisable at all without a shared session.
+//!
 //! Run: `cargo run --release -p yip-bench --example sharding_scale`
 //! Test: `cargo test -p yip-bench --example sharding_scale`
 
+use std::io::ErrorKind;
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use socket2::{Domain, SockAddr, Socket, Type};
 
 use yip_bench::{established_pair, sample_inner};
 use yip_crypto::Session;
@@ -115,37 +146,106 @@ impl Worker {
         }
     }
 
-    /// One fresh-counter roundtrip through the real receive chain:
-    /// seal -> FEC-encode -> frame -> deframe -> parse Symbol -> FEC-decode
-    /// -> AEAD-open. Each call uses a strictly increasing AEAD counter (own
-    /// `Session`, never shared), so the replay window never rejects.
-    ///
-    /// Returns the number of inner bytes recovered (0 if the chain didn't
-    /// produce a decoded frame this call, which should not happen since no
-    /// datagrams are dropped here).
-    fn step(&mut self, inner: &[u8]) -> usize {
+    /// Send-only half of the chain for one object: seal -> FEC-encode ->
+    /// frame, producing the wire datagrams a receiver would see for this
+    /// `inner` payload. Shared by `step` (in-process loopback, level 1) and
+    /// the level-2 blaster (which sends these bytes over a real UDP socket
+    /// to a SO_REUSEPORT-bound receiver in a different thread/`Worker`
+    /// instead of looping them back in-process).
+    fn send(&mut self, inner: &[u8]) -> Vec<Vec<u8>> {
         let sealed = self.sender.seal(inner).expect("seal");
         let (class, symbols) = self.tx.encode(&sealed.ciphertext, inner, false, 0);
-
-        let datagrams: Vec<Vec<u8>> = symbols
+        symbols
             .iter()
             .map(|sym| {
                 let frame = symbol_to_frame(CONN_TAG, sym, sealed.counter, class);
                 self.codec.frame(&frame)
             })
-            .collect();
+            .collect()
+    }
 
+    /// Like `send`, but assigns an EXPLICIT `object_id` (via
+    /// `Transport::repair_object`, the same "re-encode under a caller-chosen
+    /// id" entry point production ARQ retransmits use) instead of letting
+    /// `self.tx`'s internal `FecEncoder` auto-increment its own counter.
+    ///
+    /// This exists only for the level-2 blaster: every blaster thread owns
+    /// its own `Worker` (own `Transport`, own `FecEncoder` starting at
+    /// object_id 0), so with plain `send` every thread's Nth call would
+    /// carry the SAME object_id. Two different threads' equal-object_id
+    /// bursts landing on the same SO_REUSEPORT receiver socket (entirely
+    /// possible -- the kernel picks by 4-tuple hash, not by content) would
+    /// interleave into that receiver's ONE `FecReassembler` slot for that
+    /// id, corrupting both objects' shard sets. `blast_worker` instead hands
+    /// every pre-built object a globally unique id (a disjoint `u16` range
+    /// per thread) so no two blaster threads can ever collide.
+    ///
+    /// `class` is passed explicitly rather than re-derived from
+    /// `self.tx`'s classifier (which `repair_object` does not consult) --
+    /// callers must classify `inner` themselves first if it isn't already
+    /// known, as `blast_worker`'s fixture is (always DSCP EF -> `Realtime`,
+    /// see `build_fixture`'s doc comment).
+    fn send_with_id(
+        &mut self,
+        inner: &[u8],
+        class: FlowClass,
+        object_id: u16,
+        extra_repair: u32,
+    ) -> Vec<Vec<u8>> {
+        let sealed = self.sender.seal(inner).expect("seal");
+        let symbols = self
+            .tx
+            .repair_object(&sealed.ciphertext, class, object_id, extra_repair);
+        symbols
+            .iter()
+            .map(|sym| {
+                let frame = symbol_to_frame(CONN_TAG, sym, sealed.counter, class);
+                self.codec.frame(&frame)
+            })
+            .collect()
+    }
+
+    /// Receive-only half of the chain for one arbitrary wire datagram:
+    /// deframe -> parse Symbol -> FEC-decode -> AEAD-open. Shared by `step`
+    /// (which drives its own send half first, so `open` always matches) and
+    /// the level-2 SO_REUSEPORT sweep (which receives datagrams produced by
+    /// a separate blaster thread with its own, unrelated `Session`).
+    ///
+    /// Returns `None` if deframe/parse/FEC-decode did not complete this call
+    /// (garbage on the wire, or an object not yet fully reassembled --
+    /// normal for FEC, not a failure). Otherwise returns
+    /// `Some((len, opened))`: `opened` is whether `open` accepted the
+    /// decoded ciphertext under this `Worker`'s own receiver `Session`, and
+    /// `len` is the inner byte length when `opened`, or the FEC-decoded
+    /// ciphertext length when not -- level 2 relies on this fallback because
+    /// its blaster's session is never the matching pair for an arbitrary
+    /// receiver (see the module doc comment).
+    fn receive(&mut self, dg: &[u8]) -> Option<(usize, bool)> {
+        let frame = self.codec.deframe(dg).ok()?;
+        let (sym, counter, class) = frame_to_symbol(&frame)?;
+        let ciphertext = self.rx.decode(&sym, class)?;
+        match self.receiver.open(counter, &ciphertext) {
+            Ok(inner_bytes) => Some((inner_bytes.len(), true)),
+            Err(_) => Some((ciphertext.len(), false)),
+        }
+    }
+
+    /// One fresh-counter roundtrip through the real receive chain: `send`
+    /// followed by `receive` on every resulting datagram. Each call uses a
+    /// strictly increasing AEAD counter (own `Session`, never shared), so
+    /// the replay window never rejects and `receive` always reports
+    /// `opened == true` here.
+    ///
+    /// Returns the number of inner bytes recovered (0 if the chain didn't
+    /// produce a decoded frame this call, which should not happen since no
+    /// datagrams are dropped here).
+    fn step(&mut self, inner: &[u8]) -> usize {
+        let datagrams = self.send(inner);
         let mut recovered_len = 0usize;
         for dg in &datagrams {
-            let Ok(frame) = self.codec.deframe(dg) else {
-                continue;
-            };
-            let Some((sym, counter, class)) = frame_to_symbol(&frame) else {
-                continue;
-            };
-            if let Some(ciphertext) = self.rx.decode(&sym, class) {
-                if let Ok(inner_bytes) = self.receiver.open(counter, &ciphertext) {
-                    recovered_len = inner_bytes.len();
+            if let Some((len, opened)) = self.receive(dg) {
+                if opened {
+                    recovered_len = len;
                 }
             }
         }
@@ -463,6 +563,455 @@ fn level1_sweep(cores: &[usize], dur: Duration) -> Vec<(usize, f64, f64)> {
     rows
 }
 
+/// Number of dedicated sender sockets each blaster thread pre-binds to
+/// `127.0.0.1:0`. Every distinct source port is a distinct 4-tuple, which is
+/// what gives the kernel's SO_REUSEPORT hash something to spread across the
+/// `n` receiver sockets -- one socket alone would always land on the same
+/// receiver every time. A single object's whole datagram set is always sent
+/// from ONE of these sockets (see `blast_thread`), so an object's shards
+/// stay together (same receiver), while different objects fan out across
+/// receivers as they rotate through this pool.
+///
+/// Kept at 16 (not dozens) so `OBJECTS_PER_BLASTER_THREAD` divided across
+/// this many sockets still leaves each socket a large distinct-object count
+/// per rotation -- see that constant's doc comment for why the ratio
+/// between the two matters. 16 (rather than the 8 this started at) also
+/// matters for `imbalance_ratio`: with only `MAX_BLASTER_THREADS * 8` = 48
+/// distinct sender sockets hashed across up to 6 receiver sockets, sampling
+/// noise alone produced imbalance ratios over the brief's "< ~2x" guideline
+/// at N=6 across repeated runs -- doubling the distinct-flow count reduces
+/// that sampling noise (still not a proof of perfect fairness, but a lot
+/// less likely to look unfair by chance alone).
+const SENDER_SOCKETS_PER_BLASTER_THREAD: usize = 16;
+
+/// Number of distinct payloads each blaster thread cycles through when
+/// pre-building its object pool. Kept small (unlike level 1's L3-exceeding
+/// `PAYLOADS_PER_WORKER`) because level 2 is measuring delivery/decode
+/// scaling, not memory-bandwidth contention; repeated payload *content* is
+/// harmless here since each pre-built object still gets its own object_id
+/// (see `OBJECTS_PER_BLASTER_THREAD`).
+const BLAST_PAYLOADS_PER_THREAD: usize = 64;
+
+/// Number of distinct objects (each a `Worker::send` call: seal -> FEC
+/// -encode -> frame) each blaster thread pre-builds before the timed window
+/// starts, so the hot send loop (`blast_thread`) does nothing but
+/// `send_to` -- no seal/encode/allocation on the critical path.
+///
+/// Sized well above `FecReassembler`'s `max_objects` window (256, see
+/// `yip_transport::fec::FecReassembler::new`'s caller in `Worker::new`'s
+/// `rx: Transport::new(..)`): a fixed sender socket's traffic always lands
+/// on the SAME receiver socket (deterministic kernel 4-tuple hash), and this
+/// pool is replayed on a loop, so each receiver sees the same object_id
+/// again after `OBJECTS_PER_BLASTER_THREAD / SENDER_SOCKETS_PER_BLASTER_THREAD`
+/// (8192 / 16 = 512) other distinct object_ids from that socket -- comfortably
+/// above 256, so the repeat is always evicted from the reassembler's window
+/// by the time it recurs (worst case: that one sender socket is a receiver's
+/// only traffic source; any additional sockets sharing that receiver only
+/// interleave MORE distinct ids in between, which is even safer). Without
+/// this margin, replaying the same `object_id` while it's still resident hits
+/// `FecReassembler::push`'s `if state.done { return None }` guard and
+/// `receive()` would silently stop decoding -- exactly the failure mode the
+/// task brief calls out ("Do NOT let replay-window rejection silently zero
+/// out the measurement").
+///
+/// `MAX_BLASTER_THREADS * OBJECTS_PER_BLASTER_THREAD` (8 * 8192 = 65536)
+/// exactly fills the `u16` object_id space `Worker::send_with_id`'s
+/// per-thread partitioning relies on -- see `MAX_BLASTER_THREADS`'s doc
+/// comment for why thread count is capped to make this fit.
+const OBJECTS_PER_BLASTER_THREAD: usize = 8192;
+
+/// Set `SO_REUSEPORT` on `sock` via a raw `setsockopt`, rather than
+/// `socket2::Socket::set_reuse_port` (the safe wrapper for the same
+/// syscall): that wrapper is gated behind `socket2`'s `"all"` Cargo feature,
+/// which is off by default for this crate's `socket2` dependency, and
+/// turning it on would mean editing `Cargo.toml` -- a second file, when this
+/// task is scoped to `sharding_scale.rs` alone. This makes the identical
+/// `setsockopt(SOL_SOCKET, SO_REUSEPORT, 1)` call directly instead.
+fn set_so_reuseport(sock: &Socket) {
+    let val: libc::c_int = 1;
+    // SAFETY: `sock.as_raw_fd()` is a valid, open socket fd for the
+    // duration of this call (borrowed from `sock`, which outlives it); `val`
+    // is a fully-initialized `c_int` and the length argument matches its
+    // size, satisfying `setsockopt`'s buffer contract.
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_REUSEPORT,
+            std::ptr::from_ref(&val).cast::<libc::c_void>(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "setsockopt(SO_REUSEPORT) failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// Bind one UDP socket for the level-2 receiver group. `port` is `None` for
+/// the very first socket (ephemeral bind, whose assigned port becomes the
+/// shared target) and `Some(port)` for every subsequent socket in the group
+/// (bound to that exact port). `SO_REUSEPORT` is set on every socket BEFORE
+/// bind -- including the first -- because Linux requires every socket
+/// sharing an address:port tuple to carry the option, not just the ones
+/// added after the first.
+fn bind_reuseport_socket(port: Option<u16>) -> (UdpSocket, u16) {
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, None).expect("create UDP socket");
+    set_so_reuseport(&sock);
+    // Linux's default UDP receive buffer (a few hundred KB) is a genuine
+    // bottleneck once the blaster group (all of `cores[n..]`, which can be
+    // 10+ threads at low `n`) floods a single socket faster than one
+    // core-pinned thread can `recv` + deframe + FEC-decode it: bursts
+    // overflow the kernel queue and are dropped there, before this
+    // benchmark's own recv/decode path is even exercised. That's a socket-
+    // buffer-size artifact, not the recv-syscall/decode scaling question
+    // level 2 is trying to answer, so size the buffer generously (8 MiB) to
+    // keep drops attributable to the receive path itself, not queue depth.
+    sock.set_recv_buffer_size(8 * 1024 * 1024)
+        .expect("set SO_RCVBUF");
+    let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port.unwrap_or(0));
+    sock.bind(&SockAddr::from(addr)).expect("bind");
+    let bound_port = if let Some(p) = port {
+        p
+    } else {
+        sock.local_addr()
+            .expect("local_addr")
+            .as_socket_ipv4()
+            .expect("IPv4 local addr")
+            .port()
+    };
+    (sock.into(), bound_port)
+}
+
+/// One level-2 receiver: pin to `core`, own a fresh `Worker` (its own
+/// AEAD session -- never shared, see the module doc comment), wait on the
+/// start barrier, then recv-loop `sock` until `dur` elapses, running
+/// `Worker::receive` (deframe -> FEC-decode -> open) on every datagram.
+///
+/// Returns `(datagrams_seen, bytes_counted, opens_succeeded,
+/// objects_completed)`. `bytes_counted` uses `receive`'s fallback semantics:
+/// inner-plaintext length when `open` accepted the frame, FEC-decoded
+/// ciphertext length otherwise (expected to be the common case here -- see
+/// the module doc comment on why `open` cannot match across independently-
+/// established sessions).
+///
+/// `objects_completed` counts `receive`'s `Some(..)` returns, i.e. datagrams
+/// that triggered a completed FEC decode (one per object, on whichever
+/// shard supplies the object's K-th distinct index). It is NOT the same as
+/// "datagrams received": most received datagrams legitimately return `None`
+/// from `receive` -- either still-accumulating shards for an object that
+/// hasn't reached K distinct indices yet, or late/redundant shards for an
+/// object that already completed (`FecReassembler::push`'s `if state.done`
+/// guard). With this file's fixture (K=2 source symbols, blaster
+/// `extra_repair=2`, so 4 symbols/object under no loss), the steady-state
+/// expectation is exactly 1 completion per 4 datagrams received -- i.e.
+/// `received / objects_completed.max(1) ~= 4`. `level2_sweep` checks that
+/// ratio (not a flat "None rate") to catch the task brief's "detect it,
+/// don't silently zero out the measurement" failure mode: a datagram count
+/// that stays healthy while completions collapse toward 0 (ratio blowing up
+/// far past ~4) would mean objects are arriving but not decoding -- e.g. an
+/// object-id collision or an eviction-window regression -- while a flat
+/// None-rate check would false-alarm on this file's own expected ~75% rate.
+fn recv_worker(
+    sock: UdpSocket,
+    core: usize,
+    barrier: Arc<Barrier>,
+    dur: Duration,
+) -> (u64, u64, u64, u64) {
+    pin_current_thread(core);
+    let mut w = Worker::new();
+    // Bounded so the recv loop below can re-check the deadline instead of
+    // blocking forever once the blaster stops sending.
+    sock.set_read_timeout(Some(Duration::from_millis(20)))
+        .expect("set_read_timeout");
+    let mut buf = [0u8; 2048]; // frame overhead + 1200B symbol comfortably fits
+    barrier.wait();
+    let deadline = Instant::now() + dur;
+    let (mut datagrams, mut bytes, mut opened, mut completed) = (0u64, 0u64, 0u64, 0u64);
+    while Instant::now() < deadline {
+        match sock.recv_from(&mut buf) {
+            Ok((n, _src)) => {
+                datagrams += 1;
+                if let Some((len, was_opened)) = w.receive(&buf[..n]) {
+                    bytes += len as u64;
+                    completed += 1;
+                    if was_opened {
+                        opened += 1;
+                    }
+                }
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => continue,
+            Err(e) => {
+                eprintln!("recv_worker(core={core}): recv_from error: {e}");
+                continue;
+            }
+        }
+    }
+    (datagrams, bytes, opened, completed)
+}
+
+/// One level-2 blaster thread: pin to `core`, own a fresh `Worker` (used
+/// ONLY for its send half -- `Worker::send`) and its own payload fixture,
+/// pre-bind `SENDER_SOCKETS_PER_BLASTER_THREAD` sender sockets, PRE-BUILD
+/// `OBJECTS_PER_BLASTER_THREAD` whole objects (each one `Worker::send` call's
+/// full set of framed datagrams) so the timed hot loop below does nothing
+/// but `send_to`, then wait on the start barrier and loop for `dur` sending
+/// whole objects (all of one object's datagrams via the SAME sender socket,
+/// rotating sender sockets object-to-object) to `target`.
+///
+/// Building the pool before the barrier -- rather than calling
+/// `Worker::send` (seal + FEC-encode + frame + several `Vec` allocations)
+/// live in the hot loop -- matters for measurement honesty here: this
+/// benchmark exists to measure the RECEIVE path's scaling, and a blaster
+/// thread spending its cycles on send-side crypto/FEC work instead of
+/// `send_to` calls understates the load actually offered, making receivers
+/// look artificially unsaturated (near-zero drop%) when they were simply
+/// never given enough traffic to test.
+///
+/// Returns the number of datagrams sent.
+fn blast_worker(
+    core: usize,
+    target: SocketAddrV4,
+    barrier: Arc<Barrier>,
+    dur: Duration,
+    thread_id: usize,
+) -> u64 {
+    pin_current_thread(core);
+    assert!(
+        thread_id * OBJECTS_PER_BLASTER_THREAD + OBJECTS_PER_BLASTER_THREAD
+            <= u16::MAX as usize + 1,
+        "blast_worker: thread_id={thread_id} would overflow the u16 object_id \
+         space at {OBJECTS_PER_BLASTER_THREAD} objects/thread -- this box has \
+         more blaster threads than this partitioning scheme supports"
+    );
+    let mut template = Worker::new();
+    let inners = build_fixture(10_000 + thread_id, BLAST_PAYLOADS_PER_THREAD);
+    // See `Worker::send_with_id`'s doc comment: every blaster thread gets a
+    // disjoint slice of the u16 object_id space so independently-running
+    // threads can never collide on the same id.
+    let id_base = (thread_id * OBJECTS_PER_BLASTER_THREAD) as u16;
+    let objects: Vec<Vec<Vec<u8>>> = (0..OBJECTS_PER_BLASTER_THREAD)
+        .map(|i| {
+            let object_id = id_base + i as u16;
+            template.send_with_id(&inners[i % inners.len()], FlowClass::Realtime, object_id, 2)
+        })
+        .collect();
+    let senders: Vec<UdpSocket> = (0..SENDER_SOCKETS_PER_BLASTER_THREAD)
+        .map(|_| {
+            let s = Socket::new(Domain::IPV4, Type::DGRAM, None).expect("create UDP socket");
+            // See `bind_reuseport_socket`'s SO_RCVBUF comment: give the send
+            // side matching headroom so a burst isn't dropped on the way out
+            // either.
+            s.set_send_buffer_size(8 * 1024 * 1024)
+                .expect("set SO_SNDBUF");
+            let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+            s.bind(&SockAddr::from(addr)).expect("bind ephemeral");
+            s.into()
+        })
+        .collect();
+
+    barrier.wait();
+    let deadline = Instant::now() + dur;
+    let mut sent = 0u64;
+    let mut obj_idx = 0usize;
+    while Instant::now() < deadline {
+        let datagrams = &objects[obj_idx % objects.len()];
+        let sock = &senders[obj_idx % senders.len()];
+        for dg in datagrams {
+            if sock.send_to(dg, target).is_ok() {
+                sent += 1;
+            }
+        }
+        obj_idx += 1;
+    }
+    sent
+}
+
+/// Minimum number of cores reserved for the blaster group, disjoint from the
+/// `n` receiver cores, so the blaster never contends with (and therefore
+/// never throttles) the sockets under test.
+const MIN_BLASTER_CORES: usize = 2;
+
+/// Upper bound on how many blaster threads a single sweep point spawns,
+/// even if more disjoint cores are free (e.g. 11 at N=1 on a 12-thread box).
+/// Two reasons, not one:
+///
+/// 1. `Worker::send_with_id` partitions the `u16` object_id space into one
+///    disjoint block per blaster thread (see its doc comment) so no two
+///    threads ever collide on an id; `MAX_BLASTER_THREADS *
+///    OBJECTS_PER_BLASTER_THREAD` must fit in that 65536-id space, which
+///    bounds how many threads can run at once.
+/// 2. Unboundedly following "all remaining cores" produces a MASSIVE,
+///    N-dependent oversubscription ratio at low N (11 blaster threads vs. 1
+///    receiver) that just drives loopback-buffer drop% higher without
+///    telling us anything more about receive-path scaling than a smaller,
+///    still-comfortably-saturating ratio would.
+const MAX_BLASTER_THREADS: usize = 8;
+
+/// Run the SO_REUSEPORT delivery-scaling sweep (level 2): for each sweep
+/// point `n`, bind `n` UDP sockets to the SAME `127.0.0.1:PORT` via
+/// `SO_REUSEPORT`, hand each to a core-pinned receiver thread (`cores[..n]`),
+/// and drive them with a blaster thread group pinned to a DISJOINT core set
+/// (`cores[n..]`) sending from many source sockets so the kernel's 4-tuple
+/// hash -- not this code -- decides which receiver socket each datagram
+/// lands on.
+///
+/// Sweep points are capped so at least `MIN_BLASTER_CORES` cores always
+/// remain free for the blaster group; on a box with fewer usable cores than
+/// that, level 2 is skipped (returns an empty `Vec`) rather than starving
+/// the blaster and silently measuring an artificially throttled sender.
+///
+/// Returns `(n, aggregate_gbps, imbalance_ratio)` per sweep point, matching
+/// `level1_sweep`'s row shape. `aggregate_gbps` and per-socket counts (used
+/// for `imbalance_ratio` and printed alongside offered/received/drop%) are
+/// also printed directly by this function, since the 3-column return type
+/// mirroring level 1 has no room for the per-socket breakdown.
+fn level2_sweep(cores: &[usize], dur: Duration) -> Vec<(usize, f64, f64)> {
+    let total = cores.len();
+    let ns: Vec<usize> = [1usize, 2, 4, 6]
+        .into_iter()
+        .filter(|&n| n + MIN_BLASTER_CORES <= total)
+        .collect();
+    if ns.is_empty() {
+        eprintln!(
+            "level2_sweep: only {total} usable cores (need >=1 receiver + \
+             {MIN_BLASTER_CORES} disjoint blaster cores) -- skipping level 2"
+        );
+        return Vec::new();
+    }
+
+    println!("\nlevel 2 (SO_REUSEPORT delivery) per-N detail:");
+    println!(
+        " N   recv_Gbps   imbalance   offered   received    drop%   dgrams/object   per_socket_datagrams"
+    );
+    let mut rows = Vec::with_capacity(ns.len());
+
+    for &n in &ns {
+        // --- n SO_REUSEPORT receiver sockets, all bound to the same port ---
+        let (first_sock, port) = bind_reuseport_socket(None);
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+        let mut sockets = Vec::with_capacity(n);
+        sockets.push(first_sock);
+        for _ in 1..n {
+            let (sock, _) = bind_reuseport_socket(Some(port));
+            sockets.push(sock);
+        }
+
+        // Up to `MAX_BLASTER_THREADS` of the remaining cores blast. This is
+        // NOT the same mistake as an earlier, too-small fixed cap: at every
+        // sweep point here the blaster group is either "all remaining cores"
+        // (when that's <= MAX_BLASTER_THREADS, e.g. N=6 on this box) or a
+        // comfortably-saturating 8 threads (see `MAX_BLASTER_THREADS`'s doc
+        // comment) -- never starved down to a handful of threads regardless
+        // of how many receiver cores are in use.
+        let blaster_core_count = (total - n).min(MAX_BLASTER_THREADS);
+        let blaster_cores = &cores[n..n + blaster_core_count];
+
+        // n receivers + the blaster threads, all released together.
+        let barrier = Arc::new(Barrier::new(n + blaster_cores.len()));
+
+        let recv_handles: Vec<_> = sockets
+            .into_iter()
+            .enumerate()
+            .map(|(i, sock)| {
+                let core = cores[i];
+                let barrier = Arc::clone(&barrier);
+                thread::Builder::new()
+                    .name(format!("l2-recv-{i}"))
+                    .spawn(move || recv_worker(sock, core, barrier, dur))
+                    .expect("spawn receiver thread")
+            })
+            .collect();
+
+        let blast_handles: Vec<_> = blaster_cores
+            .iter()
+            .enumerate()
+            .map(|(i, &core)| {
+                let barrier = Arc::clone(&barrier);
+                thread::Builder::new()
+                    .name(format!("l2-blast-{i}"))
+                    .spawn(move || blast_worker(core, target, barrier, dur, i))
+                    .expect("spawn blaster thread")
+            })
+            .collect();
+
+        let recv_results: Vec<(u64, u64, u64, u64)> = recv_handles
+            .into_iter()
+            .map(|h| h.join().expect("join receiver thread"))
+            .collect();
+        let offered: u64 = blast_handles
+            .into_iter()
+            .map(|h| h.join().expect("join blaster thread"))
+            .sum();
+
+        let counts: Vec<u64> = recv_results.iter().map(|r| r.0).collect();
+        let received: u64 = counts.iter().sum();
+        let total_bytes: u64 = recv_results.iter().map(|r| r.1).sum();
+        let total_opened: u64 = recv_results.iter().map(|r| r.2).sum();
+        let total_completed: u64 = recv_results.iter().map(|r| r.3).sum();
+
+        let max_c = *counts.iter().max().unwrap_or(&0);
+        let min_c = *counts.iter().min().unwrap_or(&0);
+        let imbalance = max_c as f64 / (min_c.max(1) as f64);
+        let gbps = (total_bytes as f64 * 8.0) / dur.as_secs_f64() / 1e9;
+        let drop_pct = if offered > 0 {
+            100.0 * (1.0 - received as f64 / offered as f64)
+        } else {
+            0.0
+        };
+        // See `recv_worker`'s doc comment: with this file's fixture (K=2
+        // source symbols, blaster `extra_repair=2`), ~4 datagrams arrive per
+        // completed object under no loss -- this is the "is `receive`
+        // actually decoding, or silently zeroing out?" health signal, NOT
+        // the raw per-datagram None rate (which is expected to be ~75% and
+        // would false-alarm on every run).
+        let dgrams_per_object = received as f64 / total_completed.max(1) as f64;
+
+        println!(
+            " {n:<3} {gbps:>9.2}   {imbalance:>9.2}   {offered:>7}   {received:>8}   {drop_pct:>5.1}   {dgrams_per_object:>11.2}   {counts:?}"
+        );
+        // `open()` succeeding at all here would mean the blaster's session
+        // happened to match a receiver's -- see the module doc comment on
+        // why that should never happen. Surfacing it rather than silently
+        // folding it into `gbps` is the "detect it" requirement from the
+        // task brief: a real acceptance would need investigating, not
+        // quietly trusting the byte count.
+        if total_opened > 0 {
+            eprintln!(
+                "level2_sweep(N={n}): {total_opened} datagram(s) AEAD-opened \
+                 successfully despite independent blaster/receiver sessions \
+                 -- unexpected, see report"
+            );
+        }
+        // A datagram count that stays healthy while completions collapse is
+        // exactly the silent-zeroing failure mode the task brief warns
+        // about (e.g. an object-id collision, or the FecReassembler's
+        // `state.done` guard rejecting a repeated id before enough distinct
+        // ids evicted it -- see `OBJECTS_PER_BLASTER_THREAD`'s doc comment).
+        // 12 is 3x the ~4 expected under no loss -- generous headroom for
+        // real loopback loss (which raises this ratio legitimately, since
+        // lost shards mean more received-but-still-incomplete objects) while
+        // still catching a genuine "objects aren't completing" regression.
+        if received > 0 && total_completed > 0 && dgrams_per_object > 12.0 {
+            eprintln!(
+                "level2_sweep(N={n}): {dgrams_per_object:.1} datagrams received per \
+                 completed object (expected ~4) -- objects may not be decoding \
+                 as expected, see report"
+            );
+        } else if received > 0 && total_completed == 0 {
+            eprintln!(
+                "level2_sweep(N={n}): {received} datagrams received but ZERO objects \
+                 completed -- gbps is silently zero, see report"
+            );
+        }
+
+        rows.push((n, gbps, imbalance));
+    }
+    rows
+}
+
 fn main() {
     let cores = topology_ordered_cores();
     let dur = Duration::from_secs(5);
@@ -475,11 +1024,19 @@ fn main() {
         .map(|(_, g, _)| *g)
         .unwrap_or(1.0);
 
+    println!("level 1 (in-process compute scaling):");
     println!(" N   aggregate_Gbps   per_core   efficiency   avg_MHz");
     for (n, gbps, avg_mhz) in &rows {
         let per_core = gbps / *n as f64;
         let efficiency = gbps / (*n as f64 * gbps_1);
         println!(" {n:<3} {gbps:>13.2}   {per_core:>8.2}   {efficiency:>10.2}   {avg_mhz:>7.0}");
+    }
+
+    let rows2 = level2_sweep(&cores, dur);
+    println!("\nlevel 2 (SO_REUSEPORT delivery scaling) summary:");
+    println!(" N   recv_Gbps   imbalance");
+    for (n, gbps, imbalance) in &rows2 {
+        println!(" {n:<3} {gbps:>11.2}   {imbalance:>9.2}");
     }
 }
 
