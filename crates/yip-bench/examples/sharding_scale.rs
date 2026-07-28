@@ -27,7 +27,7 @@
 //! Task 3 (level 2) swaps the in-process loopback of level 1 for a REAL
 //! `SO_REUSEPORT` UDP delivery path: `n` sockets bound to the same
 //! `127.0.0.1:PORT`, each owned by a core-pinned receiver thread, fed by a
-//! separate blaster thread group (pinned to a disjoint core set) sending
+//! separate blaster thread group (pinned to a disjoint-by-index core set) sending
 //! from many distinct source sockets so the kernel's 4-tuple hash is what
 //! decides which receiver socket each datagram lands on -- confirming that
 //! `SO_REUSEPORT` actually spreads load evenly across the `n` sockets
