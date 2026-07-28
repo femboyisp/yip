@@ -13,12 +13,16 @@
 //!
 //! Task 1 built the self-contained `Worker` + single-threaded `run_worker`
 //! loop (N=1, ~1.69 Gbps on the reference box). Task 2 extends this to a
-//! core-pinned N-worker sweep ([1, 2, 4, 8, 12]) to see how the receive
-//! chain scales across real cores, with two measurement-honesty
-//! requirements: (a) each worker owns a distinct, L3-exceeding, multi-flow
-//! fixture (not a shared/cache-resident single-flow fixture, which would
-//! inflate the scaling result), and (b) a start barrier so all worker
-//! threads begin their timing window together.
+//! core-pinned N-worker sweep ([1, 2, 4, 6, 8, 12] -- N=6 is this box's last
+//! all-physical-core point before N=8/N=12 double up on SMT siblings) to
+//! see how the receive chain scales across real cores, with measurement-
+//! honesty requirements: (a) each worker owns a distinct, L3-exceeding
+//! fixture (not a shared/cache-resident fixture, which would inflate the
+//! scaling result), (b) a start barrier so all worker threads begin their
+//! timing window together, and (c) an average per-core clock (MHz) reading
+//! over the same timing window, since this is a mobile APU under a package
+//! power limit and DVFS clock-droop at high N must not be mistaken for
+//! sharding/SMT contention.
 //!
 //! Run: `cargo run --release -p yip-bench --example sharding_scale`
 //! Test: `cargo test -p yip-bench --example sharding_scale`
@@ -180,17 +184,32 @@ const PAYLOADS_PER_WORKER: usize = 3000;
 /// Build one worker's own fixture: `PAYLOADS_PER_WORKER` distinct 1300-byte
 /// inner packets, each with a distinct IPv4/UDP 5-tuple (src/dst address +
 /// src/dst port), and distinct *across workers too* (the `worker_id` feeds
-/// the source address). This is what makes the fixture a genuine multi-flow
-/// workload for the classifier's flow table rather than one hot entry: a
-/// cache-resident single-flow fixture would let the classifier/FEC state
-/// stay pinned in a tiny working set and inflate the scaling number, which
-/// is the failure mode this spike must avoid.
+/// the source address). The distinctness is what defeats cache residency: a
+/// single shared/repeated payload would let the whole fixture (and any
+/// per-flow state touching it) stay pinned in a tiny working set, so the
+/// combined multi-MB, L3-exceeding footprint across N workers (see
+/// `PAYLOADS_PER_WORKER` above) would never actually get exercised as real
+/// memory traffic. That inflated-scaling failure mode is what this fixture
+/// avoids.
+///
+/// Note on what the 5-tuple mutation does *not* currently exercise:
+/// `sample_inner` sets DSCP = 46 (EF), and `Classifier::classify`
+/// (`yip_transport::classify`) short-circuits straight to
+/// `FlowClass::Realtime` on that DSCP match before it ever consults the
+/// flow table keyed by the 5-tuple. So varying src/dst address/port here
+/// does *not* create extra flow-table entries or exercise extra classifier
+/// code paths in this fixture -- it only guarantees the payload bytes
+/// (and therefore the fixture's memory footprint) are distinct. The 5-tuple
+/// variation is harmless (verified by `fixture_payloads_all_roundtrip`
+/// below) and kept because it costs nothing and would matter the moment
+/// `sample_inner`'s DSCP stops being fixed at EF, but it is not currently
+/// doing multi-flow classification work.
 ///
 /// Header layout (see `yip_bench::sample_inner` and
 /// `yip_transport::classify::parse_ip`): IPv4 src addr at bytes 12..16, dst
 /// addr at 16..20, then (proto 17 = UDP) src port at 20..22, dst port at
-/// 22..24. `sample_inner` zeroes these, so every payload would otherwise
-/// collide on the same (0.0.0.0:0 -> 0.0.0.0:0) flow key.
+/// 22..24. `sample_inner` zeroes these, so every payload would otherwise be
+/// byte-identical.
 fn build_fixture(worker_id: usize, count: usize) -> Vec<Vec<u8>> {
     (0..count)
         .map(|i| {
@@ -294,6 +313,12 @@ fn topology_ordered_cores() -> Vec<usize> {
     }
 
     if groups.is_empty() {
+        eprintln!(
+            "warning: could not read SMT topology from /sys/devices/system/cpu; \
+             falling back to naive (0..n) core ordering, which may place SMT \
+             siblings together and reintroduce the same-physical-core bias \
+             this ordering exists to avoid"
+        );
         let n = std::thread::available_parallelism().map_or(12, |p| p.get());
         return (0..n).collect();
     }
@@ -312,13 +337,71 @@ fn topology_ordered_cores() -> Vec<usize> {
     ordered
 }
 
+/// Fallback: parse `/proc/cpuinfo`'s per-processor `"cpu MHz"` line for
+/// logical CPU `core`, for systems without cpufreq sysfs.
+fn proc_cpuinfo_mhz(core: usize) -> Option<f64> {
+    let contents = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    let mut current: Option<usize> = None;
+    for line in contents.lines() {
+        let (key, val) = line.split_once(':')?;
+        let (key, val) = (key.trim(), val.trim());
+        if key == "processor" {
+            current = val.parse().ok();
+        } else if key == "cpu MHz" && current == Some(core) {
+            return val.parse().ok();
+        }
+    }
+    None
+}
+
+/// Sample the current clock speed (MHz) for each of `cores`, averaged.
+///
+/// This box is a Ryzen 5 7640U -- a mobile APU under a package power limit
+/// (`CPU scaling MHz ~91%` in `lscpu`), where single-core boost clock is
+/// well above sustained all-core clock. That means part of any efficiency
+/// drop at high N is DVFS clock-droop (the package throttling per-core
+/// clocks as more cores go active), not sharding/SMT contention -- and
+/// without a clock reading alongside the sweep there is no way to tell the
+/// two apart. Prefers `scaling_cur_freq` (kHz, per-core, cpufreq sysfs);
+/// falls back to `/proc/cpuinfo`'s per-processor `"cpu MHz"` lines when
+/// cpufreq sysfs isn't present.
+fn sample_core_mhz(cores: &[usize]) -> Option<f64> {
+    let mut total = 0.0;
+    let mut count = 0usize;
+    for &c in cores {
+        let path = format!("/sys/devices/system/cpu/cpu{c}/cpufreq/scaling_cur_freq");
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Ok(khz) = contents.trim().parse::<f64>() {
+                total += khz / 1000.0;
+                count += 1;
+                continue;
+            }
+        }
+        if let Some(mhz) = proc_cpuinfo_mhz(c) {
+            total += mhz;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        None
+    } else {
+        Some(total / count as f64)
+    }
+}
+
 /// Run the core-pinned N-worker sweep: for each `n` in `cores.len()`-bounded
 /// group sizes, spawn `n` threads (thread `i` pinned to `cores[i]`), each
 /// building its own `Worker` + its own fixture, then run all `n` for `dur`
 /// wall-clock seconds starting from a shared barrier so ramp-up skew doesn't
-/// distort the aggregate. Returns `(n, aggregate_gbps)` per sweep point.
-fn level1_sweep(cores: &[usize], dur: Duration) -> Vec<(usize, f64)> {
-    let ns = [1usize, 2, 4, 8, 12];
+/// distort the aggregate. An extra sampler thread joins the same barrier and
+/// polls `sample_core_mhz` over the pinned cores for the same window, so the
+/// returned average clock is measured over the identical timing window as
+/// the throughput -- not before ramp-up, not after cool-down. Returns
+/// `(n, aggregate_gbps, avg_mhz)` per sweep point. `n = 6` is this box's
+/// last all-physical-core point (6 cores / 12 SMT threads) before N=8/N=12
+/// necessarily double up on hyperthreads.
+fn level1_sweep(cores: &[usize], dur: Duration) -> Vec<(usize, f64, f64)> {
+    let ns = [1usize, 2, 4, 6, 8, 12];
     let mut rows = Vec::with_capacity(ns.len());
 
     for &n in &ns {
@@ -327,7 +410,10 @@ fn level1_sweep(cores: &[usize], dur: Duration) -> Vec<(usize, f64)> {
             "sweep point N={n} exceeds available cores ({})",
             cores.len()
         );
-        let barrier = Arc::new(Barrier::new(n));
+        let used_cores: Vec<usize> = cores[..n].to_vec();
+        // n workers + 1 clock sampler, all released together.
+        let barrier = Arc::new(Barrier::new(n + 1));
+
         let handles: Vec<_> = (0..n)
             .map(|i| {
                 let core = cores[i];
@@ -348,9 +434,31 @@ fn level1_sweep(cores: &[usize], dur: Duration) -> Vec<(usize, f64)> {
             })
             .collect();
 
+        let sampler_barrier = Arc::clone(&barrier);
+        let sampler = thread::Builder::new()
+            .name("mhz-sampler".to_string())
+            .spawn(move || {
+                sampler_barrier.wait();
+                let deadline = Instant::now() + dur;
+                let mut samples = Vec::new();
+                while Instant::now() < deadline {
+                    if let Some(mhz) = sample_core_mhz(&used_cores) {
+                        samples.push(mhz);
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                if samples.is_empty() {
+                    0.0
+                } else {
+                    samples.iter().sum::<f64>() / samples.len() as f64
+                }
+            })
+            .expect("spawn mhz sampler thread");
+
         let total_bytes: u64 = handles.into_iter().map(|h| h.join().expect("join")).sum();
+        let avg_mhz = sampler.join().expect("join mhz sampler");
         let gbps = (total_bytes as f64 * 8.0) / dur.as_secs_f64() / 1e9;
-        rows.push((n, gbps));
+        rows.push((n, gbps, avg_mhz));
     }
     rows
 }
@@ -363,15 +471,15 @@ fn main() {
 
     let gbps_1 = rows
         .iter()
-        .find(|(n, _)| *n == 1)
-        .map(|(_, g)| *g)
+        .find(|(n, _, _)| *n == 1)
+        .map(|(_, g, _)| *g)
         .unwrap_or(1.0);
 
-    println!(" N   aggregate_Gbps   per_core   efficiency");
-    for (n, gbps) in &rows {
+    println!(" N   aggregate_Gbps   per_core   efficiency   avg_MHz");
+    for (n, gbps, avg_mhz) in &rows {
         let per_core = gbps / *n as f64;
         let efficiency = gbps / (*n as f64 * gbps_1);
-        println!(" {n:<3} {gbps:>13.2}   {per_core:>8.2}   {efficiency:>10.2}");
+        println!(" {n:<3} {gbps:>13.2}   {per_core:>8.2}   {efficiency:>10.2}   {avg_mhz:>7.0}");
     }
 }
 
