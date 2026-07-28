@@ -32,6 +32,12 @@ jobs:
       - name: Build
         run: cargo build --workspace
       - name: Test
+        # This job runs as root in a container without netns/`ip` tooling, so the
+        # root-gated netns/netem integration tests must skip here (they have
+        # dedicated privileged jobs in integration.yml). YIP_SKIP_PRIVILEGED_TESTS
+        # forces them to skip; it is unset in the privileged jobs and locally.
+        env:
+          YIP_SKIP_PRIVILEGED_TESTS: "1"
         run: cargo test --workspace
 
   shear:

@@ -12,16 +12,28 @@
 //! separate script is needed for either.
 use std::process::Command;
 
-#[test]
-fn ping_across_yipd_tunnel() {
-    // Only run as root (the script needs netns + TUN).
-    let is_root = Command::new("id")
+/// True if we should run the root-gated netns/TUN tests. Skips when
+/// `YIP_SKIP_PRIVILEGED_TESTS` is set (the non-privileged `build-test` CI job
+/// runs as root in a container without netns/`ip` tooling, so these tests must
+/// skip rather than fail); privileged integration jobs and local `sudo cargo
+/// test` leave it unset and still run.
+fn have_root() -> bool {
+    if std::env::var_os("YIP_SKIP_PRIVILEGED_TESTS").is_some() {
+        return false;
+    }
+    Command::new("id")
         .arg("-u")
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+        .unwrap_or(false)
+}
+
+#[test]
+fn ping_across_yipd_tunnel() {
+    // Only run as root (the script needs netns + TUN).
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP ping_across_yipd_tunnel: needs root (run under sudo in CI)");
         return;
@@ -34,13 +46,7 @@ fn ping_across_yipd_tunnel() {
 
 #[test]
 fn ping_across_yipd_tunnel_under_loss() {
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP ping_across_yipd_tunnel_under_loss: needs root");
         return;
@@ -60,13 +66,7 @@ fn quic_tunnel_ping() {
     // (run_quic ignores YIP_USE_URING), so — unlike ping_across_yipd_tunnel —
     // this test is never exercised under the UringDriver in the netns CI
     // matrix; see .github/workflows/integration.yml's separate poll-only loop.
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP quic_tunnel_ping: needs root");
         return;
@@ -85,13 +85,7 @@ fn quic_tunnel_ping() {
 fn quic_ping_under_loss() {
     // Requires root: netns creation + TUN device + tc netem. Poll-only, same
     // reasoning as quic_tunnel_ping.
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP quic_ping_under_loss: needs root");
         return;
@@ -114,13 +108,7 @@ fn tls_tunnel_ping() {
     // sequential handshakes (outer TLS 1.3 over TCP, then inner yip Noise-IK
     // over the length-prefix-framed byte-stream) must complete before traffic
     // flows; the script's ping budget is sized for that warm-up.
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP tls_tunnel_ping: needs root");
         return;
@@ -138,13 +126,7 @@ fn tls_tunnel_ping() {
 
 #[test]
 fn l2_tap_ping_or_arp_across_tunnel() {
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP l2_tap_ping_or_arp_across_tunnel: needs root");
         return;
@@ -161,13 +143,7 @@ fn l2_tap_ping_or_arp_across_tunnel() {
 #[test]
 fn triangle_full_mesh_ping() {
     // Requires root: netns creation + TUN devices + a shared bridge underlay.
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP triangle_full_mesh_ping: needs root (run under sudo in CI)");
         return;
@@ -184,13 +160,7 @@ fn triangle_full_mesh_ping() {
 #[test]
 fn arq_recovers_bulk_loss() {
     // Requires root: netns creation + TUN device + tc netem.
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP arq_recovers_bulk_loss: needs root (run under sudo in CI)");
         return;
@@ -245,13 +215,7 @@ fn yip_rendezvous_bin() -> std::path::PathBuf {
 #[test]
 fn relay_path_ping() {
     // Requires root: netns creation + TUN devices + yip-rendezvous.
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP relay_path_ping: needs root (run under sudo in CI)");
         return;
@@ -294,13 +258,7 @@ fn yip_ca_bin() -> std::path::PathBuf {
 #[test]
 fn discovery_dynamic_ping() {
     // Requires root: netns creation + TUN devices + a shared bridge underlay.
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP discovery_dynamic_ping: needs root (run under sudo in CI)");
         return;
@@ -332,13 +290,7 @@ fn discovery_dynamic_ping() {
 #[test]
 fn admission_rejects_uncertified() {
     // Requires root: netns creation + TUN devices.
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP admission_rejects_uncertified: needs root (run under sudo in CI)");
         return;
@@ -373,13 +325,7 @@ fn admission_rejects_uncertified() {
 #[test]
 fn discovery_survives_root_outage() {
     // Requires root: netns creation + TUN devices + a shared bridge underlay.
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP discovery_survives_root_outage: needs root (run under sudo in CI)");
         return;
@@ -417,13 +363,7 @@ const OBF_PSK: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbc
 #[test]
 fn obfuscated_ping() {
     // Only run as root (the script needs netns + TUN).
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP obfuscated_ping: needs root (run under sudo in CI)");
         return;
@@ -445,13 +385,7 @@ fn obfuscated_ping() {
 #[test]
 fn obfuscated_ping_with_cover() {
     // Only run as root (the script needs netns + TUN).
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP obfuscated_ping_with_cover: needs root (run under sudo in CI)");
         return;
@@ -474,13 +408,7 @@ fn obfuscated_ping_with_cover() {
 #[test]
 fn obf_psk_mismatch_no_connection() {
     // Only run as root (the script needs netns + TUN).
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP obf_psk_mismatch_no_connection: needs root (run under sudo in CI)");
         return;
@@ -501,13 +429,7 @@ fn obf_psk_mismatch_no_connection() {
 #[test]
 fn relay_path_ping_obfuscated() {
     // Requires root: netns creation + TUN devices + yip-rendezvous.
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP relay_path_ping_obfuscated: needs root (run under sudo in CI)");
         return;
@@ -540,13 +462,7 @@ fn relay_path_ping_obfuscated() {
 #[test]
 fn hole_punch_ping_obfuscated() {
     // Requires root: netns creation + TUN devices + yip-rendezvous + NAT.
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP hole_punch_ping_obfuscated: needs root (run under sudo in CI)");
         return;
@@ -579,13 +495,7 @@ fn hole_punch_ping_obfuscated() {
 #[test]
 fn discovery_dynamic_ping_obfuscated() {
     // Requires root: netns creation + TUN devices + a shared bridge underlay.
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP discovery_dynamic_ping_obfuscated: needs root (run under sudo in CI)");
         return;
@@ -618,13 +528,7 @@ fn discovery_dynamic_ping_obfuscated() {
 #[test]
 fn hole_punch_ping() {
     // Requires root: netns creation + TUN devices + yip-rendezvous + NAT.
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP hole_punch_ping: needs root (run under sudo in CI)");
         return;
@@ -677,13 +581,7 @@ fn dpi_undetectability() {
     // gated — that's a documented 3c gap, not a 3a regression).
     //
     // Requires root: netns creation + TUN devices + tcpdump.
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP dpi_undetectability: needs root (run under sudo in CI)");
         return;
@@ -723,13 +621,7 @@ fn quic_classified_as_quic() {
     // reported, not gated — that's the R8/3d port-plausibility follow-up).
     //
     // Requires root: netns creation + TUN devices + tcpdump.
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP quic_classified_as_quic: needs root (run under sudo in CI)");
         return;
@@ -772,13 +664,7 @@ fn tls_classified_as_tls() {
     // port-plausibility follow-up respectively).
     //
     // Requires root: netns creation + TUN devices + tcpdump.
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP tls_classified_as_tls: needs root (run under sudo in CI)");
         return;
@@ -823,13 +709,7 @@ fn port_plausibility_oracle() {
     // full assertion set.
     //
     // Requires root: netns creation + TUN devices + tcpdump + binding 443.
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP port_plausibility_oracle: needs root (run under sudo in CI)");
         return;
@@ -874,13 +754,7 @@ fn reality_probe_serves_decoy() {
     // for a fully-silent connection is a known, tracked gap, not gated here).
     //
     // Requires root: netns creation.
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP reality_probe_serves_decoy: needs root (run under sudo in CI)");
         return;
@@ -926,13 +800,7 @@ fn flowshape_not_obviously_constant() {
     // assertion set and derivation.
     //
     // Requires root: netns creation + TUN devices + tcpdump.
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP flowshape_not_obviously_constant: needs root (run under sudo in CI)");
         return;
@@ -960,13 +828,7 @@ fn relay_tls_tunnel_ping() {
     // UDP crossing the peer<->relay link).
     //
     // Requires root: netns creation + TUN devices + yip-rendezvous + tcpdump.
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP relay_tls_tunnel_ping: needs root (run under sudo in CI)");
         return;
@@ -1024,13 +886,7 @@ fn relay_reality_tunnel_ping() {
     // assertion set (money test + wrong-pubkey negative test).
     //
     // Requires root: netns creation + TUN devices + yip-rendezvous + openssl.
-    let is_root = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false);
+    let is_root = have_root();
     if !is_root {
         eprintln!("SKIP relay_reality_tunnel_ping: needs root (run under sudo in CI)");
         return;
