@@ -29,22 +29,36 @@
 //! `127.0.0.1:PORT`, each owned by a core-pinned receiver thread, fed by a
 //! separate blaster thread group (pinned to a disjoint core set) sending
 //! from many distinct source sockets so the kernel's 4-tuple hash is what
-//! decides which receiver socket each datagram lands on -- confirming both
-//! that `SO_REUSEPORT` actually spreads load across the `n` sockets
+//! decides which receiver socket each datagram lands on -- confirming that
+//! `SO_REUSEPORT` actually spreads load evenly across the `n` sockets
 //! (`imbalance_ratio` near 1.0) and that the `recv()` syscall + deframe +
-//! FEC-decode path scales the way level 1's in-process chain did.
+//! decrypt-attempt path holds up under real UDP delivery. Level 2's absolute
+//! Gbps and its scaling across `n` must NOT be read as a receiver throughput
+//! ceiling or compared in magnitude to level 1: on this box (6 physical
+//! cores / 12 threads, `MAX_BLASTER_THREADS` = 8), `cores[n..n +
+//! blaster_core_count]` includes the SMT siblings of `cores[..n]` at every
+//! `n` this sweep uses ([1, 2, 4, 6]), so every level-2 receiver shares a
+//! physical core with an active blaster thread -- level 2's throughput
+//! numbers are blaster-/SMT-/loopback-bound, unlike level 1's idle-sibling
+//! measurement. Level 1 remains the authoritative compute-scaling result;
+//! level 2 only confirms even kernel *distribution* and exercises the real
+//! per-packet receive cost.
 //!
-//! Level 2 deliberately measures deframe + FEC-decode throughput, NOT the
-//! full `open()`-included chain: the blaster's AEAD session is independent
-//! of every receiver's session (each `Worker` establishes its own handshake
-//! pair, and per this file's "never share a Session/Worker across threads"
-//! rule the blaster cannot borrow a specific receiver's session either), so
-//! `open()` is expected to reject every datagram on a key mismatch -- not a
+//! Level 2 uses independently-established blaster/receiver sessions BY
+//! CONSTRUCTION: the blaster's AEAD session is independent of every
+//! receiver's session (each `Worker` establishes its own handshake pair, and
+//! per this file's "never share a Session/Worker across threads" rule the
+//! blaster cannot borrow a specific receiver's session either), so `open()`
+//! is expected to reject every datagram on a key mismatch -- not a
 //! replay-window false reject, a hard decrypt failure. `Worker::receive`
 //! still attempts `open()` (so a real acceptance would be visible/reported),
 //! but level 2's byte-counting falls back to the FEC-decoded ciphertext
-//! length whenever `open()` doesn't succeed, per the task brief's documented
-//! fallback. The wire codec's coverage-auth key, unlike the AEAD session, is
+//! length whenever `open()` doesn't succeed. This is deliberate and honest,
+//! not a shortcut: every datagram still pays the full ChaCha20-Poly1305
+//! decrypt + tag-verify cost inside `open()`, it just never commits a
+//! plaintext, so the measurement covers the FULL deframe -> FEC-decode ->
+//! decrypt-attempt cost over real UDP delivery -- just not a successful
+//! decrypt. The wire codec's coverage-auth key, unlike the AEAD session, is
 //! a fixed constant baked into every `Worker::new()` (`Codec::new([1u8; 16],
 //! [2u8; 16])`), so deframing across independently-constructed `Worker`s
 //! (receiver vs. blaster) works fine -- that's what makes the SO_REUSEPORT
@@ -829,9 +843,14 @@ fn blast_worker(
     sent
 }
 
-/// Minimum number of cores reserved for the blaster group, disjoint from the
-/// `n` receiver cores, so the blaster never contends with (and therefore
-/// never throttles) the sockets under test.
+/// Minimum number of cores reserved for the blaster group, disjoint BY INDEX
+/// from the `n` receiver cores, so the blaster is never starved down to a
+/// handful of logical CPUs and therefore never throttles the offered load.
+/// This is NOT SMT-level isolation: on this box (`cores` physical-core-first,
+/// see `topology_ordered_cores`) `cores[n..]` still contains the SMT
+/// siblings of `cores[..n]` at the `n` values this sweep uses, so the
+/// blaster DOES contend with the receivers at the physical-core level --
+/// see `level2_sweep`'s doc comment.
 const MIN_BLASTER_CORES: usize = 2;
 
 /// Upper bound on how many blaster threads a single sweep point spawns,
@@ -853,22 +872,31 @@ const MAX_BLASTER_THREADS: usize = 8;
 /// Run the SO_REUSEPORT delivery-scaling sweep (level 2): for each sweep
 /// point `n`, bind `n` UDP sockets to the SAME `127.0.0.1:PORT` via
 /// `SO_REUSEPORT`, hand each to a core-pinned receiver thread (`cores[..n]`),
-/// and drive them with a blaster thread group pinned to a DISJOINT core set
-/// (`cores[n..]`) sending from many source sockets so the kernel's 4-tuple
-/// hash -- not this code -- decides which receiver socket each datagram
-/// lands on.
+/// and drive them with a blaster thread group pinned to a core set
+/// (`cores[n..n + blaster_core_count]`) disjoint by *index* from the
+/// receivers' -- but NOT disjoint by physical core: `cores` is
+/// physical-core-first (see `topology_ordered_cores`), and on this box (6
+/// physical cores / 12 threads) that range contains the SMT siblings of
+/// `cores[..n]` at every `n` this sweep uses, meaning every receiver in this
+/// sweep shares a physical core with an active blaster thread. Datagrams are
+/// sent from many source sockets so the kernel's 4-tuple hash -- not this
+/// code -- decides which receiver socket each datagram lands on.
 ///
 /// Sweep points are capped so at least `MIN_BLASTER_CORES` cores always
 /// remain free for the blaster group; on a box with fewer usable cores than
 /// that, level 2 is skipped (returns an empty `Vec`) rather than starving
 /// the blaster and silently measuring an artificially throttled sender.
 ///
-/// Returns `(n, aggregate_gbps, imbalance_ratio)` per sweep point, matching
-/// `level1_sweep`'s row shape. `aggregate_gbps` and per-socket counts (used
-/// for `imbalance_ratio` and printed alongside offered/received/drop%) are
-/// also printed directly by this function, since the 3-column return type
-/// mirroring level 1 has no room for the per-socket breakdown.
-fn level2_sweep(cores: &[usize], dur: Duration) -> Vec<(usize, f64, f64)> {
+/// Returns `(n, aggregate_gbps, imbalance_ratio, offered, drop_pct)` per
+/// sweep point. The first three columns match `level1_sweep`'s row shape by
+/// convention only -- because of the SMT overlap above, `aggregate_gbps`
+/// here is NOT comparable in magnitude to level 1's and must not be read as
+/// a receiver throughput ceiling; it (and its scaling across `n`) is
+/// blaster-/SMT-/loopback-bound. `offered` and `drop_pct` are carried in the
+/// return value (in addition to being printed directly by this function
+/// alongside the other per-socket counts) so the go/no-go-facing summary in
+/// `main` can surface the blaster-bound nature of these numbers too.
+fn level2_sweep(cores: &[usize], dur: Duration) -> Vec<(usize, f64, f64, u64, f64)> {
     let total = cores.len();
     let ns: Vec<usize> = [1usize, 2, 4, 6]
         .into_iter()
@@ -1007,7 +1035,7 @@ fn level2_sweep(cores: &[usize], dur: Duration) -> Vec<(usize, f64, f64)> {
             );
         }
 
-        rows.push((n, gbps, imbalance));
+        rows.push((n, gbps, imbalance, offered, drop_pct));
     }
     rows
 }
@@ -1033,10 +1061,14 @@ fn main() {
     }
 
     let rows2 = level2_sweep(&cores, dur);
-    println!("\nlevel 2 (SO_REUSEPORT delivery scaling) summary:");
-    println!(" N   recv_Gbps   imbalance");
-    for (n, gbps, imbalance) in &rows2 {
-        println!(" {n:<3} {gbps:>11.2}   {imbalance:>9.2}");
+    println!(
+        "\nlevel 2 (SO_REUSEPORT delivery scaling) summary -- blaster-/SMT-/loopback-bound, \
+         NOT a receiver throughput ceiling and NOT comparable in magnitude to level 1 above \
+         (see module doc comment):"
+    );
+    println!(" N   recv_Gbps   imbalance   offered    drop%");
+    for (n, gbps, imbalance, offered, drop_pct) in &rows2 {
+        println!(" {n:<3} {gbps:>11.2}   {imbalance:>9.2}   {offered:>7}   {drop_pct:>5.1}");
     }
 }
 
@@ -1078,6 +1110,25 @@ mod tests {
         assert_eq!(parse_cpu_list("0-1"), vec![0, 1]);
         assert_eq!(parse_cpu_list("3"), vec![3]);
         assert_eq!(parse_cpu_list("0,2,4"), vec![0, 2, 4]);
+    }
+
+    /// The core `SO_REUSEPORT` claim underpinning level 2: two sockets can
+    /// bind the SAME `127.0.0.1:port` at once. If this ever stopped holding
+    /// (e.g. a missing/failed `setsockopt` on some kernel), the second
+    /// `bind_reuseport_socket` call would fail with `EADDRINUSE` instead of
+    /// succeeding, and level 2's entire premise would be broken silently
+    /// upstream of any Gbps/imbalance number.
+    #[test]
+    fn bind_reuseport_socket_allows_multiple_binds_same_port() {
+        let (first, port) = bind_reuseport_socket(None);
+        // Without SO_REUSEPORT this second bind to the same port would fail
+        // with EADDRINUSE; succeeding (and `.expect("bind")` not panicking)
+        // is the actual claim under test, not the returned port number.
+        let (second, port2) = bind_reuseport_socket(Some(port));
+        let (third, port3) = bind_reuseport_socket(Some(port));
+        for (sock, p) in [(&first, port), (&second, port2), (&third, port3)] {
+            assert_eq!(sock.local_addr().expect("local_addr").port(), p);
+        }
     }
 }
 
