@@ -21,6 +21,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - name: Install build prerequisites (BoringSSL needs cmake + libclang)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -35,7 +39,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@cargo-shear
+      # taiki-e/install-action is not mirrored on this Forgejo instance; install
+      # the tool directly instead of via the composite action.
+      - name: Install cargo-shear
+        run: cargo install cargo-shear --locked
       - name: Unused dependencies
         run: cargo shear
 
@@ -43,4 +50,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: dtolnay/rust-toolchain@stable
+      # EmbarkStudios/cargo-deny-action is not mirrored on this Forgejo instance;
+      # install and run cargo-deny directly (same default `cargo deny check`).
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: License + advisory check
+        run: cargo deny check
