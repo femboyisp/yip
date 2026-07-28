@@ -1,4 +1,4 @@
-//! Sharding-scale spike, task 1: single-worker (N=1) receive-chain loop.
+//! Sharding-scale spike, task 2: core-pinned N-worker sweep (level 1).
 //!
 //! De-risking spike for multi-core sharding (#10). This example reassembles
 //! the REAL yip receive chain from the library crates (`yip-crypto`,
@@ -11,9 +11,20 @@
 //! counter+object_size prefix), not a fallback: the full
 //! deframe -> parse Symbol -> FEC-decode -> AEAD-open chain runs per packet.
 //!
+//! Task 1 built the self-contained `Worker` + single-threaded `run_worker`
+//! loop (N=1, ~1.69 Gbps on the reference box). Task 2 extends this to a
+//! core-pinned N-worker sweep ([1, 2, 4, 8, 12]) to see how the receive
+//! chain scales across real cores, with two measurement-honesty
+//! requirements: (a) each worker owns a distinct, L3-exceeding, multi-flow
+//! fixture (not a shared/cache-resident single-flow fixture, which would
+//! inflate the scaling result), and (b) a start barrier so all worker
+//! threads begin their timing window together.
+//!
 //! Run: `cargo run --release -p yip-bench --example sharding_scale`
 //! Test: `cargo test -p yip-bench --example sharding_scale`
 
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use yip_bench::{established_pair, sample_inner};
@@ -138,10 +149,16 @@ impl Worker {
     }
 }
 
-/// Run one worker for `dur`, cycling through `inners`, returning the total
-/// number of recovered inner bytes processed in the window.
-fn run_worker(inners: &[Vec<u8>], dur: Duration) -> u64 {
-    let mut w = Worker::new();
+/// Run `w` for `dur`, cycling through `inners`, returning the total number
+/// of recovered inner bytes processed in the window.
+///
+/// Takes an already-constructed `Worker` (rather than building one itself)
+/// so callers can do the one-time handshake cost of `Worker::new()` before
+/// starting the timed window — required by `level1_sweep` below, which puts
+/// `Worker::new()` before a start barrier and only calls `run_worker` after
+/// every thread has been released, so the timing window is apples-to-apples
+/// across all N threads.
+fn run_worker(w: &mut Worker, inners: &[Vec<u8>], dur: Duration) -> u64 {
     let deadline = Instant::now() + dur;
     let mut bytes = 0u64;
     let mut i = 0usize;
@@ -153,22 +170,209 @@ fn run_worker(inners: &[Vec<u8>], dur: Duration) -> u64 {
     bytes
 }
 
-fn main() {
-    // A few hundred distinct payloads so the loop isn't just re-processing
-    // one cached packet.
-    let inners: Vec<Vec<u8>> = (0..256u32)
+/// Number of distinct 1300-byte payloads each worker owns. At 1300 bytes each
+/// this is ~3.8 MB per worker — a few MB, as required — so the combined
+/// footprint across all N workers in the sweep (N up to 12) reaches ~46 MB,
+/// well past this box's ~16 MB L3, forcing real memory-bandwidth contention
+/// at high N instead of everything living cache-resident.
+const PAYLOADS_PER_WORKER: usize = 3000;
+
+/// Build one worker's own fixture: `PAYLOADS_PER_WORKER` distinct 1300-byte
+/// inner packets, each with a distinct IPv4/UDP 5-tuple (src/dst address +
+/// src/dst port), and distinct *across workers too* (the `worker_id` feeds
+/// the source address). This is what makes the fixture a genuine multi-flow
+/// workload for the classifier's flow table rather than one hot entry: a
+/// cache-resident single-flow fixture would let the classifier/FEC state
+/// stay pinned in a tiny working set and inflate the scaling number, which
+/// is the failure mode this spike must avoid.
+///
+/// Header layout (see `yip_bench::sample_inner` and
+/// `yip_transport::classify::parse_ip`): IPv4 src addr at bytes 12..16, dst
+/// addr at 16..20, then (proto 17 = UDP) src port at 20..22, dst port at
+/// 22..24. `sample_inner` zeroes these, so every payload would otherwise
+/// collide on the same (0.0.0.0:0 -> 0.0.0.0:0) flow key.
+fn build_fixture(worker_id: usize, count: usize) -> Vec<Vec<u8>> {
+    (0..count)
         .map(|i| {
             let mut p = sample_inner(1300);
-            let l = p.len();
-            p[l - 4..].copy_from_slice(&i.to_be_bytes());
+            let src_ip = (worker_id as u32) + 1; // distinct per worker
+            let dst_ip = (i as u32) + 1; // distinct per payload
+            let src_port = ((i as u16) ^ 0x5A5A).wrapping_add(1);
+            let dst_port = ((i as u16).wrapping_mul(7)).wrapping_add(1);
+            p[12..16].copy_from_slice(&src_ip.to_be_bytes());
+            p[16..20].copy_from_slice(&dst_ip.to_be_bytes());
+            p[20..22].copy_from_slice(&src_port.to_be_bytes());
+            p[22..24].copy_from_slice(&dst_port.to_be_bytes());
             p
         })
-        .collect();
+        .collect()
+}
 
+/// Pin the calling thread to `core` via `sched_setaffinity` (pid 0 = current
+/// thread/process, per `man 2 sched_setaffinity`).
+///
+/// Panics if the syscall fails: the entire "core-pinned" premise of this
+/// sweep rests on this succeeding, so a silently-ignored failure (e.g. a
+/// restricted cpuset) would quietly degrade the whole table to an unpinned,
+/// scheduler-shuffled measurement with no indication in the output.
+fn pin_current_thread(core: usize) {
+    // SAFETY: `set` is a valid, fully-initialized (zeroed then CPU_ZERO'd)
+    // `cpu_set_t` local; `CPU_SET`/`sched_setaffinity` only read/write within
+    // its bounds, and `size_of::<cpu_set_t>()` matches the buffer we pass.
+    let rc = unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(core, &mut set);
+        // pin the calling thread (pid 0 = current)
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const set)
+    };
+    assert_eq!(
+        rc,
+        0,
+        "sched_setaffinity(core={core}) failed: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// Parse a Linux sysfs CPU list (e.g. `"0-1"`, `"0,2,4"`, `"0"`) into the
+/// individual CPU indices it names, in ascending order.
+fn parse_cpu_list(s: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for part in s.trim().split(',') {
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((a, b)) = part.split_once('-') {
+            if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                out.extend(a..=b);
+            }
+        } else if let Ok(v) = part.parse::<usize>() {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Build a physical-core-first CPU ordering by reading SMT sibling groups
+/// from sysfs, so `cores[0..k]` always lands on `k` *distinct physical
+/// cores* before doubling up on hyperthreads.
+///
+/// This matters because a naive `(0..n).collect()` is wrong on SMT hardware:
+/// on this box (Ryzen 5 7640U, 6 cores / 12 threads) `cpu0` and `cpu1` are
+/// SMT siblings on the *same* physical core (confirmed via
+/// `/sys/devices/system/cpu/cpu0/topology/thread_siblings_list` == `"0-1"`).
+/// With naive ordering the N=2 sweep point would pin both workers onto one
+/// physical core (measuring SMT contention, not 2-core scaling), and N=4/N=8
+/// would similarly under-count distinct cores. That would silently corrupt
+/// exactly the number this spike exists to produce honestly. Ordering
+/// physical-core-first means `cores[0..6]` are 6 distinct physical cores and
+/// `cores[6..12]` are their SMT siblings, so the sweep's low-N points
+/// measure real multi-core scaling and only N=8/N=12 (which exceed 6
+/// physical cores) reflect SMT sharing -- which is real and worth seeing,
+/// just not conflated with the N=2/N=4 points.
+///
+/// Falls back to a plain `(0..n).collect()` if sysfs topology info isn't
+/// available (e.g. non-Linux, or a sandboxed environment without
+/// `/sys/devices/system/cpu`).
+fn topology_ordered_cores() -> Vec<usize> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut cpu = 0usize;
+    loop {
+        let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            break;
+        };
+        if !seen.contains(&cpu) {
+            let siblings = parse_cpu_list(&contents);
+            for &s in &siblings {
+                seen.insert(s);
+            }
+            groups.push(siblings);
+        }
+        cpu += 1;
+    }
+
+    if groups.is_empty() {
+        let n = std::thread::available_parallelism().map_or(12, |p| p.get());
+        return (0..n).collect();
+    }
+
+    // Round-robin across groups: first thread of every core, then second
+    // thread of every core, etc.
+    let max_len = groups.iter().map(|g| g.len()).max().unwrap_or(0);
+    let mut ordered = Vec::with_capacity(seen.len());
+    for round in 0..max_len {
+        for g in &groups {
+            if let Some(&c) = g.get(round) {
+                ordered.push(c);
+            }
+        }
+    }
+    ordered
+}
+
+/// Run the core-pinned N-worker sweep: for each `n` in `cores.len()`-bounded
+/// group sizes, spawn `n` threads (thread `i` pinned to `cores[i]`), each
+/// building its own `Worker` + its own fixture, then run all `n` for `dur`
+/// wall-clock seconds starting from a shared barrier so ramp-up skew doesn't
+/// distort the aggregate. Returns `(n, aggregate_gbps)` per sweep point.
+fn level1_sweep(cores: &[usize], dur: Duration) -> Vec<(usize, f64)> {
+    let ns = [1usize, 2, 4, 8, 12];
+    let mut rows = Vec::with_capacity(ns.len());
+
+    for &n in &ns {
+        assert!(
+            n <= cores.len(),
+            "sweep point N={n} exceeds available cores ({})",
+            cores.len()
+        );
+        let barrier = Arc::new(Barrier::new(n));
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let core = cores[i];
+                let barrier = Arc::clone(&barrier);
+                thread::Builder::new()
+                    .name(format!("worker-{i}"))
+                    .spawn(move || {
+                        pin_current_thread(core);
+                        // Build fixture + handshake BEFORE the barrier so the
+                        // timed window below starts from a cold, identical
+                        // footing across all N threads.
+                        let inners = build_fixture(i, PAYLOADS_PER_WORKER);
+                        let mut w = Worker::new();
+                        barrier.wait();
+                        run_worker(&mut w, &inners, dur)
+                    })
+                    .expect("spawn worker thread")
+            })
+            .collect();
+
+        let total_bytes: u64 = handles.into_iter().map(|h| h.join().expect("join")).sum();
+        let gbps = (total_bytes as f64 * 8.0) / dur.as_secs_f64() / 1e9;
+        rows.push((n, gbps));
+    }
+    rows
+}
+
+fn main() {
+    let cores = topology_ordered_cores();
     let dur = Duration::from_secs(5);
-    let bytes = run_worker(&inners, dur);
-    let gbps = (bytes as f64 * 8.0) / dur.as_secs_f64() / 1e9;
-    println!("N=1  {gbps:.2} Gbps");
+
+    let rows = level1_sweep(&cores, dur);
+
+    let gbps_1 = rows
+        .iter()
+        .find(|(n, _)| *n == 1)
+        .map(|(_, g)| *g)
+        .unwrap_or(1.0);
+
+    println!(" N   aggregate_Gbps   per_core   efficiency");
+    for (n, gbps) in &rows {
+        let per_core = gbps / *n as f64;
+        let efficiency = gbps / (*n as f64 * gbps_1);
+        println!(" {n:<3} {gbps:>13.2}   {per_core:>8.2}   {efficiency:>10.2}");
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +384,35 @@ mod tests {
         let mut w = Worker::new();
         let inner = sample_inner(1300);
         assert_eq!(w.step(&inner), inner.len());
+    }
+
+    /// `run_worker` silently under-counts on failure: `Worker::step` returns
+    /// 0 for any payload the receive chain rejects, and the sweep's total
+    /// byte count would still print a clean (if smaller) number with no
+    /// indication that the 5-tuple mutation in `build_fixture` broke
+    /// anything. This test makes that failure mode visible: every mutated
+    /// payload in a worker's fixture must round-trip exactly like the
+    /// untouched fixture above.
+    #[test]
+    fn fixture_payloads_all_roundtrip() {
+        let mut w = Worker::new();
+        let inners = build_fixture(0, PAYLOADS_PER_WORKER);
+        for (idx, inner) in inners.iter().enumerate() {
+            let recovered = w.step(inner);
+            assert_eq!(
+                recovered,
+                inner.len(),
+                "fixture payload {idx} failed to roundtrip (got {recovered} bytes, expected {})",
+                inner.len()
+            );
+        }
+    }
+
+    #[test]
+    fn parse_cpu_list_handles_ranges_and_singletons() {
+        assert_eq!(parse_cpu_list("0-1"), vec![0, 1]);
+        assert_eq!(parse_cpu_list("3"), vec![3]);
+        assert_eq!(parse_cpu_list("0,2,4"), vec![0, 2, 4]);
     }
 }
 
