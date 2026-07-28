@@ -13,9 +13,11 @@
 //!
 //! Task 1 built the self-contained `Worker` + single-threaded `run_worker`
 //! loop (N=1, ~1.69 Gbps on the reference box). Task 2 extends this to a
-//! core-pinned N-worker sweep ([1, 2, 4, 6, 8, 12] -- N=6 is this box's last
-//! all-physical-core point before N=8/N=12 double up on SMT siblings) to
-//! see how the receive chain scales across real cores, with measurement-
+//! core-pinned N-worker sweep ([1, 2, 4, 6, 8, 12] on this 12-thread box --
+//! N=6 is this box's last all-physical-core point before N=8/N=12 double up
+//! on SMT siblings -- clamped down via `sweep_ns` to however many cores are
+//! actually available on smaller boxes, e.g. CI runners) to see how the
+//! receive chain scales across real cores, with measurement-
 //! honesty requirements: (a) each worker owns a distinct, L3-exceeding
 //! fixture (not a shared/cache-resident fixture, which would inflate the
 //! scaling result), (b) a start barrier so all worker threads begin their
@@ -291,8 +293,9 @@ fn run_worker(w: &mut Worker, inners: &[Vec<u8>], dur: Duration) -> u64 {
 /// Number of distinct 1300-byte payloads each worker owns. At 1300 bytes each
 /// this is ~3.8 MB per worker — a few MB, as required — so the combined
 /// footprint across all N workers in the sweep (N up to 12) reaches ~46 MB,
-/// well past this box's ~16 MB L3, forcing real memory-bandwidth contention
-/// at high N instead of everything living cache-resident.
+/// well past this box's ~16 MB L3, so it can't stay cache-resident at high N
+/// (which would otherwise inflate the scaling result -- see `build_fixture`'s
+/// doc comment).
 const PAYLOADS_PER_WORKER: usize = 3000;
 
 /// Build one worker's own fixture: `PAYLOADS_PER_WORKER` distinct 1300-byte
@@ -344,10 +347,15 @@ fn build_fixture(worker_id: usize, count: usize) -> Vec<Vec<u8>> {
 /// Pin the calling thread to `core` via `sched_setaffinity` (pid 0 = current
 /// thread/process, per `man 2 sched_setaffinity`).
 ///
-/// Panics if the syscall fails: the entire "core-pinned" premise of this
-/// sweep rests on this succeeding, so a silently-ignored failure (e.g. a
-/// restricted cpuset) would quietly degrade the whole table to an unpinned,
-/// scheduler-shuffled measurement with no indication in the output.
+/// Failure is non-fatal, by design: on a cgroup/cpuset-restricted runner
+/// (e.g. CI), `sched_setaffinity` can return `EINVAL` for a CPU that sysfs
+/// topology lists but this process isn't actually permitted to use --
+/// `topology_ordered_cores` reads sysfs, not this process's affinity mask, so
+/// the two can disagree. Panicking the whole multi-minute sweep over one
+/// unpinnable core would be worse than continuing degraded, so a failure
+/// prints a warning (via `eprintln!`) and this thread simply runs unpinned
+/// (scheduler-shuffled) instead -- the measurement is less clean for that
+/// thread but the run still completes and reports.
 fn pin_current_thread(core: usize) {
     // SAFETY: `set` is a valid, fully-initialized (zeroed then CPU_ZERO'd)
     // `cpu_set_t` local; `CPU_SET`/`sched_setaffinity` only read/write within
@@ -359,12 +367,13 @@ fn pin_current_thread(core: usize) {
         // pin the calling thread (pid 0 = current)
         libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const set)
     };
-    assert_eq!(
-        rc,
-        0,
-        "sched_setaffinity(core={core}) failed: {}",
-        std::io::Error::last_os_error()
-    );
+    if rc != 0 {
+        eprintln!(
+            "warning: sched_setaffinity(core={core}) failed: {} -- continuing \
+             unpinned on this thread, measurement will be less clean",
+            std::io::Error::last_os_error()
+        );
+    }
 }
 
 /// Parse a Linux sysfs CPU list (e.g. `"0-1"`, `"0,2,4"`, `"0"`) into the
@@ -503,27 +512,56 @@ fn sample_core_mhz(cores: &[usize]) -> Option<f64> {
     }
 }
 
-/// Run the core-pinned N-worker sweep: for each `n` in `cores.len()`-bounded
-/// group sizes, spawn `n` threads (thread `i` pinned to `cores[i]`), each
-/// building its own `Worker` + its own fixture, then run all `n` for `dur`
-/// wall-clock seconds starting from a shared barrier so ramp-up skew doesn't
-/// distort the aggregate. An extra sampler thread joins the same barrier and
-/// polls `sample_core_mhz` over the pinned cores for the same window, so the
+/// Build the level-1 sweep points for a box with `total` available cores.
+///
+/// Starts from the fixed reference sweep `[1, 2, 4, 6, 8, 12]` -- this box's
+/// (6 physical cores / 12 SMT threads) full physical+SMT sweep -- and filters
+/// out anything exceeding `total`, so a runner with fewer logical CPUs than
+/// this dev box (e.g. a `runs-on: ubuntu-latest` CI runner) never tries to
+/// pin more threads than exist. When the filtered list's largest point is
+/// still below `total` (any `total` in `1..12`, e.g. an 8-core box would
+/// otherwise stop at `[1,2,4,6]`), the sweep also includes `total` itself so
+/// the box's full core count always gets measured. `total >= 12` is left as
+/// exactly the fixed reference list (never grown past 12), so a big
+/// many-core CI/server box doesn't silently balloon into extra multi-minute
+/// sweep points this doc/report doesn't account for.
+///
+/// There is ALWAYS an `N=1` point for any `total >= 1` (the fixed list starts
+/// at 1) -- required as the efficiency-table denominator in `main`, which
+/// would otherwise silently fall back to a fabricated `1.0` Gbps baseline.
+/// `total == 0` (no cores at all -- not reachable via
+/// `topology_ordered_cores` in practice, whose own fallback bottoms out at
+/// `available_parallelism`) returns an empty sweep rather than panicking.
+fn sweep_ns(total: usize) -> Vec<usize> {
+    const REFERENCE: [usize; 6] = [1, 2, 4, 6, 8, 12];
+    let mut ns: Vec<usize> = REFERENCE.into_iter().filter(|&n| n <= total).collect();
+    if total < 12 {
+        match ns.last() {
+            Some(&largest) if largest < total => ns.push(total),
+            None if total > 0 => ns.push(total),
+            _ => {}
+        }
+    }
+    ns
+}
+
+/// Run the core-pinned N-worker sweep: for each `n` in `sweep_ns(cores.len())`
+/// (clamped to however many cores this box actually has -- see `sweep_ns`),
+/// spawn `n` threads (thread `i` pinned to `cores[i]`), each building its own
+/// `Worker` + its own fixture, then run all `n` for `dur` wall-clock seconds
+/// starting from a shared barrier so ramp-up skew doesn't distort the
+/// aggregate. An extra sampler thread joins the same barrier and polls
+/// `sample_core_mhz` over the pinned cores for the same window, so the
 /// returned average clock is measured over the identical timing window as
 /// the throughput -- not before ramp-up, not after cool-down. Returns
 /// `(n, aggregate_gbps, avg_mhz)` per sweep point. `n = 6` is this box's
 /// last all-physical-core point (6 cores / 12 SMT threads) before N=8/N=12
 /// necessarily double up on hyperthreads.
 fn level1_sweep(cores: &[usize], dur: Duration) -> Vec<(usize, f64, f64)> {
-    let ns = [1usize, 2, 4, 6, 8, 12];
+    let ns = sweep_ns(cores.len());
     let mut rows = Vec::with_capacity(ns.len());
 
     for &n in &ns {
-        assert!(
-            n <= cores.len(),
-            "sweep point N={n} exceeds available cores ({})",
-            cores.len()
-        );
         let used_cores: Vec<usize> = cores[..n].to_vec();
         // n workers + 1 clock sampler, all released together.
         let barrier = Arc::new(Barrier::new(n + 1));
@@ -1110,6 +1148,55 @@ mod tests {
         assert_eq!(parse_cpu_list("0-1"), vec![0, 1]);
         assert_eq!(parse_cpu_list("3"), vec![3]);
         assert_eq!(parse_cpu_list("0,2,4"), vec![0, 2, 4]);
+    }
+
+    /// Exact sweep shapes for a handful of representative core counts,
+    /// including the brief's own examples (8-core -> `[1,2,4,6,8]`, 4-core ->
+    /// `[1,2,4]`) plus in-between (3, 9) and at/above-12 (12, 16) cases.
+    #[test]
+    fn sweep_ns_matches_expected_shapes() {
+        assert_eq!(sweep_ns(1), vec![1]);
+        assert_eq!(sweep_ns(2), vec![1, 2]);
+        assert_eq!(sweep_ns(3), vec![1, 2, 3]);
+        assert_eq!(sweep_ns(4), vec![1, 2, 4]);
+        assert_eq!(sweep_ns(8), vec![1, 2, 4, 6, 8]);
+        assert_eq!(sweep_ns(9), vec![1, 2, 4, 6, 8, 9]);
+        assert_eq!(sweep_ns(12), vec![1, 2, 4, 6, 8, 12]);
+        // Above the fixed reference sweep's max: stays exactly the fixed
+        // list rather than silently growing to N=16 (see `sweep_ns`'s doc
+        // comment on why a big CI/server box shouldn't balloon the sweep).
+        assert_eq!(sweep_ns(16), vec![1, 2, 4, 6, 8, 12]);
+    }
+
+    /// The two hard invariants `sweep_ns` must hold for EVERY core count this
+    /// example could ever run on: an N=1 point always exists (required as
+    /// `main`'s efficiency denominator -- see `sweep_ns`'s doc comment on the
+    /// `gbps_1 ... .unwrap_or(1.0)` fallback it guards against), and no
+    /// sweep point ever exceeds the box's actual core count (the panic this
+    /// whole fix removes). Swept across a wide range (1..=64) rather than a
+    /// few samples so a future edit can't reintroduce a narrow gap.
+    #[test]
+    fn sweep_ns_always_has_n1_and_never_exceeds_total() {
+        for total in 1..=64usize {
+            let ns = sweep_ns(total);
+            assert_eq!(ns.first(), Some(&1), "total={total} ns={ns:?}");
+            assert!(
+                ns.iter().all(|&n| n <= total),
+                "total={total} ns={ns:?} contains a point exceeding total"
+            );
+            if total < 12 {
+                assert_eq!(
+                    ns.last(),
+                    Some(&total),
+                    "total={total} ns={ns:?} should top out at total when total < 12"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sweep_ns_empty_for_zero_cores() {
+        assert_eq!(sweep_ns(0), Vec::<usize>::new());
     }
 
     /// The core `SO_REUSEPORT` claim underpinning level 2: two sockets can
