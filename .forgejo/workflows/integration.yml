@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   bench-smoke:
-    runs-on: ubuntu-latest
+    runs-on: privileged
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -26,10 +26,16 @@ jobs:
           --warm-up-time 1 --measurement-time 1 --sample-size 10
 
   netem-comparison:
-    runs-on: ubuntu-latest
+    runs-on: privileged
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install BoringSSL build deps (cmake + libclang)
+        # The release yipd built below links `boring` (BoringSSL), whose build
+        # needs cmake + a C/C++ toolchain, and whose bindgen step needs libclang.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
       - name: Install wireguard-tools
         run: sudo apt-get install -y wireguard-tools
       - name: Load wireguard kernel module
@@ -81,7 +87,7 @@ jobs:
           fi
 
   device-tests:
-    runs-on: ubuntu-latest
+    runs-on: privileged
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -107,16 +113,16 @@ jobs:
           fi
 
   netns-tunnel-test:
-    runs-on: ubuntu-latest
+    runs-on: privileged
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install BoringSSL build deps (cmake)
+      - name: Install BoringSSL build deps (cmake + libclang)
         # The TLS-mimicry transport (3c.2) links the `boring` crate, whose
-        # build compiles BoringSSL and therefore requires cmake + a C/C++
-        # toolchain. ubuntu-latest ships these, but install cmake explicitly so
-        # the yipd build below cannot fail on a runner-image change.
-        run: sudo apt-get update && sudo apt-get install -y cmake
+        # build compiles BoringSSL (needs cmake + a C/C++ toolchain) and whose
+        # bindgen step needs libclang. The Forgejo runner image does not ship
+        # these, so install them explicitly.
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev pkg-config
       - name: Build and run yipd netns tunnel tests under sudo
         run: |
           # Filter for the tunnel_netns test binary specifically: a --no-run build
@@ -459,7 +465,7 @@ jobs:
     # Uses nDPI/nDPId's `ndpiReader` as the adversary, per CLAUDE.md's stated
     # test methodology ("nDPI/nDPId are the test adversary and should be
     # wired into CI to verify undetectability").
-    runs-on: ubuntu-latest
+    runs-on: privileged
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -472,7 +478,9 @@ jobs:
           sudo apt-get update
           # cmake: required to build the `boring` crate (BoringSSL) that the
           # transport=tls oracle's release yipd links (3c.2).
-          sudo apt-get install -y libpcap-dev libjson-c-dev libgcrypt20-dev autoconf automake libtool pkg-config gettext cmake
+          # clang + libclang-dev: boring's bindgen step (the transport=tls yipd
+          # links BoringSSL) needs libclang; the runner image doesn't ship it.
+          sudo apt-get install -y libpcap-dev libjson-c-dev libgcrypt20-dev autoconf automake libtool pkg-config gettext cmake clang libclang-dev
 
       # Pinned nDPI checkout: this SHA is the exact commit vendored locally at
       # refrences/nDPI (git-ignored/local per CLAUDE.md, so CI can't just use

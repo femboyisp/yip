@@ -3,6 +3,13 @@
 use std::process::Command;
 
 fn is_root() -> bool {
+    // Opt-out for non-privileged CI (e.g. the `build-test` job runs as root in a
+    // container without netns/`ip` tooling, so these root-gated harness tests
+    // would try to run and fail instead of skipping). The privileged integration
+    // jobs and local `sudo cargo test` leave this unset, so they still run.
+    if std::env::var_os("YIP_SKIP_PRIVILEGED_TESTS").is_some() {
+        return false;
+    }
     Command::new("id")
         .arg("-u")
         .output()
