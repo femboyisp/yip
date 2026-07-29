@@ -34,7 +34,7 @@ tokio = { version = "1", features = ["io-util", "net", "macros", "rt-multi-threa
 # in-process mock-TLS-server `connect(verify=true)` tests. Already in the
 # workspace's Cargo.lock (bin/yip-rendezvous uses it in production); here
 # it's dev-only, so it adds no footprint to the shipped `yip-utls` library.
-rcgen = { version = "0.13.2", default-features = false, features = ["ring", "crypto", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "crypto", "pem"] }
 
 [lints]
 workspace = true

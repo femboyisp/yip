@@ -28,7 +28,7 @@ quinn-proto = { version = "0.11.16", default-features = false, features = ["rust
 rustls = { version = "0.23.41", default-features = false, features = ["ring", "std", "tls12"] }
 # Throwaway self-signed server cert for the outer QUIC costume (zero-auth by design; the inner
 # yip Noise-IK handshake is the real security -- see 3c.1 spec).
-rcgen = { version = "0.13.2", default-features = false, features = ["ring", "crypto"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "crypto"] }
 bytes = { version = "1", default-features = false }
 # 3c.2 TLS mimicry (bin/yipd/src/tls.rs): BoringSSL bindings for a GREASE-enabled
 # browser-parrot ClientHello -- rustls has no GREASE support, so it cannot produce
