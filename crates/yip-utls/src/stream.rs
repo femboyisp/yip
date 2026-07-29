@@ -583,7 +583,7 @@ fn spki_sec1_pubkey_from_der(cert_der: &[u8]) -> Result<Vec<u8>, Error> {
     // version [0] EXPLICIT is OPTIONAL; if present, consume+discard it — the
     // NEXT field is then serialNumber. If absent, the field already peeked
     // at (still unconsumed) IS serialNumber.
-    let first_tag = tbs.peek_tag().map_err(|_| bad_der())?;
+    let first_tag = der::Tag::peek(&tbs).map_err(|_| bad_der())?;
     if first_tag.is_context_specific() {
         tbs.tlv_bytes().map_err(|_| bad_der())?; // version
     }

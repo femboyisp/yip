@@ -191,10 +191,10 @@ pub fn seal(
 
     let cipher = ChaCha20Poly1305::new_from_slice(&aead_key)
         .expect("aead_key is exactly 32 bytes, ChaCha20Poly1305's required key length");
-    let nonce = Nonce::from_slice(&client_random[..12]);
+    let nonce = Nonce::try_from(&client_random[..12]).expect("client_random has >= 12 bytes");
     let sealed = cipher
         .encrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: &plaintext,
                 aad: b"",
@@ -256,11 +256,11 @@ pub fn open_recover_shared(
     let cipher = ChaCha20Poly1305::new_from_slice(&aead_key)
         .expect("aead_key is exactly 32 bytes, ChaCha20Poly1305's required key length");
     let nonce_bytes = client_random.get(..12)?;
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::try_from(nonce_bytes).expect("nonce_bytes is exactly 12 bytes");
 
     let plaintext = cipher
         .decrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: session_id,
                 aad: b"",
