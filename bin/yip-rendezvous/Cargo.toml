@@ -23,8 +23,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 # 3c.3 TCP/TLS Trojan front: real-cert TLS termination on the rendezvous
 # binary (nginx-like config), matching `yipd`'s 3c.2 TLS-mimicry costume.
 # tokio/boring/tokio-boring are scoped to THIS binary only.
-boring = "4.22.0"
-tokio-boring = "4.22.0"
+boring = "5"
+tokio-boring = "5"
 # REALITY.1 Task 1 / REALITY.2 Task 5: pure TLS-ClientHello parser
 # (src/reality.rs). The auth seal/open codec itself (HKDF-SHA256 + X25519
 # ECDH + ChaCha20-Poly1305) now lives in yip-utls::auth, shared with the
