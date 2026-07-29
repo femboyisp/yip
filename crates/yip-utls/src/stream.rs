@@ -593,7 +593,7 @@ fn spki_sec1_pubkey_from_der(cert_der: &[u8]) -> Result<Vec<u8>, Error> {
     let vk = p256::ecdsa::VerifyingKey::from_public_key_der(spki_der).map_err(|_| {
         Error::RealityVerify("leaf certificate's public key is not a valid P-256 SPKI")
     })?;
-    Ok(vk.to_encoded_point(false).as_bytes().to_vec())
+    Ok(vk.to_sec1_point(false).as_bytes().to_vec())
 }
 
 /// Verify a TLS 1.3 server `CertificateVerify` for REALITY.4b: the leaf's
@@ -3235,7 +3235,7 @@ mod tests {
         let signing_key = SigningKey::from_slice(&[0x11u8; 32]).unwrap();
         let pubkey_sec1 = signing_key
             .verifying_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec();
         let transcript = transcript_hash(b"ch||sh||ee||cert", SUITE);
@@ -3256,7 +3256,7 @@ mod tests {
         let other_key = SigningKey::from_slice(&[0x22u8; 32]).unwrap();
         let other_pub = other_key
             .verifying_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec();
         let transcript = transcript_hash(b"ch||sh||ee||cert", SUITE);
@@ -3268,7 +3268,7 @@ mod tests {
         // Tampered transcript (verify against a different hash) → RealityVerify.
         let signer_pub = signing_key
             .verifying_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec();
         let tampered = transcript_hash(b"different-transcript", SUITE);
