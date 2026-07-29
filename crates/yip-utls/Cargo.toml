@@ -6,25 +6,19 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-md-5 = "0.10"
+md-5 = "0.11"
 ring = "0.17"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"
-sha2 = "0.10"
+sha2 = "0.11"
 getrandom = "0.4"
 tokio = { version = "1", features = ["io-util", "net", "macros", "rt"] }
-ml-kem = "0.2"
-# Pinned at 0.6 (NOT part of the workspace's rand_core 0.10 migration): this
-# is `ml-kem` 0.2's `rand_core::{RngCore, CryptoRng}` bound for its
-# `Encapsulate`/`Decapsulate` traits (see `stream.rs`'s `MlKemRng` and
-# `server.rs`'s `RandomSourceRng` bridges) — a separate major version of the
-# rand_core crate from the one ed25519-dalek 3 needs, coexisting in the same
-# dependency graph. No `ed25519-dalek` usage lives in this crate.
-rand_core = { version = "0.6", default-features = false }
+ml-kem = "0.3"
+rand_core = { version = "0.10", default-features = false }
 # REALITY.4b: ECDSA-P256 (ecdsa_secp256r1_sha256, the Chrome-advertised sig alg)
 # for the shared-secret-derived cert key — client verify + server binding.
 # `pkcs8` lets the server hand the derived key to rcgen; `ecdsa` for verify.
-p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
 # REALITY.4b Task 2: a safe, fail-closed (panic-free on hostile bytes), no_std
 # DER reader — already present in the dependency graph transitively via
 # p256's `pkcs8` feature — used to walk the server's Certificate leaf's DER
@@ -40,7 +34,7 @@ tokio = { version = "1", features = ["io-util", "net", "macros", "rt-multi-threa
 # in-process mock-TLS-server `connect(verify=true)` tests. Already in the
 # workspace's Cargo.lock (bin/yip-rendezvous uses it in production); here
 # it's dev-only, so it adds no footprint to the shipped `yip-utls` library.
-rcgen = { version = "0.13.2", default-features = false, features = ["ring", "crypto", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "crypto", "pem"] }
 
 [lints]
 workspace = true

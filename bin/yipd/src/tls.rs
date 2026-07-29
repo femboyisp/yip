@@ -172,6 +172,28 @@ pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// `quic.rs` uses ALPN `h3` for the same reason).
 const TLS_ALPN_WIRE: &[u8] = b"\x02h2\x08http/1.1";
 
+/// `supported_groups` list for the client-side browser-parrot ClientHello,
+/// in real-Chrome order: `X25519MLKEM768` (the PQ hybrid, real IANA
+/// codepoint `0x11ec`/`4588`), then `X25519`, `P-256`, `P-384` — the same
+/// set/order `yip_utls::hello`'s Chrome-150 fixture crafts (see that crate's
+/// `supported_groups_body`: `GREASE,4588,29,23,24`), so both TLS surfaces
+/// present one consistent browser profile. Boring 5's vendored BoringSSL
+/// (`boring-sys` bundles a Cloudflare fork, `patches/boring-pq.patch`)
+/// defaults `supported_groups` to
+/// `X25519MLKEM768,P256Kyber768Draft00,X25519,P-256,P-384` — the second
+/// entry, group id `0xfe32`, is explicitly NOT the IANA-assigned codepoint
+/// for that exchange (the patch's own commit message says so) and no real
+/// browser ever sends it, making it a novel distinguisher for a TLS-mimicry
+/// costume. `set_curves_list` below REPLACES the context's group list
+/// wholesale (`SSL_CTX_set1_curves_list` → `ssl_str_to_group_ids`, a copy,
+/// not an append/merge — verified against boring-sys 5.1.0's patched
+/// vendored source), so this drops `0xfe32` while keeping the real
+/// `X25519MLKEM768` hybrid (it makes the costume MORE Chrome-like, since
+/// modern Chrome sends it too). Names must match `boring-sys`'s
+/// `kNamedGroups` table exactly (case-sensitive): `"X25519MLKEM768"`,
+/// `"X25519"`, `"P-256"`, `"P-384"`.
+const CLIENT_CURVES_LIST: &str = "X25519MLKEM768:X25519:P-256:P-384";
+
 // ── BoringSSL config builders ──────────────────────────────────────────────
 
 /// Client-side BoringSSL config: GREASE-enabled (the browser-parrot signal —
@@ -180,13 +202,18 @@ const TLS_ALPN_WIRE: &[u8] = b"\x02h2\x08http/1.1";
 /// exact current-Chrome tuning is deferred to the nDPI-oracle-driven Task 6,
 /// not blocked on here) and zero-auth verify (the outer TLS authenticates
 /// nothing — inner yip Noise-IK is the real security, exactly like `quic.rs`'s
-/// `SkipServerVerification`).
+/// `SkipServerVerification`). [`CLIENT_CURVES_LIST`] pins `supported_groups`
+/// to a real-browser set, dropping boring 5's non-standard `0xfe32` default
+/// (see that constant's doc comment).
 pub(crate) fn build_client_connector() -> io::Result<SslConnector> {
     let mut builder = SslConnector::builder(SslMethod::tls()).map_err(io::Error::other)?;
     builder.set_verify(SslVerifyMode::NONE);
     builder.set_grease_enabled(true);
     builder
         .set_alpn_protos(TLS_ALPN_WIRE)
+        .map_err(io::Error::other)?;
+    builder
+        .set_curves_list(CLIENT_CURVES_LIST)
         .map_err(io::Error::other)?;
     Ok(builder.build())
 }
@@ -212,7 +239,7 @@ fn gen_cert(tls_sni: &str) -> io::Result<(X509, PKey<Private>)> {
     let certified =
         rcgen::generate_simple_self_signed(vec![tls_sni.to_owned()]).map_err(io::Error::other)?;
     let cert = X509::from_der(certified.cert.der()).map_err(io::Error::other)?;
-    let key = PKey::private_key_from_pkcs8(&certified.key_pair.serialize_der())
+    let key = PKey::private_key_from_pkcs8(&certified.signing_key.serialize_der())
         .map_err(io::Error::other)?;
     Ok((cert, key))
 }
@@ -813,5 +840,183 @@ mod tests {
         );
 
         server.join().expect("server thread panicked");
+    }
+
+    // ── boring 5 curve-list regression guard ───────────────────────────────
+    //
+    // boring 5's vendored BoringSSL (a Cloudflare fork, `boring-sys`'s
+    // `patches/boring-pq.patch`) defaults `supported_groups` to
+    // `X25519MLKEM768,P256Kyber768Draft00,X25519,P-256,P-384` — the second
+    // entry, group id `0xfe32`, is NOT the IANA-assigned codepoint for that
+    // exchange (the patch says so itself) and no real browser sends it,
+    // making it a novel distinguisher for this transport=tls browser-parrot
+    // costume. `build_client_connector` pins `CLIENT_CURVES_LIST` to drop it
+    // while keeping the real `X25519MLKEM768` hybrid. These two tests prove
+    // that pin holds against the ACTUAL wire bytes (not just the source),
+    // so a future `boring`/`boring-sys` bump can't silently reintroduce
+    // `0xfe32` (or any other unreviewed codepoint) without failing CI.
+
+    /// `SSL_GROUP_P256_KYBER768_DRAFT00` — boring-sys 5.1.0's non-standard,
+    /// non-IANA experimental group id (see [`CLIENT_CURVES_LIST`]'s doc
+    /// comment). Must never appear in `build_client_connector`'s
+    /// `supported_groups`.
+    const GROUP_P256_KYBER768_DRAFT00_NONSTANDARD: u16 = 0xfe32;
+
+    /// A TLS extension's `(type, body)`, walked out of a ClientHello's
+    /// `extensions` block.
+    fn walk_extensions(mut ext_block: &[u8]) -> Vec<(u16, &[u8])> {
+        let mut out = Vec::new();
+        while ext_block.len() >= 4 {
+            let etype = u16::from_be_bytes([ext_block[0], ext_block[1]]);
+            let elen = usize::from(u16::from_be_bytes([ext_block[2], ext_block[3]]));
+            let body = &ext_block[4..4 + elen];
+            out.push((etype, body));
+            ext_block = &ext_block[4 + elen..];
+        }
+        assert!(ext_block.is_empty(), "trailing bytes after last extension");
+        out
+    }
+
+    /// Parse the `supported_groups` (extension `0x000a`) group-id list out
+    /// of a captured, single-TLS-record ClientHello (record header +
+    /// handshake header + body, exactly what a raw `TcpStream::read` off an
+    /// accepted socket returns for boring's first flight — no fragmentation
+    /// handling needed at this size).
+    fn supported_groups_of_captured_client_hello(wire: &[u8]) -> Vec<u16> {
+        assert_eq!(wire[0], 22, "must be a handshake record");
+        let record_len = usize::from(u16::from_be_bytes([wire[3], wire[4]]));
+        let hs = &wire[5..5 + record_len];
+        assert_eq!(hs[0], 0x01, "must be a ClientHello");
+        let hs_len = usize::from(u16::from_be_bytes([hs[2], hs[3]])) | (usize::from(hs[1]) << 16);
+        let body = &hs[4..4 + hs_len];
+
+        let mut off = 2 + 32; // legacy_version, random
+        let sid_len = usize::from(body[off]);
+        off += 1 + sid_len;
+        let cs_len = usize::from(u16::from_be_bytes([body[off], body[off + 1]]));
+        off += 2 + cs_len;
+        let cm_len = usize::from(body[off]);
+        off += 1 + cm_len;
+        let ext_total_len = usize::from(u16::from_be_bytes([body[off], body[off + 1]]));
+        off += 2;
+        let extensions = walk_extensions(&body[off..off + ext_total_len]);
+
+        let (_etype, groups_body) = extensions
+            .into_iter()
+            .find(|(etype, _)| *etype == 0x000a)
+            .expect("supported_groups extension must be present");
+        let list_len = usize::from(u16::from_be_bytes([groups_body[0], groups_body[1]]));
+        assert_eq!(2 + list_len, groups_body.len(), "supported_groups length");
+        groups_body[2..2 + list_len]
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect()
+    }
+
+    /// A GREASE value per RFC 8701 §3.1: bytes `0x?A?A` for the same nibble
+    /// on both halves (`0x0A0A, 0x1A1A, ..., 0xFAFA`).
+    fn is_grease(v: u16) -> bool {
+        let [hi, lo] = v.to_be_bytes();
+        hi & 0x0F == 0x0A && lo & 0x0F == 0x0A && hi >> 4 == lo >> 4
+    }
+
+    /// Capture the raw first-flight bytes `build_client_connector` sends
+    /// against a bare accepting socket (server never speaks TLS back, so the
+    /// client blocks on `WANT_READ`/a real blocking read after sending the
+    /// ClientHello — irrelevant here, we only need the accepted side's
+    /// bytes).
+    fn capture_client_hello() -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let client = std::thread::spawn(move || {
+            let connector = build_client_connector().expect("connector");
+            let tcp = TcpStream::connect(addr).expect("connect");
+            let _ = connector.connect("probe.test", tcp);
+        });
+        let (mut tcp, _from) = listener.accept().expect("accept");
+        tcp.set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("set_read_timeout");
+        let mut buf = vec![0u8; 8192];
+        let mut total = Vec::new();
+        loop {
+            match std::io::Read::read(&mut tcp, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => total.extend_from_slice(&buf[..n]),
+                Err(_) => break, // read timeout: first flight fully arrived
+            }
+        }
+        drop(tcp);
+        let _ = client.join();
+        total
+    }
+
+    /// Regression guard (boring 5 migration): `build_client_connector`'s
+    /// `supported_groups` must be EXACTLY GREASE followed by
+    /// `[X25519MLKEM768, X25519, P-256, P-384]` — real IANA codepoints only,
+    /// in real-Chrome order, matching `yip_utls::hello`'s Chrome-150 fixture
+    /// (`GREASE,4588,29,23,24`). Fails loudly if a future `boring`/
+    /// `boring-sys` bump reintroduces `0xfe32` (or anything else not on this
+    /// exact list) into the default group set.
+    #[test]
+    fn client_connector_supported_groups_are_exactly_the_real_browser_set() {
+        let wire = capture_client_hello();
+        let groups = supported_groups_of_captured_client_hello(&wire);
+
+        assert!(
+            !groups.contains(&GROUP_P256_KYBER768_DRAFT00_NONSTANDARD),
+            "supported_groups must never carry the non-standard, non-IANA \
+             P256Kyber768Draft00 codepoint (0xfe32): {groups:04x?}"
+        );
+
+        assert_eq!(groups.len(), 5, "GREASE + 4 real groups: {groups:04x?}");
+        assert!(
+            is_grease(groups[0]),
+            "first entry must be a GREASE value: {:#06x}",
+            groups[0]
+        );
+        const GROUP_X25519MLKEM768: u16 = 0x11ec;
+        const GROUP_X25519: u16 = 0x001d;
+        const GROUP_SECP256R1: u16 = 0x0017;
+        const GROUP_SECP384R1: u16 = 0x0018;
+        assert_eq!(
+            &groups[1..],
+            &[
+                GROUP_X25519MLKEM768,
+                GROUP_X25519,
+                GROUP_SECP256R1,
+                GROUP_SECP384R1
+            ],
+            "supported_groups (after GREASE) must be exactly the pinned \
+             real-browser list, in real-Chrome order: {groups:04x?}"
+        );
+    }
+
+    /// Regression guard (boring 5 migration): pinning `CLIENT_CURVES_LIST`
+    /// must not accidentally drop the real `X25519MLKEM768` hybrid — a live
+    /// client<->server handshake (both `build_client_connector`/
+    /// `build_server_acceptor`, both boring 5 defaults on the server side)
+    /// must still negotiate it.
+    #[test]
+    fn client_server_handshake_still_negotiates_x25519_mlkem768() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener local_addr");
+        let sni = "example.test";
+
+        let server = std::thread::spawn(move || {
+            let (tcp, _from) = listener.accept().expect("accept");
+            let acceptor = build_server_acceptor(sni).expect("server acceptor");
+            let stream = acceptor.accept(tcp).expect("server handshake");
+            stream.ssl().curve_name().map(str::to_owned)
+        });
+
+        let connector = build_client_connector().expect("client connector");
+        let tcp = TcpStream::connect(addr).expect("connect");
+        let stream = connector.connect(sni, tcp).expect("client handshake");
+        let client_curve = stream.ssl().curve_name().map(str::to_owned);
+
+        let server_curve = server.join().expect("server thread panicked");
+
+        assert_eq!(client_curve.as_deref(), Some("X25519MLKEM768"));
+        assert_eq!(server_curve.as_deref(), Some("X25519MLKEM768"));
     }
 }
