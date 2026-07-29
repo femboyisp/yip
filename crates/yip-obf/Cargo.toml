@@ -8,7 +8,7 @@ repository.workspace = true
 [dependencies]
 blake2 = { workspace = true }
 siphasher = "1.0.3"
-getrandom = "0.2"
+getrandom = "0.4"
 
 [lints]
 workspace = true

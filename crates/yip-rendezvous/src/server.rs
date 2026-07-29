@@ -340,7 +340,8 @@ mod tests {
     use super::*;
     use crate::proto::{node_id, Message};
     use ed25519_dalek::{Signer, SigningKey};
-    use rand_core::OsRng;
+    use getrandom::SysRng;
+    use rand_core::UnwrapErr;
     use std::net::SocketAddr;
     use yip_membership::Cert;
 
@@ -851,7 +852,7 @@ mod tests {
         let ca_pub = ca.verifying_key().to_bytes();
         let network_id = [7u8; 16];
         let member_pub = [1u8; 32];
-        let member_sign_key = SigningKey::generate(&mut OsRng);
+        let member_sign_key = SigningKey::generate(&mut UnwrapErr(SysRng));
         let member_sign_pub = member_sign_key.verifying_key().to_bytes();
         let cert = mk_cert(&ca, member_pub, member_sign_pub, network_id);
         let member_sign_priv: [u8; 32] = member_sign_key.to_bytes();
@@ -881,7 +882,7 @@ mod tests {
             "test helper CA must match the CA `valid_registration` used"
         );
         let attacker_pub = [2u8; 32]; // distinct from valid_registration's member
-        let attacker_sign_key = SigningKey::generate(&mut OsRng);
+        let attacker_sign_key = SigningKey::generate(&mut UnwrapErr(SysRng));
         let attacker_sign_pub = attacker_sign_key.verifying_key().to_bytes();
         let cert = mk_cert(&ca, attacker_pub, attacker_sign_pub, network_id);
         let mut r = Record {

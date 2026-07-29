@@ -374,14 +374,15 @@ mod tests {
     /// fixture (not exposed outside that crate, so reconstructed here).
     fn sample_record() -> Record {
         use ed25519_dalek::{Signer, SigningKey};
-        use rand_core::OsRng;
+        use getrandom::SysRng;
+        use rand_core::UnwrapErr;
         use yip_membership::cert::cert_signing_body;
         use yip_membership::record::{record_signing_body, sign};
         use yip_membership::{node_id, Cert};
 
-        let ca = SigningKey::generate(&mut OsRng);
+        let ca = SigningKey::generate(&mut UnwrapErr(SysRng));
         let member_pubkey = [1u8; 32];
-        let member_sign_key = SigningKey::generate(&mut OsRng);
+        let member_sign_key = SigningKey::generate(&mut UnwrapErr(SysRng));
         let member_sign_pubkey = member_sign_key.verifying_key().to_bytes();
         let network_id = [7u8; 16];
 

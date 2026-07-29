@@ -12,7 +12,8 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signer, SigningKey};
-use rand_core::OsRng;
+use getrandom::SysRng;
+use rand_core::UnwrapErr;
 use yip_membership::cert::{cert_signing_body, rootset_signing_body, Cert, RootSet};
 
 const SECS_PER_DAY: u64 = 86_400;
@@ -58,7 +59,7 @@ fn usage() -> String {
 // --- genkey -----------------------------------------------------------
 
 fn cmd_genkey() -> Result<(), String> {
-    let signing_key = SigningKey::generate(&mut OsRng);
+    let signing_key = SigningKey::generate(&mut UnwrapErr(SysRng));
     let verifying_key = signing_key.verifying_key();
     println!("ca_private={}", hex_encode(&signing_key.to_bytes()));
     println!("ca_public={}", hex_encode(verifying_key.as_bytes()));

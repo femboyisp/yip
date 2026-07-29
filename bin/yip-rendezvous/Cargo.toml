@@ -18,7 +18,7 @@ yip-rendezvous = { path = "../../crates/yip-rendezvous" }
 yip-membership = { path = "../../crates/yip-membership" }
 yip-obf = { path = "../../crates/yip-obf" }
 yip-utls = { path = "../../crates/yip-utls" }
-getrandom = "0.2"
+getrandom = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
 # 3c.3 TCP/TLS Trojan front: real-cert TLS termination on the rendezvous
 # binary (nginx-like config), matching `yipd`'s 3c.2 TLS-mimicry costume.

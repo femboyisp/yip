@@ -15,7 +15,7 @@ yip-rendezvous = { path = "../../crates/yip-rendezvous" }
 yip-membership = { path = "../../crates/yip-membership" }
 yip-obf = { path = "../../crates/yip-obf" }
 blake2 = { workspace = true }
-getrandom = "0.2"
+getrandom = "0.4"
 # 3c.1 QUIC mimicry (bin/yipd/src/quic.rs): the sans-IO QUIC state machine
 # (NOT the `quinn` crate -- that pulls in tokio). `rustls-ring` pulls rustls 0.23 configured
 # with the ring crypto provider (matches `rustls`/`rcgen` below). Drives yip's unchanged inner
@@ -48,7 +48,7 @@ tokio = { version = "1", features = ["rt", "net", "time", "io-util", "sync", "ma
 yip-utls = { path = "../../crates/yip-utls" }
 
 [dev-dependencies]
-ed25519-dalek = { version = "2.1", default-features = false }
+ed25519-dalek = { version = "3", default-features = false }
 
 [lints]
 workspace = true

@@ -86,7 +86,7 @@ fn random_pad(max: usize) -> usize {
         return 0;
     }
     let mut b = [0u8; 8];
-    getrandom::getrandom(&mut b).expect("OS RNG");
+    getrandom::fill(&mut b).expect("OS RNG");
     let v = u64::from_le_bytes(b);
     let span = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
     usize::try_from(v % span).unwrap_or(0)

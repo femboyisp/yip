@@ -401,12 +401,6 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "const-oid"
-version = "0.9.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
-
-[[package]]
-name = "const-oid"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
@@ -574,8 +568,24 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "curve25519-dalek-derive",
- "digest 0.10.7",
- "fiat-crypto",
+ "fiat-crypto 0.2.9",
+ "rustc_version",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "curve25519-dalek"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5eed333089e2e1c1ac8c6c0398e5e2497b4c9926ca6d0365ed1e099afa5bc23"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "curve25519-dalek-derive",
+ "digest 0.11.3",
+ "fiat-crypto 0.3.0",
+ "rand_core 0.10.1",
  "rustc_version",
  "subtle",
  "zeroize",
@@ -603,10 +613,6 @@ name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
-dependencies = [
- "const-oid 0.9.6",
- "zeroize",
-]
 
 [[package]]
 name = "der"
@@ -614,7 +620,7 @@ version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a69dedd701da44b0536442edf09c81a64b0ab97a7a4a5e3d1971f00027cbc63d"
 dependencies = [
- "const-oid 0.10.2",
+ "const-oid",
  "pem-rfc7468",
  "zeroize",
 ]
@@ -657,7 +663,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer 0.12.1",
- "const-oid 0.10.2",
+ "const-oid",
  "crypto-common 0.2.2",
  "ctutils",
 ]
@@ -683,32 +689,31 @@ dependencies = [
  "digest 0.11.3",
  "elliptic-curve",
  "rfc6979",
- "signature 3.0.0",
- "spki 0.8.0",
+ "signature",
+ "spki",
  "zeroize",
 ]
 
 [[package]]
 name = "ed25519"
-version = "2.2.3"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
+checksum = "29fcf32e6c73d1079f83ab4d782de2d81620346a5f38c6237a86a22f8368980a"
 dependencies = [
- "pkcs8 0.10.2",
- "signature 2.2.0",
+ "signature",
 ]
 
 [[package]]
 name = "ed25519-dalek"
-version = "2.2.0"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
+checksum = "6ebaa1a2bf1290ab3bfe5a7b771d050ebffab2711c19a81691c683a5144a25de"
 dependencies = [
- "curve25519-dalek",
+ "curve25519-dalek 5.0.0",
  "ed25519",
- "rand_core 0.6.4",
- "serde",
- "sha2 0.10.9",
+ "rand_core 0.10.1",
+ "sha2 0.11.0",
+ "signature",
  "subtle",
  "zeroize",
 ]
@@ -733,7 +738,7 @@ dependencies = [
  "group",
  "hybrid-array",
  "pem-rfc7468",
- "pkcs8 0.11.0",
+ "pkcs8",
  "rand_core 0.10.1",
  "sec1",
  "subtle",
@@ -755,6 +760,12 @@ name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
+
+[[package]]
+name = "fiat-crypto"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 
 [[package]]
 name = "find-msvc-tools"
@@ -1090,7 +1101,7 @@ dependencies = [
  "hybrid-array",
  "kem",
  "module-lattice",
- "pkcs8 0.11.0",
+ "pkcs8",
  "rand_core 0.10.1",
  "sha3",
 ]
@@ -1228,22 +1239,12 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pkcs8"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f950b2377845cebe5cf8b5165cb3cc1a5e0fa5cfa3e1f7f55707d8fd82e0a7b7"
-dependencies = [
- "der 0.7.10",
- "spki 0.7.3",
-]
-
-[[package]]
-name = "pkcs8"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "451913da69c775a56034ea8d9003d27ee8948e12443eae7c038ba100a4f21cb7"
 dependencies = [
  "der 0.8.1",
- "spki 0.8.0",
+ "spki",
 ]
 
 [[package]]
@@ -1697,15 +1698,6 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "signature"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
-dependencies = [
- "rand_core 0.6.4",
-]
-
-[[package]]
-name = "signature"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
@@ -1735,7 +1727,7 @@ dependencies = [
  "aes-gcm",
  "blake2",
  "chacha20poly1305",
- "curve25519-dalek",
+ "curve25519-dalek 4.1.3",
  "getrandom 0.3.4",
  "ring",
  "rustc_version",
@@ -1751,16 +1743,6 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "spki"
-version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
-dependencies = [
- "base64ct",
- "der 0.7.10",
 ]
 
 [[package]]
@@ -2198,7 +2180,7 @@ version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
 dependencies = [
- "curve25519-dalek",
+ "curve25519-dalek 4.1.3",
  "rand_core 0.6.4",
  "serde",
  "zeroize",
@@ -2249,7 +2231,8 @@ name = "yip-ca"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
- "rand_core 0.6.4",
+ "getrandom 0.4.3",
+ "rand_core 0.10.1",
  "yip-membership",
 ]
 
@@ -2284,7 +2267,8 @@ version = "0.1.0"
 dependencies = [
  "blake2",
  "ed25519-dalek",
- "rand_core 0.6.4",
+ "getrandom 0.4.3",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -2292,7 +2276,7 @@ name = "yip-obf"
 version = "0.1.0"
 dependencies = [
  "blake2",
- "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "siphasher",
 ]
 
@@ -2302,7 +2286,8 @@ version = "0.1.0"
 dependencies = [
  "blake2",
  "ed25519-dalek",
- "rand_core 0.6.4",
+ "getrandom 0.4.3",
+ "rand_core 0.10.1",
  "yip-membership",
 ]
 
@@ -2311,7 +2296,7 @@ name = "yip-rendezvous-bin"
 version = "0.1.0"
 dependencies = [
  "boring",
- "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "p256",
  "rcgen",
  "time",
@@ -2338,7 +2323,7 @@ version = "0.1.0"
 dependencies = [
  "chacha20poly1305",
  "der 0.7.10",
- "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "md-5",
  "ml-kem",
  "p256",
@@ -2367,7 +2352,7 @@ dependencies = [
  "boring",
  "bytes",
  "ed25519-dalek",
- "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "quinn-proto",
  "rcgen",
  "rustls",

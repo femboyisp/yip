@@ -144,10 +144,11 @@ impl Record {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey as MemberSigningKey;
-    use rand_core::OsRng;
+    use getrandom::SysRng;
+    use rand_core::UnwrapErr;
 
     fn ca() -> SigningKey {
-        SigningKey::generate(&mut OsRng)
+        SigningKey::generate(&mut UnwrapErr(SysRng))
     }
 
     /// Mint a CA-signed cert whose `member_sign_pubkey` is `member_sign_pub`.
@@ -187,7 +188,7 @@ mod tests {
         let ca = ca();
         let ca_pub = ca.verifying_key().to_bytes();
         let member = [1u8; 32];
-        let member_sign_key = MemberSigningKey::generate(&mut OsRng);
+        let member_sign_key = MemberSigningKey::generate(&mut UnwrapErr(SysRng));
         let member_sign_pub = member_sign_key.verifying_key().to_bytes();
         let net = [7u8; 16];
 
@@ -227,7 +228,7 @@ mod tests {
         let ca = ca();
         let ca_pub = ca.verifying_key().to_bytes();
         let member = [1u8; 32];
-        let member_sign_key = MemberSigningKey::generate(&mut OsRng);
+        let member_sign_key = MemberSigningKey::generate(&mut UnwrapErr(SysRng));
         let member_sign_pub = member_sign_key.verifying_key().to_bytes();
         let net = [7u8; 16];
         let cert = make_cert(&ca, member, member_sign_pub, net, 100, 200);
@@ -241,7 +242,7 @@ mod tests {
         };
         let body = record_signing_body(&r);
         // Sign with a DIFFERENT key than cert.member_sign_pubkey.
-        let other_key = MemberSigningKey::generate(&mut OsRng);
+        let other_key = MemberSigningKey::generate(&mut UnwrapErr(SysRng));
         r.sig = sign(&body, other_key.to_bytes().as_ref().try_into().unwrap());
 
         assert_eq!(r.verify(&[ca_pub], &net, 150, 0), Err(CertError::BadSig));
@@ -255,7 +256,7 @@ mod tests {
         let ca = ca();
         let ca_pub = ca.verifying_key().to_bytes();
         let member = [1u8; 32];
-        let member_sign_key = MemberSigningKey::generate(&mut OsRng);
+        let member_sign_key = MemberSigningKey::generate(&mut UnwrapErr(SysRng));
         let member_sign_pub = member_sign_key.verifying_key().to_bytes();
         let net = [7u8; 16];
         let cert = make_cert(&ca, member, member_sign_pub, net, 100, 200);

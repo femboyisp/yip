@@ -10,8 +10,11 @@ blake2 = { workspace = true }
 yip-membership = { path = "../yip-membership" }
 
 [dev-dependencies]
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+rand_core = "0.10"
+# Test-only OS-CSPRNG key generation: `getrandom::SysRng` (wrapped in
+# `rand_core::UnwrapErr` to satisfy ed25519-dalek 3's `CryptoRng` bound).
+getrandom = { version = "0.4", features = ["sys_rng"] }
 
 [lints]
 workspace = true

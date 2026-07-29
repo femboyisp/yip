@@ -37,7 +37,7 @@ pub struct XorShift64 {
 impl XorShift64 {
     pub fn from_getrandom() -> Self {
         let mut seed = [0u8; 8];
-        getrandom::getrandom(&mut seed).expect("OS RNG");
+        getrandom::fill(&mut seed).expect("OS RNG");
         // xorshift64* must never have a zero state.
         let s = u64::from_le_bytes(seed) | 1;
         Self { state: s }
@@ -105,7 +105,7 @@ fn keystream(key: &[u8; 16], nonce: &[u8; NONCE_LEN], n: usize) -> Vec<u8> {
 
 fn random_nonce() -> [u8; NONCE_LEN] {
     let mut n = [0u8; NONCE_LEN];
-    getrandom::getrandom(&mut n).expect("OS RNG");
+    getrandom::fill(&mut n).expect("OS RNG");
     n
 }
 
