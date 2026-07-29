@@ -212,7 +212,7 @@ fn gen_cert(tls_sni: &str) -> io::Result<(X509, PKey<Private>)> {
     let certified =
         rcgen::generate_simple_self_signed(vec![tls_sni.to_owned()]).map_err(io::Error::other)?;
     let cert = X509::from_der(certified.cert.der()).map_err(io::Error::other)?;
-    let key = PKey::private_key_from_pkcs8(&certified.key_pair.serialize_der())
+    let key = PKey::private_key_from_pkcs8(&certified.signing_key.serialize_der())
         .map_err(io::Error::other)?;
     Ok((cert, key))
 }
