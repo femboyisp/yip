@@ -84,7 +84,14 @@ fn hkdf_expand_48(shared: &[u8; 32], info: &[u8]) -> [u8; 48] {
 ///
 /// Zero-extends the 384-bit input to 512 bits (two 256-bit halves) and
 /// reduces it mod the curve order `n` via
-/// [`crypto_bigint`]'s `Uint::const_rem_wide` (`p256::elliptic_curve::bigint::U256`).
+/// [`crypto_bigint`]'s `Uint::rem_wide` (`p256::elliptic_curve::bigint::U256`;
+/// the `p256` 0.14 / `crypto-bigint` 0.7 successor to the removed
+/// `const_rem_wide` — same fixed-modulus long division, now taking the
+/// modulus as a `NonZero<Uint>` instead of returning a runtime nonzero flag,
+/// so `NistP256::ORDER.as_nz_ref()` — `Odd<Uint>`'s const accessor for the
+/// equivalent `&NonZero<Uint>` — is used to supply it, with `ORDER`'s
+/// well-known nonzero-ness now enforced at the type level instead of a
+/// discarded `CtChoice`).
 /// That routine is a fixed-modulus long division — per its own doc comment,
 /// "when used with a fixed `rhs`, this function is constant-time with
 /// respect to `self`" — and our `rhs` (the curve order) is a fixed constant,
@@ -103,7 +110,7 @@ fn signing_key_from_wide(wide: &[u8; 48]) -> SigningKey {
     padded[16..].copy_from_slice(wide);
     let upper = U256::from_be_slice(&padded[..32]);
     let lower = U256::from_be_slice(&padded[32..]);
-    let (remainder, _rhs_is_nonzero) = U256::const_rem_wide((lower, upper), &NistP256::ORDER);
+    let remainder = U256::rem_wide((lower, upper), NistP256::ORDER.as_nz_ref());
 
     let scalar = Scalar::from_uint_unchecked(remainder);
     let nonzero = NonZeroScalar::new(scalar)
@@ -140,7 +147,7 @@ pub fn derive_cert_key(shared: &[u8; 32]) -> DerivedCertKey {
         .to_vec();
     let public_sec1 = signing_key
         .verifying_key()
-        .to_encoded_point(false) // uncompressed
+        .to_sec1_point(false) // uncompressed
         .as_bytes()
         .to_vec();
     DerivedCertKey {

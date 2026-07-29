@@ -54,9 +54,10 @@ pub struct StolenFields {
     pub aia_der: Option<Vec<u8>>,
 }
 
+use rcgen::string::Ia5String;
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, Ia5String, IsCa, KeyPair,
-    SanType, SerialNumber,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, SanType,
+    SerialNumber,
 };
 
 /// Build a forged leaf whose identity fields copy `fields`, self-signed by
