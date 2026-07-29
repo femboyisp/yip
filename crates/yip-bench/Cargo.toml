@@ -16,7 +16,7 @@ yip-transport = { path = "../yip-transport" }
 blake3 = "1.8.5"
 siphasher = "1.0.3"
 libc = "0.2"
-socket2 = "0.5"
+socket2 = "0.6"
 
 [[bench]]
 name = "hotpath"
