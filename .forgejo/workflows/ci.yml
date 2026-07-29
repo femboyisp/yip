@@ -17,7 +17,7 @@ jobs:
   build-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -43,7 +43,7 @@ jobs:
   shear:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       # taiki-e/install-action is not mirrored on this Forgejo instance; install
       # the tool directly instead of via the composite action.
@@ -55,7 +55,7 @@ jobs:
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       # EmbarkStudios/cargo-deny-action is not mirrored on this Forgejo instance;
       # install and run cargo-deny directly (same default `cargo deny check`).

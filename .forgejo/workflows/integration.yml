@@ -13,7 +13,7 @@ jobs:
   bench-smoke:
     runs-on: privileged
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Bench smoke (compile + quick run, not a perf gate)
         # --warm-up-time 1 --measurement-time 1 --sample-size 10 keeps the job
@@ -28,7 +28,7 @@ jobs:
   netem-comparison:
     runs-on: privileged
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install BoringSSL build deps (cmake + libclang)
         # The release yipd built below links `boring` (BoringSSL), whose build
@@ -89,7 +89,7 @@ jobs:
   device-tests:
     runs-on: privileged
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Build and run yip-device tests under sudo (CAP_NET_ADMIN)
         run: |
@@ -115,7 +115,7 @@ jobs:
   netns-tunnel-test:
     runs-on: privileged
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install BoringSSL build deps (cmake + libclang)
         # The TLS-mimicry transport (3c.2) links the `boring` crate, whose
@@ -467,7 +467,7 @@ jobs:
     # wired into CI to verify undetectability").
     runs-on: privileged
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install nDPI build dependencies
         # libpcap-dev is required (ndpiReader reads/writes pcaps). json-c and
