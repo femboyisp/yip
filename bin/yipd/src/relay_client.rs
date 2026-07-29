@@ -237,7 +237,7 @@ fn verify_fail_backoff(rng_bytes: [u8; 8]) -> Duration {
 /// `VERIFY_FAIL_BACKOFF_BASE`), which is safe.
 fn draw_verify_fail_backoff() -> Duration {
     let mut rng_bytes = [0u8; 8];
-    if let Err(e) = getrandom::getrandom(&mut rng_bytes) {
+    if let Err(e) = getrandom::fill(&mut rng_bytes) {
         eprintln!(
             "relay_client(reality): getrandom failed while jittering the verify-fail backoff, \
              using zero jitter: {e}"

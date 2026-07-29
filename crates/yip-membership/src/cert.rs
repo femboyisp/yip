@@ -245,10 +245,11 @@ impl RootSet {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use rand_core::OsRng;
+    use getrandom::SysRng;
+    use rand_core::UnwrapErr;
 
     fn ca() -> SigningKey {
-        SigningKey::generate(&mut OsRng)
+        SigningKey::generate(&mut UnwrapErr(SysRng))
     }
 
     fn make_cert(ca: &SigningKey, member: [u8; 32], net: [u8; 16], nb: u64, na: u64) -> Cert {
@@ -307,7 +308,9 @@ mod tests {
             Err(CertError::WrongMember)
         );
         // wrong CA
-        let other = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        let other = SigningKey::generate(&mut UnwrapErr(SysRng))
+            .verifying_key()
+            .to_bytes();
         assert_eq!(
             verify_cert(&c, &[other], &net, &member, 150, 0),
             Err(CertError::BadSig)
@@ -358,7 +361,9 @@ mod tests {
         assert!(rs.verify_rootset(&[ca_pub]));
 
         // wrong CA rejects
-        let other_ca = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        let other_ca = SigningKey::generate(&mut UnwrapErr(SysRng))
+            .verifying_key()
+            .to_bytes();
         assert!(!rs.verify_rootset(&[other_ca]));
 
         // tampered version rejects

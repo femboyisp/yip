@@ -132,7 +132,7 @@ impl RandomSource for OsRng {
         if self.error.is_some() {
             return;
         }
-        if let Err(e) = getrandom::getrandom(buf) {
+        if let Err(e) = getrandom::fill(buf) {
             self.error = Some(e);
         }
     }
@@ -182,7 +182,7 @@ impl rand_core::RngCore for MlKemRng {
         if self.error.is_some() {
             return;
         }
-        if let Err(e) = getrandom::getrandom(dest) {
+        if let Err(e) = getrandom::fill(dest) {
             self.error = Some(e);
         }
     }
@@ -778,7 +778,7 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
     // seal's ECDH. Never ring::agreement — its private key isn't
     // extractable, so it could not be reused for the seal.
     let mut eph_priv = [0u8; 32];
-    getrandom::getrandom(&mut eph_priv)?;
+    getrandom::fill(&mut eph_priv)?;
     let secret = x25519_dalek::StaticSecret::from(eph_priv);
     let eph_pub: [u8; 32] = x25519_dalek::PublicKey::from(&secret).to_bytes();
 
@@ -795,7 +795,7 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
     mlkem_rng.into_result()?;
 
     let mut client_random = [0u8; 32];
-    getrandom::getrandom(&mut client_random)?;
+    getrandom::fill(&mut client_random)?;
 
     let ts_min = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1047,7 +1047,7 @@ pub async fn capture_dest_flight<S: AsyncRead + AsyncWrite + Unpin>(
     // comment) — reused for the TLS key_share/ECDHE only, since there is no
     // REALITY seal to also key here.
     let mut eph_priv = [0u8; 32];
-    getrandom::getrandom(&mut eph_priv)?;
+    getrandom::fill(&mut eph_priv)?;
     let secret = x25519_dalek::StaticSecret::from(eph_priv);
     let eph_pub: [u8; 32] = x25519_dalek::PublicKey::from(&secret).to_bytes();
 
@@ -1059,13 +1059,13 @@ pub async fn capture_dest_flight<S: AsyncRead + AsyncWrite + Unpin>(
     mlkem_rng.into_result()?;
 
     let mut client_random = [0u8; 32];
-    getrandom::getrandom(&mut client_random)?;
+    getrandom::fill(&mut client_random)?;
 
     // No REALITY seal: dest ignores legacy_session_id entirely, so a random
     // 32-byte value stands in for it — still wire-shaped exactly like a real
     // seal (hello::craft only cares that it fits, not what's inside).
     let mut legacy_session_id = [0u8; 32];
-    getrandom::getrandom(&mut legacy_session_id)?;
+    getrandom::fill(&mut legacy_session_id)?;
 
     let params = ClientHelloParams {
         sni: sni.to_string(),
@@ -2060,7 +2060,7 @@ mod tests {
             .to_vec();
 
         let mut server_random = [0u8; 32];
-        getrandom::getrandom(&mut server_random).unwrap();
+        getrandom::fill(&mut server_random).unwrap();
 
         let mut key_share_entry = Vec::new();
         key_share_entry.extend_from_slice(&GROUP_X25519.to_be_bytes());
@@ -2522,7 +2522,7 @@ mod tests {
             .to_vec();
 
         let mut server_random = [0u8; 32];
-        getrandom::getrandom(&mut server_random).unwrap();
+        getrandom::fill(&mut server_random).unwrap();
 
         let mut key_share_entry = Vec::new();
         key_share_entry.extend_from_slice(&GROUP_X25519.to_be_bytes());
@@ -3012,7 +3012,7 @@ mod tests {
             .to_vec();
 
         let mut server_random = [0u8; 32];
-        getrandom::getrandom(&mut server_random).unwrap();
+        getrandom::fill(&mut server_random).unwrap();
 
         let mut key_share_entry = Vec::new();
         key_share_entry.extend_from_slice(&GROUP_X25519.to_be_bytes());

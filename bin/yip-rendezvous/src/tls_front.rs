@@ -216,7 +216,7 @@ impl yip_utls::hello::RandomSource for OsRandomSource {
         if self.error {
             return;
         }
-        if getrandom::getrandom(buf).is_err() {
+        if getrandom::fill(buf).is_err() {
             self.error = true;
         }
     }

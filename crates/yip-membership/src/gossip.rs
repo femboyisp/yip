@@ -126,12 +126,13 @@ mod tests {
     use crate::ids::node_id;
     use crate::record::{record_signing_body, sign};
     use ed25519_dalek::{Signer, SigningKey};
-    use rand_core::OsRng;
+    use getrandom::SysRng;
+    use rand_core::UnwrapErr;
 
     fn signed_record(seq: u64) -> Record {
-        let ca = SigningKey::generate(&mut OsRng);
+        let ca = SigningKey::generate(&mut UnwrapErr(SysRng));
         let member = [3u8; 32];
-        let member_sign_key = SigningKey::generate(&mut OsRng);
+        let member_sign_key = SigningKey::generate(&mut UnwrapErr(SysRng));
         let member_sign_pub = member_sign_key.verifying_key().to_bytes();
         let net = [7u8; 16];
 
