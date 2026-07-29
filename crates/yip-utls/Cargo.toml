@@ -6,11 +6,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-md-5 = "0.10"
+md-5 = "0.11"
 ring = "0.17"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"
-sha2 = "0.10"
+sha2 = "0.11"
 getrandom = { version = "0.2", features = ["std"] }
 tokio = { version = "1", features = ["io-util", "net", "macros", "rt"] }
 ml-kem = "0.2"
