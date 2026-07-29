@@ -126,7 +126,7 @@ pub fn build_throwaway_acceptor() -> Result<SslAcceptor, String> {
             .map_err(|e| e.to_string())?;
     let der = certified.cert.der().as_ref().to_vec();
     let x509 = boring::x509::X509::from_der(&der).map_err(|e| e.to_string())?;
-    let pkey = PKey::private_key_from_der(&certified.key_pair.serialize_der())
+    let pkey = PKey::private_key_from_der(&certified.signing_key.serialize_der())
         .map_err(|e| e.to_string())?;
 
     let mut b =
@@ -517,7 +517,7 @@ pub(crate) fn write_self_signed(dir: &std::path::Path) -> (String, String) {
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("key.pem");
     std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
     (
         cert_path.to_str().unwrap().to_owned(),
         key_path.to_str().unwrap().to_owned(),

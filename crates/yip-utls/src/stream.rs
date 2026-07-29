@@ -37,8 +37,8 @@ use crate::handshake::{
 };
 use crate::hello::{self, ClientHelloParams, RandomSource};
 use crate::template::{CapturedFlight, CertChainShape, EncryptedFlightShape, ServerFlightTemplate};
-use ml_kem::kem::Decapsulate;
-use ml_kem::{EncodedSizeUser, KemCore, MlKem768};
+use ml_kem::kem::{Decapsulate, KeyExport};
+use ml_kem::{Kem, MlKem768};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -139,15 +139,17 @@ impl RandomSource for OsRng {
 }
 
 /// The same OS-CSPRNG-backed, latched-error `getrandom` bridge as [`OsRng`],
-/// but implementing `rand_core::{RngCore, CryptoRng}` instead of
-/// [`RandomSource`] — the trait bound `ml_kem::MlKem768::generate` needs
-/// (`rand_core::CryptoRngCore`, blanket-implemented for any
-/// `RngCore + CryptoRng`). `rand_core::RngCore::fill_bytes` has no `Result`
-/// return, so a `getrandom` failure is latched the same way `OsRng` latches
+/// but implementing `rand_core`'s `TryRng`/`TryCryptoRng` instead of
+/// [`RandomSource`] — the trait bound `ml_kem::MlKem768::generate_keypair_from_rng`
+/// needs (`rand_core::CryptoRng`, blanket-implemented for any
+/// `TryRng<Error = Infallible> + TryCryptoRng<Error = Infallible>`).
+/// `try_fill_bytes` returns `Result<(), Infallible>` (it cannot itself
+/// fail), so a `getrandom` failure is latched the same way `OsRng` latches
 /// one, and [`MlKemRng::into_result`] surfaces it to the caller after
-/// `generate` returns (which, on a latched failure, still returns *some*
-/// keypair built from bytes that silently stayed zero — [`connect`] discards
-/// it and bails out via `into_result` before ever using it).
+/// `generate_keypair_from_rng` returns (which, on a latched failure, still
+/// returns *some* keypair built from bytes that silently stayed zero —
+/// [`connect`] discards it and bails out via `into_result` before ever using
+/// it).
 /// `pub(crate)` (not just private to this module) so [`crate::server`]'s test
 /// module can generate a real client ML-KEM keypair the same way `connect`
 /// does, without duplicating this bridge.
@@ -163,22 +165,8 @@ impl MlKemRng {
             None => Ok(()),
         }
     }
-}
 
-impl rand_core::RngCore for MlKemRng {
-    fn next_u32(&mut self) -> u32 {
-        let mut buf = [0u8; 4];
-        self.fill_bytes(&mut buf);
-        u32::from_ne_bytes(buf)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let mut buf = [0u8; 8];
-        self.fill_bytes(&mut buf);
-        u64::from_ne_bytes(buf)
-    }
-
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
+    fn fill(&mut self, dest: &mut [u8]) {
         if self.error.is_some() {
             return;
         }
@@ -186,14 +174,30 @@ impl rand_core::RngCore for MlKemRng {
             self.error = Some(e);
         }
     }
+}
 
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
-        self.fill_bytes(dest);
+impl rand_core::TryRng for MlKemRng {
+    type Error = core::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        let mut buf = [0u8; 4];
+        self.fill(&mut buf);
+        Ok(u32::from_ne_bytes(buf))
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        let mut buf = [0u8; 8];
+        self.fill(&mut buf);
+        Ok(u64::from_ne_bytes(buf))
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
+        self.fill(dest);
         Ok(())
     }
 }
 
-impl rand_core::CryptoRng for MlKemRng {}
+impl rand_core::TryCryptoRng for MlKemRng {}
 
 /// Builds a 5-byte TLS record header for a `content_type`/`legacy_version`
 /// record of plaintext-or-ciphertext length `len`.
@@ -593,7 +597,7 @@ fn spki_sec1_pubkey_from_der(cert_der: &[u8]) -> Result<Vec<u8>, Error> {
     let vk = p256::ecdsa::VerifyingKey::from_public_key_der(spki_der).map_err(|_| {
         Error::RealityVerify("leaf certificate's public key is not a valid P-256 SPKI")
     })?;
-    Ok(vk.to_encoded_point(false).as_bytes().to_vec())
+    Ok(vk.to_sec1_point(false).as_bytes().to_vec())
 }
 
 /// Verify a TLS 1.3 server `CertificateVerify` for REALITY.4b: the leaf's
@@ -791,7 +795,7 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
     // the hybrid exchange if the server selects group 4588 below; `mlkem_ek`
     // is sent as-is in the ClientHello.
     let mut mlkem_rng = MlKemRng::default();
-    let (mlkem_dk, mlkem_ek) = MlKem768::generate(&mut mlkem_rng);
+    let (mlkem_dk, mlkem_ek) = MlKem768::generate_keypair_from_rng(&mut mlkem_rng);
     mlkem_rng.into_result()?;
 
     let mut client_random = [0u8; 32];
@@ -814,7 +818,7 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
     let params = ClientHelloParams {
         sni: sni.to_string(),
         key_share_x25519_pub: eph_pub,
-        key_share_mlkem_ek: mlkem_ek.as_bytes().to_vec(),
+        key_share_mlkem_ek: mlkem_ek.to_bytes().to_vec(),
         legacy_session_id,
         client_random,
     };
@@ -864,9 +868,7 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
             let ciphertext = ct_bytes
                 .try_into()
                 .map_err(|_| handshake::Error::MlKemDecapsulation)?;
-            let mlkem_ss = mlkem_dk
-                .decapsulate(&ciphertext)
-                .map_err(|()| handshake::Error::MlKemDecapsulation)?;
+            let mlkem_ss = mlkem_dk.decapsulate(&ciphertext);
             let server_x25519_pub: [u8; 32] = server_x25519_pub
                 .try_into()
                 .map_err(|_| handshake::Error::BadKeyShareLength)?;
@@ -1055,7 +1057,7 @@ pub async fn capture_dest_flight<S: AsyncRead + AsyncWrite + Unpin>(
     // ML-KEM-strict dest (Cloudflare, Google) validates the encapsulation
     // key's canonical encoding, so only a genuine key survives probing it.
     let mut mlkem_rng = MlKemRng::default();
-    let (mlkem_dk, mlkem_ek) = MlKem768::generate(&mut mlkem_rng);
+    let (mlkem_dk, mlkem_ek) = MlKem768::generate_keypair_from_rng(&mut mlkem_rng);
     mlkem_rng.into_result()?;
 
     let mut client_random = [0u8; 32];
@@ -1070,7 +1072,7 @@ pub async fn capture_dest_flight<S: AsyncRead + AsyncWrite + Unpin>(
     let params = ClientHelloParams {
         sni: sni.to_string(),
         key_share_x25519_pub: eph_pub,
-        key_share_mlkem_ek: mlkem_ek.as_bytes().to_vec(),
+        key_share_mlkem_ek: mlkem_ek.to_bytes().to_vec(),
         legacy_session_id,
         client_random,
     };
@@ -1116,9 +1118,7 @@ pub async fn capture_dest_flight<S: AsyncRead + AsyncWrite + Unpin>(
             let ciphertext = ct_bytes
                 .try_into()
                 .map_err(|_| handshake::Error::MlKemDecapsulation)?;
-            let mlkem_ss = mlkem_dk
-                .decapsulate(&ciphertext)
-                .map_err(|()| handshake::Error::MlKemDecapsulation)?;
+            let mlkem_ss = mlkem_dk.decapsulate(&ciphertext);
             let server_x25519_pub: [u8; 32] = server_x25519_pub
                 .try_into()
                 .map_err(|_| handshake::Error::BadKeyShareLength)?;
@@ -3235,7 +3235,7 @@ mod tests {
         let signing_key = SigningKey::from_slice(&[0x11u8; 32]).unwrap();
         let pubkey_sec1 = signing_key
             .verifying_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec();
         let transcript = transcript_hash(b"ch||sh||ee||cert", SUITE);
@@ -3256,7 +3256,7 @@ mod tests {
         let other_key = SigningKey::from_slice(&[0x22u8; 32]).unwrap();
         let other_pub = other_key
             .verifying_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec();
         let transcript = transcript_hash(b"ch||sh||ee||cert", SUITE);
@@ -3268,7 +3268,7 @@ mod tests {
         // Tampered transcript (verify against a different hash) → RealityVerify.
         let signer_pub = signing_key
             .verifying_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec();
         let tampered = transcript_hash(b"different-transcript", SUITE);

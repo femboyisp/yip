@@ -12,7 +12,7 @@ use crate::hello::RandomSource;
 use crate::template::ServerHelloShape;
 use crate::wire::HelloWriter;
 use ml_kem::kem::Encapsulate;
-use ml_kem::{EncodedSizeUser, KemCore, MlKem768};
+use ml_kem::{Kem, Key, MlKem768};
 
 /// The `key_share` extension's registered TLS extension ID (RFC 8446 §4.2.8).
 const EXT_KEY_SHARE: u16 = 0x0033;
@@ -22,39 +22,42 @@ const LEGACY_VERSION_TLS12: u16 = 0x0303;
 /// The `ServerHello` handshake message type (RFC 8446 §4).
 const HANDSHAKE_TYPE_SERVER_HELLO: u8 = 0x02;
 
-/// Bridges the caller's [`RandomSource`] to the `rand_core::CryptoRngCore`
-/// bound `ml_kem`'s `Encapsulate` needs. Unlike [`crate::stream`]'s
-/// `MlKemRng` (which is hardwired to the OS CSPRNG for `connect`'s
-/// production use), this wraps whatever [`RandomSource`] the caller passed
-/// `server_key_share` — the OS CSPRNG in production, or a deterministic
-/// seeded RNG in tests — so every byte `server_key_share` produces, X25519
-/// and ML-KEM alike, is attributable to its one `rng` argument.
+/// Bridges the caller's [`RandomSource`] to the `rand_core::CryptoRng` bound
+/// `ml_kem`'s `Encapsulate` needs. Unlike [`crate::stream`]'s `MlKemRng`
+/// (which is hardwired to the OS CSPRNG for `connect`'s production use),
+/// this wraps whatever [`RandomSource`] the caller passed `server_key_share`
+/// — the OS CSPRNG in production, or a deterministic seeded RNG in tests —
+/// so every byte `server_key_share` produces, X25519 and ML-KEM alike, is
+/// attributable to its one `rng` argument.
+///
+/// Implements `rand_core` 0.10's `TryRng` (with `Error = Infallible`, since
+/// [`RandomSource::fill`] cannot fail) rather than the old 0.6 `RngCore`;
+/// `Rng` and `CryptoRng` are then blanket-derived for any
+/// `TryRng<Error = Infallible>` + `TryCryptoRng<Error = Infallible>` type.
 struct RandomSourceRng<'a>(&'a mut dyn RandomSource);
 
-impl rand_core::RngCore for RandomSourceRng<'_> {
-    fn next_u32(&mut self) -> u32 {
+impl rand_core::TryRng for RandomSourceRng<'_> {
+    type Error = core::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
         let mut buf = [0u8; 4];
-        self.fill_bytes(&mut buf);
-        u32::from_ne_bytes(buf)
+        self.0.fill(&mut buf);
+        Ok(u32::from_ne_bytes(buf))
     }
 
-    fn next_u64(&mut self) -> u64 {
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
         let mut buf = [0u8; 8];
-        self.fill_bytes(&mut buf);
-        u64::from_ne_bytes(buf)
+        self.0.fill(&mut buf);
+        Ok(u64::from_ne_bytes(buf))
     }
 
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
         self.0.fill(dest);
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
-        self.fill_bytes(dest);
         Ok(())
     }
 }
 
-impl rand_core::CryptoRng for RandomSourceRng<'_> {}
+impl rand_core::TryCryptoRng for RandomSourceRng<'_> {}
 
 /// The relay's server-side KEX for `group`. Returns `(server_key_share_bytes,
 /// shared_secret)`: the key_share to put in the `ServerHello`, and the ECDHE
@@ -84,14 +87,12 @@ pub fn server_key_share(
                 "group 4588 requires the client's ML-KEM ek",
             ))?;
             // Decode the client's encapsulation key, encapsulate against it.
-            let encoded =
-                ml_kem::Encoded::<<MlKem768 as KemCore>::EncapsulationKey>::try_from(ek_bytes)
-                    .map_err(|_| Error::Protocol("client ML-KEM ek is the wrong length"))?;
-            let ek = <MlKem768 as KemCore>::EncapsulationKey::from_bytes(&encoded);
+            let encoded = Key::<<MlKem768 as Kem>::EncapsulationKey>::try_from(ek_bytes)
+                .map_err(|_| Error::Protocol("client ML-KEM ek is the wrong length"))?;
+            let ek = <MlKem768 as Kem>::EncapsulationKey::new(&encoded)
+                .map_err(|_| Error::Protocol("client ML-KEM ek failed validation"))?;
             let mut kem_rng = RandomSourceRng(rng);
-            let (ct, mlkem_ss) = ek
-                .encapsulate(&mut kem_rng)
-                .map_err(|()| Error::Protocol("ML-KEM encapsulation failed"))?;
+            let (ct, mlkem_ss) = ek.encapsulate_with_rng(&mut kem_rng);
             // server key_share = ct(1088) ‖ x25519_pub(32).
             let mut ks = Vec::with_capacity(MLKEM768_CIPHERTEXT_LEN + 32);
             ks.extend_from_slice(ct.as_slice());
@@ -197,7 +198,7 @@ mod tests {
     use super::*;
     use crate::hello::RandomSource;
     use crate::template::ServerHelloShape;
-    use ml_kem::kem::Decapsulate;
+    use ml_kem::kem::{Decapsulate, KeyExport};
 
     /// A deterministic test RNG (mirrors the one `hello.rs`/`stream.rs` tests
     /// use): fills every buffer with a counting byte sequence starting at the
@@ -251,8 +252,8 @@ mod tests {
     fn roundtrip(group: u16) {
         // Client keypairs (as `stream::connect` generates them).
         let mut mlkem_rng = crate::stream::MlKemRng::default();
-        let (client_dk, client_ek) = MlKem768::generate(&mut mlkem_rng);
-        let client_ek_bytes = client_ek.as_bytes().to_vec();
+        let (client_dk, client_ek) = MlKem768::generate_keypair_from_rng(&mut mlkem_rng);
+        let client_ek_bytes = client_ek.to_bytes().to_vec();
         let mut cx = [0u8; 32];
         SeqRng(3).fill(&mut cx);
         let client_secret = x25519_dalek::StaticSecret::from(cx);
@@ -283,7 +284,7 @@ mod tests {
         let ecdhe: Vec<u8> = if group == 4588 {
             let (ct, sx) = shi.server_key_share.split_at(1088);
             let ciphertext = ct.try_into().unwrap();
-            let mlkem_ss = client_dk.decapsulate(&ciphertext).unwrap();
+            let mlkem_ss = client_dk.decapsulate(&ciphertext);
             let sxp: [u8; 32] = sx.try_into().unwrap();
             let x_ss = client_secret
                 .diffie_hellman(&x25519_dalek::PublicKey::from(sxp))
@@ -370,10 +371,10 @@ mod tests {
     #[test]
     fn server_key_share_4588_shapes() {
         // A real client ML-KEM ek (generate one, as the client does).
-        use ml_kem::{EncodedSizeUser, KemCore, MlKem768};
+        use ml_kem::MlKem768;
         let mut r = crate::stream::MlKemRng::default();
-        let (_dk, ek) = MlKem768::generate(&mut r);
-        let ek_bytes = ek.as_bytes().to_vec();
+        let (_dk, ek) = MlKem768::generate_keypair_from_rng(&mut r);
+        let ek_bytes = ek.to_bytes().to_vec();
         let client_x = [9u8; 32];
         let (ks, ss) = server_key_share(4588, &client_x, Some(&ek_bytes), &mut SeqRng(1)).unwrap();
         assert_eq!(ks.len(), 1088 + 32); // ct ‖ x25519 public

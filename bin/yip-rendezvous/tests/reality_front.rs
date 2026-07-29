@@ -131,7 +131,7 @@ async fn unauthenticated_connection_is_spliced_to_dest() {
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("key.pem");
     std::fs::write(&cert_path, cert.cert.pem()).expect("write cert.pem");
-    std::fs::write(&key_path, cert.key_pair.serialize_pem()).expect("write key.pem");
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).expect("write key.pem");
 
     let udp_addr = format!("127.0.0.1:{}", free_udp_port());
     let tcp_addr = format!("127.0.0.1:{}", free_tcp_port());
