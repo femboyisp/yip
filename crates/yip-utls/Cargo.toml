@@ -18,7 +18,7 @@ rand_core = { version = "0.6", default-features = false }
 # REALITY.4b: ECDSA-P256 (ecdsa_secp256r1_sha256, the Chrome-advertised sig alg)
 # for the shared-secret-derived cert key — client verify + server binding.
 # `pkcs8` lets the server hand the derived key to rcgen; `ecdsa` for verify.
-p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
 # REALITY.4b Task 2: a safe, fail-closed (panic-free on hostile bytes), no_std
 # DER reader — already present in the dependency graph transitively via
 # p256's `pkcs8` feature — used to walk the server's Certificate leaf's DER

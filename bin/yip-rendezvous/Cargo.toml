@@ -52,7 +52,7 @@ x509-parser = { version = "0.18.1", default-features = false }
 # (REALITY.4b Task 3 test-only use) now that it is also a production
 # dependency; same version yip-utls already depends on for the identical
 # derivation.
-p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
 
 [lints]
 workspace = true
