@@ -32,7 +32,7 @@ tokio-boring = "5"
 # tests (deriving a public key from a raw private scalar via `StaticSecret`,
 # which needs raw 32-byte-key construction — `ring::agreement` doesn't
 # accept raw private-key bytes).
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 # REALITY.3: runtime leaf forgery for the stolen-cert authed acceptor
 # (src/reality_cert.rs). Same feature set the tests already used.
 rcgen = { version = "0.14", default-features = false, features = ["ring", "crypto", "pem"] }

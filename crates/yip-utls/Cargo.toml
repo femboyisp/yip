@@ -8,8 +8,8 @@ repository.workspace = true
 [dependencies]
 md-5 = "0.11"
 ring = "0.17"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-chacha20poly1305 = "0.10"
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+chacha20poly1305 = "0.11"
 sha2 = "0.11"
 getrandom = "0.4"
 tokio = { version = "1", features = ["io-util", "net", "macros", "rt"] }
@@ -25,7 +25,7 @@ p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
 # far enough to slice out its `subjectPublicKeyInfo` TLV, which is then
 # handed to `p256::ecdsa::VerifyingKey::from_public_key_der` (never
 # hand-rolled ASN.1 arithmetic on untrusted bytes).
-der = "0.7"
+der = "0.8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "net", "macros", "rt-multi-thread", "time"] }
