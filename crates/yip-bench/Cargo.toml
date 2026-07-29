@@ -10,7 +10,7 @@ publish = false
 yip-crypto = { path = "../yip-crypto" }
 
 [dev-dependencies]
-criterion = "0.5.1"
+criterion = "0.8.0"
 yip-wire = { path = "../yip-wire" }
 yip-transport = { path = "../yip-transport" }
 blake3 = "1.8.5"
