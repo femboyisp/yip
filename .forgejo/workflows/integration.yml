@@ -138,7 +138,12 @@ jobs:
         # so every attempt died identically at run-netns-tunnel.sh:86. Every
         # job that needs `ip` now declares it: relying on it arriving as a
         # Recommends of something else is what broke netem-comparison.
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev pkg-config iproute2 iputils-ping
+        #
+        # tcpdump: this job's 26 tests span ~30 harness scripts, and ten of
+        # them capture with tcpdump (flowshape, rekey, replay-hijack,
+        # path-switch, the mimicry oracles). It is NOT preinstalled — see the
+        # corrected note on the tshark step below.
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev pkg-config iproute2 iputils-ping tcpdump
       - name: Build and run yipd netns tunnel tests under sudo
         run: |
           # Filter for the tunnel_netns test binary specifically: a --no-run build
@@ -323,9 +328,12 @@ jobs:
 
       - name: Install tshark
         # run-netns-replay-hijack.sh (below) uses tshark to extract a
-        # captured [HandshakeInit] datagram's raw UDP payload for replay --
-        # unlike tcpdump (preinstalled on the runner image), tshark is not
-        # guaranteed present, so install it explicitly.
+        # captured [HandshakeInit] datagram's raw UDP payload for replay, and
+        # is not present on the runner image. Neither is tcpdump -- an earlier
+        # version of this comment claimed it was preinstalled, which is how
+        # flowshape_not_obviously_constant came to fail on
+        # `exec of "tcpdump" failed`. Both are installed explicitly now
+        # (tcpdump with the netns tooling above).
         # DEBIAN_FRONTEND=noninteractive: tshark's postinst otherwise prompts
         # (debconf) to ask whether non-superusers may capture packets; this
         # job always invokes it via sudo anyway, so the prompt is moot.
