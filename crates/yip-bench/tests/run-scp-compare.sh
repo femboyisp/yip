@@ -360,6 +360,13 @@ start_sshd() {
     local logfile="$3"
     # Remove stale pidfile
     rm -f "$pidfile"
+    # sshd refuses to start without its privilege-separation directory
+    # ("Missing privilege separation directory: /run/sshd", exit 255). The
+    # package's postinst normally creates it, but the CI runner image
+    # (catthehacker/ubuntu:act-22.04) ships sshd without ever having run it,
+    # and /run is a fresh tmpfs each container. Root here already — the whole
+    # harness runs under sudo for netns.
+    mkdir -p /run/sshd && chmod 0755 /run/sshd
     # `-E "$logfile"` routes sshd's own diagnostics to a file, so a failed start
     # under `set -e` aborted the whole harness with nothing on stdout but
     # "[yip] starting sshd in yipA" — the reason sealed in a file the cleanup
