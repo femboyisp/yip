@@ -360,6 +360,12 @@ start_sshd() {
     local logfile="$3"
     # Remove stale pidfile
     rm -f "$pidfile"
+    # `-E "$logfile"` routes sshd's own diagnostics to a file, so a failed start
+    # under `set -e` aborted the whole harness with nothing on stdout but
+    # "[yip] starting sshd in yipA" — the reason sealed in a file the cleanup
+    # trap then removed. That is how CI reported only "harness failed". Surface
+    # it: on failure dump sshd's log and exit status before propagating.
+    local rc=0
     ip netns exec "$ns" /usr/sbin/sshd -p 2222 -h "$TMPDIR_TEST/host" \
         -o "PidFile=$pidfile" \
         -o "AuthorizedKeysFile=$TMPDIR_TEST/authkeys" \
@@ -367,7 +373,12 @@ start_sshd() {
         -o "PasswordAuthentication=no" \
         -o "StrictModes=no" \
         -o "PermitRootLogin=yes" \
-        -E "$logfile"
+        -E "$logfile" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "[error] sshd failed to start in netns $ns (exit $rc); sshd log follows:" >&2
+        cat "$logfile" >&2 2>/dev/null || echo "[error] (no sshd log at $logfile)" >&2
+        return "$rc"
+    fi
     # Brief wait for sshd to write its pidfile
     local wait=0
     while [ ! -f "$pidfile" ] && [ "$wait" -lt 50 ]; do
