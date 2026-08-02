@@ -375,8 +375,16 @@ start_sshd() {
         -o "PermitRootLogin=yes" \
         -E "$logfile" || rc=$?
     if [ "$rc" -ne 0 ]; then
-        echo "[error] sshd failed to start in netns $ns (exit $rc); sshd log follows:" >&2
-        cat "$logfile" >&2 2>/dev/null || echo "[error] (no sshd log at $logfile)" >&2
+        echo "[error] sshd failed to start in netns $ns (exit $rc)" >&2
+        # Test for content, not for cat's exit status: an existing-but-empty
+        # log makes `cat` succeed silently, reproducing the blank wall this
+        # whole branch exists to remove.
+        if [ -s "$logfile" ]; then
+            echo "[error] sshd log follows:" >&2
+            cat "$logfile" >&2
+        else
+            echo "[error] sshd wrote no log at $logfile" >&2
+        fi
         return "$rc"
     fi
     # Brief wait for sshd to write its pidfile

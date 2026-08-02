@@ -38,6 +38,16 @@ jobs:
           sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
       - name: Install wireguard-tools
         run: sudo apt-get install -y wireguard-tools
+      - name: Install netns/netem tooling
+        # The five harness scripts this job drives need `ip` + `tc` (iproute2),
+        # `ping` (iputils-ping) and `iperf3`; none ship in the runner image.
+        #
+        # These were never declared because wireguard-tools happened to pull
+        # iproute2 and iputils-ping in as Recommends. That is not a dependency,
+        # and it stopped happening: run 277 shows "Setting up iproute2", run 290
+        # (one day later, same line) does not, and the job then died at
+        # run-yip-netem.sh:99 with `ip: command not found`. Declare them.
+        run: sudo apt-get install -y iproute2 iputils-ping iperf3
       - name: Load wireguard kernel module
         run: sudo modprobe wireguard || echo "[note] wireguard module unavailable; WG column will be skipped"
       - name: Build test binaries
@@ -124,10 +134,10 @@ jobs:
         # these, so install them explicitly.
         #
         # iproute2 + iputils-ping are what run-netns-tunnel.sh actually drives
-        # (`ip` 42x, `ping` 4x) and are likewise absent from the runner image.
-        # netem-comparison only has them by accident — transitive deps of
-        # wireguard-tools. This job installs no such package, so `ip` was not
-        # found and every attempt died identically at run-netns-tunnel.sh:86.
+        # (`ip` 42x, `ping` 4x) and are likewise absent from the runner image,
+        # so every attempt died identically at run-netns-tunnel.sh:86. Every
+        # job that needs `ip` now declares it: relying on it arriving as a
+        # Recommends of something else is what broke netem-comparison.
         run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev pkg-config iproute2 iputils-ping
       - name: Build and run yipd netns tunnel tests under sudo
         run: |
@@ -487,9 +497,8 @@ jobs:
           # clang + libclang-dev: boring's bindgen step (the transport=tls yipd
           # links BoringSSL) needs libclang; the runner image doesn't ship it.
           # iproute2 + iputils-ping + tcpdump: what run-ndpi-oracle.sh drives
-          # directly (`ip` 33x, `tcpdump` 8x, `ping` 7x). Absent from the runner
-          # image, and unlike netem-comparison nothing here pulls them in as a
-          # transitive dep, so every attempt died at run-ndpi-oracle.sh:129.
+          # directly (`ip` 33x, `tcpdump` 8x, `ping` 7x). All absent from the
+          # runner image, so every attempt died at run-ndpi-oracle.sh:129.
           sudo apt-get install -y libpcap-dev libjson-c-dev libgcrypt20-dev autoconf automake libtool pkg-config gettext cmake clang libclang-dev iproute2 iputils-ping tcpdump
 
       # Pinned nDPI checkout: this SHA is the exact commit vendored locally at
