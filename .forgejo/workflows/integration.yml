@@ -36,18 +36,26 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
-      - name: Install wireguard-tools
-        run: sudo apt-get install -y wireguard-tools
-      - name: Install netns/netem tooling
-        # The five harness scripts this job drives need `ip` + `tc` (iproute2),
-        # `ping` (iputils-ping) and `iperf3`; none ship in the runner image.
+      - name: Install netns/netem + wireguard tooling
+        # The job image (catthehacker/ubuntu:act-22.04) ships NO iproute2 and no ping —
+        # `ip`, `tc` and `ping` are all absent from it, which is why run-yip-netem.sh
+        # died at line 99 with `ip: command not found`. iproute2 provides BOTH `ip` and
+        # `tc`, and `tc` is what applies the netem impairment this job exists to measure.
         #
-        # These were never declared because wireguard-tools happened to pull
-        # iproute2 and iputils-ping in as Recommends. That is not a dependency,
-        # and it stopped happening: run 277 shows "Setting up iproute2", run 290
-        # (one day later, same line) does not, and the job then died at
-        # run-yip-netem.sh:99 with `ip: command not found`. Declare them.
-        run: sudo apt-get install -y iproute2 iputils-ping iperf3
+        # Installing these on the runner-priv container itself does nothing: act_runner
+        # here maps `privileged` to docker://catthehacker/ubuntu:act-22.04, so every step
+        # executes inside that image and never touches the runner's own filesystem.
+        # The container does run privileged, so netns/tc work once the tools are present.
+        #
+        # iperf3 belongs here for the same reason: run-fec-compare.sh and
+        # run-iperf-compare.sh drive it, and without it those two SKIP their
+        # column while the job still reports green — measuring less than it claims.
+        #
+        # These were never *declared* before because wireguard-tools happens to
+        # list iproute2/iputils-ping as Recommends. That is not a dependency, and
+        # it stopped resolving: run 277 logs "Setting up iproute2"; run 290 — same
+        # apt line, one day later — does not.
+        run: sudo apt-get install -y iproute2 iputils-ping iperf3 wireguard-tools
       - name: Load wireguard kernel module
         run: sudo modprobe wireguard || echo "[note] wireguard module unavailable; WG column will be skipped"
       - name: Build test binaries
