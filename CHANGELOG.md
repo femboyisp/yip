@@ -191,6 +191,34 @@ until 0.1.0.
   (`RetxBuffer`), plus `Transport::repair_object`.
 
 ### Fixed
+- **Privileged CI jobs declared none of the tooling they drive (PR #156).**
+  `catthehacker/ubuntu:act-22.04` — the image every Forgejo Actions job runs
+  in — ships no `ip`, `tc`, `ping`, `tcpdump`, `iperf3` or `wg`, and its
+  `PATH` already includes `/usr/sbin` and `/sbin`, so these were missing
+  packages and never a PATH problem. `netns-tunnel-test` and
+  `dpi-undetectability` died at `run-netns-tunnel.sh:86` and
+  `run-ndpi-oracle.sh:129` with `ip: command not found`; every retry failed
+  identically because the fault was deterministic. `netem-comparison` had
+  `ip` only as a transitive *Recommends* of `wireguard-tools` — not a
+  dependency — and broke the day that resolution changed. Each job now
+  installs what its harness scripts actually run, sized from every script the
+  job drives rather than the one that happened to fail first. Also: the scp
+  harness creates `/run/sshd` before starting `sshd` (the package postinst
+  normally does, but the image ships `sshd` without having run it and `/run`
+  is a fresh tmpfs per container), and `start_sshd` now prints sshd's log and
+  exit status on failure instead of leaving `-E "$logfile"` output in a file
+  the cleanup trap deletes — which is why that failure had surfaced only as
+  `harness failed`. A stale comment claiming `tcpdump` was "preinstalled on
+  the runner image" is corrected; that belief is why it was never declared.
+- **`hardening.41` cert-revocation gave discovery less time than it needs
+  (PR #158, #157).** `CERT_A_SECS` was 60 and the establish loop stops 5s
+  before expiry to keep the "still valid" invariant honest, leaving a 55s
+  convergence window — while `run-netns-discovery.sh:287` documents gossip
+  warm-up as needing "up to a 60s budget". The test allocated less time than
+  its own sibling says the thing it waits for can take, so a green run was
+  one that happened to converge early. Raised to 150s (~2.5x the documented
+  worst case); the assertion is unchanged, since the cert still expires
+  mid-test.
 - Session-lifecycle hardening (#36 path-switch re-handshake + #41 cert
   revocation, PR #95): a path-switch (roaming) no longer discards the
   in-flight handshake ephemeral, both initiator- and responder-side relay
