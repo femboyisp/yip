@@ -109,11 +109,21 @@ NETWORK_ID="c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
 # `YIP_CERT_SKEW_SECS` (exported to the daemons below) overrides it to this
 # small value so the expiry wait is bounded to seconds. Keep the two in sync.
 CLOCK_SKEW_SECS=3
-# A's cert validity window (seconds). Generous enough to comfortably cover
-# netns/CA setup + daemon startup + TUN wait + gossip discovery warm-up
-# (run-netns-discovery.sh documents up to a 60s budget for that warm-up)
-# before we need it to still be valid for the "establish while valid" step.
-CERT_A_SECS=60
+# A's cert validity window (seconds). This has to outlast gossip discovery
+# warm-up, because the "establish while valid" step below cannot succeed until
+# A has discovered B.
+#
+# It was 60s, which could not work: run-netns-discovery.sh:287 documents that
+# warm-up as needing "up to a 60s budget", and the retry loop in step 8 gives
+# up 5s BEFORE expiry to keep the still-valid invariant honest -- so the real
+# window was 55s for something documented to need 60. Every green run was one
+# that happened to converge early; a loaded runner only decided which side of
+# the line a given run landed on. See #157.
+#
+# 150s is ~2.5x the documented worst case. The assertion is unchanged: the cert
+# still expires mid-test, which is the entire point of the revocation check.
+# The cost is that step 9's wait-for-expiry grows by the same amount.
+CERT_A_SECS=150
 # Extra slack past cert_secs+skew+rekey_interval before we check for the
 # drop: covers scheduling jitter in the sweep's throttle and the rekey
 # cadence (a few missed 2s cycles is nothing against this margin).
