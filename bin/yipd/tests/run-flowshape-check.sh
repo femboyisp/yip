@@ -18,53 +18,76 @@
 # startup and glare-resolve by static-key comparison (peer_manager.rs, the
 # `Glare:` comment). With obf_psk set, EACH side's `begin_handshake` prepends
 # its own burst of `Jc ∈ [JUNK_BURST_MIN, JUNK_BURST_MAX] = [3, 12]` plaintext
-# junk datagrams ahead of its `[HandshakeInit]` (peer_manager.rs), so in
-# practice both bursts interleave on the wire within microseconds of process
-# start, followed (once the glare tie is broken) by a single `[HandshakeResp]`
-# — verified empirically: capturing a real session and computing inter-packet
-# gaps shows a tight cluster of sub-millisecond gaps (the two bursts + Init(s)
-# + Resp) followed by a hard cutover to the periodic ~22-38ms
-# Control-feedback cadence (`FEEDBACK_INTERVAL_MS` jittered under obf_psk,
-# bin/yipd/src/dataplane.rs) that starts ticking in both directions forever
-# afterward, data or no data.
+# junk datagrams ahead of its `[HandshakeInit]` (peer_manager.rs), so within
+# microseconds of process start each side emits a dense sub-millisecond burst
+# (its Jc junk + Init), the two bursts separated by a short scheduling handoff,
+# then (once the glare tie is broken) the Noise completion / `[HandshakeResp]`
+# messages — also dense but after a ~30ms round-trip wait. Eventually the
+# periodic Control-feedback cadence takes over (`FEEDBACK_INTERVAL_MS`=30ms
+# jittered to [23, 37]ms under obf_psk, bin/yipd/src/dataplane.rs), ticking in
+# both directions forever afterward, data or no data. The exact structure and
+# why the boundary is NOT a single clean gap are detailed in the MEASUREMENT
+# block below.
 #
-# That inter-packet-gap structure is what this script measures, and it is
-# what makes the count deterministic to compute regardless of which side
-# ends up as Noise responder: read the capture in arrival order and count
-# the leading run of datagrams whose inter-arrival gap never exceeds a fixed
-# threshold (5 ms — two orders of magnitude above the observed intra-burst
-# gaps of low single-digit microseconds, and well below the lowest possible
-# steady-state feedback gap of ~22.5 ms). That leading run IS the
-# handshake-phase: both sides' junk bursts, their Init(s), and the Resp.
+# MEASUREMENT — count the handshake DENSE-CLUSTER SPAN, not a gap-cutoff run.
+# An earlier version stopped the count at the first inter-packet gap above a
+# fixed threshold ("leading run"). That is not robust: empirically the
+# handshake phase is NOT one uninterrupted dense run separated from steady
+# state by a single big gap. A real idle capture (both directions, in arrival
+# order) looks like:
+#   * a dense burst from one side (its Jc junk + Init), gaps ~microseconds;
+#   * a ~5 ms scheduling handoff, then the other side's dense burst;
+#   * a ~30 ms round-trip WAIT (inside the handshake) before the Noise
+#     completion / Resp messages, which are themselves dense;
+#   * only then steady-state feedback: two independent ~30 ms streams whose
+#     merged inter-packet gaps swing between ~0 ms (coincident cross-response
+#     pairs) and ~30 ms.
+# So gap MAGNITUDE alone cannot say which phase a packet is in: a ~30 ms gap
+# occurs INSIDE the handshake (the round-trip wait) and coincident sub-ms
+# pairs occur INSIDE steady state. Any single gap threshold either truncates
+# the handshake mid-burst on a scheduling stall (the CI flake this replaced —
+# a burst of ~20 datagrams was counted as 4) or plows deep into steady state.
+#
+# The reliable discriminator is CLUSTER DENSITY: the handshake phase is built
+# of dense clusters of >= MIN_CLUSTER packets spaced < DENSE_GAP_S apart (both
+# junk bursts, both Inits, and the Noise completion), whereas steady state
+# never forms a run of 3 packets that close — at most a coincident PAIR. So
+# the count is the index of the LAST packet belonging to a >= MIN_CLUSTER
+# dense cluster. This is robust to scheduling stalls: a stall merely splits
+# one dense cluster into two (both still counted, since we anchor on the last
+# qualifying cluster, not a leading run), and it never mistakes steady state
+# for handshake (steady state has no >= 3 dense run). Empirically stable:
+# across 20+ captures on an idle box AND under 2x CPU oversubscription the
+# count never dropped into the gate's failure band, where the naive
+# gap-cutoff hit 4.
 #
 # Assertions (see CONTROLLER ADDENDUM, Deliverable 2, in
-# .superpowers/sdd/task-7-brief.md for the empirical basis):
-#   (a) HARD, per-session: the handshake-phase datagram count is > 4. This
-#       is NOT ">2 => junk present" — both peers glare-initiate (each
-#       self-initiates at bring-up; the loser's Init still reaches the wire
-#       before glare-resolution — see peer_manager.rs's `Glare:` comment),
-#       so a JUNK-FREE two-sided-glare handshake already puts Init(A) +
-#       Init(B) + Resp = 3 datagrams on the wire before data, and a >2
-#       threshold would pass even with junk disabled. 4 sits strictly above
-#       that junk-free glare baseline (with a +1 retransmit margin) and
-#       strictly below the observed junk-present minimum (~7-8, clipped
-#       down from the ~9 theoretical floor of 2*(JUNK_BURST_MIN+1)+1 by the
-#       leading-gap window occasionally swallowing the trailing Resp). So
-#       gate (a) shows the opener carries MORE datagrams than a junk-free
-#       glare handshake would — i.e. junk is present — without false-failing
-#       on Resp-clipping.
+# .superpowers/sdd/task-7-brief.md for the original empirical basis; the
+# numbers below were re-derived for the cluster-span measurement by capturing
+# junk-on vs junk-off sessions, idle and under load — see the CLUSTER_MIN
+# comment):
+#   (a) HARD, per-session: the dense-cluster span is > CLUSTER_MIN (12).
+#       Junk-OFF (obf_psk unset) still produces a dense handshake cluster —
+#       the 3 Noise messages plus retransmits and the completion exchange —
+#       measured empirically at 6-10 datagrams. Junk-ON adds both sides' Jc
+#       bursts (Jc in [3,12] each) and measures 15-32. So >12 sits strictly
+#       above the junk-OFF ceiling (10) and strictly below the junk-ON floor
+#       (15): it proves the opener carries MORE datagrams than a junk-free
+#       handshake would, i.e. junk is present. (A bare ">2 => junk present"
+#       or the old ">4" would BOTH pass junk-off here, since the junk-free
+#       dense handshake alone already reaches ~10 — the cluster measurement
+#       counts the whole dense handshake, not just the leading Init(s).)
 #   (b) HARD, across sessions: the N counts are not all identical — i.e.
-#       take > 1 distinct value. Gate (a) alone only proves junk is present
-#       on top of the glare baseline; it says nothing about whether that
-#       junk is randomized. Gate (b) is the primary non-vacuous proof that
-#       the Jc burst actually varies the opener's shape: if junk were
-#       disabled (or fixed-size), the handshake-phase count would be the
-#       same constant every session (2-sided glare always yields exactly 3
-#       junk-free datagrams), so gate (b) would fail. This is NOT a claim of
-#       "provably unclassifiable" traffic; it only shows the handshake
-#       opener's packet cardinality is not obviously constant (both Jc
-#       bursts are redrawn per handshake), which is what would make
-#       packet-count-based fingerprinting of the opener unreliable.
+#       take > 1 distinct value. Gate (a) alone only proves junk is present;
+#       it says nothing about whether that junk is randomized. Gate (b) is
+#       the primary non-vacuous proof that the Jc burst actually varies the
+#       opener's shape: fixed-size (or disabled) junk yields a near-constant
+#       span every session (junk-off clusters at a tight 9-10), so gate (b)
+#       would fail. This is NOT a claim of "provably unclassifiable" traffic;
+#       it only shows the handshake opener's packet cardinality is not
+#       obviously constant (both Jc bursts are redrawn per handshake), which
+#       is what would make packet-count-based fingerprinting of the opener
+#       unreliable.
 set -euo pipefail
 
 YIPD="${1:?Usage: $0 <yipd-binary>}"
@@ -81,14 +104,26 @@ fi
 # on assertion (b) even under adversarial-looking bad luck.
 N=8
 
-# Inter-packet-gap threshold (seconds) separating the handshake-phase burst
-# from the steady-state Control-feedback cadence. Empirically: intra-burst
-# gaps are low single-digit microseconds (occasionally ~0.2-0.4ms while a
-# side computes its Resp); the steady-state cadence never goes below
-# ~10ms in practice (its floor is FEEDBACK_INTERVAL_MS jittered to
-# ~22.5ms, minus scheduling slop) and is usually 20-30ms. 5ms sits with
-# an order of magnitude of margin on both sides.
-GAP_THRESHOLD_S="0.005"
+# Dense-cluster parameters (see the MEASUREMENT block in the header).
+#
+# DENSE_GAP_S: two consecutive datagrams belong to the same dense cluster if
+# their inter-arrival gap is below this. Empirically the valley is between
+# intra-cluster gaps (mostly microseconds, spiking to ~2.8ms under load) and
+# the nearest separator gap (>= ~3.8ms under load, usually >= 5ms). 1ms sits
+# in that valley; the choice is not delicate because we anchor on the LAST
+# qualifying cluster, not a leading run — 0.5ms, 1ms and 2ms produced an
+# IDENTICAL count on every one of 20+ idle-and-loaded captures.
+DENSE_GAP_S="0.001"
+# MIN_CLUSTER: a run of at least this many datagrams closer than DENSE_GAP_S
+# apart counts as a handshake dense cluster. Steady-state feedback (two
+# independent ~30ms streams) never puts 3 datagrams that close — at most a
+# coincident cross-response pair — so 3 excludes steady state while including
+# every junk burst / Init / completion cluster.
+MIN_CLUSTER=3
+# CLUSTER_MIN: gate (a) requires each session's span to exceed this. Junk-OFF
+# spans measured 6-10 (the junk-free dense handshake); junk-ON 15-32. 12 sits
+# strictly between (junk-off ceiling 10, junk-on floor 15).
+CLUSTER_MIN=12
 
 TMPDIR_TEST="$(mktemp -d /tmp/yipd-flowshape-test.XXXXXX)"
 
@@ -303,60 +338,77 @@ for i in $(seq 1 "$N"); do
         exit 1
     fi
 
-    # Handshake-phase datagram count = the leading run of packets (in
-    # capture order, both directions) whose inter-arrival gap never exceeds
-    # GAP_THRESHOLD_S. This is a deterministic function of the pcap's own
-    # packet timestamps — integer in, integer out, no ML/heuristics — and
-    # is robust to which side wins the glare tie-break (see header comment).
-    COUNT="$(tcpdump -tt -r "$PCAP" -nn 2>/dev/null | awk -v thresh="$GAP_THRESHOLD_S" '
-        NR == 1 { count = 1; prev = $1; next }
-        {
-            gap = $1 - prev
-            if (gap > thresh) { exit }
-            count++
-            prev = $1
+    # Handshake dense-cluster span = the index of the LAST datagram (in
+    # capture order, both directions) that belongs to a run of >= MIN_CLUSTER
+    # datagrams spaced < DENSE_GAP_S apart. This is a deterministic function
+    # of the pcap's own packet timestamps — integer in, integer out, no
+    # ML/heuristics — robust to which side wins the glare tie-break and to
+    # scheduling stalls (a stall only splits one dense cluster into two, both
+    # of which precede the anchor). See the header MEASUREMENT block for why
+    # this beats a gap-cutoff leading run.
+    #
+    # Emits three fields: the span count, and two DIAGNOSTIC-ONLY values that
+    # gate nothing but make a future failure self-explaining — the largest
+    # intra-cluster gap (< 3ms) and the smallest separator gap (>= 3ms), i.e.
+    # the two walls of the density valley. If they ever cross (max intra >=
+    # min separator) the DENSE_GAP_S assumption has broken and the count is
+    # untrustworthy; normally they straddle DENSE_GAP_S comfortably.
+    read -r COUNT MAXDENSE MINSEP < <(tcpdump -tt -r "$PCAP" -nn 2>/dev/null | awk \
+        -v dense="$DENSE_GAP_S" -v minc="$MIN_CLUSTER" '
+        { t[NR] = $1 }
+        END {
+            n = NR
+            last = 0; cs = 1
+            maxdense = 0; minsep = 999
+            for (i = 2; i <= n; i++) {
+                g = t[i] - t[i-1]
+                if (g < dense) { cs++ }
+                else { if (cs >= minc) last = i - 1; cs = 1 }
+                if (g < 0.003 && g > maxdense) maxdense = g
+                if (g >= 0.003 && g < minsep) minsep = g
+            }
+            if (cs >= minc) last = n
+            printf "%d %.3f %.3f\n", last, maxdense * 1000, minsep * 1000
         }
-        END { print count + 0 }
-    ')"
-    echo "[session $i/$N] handshake-phase datagram count = $COUNT"
+    ')
+    echo "[session $i/$N] handshake dense-cluster span = $COUNT datagrams (density valley: max intra-cluster gap ${MAXDENSE}ms < min separator gap ${MINSEP}ms; DENSE_GAP_S=${DENSE_GAP_S}s)"
     COUNTS+=("$COUNT")
 done
 
-echo "[result] per-session handshake-phase counts: ${COUNTS[*]}"
+echo "[result] per-session handshake dense-cluster spans: ${COUNTS[*]}"
 
 FAIL=0
 
-# HARD gate (a): junk present in every session — count > 4. This threshold
-# sits strictly above the junk-free two-sided-glare baseline of 3 datagrams
-# (Init(A) + Init(B) + Resp, +1 retransmit margin) and strictly below the
-# observed junk-present minimum (~7-8), so it robustly distinguishes "junk
-# present" from "junk-free glare handshake" without false-failing on
-# occasional Resp-clipping. See the header comment for the full derivation.
+# HARD gate (a): junk present in every session — span > CLUSTER_MIN. The
+# junk-free dense handshake alone measures 6-10; both sides' Jc bursts lift it
+# to 15-32. CLUSTER_MIN (12) sits strictly between, so this distinguishes
+# "junk present" from "junk-free handshake". See the header comment for the
+# full derivation and the junk-on/junk-off measurements.
 for idx in "${!COUNTS[@]}"; do
     c="${COUNTS[$idx]}"
     session_num=$((idx + 1))
-    if [ "$c" -le 4 ]; then
-        echo "[FAIL] gate (a): session $session_num count=$c is <= 4 — at or below the junk-free two-sided-glare baseline (3, +1 margin); junk burst did not reach the wire"
+    if [ "$c" -le "$CLUSTER_MIN" ]; then
+        echo "[FAIL] gate (a): session $session_num span=$c is <= CLUSTER_MIN ($CLUSTER_MIN) — within the junk-free dense-handshake range (6-10); junk burst did not reach the wire"
         FAIL=1
     fi
 done
 if [ "$FAIL" -eq 0 ]; then
-    echo "[PASS] gate (a): every session's handshake-phase count is > 4 (above the junk-free two-sided-glare baseline of 3 — junk present)"
+    echo "[PASS] gate (a): every session's dense-cluster span is > CLUSTER_MIN ($CLUSTER_MIN) — above the junk-free dense-handshake ceiling of 10, junk present"
 fi
 
-# HARD gate (b): not obviously constant — the N counts take > 1 distinct
+# HARD gate (b): not obviously constant — the N spans take > 1 distinct
 # value (both sides' Jc in [3, 12] bursts are redrawn per handshake). This
 # is the primary non-vacuous proof of randomization: a junk-free (or
-# fixed-size-junk) two-sided-glare handshake would produce the SAME count
-# every session, so gate (b) is what would actually fail if junk were
-# disabled — gate (a) alone only proves "more than the glare baseline",
-# not "randomized".
+# fixed-size-junk) handshake produces a near-constant span every session
+# (junk-off clusters at a tight 9-10), so gate (b) is what would actually
+# fail if junk were disabled — gate (a) alone only proves "more than the
+# junk-free handshake", not "randomized".
 DISTINCT="$(printf '%s\n' "${COUNTS[@]}" | sort -u | wc -l)"
 if [ "$DISTINCT" -le 1 ]; then
-    echo "[FAIL] gate (b): all $N sessions produced the identical handshake-phase count — handshake cardinality looks constant"
+    echo "[FAIL] gate (b): all $N sessions produced the identical dense-cluster span — handshake cardinality looks constant"
     FAIL=1
 else
-    echo "[PASS] gate (b): $DISTINCT distinct handshake-phase counts across $N sessions — no obviously-constant handshake cardinality (Jc junk randomizes the opener)"
+    echo "[PASS] gate (b): $DISTINCT distinct dense-cluster spans across $N sessions — no obviously-constant handshake cardinality (Jc junk randomizes the opener)"
 fi
 
 if [ "$FAIL" -ne 0 ]; then
@@ -364,4 +416,4 @@ if [ "$FAIL" -ne 0 ]; then
     exit 1
 fi
 
-echo "[PASS] flow-shape structural check PASSED: obf-on handshake opener carries more datagrams than a junk-free two-sided-glare handshake (>4, gate a) and shows no obviously-constant handshake cardinality across independent sessions (gate b, the primary proof of randomization)"
+echo "[PASS] flow-shape structural check PASSED: obf-on handshake opener carries more datagrams than a junk-free handshake (span > CLUSTER_MIN, gate a) and shows no obviously-constant handshake cardinality across independent sessions (gate b, the primary proof of randomization)"
