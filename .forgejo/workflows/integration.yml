@@ -46,7 +46,16 @@ jobs:
         # here maps `privileged` to docker://catthehacker/ubuntu:act-22.04, so every step
         # executes inside that image and never touches the runner's own filesystem.
         # The container does run privileged, so netns/tc work once the tools are present.
-        run: sudo apt-get install -y iproute2 iputils-ping wireguard-tools
+        #
+        # iperf3 belongs here for the same reason: run-fec-compare.sh and
+        # run-iperf-compare.sh drive it, and without it those two SKIP their
+        # column while the job still reports green — measuring less than it claims.
+        #
+        # These were never *declared* before because wireguard-tools happens to
+        # list iproute2/iputils-ping as Recommends. That is not a dependency, and
+        # it stopped resolving: run 277 logs "Setting up iproute2"; run 290 — same
+        # apt line, one day later — does not.
+        run: sudo apt-get install -y iproute2 iputils-ping iperf3 wireguard-tools
       - name: Load wireguard kernel module
         run: sudo modprobe wireguard || echo "[note] wireguard module unavailable; WG column will be skipped"
       - name: Build test binaries
@@ -126,12 +135,23 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install BoringSSL build deps (cmake + libclang)
+      - name: Install BoringSSL build deps (cmake + libclang) and netns tooling
         # The TLS-mimicry transport (3c.2) links the `boring` crate, whose
         # build compiles BoringSSL (needs cmake + a C/C++ toolchain) and whose
         # bindgen step needs libclang. The Forgejo runner image does not ship
         # these, so install them explicitly.
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev pkg-config
+        #
+        # iproute2 + iputils-ping are what run-netns-tunnel.sh actually drives
+        # (`ip` 42x, `ping` 4x) and are likewise absent from the runner image,
+        # so every attempt died identically at run-netns-tunnel.sh:86. Every
+        # job that needs `ip` now declares it: relying on it arriving as a
+        # Recommends of something else is what broke netem-comparison.
+        #
+        # tcpdump: this job's 26 tests span ~30 harness scripts, and ten of
+        # them capture with tcpdump (flowshape, rekey, replay-hijack,
+        # path-switch, the mimicry oracles). It is NOT preinstalled — see the
+        # corrected note on the tshark step below.
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev pkg-config iproute2 iputils-ping tcpdump
       - name: Build and run yipd netns tunnel tests under sudo
         run: |
           # Filter for the tunnel_netns test binary specifically: a --no-run build
@@ -316,9 +336,12 @@ jobs:
 
       - name: Install tshark
         # run-netns-replay-hijack.sh (below) uses tshark to extract a
-        # captured [HandshakeInit] datagram's raw UDP payload for replay --
-        # unlike tcpdump (preinstalled on the runner image), tshark is not
-        # guaranteed present, so install it explicitly.
+        # captured [HandshakeInit] datagram's raw UDP payload for replay, and
+        # is not present on the runner image. Neither is tcpdump -- an earlier
+        # version of this comment claimed it was preinstalled, which is how
+        # flowshape_not_obviously_constant came to fail on
+        # `exec of "tcpdump" failed`. Both are installed explicitly now
+        # (tcpdump with the netns tooling above).
         # DEBIAN_FRONTEND=noninteractive: tshark's postinst otherwise prompts
         # (debconf) to ask whether non-superusers may capture packets; this
         # job always invokes it via sudo anyway, so the prompt is moot.
@@ -489,7 +512,10 @@ jobs:
           # transport=tls oracle's release yipd links (3c.2).
           # clang + libclang-dev: boring's bindgen step (the transport=tls yipd
           # links BoringSSL) needs libclang; the runner image doesn't ship it.
-          sudo apt-get install -y libpcap-dev libjson-c-dev libgcrypt20-dev autoconf automake libtool pkg-config gettext cmake clang libclang-dev
+          # iproute2 + iputils-ping + tcpdump: what run-ndpi-oracle.sh drives
+          # directly (`ip` 33x, `tcpdump` 8x, `ping` 7x). All absent from the
+          # runner image, so every attempt died at run-ndpi-oracle.sh:129.
+          sudo apt-get install -y libpcap-dev libjson-c-dev libgcrypt20-dev autoconf automake libtool pkg-config gettext cmake clang libclang-dev iproute2 iputils-ping tcpdump
 
       # Pinned nDPI checkout: this SHA is the exact commit vendored locally at
       # refrences/nDPI (git-ignored/local per CLAUDE.md, so CI can't just use

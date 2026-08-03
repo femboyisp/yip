@@ -360,6 +360,19 @@ start_sshd() {
     local logfile="$3"
     # Remove stale pidfile
     rm -f "$pidfile"
+    # sshd refuses to start without its privilege-separation directory
+    # ("Missing privilege separation directory: /run/sshd", exit 255). The
+    # package's postinst normally creates it, but the CI runner image
+    # (catthehacker/ubuntu:act-22.04) ships sshd without ever having run it,
+    # and /run is a fresh tmpfs each container. Root here already — the whole
+    # harness runs under sudo for netns.
+    mkdir -p /run/sshd && chmod 0755 /run/sshd
+    # `-E "$logfile"` routes sshd's own diagnostics to a file, so a failed start
+    # under `set -e` aborted the whole harness with nothing on stdout but
+    # "[yip] starting sshd in yipA" — the reason sealed in a file the cleanup
+    # trap then removed. That is how CI reported only "harness failed". Surface
+    # it: on failure dump sshd's log and exit status before propagating.
+    local rc=0
     ip netns exec "$ns" /usr/sbin/sshd -p 2222 -h "$TMPDIR_TEST/host" \
         -o "PidFile=$pidfile" \
         -o "AuthorizedKeysFile=$TMPDIR_TEST/authkeys" \
@@ -367,7 +380,20 @@ start_sshd() {
         -o "PasswordAuthentication=no" \
         -o "StrictModes=no" \
         -o "PermitRootLogin=yes" \
-        -E "$logfile"
+        -E "$logfile" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "[error] sshd failed to start in netns $ns (exit $rc)" >&2
+        # Test for content, not for cat's exit status: an existing-but-empty
+        # log makes `cat` succeed silently, reproducing the blank wall this
+        # whole branch exists to remove.
+        if [ -s "$logfile" ]; then
+            echo "[error] sshd log follows:" >&2
+            cat "$logfile" >&2
+        else
+            echo "[error] sshd wrote no log at $logfile" >&2
+        fi
+        return "$rc"
+    fi
     # Brief wait for sshd to write its pidfile
     local wait=0
     while [ ! -f "$pidfile" ] && [ "$wait" -lt 50 ]; do

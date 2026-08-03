@@ -23,6 +23,18 @@ jobs:
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
       - name: Coverage (logic crates; uring driver netns-gated)
+        # Same reason as the `build-test` job in ci.yml: this job runs as root in
+        # a container with no netns/`ip` tooling, so `is_root()` returns true and
+        # the root-gated netns/netem harness tests try to run for real and die on
+        # `ip: command not found` instead of skipping. They have dedicated
+        # privileged jobs in integration.yml.
+        #
+        # ci.yml has set this since the gate was written; coverage.yml never did,
+        # which is why this job failed on every PR from #149 onward with four
+        # netem_bench failures. The gate itself was always correct — nothing here
+        # opted into it.
+        env:
+          YIP_SKIP_PRIVILEGED_TESTS: "1"
         run: >
           cargo llvm-cov --workspace
           --exclude yip-device --exclude yipd
