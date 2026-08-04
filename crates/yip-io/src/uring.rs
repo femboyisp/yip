@@ -19,14 +19,34 @@ use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use crate::poll::{Dispatch, DispatchOut, EgressDatagram};
 use crate::{sockaddr_to_std, std_to_sockaddr, MAX_DATAGRAM_BATCH, MAX_WIRE_DATAGRAM};
 
-const RING_ENTRIES: u32 = 512;
+// io_uring SQ depth (CQ is 2x this = the kernel default). Sized to hold the
+// deeper UDP recv queue (`UDP_RECV_DEPTH` = 256) plus in-flight sends
+// (`SEND_SLOTS` = 256) and TUN reads without the SQ filling mid-iteration
+// (which forces extra submit-retry syscalls) or the CQ overflowing into the
+// (NODROP) kernel backlog. Raised 512 -> 1024 alongside the recv-depth bump.
+const RING_ENTRIES: u32 = 1024;
 const RING_BUFS: usize = 256;
 const TUN_READ_DEPTH: usize = 16;
 /// How many single-shot UDP `recvmsg` requests are kept outstanding at once.
 /// Each has its own dedicated buffer + `sockaddr_storage` (no provided-buffer
 /// pool, unlike TUN reads) — see the module doc for why UDP recv moved off
 /// multishot `RecvMulti`/`BUFFER_SELECT`.
-const UDP_RECV_DEPTH: usize = 16;
+///
+/// This also caps how many datagrams a single `poll_once` can harvest before it
+/// must re-arm, so it bounds the UDP drain rate per wake cycle. The poll
+/// fallback (`PlainIo::drain_udp`) drains the WHOLE socket backlog per wakeup
+/// (`recvmmsg(64)` until a short read); a shallow depth here does not, so under
+/// CPU contention the socket receive queue can outpace the driver and overflow
+/// a clamped `net.core.rmem_max`, dropping datagrams the poll driver would not.
+/// Measured on the CI runner (constrained container): the uring bulk flow
+/// delivered 80-96% while poll held 99.3% in the same run — and the run did NOT
+/// fall back to poll (no "falling back to PollDriver" log line), so it was this
+/// drain-depth deficit, not a driver crash. Raised 16 -> 256 (matches
+/// `RING_BUFS`; ~590 KB of slots) so one `poll_once` drains up to ~256 datagrams
+/// (~51 ms of a 5000 pps flow), closing the gap to the poll driver. Total
+/// outstanding (256 recv + up to 256 send + TUN) stays within the CQ — see
+/// `RING_ENTRIES`.
+const UDP_RECV_DEPTH: usize = 256;
 const BUF_GROUP: u16 = 17;
 const SEND_SLOTS: usize = 256;
 const TAG_SHIFT: u32 = 56;
