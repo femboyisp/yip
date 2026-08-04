@@ -787,16 +787,17 @@ fn flowshape_not_obviously_constant() {
     // of 3a's `no_byte_position_is_constant`: for N independent obf-on
     // sessions (fresh handshake each, both peers bootstrap-initiate and
     // glare-resolve — see run-flowshape-check.sh's header comment), the
-    // handshake-phase datagram count (measured via inter-packet-gap cutoff,
-    // not by source address, since there is no fixed "initiator" role) must
-    // (a) exceed 4 — strictly above the junk-free two-sided-glare baseline
-    // of 3 datagrams (Init(A) + Init(B) + Resp), which is what a junk-free
-    // handshake would already produce given both peers glare-initiate — and
-    // (b) take more than one distinct value across sessions (the Jc in
+    // handshake DENSE-CLUSTER SPAN (the index of the last datagram in a run
+    // of >=3 packets spaced <1ms apart, measured from the pcap in arrival
+    // order — not by source address, since there is no fixed "initiator"
+    // role, and NOT by a single gap cutoff, which a scheduling stall would
+    // truncate) must (a) exceed CLUSTER_MIN (12) — the junk-free dense
+    // handshake alone measures 6-10, both sides' Jc bursts lift it to 15-32
+    // — and (b) take more than one distinct value across sessions (the Jc in
     // [JUNK_BURST_MIN, JUNK_BURST_MAX] junk burst on each side is redrawn
     // per handshake). Gate (b) is the primary non-vacuous proof of
     // randomization: gate (a) alone only shows junk is present on top of
-    // the glare baseline. See run-flowshape-check.sh for the full
+    // the junk-free handshake. See run-flowshape-check.sh for the full
     // assertion set and derivation.
     //
     // Requires root: netns creation + TUN devices + tcpdump.
@@ -810,9 +811,9 @@ fn flowshape_not_obviously_constant() {
     let status = Command::new("bash").arg(script).arg(yipd).status().unwrap();
     assert!(
         status.success(),
-        "flow-shape structural check failed (obf-on handshake opener packet count was not \
-         >4, or was identical across independent sessions — the Jc junk burst is not \
-         reaching the wire as expected)"
+        "flow-shape structural check failed (obf-on handshake dense-cluster span was not \
+         > CLUSTER_MIN, or was identical across independent sessions — the Jc junk burst is \
+         not reaching the wire as expected)"
     );
 }
 
