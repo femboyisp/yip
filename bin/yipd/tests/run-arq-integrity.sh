@@ -218,8 +218,28 @@ sleep 0.5
 # packets.  5000 pps is well above MIN_RATE_PPS (20), reaching Bulk quickly.
 echo "[blast] sending N=${N} UDP packets (${PAYLOAD} bytes) at ${PPS} pps"
 
-# Receiver: bind on arqA's tunnel IP, 10s idle timeout (generous for ARQ round-trips)
-ip netns exec "$NS_A" python3 "$PY_DIR/udp_rx.py" "$TUN_A_IP" 7890 "$N" 10 \
+# Receiver: bind on arqA's tunnel IP. RX_IDLE is the seconds-of-silence idle
+# timeout: udp_rx.py exits after that long with no packet. It MUST outlast the
+# longest gap between late ARQ retransmits, or the receiver quits while the tail
+# is still being recovered and undercounts delivery.
+#
+# Raised 10 -> 30 to cover a CI flake: one uring run on the runner delivered
+# 96.4% (received=19274, ARQ retransmits=193 — the sender was still actively
+# retransmitting when the receiver gave up). That truncated-tail signature says
+# the receiver's patience, not the recovery, was the limit: io_uring inside the
+# runner container evidently stalls retransmit delivery past 10s of silence.
+# NOT reproducible on bare metal (delivery held >=99.2% on both drivers, idle
+# and under 3x CPU oversubscription, even with RX_IDLE forced to 2s — this box
+# never reaches the container's stall regime), so 30 is bounded by "more than
+# the >10s stall we saw", not tuned to a measured gap. udp_rx.py now also
+# prints stop=<idle|complete> and idle_gap so the NEXT occurrence shows directly
+# whether the receiver quit early (stop=idle, tail truncated) or got everything.
+#
+# COST: delivery is never 100% (some loss is always unrecovered within the flow
+# window), so udp_rx.py ALWAYS exits via this idle path, never via got-all-N.
+# The full RX_IDLE therefore lands on every arq run, on BOTH driver passes, so
+# this adds ~20s x2 to the arq test's wall-clock. Overridable for diagnosis.
+ip netns exec "$NS_A" python3 "$PY_DIR/udp_rx.py" "$TUN_A_IP" 7890 "$N" "${RX_IDLE:-30}" \
     >"$TMPDIR_TEST/arq.out" 2>&1 &
 RX_PID=$!
 
