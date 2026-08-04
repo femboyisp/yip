@@ -791,14 +791,16 @@ fn flowshape_not_obviously_constant() {
     // of >=3 packets spaced <1ms apart, measured from the pcap in arrival
     // order — not by source address, since there is no fixed "initiator"
     // role, and NOT by a single gap cutoff, which a scheduling stall would
-    // truncate) must (a) exceed CLUSTER_MIN (12) — the junk-free dense
-    // handshake alone measures 6-10, both sides' Jc bursts lift it to 15-32
-    // — and (b) take more than one distinct value across sessions (the Jc in
-    // [JUNK_BURST_MIN, JUNK_BURST_MAX] junk burst on each side is redrawn
-    // per handshake). Gate (b) is the primary non-vacuous proof of
-    // randomization: gate (a) alone only shows junk is present on top of
-    // the junk-free handshake. See run-flowshape-check.sh for the full
-    // assertion set and derivation.
+    // truncate) is gated two ways: (a) a loose sanity floor — every span >
+    // SPAN_FLOOR (4) — that only rejects a broken capture, and (b) the PRIMARY
+    // proof: the spread (max-min) of the N spans >= SPREAD_MIN (6). The Jc in
+    // [JUNK_BURST_MIN, JUNK_BURST_MAX] burst on each side is redrawn per
+    // handshake, so junk-ON spans vary widely (spread 14-19 on CI) while a
+    // junk-free / fixed-junk handshake is near-constant (spread <= 4) — so the
+    // spread proves BOTH junk-present and randomized in one shot, and is
+    // LEVEL-INDEPENDENT (an earlier absolute "> 12" floor false-failed on CI
+    // when contention pulled junk-on spans down to ~12). See
+    // run-flowshape-check.sh for the full assertion set and derivation.
     //
     // Requires root: netns creation + TUN devices + tcpdump.
     let is_root = have_root();
@@ -811,9 +813,9 @@ fn flowshape_not_obviously_constant() {
     let status = Command::new("bash").arg(script).arg(yipd).status().unwrap();
     assert!(
         status.success(),
-        "flow-shape structural check failed (obf-on handshake dense-cluster span was not \
-         > CLUSTER_MIN, or was identical across independent sessions — the Jc junk burst is \
-         not reaching the wire as expected)"
+        "flow-shape structural check failed (obf-on handshake dense-cluster span spread across \
+         sessions was < SPREAD_MIN, or a capture was broken — the Jc junk burst is not reaching \
+         the wire / randomizing the opener as expected)"
     );
 }
 
