@@ -63,31 +63,28 @@
 #
 # Assertions (see CONTROLLER ADDENDUM, Deliverable 2, in
 # .superpowers/sdd/task-7-brief.md for the original empirical basis; the
-# numbers below were re-derived for the cluster-span measurement by capturing
-# junk-on vs junk-off sessions, idle and under load — see the CLUSTER_MIN
-# comment):
-#   (a) HARD, per-session: the dense-cluster span is > CLUSTER_MIN (12).
-#       Junk-OFF (obf_psk unset) still produces a dense handshake cluster —
-#       the 3 Noise messages plus retransmits and the completion exchange —
-#       measured empirically at 6-10 datagrams. Junk-ON adds both sides' Jc
-#       bursts (Jc in [3,12] each) and measures 15-32. So >12 sits strictly
-#       above the junk-OFF ceiling (10) and strictly below the junk-ON floor
-#       (15): it proves the opener carries MORE datagrams than a junk-free
-#       handshake would, i.e. junk is present. (A bare ">2 => junk present"
-#       or the old ">4" would BOTH pass junk-off here, since the junk-free
-#       dense handshake alone already reaches ~10 — the cluster measurement
-#       counts the whole dense handshake, not just the leading Init(s).)
-#   (b) HARD, across sessions: the N counts are not all identical — i.e.
-#       take > 1 distinct value. Gate (a) alone only proves junk is present;
-#       it says nothing about whether that junk is randomized. Gate (b) is
-#       the primary non-vacuous proof that the Jc burst actually varies the
-#       opener's shape: fixed-size (or disabled) junk yields a near-constant
-#       span every session (junk-off clusters at a tight 9-10), so gate (b)
-#       would fail. This is NOT a claim of "provably unclassifiable" traffic;
-#       it only shows the handshake opener's packet cardinality is not
-#       obviously constant (both Jc bursts are redrawn per handshake), which
-#       is what would make packet-count-based fingerprinting of the opener
-#       unreliable.
+# gating below was re-derived for the cluster-span measurement by capturing
+# junk-on vs junk-off sessions, idle and under load — see the SPAN_FLOOR /
+# SPREAD_MIN comment):
+#   (a) HARD, per-session sanity floor: every span > SPAN_FLOOR (4). This only
+#       rejects a broken/empty capture — even a junk-FREE handshake spans ~6-10,
+#       so junk-on clears it with huge margin. It is NOT the junk-present proof.
+#   (b) HARD, PRIMARY: the SPREAD (max-min) of the N spans is >= SPREAD_MIN (6).
+#       Each side's Jc in [3,12] is redrawn per session, so junk-ON spans vary
+#       widely (spread 14-19 on CI, 14-16 locally); a junk-FREE or fixed-size
+#       handshake is near-constant (junk-off spread <= 4). A junk-free run
+#       cannot manufacture this spread, so passing it proves BOTH that junk
+#       reached the wire AND that it randomizes the opener — in one shot.
+#       Crucially the spread is LEVEL-INDEPENDENT: CI contention shifts the
+#       absolute spans (it once pulled a session to exactly 12) but not the
+#       spread, so this does not false-fail the way an absolute floor did.
+#       This is NOT a claim of "provably unclassifiable" traffic; it only shows
+#       the handshake opener's packet cardinality is not obviously constant,
+#       which is what would make packet-count fingerprinting of the opener
+#       unreliable. (History: gate (b) was once a bare ">1 distinct value" and
+#       gate (a) an absolute "span > 12"; the absolute floor false-failed on CI
+#       when contention pulled junk-on spans into the junk-off band, so the
+#       proof moved to the spread and the floor was demoted to a sanity check.)
 set -euo pipefail
 
 YIPD="${1:?Usage: $0 <yipd-binary>}"
@@ -120,10 +117,25 @@ DENSE_GAP_S="0.001"
 # coincident cross-response pair — so 3 excludes steady state while including
 # every junk burst / Init / completion cluster.
 MIN_CLUSTER=3
-# CLUSTER_MIN: gate (a) requires each session's span to exceed this. Junk-OFF
-# spans measured 6-10 (the junk-free dense handshake); junk-ON 15-32. 12 sits
-# strictly between (junk-off ceiling 10, junk-on floor 15).
-CLUSTER_MIN=12
+# SPAN_FLOOR / SPREAD_MIN: how the spans are gated (see the "Assertions" block).
+#
+# An absolute per-session floor turned out NOT to be robust. Junk-OFF spans are
+# 6-10 and junk-ON 15-32 on bare metal, but on the CI runner the intra-burst
+# gaps balloon toward the ~3ms separator floor under contention, fragmenting the
+# dense clusters and pulling junk-ON spans DOWN into the 12-16 range — one CI
+# session measured exactly 12. So junk-on's low tail collides with any floor
+# that sits above the junk-off ceiling of 10: the 10-vs-12 gap is too narrow to
+# gate on absolutely under CI variance.
+#
+# The randomization itself is the robust, level-INDEPENDENT signal: each side's
+# Jc in [3,12] is redrawn per session, so junk-ON spans vary a lot across the N
+# sessions (observed spread max-min = 14-19 on CI, 14-16 locally), whereas a
+# junk-free (or fixed-junk) handshake is near-constant (junk-off spread <= 4).
+# CI contention shifts the absolute spans but not this spread. So the primary
+# gate is on the SPREAD, and SPAN_FLOOR is only a loose sanity check that the
+# capture is not broken (junk-on always clears it with huge margin).
+SPAN_FLOOR=4
+SPREAD_MIN=6
 
 TMPDIR_TEST="$(mktemp -d /tmp/yipd-flowshape-test.XXXXXX)"
 
@@ -379,36 +391,40 @@ echo "[result] per-session handshake dense-cluster spans: ${COUNTS[*]}"
 
 FAIL=0
 
-# HARD gate (a): junk present in every session — span > CLUSTER_MIN. The
-# junk-free dense handshake alone measures 6-10; both sides' Jc bursts lift it
-# to 15-32. CLUSTER_MIN (12) sits strictly between, so this distinguishes
-# "junk present" from "junk-free handshake". See the header comment for the
-# full derivation and the junk-on/junk-off measurements.
+# HARD gate (a) — sanity floor: every session's span > SPAN_FLOOR. This is NOT
+# the junk-present proof (that is gate (b)); it only catches a broken/empty
+# capture or a total collapse of the handshake. Junk-on spans are 12+ even on a
+# contended CI runner, so this clears with large margin; a span at/below 4 means
+# something is structurally wrong with the capture, not a randomization result.
+MINSP="$(printf '%s\n' "${COUNTS[@]}" | sort -n | head -1)"
+MAXSP="$(printf '%s\n' "${COUNTS[@]}" | sort -n | tail -1)"
 for idx in "${!COUNTS[@]}"; do
     c="${COUNTS[$idx]}"
     session_num=$((idx + 1))
-    if [ "$c" -le "$CLUSTER_MIN" ]; then
-        echo "[FAIL] gate (a): session $session_num span=$c is <= CLUSTER_MIN ($CLUSTER_MIN) — within the junk-free dense-handshake range (6-10); junk burst did not reach the wire"
+    if [ "$c" -le "$SPAN_FLOOR" ]; then
+        echo "[FAIL] gate (a): session $session_num span=$c is <= SPAN_FLOOR ($SPAN_FLOOR) — capture looks broken (even a junk-free handshake spans ~6-10)"
         FAIL=1
     fi
 done
 if [ "$FAIL" -eq 0 ]; then
-    echo "[PASS] gate (a): every session's dense-cluster span is > CLUSTER_MIN ($CLUSTER_MIN) — above the junk-free dense-handshake ceiling of 10, junk present"
+    echo "[PASS] gate (a): every session's span > SPAN_FLOOR ($SPAN_FLOOR) — captures are structurally sound"
 fi
 
-# HARD gate (b): not obviously constant — the N spans take > 1 distinct
-# value (both sides' Jc in [3, 12] bursts are redrawn per handshake). This
-# is the primary non-vacuous proof of randomization: a junk-free (or
-# fixed-size-junk) handshake produces a near-constant span every session
-# (junk-off clusters at a tight 9-10), so gate (b) is what would actually
-# fail if junk were disabled — gate (a) alone only proves "more than the
-# junk-free handshake", not "randomized".
-DISTINCT="$(printf '%s\n' "${COUNTS[@]}" | sort -u | wc -l)"
-if [ "$DISTINCT" -le 1 ]; then
-    echo "[FAIL] gate (b): all $N sessions produced the identical dense-cluster span — handshake cardinality looks constant"
+# HARD gate (b) — PRIMARY, junk present AND randomized: the spread (max-min) of
+# the N spans is >= SPREAD_MIN. Each side's Jc in [3,12] is redrawn per session,
+# so junk-ON spans vary widely (observed spread 14-19 on CI, 14-16 locally),
+# whereas a junk-free / fixed-junk handshake is near-constant (junk-off spread
+# <= 4). This is LEVEL-INDEPENDENT: CI contention shifts the absolute spans but
+# not the spread, so unlike an absolute floor it does not false-fail when
+# contention pulls junk-on spans down toward the junk-off band. A junk-free run
+# could not manufacture this spread, so passing it proves both that junk reached
+# the wire and that it randomizes the opener.
+SPREAD=$((MAXSP - MINSP))
+if [ "$SPREAD" -lt "$SPREAD_MIN" ]; then
+    echo "[FAIL] gate (b): span spread=$SPREAD (min=$MINSP max=$MAXSP) < SPREAD_MIN ($SPREAD_MIN) — handshake cardinality looks constant (junk absent, fixed-size, or not reaching the wire)"
     FAIL=1
 else
-    echo "[PASS] gate (b): $DISTINCT distinct dense-cluster spans across $N sessions — no obviously-constant handshake cardinality (Jc junk randomizes the opener)"
+    echo "[PASS] gate (b): span spread=$SPREAD (min=$MINSP max=$MAXSP) >= SPREAD_MIN ($SPREAD_MIN) — Jc junk randomizes the opener across sessions"
 fi
 
 if [ "$FAIL" -ne 0 ]; then
@@ -416,4 +432,4 @@ if [ "$FAIL" -ne 0 ]; then
     exit 1
 fi
 
-echo "[PASS] flow-shape structural check PASSED: obf-on handshake opener carries more datagrams than a junk-free handshake (span > CLUSTER_MIN, gate a) and shows no obviously-constant handshake cardinality across independent sessions (gate b, the primary proof of randomization)"
+echo "[PASS] flow-shape structural check PASSED: structurally-sound captures (gate a) whose handshake dense-cluster span varies by >= $SPREAD_MIN across independent sessions (gate b) — the level-independent proof that the Jc junk burst reaches the wire and randomizes the opener"
