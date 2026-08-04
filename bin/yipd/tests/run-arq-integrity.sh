@@ -216,30 +216,42 @@ sleep 0.5
 # ── 9. drive a Bulk-classified UDP flow ──────────────────────────────────────
 # 1400-byte payloads guarantee ewma_size > LARGE_BYTES (1000) → Bulk after 4+
 # packets.  5000 pps is well above MIN_RATE_PPS (20), reaching Bulk quickly.
+# Kernel-truth RX-drop instrumentation. UdpRcvbufErrors in /proc/net/snmp counts
+# datagrams the kernel dropped because the socket receive buffer was full — the
+# exact signature of an RX path that cannot drain fast enough. /proc/net/snmp is
+# per-netns, so read it inside each namespace. Captured before/after the blast
+# and reported as a delta below: if the uring driver overflows arqA's underlay
+# socket while poll does not, this is where it shows (arqA receives the bulk
+# B->A flow + retransmits, so its RcvbufErrors is the one to watch).
+udp_snmp() { # <netns> -> "RcvbufErrors InErrors InDatagrams"
+    ip netns exec "$1" python3 - <<'PY'
+h=v=None
+for line in open('/proc/net/snmp'):
+    if line.startswith('Udp:'):
+        if h is None: h=line.split()
+        else: v=line.split()
+c=dict(zip(h or [], v or []))
+print(c.get('RcvbufErrors','0'), c.get('InErrors','0'), c.get('InDatagrams','0'))
+PY
+}
+read -r RBE_A0 IE_A0 ID_A0 <<<"$(udp_snmp "$NS_A")"
+read -r RBE_B0 IE_B0 ID_B0 <<<"$(udp_snmp "$NS_B")"
+
 echo "[blast] sending N=${N} UDP packets (${PAYLOAD} bytes) at ${PPS} pps"
 
 # Receiver: bind on arqA's tunnel IP. RX_IDLE is the seconds-of-silence idle
-# timeout: udp_rx.py exits after that long with no packet. It MUST outlast the
-# longest gap between late ARQ retransmits, or the receiver quits while the tail
-# is still being recovered and undercounts delivery.
+# timeout: udp_rx.py exits after that long with no packet, and also prints
+# stop=<idle|complete> + idle_gap for diagnosis.
 #
-# Raised 10 -> 30 to cover a CI flake: one uring run on the runner delivered
-# 96.4% (received=19274, ARQ retransmits=193 — the sender was still actively
-# retransmitting when the receiver gave up). That truncated-tail signature says
-# the receiver's patience, not the recovery, was the limit: io_uring inside the
-# runner container evidently stalls retransmit delivery past 10s of silence.
-# NOT reproducible on bare metal (delivery held >=99.2% on both drivers, idle
-# and under 3x CPU oversubscription, even with RX_IDLE forced to 2s — this box
-# never reaches the container's stall regime), so 30 is bounded by "more than
-# the >10s stall we saw", not tuned to a measured gap. udp_rx.py now also
-# prints stop=<idle|complete> and idle_gap so the NEXT occurrence shows directly
-# whether the receiver quit early (stop=idle, tail truncated) or got everything.
-#
-# COST: delivery is never 100% (some loss is always unrecovered within the flow
-# window), so udp_rx.py ALWAYS exits via this idle path, never via got-all-N.
-# The full RX_IDLE therefore lands on every arq run, on BOTH driver passes, so
-# this adds ~20s x2 to the arq test's wall-clock. Overridable for diagnosis.
-ip netns exec "$NS_A" python3 "$PY_DIR/udp_rx.py" "$TUN_A_IP" 7890 "$N" "${RX_IDLE:-30}" \
+# HISTORY: this was briefly raised to 30s on the theory that a uring CI failure
+# (96.4% delivery, ARQ retransmits still climbing) was the receiver giving up on
+# a slow retransmit tail. The diagnostic REFUTED that: the next uring CI run
+# printed `stop=idle idle_gap=30.0` at 80.1% delivery — the receiver waited the
+# full 30s and the packets never came. So it is NOT receiver patience; the
+# io_uring RX path itself is dropping datagrams under the container's load (poll
+# delivers 99.3% in the same run). Reverted to 10s; the real drop is quantified
+# by the UdpRcvbufErrors instrumentation below.
+ip netns exec "$NS_A" python3 "$PY_DIR/udp_rx.py" "$TUN_A_IP" 7890 "$N" "${RX_IDLE:-10}" \
     >"$TMPDIR_TEST/arq.out" 2>&1 &
 RX_PID=$!
 
@@ -252,6 +264,14 @@ ip netns exec "$NS_B" python3 "$PY_DIR/udp_tx.py" "$TUN_A_IP" 7890 "$N" "$PPS" "
 
 # Wait for receiver to finish (it exits after the idle timeout or all N received)
 wait "$RX_PID" || true
+
+# RX-drop deltas over the blast (see udp_snmp above). A large RcvbufErrors on
+# arqA under the uring driver, ~0 under poll, would localize the loss to the
+# underlay socket overflowing because the io_uring RX path drained too slowly.
+read -r RBE_A1 IE_A1 ID_A1 <<<"$(udp_snmp "$NS_A")"
+read -r RBE_B1 IE_B1 ID_B1 <<<"$(udp_snmp "$NS_B")"
+echo "[snmp] arqA underlay UDP over blast: RcvbufErrors+=$((RBE_A1-RBE_A0)) InErrors+=$((IE_A1-IE_A0)) InDatagrams+=$((ID_A1-ID_A0))"
+echo "[snmp] arqB underlay UDP over blast: RcvbufErrors+=$((RBE_B1-RBE_B0)) InErrors+=$((IE_B1-IE_B0)) InDatagrams+=$((ID_B1-ID_B0))"
 
 # ── 10. parse delivery results ────────────────────────────────────────────────
 RECV_LINE="$(cat "$TMPDIR_TEST/arq.out")"
