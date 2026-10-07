@@ -17,6 +17,7 @@ mod port;
 mod quic;
 mod relay_client;
 mod rendezvous;
+pub mod sharding;
 mod tls;
 mod tunnel;
 mod wire_glue;
