@@ -1,0 +1,27 @@
+---
+name: Mutation testing
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mutants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build prerequisites (BoringSSL needs cmake + libclang)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
+      # taiki-e/install-action is not mirrored on this Forgejo instance.
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+      - name: Mutation test (logic crates)
+        run: >
+          cargo mutants --package yip-wire --package yip-transport
+          --package yip-crypto -- --all-targets

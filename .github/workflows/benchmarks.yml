@@ -1,0 +1,35 @@
+---
+name: benchmarks
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmarks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build release
+        run: cargo build --release -p yip-bench --examples
+      - name: hotpath + mac_candidates (criterion, quick)
+        run: |
+          set -o pipefail
+          cargo bench -p yip-bench --bench hotpath -- --warm-up-time 1 --measurement-time 3 | tee bench-hotpath.txt
+          cargo bench -p yip-bench --bench mac_candidates -- --warm-up-time 1 --measurement-time 3 | tee bench-mac.txt
+      - name: sharding_scale
+        run: |
+          set -o pipefail
+          cargo run --release -p yip-bench --example sharding_scale | tee bench-sharding.txt
+      - name: results
+        if: always()
+        run: |
+          for f in bench-hotpath.txt bench-mac.txt bench-sharding.txt; do
+            echo "::group::$f"
+            cat "$f" 2>/dev/null || echo "(missing: $f)"
+            echo "::endgroup::"
+          done
