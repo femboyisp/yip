@@ -8,6 +8,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 const TUN_PATH: &str = "/dev/net/tun";
 const IFF_TUN: libc::c_short = 0x0001;
 const IFF_TAP: libc::c_short = 0x0002;
+/// Support multiple independent queue file descriptors for the same interface.
+const IFF_MULTI_QUEUE: libc::c_short = 0x0100;
 const IFF_NO_PI: libc::c_short = 0x1000;
 /// Prefix every TUN read/write with a `virtio_net_hdr` (GSO/GRO framing).
 const IFF_VNET_HDR: libc::c_short = 0x4000;
@@ -44,6 +46,56 @@ fn encode_ifname(name: &str) -> Result<[u8; libc::IFNAMSIZ], DeviceError> {
     let mut buf = [0u8; libc::IFNAMSIZ];
     buf[..bytes.len()].copy_from_slice(bytes);
     Ok(buf)
+}
+
+/// Decode a NUL-padded `IFNAMSIZ` buffer into a `String`.
+fn decode_ifname(buf: &[u8; libc::IFNAMSIZ]) -> Result<String, DeviceError> {
+    let nul_pos = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let s = std::str::from_utf8(&buf[..nul_pos])
+        .map_err(|e| DeviceError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
+    Ok(s.to_owned())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OffloadMode {
+    Full,
+    CsumOnly,
+}
+
+fn negotiate_offload(fd: std::os::fd::RawFd) -> Option<OffloadMode> {
+    // SAFETY: `fd` is a valid open /dev/net/tun fd on which TUNSETIFF (with IFF_VNET_HDR)
+    // just succeeded. TUNSETOFFLOAD takes its flags as an integer argument passed by value.
+    let full = unsafe {
+        libc::ioctl(
+            fd,
+            TUNSETOFFLOAD,
+            libc::c_ulong::from(TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6),
+        )
+    };
+    if full == 0 {
+        return Some(OffloadMode::Full);
+    }
+
+    // SAFETY: same rationale as the previous TUNSETOFFLOAD call.
+    let csum_only = unsafe { libc::ioctl(fd, TUNSETOFFLOAD, libc::c_ulong::from(TUN_F_CSUM)) };
+    if csum_only == 0 {
+        return Some(OffloadMode::CsumOnly);
+    }
+
+    None
+}
+
+fn apply_offload(fd: std::os::fd::RawFd, mode: OffloadMode) -> Result<(), DeviceError> {
+    let flags = match mode {
+        OffloadMode::Full => libc::c_ulong::from(TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6),
+        OffloadMode::CsumOnly => libc::c_ulong::from(TUN_F_CSUM),
+    };
+    // SAFETY: `fd` is a valid open /dev/net/tun fd. TUNSETOFFLOAD takes its flags as an integer passed by value.
+    let rc = unsafe { libc::ioctl(fd, TUNSETOFFLOAD, flags) };
+    if rc != 0 {
+        return Err(DeviceError::Io(io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 /// Whether a device operates at L3 (IP) or L2 (Ethernet).
@@ -149,15 +201,55 @@ impl TunTap {
         let ifname = encode_ifname(name)?;
 
         if want_vnet_hdr {
-            if let Some(tun) = Self::open_with_offload(name, kind, &ifname)? {
+            if let Some(tun) = Self::open_with_offload(kind, &ifname)? {
                 return Ok(tun);
             }
         }
 
-        Self::open_plain(name, kind, &ifname)
+        Self::open_plain(kind, &ifname)
     }
 
-    /// Attempt to open `name` with `IFF_VNET_HDR` framing and kernel GSO/GRO
+    /// Create a multi-queue TUN/TAP device with `queue_count` independent queue fds.
+    ///
+    /// When `queue_count == 1`, delegates transparently to [`TunTap::create`].
+    /// When `queue_count > 1`, opens `/dev/net/tun` `queue_count` times with
+    /// `IFF_MULTI_QUEUE` set, returning one [`TunTap`] per queue.
+    ///
+    /// All returned queue fds are placed in non-blocking mode (`O_NONBLOCK`).
+    /// If `want_vnet_hdr` is requested, `IFF_VNET_HDR` and kernel offload
+    /// (`TUNSETOFFLOAD`) are negotiated across all queues, falling back
+    /// transparently to plain queues if unsupported.
+    pub fn create_multi_queue(
+        name: &str,
+        kind: DeviceKind,
+        queue_count: usize,
+        want_vnet_hdr: bool,
+    ) -> Result<Vec<TunTap>, DeviceError> {
+        if queue_count == 0 {
+            return Err(DeviceError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "queue_count must be at least 1",
+            )));
+        }
+
+        if queue_count == 1 {
+            let tun = Self::create(name, kind, want_vnet_hdr)?;
+            tun.set_nonblocking()?;
+            return Ok(vec![tun]);
+        }
+
+        let ifname = encode_ifname(name)?;
+
+        if want_vnet_hdr {
+            if let Some(queues) = Self::open_multi_queue_with_offload(kind, &ifname, queue_count)? {
+                return Ok(queues);
+            }
+        }
+
+        Self::open_multi_queue_plain(kind, &ifname, queue_count)
+    }
+
+    /// Attempt to open with `IFF_VNET_HDR` framing and kernel GSO/GRO
     /// offload (`TUNSETOFFLOAD`) enabled. Returns `Ok(Some(_))` only when
     /// `TUNSETIFF` (with `IFF_VNET_HDR`) *and* `TUNSETOFFLOAD` both succeed;
     /// `Ok(None)` on any unsupported step (the freshly-opened fd is dropped/
@@ -166,7 +258,6 @@ impl TunTap {
     /// that would fail identically on the plain path (e.g. `/dev/net/tun`
     /// cannot be opened at all) is propagated as `Err`.
     fn open_with_offload(
-        name: &str,
         kind: DeviceKind,
         ifname: &[u8; libc::IFNAMSIZ],
     ) -> Result<Option<TunTap>, DeviceError> {
@@ -196,40 +287,13 @@ impl TunTap {
             return Ok(None);
         }
 
-        // SAFETY: `file`'s fd is the freshly-opened tun on which TUNSETIFF
-        // (with IFF_VNET_HDR) just succeeded. TUNSETOFFLOAD takes its flags
-        // as an integer argument passed by value — no pointer, no aliasing.
-        let full = unsafe {
-            libc::ioctl(
-                file.as_raw_fd(),
-                TUNSETOFFLOAD,
-                libc::c_ulong::from(TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6),
-            )
-        };
-        if full == 0 {
-            bring_up(ifname)?;
+        if let Some(_mode) = negotiate_offload(file.as_raw_fd()) {
+            bring_up(&req.name)?;
+            let actual_name = decode_ifname(&req.name)?;
             return Ok(Some(TunTap {
                 file,
                 kind,
-                name: name.to_owned(),
-                vnet_hdr_len: Some(VNET_HDR_LEN),
-            }));
-        }
-
-        // SAFETY: same rationale as the previous TUNSETOFFLOAD call.
-        let csum_only = unsafe {
-            libc::ioctl(
-                file.as_raw_fd(),
-                TUNSETOFFLOAD,
-                libc::c_ulong::from(TUN_F_CSUM),
-            )
-        };
-        if csum_only == 0 {
-            bring_up(ifname)?;
-            return Ok(Some(TunTap {
-                file,
-                kind,
-                name: name.to_owned(),
+                name: actual_name,
                 vnet_hdr_len: Some(VNET_HDR_LEN),
             }));
         }
@@ -240,12 +304,8 @@ impl TunTap {
         Ok(None)
     }
 
-    /// Open `name` without `IFF_VNET_HDR` framing (today's plain TUN/TAP path).
-    fn open_plain(
-        name: &str,
-        kind: DeviceKind,
-        ifname: &[u8; libc::IFNAMSIZ],
-    ) -> Result<TunTap, DeviceError> {
+    /// Open without `IFF_VNET_HDR` framing (today's plain TUN/TAP path).
+    fn open_plain(kind: DeviceKind, ifname: &[u8; libc::IFNAMSIZ]) -> Result<TunTap, DeviceError> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -270,14 +330,164 @@ impl TunTap {
         }
 
         // Bring the interface up so that reads and writes work immediately.
-        bring_up(ifname)?;
+        bring_up(&req.name)?;
+        let actual_name = decode_ifname(&req.name)?;
 
         Ok(TunTap {
             file,
             kind,
-            name: name.to_owned(),
+            name: actual_name,
             vnet_hdr_len: None,
         })
+    }
+
+    fn open_multi_queue_with_offload(
+        kind: DeviceKind,
+        ifname: &[u8; libc::IFNAMSIZ],
+        queue_count: usize,
+    ) -> Result<Option<Vec<TunTap>>, DeviceError> {
+        let file0 = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(TUN_PATH)?;
+
+        let type_flag = match kind {
+            DeviceKind::Tun => IFF_TUN,
+            DeviceKind::Tap => IFF_TAP,
+        };
+        let mut req0 = IfReq {
+            name: *ifname,
+            flags: type_flag | IFF_NO_PI | IFF_MULTI_QUEUE | IFF_VNET_HDR,
+            _pad: [0; 22],
+        };
+
+        // SAFETY: req0 is a correctly-sized ifreq for TUNSETIFF; file0 is a freshly-opened /dev/net/tun.
+        let rc = unsafe { libc::ioctl(file0.as_raw_fd(), TUNSETIFF, &raw mut req0) };
+        if rc != 0 {
+            return Ok(None);
+        }
+
+        let offload_mode = match negotiate_offload(file0.as_raw_fd()) {
+            Some(mode) => mode,
+            None => return Ok(None),
+        };
+
+        bring_up(&req0.name)?;
+        let actual_name = decode_ifname(&req0.name)?;
+
+        let q0 = TunTap {
+            file: file0,
+            kind,
+            name: actual_name.clone(),
+            vnet_hdr_len: Some(VNET_HDR_LEN),
+        };
+        q0.set_nonblocking()?;
+
+        let mut queues = Vec::with_capacity(queue_count);
+        queues.push(q0);
+
+        for _ in 1..queue_count {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(TUN_PATH)?;
+
+            let mut req = IfReq {
+                name: req0.name,
+                flags: type_flag | IFF_NO_PI | IFF_MULTI_QUEUE | IFF_VNET_HDR,
+                _pad: [0; 22],
+            };
+
+            // SAFETY: req is a correctly-sized ifreq for TUNSETIFF; file is a freshly-opened /dev/net/tun.
+            let rc = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETIFF, &raw mut req) };
+            if rc != 0 {
+                return Err(DeviceError::Io(io::Error::last_os_error()));
+            }
+
+            apply_offload(file.as_raw_fd(), offload_mode)?;
+
+            let q = TunTap {
+                file,
+                kind,
+                name: actual_name.clone(),
+                vnet_hdr_len: Some(VNET_HDR_LEN),
+            };
+            q.set_nonblocking()?;
+            queues.push(q);
+        }
+
+        Ok(Some(queues))
+    }
+
+    fn open_multi_queue_plain(
+        kind: DeviceKind,
+        ifname: &[u8; libc::IFNAMSIZ],
+        queue_count: usize,
+    ) -> Result<Vec<TunTap>, DeviceError> {
+        let file0 = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(TUN_PATH)?;
+
+        let type_flag = match kind {
+            DeviceKind::Tun => IFF_TUN,
+            DeviceKind::Tap => IFF_TAP,
+        };
+        let mut req0 = IfReq {
+            name: *ifname,
+            flags: type_flag | IFF_NO_PI | IFF_MULTI_QUEUE,
+            _pad: [0; 22],
+        };
+
+        // SAFETY: req0 is a correctly-sized ifreq for TUNSETIFF; file0 is a freshly-opened /dev/net/tun.
+        let rc = unsafe { libc::ioctl(file0.as_raw_fd(), TUNSETIFF, &raw mut req0) };
+        if rc != 0 {
+            return Err(DeviceError::Io(io::Error::last_os_error()));
+        }
+
+        bring_up(&req0.name)?;
+        let actual_name = decode_ifname(&req0.name)?;
+
+        let q0 = TunTap {
+            file: file0,
+            kind,
+            name: actual_name.clone(),
+            vnet_hdr_len: None,
+        };
+        q0.set_nonblocking()?;
+
+        let mut queues = Vec::with_capacity(queue_count);
+        queues.push(q0);
+
+        for _ in 1..queue_count {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(TUN_PATH)?;
+
+            let mut req = IfReq {
+                name: req0.name,
+                flags: type_flag | IFF_NO_PI | IFF_MULTI_QUEUE,
+                _pad: [0; 22],
+            };
+
+            // SAFETY: req is a correctly-sized ifreq for TUNSETIFF; file is a freshly-opened /dev/net/tun.
+            let rc = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETIFF, &raw mut req) };
+            if rc != 0 {
+                return Err(DeviceError::Io(io::Error::last_os_error()));
+            }
+
+            let q = TunTap {
+                file,
+                kind,
+                name: actual_name.clone(),
+                vnet_hdr_len: None,
+            };
+            q.set_nonblocking()?;
+            queues.push(q);
+        }
+
+        Ok(queues)
     }
 
     /// The interface name.
@@ -389,6 +599,24 @@ impl Device for TunTap {
     fn write_frame(&mut self, frame: &[u8]) -> io::Result<usize> {
         use std::io::Write;
         self.file.write(frame)
+    }
+}
+
+impl AsRawFd for TunTap {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.file.as_raw_fd()
+    }
+}
+
+impl AsRawFd for TunReader {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.file.as_raw_fd()
+    }
+}
+
+impl AsRawFd for TunWriter {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.file.as_raw_fd()
     }
 }
 
