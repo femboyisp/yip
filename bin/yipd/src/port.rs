@@ -41,10 +41,6 @@ fn create_reuseport_socket(addr: SocketAddr) -> io::Result<socket2::Socket> {
     Ok(sock)
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by multi-core sharding in later tasks")
-)]
 pub(crate) fn bind_udp_reuseport(
     addr: SocketAddr,
     port_auto: bool,

@@ -98,7 +98,7 @@ pub struct PeerConfig {
 }
 
 /// Static configuration for one yip tunnel endpoint.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Config {
     /// Local X25519 private key (32 bytes).
     pub local_private: [u8; 32],
@@ -163,6 +163,9 @@ pub struct Config {
     /// TLS SNI presented by `transport=tls` (`tls_sni=<domain>`), defaulting
     /// to [`DEFAULT_TLS_SNI`] when absent. Ignored for other transports.
     pub tls_sni: String,
+    /// Number of worker shards for multi-core throughput scaling (`shards=N` or `threads=N`).
+    /// Defaults to 1 (single-threaded).
+    pub shards: usize,
 }
 
 // ── hex decode helper ─────────────────────────────────────────────────────────
@@ -505,6 +508,7 @@ impl Config {
         let mut cover_traffic_ms: Option<u64> = None;
         let mut transport = TransportMode::default();
         let mut tls_sni: Option<String> = None;
+        let mut shards: Option<usize> = None;
 
         for line in text.lines() {
             let line = line.trim();
@@ -619,6 +623,21 @@ impl Config {
                     }
                 }
                 "tls_sni" => tls_sni = Some(val.to_owned()),
+                "shards" | "threads" => {
+                    let n = val.parse::<usize>().map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid shards count: {e}"),
+                        )
+                    })?;
+                    if n == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "shards must be at least 1",
+                        ));
+                    }
+                    shards = Some(n);
+                }
                 // Silently ignore unknown keys for forward-compatibility. The
                 // netns config files still contain `initiate=true|false` from
                 // before Task 5 removed the field; this is intentional so
@@ -741,6 +760,7 @@ impl Config {
             cover_traffic_ms,
             transport,
             tls_sni: tls_sni.unwrap_or_else(|| DEFAULT_TLS_SNI.to_owned()),
+            shards: shards.unwrap_or(1),
         })
     }
 }
@@ -762,6 +782,27 @@ mod tests {
         assert_eq!(c.device, "yip0");
         assert_eq!(c.local_private[31], 0xff);
         assert_eq!(c.peers[0].public_key[31], 0xbb);
+        assert_eq!(c.shards, 1);
+    }
+
+    #[test]
+    fn parse_config_shards_and_threads() {
+        let base = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
+                    local_public=00000000000000000000000000000000000000000000000000000000000000aa\n\
+                    peer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:51820\n";
+
+        let text_shards = format!("{base}shards=4\n");
+        let c = Config::parse(&text_shards).unwrap();
+        assert_eq!(c.shards, 4);
+
+        let text_threads = format!("{base}threads=8\n");
+        let c2 = Config::parse(&text_threads).unwrap();
+        assert_eq!(c2.shards, 8);
+
+        let text_zero = format!("{base}shards=0\n");
+        assert!(Config::parse(&text_zero).is_err());
     }
 
     #[test]
