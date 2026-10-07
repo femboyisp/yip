@@ -2426,6 +2426,7 @@ dependencies = [
  "quinn-proto",
  "rcgen",
  "rustls",
+ "socket2 0.5.10",
  "tokio",
  "yip-crypto",
  "yip-device",

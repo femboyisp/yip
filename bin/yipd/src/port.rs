@@ -29,6 +29,64 @@ pub(crate) fn bind_udp(addr: SocketAddr, port_auto: bool) -> io::Result<UdpSocke
     }
 }
 
+fn create_reuseport_socket(addr: SocketAddr) -> io::Result<socket2::Socket> {
+    let domain = if addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
+    sock.set_reuse_port(true)?;
+    sock.set_nonblocking(true)?;
+    Ok(sock)
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by multi-core sharding in later tasks")
+)]
+pub(crate) fn bind_udp_reuseport(
+    addr: SocketAddr,
+    port_auto: bool,
+    count: usize,
+) -> io::Result<Vec<UdpSocket>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut sockets = Vec::with_capacity(count);
+    let mut bound_addr = addr;
+
+    let sock0 = create_reuseport_socket(bound_addr)?;
+    let sock0 = match sock0.bind(&bound_addr.into()) {
+        Ok(()) => sock0,
+        Err(e) if port_auto && e.kind() == io::ErrorKind::PermissionDenied => {
+            warn_fallback("udp", bound_addr);
+            bound_addr = fallback_addr(bound_addr);
+            let fb_sock = create_reuseport_socket(bound_addr)?;
+            fb_sock.bind(&bound_addr.into())?;
+            fb_sock
+        }
+        Err(e) => return Err(e),
+    };
+    let std_sock0: UdpSocket = sock0.into();
+    yip_io::set_socket_buffers(&std_sock0, 4 * 1024 * 1024)?;
+    if bound_addr.port() == 0 {
+        bound_addr = SocketAddr::new(bound_addr.ip(), std_sock0.local_addr()?.port());
+    }
+    sockets.push(std_sock0);
+
+    for _ in 1..count {
+        let sock = create_reuseport_socket(bound_addr)?;
+        sock.bind(&bound_addr.into())?;
+        let std_sock: UdpSocket = sock.into();
+        yip_io::set_socket_buffers(&std_sock, 4 * 1024 * 1024)?;
+        sockets.push(std_sock);
+    }
+
+    Ok(sockets)
+}
+
 pub(crate) fn bind_tcp(addr: SocketAddr, port_auto: bool) -> io::Result<TcpListener> {
     match TcpListener::bind(addr) {
         Ok(s) => Ok(s),
@@ -110,6 +168,128 @@ mod tests {
                 s.local_addr().unwrap()
             ),
             Err(e) => assert_eq!(e.kind(), io::ErrorKind::AddrInUse),
+        }
+    }
+
+    #[test]
+    fn bind_udp_reuseport_zero_count_returns_empty() {
+        let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
+        let socks = bind_udp_reuseport(addr, false, 0).unwrap();
+        assert!(socks.is_empty());
+    }
+
+    #[test]
+    fn bind_udp_reuseport_single_socket() {
+        let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
+        let socks = bind_udp_reuseport(addr, false, 1).unwrap();
+        assert_eq!(socks.len(), 1);
+        assert!(socks[0].local_addr().is_ok());
+    }
+
+    #[test]
+    fn bind_udp_reuseport_multiple_sockets_same_port() {
+        let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
+        let socks = bind_udp_reuseport(addr, false, 3).expect("bind reuseport sockets");
+        assert_eq!(socks.len(), 3);
+        let port0 = socks[0].local_addr().unwrap().port();
+        assert_ne!(port0, 0);
+        for sock in &socks[1..] {
+            assert_eq!(sock.local_addr().unwrap().port(), port0);
+        }
+    }
+
+    #[test]
+    fn bind_udp_reuseport_sockets_send_and_receive_independently() {
+        let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
+        let socks = bind_udp_reuseport(addr, false, 2).expect("bind 2 reuseport sockets");
+        let target_port = socks[0].local_addr().unwrap().port();
+        let target_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), target_port);
+
+        // 1. Verify each socket can send independently to a client.
+        let client = UdpSocket::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)).unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        socks[0].send_to(b"from-sock-0", client_addr).unwrap();
+        let mut buf = [0u8; 64];
+        let (len, from) = client.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..len], b"from-sock-0");
+        assert_eq!(from.port(), target_port);
+
+        socks[1].send_to(b"from-sock-1", client_addr).unwrap();
+        let (len, from) = client.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..len], b"from-sock-1");
+        assert_eq!(from.port(), target_port);
+
+        // 2. Verify each socket can receive independently.
+        // Linux SO_REUSEPORT hashes (src_ip, src_port, dst_ip, dst_port) to pick
+        // the receiving socket. With multiple distinct client sockets, datagrams
+        // will route to both socket 0 and socket 1.
+        let mut sock0_received = false;
+        let mut sock1_received = false;
+
+        for i in 0..100 {
+            if sock0_received && sock1_received {
+                break;
+            }
+            let sender = UdpSocket::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)).unwrap();
+            sender
+                .send_to(format!("probe {i}").as_bytes(), target_addr)
+                .unwrap();
+
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            let mut recv_buf = [0u8; 64];
+            while let Ok((n, _)) = socks[0].recv_from(&mut recv_buf) {
+                if n > 0 {
+                    sock0_received = true;
+                }
+            }
+            while let Ok((n, _)) = socks[1].recv_from(&mut recv_buf) {
+                if n > 0 {
+                    sock1_received = true;
+                }
+            }
+        }
+
+        assert!(sock0_received, "socket 0 should have received packets");
+        assert!(sock1_received, "socket 1 should have received packets");
+    }
+
+    #[test]
+    fn bind_udp_reuseport_auto_falls_back_when_privileged_port_denied() {
+        let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 443);
+        match bind_udp_reuseport(addr, true, 2) {
+            Ok(socks) => {
+                assert_eq!(socks.len(), 2);
+                let p0 = socks[0].local_addr().unwrap().port();
+                let p1 = socks[1].local_addr().unwrap().port();
+                assert_eq!(p0, p1);
+                assert!(p0 == 443 || p0 == FALLBACK_LISTEN_PORT);
+            }
+            Err(e) => panic!("auto reuseport bind must not error (443 or 8443): {e}"),
+        }
+    }
+
+    #[test]
+    fn bind_udp_reuseport_explicit_privileged_port_never_falls_back() {
+        const EXPLICIT_PRIV_PORT: u16 = 1023;
+        let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), EXPLICIT_PRIV_PORT);
+        match bind_udp_reuseport(addr, false, 2) {
+            Ok(socks) => {
+                assert_eq!(socks.len(), 2);
+                let p0 = socks[0].local_addr().unwrap().port();
+                let p1 = socks[1].local_addr().unwrap().port();
+                assert_eq!(p0, p1);
+                assert_eq!(
+                    p0,
+                    EXPLICIT_PRIV_PORT,
+                    "an explicit port must bind as-configured, never fall back to {FALLBACK_LISTEN_PORT}"
+                );
+            }
+            Err(e) => assert_eq!(
+                e.kind(),
+                io::ErrorKind::PermissionDenied,
+                "explicit privileged bind must surface PermissionDenied, not fall back"
+            ),
         }
     }
 }

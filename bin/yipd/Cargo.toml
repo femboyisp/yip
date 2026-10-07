@@ -46,6 +46,7 @@ boring = "5"
 # enters yipd transitively via yip-utls, so this is not a new heavyweight dep.
 tokio = { version = "1", features = ["rt", "net", "time", "io-util", "sync", "macros"] }
 yip-utls = { path = "../../crates/yip-utls" }
+socket2 = { version = "0.5", features = ["all"] }
 
 [dev-dependencies]
 ed25519-dalek = { version = "3", default-features = false }
