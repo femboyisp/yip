@@ -5,6 +5,7 @@
 pub mod addr;
 pub mod epoll;
 pub(crate) mod gso;
+pub mod nonce;
 pub mod poll;
 pub mod spsc;
 pub(crate) mod tun_offload;
