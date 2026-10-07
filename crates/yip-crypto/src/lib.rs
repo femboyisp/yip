@@ -37,31 +37,42 @@ pub fn generate_keypair() -> Keypair {
     Keypair { private, public }
 }
 
-/// Number of past counters the replay window tracks behind the latest.
-const REPLAY_WINDOW_BITS: u64 = 64;
+/// Number of past counters the replay window tracks behind the latest (16 KB bitmap).
+pub const REPLAY_WINDOW_BITS: u64 = 131_072;
+pub const REPLAY_WORDS: usize = 2048;
 
-/// A WireGuard-style sliding replay window over a monotonic `u64` counter.
-/// Bit `i` of `bitmap` records that `latest - i` has been seen.
-struct ReplayWindow {
+/// A wide sliding replay window over a monotonic `u64` counter using a circular word ring.
+#[derive(Clone)]
+pub struct ReplayWindow {
     latest: u64,
-    bitmap: u64,
+    bitmap: Box<[u64; REPLAY_WORDS]>,
     started: bool,
 }
 
 impl ReplayWindow {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             latest: 0,
-            bitmap: 0,
+            bitmap: vec![0u64; REPLAY_WORDS]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
             started: false,
         }
     }
 
-    /// Would `counter` be accepted right now? Read-only — does **not** mutate the
-    /// window. On the receive path this gates AEAD verification cheaply, and the
-    /// slot is only committed (via [`commit`](Self::commit)) once the frame
-    /// authenticates, so a forged counter cannot advance the window.
-    fn check(&self, counter: u64) -> bool {
+    #[inline]
+    fn word_idx(counter: u64) -> usize {
+        ((counter / 64) as usize) & (REPLAY_WORDS - 1)
+    }
+
+    #[inline]
+    fn bit_mask(counter: u64) -> u64 {
+        1u64 << (counter % 64)
+    }
+
+    /// Would `counter` be accepted right now? Read-only — does not mutate state.
+    pub fn check(&self, counter: u64) -> bool {
         if !self.started {
             return true;
         }
@@ -72,42 +83,53 @@ impl ReplayWindow {
             if diff >= REPLAY_WINDOW_BITS {
                 return false; // too old
             }
-            self.bitmap & (1u64 << diff) == 0 // false ⇒ already seen (replay)
+            let idx = Self::word_idx(counter);
+            let mask = Self::bit_mask(counter);
+            (self.bitmap[idx] & mask) == 0
         }
     }
 
-    /// Record `counter` as seen, advancing the window. The caller MUST have
-    /// confirmed acceptance via [`check`](Self::check) first (and, on the
-    /// receive path, AEAD verification); `counter` is therefore never too-old
-    /// here, so the in-window shift is always in range.
-    fn commit(&mut self, counter: u64) {
+    /// Record `counter` as seen, advancing the window. Must be preceded by check().
+    pub fn commit(&mut self, counter: u64) {
         if !self.started {
             self.started = true;
             self.latest = counter;
-            self.bitmap = 1;
+            let idx = Self::word_idx(counter);
+            self.bitmap[idx] = Self::bit_mask(counter);
             return;
         }
+
         if counter > self.latest {
-            let shift = counter - self.latest;
-            self.bitmap = if shift >= REPLAY_WINDOW_BITS {
-                1
+            let diff = counter - self.latest;
+            if diff >= REPLAY_WINDOW_BITS {
+                // Large leap: clear entire bitmap
+                self.bitmap.fill(0);
             } else {
-                (self.bitmap << shift) | 1
-            };
+                // Clear any words in the circular ring that were overtaken
+                let old_word = self.latest / 64;
+                let new_word = counter / 64;
+                if new_word > old_word {
+                    let words_to_clear = ((new_word - old_word) as usize).min(REPLAY_WORDS);
+                    for w in 1..=words_to_clear {
+                        let idx = ((old_word + w as u64) as usize) & (REPLAY_WORDS - 1);
+                        self.bitmap[idx] = 0;
+                    }
+                }
+            }
             self.latest = counter;
+            let idx = Self::word_idx(counter);
+            self.bitmap[idx] |= Self::bit_mask(counter);
         } else {
             let diff = self.latest - counter;
-            self.bitmap |= 1u64 << diff;
+            if diff < REPLAY_WINDOW_BITS {
+                let idx = Self::word_idx(counter);
+                self.bitmap[idx] |= Self::bit_mask(counter);
+            }
         }
     }
 
-    /// Atomic check-and-set: accept `counter` if fresh, recording it. The receive
-    /// path deliberately does **not** use this — it splits into
-    /// [`check`](Self::check) → AEAD → [`commit`](Self::commit) so a forged frame
-    /// cannot advance the window before it authenticates. Retained as a compact
-    /// way to exercise the sliding-window math directly in unit tests.
     #[cfg(test)]
-    fn check_and_set(&mut self, counter: u64) -> bool {
+    pub fn check_and_set(&mut self, counter: u64) -> bool {
         if self.check(counter) {
             self.commit(counter);
             true
@@ -117,7 +139,14 @@ impl ReplayWindow {
     }
 }
 
+impl Default for ReplayWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Errors from the crypto layer.
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CryptoError {
     /// AEAD tag did not verify / decryption failed.
@@ -849,5 +878,34 @@ mod tests {
         let mut obuf = Vec::new();
         b.open_into(ctr, &sbuf, &mut obuf).unwrap();
         assert_eq!(obuf, b"reuse me");
+    }
+
+    #[test]
+    fn test_wide_replay_window_jitter_and_rejection() {
+        let mut w = ReplayWindow::new();
+        // Initially accepts 0
+        assert!(w.check(0));
+        w.commit(0);
+
+        // Advance latest to 100,000
+        assert!(w.check(100_000));
+        w.commit(100_000);
+
+        // Packet 50,000 (diff = 50,000 < 131,072) must be accepted
+        assert!(w.check(50_000));
+        w.commit(50_000);
+
+        // Duplicate 50,000 must be rejected
+        assert!(!w.check(50_000));
+
+        // Packet 0 is now 100,000 behind, which is < 131,072, but it was already seen
+        assert!(!w.check(0));
+
+        // Advance to 250,000
+        assert!(w.check(250_000));
+        w.commit(250_000);
+
+        // Packet 100,000 is 150,000 behind (>= 131,072), must be rejected as too old
+        assert!(!w.check(100_000));
     }
 }
