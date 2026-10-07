@@ -2326,6 +2326,7 @@ dependencies = [
 name = "yip-io"
 version = "0.0.0"
 dependencies = [
+ "crossbeam-utils",
  "io-uring",
  "libc",
 ]
