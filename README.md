@@ -24,11 +24,11 @@ plain tunnel spikes. Censorship-resistance and traffic-analysis defense are opt-
 not always-on costs.
 
 > [!NOTE]
-> **Status: pre-1.0, single maintainer, Linux-only.** The data plane, the full control
-> plane, and the anti-DPI transports (obfuscation + Xray-REALITY TLS mimicry) are implemented
-> and merged, with per-milestone integration ("money") tests running in CI on both I/O
-> drivers. Not yet built: multi-core scaling (throughput is single-core-bound today),
-> traffic-analysis/timing defense, and the post-quantum handshake. No release has been cut;
+> **Status: pre-1.0, single maintainer, Linux-only.** The data plane, multi-core throughput
+> sharding (Way A), the full control plane, and the anti-DPI transports (obfuscation +
+> Xray-REALITY TLS mimicry) are implemented and merged, with per-milestone integration
+> tests running in CI on both I/O drivers. Not yet built: traffic-analysis/timing defense
+> and the post-quantum hybrid handshake. No release has been cut;
 > [`CHANGELOG.md`](CHANGELOG.md) tracks all merged work under *Unreleased*.
 
 > [!TIP]
