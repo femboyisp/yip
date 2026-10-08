@@ -2276,6 +2276,7 @@ dependencies = [
  "siphasher",
  "socket2 0.5.10",
  "yip-crypto",
+ "yip-io",
  "yip-transport",
  "yip-wire",
 ]

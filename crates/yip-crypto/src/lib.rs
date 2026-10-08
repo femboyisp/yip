@@ -345,6 +345,79 @@ impl Session {
         Ok(counter)
     }
 
+    /// Seal one inner frame under an explicit counter, without mutating internal counter.
+    /// This allows multi-threaded workers sharing a single peer connection to seal
+    /// concurrently using nonces dispensed from a ChunkedNonceDispenser.
+    pub fn seal_with_counter(&self, counter: u64, plaintext: &[u8]) -> Result<Sealed, CryptoError> {
+        let mut buf = plaintext.to_vec();
+        self.send_key
+            .seal_in_place_append_tag(noise_nonce(counter), Aad::empty(), &mut buf)
+            .map_err(|_| CryptoError::Decrypt)?;
+        Ok(Sealed {
+            counter,
+            ciphertext: buf,
+        })
+    }
+
+    /// Seal into a caller-owned reusable buffer under an explicit counter.
+    pub fn seal_into_with_counter(
+        &self,
+        counter: u64,
+        plaintext: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), CryptoError> {
+        out.clear();
+        out.extend_from_slice(plaintext);
+        self.send_key
+            .seal_in_place_append_tag(noise_nonce(counter), Aad::empty(), out)
+            .map_err(|_| CryptoError::Decrypt)?;
+        Ok(())
+    }
+
+    /// Open one inner frame received under explicit counter against a caller-provided replay window.
+    pub fn open_with_window(
+        &self,
+        counter: u64,
+        ciphertext: &[u8],
+        replay: &mut ReplayWindow,
+    ) -> Result<Vec<u8>, CryptoError> {
+        if !replay.check(counter) {
+            return Err(CryptoError::Replay);
+        }
+        let mut buf = ciphertext.to_vec();
+        let plain = self
+            .recv_key
+            .open_in_place(noise_nonce(counter), Aad::empty(), &mut buf)
+            .map_err(|_| CryptoError::Decrypt)?;
+        replay.commit(counter);
+        Ok(plain.to_vec())
+    }
+
+    /// Open into a caller-owned reusable buffer under explicit counter against a caller-provided replay window.
+    pub fn open_into_with_window(
+        &self,
+        counter: u64,
+        ciphertext: &[u8],
+        replay: &mut ReplayWindow,
+        out: &mut Vec<u8>,
+    ) -> Result<(), CryptoError> {
+        if !replay.check(counter) {
+            return Err(CryptoError::Replay);
+        }
+        out.clear();
+        out.extend_from_slice(ciphertext);
+        let n = {
+            let plain = self
+                .recv_key
+                .open_in_place(noise_nonce(counter), Aad::empty(), out)
+                .map_err(|_| CryptoError::Decrypt)?;
+            plain.len()
+        };
+        replay.commit(counter);
+        out.truncate(n);
+        Ok(())
+    }
+
     /// Open into a caller-owned reusable buffer (no per-call allocation).
     pub fn open_into(
         &mut self,
@@ -907,5 +980,25 @@ mod tests {
 
         // Packet 100,000 is 150,000 behind (>= 131,072), must be rejected as too old
         assert!(!w.check(100_000));
+    }
+
+    #[test]
+    fn test_seal_with_counter_and_open_with_window() {
+        let (a, b) = crate::test_session_pair();
+        let payload = b"concurrent multi-worker payload";
+        let sealed = a.seal_with_counter(42, payload).unwrap();
+        assert_eq!(sealed.counter, 42);
+
+        let mut replay = ReplayWindow::new();
+        let decrypted = b
+            .open_with_window(sealed.counter, &sealed.ciphertext, &mut replay)
+            .unwrap();
+        assert_eq!(decrypted, payload);
+
+        // Replay attempt must fail
+        assert_eq!(
+            b.open_with_window(sealed.counter, &sealed.ciphertext, &mut replay),
+            Err(CryptoError::Replay)
+        );
     }
 }
