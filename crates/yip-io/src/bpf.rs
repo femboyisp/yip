@@ -60,8 +60,12 @@ pub const BPF_K: u8 = 0x00;
 pub const BPF_X: u8 = 0x08;
 
 pub const BPF_ADD: u8 = 0x00;
+pub const BPF_AND: u8 = 0x50;
+pub const BPF_LSH: u8 = 0x60;
 pub const BPF_MOV: u8 = 0xb0;
 
+pub const BPF_JA: u8 = 0x00;
+pub const BPF_JEQ: u8 = 0x10;
 pub const BPF_JGT: u8 = 0x20;
 pub const BPF_JNE: u8 = 0x50;
 pub const BPF_CALL: u8 = 0x80;
@@ -73,6 +77,7 @@ pub const R1: u8 = 1;
 pub const R2: u8 = 2;
 pub const R3: u8 = 3;
 pub const R4: u8 = 4;
+pub const R5: u8 = 5;
 pub const R6: u8 = 6;
 
 /// 8-byte eBPF instruction binary layout matching Linux kernel ABI (`struct bpf_insn`).
@@ -105,6 +110,26 @@ impl BpfInsn {
 
     pub const fn add64_imm(dst: u8, imm: i32) -> Self {
         Self::new(BPF_ALU64 | BPF_ADD | BPF_K, dst, 0, 0, imm)
+    }
+
+    pub const fn add64_reg(dst: u8, src: u8) -> Self {
+        Self::new(BPF_ALU64 | BPF_ADD | BPF_X, dst, src, 0, 0)
+    }
+
+    pub const fn and64_imm(dst: u8, imm: i32) -> Self {
+        Self::new(BPF_ALU64 | BPF_AND | BPF_K, dst, 0, 0, imm)
+    }
+
+    pub const fn lsh64_imm(dst: u8, imm: i32) -> Self {
+        Self::new(BPF_ALU64 | BPF_LSH | BPF_K, dst, 0, 0, imm)
+    }
+
+    pub const fn ja(off: i16) -> Self {
+        Self::new(BPF_JMP | BPF_JA, 0, 0, off, 0)
+    }
+
+    pub const fn jeq_imm(dst: u8, imm: i32, off: i16) -> Self {
+        Self::new(BPF_JMP | BPF_JEQ | BPF_K, dst, 0, off, imm)
     }
 
     pub const fn ldx_mem_w(dst: u8, src: u8, off: i16) -> Self {
@@ -258,16 +283,17 @@ pub fn bpf_map_update_xsk(map_fd: RawFd, queue_id: u32, xsk_fd: RawFd) -> io::Re
     Ok(())
 }
 
-/// Compiles and loads an eBPF XDP filter redirecting UDP traffic for `listen_port` to `xsk_map_fd`.
-pub fn bpf_prog_load_xdp(listen_port: u16, xsk_map_fd: RawFd) -> io::Result<RawFd> {
+/// Assembles the dual-stack outer UDP eBPF XDP filter bytecode.
+///
+/// Matches both IPv4 (`0x0800`) and IPv6 (`0x86dd`) outer UDP datagrams targeting `listen_port`,
+/// steering matched packets directly to core-pinned AF_XDP rings via `bpf_redirect_map(xsk_map_fd, ctx->rx_queue_index, 0)`.
+pub fn bpf_prog_assemble_xdp(listen_port: u16, xsk_map_fd: RawFd) -> Vec<BpfInsn> {
     let eth_p_ip = (0x0800u16).to_be() as i32;
+    let eth_p_ipv6 = (0x86ddu16).to_be() as i32;
     let udp_port = listen_port.to_be() as i32;
-    let license = b"GPL\0";
 
-    // 20-instruction eBPF packet filter:
-    // Checks Ethernet (IPv4), IP (UDP), UDP dest port == listen_port -> bpf_redirect_map(map, rx_queue, 0)
-    let insns = [
-        // 0: r6 = r1 (save context)
+    vec![
+        // 0: r6 = r1 (save context pointer)
         BpfInsn::mov64_reg(R6, R1),
         // 1: r2 = *(u32 *)(r6 + 0) (ctx->data)
         BpfInsn::ldx_mem_w(R2, R6, 0),
@@ -275,23 +301,68 @@ pub fn bpf_prog_load_xdp(listen_port: u16, xsk_map_fd: RawFd) -> io::Result<RawF
         BpfInsn::ldx_mem_w(R3, R6, 4),
         // 3: r4 = r2
         BpfInsn::mov64_reg(R4, R2),
-        // 4: r4 += 42 (14 eth + 20 ip + 8 udp)
-        BpfInsn::add64_imm(R4, 42),
-        // 5: if r4 > r3 goto +12 (index 18: LABEL_PASS)
-        BpfInsn::jgt_reg(R4, R3, 12),
-        // 6: r4 = *(u16 *)(r2 + 12) (eth->proto)
+        // 4: r4 += 14 (Ethernet header length)
+        BpfInsn::add64_imm(R4, 14),
+        // 5: if r4 > r3 goto PASS (target index 39: off = 39 - (5 + 1) = 33)
+        BpfInsn::jgt_reg(R4, R3, 33),
+        // 6: r4 = *(u16 *)(r2 + 12) (eth->h_proto)
         BpfInsn::ldx_mem_h(R4, R2, 12),
-        // 7: if r4 != eth_p_ip goto +10 (index 18: LABEL_PASS)
-        BpfInsn::jne_imm(R4, eth_p_ip, 10),
-        // 8: r4 = *(u8 *)(r2 + 23) (ip->proto: 14 + 9 = 23)
+        // 7: if r4 == eth_p_ip goto IPV4 (target index 17: off = 17 - (7 + 1) = 9)
+        BpfInsn::jeq_imm(R4, eth_p_ip, 9),
+        // 8: if r4 != eth_p_ipv6 goto PASS (target index 39: off = 39 - (8 + 1) = 30)
+        BpfInsn::jne_imm(R4, eth_p_ipv6, 30),
+        // === IPv6 Branch (indices 9..16) ===
+        // 9: r4 = r2
+        BpfInsn::mov64_reg(R4, R2),
+        // 10: r4 += 62 (14 eth + 40 ip6 + 8 udp)
+        BpfInsn::add64_imm(R4, 62),
+        // 11: if r4 > r3 goto PASS (target index 39: off = 39 - (11 + 1) = 27)
+        BpfInsn::jgt_reg(R4, R3, 27),
+        // 12: r4 = *(u8 *)(r2 + 20) (ip6->nexthdr at 14 + 6 = 20)
+        BpfInsn::ldx_mem_b(R4, R2, 20),
+        // 13: if r4 != 17 (IPPROTO_UDP) goto PASS (target index 39: off = 39 - (13 + 1) = 25)
+        BpfInsn::jne_imm(R4, 17, 25),
+        // 14: r4 = *(u16 *)(r2 + 56) (udp->dest at 14 + 40 + 2 = 56)
+        BpfInsn::ldx_mem_h(R4, R2, 56),
+        // 15: if r4 != udp_port goto PASS (target index 39: off = 39 - (15 + 1) = 23)
+        BpfInsn::jne_imm(R4, udp_port, 23),
+        // 16: goto REDIRECT (target index 33: off = 33 - (16 + 1) = 16)
+        BpfInsn::ja(16),
+        // === IPv4 Branch (indices 17..32) ===
+        // 17: r4 = r2
+        BpfInsn::mov64_reg(R4, R2),
+        // 18: r4 += 42 (14 eth + 20 ip + 8 udp min bounds)
+        BpfInsn::add64_imm(R4, 42),
+        // 19: if r4 > r3 goto PASS (target index 39: off = 39 - (19 + 1) = 19)
+        BpfInsn::jgt_reg(R4, R3, 19),
+        // 20: r4 = *(u8 *)(r2 + 23) (ip->protocol at 14 + 9 = 23)
         BpfInsn::ldx_mem_b(R4, R2, 23),
-        // 9: if r4 != 17 (IPPROTO_UDP) goto +8 (index 18: LABEL_PASS)
-        BpfInsn::jne_imm(R4, 17, 8),
-        // 10: r4 = *(u16 *)(r2 + 36) (udp->dest: 14 + 20 + 2 = 36)
-        BpfInsn::ldx_mem_h(R4, R2, 36),
-        // 11: if r4 != udp_port goto +6 (index 18: LABEL_PASS)
+        // 21: if r4 != 17 (IPPROTO_UDP) goto PASS (target index 39: off = 39 - (21 + 1) = 17)
+        BpfInsn::jne_imm(R4, 17, 17),
+        // 22: r5 = *(u8 *)(r2 + 14) (ip->v_ihl at offset 14)
+        BpfInsn::ldx_mem_b(R5, R2, 14),
+        // 23: r5 &= 0x0f (extract IHL)
+        BpfInsn::and64_imm(R5, 0x0f),
+        // 24: r5 <<= 2 (IHL in bytes: ihl * 4)
+        BpfInsn::lsh64_imm(R5, 2),
+        // 25: r4 = r2 (data)
+        BpfInsn::mov64_reg(R4, R2),
+        // 26: r4 += 14 (Ethernet header length)
+        BpfInsn::add64_imm(R4, 14),
+        // 27: r4 += r5 (r4 = data + 14 + ihl, pointing to start of UDP header)
+        BpfInsn::add64_reg(R4, R5),
+        // 28: r5 = r4
+        BpfInsn::mov64_reg(R5, R4),
+        // 29: r5 += 8 (UDP header length)
+        BpfInsn::add64_imm(R5, 8),
+        // 30: if r5 > r3 goto PASS (target index 39: off = 39 - (30 + 1) = 8)
+        BpfInsn::jgt_reg(R5, R3, 8),
+        // 31: r4 = *(u16 *)(r4 + 2) (udp->dest port)
+        BpfInsn::ldx_mem_h(R4, R4, 2),
+        // 32: if r4 != udp_port goto PASS (target index 39: off = 39 - (32 + 1) = 6)
         BpfInsn::jne_imm(R4, udp_port, 6),
-        // 12, 13: r1 = xsk_map_fd (BPF_LD_IMM64 pseudo map fd)
+        // === LABEL_REDIRECT (indices 33..38) ===
+        // 33, 34: r1 = xsk_map_fd (BPF_LD_IMM64 pseudo map fd)
         BpfInsn::new(
             BPF_LD | BPF_DW | BPF_IMM,
             R1,
@@ -300,19 +371,26 @@ pub fn bpf_prog_load_xdp(listen_port: u16, xsk_map_fd: RawFd) -> io::Result<RawF
             xsk_map_fd,
         ),
         BpfInsn::new(0, 0, 0, 0, 0),
-        // 14: r2 = *(u32 *)(r6 + 16) (ctx->rx_queue_index)
+        // 35: r2 = *(u32 *)(r6 + 16) (ctx->rx_queue_index)
         BpfInsn::ldx_mem_w(R2, R6, 16),
-        // 15: r3 = 0 (flags)
+        // 36: r3 = 0 (flags)
         BpfInsn::mov64_imm(R3, 0),
-        // 16: call bpf_redirect_map(r1, r2, r3) -> r0
+        // 37: call bpf_redirect_map(r1, r2, r3) -> r0
         BpfInsn::call_helper(BPF_FUNC_REDIRECT_MAP),
-        // 17: exit (returns r0)
+        // 38: exit (returns r0)
         BpfInsn::exit(),
-        // 18: LABEL_PASS: r0 = XDP_PASS (2)
+        // === LABEL_PASS (indices 39..40) ===
+        // 39: r0 = XDP_PASS (2)
         BpfInsn::mov64_imm(R0, XDP_PASS),
-        // 19: exit
+        // 40: exit
         BpfInsn::exit(),
-    ];
+    ]
+}
+
+/// Compiles and loads an eBPF XDP filter redirecting dual-stack UDP traffic for `listen_port` to `xsk_map_fd`.
+pub fn bpf_prog_load_xdp(listen_port: u16, xsk_map_fd: RawFd) -> io::Result<RawFd> {
+    let insns = bpf_prog_assemble_xdp(listen_port, xsk_map_fd);
+    let license = b"GPL\0";
 
     let mut attr = BpfAttr { pad: [0u8; 152] };
     attr.prog_load = BpfProgLoadAttr {
