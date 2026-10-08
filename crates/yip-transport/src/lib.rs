@@ -6,7 +6,11 @@
 pub mod rs_simd;
 pub use rs_simd::{
     avx2_supported, avx512bw_supported, gfni_supported, neon_supported, ssse3_supported,
+    wasm_simd_supported,
 };
+
+pub mod rlnc;
+pub use rlnc::{RlncDecoder, RlncEncoder};
 
 pub mod classify;
 pub use classify::{Classifier, PolicyRule};

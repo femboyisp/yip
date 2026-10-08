@@ -2,7 +2,7 @@ use yip_transport::gf256;
 use yip_transport::rs::{decode_source, encode_repair, mul_add_row, Scheme};
 use yip_transport::rs_simd::{
     avx2_supported, avx512bw_supported, gfni_supported, mul_add_avx2, mul_add_avx512, mul_add_gfni,
-    mul_add_ssse3, neon_supported, ssse3_supported,
+    mul_add_ssse3, mul_add_wasm128, neon_supported, ssse3_supported, wasm_simd_supported,
 };
 
 const TEST_LENGTHS: &[usize] = &[
@@ -27,6 +27,7 @@ fn test_simd_feature_flags_do_not_panic() {
     let _ = avx512bw_supported();
     let _ = gfni_supported();
     let _ = neon_supported();
+    let _ = wasm_simd_supported();
 }
 
 #[test]
@@ -211,4 +212,26 @@ fn test_pq_encode_decode_roundtrip_simd() {
     let decoded =
         decode_source(k, len, &received, Scheme::Pq).expect("P+Q RS must recover 2 erasures");
     assert_eq!(decoded, sources, "Decoded sources must match original");
+}
+
+#[test]
+fn test_wasm128_matches_scalar_differential() {
+    let src = make_pseudo_random_buffer(2000, 41);
+    for coeff in 0..=255u8 {
+        for &len in TEST_LENGTHS {
+            let mut dst_simd = make_pseudo_random_buffer(len, 127);
+            let mut dst_scalar = dst_simd.clone();
+
+            // SAFETY: Slice lengths match.
+            unsafe {
+                mul_add_wasm128(coeff, &src[..len], &mut dst_simd);
+            }
+            gf256::mul_slice_into(&mut dst_scalar, &src[..len], coeff);
+
+            assert_eq!(
+                dst_simd, dst_scalar,
+                "WASM128 mismatch for coeff={coeff}, len={len}"
+            );
+        }
+    }
 }

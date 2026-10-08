@@ -137,6 +137,18 @@ pub fn neon_supported() -> bool {
     }
 }
 
+/// Check if WebAssembly SIMD128 is supported on this target.
+pub fn wasm_simd_supported() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        true
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        false
+    }
+}
+
 /// Multiplies `src` by `coeff` in GF(2^8) and accumulates (XORs) into `dst` using 128-bit SSSE3 SIMD.
 ///
 /// # Safety
@@ -537,6 +549,73 @@ pub unsafe fn mul_add_neon(coeff: u8, src: &[u8], dst: &mut [u8]) {
     crate::gf256::mul_slice_into(dst, src, coeff);
 }
 
+/// Multiplies `src` by `coeff` in GF(2^8) and accumulates (XORs) into `dst` using 128-bit WebAssembly SIMD128.
+///
+/// # Safety
+///
+/// The caller must ensure that the CPU supports WebAssembly SIMD128 (e.g. verified via [`wasm_simd_supported`]).
+#[cfg(target_arch = "wasm32")]
+#[target_feature(enable = "simd128")]
+pub unsafe fn mul_add_wasm128(coeff: u8, src: &[u8], dst: &mut [u8]) {
+    assert_eq!(src.len(), dst.len(), "src and dst lengths must match");
+    if coeff == 0 {
+        return;
+    }
+
+    use core::arch::wasm32::*;
+
+    let len = src.len();
+    let chunks = len / 16;
+    let (tbl_lo, tbl_hi) = nibble_tables(coeff);
+
+    // SAFETY: tbl_lo is a 16-byte fixed array, so reading 16 bytes via unaligned load is in-bounds.
+    let t_lo = unsafe { v128_load(tbl_lo.as_ptr().cast::<v128>()) };
+    // SAFETY: tbl_hi is a 16-byte fixed array, so reading 16 bytes via unaligned load is in-bounds.
+    let t_hi = unsafe { v128_load(tbl_hi.as_ptr().cast::<v128>()) };
+    let mask_lo = u8x16_splat(0x0f);
+
+    for i in 0..chunks {
+        let offset = i * 16;
+        // SAFETY: offset + 16 <= len, and src and dst have verified length `len`. Pointers are valid
+        // for 16-byte unaligned load and store operations without overlap (by Rust borrow rules).
+        unsafe {
+            let src_ptr = src.as_ptr().add(offset).cast::<v128>();
+            let dst_ptr = dst.as_mut_ptr().add(offset).cast::<v128>();
+
+            let data = v128_load(src_ptr);
+            let prev_dst = v128_load(dst_ptr);
+
+            let v_lo = v128_and(data, mask_lo);
+            let shifted = u8x16_shr(data, 4);
+            let v_hi = v128_and(shifted, mask_lo);
+
+            let p_lo = i8x16_swizzle(t_lo, v_lo);
+            let p_hi = i8x16_swizzle(t_hi, v_hi);
+
+            let prod = v128_xor(p_lo, p_hi);
+            let acc = v128_xor(prev_dst, prod);
+
+            v128_store(dst_ptr, acc);
+        }
+    }
+
+    let remainder = chunks * 16;
+    for i in remainder..len {
+        dst[i] ^= crate::gf256::mul(src[i], coeff);
+    }
+}
+
+/// Fallback implementation of `mul_add_wasm128` for non-wasm32 target architectures.
+///
+/// # Safety
+///
+/// Safe to call on non-wasm32 architectures; adheres to the same safety contract.
+#[cfg(not(target_arch = "wasm32"))]
+pub unsafe fn mul_add_wasm128(coeff: u8, src: &[u8], dst: &mut [u8]) {
+    assert_eq!(src.len(), dst.len(), "src and dst lengths must match");
+    crate::gf256::mul_slice_into(dst, src, coeff);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,6 +761,32 @@ mod tests {
                 // SAFETY: gfni_supported() confirmed GFNI is available, slice lengths match.
                 unsafe {
                     mul_add_gfni(coeff, &src[..len], &mut dst_simd);
+                }
+                crate::gf256::mul_slice_into(&mut dst_scalar, &src[..len], coeff);
+
+                assert_eq!(
+                    dst_simd, dst_scalar,
+                    "mismatch for coeff={coeff}, len={len}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_mul_add_wasm128_matches_scalar() {
+        let mut src = [0u8; 128];
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(13);
+        }
+
+        for coeff in [0u8, 1, 2, 0x1d, 0x57, 0xff] {
+            for len in [0, 1, 15, 16, 31, 32, 33, 64, 100, 128] {
+                let mut dst_simd = vec![0xaa; len];
+                let mut dst_scalar = vec![0xaa; len];
+
+                // SAFETY: Slice lengths match.
+                unsafe {
+                    mul_add_wasm128(coeff, &src[..len], &mut dst_simd);
                 }
                 crate::gf256::mul_slice_into(&mut dst_scalar, &src[..len], coeff);
 

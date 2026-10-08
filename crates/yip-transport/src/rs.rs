@@ -6,6 +6,7 @@
 use crate::gf256;
 pub use crate::rs_simd::{
     avx2_supported, avx512bw_supported, gfni_supported, neon_supported, ssse3_supported,
+    wasm_simd_supported,
 };
 
 /// Generator scheme for the repair rows (packed into `payload_id[3]` on the wire).
@@ -128,6 +129,17 @@ pub fn mul_add_row(coeff: u8, src: &[u8], dst: &mut [u8]) {
             // SAFETY: neon_supported() confirmed CPU supports ARM64 NEON, and slice lengths were verified equal.
             unsafe {
                 crate::rs_simd::mul_add_neon(coeff, src, dst);
+            }
+            return;
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        if crate::rs_simd::wasm_simd_supported() {
+            // SAFETY: wasm_simd_supported() confirmed target is wasm32, and slice lengths were verified equal.
+            unsafe {
+                crate::rs_simd::mul_add_wasm128(coeff, src, dst);
             }
             return;
         }
@@ -317,6 +329,26 @@ pub fn test_mul_add_row_differential(coeff: u8, src: &[u8]) {
                 dst_neon,
                 dst_scalar,
                 "mismatch between mul_add_neon and scalar GF(2^8) for coeff={coeff}, len={}",
+                src.len()
+            );
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        if crate::rs_simd::wasm_simd_supported() {
+            let mut dst_wasm = vec![0u8; src.len()];
+            for (i, d) in dst_wasm.iter_mut().enumerate() {
+                *d = (i as u8).wrapping_mul(31).wrapping_add(7);
+            }
+            // SAFETY: wasm_simd_supported() confirmed WASM SIMD is available, src and dst_wasm lengths match.
+            unsafe {
+                crate::rs_simd::mul_add_wasm128(coeff, src, &mut dst_wasm);
+            }
+            assert_eq!(
+                dst_wasm,
+                dst_scalar,
+                "mismatch between mul_add_wasm128 and scalar GF(2^8) for coeff={coeff}, len={}",
                 src.len()
             );
         }
