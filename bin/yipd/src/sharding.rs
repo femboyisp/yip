@@ -510,7 +510,10 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                     crate::port::bind_udp_egress_pool(egress_bind, 64).unwrap_or_default();
                 let mut coalesced_timer = CoalescedTimer::new();
 
-                let mut udp_buf = [0u8; yip_io::MAX_WIRE_DATAGRAM];
+                let mut batch_sock = yip_io::batch::BatchUdpSocket::new(&sock);
+                let mut rx_buffers = [[0u8; yip_io::MAX_WIRE_DATAGRAM]; yip_io::batch::BATCH_SIZE];
+                let mut rx_datagrams =
+                    [const { yip_io::batch::ReceivedDatagram::empty() }; yip_io::batch::BATCH_SIZE];
                 let mut tun_buf = vec![0u8; vnet_len + yip_io::MAX_WIRE_DATAGRAM];
                 let start = std::time::Instant::now();
                 let mut cached_now_ms: u64 = 0;
@@ -529,19 +532,26 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                     let ready_none = !ready.udp && !ready.tun;
                     let mut packets_this_iter: u64 = 0;
 
-                    // 1. Drain local UDP socket via on_udp
+                    // 1. Drain local UDP socket via on_udp (vectorized batching)
                     if ready.udp {
                         loop {
-                            match sock.recv_from(&mut udp_buf) {
-                                Ok((n, src)) => {
-                                    packets_this_iter = packets_this_iter.wrapping_add(1);
-                                    let (tun_out, egress) =
-                                        owned_out(manager.on_udp(src, &udp_buf[..n], cached_now_ms));
-                                    if let Some(inner) = tun_out {
-                                        write_tun(tun_fd, &inner, vnet_len > 0);
-                                    }
-                                    for dg in &egress {
-                                        let _ = sock.send_to(&dg.bytes, dg.dst);
+                            match batch_sock.recvmmsg_batch(&mut rx_buffers, &mut rx_datagrams) {
+                                Ok(0) => break,
+                                Ok(count) => {
+                                    packets_this_iter = packets_this_iter.wrapping_add(count as u64);
+                                    for i in 0..count {
+                                        let dg = &rx_datagrams[i];
+                                        let payload = &rx_buffers[i][..dg.len];
+                                        let (tun_out, egress) =
+                                            owned_out(manager.on_udp(dg.src, payload, cached_now_ms));
+                                        if let Some(inner) = tun_out {
+                                            write_tun(tun_fd, &inner, vnet_len > 0);
+                                        }
+                                        if !egress.is_empty() {
+                                            let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
+                                                egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
+                                            let _ = batch_sock.sendmmsg_batch(&egress_batch);
+                                        }
                                     }
                                 }
                                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -627,8 +637,10 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
 
                         if coalesced_timer.should_tick(now, packets_this_iter) {
                             if let Some(egress) = manager.tick(cached_now_ms) {
-                                for dg in egress {
-                                    let _ = sock.send_to(&dg.bytes, dg.dst);
+                                if !egress.is_empty() {
+                                    let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
+                                        egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
+                                    let _ = batch_sock.sendmmsg_batch(&egress_batch);
                                 }
                             }
                         }
