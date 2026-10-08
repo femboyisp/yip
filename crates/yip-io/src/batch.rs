@@ -251,3 +251,88 @@ impl AsRawFd for BatchUdpSocket {
         self.fd
     }
 }
+
+/// Probe and optionally set socket-level `UDP_SEGMENT` size if supported by kernel.
+/// Returns `Ok(true)` if supported and configured, `Ok(false)` if unsupported by kernel/NIC.
+pub fn set_udp_gso_segment(sock: &UdpSocket, segment_size: u16) -> io::Result<bool> {
+    let val: libc::c_int = libc::c_int::from(segment_size);
+    // SAFETY: setsockopt with SOL_UDP / UDP_SEGMENT. If unsupported, EINVAL/ENOPROTOOPT/EOPNOTSUPP returned.
+    let ret = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_UDP,
+            libc::UDP_SEGMENT,
+            std::ptr::from_ref(&val).cast::<libc::c_void>(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        Ok(true)
+    } else {
+        let err = io::Error::last_os_error();
+        let raw = err.raw_os_error().unwrap_or(0);
+        if raw == libc::EINVAL || raw == libc::ENOPROTOOPT || raw == libc::EOPNOTSUPP {
+            Ok(false)
+        } else {
+            Err(err)
+        }
+    }
+}
+
+/// Send a GSO superpacket using a `UDP_SEGMENT` cmsg header.
+/// Returns `Ok(bytes_sent)` on success.
+pub fn send_gso_superpacket(
+    sock: &UdpSocket,
+    payload: &[u8],
+    segment_size: u16,
+    dst: SocketAddr,
+) -> io::Result<usize> {
+    let (mut storage, addr_len) = crate::addr::std_to_sockaddr(dst);
+    let mut iov = libc::iovec {
+        iov_base: payload.as_ptr().cast_mut().cast::<libc::c_void>(),
+        iov_len: payload.len(),
+    };
+    let mut control = [0u8; 64];
+    // SAFETY: msghdr is POD; zeroed is a valid initial state.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_name = std::ptr::from_mut(&mut storage).cast::<libc::c_void>();
+    msg.msg_namelen = addr_len;
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast::<libc::c_void>();
+    // SAFETY: CMSG_SPACE is a pure size computation.
+    let cmsg_space =
+        usize::try_from(unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) })
+            .unwrap_or(control.len());
+    msg.msg_controllen = cmsg_space;
+
+    // SAFETY: msg points to valid control storage; write SOL_UDP / UDP_SEGMENT cmsg.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
+        if !cmsg.is_null() {
+            (*cmsg).cmsg_level = libc::SOL_UDP;
+            (*cmsg).cmsg_type = libc::UDP_SEGMENT;
+            (*cmsg).cmsg_len =
+                usize::try_from(libc::CMSG_LEN(std::mem::size_of::<u16>() as u32)).unwrap_or(0);
+            let seg_ptr = libc::CMSG_DATA(cmsg).cast::<u16>();
+            *seg_ptr = segment_size;
+        }
+    }
+
+    loop {
+        // SAFETY: msg is fully initialized and points to valid stack frame structures.
+        let ret = unsafe { libc::sendmsg(sock.as_raw_fd(), &raw const msg, libc::MSG_NOSIGNAL) };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            let raw = err.raw_os_error().unwrap_or(0);
+            if raw == libc::EINTR {
+                continue;
+            }
+            if raw == libc::EWOULDBLOCK || raw == libc::EAGAIN || raw == libc::ENOBUFS {
+                return Ok(0);
+            }
+            return Err(err);
+        }
+        return Ok(usize::try_from(ret).unwrap_or(0));
+    }
+}
