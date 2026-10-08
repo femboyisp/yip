@@ -133,17 +133,16 @@ impl CoalescedTimer {
         self.packet_count
     }
 
+    /// Batch mask for traffic accounting.
+    #[inline]
+    pub fn packet_batch_mask(&self) -> u64 {
+        self.packet_batch_mask
+    }
+
     /// Check whether a timer tick should fire given the current time and packets processed
     /// in this loop iteration.
-    pub fn should_tick(&mut self, now: std::time::Instant, packets_this_iter: u64) -> bool {
-        let eligible = if packets_this_iter == 0 {
-            now.duration_since(self.last_tick) >= self.interval
-        } else {
-            (self.packet_count & self.packet_batch_mask == 0)
-                && (now.duration_since(self.last_tick) >= self.interval)
-        };
-
-        if eligible {
+    pub fn should_tick(&mut self, now: std::time::Instant, _packets_this_iter: u64) -> bool {
+        if now.duration_since(self.last_tick) >= self.interval {
             self.last_tick = now;
             true
         } else {
@@ -181,11 +180,12 @@ fn owned_out(
     }
 }
 
-fn select_egress_socket<'a>(
+pub(crate) fn select_egress_socket<'a>(
     default_sock: &'a std::net::UdpSocket,
     pool: &'a [std::net::UdpSocket],
     pkt: &[u8],
     is_tap: bool,
+    dst: std::net::SocketAddr,
 ) -> &'a std::net::UdpSocket {
     if pool.is_empty() {
         return default_sock;
@@ -205,7 +205,13 @@ fn select_egress_socket<'a>(
     let flow_hash = crate::flow::FlowTuple::extract(ip_pkt)
         .map(|f| f.flow_hash())
         .unwrap_or(0);
-    &pool[(flow_hash as usize) % pool.len()]
+    let chosen = &pool[(flow_hash as usize) % pool.len()];
+    if let Ok(chosen_local) = chosen.local_addr() {
+        if dst.is_ipv6() != chosen_local.is_ipv6() {
+            return default_sock;
+        }
+    }
+    chosen
 }
 
 fn write_tun(tun_fd: std::os::fd::RawFd, inner: &[u8], vnet_hdr: bool) {
@@ -433,7 +439,13 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                 let poller = yip_io::epoll::Epoll::new(sock_fd, tun_fd)?;
                 let vnet_len = tun_dev.vnet_hdr_len().unwrap_or(0);
                 let is_tap = cfg.device_kind == crate::mode::TunnelMode::L2Tap;
-                let egress_pool = crate::port::bind_udp_egress_pool(0, 64).unwrap_or_default();
+                let egress_bind = if cfg.listen.is_ipv6() {
+                    std::net::SocketAddr::from(([0u8; 16], 0))
+                } else {
+                    std::net::SocketAddr::from(([0u8; 4], 0))
+                };
+                let egress_pool =
+                    crate::port::bind_udp_egress_pool(egress_bind, 64).unwrap_or_default();
                 let mut coalesced_timer = CoalescedTimer::new();
 
                 let mut udp_buf = [0u8; yip_io::MAX_WIRE_DATAGRAM];
@@ -489,8 +501,14 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
 
                                         if target_shard == shard_id {
                                             let egress = manager.on_tun(pkt, now_ms);
-                                            let send_sock = select_egress_socket(&sock, &egress_pool, pkt, is_tap);
                                             for dg in egress {
+                                                let send_sock = select_egress_socket(
+                                                    &sock,
+                                                    &egress_pool,
+                                                    pkt,
+                                                    is_tap,
+                                                    dg.dst,
+                                                );
                                                 let _ = send_sock.send_to(&dg.bytes, dg.dst);
                                             }
                                         } else if let Some(Some(ref tx)) =
@@ -519,8 +537,14 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                         packets_this_iter = packets_this_iter.wrapping_add(spsc_batch.len() as u64);
                         for pkt in &spsc_batch {
                             let egress = manager.on_tun(&pkt.bytes, now_ms);
-                            let send_sock = select_egress_socket(&sock, &egress_pool, &pkt.bytes, is_tap);
                             for dg in egress {
+                                let send_sock = select_egress_socket(
+                                    &sock,
+                                    &egress_pool,
+                                    &pkt.bytes,
+                                    is_tap,
+                                    dg.dst,
+                                );
                                 let _ = send_sock.send_to(&dg.bytes, dg.dst);
                             }
                         }
@@ -557,6 +581,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
     use std::str::FromStr;
 
     fn pseudo_key(seed: u64) -> [u8; 32] {
@@ -852,20 +877,77 @@ mod tests {
         // Immediately after ticking, should not tick again
         assert!(!timer.should_tick(t51, 0));
 
-        // Under traffic: packets arriving
+        // Under traffic: packets arriving (unaligned count, e.g. 500 packets)
         let t_traffic_start = t51;
-        timer.on_packets(500); // packet_count = 500 (500 & 2047 != 0)
-        let t_traffic_later = t_traffic_start + std::time::Duration::from_millis(60);
-        // Even though >50ms elapsed, packet_count is not aligned to 2048 batch cap -> suppressed
-        assert!(!timer.should_tick(t_traffic_later, 500));
+        timer.on_packets(500); // packet_count = 500 (not a multiple of 2048)
+        let t_traffic_before_interval = t_traffic_start + std::time::Duration::from_millis(25);
+        // < 50ms elapsed -> should not tick
+        assert!(!timer.should_tick(t_traffic_before_interval, 500));
 
-        // Advance to 2048 packets
-        timer.on_packets(1548); // total = 2048, 2048 & 2047 == 0
-                                // Now batch cap aligns AND >50ms elapsed -> should tick!
-        assert!(timer.should_tick(t_traffic_later, 1548));
+        // Advance past 50ms under active traffic (unaligned packet count)
+        let t_traffic_after = t_traffic_start + std::time::Duration::from_millis(55);
+        // Once >= 50ms elapsed, should tick reliably regardless of packet count or alignment
+        assert!(timer.should_tick(t_traffic_after, 500));
+
+        // Immediately after ticking, should not tick again
+        assert!(!timer.should_tick(t_traffic_after, 500));
+
+        // Additional traffic check: batch that skips multiple of 2048 (e.g. 2049 packets)
+        timer.on_packets(2049);
+        let t_traffic_next = t_traffic_after + std::time::Duration::from_millis(52);
+        assert!(timer.should_tick(t_traffic_next, 2049));
 
         // Next check right after should not tick
-        assert!(!timer.should_tick(t_traffic_later, 1));
+        assert!(!timer.should_tick(t_traffic_next, 1));
+    }
+
+    #[test]
+    fn test_select_egress_socket_address_family_matching() {
+        let v4_default = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind v4 default");
+        let v4_pool = crate::port::bind_udp_egress_pool(SocketAddr::from(([127, 0, 0, 1], 0)), 2)
+            .expect("bind v4 pool");
+
+        let v6_dst: SocketAddr = "[2001:db8::1]:51820".parse().unwrap();
+        let v4_dst: SocketAddr = "192.0.2.1:51820".parse().unwrap();
+
+        // 1. When pool is IPv4 and peer destination is IPv6 -> safely falls back to default socket
+        let selected = select_egress_socket(&v4_default, &v4_pool, &[], false, v6_dst);
+        assert_eq!(
+            selected.local_addr().unwrap().port(),
+            v4_default.local_addr().unwrap().port(),
+            "must fallback to default socket when destination is IPv6 but pool is IPv4"
+        );
+
+        // 2. When pool is IPv4 and peer destination is IPv4 -> selects socket from pool
+        let selected = select_egress_socket(&v4_default, &v4_pool, &[], false, v4_dst);
+        let selected_port = selected.local_addr().unwrap().port();
+        assert!(
+            selected_port == v4_pool[0].local_addr().unwrap().port()
+                || selected_port == v4_pool[1].local_addr().unwrap().port(),
+            "must select socket from pool when address families match"
+        );
+
+        // 3. When pool is IPv6 and peer destination is IPv6 -> selects socket from pool
+        if let Ok(v6_default) = std::net::UdpSocket::bind("[::1]:0") {
+            if let Ok(v6_pool) =
+                crate::port::bind_udp_egress_pool(SocketAddr::from(([0u8; 16], 0)), 2)
+            {
+                let selected_v6 = select_egress_socket(&v6_default, &v6_pool, &[], false, v6_dst);
+                assert!(selected_v6.local_addr().unwrap().is_ipv6());
+                let selected_v6_port = selected_v6.local_addr().unwrap().port();
+                assert!(
+                    selected_v6_port == v6_pool[0].local_addr().unwrap().port()
+                        || selected_v6_port == v6_pool[1].local_addr().unwrap().port()
+                );
+
+                // 4. When pool is IPv6 and destination is IPv4 -> safely falls back to default socket
+                let fallback_v4 = select_egress_socket(&v6_default, &v6_pool, &[], false, v4_dst);
+                assert_eq!(
+                    fallback_v4.local_addr().unwrap().port(),
+                    v6_default.local_addr().unwrap().port()
+                );
+            }
+        }
     }
 
     #[test]

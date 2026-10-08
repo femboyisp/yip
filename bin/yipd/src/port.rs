@@ -83,8 +83,13 @@ pub(crate) fn bind_udp_reuseport(
     Ok(sockets)
 }
 
-pub(crate) fn bind_udp_egress_pool(base_port: u16, pool_size: usize) -> io::Result<Vec<UdpSocket>> {
+pub(crate) fn bind_udp_egress_pool(
+    addr: SocketAddr,
+    pool_size: usize,
+) -> io::Result<Vec<UdpSocket>> {
     let mut sockets = Vec::with_capacity(pool_size);
+    let base_port = addr.port();
+    let is_ipv6 = addr.is_ipv6();
     for i in 0..pool_size {
         let port = if base_port == 0 {
             0
@@ -99,8 +104,12 @@ pub(crate) fn bind_udp_egress_pool(base_port: u16, pool_size: usize) -> io::Resu
                 )
             })?
         };
-        let addr = SocketAddr::from(([0, 0, 0, 0], port));
-        let sock = UdpSocket::bind(addr)?;
+        let bind_target = if is_ipv6 {
+            SocketAddr::from(([0u8; 16], port))
+        } else {
+            SocketAddr::from(([0u8; 4], port))
+        };
+        let sock = UdpSocket::bind(bind_target)?;
         let _ = yip_io::set_socket_buffers(&sock, 2 * 1024 * 1024);
         sockets.push(sock);
     }
@@ -315,22 +324,37 @@ mod tests {
 
     #[test]
     fn test_bind_udp_egress_pool_zero_port() {
-        let pool = bind_udp_egress_pool(0, 8).expect("bind pool");
+        let addr = SocketAddr::from(([0, 0, 0, 0], 0));
+        let pool = bind_udp_egress_pool(addr, 8).expect("bind pool");
         assert_eq!(pool.len(), 8);
         for s in &pool {
             assert!(s.local_addr().unwrap().port() > 0);
+            assert!(s.local_addr().unwrap().is_ipv4());
+        }
+    }
+
+    #[test]
+    fn test_bind_udp_egress_pool_ipv6() {
+        let addr = SocketAddr::from(([0u8; 16], 0));
+        let pool = bind_udp_egress_pool(addr, 4).expect("bind ipv6 pool");
+        assert_eq!(pool.len(), 4);
+        for s in &pool {
+            assert!(s.local_addr().unwrap().port() > 0);
+            assert!(s.local_addr().unwrap().is_ipv6());
         }
     }
 
     #[test]
     fn test_bind_udp_egress_pool_empty() {
-        let pool = bind_udp_egress_pool(0, 0).expect("empty pool");
+        let addr = SocketAddr::from(([0, 0, 0, 0], 0));
+        let pool = bind_udp_egress_pool(addr, 0).expect("empty pool");
         assert!(pool.is_empty());
     }
 
     #[test]
     fn test_bind_udp_egress_pool_overflow() {
-        let res = bind_udp_egress_pool(65530, 10);
+        let addr = SocketAddr::from(([0, 0, 0, 0], 65530));
+        let res = bind_udp_egress_pool(addr, 10);
         assert!(res.is_err());
     }
 }
