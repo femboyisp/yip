@@ -129,13 +129,28 @@ impl PeerManager {
     /// runs for an unauthenticated Init (that path does not call `inbound_open`),
     /// preserving #34.
     ///
+    /// When authenticated data packets arrive from varying source ports (e.g. from
+    /// a multi-port UDP egress pool for remote NIC RSS scaling), preserve the
+    /// peer's configured/learned base endpoint port when only the source port changes.
+    ///
     /// Updating `endpoint` alone heals ingress demux/deobfuscation, but egress
     /// datagrams are stamped from each epoch's `DataPlane::peer_addr` (not
     /// `endpoint`), so the roam must also be pushed into the live `EpochSet` or
     /// return traffic keeps targeting the peer's stale (post-rebind, dead)
     /// address.
-    fn relearn_endpoint(&mut self, idx: usize, src: SocketAddr) {
-        if !self.peers[idx].relay && self.peers[idx].endpoint != Some(src) {
+    pub fn relearn_endpoint(&mut self, idx: usize, src: SocketAddr) {
+        if self.peers[idx].relay {
+            return;
+        }
+        if let Some(ref mut ep) = self.peers[idx].endpoint {
+            if ep.ip() != src.ip() {
+                ep.set_ip(src.ip());
+                let new_endpoint = *ep;
+                if let PeerState::Established(epochs) = &mut self.peers[idx].state {
+                    epochs.set_peer_addr(new_endpoint);
+                }
+            }
+        } else {
             self.peers[idx].endpoint = Some(src);
             if let PeerState::Established(epochs) = &mut self.peers[idx].state {
                 epochs.set_peer_addr(src);
@@ -427,10 +442,11 @@ mod tests {
             DispatchOut::None
         );
         assert!(!out_is_none, "a genuine Data datagram must authenticate");
+        let expected = SocketAddr::new(new_src.ip(), old_ep.port());
         assert_eq!(
             pm_r.peers[0].endpoint,
-            Some(new_src),
-            "dispatch_established's own relearn call must move the endpoint"
+            Some(expected),
+            "dispatch_established's own relearn call must update IP while preserving port"
         );
     }
 
@@ -449,5 +465,51 @@ mod tests {
             pm.peers[0].endpoint, placeholder,
             "a relay peer's endpoint must never roam"
         );
+    }
+
+    #[test]
+    fn authenticated_data_from_differing_port_preserves_endpoint_port() {
+        let (mut pm_i, mut pm_r, old_ep) = established_pair_for_roaming();
+        let data = pm_i.on_tun(&dummy_tun_pkt(), 0).to_vec();
+        let dg = data[0].bytes.clone();
+
+        // Datagram arrives from the SAME IP, but a different source port (e.g. from egress pool)
+        let new_src = SocketAddr::new(old_ep.ip(), old_ep.port() + 50);
+        let out = pm_r.on_udp(new_src, &dg, 1_000);
+        assert!(!matches!(out, DispatchOut::None));
+        assert_eq!(
+            pm_r.peers[0].endpoint,
+            Some(old_ep),
+            "endpoint must preserve the configured/learned base port when only src port changes"
+        );
+    }
+
+    #[test]
+    fn test_relearn_endpoint_preserves_port_on_ip_roam() {
+        let (_pm_i, mut pm_r, old_ep) = established_pair_for_roaming();
+
+        // 1. Same IP, different port -> port preserved
+        let diff_port = SocketAddr::new(old_ep.ip(), old_ep.port() + 100);
+        pm_r.relearn_endpoint(0, diff_port);
+        assert_eq!(pm_r.peers[0].endpoint, Some(old_ep));
+
+        // 2. Different IP and different port -> IP updated, old base port preserved
+        let diff_ip: SocketAddr = "198.51.100.77:33333".parse().unwrap();
+        assert_ne!(diff_ip.port(), old_ep.port());
+        pm_r.relearn_endpoint(0, diff_ip);
+        let expected = SocketAddr::new(diff_ip.ip(), old_ep.port());
+        assert_eq!(pm_r.peers[0].endpoint, Some(expected));
+
+        // 3. Peer with endpoint None -> sets endpoint to src
+        pm_r.peers[0].endpoint = None;
+        let fresh_src: SocketAddr = "203.0.113.5:12345".parse().unwrap();
+        pm_r.relearn_endpoint(0, fresh_src);
+        assert_eq!(pm_r.peers[0].endpoint, Some(fresh_src));
+
+        // 4. Relay peer -> ignored
+        let (mut pm_relay, _, _, _) = established_relay_pm(100);
+        let relay_ep = pm_relay.peers[0].endpoint;
+        pm_relay.relearn_endpoint(0, "198.51.100.99:9999".parse().unwrap());
+        assert_eq!(pm_relay.peers[0].endpoint, relay_ep);
     }
 }

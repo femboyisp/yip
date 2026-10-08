@@ -3419,10 +3419,11 @@ mod tests {
             !matches!(out, DispatchOut::None),
             "a genuine Data datagram must authenticate"
         );
+        let expected_ep = SocketAddr::new(new_src.ip(), old_ep.port());
         assert_eq!(
             pm_r.peers[0].endpoint,
-            Some(new_src),
-            "endpoint must follow an authenticated packet from a new source",
+            Some(expected_ep),
+            "endpoint must update to new IP while preserving base port",
         );
     }
 
@@ -3431,8 +3432,8 @@ mod tests {
         // Relearning `endpoint` alone is a half-fix: egress datagrams are
         // stamped from the `EpochSet`'s `DataPlane::peer_addr`, not `endpoint`.
         // After an authenticated roam, the responder's OWN outbound data must
-        // target the new source, or return traffic keeps hitting the peer's
-        // stale (post-rebind, dead) address.
+        // target the new IP (with preserved base port), or return traffic keeps
+        // hitting the peer's stale (post-rebind, dead) address.
         let (mut pm_i, mut pm_r, old_ep) = established_pair_for_roaming();
 
         // Pre-roam: pm_r's egress targets the original endpoint.
@@ -3447,17 +3448,19 @@ mod tests {
         let dg = data[0].bytes.clone();
         let new_src: SocketAddr = "198.51.100.222:60000".parse().unwrap();
         assert_ne!(new_src, old_ep);
+        assert_ne!(new_src.port(), old_ep.port());
         let out = pm_r.on_udp(new_src, &dg, 1_000);
         assert!(
             !matches!(out, DispatchOut::None),
             "the roam packet must authenticate"
         );
 
-        // Post-roam: pm_r's egress now targets the new source (not just `endpoint`).
+        // Post-roam: pm_r's egress now targets the new IP while preserving base port.
         let after = pm_r.on_tun(&dummy_tun_pkt(), 2_000).to_vec();
+        let expected_dst = SocketAddr::new(new_src.ip(), old_ep.port());
         assert_eq!(
-            after[0].dst, new_src,
-            "egress must follow the roam to the new source, not the stale addr",
+            after[0].dst, expected_dst,
+            "egress must follow the roam to the new IP with preserved port, not the stale addr",
         );
     }
 

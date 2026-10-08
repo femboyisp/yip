@@ -1,0 +1,787 @@
+---
+name: Integration (privileged)
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Bench smoke (compile + quick run, not a perf gate)
+        # --warm-up-time 1 --measurement-time 1 --sample-size 10 keeps the job
+        # fast while proving every Criterion group compiles and executes.
+        # --bench hotpath targets only the harness=false Criterion bench; a bare
+        # `cargo bench -p yip-bench` would also invoke the lib's default test
+        # harness, which rejects the Criterion `--warm-up-time` flag.
+        run: >
+          cargo bench -p yip-bench --bench hotpath --
+          --warm-up-time 1 --measurement-time 1 --sample-size 10
+
+  netem-comparison:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install BoringSSL build deps (cmake + libclang)
+        # The release yipd built below links `boring` (BoringSSL), whose build
+        # needs cmake + a C/C++ toolchain, and whose bindgen step needs libclang.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
+      - name: Install netns/netem + wireguard tooling
+        # The job image (catthehacker/ubuntu:act-22.04) ships NO iproute2 and no ping —
+        # `ip`, `tc` and `ping` are all absent from it, which is why run-yip-netem.sh
+        # died at line 99 with `ip: command not found`. iproute2 provides BOTH `ip` and
+        # `tc`, and `tc` is what applies the netem impairment this job exists to measure.
+        #
+        # Installing these on the runner-priv container itself does nothing: act_runner
+        # here maps `privileged` to docker://catthehacker/ubuntu:act-22.04, so every step
+        # executes inside that image and never touches the runner's own filesystem.
+        # The container does run privileged, so netns/tc work once the tools are present.
+        #
+        # iperf3 belongs here for the same reason: run-fec-compare.sh and
+        # run-iperf-compare.sh drive it, and without it those two SKIP their
+        # column while the job still reports green — measuring less than it claims.
+        #
+        # These were never *declared* before because wireguard-tools happens to
+        # list iproute2/iputils-ping as Recommends. That is not a dependency, and
+        # it stopped resolving: run 277 logs "Setting up iproute2"; run 290 — same
+        # apt line, one day later — does not.
+        run: sudo apt-get install -y iproute2 iputils-ping iperf3 wireguard-tools
+      - name: Load wireguard kernel module
+        run: sudo modprobe wireguard || echo "[note] wireguard module unavailable; WG column will be skipped"
+      - name: Build test binaries
+        run: cargo test -p yip-bench --test netem_bench --no-run --message-format=json | tee /tmp/netem-build.json
+      - name: Run netem harness tests under sudo
+        run: |
+          BIN=$(jq -r 'select(.executable != null) | .executable' /tmp/netem-build.json | tail -n1)
+          test -n "$BIN" || { echo "::error::could not locate netem_bench test binary"; exit 1; }
+          echo "running $BIN under sudo"
+          # Build yipd (release) so the test harness can find it (avoids a second
+          # in-script build). Release is required: debug RaptorQ is ~75x slower,
+          # which would make yip look artificially bad against in-kernel WireGuard.
+          cargo build --release -p yipd
+          # Run both tests sequentially; the WG test gracefully skips if WG is unavailable.
+          sudo -E "$BIN" yip_tunnel_under_netem_loss    --nocapture --test-threads=1 2>&1 | tee /tmp/netem-yip.log
+          sudo -E "$BIN" comparison_under_netem_loss    --nocapture --test-threads=1 2>&1 | tee /tmp/netem-compare.log
+          sudo -E "$BIN" scp_throughput_comparison    --nocapture --test-threads=1 2>&1 | tee /tmp/netem-scp.log
+          sudo -E "$BIN" udp_loss_recovery_comparison --nocapture --test-threads=1 2>&1 | tee /tmp/netem-fec.log
+          sudo -E "$BIN" iperf_throughput_comparison  --nocapture --test-threads=1 2>&1 | tee /tmp/netem-iperf.log
+          # Honesty guard: the yip-only tests must have run for real, not skipped.
+          if grep -q "SKIP yip_tunnel_under_netem_loss" /tmp/netem-yip.log; then
+            echo "::error::yip netem test skipped — runner is not root"
+            exit 1
+          fi
+          if grep -q "SKIP comparison_under_netem_loss" /tmp/netem-compare.log; then
+            echo "::error::comparison netem test skipped — runner is not root"
+            exit 1
+          fi
+          # Honesty guard: the scp test must have run for real, not skipped.
+          # Exception: if sshd/scp are absent, the harness itself logs SKIP and exits 0 — that is acceptable.
+          if grep -q "SKIP scp_throughput_comparison: needs root" /tmp/netem-scp.log; then
+            echo "::error::scp throughput test skipped — runner is not root"
+            exit 1
+          fi
+          # Honesty guard: the FEC + iperf tests must have run for real, not skipped
+          # for "needs root". The harness's own tool-absent SKIPs are ALLOWED:
+          # UDPspeeder/OpenVPN/n2n won't be installed in CI — the yip (+ WireGuard)
+          # paths are the must-run core, and each absent contender SKIPs its column
+          # cleanly while the harness still exits 0.
+          if grep -q "SKIP udp_loss_recovery_comparison: needs root" /tmp/netem-fec.log; then
+            echo "::error::UDP loss recovery test skipped — runner is not root"
+            exit 1
+          fi
+          if grep -q "SKIP iperf_throughput_comparison: needs root" /tmp/netem-iperf.log; then
+            echo "::error::iperf throughput test skipped — runner is not root"
+            exit 1
+          fi
+
+  device-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build and run yip-device tests under sudo (CAP_NET_ADMIN)
+        run: |
+          # In a single-crate --no-run build the only artifact with an
+          # executable is the test binary; this filter is robust to target-name
+          # normalization (yip-device vs yip_device).
+          BIN=$(cargo test -p yip-device --no-run --message-format=json \
+            | jq -r 'select(.executable != null) | .executable' \
+            | tail -n1)
+          test -n "$BIN" || { echo "::error::could not locate yip-device test binary"; exit 1; }
+          echo "running $BIN under sudo"
+          # --test-threads=1: these tests create fixed-named kernel interfaces and
+          # must not run concurrently (parallel runs race on the interface name).
+          sudo -E "$BIN" --nocapture --test-threads=1 2>&1 | tee /tmp/devtest.log
+          # Honesty guard: this job exists to run the privileged path for real.
+          # If the device tests SKIPped, the runner couldn't create TUN/TAP — fail loudly
+          # rather than report a vacuous green.
+          if grep -q "needs CAP_NET_ADMIN" /tmp/devtest.log; then
+            echo "::error::privileged device tests skipped — runner cannot create TUN/TAP"
+            exit 1
+          fi
+
+  netns-tunnel-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install BoringSSL build deps (cmake + libclang) and netns tooling
+        # The TLS-mimicry transport (3c.2) links the `boring` crate, whose
+        # build compiles BoringSSL (needs cmake + a C/C++ toolchain) and whose
+        # bindgen step needs libclang. The Forgejo runner image does not ship
+        # these, so install them explicitly.
+        #
+        # iproute2 + iputils-ping are what run-netns-tunnel.sh actually drives
+        # (`ip` 42x, `ping` 4x) and are likewise absent from the runner image,
+        # so every attempt died identically at run-netns-tunnel.sh:86. Every
+        # job that needs `ip` now declares it: relying on it arriving as a
+        # Recommends of something else is what broke netem-comparison.
+        #
+        # tcpdump: this job's 26 tests span ~30 harness scripts, and ten of
+        # them capture with tcpdump (flowshape, rekey, replay-hijack,
+        # path-switch, the mimicry oracles). It is NOT preinstalled — see the
+        # corrected note on the tshark step below.
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev pkg-config iproute2 iputils-ping tcpdump
+      - name: Build and run yipd netns tunnel tests under sudo
+        run: |
+          # Filter for the tunnel_netns test binary specifically: a --no-run build
+          # of -p yipd also emits the yipd daemon binary, and a bare `tail -n1`
+          # can grab that instead of the test harness.
+          BIN=$(cargo test -p yipd --test tunnel_netns --no-run --message-format=json \
+            | jq -r 'select(.executable != null) | .executable' \
+            | grep tunnel_netns | tail -n1)
+          test -n "$BIN" || { echo "::error::could not locate tunnel_netns test binary"; exit 1; }
+          # arq_recovers_bulk_loss drives a real Bulk flow and needs a release yipd
+          # (debug RaptorQ is ~75x slower).
+          cargo build --release -p yipd
+          # relay_path_ping and hole_punch_ping need the yip-rendezvous server
+          # binary (a debug build is fine: these are ping-only tests). It lives
+          # in a different package, so cargo does not build it as a side effect
+          # of the tunnel_netns test build above; the test locates it at
+          # target/debug/yip-rendezvous and SKIPs with instructions if absent,
+          # so build it here to keep this job honest (not vacuously green).
+          cargo build -p yip-rendezvous-bin
+          # discovery_dynamic_ping / admission_rejects_uncertified /
+          # discovery_survives_root_outage (2c) need the `yip-ca` offline-CA
+          # binary to mint keys/certs/root sets; it lives in a different
+          # workspace package too (like yip-rendezvous-bin above), so build it
+          # here to keep this job honest (not vacuously green via a SKIP).
+          cargo build -p yip-ca
+          echo "running netns tunnel tests under sudo: $BIN"
+          # --exact so ping_across_yipd_tunnel does not also match _under_loss.
+          for mode in poll uring; do
+            for t in ping_across_yipd_tunnel ping_across_yipd_tunnel_under_loss arq_recovers_bulk_loss l2_tap_ping_or_arp_across_tunnel triangle_full_mesh_ping relay_path_ping hole_punch_ping discovery_dynamic_ping admission_rejects_uncertified discovery_survives_root_outage obfuscated_ping obfuscated_ping_with_cover obf_psk_mismatch_no_connection relay_path_ping_obfuscated hole_punch_ping_obfuscated discovery_dynamic_ping_obfuscated flowshape_not_obviously_constant; do
+              LOG="/tmp/netns-$mode-$t.log"
+              if [ "$mode" = "uring" ]; then
+                echo "running $t with UringDriver (opt-in: YIP_USE_URING=1)"
+                sudo -E env YIP_USE_URING=1 "$BIN" "$t" --exact --nocapture --test-threads=1 2>&1 | tee "$LOG"
+              else
+                echo "running $t with default driver (PollDriver)"
+                sudo -E "$BIN" "$t" --exact --nocapture --test-threads=1 2>&1 | tee "$LOG"
+              fi
+              # Honesty guard: these tests must run for real, not skip for non-root.
+              # (A tool-absent SKIP from the harness itself, exit 0, is acceptable.)
+              if grep -q "SKIP $t: needs root" "$LOG"; then
+                echo "::error::netns test $t ($mode) skipped — runner is not root"
+                exit 1
+              fi
+            done
+          done
+          # QUIC-mimicry (3c.1 Task 6) and TLS-mimicry (3c.2 Task 6) tests: poll
+          # driver ONLY. run_quic and run_tls both ignore YIP_USE_URING (each is
+          # its own poll-style pump), so these are deliberately not part of the
+          # poll/uring loop above.
+          for t in quic_tunnel_ping quic_ping_under_loss tls_tunnel_ping; do
+            LOG="/tmp/netns-quic-$t.log"
+            echo "running $t with default driver (PollDriver; mimicry pumps ignore YIP_USE_URING)"
+            sudo -E "$BIN" "$t" --exact --nocapture --test-threads=1 2>&1 | tee "$LOG"
+            if grep -q "SKIP $t: needs root" "$LOG"; then
+              echo "::error::netns test $t skipped — runner is not root"
+              exit 1
+            fi
+          done
+
+      - name: Build the rekey_epoch_witness on-wire proof tool
+        # Standalone example binary (not a #[test]): see its module doc for
+        # why it counts distinct cleartext Noise-IK ephemeral keys rather
+        # than trying to decode session data, which is cryptographically
+        # impossible from a passive capture (forward secrecy).
+        run: cargo build --release -p yipd --example rekey_epoch_witness
+
+      - name: Run the 9a rekey money test under sudo (poll driver)
+        # run-netns-rekey.sh: two yipd peers held to YIP_REKEY_INTERVAL_MS=2000
+        # (~10 rotations over a ~20s ping stream) must show (1) loss-free
+        # continuity across every rotation and (2) >=3 distinct completed
+        # Noise-IK rekey rounds on the wire (the rigorous, non-vacuous proof
+        # that conn_tag rotates per epoch -- see the script's header comment
+        # for the full argument, including why a naive raw-byte diff would be
+        # vacuous and why re-deriving session keys from a passive capture is
+        # cryptographically impossible).
+        run: |
+          sudo bash bin/yipd/tests/run-netns-rekey.sh "$(pwd)/target/release/yipd" | tee /tmp/rekey-poll.log
+          if grep -q "^SKIP run-netns-rekey" /tmp/rekey-poll.log; then
+            echo "::error::9a rekey money test (poll) skipped — expected root + tcpdump + the built witness tool in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/rekey-poll.log; then
+            echo "::error::9a rekey money test (poll) failed — loss-free rotation or on-wire conn_tag rotation regressed"
+            exit 1
+          fi
+
+      - name: Run the 9a rekey money test under sudo (uring driver)
+        run: |
+          sudo -E env YIP_USE_URING=1 bash bin/yipd/tests/run-netns-rekey.sh "$(pwd)/target/release/yipd" | tee /tmp/rekey-uring.log
+          if grep -q "^SKIP run-netns-rekey" /tmp/rekey-uring.log; then
+            echo "::error::9a rekey money test (uring) skipped — expected root + tcpdump + the built witness tool in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/rekey-uring.log; then
+            echo "::error::9a rekey money test (uring) failed — loss-free rotation or on-wire conn_tag rotation regressed"
+            exit 1
+          fi
+
+      - name: Run the rekey.91 relay-forced money test under sudo (poll driver)
+        # run-netns-rekey-relay.sh: the run-netns-relay.sh RELAY-FORCED
+        # topology (A/B mutually unreachable except via R's blind relay)
+        # held to the same YIP_REKEY_INTERVAL_MS=2000 cadence as the 9a
+        # direct-path test above. Proves relay-only sessions also rotate
+        # loss-free: (1) relay-forwarded=<N> N>0 (the relay, not a
+        # direct/punched path, carried the traffic), (2) <=1% loss across
+        # ~10 rotations, (3) rekey_epoch_witness (with the opt-in
+        # YIP_WITNESS_UNWRAP_RELAY=1 RelaySend/RelayDeliver envelope
+        # unwrap) reports >=3 distinct completed rekey rounds. Uses the
+        # release yipd and debug yip-rendezvous already built above in
+        # this job.
+        run: |
+          sudo bash bin/yipd/tests/run-netns-rekey-relay.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/rekey-relay-poll.log
+          if grep -q "^SKIP run-netns-rekey-relay" /tmp/rekey-relay-poll.log; then
+            echo "::error::rekey.91 relay money test (poll) skipped — expected root + tcpdump + the built witness tool in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/rekey-relay-poll.log; then
+            echo "::error::rekey.91 relay money test (poll) failed — relay did not carry traffic, loss-free continuity, or on-wire rekey rotation regressed"
+            exit 1
+          fi
+
+      - name: Run the rekey.91 relay-forced money test under sudo (uring driver)
+        run: |
+          sudo -E env YIP_USE_URING=1 bash bin/yipd/tests/run-netns-rekey-relay.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/rekey-relay-uring.log
+          if grep -q "^SKIP run-netns-rekey-relay" /tmp/rekey-relay-uring.log; then
+            echo "::error::rekey.91 relay money test (uring) skipped — expected root + tcpdump + the built witness tool in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/rekey-relay-uring.log; then
+            echo "::error::rekey.91 relay money test (uring) failed — relay did not carry traffic, loss-free continuity, or on-wire rekey rotation regressed"
+            exit 1
+          fi
+
+      - name: Run the hardening.36 path-switch convergence money test under sudo (poll driver)
+        # run-netns-pathswitch-rehandshake.sh: proves the #36 INVERSION
+        # (anti-replay.34 Task 4) -- a Punch->Relay path re-target now
+        # legitimately draws a FRESH Noise ephemeral instead of preserving
+        # the in-flight one, and the session still converges because the
+        # responder rebuilds on the fresh, freshness-gated Init. Forks
+        # run-netns-relay.sh's RELAY-FORCED topology (A/B mutually
+        # unreachable except via R's blind relay) so every session is forced
+        # through punch->escalate->relay; asserts (1) A converges over the
+        # relay with >=98% steady-state delivery, (2) relay-forwarded=<N>
+        # N>0, (3) rekey_epoch_witness (with the opt-in
+        # YIP_WITNESS_UNWRAP_RELAY=1 envelope unwrap, filtered to A's own
+        # outbound traffic) reports >=2 distinct cleartext Init ephemerals
+        # across >=2 captured Init datagrams -- the rigorous, on-wire,
+        # non-vacuous proof that the retarget drew a fresh ephemeral rather
+        # than preserving the punch attempt's. Uses the release yipd and
+        # debug yip-rendezvous already built above in this job.
+        #
+        # POLL DRIVER ONLY: the punch->relay escalation is driven by discovery
+        # + path-SM timers, and this test shares the discovery-timing sensitivity
+        # that already makes run-netns-discovery.sh and run-netns-cert-revocation.sh
+        # poll-only here.
+        #
+        # NOTE (#116): a prior "only 1 captured ephemeral" flake on this gate was
+        # NOT a capture-window miss — it was a real intermittent bug where the
+        # punch->relay retarget reused the punch ephemeral if an inbound relayed
+        # packet set `relay` before our own escalation timer fired. Fixed by
+        # keying the escalation on the in-flight Init's `via_relay` rather than
+        # the `relay` flag; a deterministic unit test
+        # (punch_relay_retarget_draws_fresh_ephemeral_even_if_relay_flag_preset)
+        # now covers it. The retarget logic is driver-independent, so uring adds
+        # only timing flakiness with no extra coverage.
+        run: |
+          sudo bash bin/yipd/tests/run-netns-pathswitch-rehandshake.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/pathswitch-poll.log
+          if grep -q "^SKIP run-netns-pathswitch-rehandshake" /tmp/pathswitch-poll.log; then
+            echo "::error::hardening.36 path-switch money test (poll) skipped — expected root + tcpdump + the built witness tool in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/pathswitch-poll.log; then
+            echo "::error::hardening.36 path-switch money test (poll) failed — A did not converge over the relay, or the retarget did not draw a fresh ephemeral"
+            exit 1
+          fi
+
+      - name: Install tshark
+        # run-netns-replay-hijack.sh (below) uses tshark to extract a
+        # captured [HandshakeInit] datagram's raw UDP payload for replay, and
+        # is not present on the runner image. Neither is tcpdump -- an earlier
+        # version of this comment claimed it was preinstalled, which is how
+        # flowshape_not_obviously_constant came to fail on
+        # `exec of "tcpdump" failed`. Both are installed explicitly now
+        # (tcpdump with the netns tooling above).
+        # DEBIAN_FRONTEND=noninteractive: tshark's postinst otherwise prompts
+        # (debconf) to ask whether non-superusers may capture packets; this
+        # job always invokes it via sudo anyway, so the prompt is moot.
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
+
+      - name: Run the anti-replay.34 endpoint-hijack/restart money test under sudo (poll driver)
+        # run-netns-replay-hijack.sh: proves the #34 freshness gate end-to-end
+        # -- a captured-and-replayed HandshakeInit from an off-path attacker
+        # (a fourth netns, S) cannot redirect B's learned endpoint for A
+        # (steady ping A->B stays <=1% loss across the replay), B's stderr
+        # shows the replay was actually refused by the freshness gate, and a
+        # genuine restart of A (fresh ephemeral + newer wall-clock ts) still
+        # recovers within a bounded ping window. Uses the release yipd and
+        # debug yip-rendezvous already built above in this job.
+        run: |
+          sudo bash bin/yipd/tests/run-netns-replay-hijack.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/replay-hijack-poll.log
+          if grep -q "^SKIP run-netns-replay-hijack" /tmp/replay-hijack-poll.log; then
+            echo "::error::anti-replay.34 endpoint-hijack/restart money test (poll) skipped — expected root + tcpdump/tshark in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/replay-hijack-poll.log; then
+            echo "::error::anti-replay.34 endpoint-hijack/restart money test (poll) failed — the replay redirected B's endpoint for A, was not refused by the freshness gate, or A's restart did not recover"
+            exit 1
+          fi
+
+      - name: Run the anti-replay.34 endpoint-hijack/restart money test under sudo (uring driver)
+        run: |
+          sudo -E env YIP_USE_URING=1 bash bin/yipd/tests/run-netns-replay-hijack.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/replay-hijack-uring.log
+          if grep -q "^SKIP run-netns-replay-hijack" /tmp/replay-hijack-uring.log; then
+            echo "::error::anti-replay.34 endpoint-hijack/restart money test (uring) skipped — expected root + tcpdump/tshark in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/replay-hijack-uring.log; then
+            echo "::error::anti-replay.34 endpoint-hijack/restart money test (uring) failed — the replay redirected B's endpoint for A, was not refused by the freshness gate, or A's restart did not recover"
+            exit 1
+          fi
+
+      - name: Run the roaming.m2 NAT-rebind money test under sudo (poll driver)
+        # run-netns-roaming.sh: proves M2 authenticated endpoint roaming
+        # end-to-end. A direct, obfuscation-on peer A changes its on-wire
+        # source address mid-session (a NAT rebind: A binds 0.0.0.0 and the
+        # script adds a second address + flips the route's preferred source,
+        # so A's session/keys/conn_tag are untouched). B must relearn A's
+        # endpoint from an authenticated, non-replayed inbound packet AND
+        # redirect its egress there (endpoint alone is insufficient: egress is
+        # stamped from the epoch's peer_addr), so a steady ping A->B stays
+        # <=1% loss across the rebind. Uses the release yipd and debug
+        # yip-rendezvous already built above in this job.
+        run: |
+          sudo bash bin/yipd/tests/run-netns-roaming.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/roaming-poll.log
+          if grep -q "^SKIP run-netns-roaming" /tmp/roaming-poll.log; then
+            echo "::error::roaming.m2 NAT-rebind money test (poll) skipped — expected root + TUN in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/roaming-poll.log; then
+            echo "::error::roaming.m2 NAT-rebind money test (poll) failed — B did not recover A's roamed, obfuscated source across the mid-session rebind"
+            exit 1
+          fi
+
+      - name: Run the roaming.m2 NAT-rebind money test under sudo (uring driver)
+        run: |
+          sudo -E env YIP_USE_URING=1 bash bin/yipd/tests/run-netns-roaming.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/roaming-uring.log
+          if grep -q "^SKIP run-netns-roaming" /tmp/roaming-uring.log; then
+            echo "::error::roaming.m2 NAT-rebind money test (uring) skipped — expected root + TUN in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/roaming-uring.log; then
+            echo "::error::roaming.m2 NAT-rebind money test (uring) failed — B did not recover A's roamed, obfuscated source across the mid-session rebind"
+            exit 1
+          fi
+
+      - name: Run the hardening.41 cert-revocation money test under sudo (poll driver)
+        # run-netns-cert-revocation.sh: proves the #41 fix -- a revoked
+        # (cert-expired) mesh member loses its session within a bounded
+        # window of expiry (not just at process restart) and cannot
+        # re-establish. Forks run-netns-discovery.sh's gossip-based mesh
+        # topology (required: the periodic cert-liveness sweep reads a
+        # peer's cert from the gossip-populated directory, not static
+        # config). The script sets YIP_CERT_SKEW_SECS low so the cert
+        # expires in seconds rather than waiting out membership.rs's 300s
+        # production grace, so the whole run is ~90s.
+        #
+        # POLL DRIVER ONLY: like its fork source run-netns-discovery.sh
+        # (also poll-only), gossip discovery convergence is flaky under the
+        # io_uring driver -- and #41's cert-revocation logic (the sweep /
+        # re-admission gate) is driver-agnostic, exercised identically by
+        # the poll run. The #36 money test above still covers both drivers.
+        # Uses the release yipd and debug yip-ca/yip-rendezvous already
+        # built above in this job.
+        run: |
+          sudo bash bin/yipd/tests/run-netns-cert-revocation.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-ca" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/cert-revocation-poll.log
+          if grep -q "^SKIP run-netns-cert-revocation" /tmp/cert-revocation-poll.log; then
+            echo "::error::hardening.41 cert-revocation money test (poll) skipped — expected root in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/cert-revocation-poll.log; then
+            echo "::error::hardening.41 cert-revocation money test (poll) failed — a revoked peer's session was not dropped, or it was allowed to re-establish"
+            exit 1
+          fi
+
+      - name: Run the rdv.37 registration-hijack money test under sudo (poll driver)
+        # run-netns-registration-hijack.sh: proves the #37 fix -- a ROOTED
+        # (mesh-mode, --roots/--network-id) standalone yip-rendezvous server
+        # refuses a forged, unsigned `Register` claiming an established
+        # member's (A's) node_id from a third, uncertified netns (S), and
+        # B<->A stays reachable (<=1% loss) throughout the attack. Forks
+        # run-netns-discovery.sh's CA/cert/roots minting and
+        # run-netns-punch.sh's rendezvous-only `[peer]` config style; new in
+        # this milestone is combining full mesh-cert config with a rooted
+        # standalone rendezvous server (no gossip root at all).
+        #
+        # POLL DRIVER ONLY: the property under test (the forged Register's
+        # refusal) lives entirely in the rendezvous SERVER
+        # (crates/yip-rendezvous/src/server.rs's `handle`, the
+        # `roots_cfg.is_some()` drop) -- plain tokio, no yipd I/O driver
+        # involved, so `YIP_USE_URING` cannot change that assertion's
+        # outcome. The only uring-sensitive part of this script is A/B's
+        # signed-registration + Lookup establishment timing, which is the
+        # same discovery-convergence risk run-netns-discovery.sh /
+        # run-netns-cert-revocation.sh already document as flaky under
+        # io_uring -- so, like cert-revocation.sh, this runs poll-only rather
+        # than add a spurious-failure vector for zero additional coverage of
+        # the actual security property. Uses the release yipd and debug
+        # yip-ca/yip-rendezvous already built above in this job.
+        run: |
+          sudo bash bin/yipd/tests/run-netns-registration-hijack.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-ca" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/registration-hijack-poll.log
+          if grep -q "^SKIP run-netns-registration-hijack" /tmp/registration-hijack-poll.log; then
+            echo "::error::rdv.37 registration-hijack money test (poll) skipped — expected root in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/registration-hijack-poll.log; then
+            echo "::error::rdv.37 registration-hijack money test (poll) failed — the rooted server accepted a forged registration, or it disrupted B<->A connectivity"
+            exit 1
+          fi
+
+  dpi-undetectability:
+    # The anti-DPI undetectability merge gate (3a Task 7): fails the build if
+    # a wire/obfuscation change reintroduces a DPI-recognizable fingerprint.
+    # Uses nDPI/nDPId's `ndpiReader` as the adversary, per CLAUDE.md's stated
+    # test methodology ("nDPI/nDPId are the test adversary and should be
+    # wired into CI to verify undetectability").
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install nDPI build dependencies
+        # libpcap-dev is required (ndpiReader reads/writes pcaps). json-c and
+        # gcrypt are optional (nDPI degrades gracefully without them, as
+        # confirmed by the local build under refrences/nDPI) but installed
+        # here anyway for full feature parity with the vendored dev build.
+        run: |
+          sudo apt-get update
+          # cmake: required to build the `boring` crate (BoringSSL) that the
+          # transport=tls oracle's release yipd links (3c.2).
+          # clang + libclang-dev: boring's bindgen step (the transport=tls yipd
+          # links BoringSSL) needs libclang; the runner image doesn't ship it.
+          # iproute2 + iputils-ping + tcpdump: what run-ndpi-oracle.sh drives
+          # directly (`ip` 33x, `tcpdump` 8x, `ping` 7x). All absent from the
+          # runner image, so every attempt died at run-ndpi-oracle.sh:129.
+          sudo apt-get install -y libpcap-dev libjson-c-dev libgcrypt20-dev autoconf automake libtool pkg-config gettext cmake clang libclang-dev iproute2 iputils-ping tcpdump
+
+      # Pinned nDPI checkout: this SHA is the exact commit vendored locally at
+      # refrences/nDPI (git-ignored/local per CLAUDE.md, so CI can't just use
+      # the checked-out tree — it clones the same commit fresh). Pinning to a
+      # commit (rather than tracking a moving branch) keeps the oracle
+      # reproducible and stops an upstream nDPI change from silently altering
+      # detection behavior underneath this gate. Bump this SHA deliberately
+      # (and re-verify the assertions in bin/yipd/tests/run-ndpi-oracle.sh
+      # still hold against the new nDPI) when refreshing.
+      - name: Clone pinned nDPI
+        env:
+          NDPI_REF: 6dcb2622360edb28304d76b2f6a25984b706c618
+        run: |
+          git init /tmp/nDPI
+          git -C /tmp/nDPI remote add origin https://github.com/ntop/nDPI.git
+          git -C /tmp/nDPI fetch --depth 1 origin "$NDPI_REF"
+          git -C /tmp/nDPI checkout FETCH_HEAD
+
+      - name: Build ndpiReader
+        run: |
+          cd /tmp/nDPI
+          ./autogen.sh
+          ./configure
+          make -j"$(nproc)"
+          test -x example/ndpiReader || { echo "::error::ndpiReader did not build"; exit 1; }
+
+      - name: Build release yipd
+        run: cargo build --release -p yipd
+
+      - name: Build yip-rendezvous
+        # Debug build: the 3c.3 probe-resistance oracle below runs the binary
+        # directly (not netns-namespaced tunnel throughput), so a debug build
+        # is sufficient — mirrors the local repro command in
+        # run-netns-reality-probe.sh's header.
+        run: cargo build -p yip-rendezvous-bin
+
+      - name: Run the nDPI undetectability oracle under sudo
+        run: |
+          sudo bash bin/yipd/tests/run-ndpi-oracle.sh \
+            "$(pwd)/target/release/yipd" \
+            /tmp/nDPI/example/ndpiReader | tee /tmp/ndpi-oracle.log
+          # Honesty guard: the oracle must have actually run its gates, not
+          # SKIPped (this job always runs as sudo and always builds
+          # ndpiReader above, so a SKIP here means the harness itself is
+          # broken, not that preconditions were legitimately absent).
+          if grep -q "^SKIP run-ndpi-oracle" /tmp/ndpi-oracle.log; then
+            echo "::error::nDPI oracle skipped — expected root + a built ndpiReader in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/ndpi-oracle.log; then
+            echo "::error::nDPI classified obfuscated yip traffic as a known protocol, or raised an Obfuscated Traffic risk — undetectability regression"
+            exit 1
+          fi
+          # NOTE: NDPI_SUSPICIOUS_ENTROPY ("Susp Entropy") firing is EXPECTED
+          # and NOT gated here — see run-ndpi-oracle.sh's header comment.
+          # High entropy is inherent to all encrypted/random payloads
+          # (WireGuard trips it too); suppressing it needs TLS/QUIC mimicry,
+          # which is milestone 3c, not 3a.
+
+      - name: Run the nDPI QUIC-classification oracle under sudo
+        # 3c.1 Task 7's headline flip: unlike the undetectability oracle above
+        # (proves yip is Unknown to nDPI), this proves a transport=quic yip
+        # flow is POSITIVELY classified as QUIC, with NO Susp Entropy risk —
+        # the concrete proof QUIC mimicry beats the entropy heuristic 3a/3b
+        # could only report on. See run-quic-mimicry-oracle.sh for the full
+        # assertion set.
+        run: |
+          sudo bash bin/yipd/tests/run-quic-mimicry-oracle.sh \
+            "$(pwd)/target/release/yipd" \
+            /tmp/nDPI/example/ndpiReader | tee /tmp/quic-ndpi-oracle.log
+          # Honesty guard, same reasoning as the undetectability oracle above:
+          # this job always runs as sudo and always builds ndpiReader, so a
+          # SKIP here means the harness itself is broken.
+          if grep -q "^SKIP run-quic-mimicry-oracle" /tmp/quic-ndpi-oracle.log; then
+            echo "::error::QUIC-classification oracle skipped — expected root + a built ndpiReader in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/quic-ndpi-oracle.log; then
+            echo "::error::nDPI did not classify yip-over-QUIC traffic as QUIC, or raised a Susp Entropy risk — 3c mimicry regression"
+            exit 1
+          fi
+          # NOTE: "Known Proto on Non Std Port" firing is EXPECTED and NOT
+          # gated here — see run-quic-mimicry-oracle.sh's header comment.
+          # It's the R8 port-plausibility follow-up (yip's default port isn't
+          # 443 yet), tracked for milestone 3d, not an entropy/obfuscation
+          # regression.
+
+      - name: Run the nDPI TLS-classification oracle under sudo
+        # 3c.2 Task 6's headline: a transport=tls yip flow is POSITIVELY
+        # classified by nDPI as TLS with the configured SNI and a browser-shaped
+        # JA4, with NO VPN / Obfuscated / Susp Entropy risk — the TCP sibling of
+        # the QUIC oracle above. See run-tls-mimicry-oracle.sh for the full
+        # assertion set (browser/JA4 tag and Known-Proto-on-Non-Std-Port are
+        # reported, not gated).
+        run: |
+          sudo bash bin/yipd/tests/run-tls-mimicry-oracle.sh \
+            "$(pwd)/target/release/yipd" \
+            /tmp/nDPI/example/ndpiReader | tee /tmp/tls-ndpi-oracle.log
+          # Honesty guard, same reasoning as the oracles above: this job always
+          # runs as sudo and always builds ndpiReader, so a SKIP means the
+          # harness itself is broken.
+          if grep -q "^SKIP run-tls-mimicry-oracle" /tmp/tls-ndpi-oracle.log; then
+            echo "::error::TLS-classification oracle skipped — expected root + a built ndpiReader in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/tls-ndpi-oracle.log; then
+            echo "::error::nDPI did not classify yip-over-TLS traffic as TLS with the configured SNI, or raised a VPN/Obfuscated/Susp-Entropy risk — 3c.2 mimicry regression"
+            exit 1
+          fi
+          # NOTE: "Known Proto on Non Std Port" and "Mismatching Protocol with
+          # server IP address" firing are EXPECTED and NOT gated here — see
+          # run-tls-mimicry-oracle.sh's header. The former is the R8/3d
+          # port-plausibility follow-up; the latter is inherent to a P2P TLS
+          # costume whose SNI (a real site) never matches the peer's IP.
+
+      - name: Run the nDPI port-plausibility oracle under sudo
+        # 3d Task 6's headline: proves the R8 port fix actually removes the
+        # "unknown thing on a weird port" risk. Arm 1 reruns the TLS-mimicry
+        # costume on 443 (instead of the neutral port above) and asserts
+        # `Known Proto on Non Std Port` — reported, never gated, by the
+        # neutral-port oracle above — is now ABSENT. Arm 2 reruns the
+        # undetectability oracle's obf capture on UDP 51820 (WireGuard's
+        # default) and asserts nDPI classifies it as WireGuard BY PORT — the
+        # concrete #45 tell that motivates moving off 51820. See
+        # run-port-plausibility-oracle.sh for the full assertion set.
+        run: |
+          sudo bash bin/yipd/tests/run-port-plausibility-oracle.sh \
+            "$(pwd)/target/release/yipd" \
+            /tmp/nDPI/example/ndpiReader | tee /tmp/port-plausibility-oracle.log
+          # Honesty guard, same reasoning as the oracles above: this job
+          # always runs as sudo and always builds ndpiReader, so a SKIP means
+          # the harness itself is broken.
+          if grep -q "^SKIP run-port-plausibility-oracle" /tmp/port-plausibility-oracle.log; then
+            echo "::error::port-plausibility oracle skipped — expected root + a built ndpiReader in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/port-plausibility-oracle.log; then
+            echo "::error::the 443 TLS-mimicry flow still showed Known-Proto-on-Non-Std-Port / a VPN classification, or the 51820 raw-yip flow was not port-matched as WireGuard — 3d port-plausibility regression"
+            exit 1
+          fi
+
+      - name: Run the REALITY probe-resistance oracle under sudo
+        # 3c.3's headline money test: an active prober (curl, garbage bytes
+        # over TLS, an idle connection) dialing the relay's TLS Trojan front
+        # must see only a real decoy site, never rendezvous/tunnel behavior,
+        # and the relay must not hard-close a connection at its internal ~3s
+        # classification timeout. See run-netns-reality-probe.sh for the
+        # full assertion set (including the #63 follow-up: sub-second
+        # decoy-connect timing parity for a fully-silent connection is a
+        # known, tracked gap and is NOT gated here).
+        run: |
+          sudo bash bin/yipd/tests/run-netns-reality-probe.sh \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/reality-probe-oracle.log
+          # Honesty guard, same reasoning as the oracles above: this job
+          # always runs as sudo and always builds yip-rendezvous-bin above,
+          # so a SKIP here means the harness itself is broken.
+          if grep -q "^SKIP run-netns-reality-probe" /tmp/reality-probe-oracle.log; then
+            echo "::error::probe-resistance oracle skipped — expected root + a built yip-rendezvous binary in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/reality-probe-oracle.log; then
+            echo "::error::an active probe was not served the decoy, or the relay hard-closed an idle connection at its classification timeout — 3c.3 probe-resistance regression"
+            exit 1
+          fi
+          # FOLLOW-UP (REALITY.3/CI, not yet built): the oracle above still
+          # exercises the 3c.3 Trojan `--decoy` model (own self-signed cert +
+          # self-hosted decoy backend). REALITY.1 (server-side --reality-dest
+          # splice, see docs/configuration.md's "REALITY-style TLS front"
+          # section) needs its own active-probe oracle: dial the relay with
+          # --reality-dest set and NO valid REALITY auth (no key, or a
+          # wrong/absent short_id) and assert the TLS cert returned is
+          # dest's genuine cert, never the relay's own — proving the splice,
+          # not just a decoy-shaped reply. Track under REALITY.3.
+
+      - name: Run the relay-over-TLS money test under sudo
+        # The 3c.4 headline money test: two UDP-blocked yipd peers tunnel to
+        # each other THROUGH the 3c.3 TLS relay — `rendezvous=tls://host:port`
+        # + `obf_psk` dials the relay over browser-parrot TLS, registers, and
+        # the relay blindly forwards ALL peer traffic. See
+        # run-netns-relay-tls.sh for the full topology and assertion set
+        # (ping success, relay-forwarded>0, TCP-carried with zero UDP
+        # crossing the peer<->relay link). Release yipd (already built above
+        # for the mimicry oracles) is required — the inner Noise/FEC
+        # handshake+dataplane needs release for reasonable speed; the debug
+        # yip-rendezvous-bin built above is sufficient for the relay side.
+        run: |
+          sudo bash bin/yipd/tests/run-netns-relay-tls.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/relay-tls-money-test.log
+          # Honesty guard, same reasoning as the oracles above: this job
+          # always runs as sudo and always builds both binaries, so a SKIP
+          # here means the harness itself is broken.
+          if grep -q "^SKIP run-netns-relay-tls" /tmp/relay-tls-money-test.log; then
+            echo "::error::relay-over-TLS money test skipped — expected root + built yipd/yip-rendezvous binaries in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/relay-tls-money-test.log; then
+            echo "::error::two UDP-blocked peers failed to tunnel via the TLS relay (ping failed, relay-forwarded stayed 0, or the peer<->relay link was not TCP-only) — 3c.4 relay-dial regression"
+            exit 1
+          fi
+
+      - name: Run the relay-over-REALITY verify=on money + wrong-pubkey/wrong-relay-key tests under sudo
+        # REALITY.4a/4b's headline money test: two UDP-blocked yipd peers
+        # tunnel to each other THROUGH a REALITY relay, with the clients
+        # explicitly `verify=on` —
+        # `rendezvous=reality://host:port?pbk=&sid=&sni=&verify=on` +
+        # `obf_psk` dials the relay with a Chrome-faithful REALITY
+        # ClientHello (`relay_client::spawn_reality`), registers, and the
+        # relay blindly forwards ALL peer traffic, with the relay's automatic
+        # per-connection cert bind (REALITY.4b) verified end-to-end by the
+        # client. Also proves the zero-cert-auth caveat's fail-closed side
+        # two ways: a wrong `pbk=` (client-side) and a mismatched
+        # `--reality-private-key` (relay-side) both yield NO tunnel (the
+        # relay's seal-open fails and splices the connection to
+        # `--reality-dest` instead, and the client's own `verify=on` check
+        # then fails closed too, backing off on the long jittered interval
+        # instead of retry-storming). See run-netns-reality-relay.sh for the
+        # full topology, pinned keypair derivation, and assertion set.
+        # Release yipd (already built above) is required for the same reason
+        # as the TLS relay test; the debug yip-rendezvous-bin built above is
+        # sufficient for the relay side (it also needs cmake, already
+        # installed in this job for the `boring`/BoringSSL crate yipd
+        # links).
+        run: |
+          sudo bash bin/yipd/tests/run-netns-reality-relay.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/relay-reality-money-test.log
+          # Honesty guard, same reasoning as the oracles above: this job
+          # always runs as sudo and always builds both binaries, so a SKIP
+          # here means the harness itself is broken.
+          if grep -q "^SKIP run-netns-reality-relay" /tmp/relay-reality-money-test.log; then
+            echo "::error::relay-over-REALITY money test skipped — expected root + built yipd/yip-rendezvous binaries in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/relay-reality-money-test.log; then
+            echo "::error::two UDP-blocked peers failed to tunnel via the REALITY relay under verify=on (ping failed, relay-forwarded stayed 0, a wrong pbk/relay key was wrongly accepted, or the client retry-stormed on a verify failure) — REALITY.4a/4b relay-dial regression"
+            exit 1
+          fi
+
+      - name: Run the REALITY.5d hand-rolled-flight verify=on money test under sudo
+        # REALITY.5d's headline money test: same topology and assertions as
+        # the 4a/4b relay-over-REALITY test above (verify=on tunnel;
+        # wrong-pbk fail-closed), but proving the relay's AUTHED path now
+        # hand-rolls the entire server flight (`tls_front::run_reality_conn`
+        # `Decision::Accept` — REALITY.5b `emit_server_hello` + REALITY.5c
+        # `emit_server_flight`/`serve`) instead of driving a BoringSSL
+        # `SslAcceptor`. A passing verify=on ping here proves the hand-rolled
+        # flight completed AND the client's REALITY.4b binding check
+        # verified against the relay's forged leaf; the wrong-pbk variant
+        # proves the relay still splices to `--reality-dest`
+        # pre-ServerHello-write (never entering the hand-rolled emit path)
+        # when the seal fails to open. See run-netns-reality-5d.sh for the
+        # full topology and assertion set. Same binary requirements as the
+        # 4a/4b test above (release yipd, debug yip-rendezvous-bin).
+        run: |
+          sudo bash bin/yipd/tests/run-netns-reality-5d.sh \
+            "$(pwd)/target/release/yipd" \
+            "$(pwd)/target/debug/yip-rendezvous" | tee /tmp/relay-reality-5d-money-test.log
+          # Honesty guard, same reasoning as the oracles above: this job
+          # always runs as sudo and always builds both binaries, so a SKIP
+          # here means the harness itself is broken.
+          if grep -q "^SKIP run-netns-reality-5d" /tmp/relay-reality-5d-money-test.log; then
+            echo "::error::REALITY.5d money test skipped — expected root + built yipd/yip-rendezvous binaries in this job"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/relay-reality-5d-money-test.log; then
+            echo "::error::verify=on client failed to tunnel via the REALITY relay's hand-rolled 5b+5c authed flight (ping failed, relay-forwarded stayed 0, or a wrong pbk was wrongly accepted) — REALITY.5d wiring regression"
+            exit 1
+          fi

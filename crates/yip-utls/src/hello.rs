@@ -522,7 +522,9 @@ mod tests {
     fn parse_u16_len16_list(body: &[u8]) -> Vec<u16> {
         let len = usize::from(u16::from_be_bytes([body[0], body[1]]));
         body[2..2 + len]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .collect()
     }

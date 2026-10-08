@@ -50,6 +50,15 @@ use crate::peer_manager::PeerManager;
 ///
 /// Only returns on a fatal I/O error.
 pub fn run(config: Config) -> io::Result<()> {
+    // Regime B single-peer multi-core throughput scaling:
+    // When shards > 1, delegate to the sharded event loop which provides symmetric
+    // flow pinning (guaranteeing zero TCP reordering), lock-free cross-shard SPSC routing,
+    // multi-port UDP egress pool selection, and 20 Hz coalesced timer ticks.
+    if config.shards > 1 {
+        let shards = config.shards;
+        return crate::sharding::run_sharded(config, shards);
+    }
+
     // The data-plane UDP socket is bound lazily, only on the transports that
     // actually use it (raw + quic) — see `bind_dataplane_udp` and the dispatch
     // below. The TLS costume and TLS relay-dial paths open their own TCP sockets
@@ -382,7 +391,7 @@ fn bind_dataplane_udp(config: &Config) -> io::Result<UdpSocket> {
 /// being absent) are logged and swallowed — this is additive to whatever
 /// addressing a test harness assigns itself, never required for the tunnel
 /// to function in single-peer 2a scope.
-fn assign_mesh_address(device: &str, local_addr: std::net::Ipv6Addr) {
+pub(crate) fn assign_mesh_address(device: &str, local_addr: std::net::Ipv6Addr) {
     let addr_arg = format!("{local_addr}/128");
     match Command::new("ip")
         .args(["-6", "addr", "add", &addr_arg, "dev", device])

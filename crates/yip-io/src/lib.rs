@@ -5,7 +5,9 @@
 pub mod addr;
 pub mod epoll;
 pub(crate) mod gso;
+pub mod nonce;
 pub mod poll;
+pub mod spsc;
 pub(crate) mod tun_offload;
 pub mod uring;
 
@@ -352,6 +354,26 @@ pub fn set_socket_buffers(sock: &UdpSocket, bytes: usize) -> io::Result<()> {
     Ok(())
 }
 
+/// Pin the calling thread to `core` via `libc::sched_setaffinity`.
+///
+/// Returns `Ok(())` on success, or an `io::Error` if affinity could not be set.
+pub fn pin_current_thread(core: usize) -> io::Result<()> {
+    // SAFETY: `set` is a valid, fully-initialized `cpu_set_t` local; `CPU_SET`
+    // and `sched_setaffinity` only read/write within its bounds, and
+    // `size_of::<cpu_set_t>()` matches the buffer we pass.
+    let rc = unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(core, &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const set)
+    };
+    if rc != 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Choose the lowest-latency backend that initializes: io_uring if its ring
 /// builds on this kernel, else the portable plain-socket fallback.
 pub fn select_backend(socket: UdpSocket) -> Box<dyn DataPlaneIo> {
@@ -510,5 +532,12 @@ mod tests {
         }
         assert!(got.contains(&a.to_vec()));
         assert!(got.contains(&b.to_vec()));
+    }
+
+    #[test]
+    fn test_pin_current_thread_does_not_crash() {
+        // Core 0 is present on standard systems. Call pin_current_thread and verify
+        // it returns Ok or an OS error without crashing or corrupting memory.
+        let _ = pin_current_thread(0);
     }
 }
