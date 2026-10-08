@@ -132,6 +132,7 @@ use std::net::ToSocketAddrs;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use yip_io::af_xdp::{FillRing, UmemPool, XskBindMode, XskDesc, XskSocket, UMEM_RING_SIZE};
 use yip_io::poll::Dispatch;
 
 use crate::config::Config;
@@ -497,7 +498,35 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
 
                 let mut manager = create_peer_manager(&cfg, &peers)?;
                 let tun_fd = tun_dev.as_raw_fd();
-                let sock_fd = sock.as_raw_fd();
+
+                // Probe opportunistic AF_XDP socket with 3-tier fallback
+                let mut umem_pool = UmemPool::new(2048, 4096).ok();
+                let xsk_ifname =
+                    std::env::var("YIP_XDP_IFNAME").unwrap_or_else(|_| "lo".to_string());
+                let mut xsk_sock = if let Some(ref pool) = umem_pool {
+                    XskSocket::bind_opportunistic(&xsk_ifname, shard_id as u32, pool)
+                        .unwrap_or_else(|_| XskSocket::fallback())
+                } else {
+                    XskSocket::fallback()
+                };
+
+                let mut fill_ring = FillRing::new(UMEM_RING_SIZE);
+                if let Some(ref mut pool) = umem_pool {
+                    while !fill_ring.is_full() {
+                        if let Some(addr) = pool.alloc_chunk() {
+                            fill_ring.produce(addr);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+
+                let sock_fd =
+                    if xsk_sock.mode() != XskBindMode::FallbackRecvmmsg && xsk_sock.fd() >= 0 {
+                        xsk_sock.fd()
+                    } else {
+                        sock.as_raw_fd()
+                    };
                 let poller = yip_io::epoll::Epoll::new(sock_fd, tun_fd)?;
                 let vnet_len = tun_dev.vnet_hdr_len().unwrap_or(0);
                 let is_tap = cfg.device_kind == crate::mode::TunnelMode::L2Tap;
@@ -529,34 +558,66 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                         break;
                     }
 
-                    let ready_none = !ready.udp && !ready.tun;
+                    let xsk_rx_ready = xsk_sock.mode() != XskBindMode::FallbackRecvmmsg
+                        && !xsk_sock.rx_ring().is_empty();
+                    let ready_none = !ready.udp && !ready.tun && !xsk_rx_ready;
                     let mut packets_this_iter: u64 = 0;
 
-                    // 1. Drain local UDP socket via on_udp (vectorized batching)
-                    if ready.udp {
-                        loop {
-                            match batch_sock.recvmmsg_batch(&mut rx_buffers, &mut rx_datagrams) {
-                                Ok(0) => break,
-                                Ok(count) => {
-                                    packets_this_iter = packets_this_iter.wrapping_add(count as u64);
-                                    for i in 0..count {
-                                        let dg = &rx_datagrams[i];
-                                        let payload = &rx_buffers[i][..dg.len];
-                                        let (tun_out, egress) =
-                                            owned_out(manager.on_udp(dg.src, payload, cached_now_ms));
-                                        if let Some(inner) = tun_out {
-                                            write_tun(tun_fd, &inner, vnet_len > 0);
-                                        }
-                                        if !egress.is_empty() {
-                                            let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
-                                                egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
-                                            let _ = batch_sock.sendmmsg_batch(&egress_batch);
+                    // 1. Drain local UDP socket / AF_XDP RX ring via on_udp
+                    if ready.udp || xsk_rx_ready {
+                        if xsk_sock.mode() == XskBindMode::FallbackRecvmmsg {
+                            loop {
+                                match batch_sock.recvmmsg_batch(&mut rx_buffers, &mut rx_datagrams) {
+                                    Ok(0) => break,
+                                    Ok(count) => {
+                                        packets_this_iter =
+                                            packets_this_iter.wrapping_add(count as u64);
+                                        for i in 0..count {
+                                            let dg = &rx_datagrams[i];
+                                            let payload = &rx_buffers[i][..dg.len];
+                                            let (tun_out, egress) =
+                                                owned_out(manager.on_udp(dg.src, payload, cached_now_ms));
+                                            if let Some(inner) = tun_out {
+                                                write_tun(tun_fd, &inner, vnet_len > 0);
+                                            }
+                                            if !egress.is_empty() {
+                                                let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
+                                                    egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
+                                                let _ = batch_sock.sendmmsg_batch(&egress_batch);
+                                            }
                                         }
                                     }
+                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                                    Err(e) => return Err(e),
                                 }
-                                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                                Err(e) => return Err(e),
+                            }
+                        } else if let Some(ref mut pool) = umem_pool {
+                            let mut descs = [XskDesc::default(); 32];
+                            loop {
+                                let count = xsk_sock.rx_ring_mut().consume_batch(&mut descs);
+                                if count == 0 {
+                                    break;
+                                }
+                                packets_this_iter =
+                                    packets_this_iter.wrapping_add(count as u64);
+                                for desc in &descs[..count] {
+                                    let payload =
+                                        pool.chunk_slice(desc.addr, desc.len as usize);
+                                    let (tun_out, egress) =
+                                        owned_out(manager.on_udp(cfg.listen, payload, cached_now_ms));
+                                    if let Some(inner) = tun_out {
+                                        write_tun(tun_fd, &inner, vnet_len > 0);
+                                    }
+                                    if !egress.is_empty() {
+                                        let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
+                                            egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
+                                        let _ = batch_sock.sendmmsg_batch(&egress_batch);
+                                    }
+                                    if !fill_ring.produce(desc.addr) {
+                                        pool.free_chunk(desc.addr);
+                                    }
+                                }
                             }
                         }
                     }
