@@ -264,6 +264,9 @@ impl AutoTunedPoller {
     pub const DEFAULT_MAX_US: u64 = 200;
     /// Default initial spin duration in microseconds.
     pub const DEFAULT_INITIAL_US: u64 = 50;
+    /// Maximum inter-arrival interval (in microseconds) considered for burst tracking.
+    /// Arrivals spaced further than 2 ms represent idle intervals and are excluded from EWMA updates.
+    pub const MAX_BURST_INTERVAL_US: f64 = 2000.0;
 
     /// Create a new `AutoTunedPoller` with specified minimum and maximum spin bounds in microseconds.
     pub fn new(min_spin_us: u64, max_spin_us: u64) -> Self {
@@ -295,7 +298,7 @@ impl AutoTunedPoller {
         }
         if let Some(last_burst) = self.last_burst {
             let dt_us = now.saturating_duration_since(last_burst).as_micros() as f64;
-            if dt_us <= 2000.0 {
+            if dt_us <= Self::MAX_BURST_INTERVAL_US {
                 self.ewma_us = 0.875 * self.ewma_us + 0.125 * dt_us;
                 self.jitter_us = 0.75 * self.jitter_us + 0.25 * (dt_us - self.ewma_us).abs();
                 let min_us = self.min_spin.as_micros() as f64;

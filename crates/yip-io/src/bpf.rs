@@ -639,8 +639,13 @@ impl XdpRedirectFilter {
     ) -> BpfFilterStatus {
         match Self::load_multi_queue(ifname, listen_port, queue_fds) {
             Ok(filter) => {
-                let prog_fd = filter.prog_fd;
-                let _ = filter.into_raw();
+                let (map_fd, prog_fd) = filter.into_raw();
+                if map_fd >= 0 {
+                    // SAFETY: Closing unexported map descriptor; kernel keeps map reference alive via BPF prog.
+                    unsafe {
+                        libc::close(map_fd);
+                    }
+                }
                 BpfFilterStatus::Attached(prog_fd)
             }
             Err(status) => status,

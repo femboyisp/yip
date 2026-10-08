@@ -420,9 +420,14 @@ impl Session {
         if self.send_counter == 0 {
             self.send_counter = start_counter;
         } else {
-            while self.send_counter % stride != start_counter % stride {
-                self.send_counter = self.send_counter.saturating_add(1);
-            }
+            let rem = self.send_counter % stride;
+            let target_rem = start_counter % stride;
+            let diff = if rem <= target_rem {
+                target_rem - rem
+            } else {
+                stride - (rem - target_rem)
+            };
+            self.send_counter = self.send_counter.saturating_add(diff);
         }
         self.stride = stride;
     }
