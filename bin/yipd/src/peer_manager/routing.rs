@@ -138,49 +138,22 @@ impl PeerManager {
     /// `endpoint`), so the roam must also be pushed into the live `EpochSet` or
     /// return traffic keeps targeting the peer's stale (post-rebind, dead)
     /// address.
-    fn relearn_endpoint(&mut self, idx: usize, src: SocketAddr) {
-        if !self.peers[idx].relay && self.peers[idx].endpoint != Some(src) {
-            if let Some(ep) = self.peers[idx].endpoint {
-                if ep.ip() == src.ip() {
-                    return;
+    pub fn relearn_endpoint(&mut self, idx: usize, src: SocketAddr) {
+        if self.peers[idx].relay {
+            return;
+        }
+        if let Some(ref mut ep) = self.peers[idx].endpoint {
+            if ep.ip() != src.ip() {
+                ep.set_ip(src.ip());
+                let new_endpoint = *ep;
+                if let PeerState::Established(epochs) = &mut self.peers[idx].state {
+                    epochs.set_peer_addr(new_endpoint);
                 }
             }
+        } else {
             self.peers[idx].endpoint = Some(src);
             if let PeerState::Established(epochs) = &mut self.peers[idx].state {
                 epochs.set_peer_addr(src);
-            }
-        }
-    }
-
-    /// Preserves the peer's configured/learned base endpoint port when roaming.
-    /// When authenticated data packets arrive with a different IP, updates the IP
-    /// while keeping the existing port. When only the source port changes, the
-    /// endpoint port is untouched.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "roaming port-preservation helper for Regime B multi-port egress"
-        )
-    )]
-    pub fn relearn_endpoint_preserve_port(&mut self, peer_idx: usize, src: SocketAddr) {
-        if let Some(peer) = self.peers.get_mut(peer_idx) {
-            if peer.relay {
-                return;
-            }
-            if let Some(ref mut ep) = peer.endpoint {
-                if ep.ip() != src.ip() {
-                    ep.set_ip(src.ip());
-                    let new_ep = *ep;
-                    if let PeerState::Established(epochs) = &mut peer.state {
-                        epochs.set_peer_addr(new_ep);
-                    }
-                }
-            } else {
-                peer.endpoint = Some(src);
-                if let PeerState::Established(epochs) = &mut peer.state {
-                    epochs.set_peer_addr(src);
-                }
             }
         }
     }
@@ -469,10 +442,11 @@ mod tests {
             DispatchOut::None
         );
         assert!(!out_is_none, "a genuine Data datagram must authenticate");
+        let expected = SocketAddr::new(new_src.ip(), old_ep.port());
         assert_eq!(
             pm_r.peers[0].endpoint,
-            Some(new_src),
-            "dispatch_established's own relearn call must move the endpoint"
+            Some(expected),
+            "dispatch_established's own relearn call must update IP while preserving port"
         );
     }
 
@@ -511,30 +485,31 @@ mod tests {
     }
 
     #[test]
-    fn test_relearn_endpoint_preserve_port() {
+    fn test_relearn_endpoint_preserves_port_on_ip_roam() {
         let (_pm_i, mut pm_r, old_ep) = established_pair_for_roaming();
 
         // 1. Same IP, different port -> port preserved
         let diff_port = SocketAddr::new(old_ep.ip(), old_ep.port() + 100);
-        pm_r.relearn_endpoint_preserve_port(0, diff_port);
+        pm_r.relearn_endpoint(0, diff_port);
         assert_eq!(pm_r.peers[0].endpoint, Some(old_ep));
 
-        // 2. Different IP -> IP updated, base port preserved
+        // 2. Different IP and different port -> IP updated, old base port preserved
         let diff_ip: SocketAddr = "198.51.100.77:33333".parse().unwrap();
-        pm_r.relearn_endpoint_preserve_port(0, diff_ip);
+        assert_ne!(diff_ip.port(), old_ep.port());
+        pm_r.relearn_endpoint(0, diff_ip);
         let expected = SocketAddr::new(diff_ip.ip(), old_ep.port());
         assert_eq!(pm_r.peers[0].endpoint, Some(expected));
 
         // 3. Peer with endpoint None -> sets endpoint to src
         pm_r.peers[0].endpoint = None;
         let fresh_src: SocketAddr = "203.0.113.5:12345".parse().unwrap();
-        pm_r.relearn_endpoint_preserve_port(0, fresh_src);
+        pm_r.relearn_endpoint(0, fresh_src);
         assert_eq!(pm_r.peers[0].endpoint, Some(fresh_src));
 
         // 4. Relay peer -> ignored
         let (mut pm_relay, _, _, _) = established_relay_pm(100);
         let relay_ep = pm_relay.peers[0].endpoint;
-        pm_relay.relearn_endpoint_preserve_port(0, "198.51.100.99:9999".parse().unwrap());
+        pm_relay.relearn_endpoint(0, "198.51.100.99:9999".parse().unwrap());
         assert_eq!(pm_relay.peers[0].endpoint, relay_ep);
     }
 }

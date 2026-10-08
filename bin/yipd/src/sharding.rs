@@ -102,6 +102,7 @@ pub struct CoalescedTimer {
     packet_batch_mask: u64,
     last_tick: std::time::Instant,
     packet_count: u64,
+    last_check_packets: u64,
 }
 
 impl CoalescedTimer {
@@ -118,6 +119,7 @@ impl CoalescedTimer {
             packet_batch_mask,
             last_tick: std::time::Instant::now(),
             packet_count: 0,
+            last_check_packets: 0,
         }
     }
 
@@ -139,9 +141,22 @@ impl CoalescedTimer {
         self.packet_batch_mask
     }
 
+    /// Check whether a clock query (`Instant::now()`) should be performed.
+    ///
+    /// Throttles clock queries to eliminate per-batch vDSO invocations under high packet rates:
+    /// returns `true` when idle (`packets_this_iter == 0`), OR when packet count has advanced
+    /// past the batch mask threshold (e.g. `accumulated_packets >= 2048` or `total_packets & 2047 == 0`).
+    #[inline]
+    pub fn should_check_time(&self, packets_this_iter: u64) -> bool {
+        packets_this_iter == 0
+            || (self.packet_count & self.packet_batch_mask == 0)
+            || self.packet_count.wrapping_sub(self.last_check_packets) > self.packet_batch_mask
+    }
+
     /// Check whether a timer tick should fire given the current time and packets processed
-    /// in this loop iteration.
+    /// in this loop iteration. Updates the last check packet count.
     pub fn should_tick(&mut self, now: std::time::Instant, _packets_this_iter: u64) -> bool {
+        self.last_check_packets = self.packet_count;
         if now.duration_since(self.last_tick) >= self.interval {
             self.last_tick = now;
             true
@@ -451,6 +466,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                 let mut udp_buf = [0u8; yip_io::MAX_WIRE_DATAGRAM];
                 let mut tun_buf = vec![0u8; vnet_len + yip_io::MAX_WIRE_DATAGRAM];
                 let start = std::time::Instant::now();
+                let mut cached_now_ms: u64 = 0;
                 let mut spsc_batch = Vec::new();
 
                 loop {
@@ -463,7 +479,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                         break;
                     }
 
-                    let now_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    let ready_none = !ready.udp && !ready.tun;
                     let mut packets_this_iter: u64 = 0;
 
                     // 1. Drain local UDP socket via on_udp
@@ -473,7 +489,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                 Ok((n, src)) => {
                                     packets_this_iter = packets_this_iter.wrapping_add(1);
                                     let (tun_out, egress) =
-                                        owned_out(manager.on_udp(src, &udp_buf[..n], now_ms));
+                                        owned_out(manager.on_udp(src, &udp_buf[..n], cached_now_ms));
                                     if let Some(inner) = tun_out {
                                         write_tun(tun_fd, &inner, vnet_len > 0);
                                     }
@@ -500,7 +516,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                         let target_shard = shard_for_packet(pkt, is_tap, num_shards);
 
                                         if target_shard == shard_id {
-                                            let egress = manager.on_tun(pkt, now_ms);
+                                            let egress = manager.on_tun(pkt, cached_now_ms);
                                             for dg in egress {
                                                 let send_sock = select_egress_socket(
                                                     &sock,
@@ -536,7 +552,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                         rx.drain_batch(&mut spsc_batch, 64);
                         packets_this_iter = packets_this_iter.wrapping_add(spsc_batch.len() as u64);
                         for pkt in &spsc_batch {
-                            let egress = manager.on_tun(&pkt.bytes, now_ms);
+                            let egress = manager.on_tun(&pkt.bytes, cached_now_ms);
                             for dg in egress {
                                 let send_sock = select_egress_socket(
                                     &sock,
@@ -551,13 +567,22 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                     }
 
                     // 4. Cadence tick (feedback / keepalive / retransmit / cover)
-                    // Coalesced to 20 Hz (50 ms interval) or every 2048 packets
+                    // Coalesced to 20 Hz (50 ms interval) or every 2048 packets.
+                    // Clock queries are throttled: only queried when idle (ready_none / packets_this_iter == 0)
+                    // or when packet count advances past the batch mask threshold.
                     coalesced_timer.on_packets(packets_this_iter);
-                    let now = std::time::Instant::now();
-                    if coalesced_timer.should_tick(now, packets_this_iter) {
-                        if let Some(egress) = manager.tick(now_ms) {
-                            for dg in egress {
-                                let _ = sock.send_to(&dg.bytes, dg.dst);
+                    if (ready_none && packets_this_iter == 0)
+                        || coalesced_timer.should_check_time(packets_this_iter)
+                    {
+                        let now = std::time::Instant::now();
+                        cached_now_ms =
+                            u64::try_from(now.duration_since(start).as_millis()).unwrap_or(u64::MAX);
+
+                        if coalesced_timer.should_tick(now, packets_this_iter) {
+                            if let Some(egress) = manager.tick(cached_now_ms) {
+                                for dg in egress {
+                                    let _ = sock.send_to(&dg.bytes, dg.dst);
+                                }
                             }
                         }
                     }
@@ -899,6 +924,38 @@ mod tests {
 
         // Next check right after should not tick
         assert!(!timer.should_tick(t_traffic_next, 1));
+    }
+
+    #[test]
+    fn test_coalesced_timer_should_check_time() {
+        let mut timer =
+            CoalescedTimer::with_interval_and_mask(std::time::Duration::from_millis(50), 2047);
+
+        // When idle (0 packets in this iteration), should check time
+        assert!(timer.should_check_time(0));
+
+        // When traffic arrives in sub-batch amounts (< 2048), should NOT check time
+        timer.on_packets(500);
+        assert!(!timer.should_check_time(500));
+
+        timer.on_packets(1547); // total 2047
+        assert_eq!(timer.packet_count(), 2047);
+        assert!(!timer.should_check_time(1547));
+
+        // Exactly hits or crosses 2048 -> should check time
+        timer.on_packets(1); // total 2048
+        assert_eq!(timer.packet_count(), 2048);
+        assert!(timer.should_check_time(1));
+
+        // After should_tick updates last_check_packets, next packet should NOT check time
+        let now = std::time::Instant::now();
+        let _ = timer.should_tick(now, 1);
+        timer.on_packets(1);
+        assert!(!timer.should_check_time(1));
+
+        // A large batch crossing 2048 threshold (e.g. 2049 packets)
+        timer.on_packets(2049);
+        assert!(timer.should_check_time(2049));
     }
 
     #[test]
