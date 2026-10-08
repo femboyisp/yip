@@ -83,6 +83,50 @@ pub fn shard_for_packet(packet: &[u8], is_tap: bool, num_shards: usize) -> usize
     }
 }
 
+/// Deterministically pin all source and repair symbols of an FEC object block
+/// to a single worker shard to ensure Cauchy Reed-Solomon decoding remains hot in L1D cache (Regime B+).
+///
+/// Guarantees that 100% of source symbols ($0..K$) and repair symbols ($0..R$) for any given
+/// `(conn_tag, object_id)` pair map to the identical worker core.
+pub fn shard_for_fec_symbol(conn_tag: u64, object_id: u16, num_shards: usize) -> usize {
+    yip_transport::fec::shard_for_fec_symbol(conn_tag, object_id, num_shards)
+}
+
+/// Demux an unmasked wire frame header by `(conn_tag, object_id)` to a target worker shard index in `0..num_shards`.
+///
+/// If `header` contains at least 10 bytes (8-byte `conn_tag` + 2-byte `object_id`),
+/// demuxes via [`shard_for_fec_symbol`]. Returns `0` if `header.len() < 10` or `num_shards <= 1`.
+pub fn shard_for_wire_header(header: &[u8], num_shards: usize) -> usize {
+    if num_shards <= 1 || header.len() < 10 {
+        return 0;
+    }
+    let conn_tag = u64::from_be_bytes(header[0..8].try_into().expect("slice has length 8"));
+    let object_id = u16::from_be_bytes(header[8..10].try_into().expect("slice has length 2"));
+    shard_for_fec_symbol(conn_tag, object_id, num_shards)
+}
+
+/// Demux an incoming wire frame to its target worker shard index in `0..num_shards`.
+pub fn shard_for_wire_frame(frame: &yip_wire::Frame, num_shards: usize) -> usize {
+    shard_for_fec_symbol(frame.conn_tag, frame.object_id, num_shards)
+}
+
+/// Map an outer UDP datagram carrying a wire frame to a target shard index in `0..num_shards`.
+///
+/// When an outer UDP frame carries a Data packet (`PacketType::Data` as u8), extracts
+/// the wire header starting at byte 1 and demuxes by `shard_for_fec_symbol`.
+/// Returns `None` if the datagram is not a Data packet, is shorter than 11 bytes,
+/// or `num_shards <= 1`.
+pub fn shard_for_outer_udp(datagram: &[u8], num_shards: usize) -> Option<usize> {
+    if num_shards <= 1 || datagram.len() < 11 {
+        return None;
+    }
+    if datagram[0] == crate::handshake::PacketType::Data as u8 {
+        Some(shard_for_wire_header(&datagram[1..11], num_shards))
+    } else {
+        None
+    }
+}
+
 use std::io;
 use std::net::ToSocketAddrs;
 use std::os::fd::AsRawFd;
@@ -1074,5 +1118,82 @@ mod tests {
                 assert_eq!(q.len(), 0, "other shard {idx} must receive 0 packets");
             }
         }
+    }
+
+    #[test]
+    fn test_shard_for_fec_symbol_boundary() {
+        let conn_tag = 0xdead_beef_1234_5678;
+        assert_eq!(shard_for_fec_symbol(conn_tag, 42, 0), 0);
+        assert_eq!(shard_for_fec_symbol(conn_tag, 42, 1), 0);
+        assert_eq!(shard_for_wire_header(&[], 4), 0);
+        assert_eq!(shard_for_wire_header(&[0u8; 9], 4), 0); // too short (< 10)
+    }
+
+    #[test]
+    fn test_shard_for_fec_symbol_affinity() {
+        let conn_tag = 0xfeed_face_cafe_babe;
+        let num_shards = 8;
+
+        for object_id in 0..100u16 {
+            let expected_shard = shard_for_fec_symbol(conn_tag, object_id, num_shards);
+            assert!(expected_shard < num_shards);
+            for _ in 0..5 {
+                assert_eq!(
+                    shard_for_fec_symbol(conn_tag, object_id, num_shards),
+                    expected_shard,
+                    "all symbols for object_id {object_id} must pin to shard {expected_shard}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_shard_for_wire_header_and_frame() {
+        let conn_tag = 0x1122_3344_5566_7788u64;
+        let object_id = 99u16;
+        let num_shards = 4;
+
+        let frame = yip_wire::Frame {
+            conn_tag,
+            object_id,
+            payload_id: [1, 0, 0, 0],
+            flags: 0,
+            payload: vec![1, 2, 3],
+        };
+
+        let expected_shard = shard_for_fec_symbol(conn_tag, object_id, num_shards);
+        assert_eq!(shard_for_wire_frame(&frame, num_shards), expected_shard);
+
+        let mut header = [0u8; 10];
+        header[0..8].copy_from_slice(&conn_tag.to_be_bytes());
+        header[8..10].copy_from_slice(&object_id.to_be_bytes());
+        assert_eq!(shard_for_wire_header(&header, num_shards), expected_shard);
+    }
+
+    #[test]
+    fn test_shard_for_outer_udp() {
+        let conn_tag = 0x0102_0304_0506_0708u64;
+        let object_id = 123u16;
+        let num_shards = 8;
+        let expected = shard_for_fec_symbol(conn_tag, object_id, num_shards);
+
+        // Valid Data datagram: [PacketType::Data, conn_tag (8b), object_id (2b), ...]
+        let mut data_dg = vec![crate::handshake::PacketType::Data as u8];
+        data_dg.extend_from_slice(&conn_tag.to_be_bytes());
+        data_dg.extend_from_slice(&object_id.to_be_bytes());
+        data_dg.extend_from_slice(&[0u8; 20]); // payload
+        assert_eq!(shard_for_outer_udp(&data_dg, num_shards), Some(expected));
+
+        // Non-Data packet (e.g. HandshakeInit) -> None
+        let mut hs_dg = data_dg.clone();
+        hs_dg[0] = crate::handshake::PacketType::HandshakeInit as u8;
+        assert_eq!(shard_for_outer_udp(&hs_dg, num_shards), None);
+
+        // Short datagram (< 11 bytes) -> None
+        assert_eq!(shard_for_outer_udp(&data_dg[..10], num_shards), None);
+
+        // num_shards <= 1 -> None
+        assert_eq!(shard_for_outer_udp(&data_dg, 1), None);
+        assert_eq!(shard_for_outer_udp(&data_dg, 0), None);
     }
 }
