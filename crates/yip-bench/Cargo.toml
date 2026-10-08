@@ -33,5 +33,10 @@ harness = false
 name = "single_flow_scale"
 harness = false
 
+[[bench]]
+name = "af_xdp_scale"
+harness = false
+
+
 [lints]
 workspace = true

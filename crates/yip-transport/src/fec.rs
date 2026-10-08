@@ -28,6 +28,16 @@ pub struct Symbol {
     pub data: Vec<u8>,
 }
 
+/// Deterministically pin all source and repair symbols of an FEC object block
+/// to a single worker shard to ensure Cauchy Reed-Solomon decoding remains hot in L1D cache.
+pub fn shard_for_fec_symbol(conn_tag: u64, object_id: u16, num_shards: usize) -> usize {
+    if num_shards <= 1 {
+        return 0;
+    }
+    let mixed = conn_tag ^ ((object_id as u64).wrapping_mul(0x9e3779b97f4a7c15));
+    (mixed as usize) % num_shards
+}
+
 /// Pack `[0x01, idx_be_hi, idx_be_lo, scheme]`.
 fn pack_payload_id(symbol_index: u16, scheme: u8) -> [u8; 4] {
     let idx = symbol_index.to_be_bytes();

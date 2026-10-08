@@ -143,3 +143,103 @@ fn test_multiple_flows_independent_pinning() {
         }
     }
 }
+
+#[test]
+fn test_af_xdp_worker_probe_and_fallback_mode_detection() {
+    use yip_io::af_xdp::{UmemPool, XskBindMode, XskSocket};
+
+    // Verify worker UMEM allocation: 2048 chunks of 4096 bytes
+    let umem = UmemPool::new(2048, 4096).expect("worker UmemPool allocation must succeed");
+    assert_eq!(umem.chunk_size(), 4096);
+    assert_eq!(umem.free_chunk_count(), 2048);
+
+    // Resolve interface name as done in worker initialization
+    let ifname = std::env::var("YIP_XDP_IFNAME").unwrap_or_else(|_| "lo".to_string());
+
+    // Probe opportunistic AF_XDP socket on shard 0
+    let sock =
+        XskSocket::bind_opportunistic(&ifname, 0, &umem).unwrap_or_else(|_| XskSocket::fallback());
+
+    // In unprivileged test environments, bind should gracefully probe and fallback
+    match sock.mode() {
+        XskBindMode::FallbackRecvmmsg => {
+            assert_eq!(sock.fd(), -1);
+        }
+        XskBindMode::ZeroCopy | XskBindMode::Copy => {
+            assert!(sock.fd() >= 0);
+        }
+    }
+
+    // Verify fallback socket fallback() behaves consistently
+    let fb = XskSocket::fallback();
+    assert_eq!(fb.mode(), XskBindMode::FallbackRecvmmsg);
+    assert_eq!(fb.fd(), -1);
+}
+
+#[test]
+fn test_af_xdp_zero_copy_rx_ring_processing_simulation() {
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use yip_io::af_xdp::{FillRing, UmemPool, XskDesc, XskSocket, UMEM_RING_SIZE};
+    use yip_io::poll::{Dispatch, DispatchOut, EgressDatagram};
+
+    let mut umem = UmemPool::new(64, 4096).expect("allocate UMEM pool for simulation");
+    let mut fill_ring = FillRing::new(UMEM_RING_SIZE);
+    let mut xsk_sock = XskSocket::fallback();
+
+    // Fill initial descriptors into fill ring
+    for _ in 0..16 {
+        if let Some(addr) = umem.alloc_chunk() {
+            assert!(fill_ring.produce(addr));
+        }
+    }
+    assert_eq!(fill_ring.len(), 16);
+
+    // Simulate incoming packet delivered via RX ring in ZeroCopy/Copy mode
+    let chunk_addr = fill_ring.consume().expect("get chunk address");
+    let dummy_packet = b"YIP_ZERO_COPY_PAYLOAD_TEST";
+    {
+        let slice = umem.chunk_slice_mut(chunk_addr, dummy_packet.len());
+        slice.copy_from_slice(dummy_packet);
+    }
+
+    let desc = XskDesc::new(chunk_addr, dummy_packet.len() as u32, 0);
+    assert!(xsk_sock.rx_ring_mut().produce(desc));
+
+    // Dummy dispatch mock implementing Dispatch trait
+    struct MockDispatch {
+        received_packets: Vec<Vec<u8>>,
+    }
+    impl Dispatch for MockDispatch {
+        fn on_udp(&mut self, _src: SocketAddr, dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
+            self.received_packets.push(dg.to_vec());
+            DispatchOut::None
+        }
+        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[EgressDatagram] {
+            &[]
+        }
+        fn tick(&mut self, _now_ms: u64) -> Option<&[EgressDatagram]> {
+            None
+        }
+    }
+
+    let mut mock = MockDispatch {
+        received_packets: Vec::new(),
+    };
+    let dummy_src = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 51820));
+
+    // Drain descriptors from RX ring and verify chunk slicing and replenish logic
+    let mut drained_descs = [XskDesc::default(); 32];
+    let n = xsk_sock.rx_ring_mut().consume_batch(&mut drained_descs);
+    assert_eq!(n, 1);
+
+    for desc in &drained_descs[..n] {
+        let payload = umem.chunk_slice(desc.addr, desc.len as usize);
+        let _ = mock.on_udp(dummy_src, payload, 0);
+        // Replenish chunk address back to fill ring
+        assert!(fill_ring.produce(desc.addr));
+    }
+
+    assert_eq!(mock.received_packets.len(), 1);
+    assert_eq!(&mock.received_packets[0], dummy_packet);
+    assert_eq!(fill_ring.len(), 16);
+}

@@ -37,33 +37,107 @@ pub fn generate_keypair() -> Keypair {
     Keypair { private, public }
 }
 
-/// Number of past counters the replay window tracks behind the latest (16 KB bitmap).
-pub const REPLAY_WINDOW_BITS: u64 = 131_072;
-pub const REPLAY_WORDS: usize = 2048;
+/// Standard profile replay window parameters (1 KB bitmap).
+pub const REPLAY_WINDOW_BITS_STANDARD: u64 = 8_192;
+pub const REPLAY_WORDS_STANDARD: usize = 128;
+
+/// HighThroughput profile replay window parameters (16 KB bitmap).
+pub const REPLAY_WINDOW_BITS_HIGH_THROUGHPUT: u64 = 131_072;
+pub const REPLAY_WORDS_HIGH_THROUGHPUT: usize = 2048;
+
+/// Number of past counters the replay window tracks behind the latest in HighThroughput mode.
+pub const REPLAY_WINDOW_BITS: u64 = REPLAY_WINDOW_BITS_HIGH_THROUGHPUT;
+pub const REPLAY_WORDS: usize = REPLAY_WORDS_HIGH_THROUGHPUT;
+
+/// Sizing profile for the sliding replay window bitmap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayProfile {
+    /// 1 KB bitmap tracking 8,192 bits behind the latest seen counter.
+    /// Fits tightly into L1/L2 cache for standard latency-critical connections.
+    Standard,
+    /// 16 KB bitmap tracking 131,072 bits behind the latest seen counter.
+    /// Designed for multi-gigabit multi-core pipelines absorbing high burst jitter.
+    HighThroughput,
+}
+
+impl ReplayProfile {
+    /// Number of past counters tracked behind the latest counter.
+    #[inline]
+    pub const fn bits(self) -> u64 {
+        match self {
+            Self::Standard => REPLAY_WINDOW_BITS_STANDARD,
+            Self::HighThroughput => REPLAY_WINDOW_BITS_HIGH_THROUGHPUT,
+        }
+    }
+
+    /// Number of 64-bit words in the circular ring bitmap.
+    #[inline]
+    pub const fn words(self) -> usize {
+        match self {
+            Self::Standard => REPLAY_WORDS_STANDARD,
+            Self::HighThroughput => REPLAY_WORDS_HIGH_THROUGHPUT,
+        }
+    }
+}
 
 /// A wide sliding replay window over a monotonic `u64` counter using a circular word ring.
 #[derive(Clone)]
 pub struct ReplayWindow {
+    profile: ReplayProfile,
     latest: u64,
-    bitmap: Box<[u64; REPLAY_WORDS]>,
+    bitmap: Box<[u64]>,
     started: bool,
 }
 
 impl ReplayWindow {
+    /// Create a replay window with the default `HighThroughput` profile (16 KB / 131,072 bits).
     pub fn new() -> Self {
+        Self::new_with_profile(ReplayProfile::HighThroughput)
+    }
+
+    /// Create a replay window configured with a specific sizing profile.
+    pub fn new_with_profile(profile: ReplayProfile) -> Self {
+        let words = profile.words();
         Self {
+            profile,
             latest: 0,
-            bitmap: vec![0u64; REPLAY_WORDS]
-                .into_boxed_slice()
-                .try_into()
-                .unwrap(),
+            bitmap: vec![0u64; words].into_boxed_slice(),
             started: false,
         }
     }
 
+    /// Current sizing profile of the replay window.
+    pub fn profile(&self) -> ReplayProfile {
+        self.profile
+    }
+
+    /// Dynamically promote window capacity to `HighThroughput` (16 KB / 131,072 bits).
+    /// Preserves all previously seen counters without dropping replay protection.
+    pub fn promote_to_high_throughput(&mut self) {
+        if self.profile == ReplayProfile::HighThroughput {
+            return;
+        }
+        let old_words = self.bitmap.len();
+        let new_words = ReplayProfile::HighThroughput.words();
+        let mut new_bitmap = vec![0u64; new_words].into_boxed_slice();
+
+        if self.started {
+            let latest_word = self.latest / 64;
+            let start_word = latest_word.saturating_sub((old_words - 1) as u64);
+            for w in start_word..=latest_word {
+                let old_idx = (w as usize) & (old_words - 1);
+                let new_idx = (w as usize) & (new_words - 1);
+                new_bitmap[new_idx] = self.bitmap[old_idx];
+            }
+        }
+
+        self.profile = ReplayProfile::HighThroughput;
+        self.bitmap = new_bitmap;
+    }
+
     #[inline]
-    fn word_idx(counter: u64) -> usize {
-        ((counter / 64) as usize) & (REPLAY_WORDS - 1)
+    fn word_idx(&self, counter: u64) -> usize {
+        ((counter / 64) as usize) & (self.bitmap.len() - 1)
     }
 
     #[inline]
@@ -80,10 +154,10 @@ impl ReplayWindow {
             true
         } else {
             let diff = self.latest - counter;
-            if diff >= REPLAY_WINDOW_BITS {
+            if diff >= self.profile.bits() {
                 return false; // too old
             }
-            let idx = Self::word_idx(counter);
+            let idx = self.word_idx(counter);
             let mask = Self::bit_mask(counter);
             (self.bitmap[idx] & mask) == 0
         }
@@ -94,14 +168,16 @@ impl ReplayWindow {
         if !self.started {
             self.started = true;
             self.latest = counter;
-            let idx = Self::word_idx(counter);
+            let idx = self.word_idx(counter);
             self.bitmap[idx] = Self::bit_mask(counter);
             return;
         }
 
         if counter > self.latest {
             let diff = counter - self.latest;
-            if diff >= REPLAY_WINDOW_BITS {
+            let window_bits = self.profile.bits();
+            let total_words = self.bitmap.len();
+            if diff >= window_bits {
                 // Large leap: clear entire bitmap
                 self.bitmap.fill(0);
             } else {
@@ -109,26 +185,27 @@ impl ReplayWindow {
                 let old_word = self.latest / 64;
                 let new_word = counter / 64;
                 if new_word > old_word {
-                    let words_to_clear = ((new_word - old_word) as usize).min(REPLAY_WORDS);
+                    let words_to_clear = ((new_word - old_word) as usize).min(total_words);
                     for w in 1..=words_to_clear {
-                        let idx = ((old_word + w as u64) as usize) & (REPLAY_WORDS - 1);
+                        let idx = ((old_word + w as u64) as usize) & (total_words - 1);
                         self.bitmap[idx] = 0;
                     }
                 }
             }
             self.latest = counter;
-            let idx = Self::word_idx(counter);
+            let idx = self.word_idx(counter);
             self.bitmap[idx] |= Self::bit_mask(counter);
         } else {
             let diff = self.latest - counter;
-            if diff < REPLAY_WINDOW_BITS {
-                let idx = Self::word_idx(counter);
+            if diff < self.profile.bits() {
+                let idx = self.word_idx(counter);
                 self.bitmap[idx] |= Self::bit_mask(counter);
             }
         }
     }
 
-    #[cfg(test)]
+    /// Convenience helper to check and commit a counter in one step.
+    /// Used by test harnesses and benchmark suites.
     pub fn check_and_set(&mut self, counter: u64) -> bool {
         if self.check(counter) {
             self.commit(counter);
@@ -440,6 +517,94 @@ impl Session {
         self.replay.commit(counter);
         out.truncate(n);
         Ok(())
+    }
+}
+
+/// ChaCha20-Poly1305 AEAD cipher supporting zero-copy in-place encryption and decryption
+/// directly within pre-allocated network packet buffers (such as AF_XDP UMEM chunks).
+pub struct ChaCha20Poly1305Cipher {
+    key: LessSafeKey,
+}
+
+impl std::fmt::Debug for ChaCha20Poly1305Cipher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChaCha20Poly1305Cipher")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ChaCha20Poly1305Cipher {
+    /// Creates a new cipher instance from a 32-byte symmetric key.
+    pub fn new(key: [u8; 32]) -> Self {
+        let unbound = UnboundKey::new(&CHACHA20_POLY1305, &key)
+            .expect("32-byte key is valid for ChaCha20-Poly1305");
+        Self {
+            key: LessSafeKey::new(unbound),
+        }
+    }
+
+    /// Seal plaintext in-place inside `buf[..plaintext_len]`, writing the 16-byte Poly1305
+    /// authentication tag immediately following the ciphertext into `buf[plaintext_len..plaintext_len + 16]`.
+    ///
+    /// The buffer must have capacity of at least `plaintext_len + 16` bytes.
+    /// Returns the total sealed ciphertext length (`plaintext_len + 16`).
+    pub fn seal_in_place(
+        &self,
+        counter: u64,
+        buf: &mut [u8],
+        plaintext_len: usize,
+    ) -> Result<usize, CryptoError> {
+        let total_len = plaintext_len.checked_add(16).ok_or(CryptoError::Decrypt)?;
+        if buf.len() < total_len {
+            return Err(CryptoError::Decrypt);
+        }
+        let (in_out, tag_out) = buf[..total_len].split_at_mut(plaintext_len);
+        let tag = self
+            .key
+            .seal_in_place_separate_tag(noise_nonce(counter), Aad::empty(), in_out)
+            .map_err(|_| CryptoError::Decrypt)?;
+        tag_out.copy_from_slice(tag.as_ref());
+        Ok(total_len)
+    }
+
+    /// Open and authenticate ciphertext in-place inside `buf[..sealed_len]`.
+    ///
+    /// Expects the 16-byte Poly1305 authentication tag at the end of the ciphertext:
+    /// `buf[sealed_len - 16..sealed_len]`.
+    /// Returns the decrypted plaintext length (`sealed_len - 16`).
+    pub fn open_in_place(
+        &self,
+        counter: u64,
+        buf: &mut [u8],
+        sealed_len: usize,
+    ) -> Result<usize, CryptoError> {
+        if sealed_len < 16 || buf.len() < sealed_len {
+            return Err(CryptoError::Decrypt);
+        }
+        let plain = self
+            .key
+            .open_in_place(noise_nonce(counter), Aad::empty(), &mut buf[..sealed_len])
+            .map_err(|_| CryptoError::Decrypt)?;
+        Ok(plain.len())
+    }
+
+    /// Open and authenticate ciphertext in-place, verifying against a sliding anti-replay window.
+    ///
+    /// The replay window is checked before AEAD decryption and committed only upon
+    /// successful authentication.
+    pub fn open_in_place_with_window(
+        &self,
+        counter: u64,
+        buf: &mut [u8],
+        sealed_len: usize,
+        replay: &mut ReplayWindow,
+    ) -> Result<usize, CryptoError> {
+        if !replay.check(counter) {
+            return Err(CryptoError::Replay);
+        }
+        let plain_len = self.open_in_place(counter, buf, sealed_len)?;
+        replay.commit(counter);
+        Ok(plain_len)
     }
 }
 
@@ -998,6 +1163,35 @@ mod tests {
         // Replay attempt must fail
         assert_eq!(
             b.open_with_window(sealed.counter, &sealed.ciphertext, &mut replay),
+            Err(CryptoError::Replay)
+        );
+    }
+
+    #[test]
+    fn test_chacha20_poly1305_cipher_in_place() {
+        let key = [0x5au8; 32];
+        let cipher = ChaCha20Poly1305Cipher::new(key);
+        let mut buffer = [0u8; 128];
+        let plaintext = b"zero-copy in-place packet buffer payload";
+        buffer[..plaintext.len()].copy_from_slice(plaintext);
+
+        let counter = 100u64;
+        let sealed_len = cipher
+            .seal_in_place(counter, &mut buffer, plaintext.len())
+            .expect("seal_in_place should succeed");
+        assert_eq!(sealed_len, plaintext.len() + 16);
+        assert_ne!(&buffer[..plaintext.len()], plaintext);
+
+        let mut replay = ReplayWindow::new();
+        let plain_len = cipher
+            .open_in_place_with_window(counter, &mut buffer, sealed_len, &mut replay)
+            .expect("open_in_place_with_window should succeed");
+        assert_eq!(plain_len, plaintext.len());
+        assert_eq!(&buffer[..plain_len], plaintext);
+
+        // Replay rejection
+        assert_eq!(
+            cipher.open_in_place_with_window(counter, &mut buffer, sealed_len, &mut replay),
             Err(CryptoError::Replay)
         );
     }

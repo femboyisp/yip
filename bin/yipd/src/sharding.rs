@@ -51,32 +51,79 @@ pub fn shard_for_pubkey(pubkey: &[u8; 32], num_shards: usize) -> usize {
 
 /// Deterministically map an incoming TUN packet to a target shard index in `0..num_shards`.
 ///
-/// Uses inner 5-tuple flow hashing (`FlowTuple::extract`) to pin each connection
-/// to a single worker shard in strict FIFO sequence, preventing TCP reordering (Regime B).
+/// Uses inner 5-tuple symmetric flow hashing (`FlowTuple::extract` + `symmetric_flow_hash`)
+/// to pin both directions of each connection to a single worker shard in strict FIFO sequence,
+/// preventing TCP reordering and cross-core cache invalidation on TCP ACKs (Regime B+).
 /// For non-IP packets or packets where flow extraction fails, falls back to destination
 /// address hashing (`dst_for_packet` + `shard_for_addr`), or shard 0.
-pub fn shard_for_packet(pkt: &[u8], is_tap: bool, num_shards: usize) -> usize {
+pub fn shard_for_packet(packet: &[u8], is_tap: bool, num_shards: usize) -> usize {
     if num_shards <= 1 {
         return 0;
     }
-    let ip_pkt = if is_tap {
-        if pkt.len() >= 14
-            && ((pkt[12] == 0x08 && pkt[13] == 0x00) || (pkt[12] == 0x86 && pkt[13] == 0xdd))
-        {
-            &pkt[14..]
+    let ip_payload = if is_tap {
+        if packet.len() < 14 {
+            return 0;
+        }
+        let ethertype = u16::from_be_bytes([packet[12], packet[13]]);
+        if ethertype == 0x0800 || ethertype == 0x86dd {
+            &packet[14..]
         } else {
-            &[]
+            return 0;
         }
     } else {
-        pkt
+        packet
     };
 
-    if let Some(flow) = crate::flow::FlowTuple::extract(ip_pkt) {
-        (flow.flow_hash() as usize) % num_shards
-    } else if let Some(dst) = dst_for_packet(pkt, is_tap) {
+    if let Some(flow) = crate::flow::FlowTuple::extract(ip_payload) {
+        (flow.symmetric_flow_hash() as usize) % num_shards
+    } else if let Some(dst) = dst_for_packet(packet, is_tap) {
         shard_for_addr(dst, num_shards)
     } else {
         0
+    }
+}
+
+/// Deterministically pin all source and repair symbols of an FEC object block
+/// to a single worker shard to ensure Cauchy Reed-Solomon decoding remains hot in L1D cache (Regime B+).
+///
+/// Guarantees that 100% of source symbols ($0..K$) and repair symbols ($0..R$) for any given
+/// `(conn_tag, object_id)` pair map to the identical worker core.
+pub fn shard_for_fec_symbol(conn_tag: u64, object_id: u16, num_shards: usize) -> usize {
+    yip_transport::fec::shard_for_fec_symbol(conn_tag, object_id, num_shards)
+}
+
+/// Demux an unmasked wire frame header by `(conn_tag, object_id)` to a target worker shard index in `0..num_shards`.
+///
+/// If `header` contains at least 10 bytes (8-byte `conn_tag` + 2-byte `object_id`),
+/// demuxes via [`shard_for_fec_symbol`]. Returns `0` if `header.len() < 10` or `num_shards <= 1`.
+pub fn shard_for_wire_header(header: &[u8], num_shards: usize) -> usize {
+    if num_shards <= 1 || header.len() < 10 {
+        return 0;
+    }
+    let conn_tag = u64::from_be_bytes(header[0..8].try_into().expect("slice has length 8"));
+    let object_id = u16::from_be_bytes(header[8..10].try_into().expect("slice has length 2"));
+    shard_for_fec_symbol(conn_tag, object_id, num_shards)
+}
+
+/// Demux an incoming wire frame to its target worker shard index in `0..num_shards`.
+pub fn shard_for_wire_frame(frame: &yip_wire::Frame, num_shards: usize) -> usize {
+    shard_for_fec_symbol(frame.conn_tag, frame.object_id, num_shards)
+}
+
+/// Map an outer UDP datagram carrying a wire frame to a target shard index in `0..num_shards`.
+///
+/// When an outer UDP frame carries a Data packet (`PacketType::Data` as u8), extracts
+/// the wire header starting at byte 1 and demuxes by `shard_for_fec_symbol`.
+/// Returns `None` if the datagram is not a Data packet, is shorter than 11 bytes,
+/// or `num_shards <= 1`.
+pub fn shard_for_outer_udp(datagram: &[u8], num_shards: usize) -> Option<usize> {
+    if num_shards <= 1 || datagram.len() < 11 {
+        return None;
+    }
+    if datagram[0] == crate::handshake::PacketType::Data as u8 {
+        Some(shard_for_wire_header(&datagram[1..11], num_shards))
+    } else {
+        None
     }
 }
 
@@ -85,6 +132,7 @@ use std::net::ToSocketAddrs;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use yip_io::af_xdp::{FillRing, UmemPool, XskBindMode, XskDesc, XskSocket, UMEM_RING_SIZE};
 use yip_io::poll::Dispatch;
 
 use crate::config::Config;
@@ -450,7 +498,35 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
 
                 let mut manager = create_peer_manager(&cfg, &peers)?;
                 let tun_fd = tun_dev.as_raw_fd();
-                let sock_fd = sock.as_raw_fd();
+
+                // Probe opportunistic AF_XDP socket with 3-tier fallback
+                let mut umem_pool = UmemPool::new(2048, 4096).ok();
+                let xsk_ifname =
+                    std::env::var("YIP_XDP_IFNAME").unwrap_or_else(|_| "lo".to_string());
+                let mut xsk_sock = if let Some(ref pool) = umem_pool {
+                    XskSocket::bind_opportunistic(&xsk_ifname, shard_id as u32, pool)
+                        .unwrap_or_else(|_| XskSocket::fallback())
+                } else {
+                    XskSocket::fallback()
+                };
+
+                let mut fill_ring = FillRing::new(UMEM_RING_SIZE);
+                if let Some(ref mut pool) = umem_pool {
+                    while !fill_ring.is_full() {
+                        if let Some(addr) = pool.alloc_chunk() {
+                            fill_ring.produce(addr);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+
+                let sock_fd =
+                    if xsk_sock.mode() != XskBindMode::FallbackRecvmmsg && xsk_sock.fd() >= 0 {
+                        xsk_sock.fd()
+                    } else {
+                        sock.as_raw_fd()
+                    };
                 let poller = yip_io::epoll::Epoll::new(sock_fd, tun_fd)?;
                 let vnet_len = tun_dev.vnet_hdr_len().unwrap_or(0);
                 let is_tap = cfg.device_kind == crate::mode::TunnelMode::L2Tap;
@@ -463,7 +539,10 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                     crate::port::bind_udp_egress_pool(egress_bind, 64).unwrap_or_default();
                 let mut coalesced_timer = CoalescedTimer::new();
 
-                let mut udp_buf = [0u8; yip_io::MAX_WIRE_DATAGRAM];
+                let mut batch_sock = yip_io::batch::BatchUdpSocket::new(&sock);
+                let mut rx_buffers = [[0u8; yip_io::MAX_WIRE_DATAGRAM]; yip_io::batch::BATCH_SIZE];
+                let mut rx_datagrams =
+                    [const { yip_io::batch::ReceivedDatagram::empty() }; yip_io::batch::BATCH_SIZE];
                 let mut tun_buf = vec![0u8; vnet_len + yip_io::MAX_WIRE_DATAGRAM];
                 let start = std::time::Instant::now();
                 let mut cached_now_ms: u64 = 0;
@@ -479,27 +558,68 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                         break;
                     }
 
-                    let ready_none = !ready.udp && !ready.tun;
+                    let xsk_rx_ready = xsk_sock.mode() != XskBindMode::FallbackRecvmmsg
+                        && !xsk_sock.rx_ring().is_empty();
+                    let ready_none = !ready.udp && !ready.tun && !xsk_rx_ready;
                     let mut packets_this_iter: u64 = 0;
 
-                    // 1. Drain local UDP socket via on_udp
-                    if ready.udp {
-                        loop {
-                            match sock.recv_from(&mut udp_buf) {
-                                Ok((n, src)) => {
-                                    packets_this_iter = packets_this_iter.wrapping_add(1);
-                                    let (tun_out, egress) =
-                                        owned_out(manager.on_udp(src, &udp_buf[..n], cached_now_ms));
-                                    if let Some(inner) = tun_out {
-                                        write_tun(tun_fd, &inner, vnet_len > 0);
+                    // 1. Drain local UDP socket / AF_XDP RX ring via on_udp
+                    if ready.udp || xsk_rx_ready {
+                        if xsk_sock.mode() == XskBindMode::FallbackRecvmmsg {
+                            loop {
+                                match batch_sock.recvmmsg_batch(&mut rx_buffers, &mut rx_datagrams) {
+                                    Ok(0) => break,
+                                    Ok(count) => {
+                                        packets_this_iter =
+                                            packets_this_iter.wrapping_add(count as u64);
+                                        for i in 0..count {
+                                            let dg = &rx_datagrams[i];
+                                            let payload = &rx_buffers[i][..dg.len];
+                                            let (tun_out, egress) =
+                                                owned_out(manager.on_udp(dg.src, payload, cached_now_ms));
+                                            if let Some(inner) = tun_out {
+                                                write_tun(tun_fd, &inner, vnet_len > 0);
+                                            }
+                                            if !egress.is_empty() {
+                                                let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
+                                                    egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
+                                                let _ = batch_sock.sendmmsg_batch(&egress_batch);
+                                            }
+                                        }
                                     }
-                                    for dg in &egress {
-                                        let _ = sock.send_to(&dg.bytes, dg.dst);
+                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                                    Err(e) => return Err(e),
+                                }
+                            }
+                        } else if let Some(ref mut pool) = umem_pool {
+                            let mut descs = [XskDesc::default(); 32];
+                            loop {
+                                let count = xsk_sock.rx_ring_mut().consume_batch(&mut descs);
+                                if count == 0 {
+                                    break;
+                                }
+                                packets_this_iter =
+                                    packets_this_iter.wrapping_add(count as u64);
+                                for desc in &descs[..count] {
+                                    if (desc.len as usize) <= pool.chunk_size() {
+                                        let payload =
+                                            pool.chunk_slice(desc.addr, desc.len as usize);
+                                        let (tun_out, egress) =
+                                            owned_out(manager.on_udp(cfg.listen, payload, cached_now_ms));
+                                        if let Some(inner) = tun_out {
+                                            write_tun(tun_fd, &inner, vnet_len > 0);
+                                        }
+                                        if !egress.is_empty() {
+                                            let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
+                                                egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
+                                            let _ = batch_sock.sendmmsg_batch(&egress_batch);
+                                        }
+                                    }
+                                    if !fill_ring.produce(desc.addr) {
+                                        pool.free_chunk(desc.addr);
                                     }
                                 }
-                                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                                Err(e) => return Err(e),
                             }
                         }
                     }
@@ -580,8 +700,10 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
 
                         if coalesced_timer.should_tick(now, packets_this_iter) {
                             if let Some(egress) = manager.tick(cached_now_ms) {
-                                for dg in egress {
-                                    let _ = sock.send_to(&dg.bytes, dg.dst);
+                                if !egress.is_empty() {
+                                    let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
+                                        egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
+                                    let _ = batch_sock.sendmmsg_batch(&egress_batch);
                                 }
                             }
                         }
@@ -834,7 +956,7 @@ mod tests {
         pkt1[22..24].copy_from_slice(&443u16.to_be_bytes());
 
         let flow1 = crate::flow::FlowTuple::extract(&pkt1).unwrap();
-        let expected_shard = (flow1.flow_hash() as usize) % 4;
+        let expected_shard = (flow1.symmetric_flow_hash() as usize) % 4;
 
         assert_eq!(shard_for_packet(&pkt1, false, 4), expected_shard);
         assert_eq!(shard_for_packet(&pkt1, false, 1), 0);
@@ -846,7 +968,7 @@ mod tests {
         let flow2 = crate::flow::FlowTuple::extract(&pkt2).unwrap();
         assert_eq!(
             shard_for_packet(&pkt2, false, 4),
-            (flow2.flow_hash() as usize) % 4
+            (flow2.symmetric_flow_hash() as usize) % 4
         );
     }
 
@@ -863,8 +985,35 @@ mod tests {
         tap_pkt[14 + 22..14 + 24].copy_from_slice(&80u16.to_be_bytes());
 
         let inner_flow = crate::flow::FlowTuple::extract(&tap_pkt[14..]).unwrap();
-        let expected_shard = (inner_flow.flow_hash() as usize) % 4;
+        let expected_shard = (inner_flow.symmetric_flow_hash() as usize) % 4;
         assert_eq!(shard_for_packet(&tap_pkt, true, 4), expected_shard);
+    }
+
+    #[test]
+    fn test_shard_for_packet_bidirectional_symmetric() {
+        let mut pkt_fwd = vec![0u8; 40];
+        pkt_fwd[0] = 0x45;
+        pkt_fwd[9] = 6; // TCP
+        pkt_fwd[12..16].copy_from_slice(&[192, 168, 1, 10]);
+        pkt_fwd[16..20].copy_from_slice(&[10, 0, 0, 1]);
+        pkt_fwd[20..22].copy_from_slice(&54321u16.to_be_bytes());
+        pkt_fwd[22..24].copy_from_slice(&443u16.to_be_bytes());
+
+        let mut pkt_rev = vec![0u8; 40];
+        pkt_rev[0] = 0x45;
+        pkt_rev[9] = 6; // TCP
+        pkt_rev[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        pkt_rev[16..20].copy_from_slice(&[192, 168, 1, 10]);
+        pkt_rev[20..22].copy_from_slice(&443u16.to_be_bytes());
+        pkt_rev[22..24].copy_from_slice(&54321u16.to_be_bytes());
+
+        for shards in [2, 3, 4, 7, 8, 16, 32] {
+            assert_eq!(
+                shard_for_packet(&pkt_fwd, false, shards),
+                shard_for_packet(&pkt_rev, false, shards),
+                "forward and reverse packets must route to identical shard for {shards} shards"
+            );
+        }
     }
 
     #[test]
@@ -1044,5 +1193,82 @@ mod tests {
                 assert_eq!(q.len(), 0, "other shard {idx} must receive 0 packets");
             }
         }
+    }
+
+    #[test]
+    fn test_shard_for_fec_symbol_boundary() {
+        let conn_tag = 0xdead_beef_1234_5678;
+        assert_eq!(shard_for_fec_symbol(conn_tag, 42, 0), 0);
+        assert_eq!(shard_for_fec_symbol(conn_tag, 42, 1), 0);
+        assert_eq!(shard_for_wire_header(&[], 4), 0);
+        assert_eq!(shard_for_wire_header(&[0u8; 9], 4), 0); // too short (< 10)
+    }
+
+    #[test]
+    fn test_shard_for_fec_symbol_affinity() {
+        let conn_tag = 0xfeed_face_cafe_babe;
+        let num_shards = 8;
+
+        for object_id in 0..100u16 {
+            let expected_shard = shard_for_fec_symbol(conn_tag, object_id, num_shards);
+            assert!(expected_shard < num_shards);
+            for _ in 0..5 {
+                assert_eq!(
+                    shard_for_fec_symbol(conn_tag, object_id, num_shards),
+                    expected_shard,
+                    "all symbols for object_id {object_id} must pin to shard {expected_shard}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_shard_for_wire_header_and_frame() {
+        let conn_tag = 0x1122_3344_5566_7788u64;
+        let object_id = 99u16;
+        let num_shards = 4;
+
+        let frame = yip_wire::Frame {
+            conn_tag,
+            object_id,
+            payload_id: [1, 0, 0, 0],
+            flags: 0,
+            payload: vec![1, 2, 3],
+        };
+
+        let expected_shard = shard_for_fec_symbol(conn_tag, object_id, num_shards);
+        assert_eq!(shard_for_wire_frame(&frame, num_shards), expected_shard);
+
+        let mut header = [0u8; 10];
+        header[0..8].copy_from_slice(&conn_tag.to_be_bytes());
+        header[8..10].copy_from_slice(&object_id.to_be_bytes());
+        assert_eq!(shard_for_wire_header(&header, num_shards), expected_shard);
+    }
+
+    #[test]
+    fn test_shard_for_outer_udp() {
+        let conn_tag = 0x0102_0304_0506_0708u64;
+        let object_id = 123u16;
+        let num_shards = 8;
+        let expected = shard_for_fec_symbol(conn_tag, object_id, num_shards);
+
+        // Valid Data datagram: [PacketType::Data, conn_tag (8b), object_id (2b), ...]
+        let mut data_dg = vec![crate::handshake::PacketType::Data as u8];
+        data_dg.extend_from_slice(&conn_tag.to_be_bytes());
+        data_dg.extend_from_slice(&object_id.to_be_bytes());
+        data_dg.extend_from_slice(&[0u8; 20]); // payload
+        assert_eq!(shard_for_outer_udp(&data_dg, num_shards), Some(expected));
+
+        // Non-Data packet (e.g. HandshakeInit) -> None
+        let mut hs_dg = data_dg.clone();
+        hs_dg[0] = crate::handshake::PacketType::HandshakeInit as u8;
+        assert_eq!(shard_for_outer_udp(&hs_dg, num_shards), None);
+
+        // Short datagram (< 11 bytes) -> None
+        assert_eq!(shard_for_outer_udp(&data_dg[..10], num_shards), None);
+
+        // num_shards <= 1 -> None
+        assert_eq!(shard_for_outer_udp(&data_dg, 1), None);
+        assert_eq!(shard_for_outer_udp(&data_dg, 0), None);
     }
 }

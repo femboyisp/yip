@@ -13,7 +13,7 @@ pub mod control;
 pub use control::AdaptiveController;
 
 pub mod fec;
-pub use fec::{FecEncoder, FecReassembler, Symbol};
+pub use fec::{shard_for_fec_symbol, FecEncoder, FecReassembler, Symbol};
 
 pub mod gf256;
 
