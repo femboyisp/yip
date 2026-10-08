@@ -7,6 +7,7 @@ mod addr;
 mod config;
 mod dataplane;
 mod epoch;
+pub(crate) mod flow;
 mod handshake;
 mod mac_table;
 mod membership;
