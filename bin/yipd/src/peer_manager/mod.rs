@@ -432,6 +432,10 @@ pub struct PeerManager {
     /// costs an Ed25519 `verify_cert` and `tick` can run far more often than
     /// that on the busy-poll path.
     last_cert_sweep_ms: u64,
+    /// Number of worker shards for multi-core scaling.
+    num_shards: usize,
+    /// Newly established session epochs queued for cross-shard broadcast.
+    new_epochs: Vec<crate::sharding::SessionEpochMsg>,
 }
 
 /// MTU budget (bytes) used to size obfuscation padding: handshakes are padded
@@ -540,6 +544,8 @@ impl PeerManager {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(crate::epoch::REKEY_INTERVAL_MS),
             last_cert_sweep_ms: 0,
+            num_shards: 1,
+            new_epochs: Vec::new(),
         };
         // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
         // exactly like configured peers: seed them into the peer table so an
@@ -642,6 +648,110 @@ impl PeerManager {
     /// local TUN/TAP device's address.
     pub fn local_addr(&self) -> Ipv6Addr {
         node_addr(&self.local_pub)
+    }
+
+    /// Set total worker shards count for multi-queue worker scaling.
+    pub fn set_num_shards(&mut self, num_shards: usize) {
+        self.num_shards = num_shards.max(1);
+    }
+
+    /// Get total worker shards count.
+    #[expect(dead_code, reason = "helper for inspecting configured shard count")]
+    pub fn num_shards(&self) -> usize {
+        self.num_shards
+    }
+
+    /// Drain newly established session epochs for cross-shard broadcast.
+    pub fn drain_new_epochs(&mut self) -> Vec<crate::sharding::SessionEpochMsg> {
+        std::mem::take(&mut self.new_epochs)
+    }
+
+    /// Record a newly established epoch and configure stride on Shard 0.
+    pub(crate) fn record_new_epoch(&mut self, idx: usize) {
+        let peer_pk = self.peers[idx].pubkey;
+        let endpoint = self.peers[idx].endpoint;
+        if let PeerState::Established(ref mut epochs) = self.peers[idx].state {
+            if self.num_shards > 1 {
+                epochs
+                    .current_mut()
+                    .session_mut()
+                    .set_stride(0, self.num_shards as u64);
+            }
+            let dp = epochs.current();
+            let send_key = *dp.raw_send_key();
+            let recv_key = *dp.raw_recv_key();
+            let auth_key = *dp.auth_key();
+            let hp_key = *dp.hp_key();
+            self.new_epochs.push(crate::sharding::SessionEpochMsg {
+                peer_pk,
+                send_key,
+                recv_key,
+                auth_key,
+                hp_key,
+                endpoint,
+            });
+        }
+    }
+
+    /// Check whether the target peer for this inner packet is already established locally.
+    pub fn is_tun_target_established(&self, inner: &[u8]) -> bool {
+        if let Some(idx) = self.route_tun_index(inner) {
+            matches!(self.peers[idx].state, PeerState::Established(_))
+        } else {
+            false
+        }
+    }
+
+    /// Directly install an established session epoch into this peer manager.
+    ///
+    /// Used by multi-core worker sharding to replicate established session epochs
+    /// from Shard 0 to worker shards $1..N$ with per-shard stride nonces.
+    pub fn install_established_session(
+        &mut self,
+        peer_pk: &[u8; 32],
+        established: Established,
+        endpoint: Option<SocketAddr>,
+    ) {
+        let idx = match self.peers.iter().position(|p| p.pubkey == *peer_pk) {
+            Some(i) => i,
+            None => {
+                let eps = endpoint.into_iter().collect();
+                self.admit_member(*peer_pk, eps, 0);
+                match self.peers.iter().position(|p| p.pubkey == *peer_pk) {
+                    Some(i) => i,
+                    None => return,
+                }
+            }
+        };
+
+        let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
+        let sess_obf = self.session_obf_key_for(&established.hp_key);
+        let peer_ep = endpoint
+            .or(self.peers[idx].endpoint)
+            .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+
+        if let Some(ep) = endpoint {
+            self.peers[idx].endpoint = Some(ep);
+            self.peers[idx].path.on_direct_addr(ep);
+        }
+
+        let dp = Box::new(DataPlane::new(
+            established,
+            conn_tag,
+            self.mode,
+            peer_ep,
+            self.obf_key.is_some(),
+            self.data_symbol_size,
+        ));
+
+        self.by_tag.insert(conn_tag, idx);
+        let addr = node_addr(peer_pk);
+        self.by_addr.insert(addr, idx);
+        self.peers[idx].session_obf_key = sess_obf;
+        self.peers[idx].path.committed(PathKind::Direct);
+        self.peers[idx].path_kind = Some(PathKind::Direct);
+        self.peers[idx].state =
+            PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, 0)));
     }
 
     // ── rendezvous / path helpers ─────────────────────────────────────────
@@ -2622,16 +2732,22 @@ mod tests {
         let _ = ini.read_message(&m2).unwrap();
         let cb = ini.channel_binding();
         let (auth_key, hp_key) = derive_wire_keys(&cb);
+        let (ini_send_k, ini_recv_k) = ini.raw_split_keys();
+        let (res_send_k, res_recv_k) = res.raw_split_keys();
         let conn_tag = conn_tag_from_keys(&auth_key, &hp_key);
         let est_i = Established {
             session: ini.into_session().unwrap(),
             auth_key,
             hp_key,
+            raw_send_key: ini_send_k,
+            raw_recv_key: ini_recv_k,
         };
         let est_r = Established {
             session: res.into_session().unwrap(),
             auth_key,
             hp_key,
+            raw_send_key: res_send_k,
+            raw_recv_key: res_recv_k,
         };
         let any: SocketAddr = "0.0.0.0:0".parse().unwrap();
         (

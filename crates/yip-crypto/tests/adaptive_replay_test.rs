@@ -50,3 +50,22 @@ fn test_adaptive_replay_profile_sizing_and_promotion() {
     assert!(w2.check_and_set(45_000));
     assert!(!w2.check_and_set(45_000));
 }
+
+#[test]
+fn test_stride_session_sealing_and_opening() {
+    let k_send = [0x42u8; 32];
+    let k_recv = [0x24u8; 32];
+    let mut s1 = yip_crypto::Session::from_raw_keys(&k_send, &k_recv, 2, 4).unwrap();
+    assert_eq!(s1.stride(), 4);
+    let mut s_recv = yip_crypto::Session::from_raw_keys(&k_recv, &k_send, 0, 1).unwrap();
+
+    let sealed1 = s1.seal(b"packet1").unwrap();
+    assert_eq!(sealed1.counter, 2);
+    let sealed2 = s1.seal(b"packet2").unwrap();
+    assert_eq!(sealed2.counter, 6);
+
+    let opened1 = s_recv.open(sealed1.counter, &sealed1.ciphertext).unwrap();
+    assert_eq!(opened1, b"packet1");
+    let opened2 = s_recv.open(sealed2.counter, &sealed2.ciphertext).unwrap();
+    assert_eq!(opened2, b"packet2");
+}

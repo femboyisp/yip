@@ -269,16 +269,22 @@ mod tests {
         assert_eq!(cb_i, cb_r);
 
         let (auth_key, hp_key) = derive_wire_keys(&cb_i);
+        let (ini_send_k, ini_recv_k) = ini.raw_split_keys();
+        let (res_send_k, res_recv_k) = res.raw_split_keys();
 
         let est_i = Established {
             session: ini.into_session().unwrap(),
             auth_key,
             hp_key,
+            raw_send_key: ini_send_k,
+            raw_recv_key: ini_recv_k,
         };
         let est_r = Established {
             session: res.into_session().unwrap(),
             auth_key,
             hp_key,
+            raw_send_key: res_send_k,
+            raw_recv_key: res_recv_k,
         };
 
         let conn_tag = conn_tag_from_keys(&auth_key, &hp_key);

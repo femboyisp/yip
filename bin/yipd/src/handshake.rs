@@ -49,6 +49,36 @@ pub struct Established {
     pub auth_key: [u8; 16],
     /// 16-byte header-protection key derived from the channel binding (for the wire codec).
     pub hp_key: [u8; 16],
+    /// 32-byte raw Noise send key.
+    pub raw_send_key: [u8; 32],
+    /// 32-byte raw Noise receive key.
+    pub raw_recv_key: [u8; 32],
+}
+
+impl Established {
+    /// Clone session parameters into an independent worker shard session with
+    /// non-overlapping stride nonces ($shard\_id, shard\_id + num\_shards, \dots$)
+    /// and an independent anti-replay sliding window.
+    #[expect(
+        dead_code,
+        reason = "clones session for worker shards; called by tests and future sharding harnesses"
+    )]
+    pub fn clone_for_shard(&self, shard_id: usize, num_shards: usize) -> Result<Self, io::Error> {
+        let shard_session = Session::from_raw_keys(
+            &self.raw_send_key,
+            &self.raw_recv_key,
+            shard_id as u64,
+            num_shards as u64,
+        )
+        .map_err(crypto_err)?;
+        Ok(Self {
+            session: shard_session,
+            auth_key: self.auth_key,
+            hp_key: self.hp_key,
+            raw_send_key: self.raw_send_key,
+            raw_recv_key: self.raw_recv_key,
+        })
+    }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -132,8 +162,9 @@ pub fn run_initiator(
 
         let _ = handshake.read_message(&pkt[1..]).map_err(crypto_err)?;
 
-        // Capture channel binding BEFORE consuming the handshake.
+        // Capture channel binding and raw split keys BEFORE consuming the handshake.
         let cb = handshake.channel_binding();
+        let (raw_send_key, raw_recv_key) = handshake.raw_split_keys();
         let session = handshake.into_session().map_err(crypto_err)?;
         let (auth_key, hp_key) = derive_wire_keys(&cb);
 
@@ -144,6 +175,8 @@ pub fn run_initiator(
             session,
             auth_key,
             hp_key,
+            raw_send_key,
+            raw_recv_key,
         });
     }
 
@@ -186,8 +219,9 @@ pub fn run_responder(
     resp_pkt.extend_from_slice(&msg2);
     sock.send_to(&resp_pkt, peer_addr)?;
 
-    // Capture channel binding BEFORE consuming the handshake.
+    // Capture channel binding and raw split keys BEFORE consuming the handshake.
     let cb = handshake.channel_binding();
+    let (raw_send_key, raw_recv_key) = handshake.raw_split_keys();
     let session = handshake.into_session().map_err(crypto_err)?;
     let (auth_key, hp_key) = derive_wire_keys(&cb);
 
@@ -196,6 +230,8 @@ pub fn run_responder(
             session,
             auth_key,
             hp_key,
+            raw_send_key,
+            raw_recv_key,
         },
         peer_addr,
     ))
@@ -336,12 +372,13 @@ impl HandshakeState {
         resp_pkt.push(PacketType::HandshakeResp as u8);
         resp_pkt.extend_from_slice(&msg2);
 
-        // Capture the initiator's static key and the channel binding BEFORE
+        // Capture the initiator's static key, raw split keys, and the channel binding BEFORE
         // consuming the handshake into a session.
         let remote_static = handshake
             .remote_static()
             .ok_or_else(|| io::Error::other("responder handshake has no remote static key"))?;
         let cb = handshake.channel_binding();
+        let (raw_send_key, raw_recv_key) = handshake.raw_split_keys();
         let session = handshake.into_session().map_err(crypto_err)?;
         let (auth_key, hp_key) = derive_wire_keys(&cb);
 
@@ -350,6 +387,8 @@ impl HandshakeState {
                 session,
                 auth_key,
                 hp_key,
+                raw_send_key,
+                raw_recv_key,
             },
             resp_pkt,
             remote_static,
@@ -369,8 +408,9 @@ impl HandshakeState {
             .read_message(&resp_pkt[1..])
             .map_err(crypto_err)?;
 
-        // Capture channel binding BEFORE consuming the handshake.
+        // Capture channel binding and raw split keys BEFORE consuming the handshake.
         let cb = self.handshake.channel_binding();
+        let (raw_send_key, raw_recv_key) = self.handshake.raw_split_keys();
         let session = self.handshake.into_session().map_err(crypto_err)?;
         let (auth_key, hp_key) = derive_wire_keys(&cb);
 
@@ -379,6 +419,8 @@ impl HandshakeState {
                 session,
                 auth_key,
                 hp_key,
+                raw_send_key,
+                raw_recv_key,
             },
             responder_payload,
         ))

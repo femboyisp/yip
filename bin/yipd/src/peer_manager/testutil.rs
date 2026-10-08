@@ -36,10 +36,13 @@ pub(super) fn fake_established_dataplane(conn_tag: u64, peer_addr: SocketAddr) -
     let _ = ini.read_message(&m2).unwrap();
     let cb = ini.channel_binding();
     let (auth_key, hp_key) = derive_wire_keys(&cb);
+    let (ini_send_k, ini_recv_k) = ini.raw_split_keys();
     let established = Established {
         session: ini.into_session().unwrap(),
         auth_key,
         hp_key,
+        raw_send_key: ini_send_k,
+        raw_recv_key: ini_recv_k,
     };
     DataPlane::new(
         established,

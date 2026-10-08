@@ -240,7 +240,7 @@ pub enum CryptoError {
 /// An in-progress Noise-IK handshake. Drive it by exchanging the two messages
 /// (`write_message`/`read_message`), then convert into a [`Session`].
 pub struct Handshake {
-    inner: snow::HandshakeState,
+    inner: std::sync::Mutex<snow::HandshakeState>,
 }
 
 impl Handshake {
@@ -256,7 +256,9 @@ impl Handshake {
             .map_err(|_| CryptoError::Handshake)?
             .build_initiator()
             .map_err(|_| CryptoError::Handshake)?;
-        Ok(Handshake { inner })
+        Ok(Handshake {
+            inner: std::sync::Mutex::new(inner),
+        })
     }
 
     /// Begin as the responder; learns the initiator's static key during the handshake.
@@ -266,7 +268,9 @@ impl Handshake {
             .map_err(|_| CryptoError::Handshake)?
             .build_responder()
             .map_err(|_| CryptoError::Handshake)?;
-        Ok(Handshake { inner })
+        Ok(Handshake {
+            inner: std::sync::Mutex::new(inner),
+        })
     }
 
     /// Produce the next handshake message to send to the peer, carrying
@@ -276,6 +280,8 @@ impl Handshake {
         let mut buf = [0u8; 4096];
         let n = self
             .inner
+            .get_mut()
+            .expect("handshake lock")
             .write_message(payload, &mut buf)
             .map_err(|_| CryptoError::Handshake)?;
         Ok(buf[..n].to_vec())
@@ -287,6 +293,8 @@ impl Handshake {
         let mut buf = [0u8; 4096];
         let n = self
             .inner
+            .get_mut()
+            .expect("handshake lock")
             .read_message(msg, &mut buf)
             .map_err(|_| CryptoError::Handshake)?;
         Ok(buf[..n].to_vec())
@@ -294,16 +302,23 @@ impl Handshake {
 
     /// Whether the handshake has completed and a session can be derived.
     pub fn is_finished(&self) -> bool {
-        self.inner.is_handshake_finished()
+        self.inner
+            .lock()
+            .expect("handshake lock")
+            .is_handshake_finished()
     }
 
     /// The peer's authenticated static public key, if learned yet.
     pub fn remote_static(&self) -> Option<[u8; 32]> {
-        self.inner.get_remote_static().map(|k| {
-            let mut out = [0u8; 32];
-            out.copy_from_slice(k);
-            out
-        })
+        self.inner
+            .lock()
+            .expect("handshake lock")
+            .get_remote_static()
+            .map(|k| {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(k);
+                out
+            })
     }
 
     /// The Noise channel-binding hash (snow's handshake hash), identical on both
@@ -311,8 +326,26 @@ impl Handshake {
     /// wire codec keys) bound to this session.
     pub fn channel_binding(&self) -> [u8; 32] {
         let mut out = [0u8; 32];
-        out.copy_from_slice(self.inner.get_handshake_hash());
+        out.copy_from_slice(
+            self.inner
+                .lock()
+                .expect("handshake lock")
+                .get_handshake_hash(),
+        );
         out
+    }
+
+    /// Extract the two raw 32-byte secret Noise transport keys (send key, recv key)
+    /// derived from the handshake.
+    pub fn raw_split_keys(&self) -> ([u8; 32], [u8; 32]) {
+        let mut inner = self.inner.lock().expect("handshake lock");
+        let is_initiator = inner.is_initiator();
+        let (k0, k1) = inner.dangerously_get_raw_split();
+        if is_initiator {
+            (k0, k1)
+        } else {
+            (k1, k0)
+        }
     }
 
     /// Convert a completed handshake into an AEAD [`Session`].
@@ -323,20 +356,9 @@ impl Handshake {
     /// the pair is the initiator's send key (= responder's receive key) and
     /// element 1 is the responder's send key (= initiator's receive key), so
     /// the mapping below is role-dependent.
-    pub fn into_session(mut self) -> Result<Session, CryptoError> {
-        let is_initiator = self.inner.is_initiator();
-        let (k0, k1) = self.inner.dangerously_get_raw_split();
-        let (k_send, k_recv) = if is_initiator { (k0, k1) } else { (k1, k0) };
-        let send =
-            UnboundKey::new(&CHACHA20_POLY1305, &k_send).map_err(|_| CryptoError::Handshake)?;
-        let recv =
-            UnboundKey::new(&CHACHA20_POLY1305, &k_recv).map_err(|_| CryptoError::Handshake)?;
-        Ok(Session {
-            send_key: LessSafeKey::new(send),
-            recv_key: LessSafeKey::new(recv),
-            send_counter: 0,
-            replay: ReplayWindow::new(),
-        })
+    pub fn into_session(self) -> Result<Session, CryptoError> {
+        let (k_send, k_recv) = self.raw_split_keys();
+        Session::from_raw_keys(&k_send, &k_recv, 0, 1)
     }
 }
 
@@ -366,10 +388,48 @@ pub struct Session {
     send_key: LessSafeKey,
     recv_key: LessSafeKey,
     send_counter: u64,
+    stride: u64,
     replay: ReplayWindow,
 }
 
 impl Session {
+    /// Construct a session directly from raw 32-byte send and receive keys,
+    /// with an explicit start counter and stride increment (e.g. for worker sharding).
+    pub fn from_raw_keys(
+        k_send: &[u8; 32],
+        k_recv: &[u8; 32],
+        start_counter: u64,
+        stride: u64,
+    ) -> Result<Self, CryptoError> {
+        let send =
+            UnboundKey::new(&CHACHA20_POLY1305, k_send).map_err(|_| CryptoError::Handshake)?;
+        let recv =
+            UnboundKey::new(&CHACHA20_POLY1305, k_recv).map_err(|_| CryptoError::Handshake)?;
+        Ok(Session {
+            send_key: LessSafeKey::new(send),
+            recv_key: LessSafeKey::new(recv),
+            send_counter: start_counter,
+            stride: if stride == 0 { 1 } else { stride },
+            replay: ReplayWindow::new(),
+        })
+    }
+
+    /// Reconfigure the send counter and stride increment for this session.
+    pub fn set_stride(&mut self, start_counter: u64, stride: u64) {
+        self.send_counter = start_counter;
+        self.stride = if stride == 0 { 1 } else { stride };
+    }
+
+    /// The current nonce stride increment.
+    pub fn stride(&self) -> u64 {
+        self.stride
+    }
+
+    /// The current send counter.
+    pub fn send_counter(&self) -> u64 {
+        self.send_counter
+    }
+
     /// Seal one inner frame, assigning it the next send counter.
     pub fn seal(&mut self, plaintext: &[u8]) -> Result<Sealed, CryptoError> {
         let counter = self.send_counter;
@@ -379,7 +439,7 @@ impl Session {
             .map_err(|_| CryptoError::Decrypt)?;
         self.send_counter = self
             .send_counter
-            .checked_add(1)
+            .checked_add(self.stride)
             .ok_or(CryptoError::Decrypt)?;
         Ok(Sealed {
             counter,
@@ -417,7 +477,7 @@ impl Session {
             .map_err(|_| CryptoError::Decrypt)?;
         self.send_counter = self
             .send_counter
-            .checked_add(1)
+            .checked_add(self.stride)
             .ok_or(CryptoError::Decrypt)?;
         Ok(counter)
     }
@@ -1015,10 +1075,10 @@ mod tests {
         // --- Production side: real `Handshake`s, hand-built here (same-crate
         // access to the private `inner` field) so the fixed ephemerals apply. ---
         let mut ini = Handshake {
-            inner: build_initiator(&e_init),
+            inner: std::sync::Mutex::new(build_initiator(&e_init)),
         };
         let mut res = Handshake {
-            inner: build_responder(&e_resp),
+            inner: std::sync::Mutex::new(build_responder(&e_resp)),
         };
         let m1 = ini.write_message(&[]).unwrap();
         let _ = res.read_message(&m1).unwrap();
@@ -1047,7 +1107,7 @@ mod tests {
         // Sanity: both independently-driven handshakes derive the identical
         // Noise split keys before either is consumed below.
         assert_eq!(
-            ini.inner.dangerously_get_raw_split(),
+            ini.inner.lock().unwrap().dangerously_get_raw_split(),
             snow_ini.dangerously_get_raw_split(),
             "production and reference derive identical split keys"
         );

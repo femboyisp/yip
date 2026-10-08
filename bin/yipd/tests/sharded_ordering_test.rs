@@ -357,3 +357,85 @@ fn test_auto_tuned_poller_dynamic_jitter_adaptation() {
         "0 packet count must not update spin window"
     );
 }
+
+#[test]
+fn test_stride_nonce_allocation_guarantees_uniqueness_across_shards() {
+    for num_shards in [2, 4, 8, 16] {
+        let mut shard_nonces: Vec<Vec<u64>> = vec![Vec::new(); num_shards];
+        for (shard, nonces) in shard_nonces.iter_mut().enumerate() {
+            let mut n = shard as u64;
+            for _ in 0..10_000 {
+                nonces.push(n);
+                n += num_shards as u64;
+            }
+        }
+        // Verify no collisions across shards
+        let mut all_nonces: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for nonces in shard_nonces {
+            for n in nonces {
+                assert!(
+                    all_nonces.insert(n),
+                    "Collision detected for nonce {n} with {num_shards} shards"
+                );
+            }
+        }
+        assert_eq!(all_nonces.len(), num_shards * 10_000);
+    }
+}
+
+#[test]
+fn test_session_epoch_replication_across_shards() {
+    use yip_crypto::generate_keypair;
+    use yip_crypto::Handshake;
+    use yipd::handshake::Established;
+
+    let init_kp = generate_keypair();
+    let resp_kp = generate_keypair();
+
+    let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
+    let mut res = Handshake::responder(&resp_kp.private).unwrap();
+
+    let m1 = ini.write_message(&[]).unwrap();
+    let _ = res.read_message(&m1).unwrap();
+    let m2 = res.write_message(&[]).unwrap();
+    let _ = ini.read_message(&m2).unwrap();
+
+    let (ini_send_k, ini_recv_k) = ini.raw_split_keys();
+    let (res_send_k, res_recv_k) = res.raw_split_keys();
+    assert_eq!(ini_send_k, res_recv_k);
+    assert_eq!(ini_recv_k, res_send_k);
+
+    let num_shards = 4;
+    let base_est = Established {
+        session: ini.into_session().unwrap(),
+        auth_key: [1u8; 16],
+        hp_key: [2u8; 16],
+        raw_send_key: ini_send_k,
+        raw_recv_key: ini_recv_k,
+    };
+
+    // Replicate across shards
+    let mut shard_senders = Vec::new();
+    for shard_id in 0..num_shards {
+        let shard_est = base_est.clone_for_shard(shard_id, num_shards).unwrap();
+        assert_eq!(shard_est.session.stride(), num_shards as u64);
+        shard_senders.push(shard_est);
+    }
+
+    // Receiver session
+    let mut receiver_session =
+        yip_crypto::Session::from_raw_keys(&res_send_k, &res_recv_k, 0, 1).unwrap();
+
+    // Round-robin seal from all shards and open on receiver
+    for i in 0..100 {
+        let shard_id = i % num_shards;
+        let plaintext = format!("hello shard {shard_id} packet {i}").into_bytes();
+        let sealed = shard_senders[shard_id].session.seal(&plaintext).unwrap();
+        assert_eq!(sealed.counter % num_shards as u64, shard_id as u64);
+
+        let opened = receiver_session
+            .open(sealed.counter, &sealed.ciphertext)
+            .unwrap();
+        assert_eq!(opened, plaintext);
+    }
+}
