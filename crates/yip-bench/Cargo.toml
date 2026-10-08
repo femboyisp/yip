@@ -41,6 +41,9 @@ harness = false
 name = "rs_simd_bench"
 harness = false
 
+[[bench]]
+name = "rlnc_bench"
+harness = false
 
 [lints]
 workspace = true
