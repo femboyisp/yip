@@ -520,6 +520,94 @@ impl Session {
     }
 }
 
+/// ChaCha20-Poly1305 AEAD cipher supporting zero-copy in-place encryption and decryption
+/// directly within pre-allocated network packet buffers (such as AF_XDP UMEM chunks).
+pub struct ChaCha20Poly1305Cipher {
+    key: LessSafeKey,
+}
+
+impl std::fmt::Debug for ChaCha20Poly1305Cipher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChaCha20Poly1305Cipher")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ChaCha20Poly1305Cipher {
+    /// Creates a new cipher instance from a 32-byte symmetric key.
+    pub fn new(key: [u8; 32]) -> Self {
+        let unbound = UnboundKey::new(&CHACHA20_POLY1305, &key)
+            .expect("32-byte key is valid for ChaCha20-Poly1305");
+        Self {
+            key: LessSafeKey::new(unbound),
+        }
+    }
+
+    /// Seal plaintext in-place inside `buf[..plaintext_len]`, writing the 16-byte Poly1305
+    /// authentication tag immediately following the ciphertext into `buf[plaintext_len..plaintext_len + 16]`.
+    ///
+    /// The buffer must have capacity of at least `plaintext_len + 16` bytes.
+    /// Returns the total sealed ciphertext length (`plaintext_len + 16`).
+    pub fn seal_in_place(
+        &self,
+        counter: u64,
+        buf: &mut [u8],
+        plaintext_len: usize,
+    ) -> Result<usize, CryptoError> {
+        let total_len = plaintext_len.checked_add(16).ok_or(CryptoError::Decrypt)?;
+        if buf.len() < total_len {
+            return Err(CryptoError::Decrypt);
+        }
+        let (in_out, tag_out) = buf[..total_len].split_at_mut(plaintext_len);
+        let tag = self
+            .key
+            .seal_in_place_separate_tag(noise_nonce(counter), Aad::empty(), in_out)
+            .map_err(|_| CryptoError::Decrypt)?;
+        tag_out.copy_from_slice(tag.as_ref());
+        Ok(total_len)
+    }
+
+    /// Open and authenticate ciphertext in-place inside `buf[..sealed_len]`.
+    ///
+    /// Expects the 16-byte Poly1305 authentication tag at the end of the ciphertext:
+    /// `buf[sealed_len - 16..sealed_len]`.
+    /// Returns the decrypted plaintext length (`sealed_len - 16`).
+    pub fn open_in_place(
+        &self,
+        counter: u64,
+        buf: &mut [u8],
+        sealed_len: usize,
+    ) -> Result<usize, CryptoError> {
+        if sealed_len < 16 || buf.len() < sealed_len {
+            return Err(CryptoError::Decrypt);
+        }
+        let plain = self
+            .key
+            .open_in_place(noise_nonce(counter), Aad::empty(), &mut buf[..sealed_len])
+            .map_err(|_| CryptoError::Decrypt)?;
+        Ok(plain.len())
+    }
+
+    /// Open and authenticate ciphertext in-place, verifying against a sliding anti-replay window.
+    ///
+    /// The replay window is checked before AEAD decryption and committed only upon
+    /// successful authentication.
+    pub fn open_in_place_with_window(
+        &self,
+        counter: u64,
+        buf: &mut [u8],
+        sealed_len: usize,
+        replay: &mut ReplayWindow,
+    ) -> Result<usize, CryptoError> {
+        if !replay.check(counter) {
+            return Err(CryptoError::Replay);
+        }
+        let plain_len = self.open_in_place(counter, buf, sealed_len)?;
+        replay.commit(counter);
+        Ok(plain_len)
+    }
+}
+
 /// Test-only helper: drive a full initiator/responder handshake to completion
 /// and return the two established sessions. Mirrors `yip_bench::established_pair`.
 #[cfg(test)]
@@ -1075,6 +1163,35 @@ mod tests {
         // Replay attempt must fail
         assert_eq!(
             b.open_with_window(sealed.counter, &sealed.ciphertext, &mut replay),
+            Err(CryptoError::Replay)
+        );
+    }
+
+    #[test]
+    fn test_chacha20_poly1305_cipher_in_place() {
+        let key = [0x5au8; 32];
+        let cipher = ChaCha20Poly1305Cipher::new(key);
+        let mut buffer = [0u8; 128];
+        let plaintext = b"zero-copy in-place packet buffer payload";
+        buffer[..plaintext.len()].copy_from_slice(plaintext);
+
+        let counter = 100u64;
+        let sealed_len = cipher
+            .seal_in_place(counter, &mut buffer, plaintext.len())
+            .expect("seal_in_place should succeed");
+        assert_eq!(sealed_len, plaintext.len() + 16);
+        assert_ne!(&buffer[..plaintext.len()], plaintext);
+
+        let mut replay = ReplayWindow::new();
+        let plain_len = cipher
+            .open_in_place_with_window(counter, &mut buffer, sealed_len, &mut replay)
+            .expect("open_in_place_with_window should succeed");
+        assert_eq!(plain_len, plaintext.len());
+        assert_eq!(&buffer[..plain_len], plaintext);
+
+        // Replay rejection
+        assert_eq!(
+            cipher.open_in_place_with_window(counter, &mut buffer, sealed_len, &mut replay),
             Err(CryptoError::Replay)
         );
     }
