@@ -83,6 +83,37 @@ pub(crate) fn bind_udp_reuseport(
     Ok(sockets)
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by Task 5 sharding and tunnel egress pool"
+    )
+)]
+pub(crate) fn bind_udp_egress_pool(base_port: u16, pool_size: usize) -> io::Result<Vec<UdpSocket>> {
+    let mut sockets = Vec::with_capacity(pool_size);
+    for i in 0..pool_size {
+        let port = if base_port == 0 {
+            0
+        } else {
+            let offset = u16::try_from(i).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "pool_size exceeds u16")
+            })?;
+            base_port.checked_add(offset).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "base_port + offset exceeds 65535",
+                )
+            })?
+        };
+        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        let sock = UdpSocket::bind(addr)?;
+        let _ = yip_io::set_socket_buffers(&sock, 2 * 1024 * 1024);
+        sockets.push(sock);
+    }
+    Ok(sockets)
+}
+
 pub(crate) fn bind_tcp(addr: SocketAddr, port_auto: bool) -> io::Result<TcpListener> {
     match TcpListener::bind(addr) {
         Ok(s) => Ok(s),
@@ -287,5 +318,26 @@ mod tests {
                 "explicit privileged bind must surface PermissionDenied, not fall back"
             ),
         }
+    }
+
+    #[test]
+    fn test_bind_udp_egress_pool_zero_port() {
+        let pool = bind_udp_egress_pool(0, 8).expect("bind pool");
+        assert_eq!(pool.len(), 8);
+        for s in &pool {
+            assert!(s.local_addr().unwrap().port() > 0);
+        }
+    }
+
+    #[test]
+    fn test_bind_udp_egress_pool_empty() {
+        let pool = bind_udp_egress_pool(0, 0).expect("empty pool");
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn test_bind_udp_egress_pool_overflow() {
+        let res = bind_udp_egress_pool(65530, 10);
+        assert!(res.is_err());
     }
 }
