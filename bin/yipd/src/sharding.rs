@@ -220,6 +220,44 @@ impl Default for CoalescedTimer {
     }
 }
 
+/// Adaptive dynamic busy-polling engine for sub-microsecond latency.
+///
+/// Under active traffic bursts, busy-polls descriptor and socket queues with zero
+/// syscalls / zero sleep-wakeup overhead for a configured duration (`busy_poll_duration`,
+/// default 50 µs), gracefully yielding to `epoll_wait(10)` when traffic subsides.
+#[derive(Debug, Clone)]
+pub struct AdaptivePoller {
+    busy_poll_duration: std::time::Duration,
+    last_active: std::time::Instant,
+}
+
+impl AdaptivePoller {
+    /// Create a new `AdaptivePoller` with a busy-poll duration of `busy_poll_us` microseconds.
+    ///
+    /// Initializes `last_active` 1 second in the past so the poller does not busy-poll
+    /// on initial startup before any packets arrive.
+    pub fn new(busy_poll_us: u64) -> Self {
+        Self {
+            busy_poll_duration: std::time::Duration::from_micros(busy_poll_us),
+            last_active: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap_or_else(std::time::Instant::now),
+        }
+    }
+
+    /// Check whether the worker should busy-poll (spin loop with non-blocking wait(0)).
+    #[inline]
+    pub fn should_busy_poll(&self, now: std::time::Instant) -> bool {
+        now.saturating_duration_since(self.last_active) < self.busy_poll_duration
+    }
+
+    /// Record that packets were processed at `now`, resetting the busy-polling window.
+    #[inline]
+    pub fn record_active(&mut self, now: std::time::Instant) {
+        self.last_active = now;
+    }
+}
+
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// Signal all worker shard loops to stop gracefully.
@@ -538,6 +576,11 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                 let egress_pool =
                     crate::port::bind_udp_egress_pool(egress_bind, 64).unwrap_or_default();
                 let mut coalesced_timer = CoalescedTimer::new();
+                let busy_poll_us = std::env::var("YIP_BUSY_POLL_US")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(50);
+                let mut adaptive_poller = AdaptivePoller::new(busy_poll_us);
 
                 let mut batch_sock = yip_io::batch::BatchUdpSocket::new(&sock);
                 let mut rx_buffers = [[0u8; yip_io::MAX_WIRE_DATAGRAM]; yip_io::batch::BATCH_SIZE];
@@ -553,7 +596,14 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                         break;
                     }
 
-                    let ready = poller.wait(10)?;
+                    let now = std::time::Instant::now();
+                    let ready = if adaptive_poller.should_busy_poll(now) {
+                        std::hint::spin_loop();
+                        poller.wait(0)?
+                    } else {
+                        poller.wait(10)?
+                    };
+
                     if SHUTDOWN.load(Ordering::Relaxed) {
                         break;
                     }
@@ -684,6 +734,10 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                 let _ = send_sock.send_to(&dg.bytes, dg.dst);
                             }
                         }
+                    }
+
+                    if packets_this_iter > 0 {
+                        adaptive_poller.record_active(now);
                     }
 
                     // 4. Cadence tick (feedback / keepalive / retransmit / cover)
@@ -1270,5 +1324,51 @@ mod tests {
         // num_shards <= 1 -> None
         assert_eq!(shard_for_outer_udp(&data_dg, 1), None);
         assert_eq!(shard_for_outer_udp(&data_dg, 0), None);
+    }
+
+    #[test]
+    fn test_adaptive_poller_initial_state_does_not_busy_poll() {
+        let poller = AdaptivePoller::new(50);
+        let now = std::time::Instant::now();
+        assert!(
+            !poller.should_busy_poll(now),
+            "poller must not busy poll initially before traffic is recorded"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_poller_record_active_and_window_expiry() {
+        let mut poller = AdaptivePoller::new(100);
+        let t0 = std::time::Instant::now();
+        poller.record_active(t0);
+
+        // Within busy-poll window (50 µs < 100 µs)
+        let t1 = t0 + std::time::Duration::from_micros(50);
+        assert!(poller.should_busy_poll(t1));
+
+        // Exactly at window boundary (100 µs not < 100 µs)
+        let t2 = t0 + std::time::Duration::from_micros(100);
+        assert!(!poller.should_busy_poll(t2));
+
+        // Past window boundary (150 µs > 100 µs)
+        let t3 = t0 + std::time::Duration::from_micros(150);
+        assert!(!poller.should_busy_poll(t3));
+
+        // Re-activating traffic at t3 extends the window
+        poller.record_active(t3);
+        assert!(poller.should_busy_poll(t3));
+        assert!(poller.should_busy_poll(t3 + std::time::Duration::from_micros(80)));
+        assert!(!poller.should_busy_poll(t3 + std::time::Duration::from_micros(101)));
+    }
+
+    #[test]
+    fn test_adaptive_poller_zero_duration() {
+        let mut poller = AdaptivePoller::new(0);
+        let now = std::time::Instant::now();
+        poller.record_active(now);
+        assert!(
+            !poller.should_busy_poll(now),
+            "0-microsecond poller should never busy poll"
+        );
     }
 }

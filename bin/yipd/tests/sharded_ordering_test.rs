@@ -243,3 +243,13 @@ fn test_af_xdp_zero_copy_rx_ring_processing_simulation() {
     assert_eq!(&mock.received_packets[0], dummy_packet);
     assert_eq!(fill_ring.len(), 16);
 }
+
+#[test]
+fn test_adaptive_poller_transitions_between_spin_and_sleep() {
+    let mut poller = yipd::sharding::AdaptivePoller::new(50);
+    let start = std::time::Instant::now();
+    poller.record_active(start);
+    assert!(poller.should_busy_poll(start));
+    assert!(poller.should_busy_poll(start + std::time::Duration::from_micros(30)));
+    assert!(!poller.should_busy_poll(start + std::time::Duration::from_micros(60)));
+}
