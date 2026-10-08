@@ -419,15 +419,16 @@ fn netlink_attach_xdp(ifindex: u32, prog_fd: RawFd) -> io::Result<RawFd> {
     if recv_ret as usize
         >= std::mem::size_of::<libc::nlmsghdr>() + std::mem::size_of::<libc::nlmsgerr>()
     {
-        // SAFETY: Pointer within received response buffer bounds.
-        let nlh = unsafe { &*(buf.as_ptr().cast::<libc::nlmsghdr>()) };
+        // SAFETY: Byte offsets are bounds-checked by recv_ret check above; read_unaligned prevents alignment UB.
+        let nlh = unsafe { std::ptr::read_unaligned(buf.as_ptr().cast::<libc::nlmsghdr>()) };
         if nlh.nlmsg_type == libc::NLMSG_ERROR as u16 {
-            // SAFETY: Byte offset arithmetic strictly within buffer bounds.
+            // SAFETY: Byte offset arithmetic strictly within buffer bounds; read_unaligned avoids alignment preconditions.
             let err = unsafe {
-                &*(buf
-                    .as_ptr()
-                    .add(std::mem::size_of::<libc::nlmsghdr>())
-                    .cast::<libc::nlmsgerr>())
+                std::ptr::read_unaligned(
+                    buf.as_ptr()
+                        .add(std::mem::size_of::<libc::nlmsghdr>())
+                        .cast::<libc::nlmsgerr>(),
+                )
             };
             if err.error != 0 {
                 return Err(io::Error::from_raw_os_error(-err.error));
