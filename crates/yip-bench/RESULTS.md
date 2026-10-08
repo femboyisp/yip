@@ -479,10 +479,10 @@ Command: `cargo bench --bench single_flow_scale -- --nocapture`
 
 | Workers (N) | Aggregate Gbps | Mpps  | Per-Core Gbps | Speedup | Efficiency | Drops | Out-of-Order |
 |------------:|---------------:|------:|--------------:|--------:|-----------:|------:|-------------:|
-|           1 |           4.34 | 0.424 |          4.34 |   1.00x |     100.0% |     0 |            0 |
-|           2 |           5.65 | 0.552 |          2.82 |   1.30x |      65.0% |     0 |            0 |
-|           4 |          10.72 | 1.047 |          2.68 |   2.47x |      61.7% |     0 |            0 |
-|           8 |          19.05 | 1.861 |          2.38 |   4.39x |      54.8% |     0 |            0 |
+|           1 |           4.58 | 0.447 |          4.58 |   1.00x |     100.0% |     0 |            0 |
+|           2 |           6.04 | 0.590 |          3.02 |   1.32x |      66.0% |     0 |            0 |
+|           4 |          11.43 | 1.116 |          2.86 |   2.50x |      62.5% |     0 |            0 |
+|           8 |          21.29 | 2.079 |          2.66 |   4.65x |      58.2% |     0 |            0 |
 
 Peak burst rates reach **21.56 Gbps (2.105 Mpps)** on 8 worker cores.
 
@@ -493,7 +493,7 @@ Peak burst rates reach **21.56 Gbps (2.105 Mpps)** on 8 worker cores.
 
 ## Way C: Kernel-Bypass Zero-Copy I/O Tier (AF_XDP) & Microbenchmarks
 
-Generated: 2026-10-08 04:05 UTC
+Generated: 2026-10-08 04:33 UTC
 Command: `cargo bench --bench af_xdp_scale -- --nocapture`
 
 ### Methodology
@@ -509,20 +509,20 @@ Command: `cargo bench --bench af_xdp_scale -- --nocapture`
 
 | Component | Metric | Latency / Unit |
 |:----------|:-------|:---------------|
-| **UMEM Chunk Alloc/Free** | 643.70 Mops/s | 1.55 ns / op |
-| **Circular Rings (Batch 32)** | 1,796.52 Mops/s | 0.56 ns / op |
-| **Zero-Copy In-Place AEAD Seal + Open** | 9.24 Gbps (0.903 Mpps) | 1,107.64 ns / packet |
+| **UMEM Chunk Alloc/Free** | 654.63 Mops/s | 1.53 ns / op |
+| **Circular Rings (Batch 32)** | 1,095.43 Mops/s | 0.91 ns / op |
+| **Zero-Copy In-Place AEAD Seal + Open** | 9.32 Gbps (0.910 Mpps) | 1,099.29 ns / packet |
 
 ### End-to-End Multi-Core Scaling Results
 
 | Workers (N) | Aggregate Gbps | Mpps  | Per-Core Gbps | Speedup | Efficiency | Drops | Out-of-Order |
 |------------:|---------------:|------:|--------------:|--------:|-----------:|------:|-------------:|
-|           1 |           7.45 | 0.727 |          7.45 |   1.00x |     100.0% |     0 |            0 |
-|           2 |          10.80 | 1.055 |          5.40 |   1.45x |      72.5% |     0 |            0 |
-|           4 |          20.50 | 2.002 |          5.13 |   2.75x |      68.8% |     0 |            0 |
-|           8 |          31.36 | 3.062 |          3.92 |   4.21x |      52.6% |     0 |            0 |
+|           1 |           7.93 | 0.774 |          7.93 |   1.00x |     100.0% |     0 |            0 |
+|           2 |          11.45 | 1.118 |          5.72 |   1.44x |      72.2% |     0 |            0 |
+|           4 |          21.05 | 2.056 |          5.26 |   2.65x |      66.4% |     0 |            0 |
+|           8 |          35.21 | 3.439 |          4.40 |   4.44x |      55.5% |     0 |            0 |
 
-Multi-core throughput scales up to **31.36 Gbps (3.062 Mpps)** at 8 worker cores with **0 packet drops** and **0 out-of-order deliveries**.
+Multi-core throughput scales up to **35.21 Gbps (3.439 Mpps)** at 8 worker cores with **0 packet drops** and **0 out-of-order deliveries**.
 
 ---
 
