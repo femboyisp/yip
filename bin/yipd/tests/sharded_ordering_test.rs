@@ -253,3 +253,20 @@ fn test_adaptive_poller_transitions_between_spin_and_sleep() {
     assert!(poller.should_busy_poll(start + std::time::Duration::from_micros(30)));
     assert!(!poller.should_busy_poll(start + std::time::Duration::from_micros(60)));
 }
+
+#[test]
+fn test_adaptive_poller_active_after_simulated_sleep_wakeup() {
+    let mut poller = yipd::sharding::AdaptivePoller::new(50);
+    // Initially not busy polling
+    let t0 = std::time::Instant::now();
+    assert!(!poller.should_busy_poll(t0));
+
+    // Simulate 10 ms sleep in epoll_wait
+    let t_wakeup = t0 + std::time::Duration::from_millis(10);
+    // After wakeup, packet arrived and drained, timestamp is recorded
+    poller.record_active(t_wakeup);
+
+    // Subsequent loop iteration (e.g. 5 micros later) MUST enter busy polling!
+    let t_next = t_wakeup + std::time::Duration::from_micros(5);
+    assert!(poller.should_busy_poll(t_next));
+}

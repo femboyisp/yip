@@ -596,8 +596,9 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                         break;
                     }
 
-                    let now = std::time::Instant::now();
-                    let ready = if adaptive_poller.should_busy_poll(now) {
+                    let is_busy_polling =
+                        adaptive_poller.should_busy_poll(std::time::Instant::now());
+                    let ready = if is_busy_polling {
                         std::hint::spin_loop();
                         poller.wait(0)?
                     } else {
@@ -737,7 +738,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                     }
 
                     if packets_this_iter > 0 {
-                        adaptive_poller.record_active(now);
+                        adaptive_poller.record_active(std::time::Instant::now());
                     }
 
                     // 4. Cadence tick (feedback / keepalive / retransmit / cover)
