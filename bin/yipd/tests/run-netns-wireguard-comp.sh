@@ -234,6 +234,8 @@ done
 # Assign tunnel IPs to yip0
 ip netns exec "$NS_A" ip addr add "${YIP_A_IP}/${YIP_PREFIX}" dev "$YIP_DEV"
 ip netns exec "$NS_B" ip addr add "${YIP_B_IP}/${YIP_PREFIX}" dev "$YIP_DEV"
+ip netns exec "$NS_A" ip link set "$YIP_DEV" mtu 1420
+ip netns exec "$NS_B" ip link set "$YIP_DEV" mtu 1420
 ip netns exec "$NS_A" ip link set "$YIP_DEV" up
 ip netns exec "$NS_B" ip link set "$YIP_DEV" up
 
