@@ -578,6 +578,59 @@ impl Session {
         out.truncate(n);
         Ok(())
     }
+
+    /// Seal plaintext in-place inside `buf[..plaintext_len]`, writing the 16-byte Poly1305
+    /// authentication tag immediately following the ciphertext into `buf[plaintext_len..plaintext_len + 16]`.
+    ///
+    /// The buffer must have capacity of at least `plaintext_len + 16` bytes.
+    /// Returns the explicit counter assigned to this frame.
+    pub fn seal_in_place(
+        &mut self,
+        buf: &mut [u8],
+        plaintext_len: usize,
+    ) -> Result<u64, CryptoError> {
+        let counter = self.send_counter;
+        let total_len = plaintext_len.checked_add(16).ok_or(CryptoError::Decrypt)?;
+        if buf.len() < total_len {
+            return Err(CryptoError::Decrypt);
+        }
+        let (in_out, tag_out) = buf[..total_len].split_at_mut(plaintext_len);
+        let tag = self
+            .send_key
+            .seal_in_place_separate_tag(noise_nonce(counter), Aad::empty(), in_out)
+            .map_err(|_| CryptoError::Decrypt)?;
+        tag_out.copy_from_slice(tag.as_ref());
+        self.send_counter = self
+            .send_counter
+            .checked_add(self.stride)
+            .ok_or(CryptoError::Decrypt)?;
+        Ok(counter)
+    }
+
+    /// Open and authenticate ciphertext in-place inside `buf[..sealed_len]`, enforcing anti-replay.
+    ///
+    /// Expects the 16-byte Poly1305 authentication tag at the end of the ciphertext:
+    /// `buf[sealed_len - 16..sealed_len]`.
+    /// Returns the decrypted plaintext length (`sealed_len - 16`).
+    pub fn open_in_place(
+        &mut self,
+        counter: u64,
+        buf: &mut [u8],
+        sealed_len: usize,
+    ) -> Result<usize, CryptoError> {
+        if !self.replay.check(counter) {
+            return Err(CryptoError::Replay);
+        }
+        if sealed_len < 16 || buf.len() < sealed_len {
+            return Err(CryptoError::Decrypt);
+        }
+        let plain = self
+            .recv_key
+            .open_in_place(noise_nonce(counter), Aad::empty(), &mut buf[..sealed_len])
+            .map_err(|_| CryptoError::Decrypt)?;
+        self.replay.commit(counter);
+        Ok(plain.len())
+    }
 }
 
 /// ChaCha20-Poly1305 AEAD cipher supporting zero-copy in-place encryption and decryption
@@ -695,6 +748,33 @@ mod tests {
         assert_eq!(a.public.len(), 32);
         assert_ne!(a.private, b.private, "two keypairs differ");
         assert_ne!(a.public, [0u8; 32], "public key is not all-zero");
+    }
+
+    #[test]
+    fn session_seal_and_open_in_place_with_stride() {
+        let (k_send, k_recv) = ([0x11u8; 32], [0x22u8; 32]);
+        let mut s_tx = Session::from_raw_keys(&k_send, &k_recv, 2, 4).unwrap();
+        let mut s_rx = Session::from_raw_keys(&k_recv, &k_send, 0, 1).unwrap();
+
+        let mut buf = vec![0u8; 64];
+        buf[..10].copy_from_slice(b"0123456789");
+
+        let c1 = s_tx.seal_in_place(&mut buf, 10).unwrap();
+        assert_eq!(c1, 2);
+        let plain_len = s_rx.open_in_place(c1, &mut buf, 26).unwrap();
+        assert_eq!(plain_len, 10);
+        assert_eq!(&buf[..10], b"0123456789");
+
+        // Next counter with stride 4
+        buf[..10].copy_from_slice(b"abcdefghij");
+        let c2 = s_tx.seal_in_place(&mut buf, 10).unwrap();
+        assert_eq!(c2, 6);
+        let plain_len2 = s_rx.open_in_place(c2, &mut buf, 26).unwrap();
+        assert_eq!(plain_len2, 10);
+        assert_eq!(&buf[..10], b"abcdefghij");
+
+        // Replay of c2 should fail
+        assert!(s_rx.open_in_place(c2, &mut buf, 26).is_err());
     }
 
     #[test]

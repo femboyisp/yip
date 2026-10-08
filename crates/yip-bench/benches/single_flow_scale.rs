@@ -16,9 +16,8 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Instant;
 
-use yip_bench::established_pair;
-use yip_crypto::ReplayWindow;
-use yip_io::nonce::ChunkedNonceDispenser;
+use yip_bench::established_raw_keys;
+use yip_crypto::Session;
 use yip_wire::{Codec, Frame, WireCodec};
 
 /// Inner 5-tuple extracted from plaintext IP packets.
@@ -164,15 +163,10 @@ struct RunResult {
 }
 
 fn run_single_flow_scale(num_workers: usize, baseline_gbps: Option<f64>) -> RunResult {
-    // 1. Establish single peer connection session pair
-    let (tx_session, rx_session) = established_pair();
-    let tx_session = Arc::new(tx_session);
-    let rx_session = Arc::new(rx_session);
+    // 1. Establish raw transport keys for single peer connection
+    let (k_send, k_recv) = established_raw_keys();
 
-    // 2. Shared chunked nonce dispenser for this peer connection (chunk size 64)
-    let dispenser = Arc::new(ChunkedNonceDispenser::new(64));
-
-    // 3. Pre-assign streams to worker shards based on 5-tuple flow hashing
+    // 2. Pre-assign streams to worker shards based on 5-tuple flow hashing
     let mut streams_for_worker: Vec<Vec<u16>> = vec![Vec::new(); num_workers];
     for s in 0..NUM_STREAMS as u16 {
         let sample_pkt = build_tcp_packet(s, 0, 46);
@@ -188,18 +182,22 @@ fn run_single_flow_scale(num_workers: usize, baseline_gbps: Option<f64>) -> RunR
     let mut handles = Vec::with_capacity(num_workers);
 
     for (worker_id, assigned_streams) in streams_for_worker.into_iter().enumerate() {
-        let tx = Arc::clone(&tx_session);
-        let rx = Arc::clone(&rx_session);
-        let disp = Arc::clone(&dispenser);
         let bar = Arc::clone(&barrier);
 
         let handle = thread::spawn(move || {
             // Topology-aware core pinning
             let _ = yip_io::pin_current_thread(worker_id);
 
+            // Per-worker sharded sessions: start counter `worker_id` and stride `num_workers`
+            let mut tx =
+                Session::from_raw_keys(&k_send, &k_recv, worker_id as u64, num_workers as u64)
+                    .expect("tx session initialization must succeed");
+
+            let mut rx = Session::from_raw_keys(&k_recv, &k_send, 0, 1)
+                .expect("rx session initialization must succeed");
+
             let codec = Codec::new([1u8; 16], [2u8; 16]);
-            let mut local_nonce = disp.claim_chunk();
-            let mut replay = ReplayWindow::new();
+            let mut generated_nonces = Vec::with_capacity(packets_per_thread);
 
             // Track sequence number per assigned stream
             let mut expected_seq: std::collections::HashMap<u16, u32> =
@@ -224,15 +222,17 @@ fn run_single_flow_scale(num_workers: usize, baseline_gbps: Option<f64>) -> RunR
                     for &stream_id in &assigned_streams {
                         let pkt = build_tcp_packet(stream_id, p, PACKET_SIZE);
 
-                        // Claim nonce without atomic contention
-                        let nonce = local_nonce
-                            .next_nonce(&disp)
-                            .expect("nonce dispenser must succeed");
+                        // 1. Seal packet with sharded Session (allocates stride nonce)
+                        let sealed = tx.seal(&pkt).expect("AEAD seal must succeed");
+                        let nonce = sealed.counter;
 
-                        // 1. Seal packet with explicit nonce
-                        let sealed = tx
-                            .seal_with_counter(nonce, &pkt)
-                            .expect("AEAD seal must succeed");
+                        // Verify local stride assignment invariant
+                        assert_eq!(
+                            nonce % num_workers as u64,
+                            worker_id as u64,
+                            "Nonce stride invariant violated for worker {worker_id}"
+                        );
+                        generated_nonces.push(nonce);
 
                         // 2. Wire frame encoding
                         let frame = Frame {
@@ -249,7 +249,7 @@ fn run_single_flow_scale(num_workers: usize, baseline_gbps: Option<f64>) -> RunR
 
                         // 4. Anti-replay verification & AEAD decrypt
                         let decrypted = rx
-                            .open_with_window(nonce, &deframed.payload, &mut replay)
+                            .open(nonce, &deframed.payload)
                             .expect("AEAD open and replay verification must succeed");
 
                         // 5. Strict monotonic FIFO verification
@@ -274,7 +274,13 @@ fn run_single_flow_scale(num_workers: usize, baseline_gbps: Option<f64>) -> RunR
                 }
             }
 
-            (thread_packets, thread_bytes, thread_drops, thread_ooo)
+            (
+                thread_packets,
+                thread_bytes,
+                thread_drops,
+                thread_ooo,
+                generated_nonces,
+            )
         });
 
         handles.push(handle);
@@ -288,14 +294,30 @@ fn run_single_flow_scale(num_workers: usize, baseline_gbps: Option<f64>) -> RunR
     let mut total_bytes = 0u64;
     let mut total_drops = 0u64;
     let mut total_ooo = 0u64;
+    let mut all_nonces = std::collections::HashSet::new();
 
     for h in handles {
-        let (pkts, bytes, drops, ooo) = h.join().expect("worker thread panicked");
+        let (pkts, bytes, drops, ooo, nonces) = h.join().expect("worker thread panicked");
         total_packets += pkts;
         total_bytes += bytes;
         total_drops += drops;
         total_ooo += ooo;
+        for nonce in nonces {
+            assert!(
+                all_nonces.insert(nonce),
+                "Strict nonce collision detected: nonce {nonce} was generated more than once!"
+            );
+        }
     }
+
+    // Verify strict nonce uniqueness across all worker threads
+    assert_eq!(
+        all_nonces.len(),
+        total_packets as usize,
+        "Total unique nonces ({}) does not match total packets ({})",
+        all_nonces.len(),
+        total_packets
+    );
 
     let duration = start.elapsed();
     let secs = duration.as_secs_f64();
@@ -385,6 +407,9 @@ fn main() {
     println!("  [PASS] 0 packet drops verified across all worker configurations.");
     println!(
         "  [PASS] 0 out-of-order deliveries verified (strict monotonic FIFO ordering per stream)."
+    );
+    println!(
+        "  [PASS] Strict nonce uniqueness confirmed across all worker threads (0 collisions)."
     );
     println!("  [PASS] Line-rate multi-core scaling confirmed without lock contention.");
     println!("================================================================================");

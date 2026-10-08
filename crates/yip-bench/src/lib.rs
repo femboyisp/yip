@@ -17,6 +17,19 @@ pub fn established_pair() -> (Session, Session) {
     )
 }
 
+/// Build an established initiator/responder raw key pair for sharded session benchmarks.
+pub fn established_raw_keys() -> ([u8; 32], [u8; 32]) {
+    let rk = generate_keypair();
+    let ik = generate_keypair();
+    let mut ini = Handshake::initiator(&ik.private, &rk.public).expect("init");
+    let mut res = Handshake::responder(&rk.private).expect("resp");
+    let m1 = ini.write_message(&[]).expect("m1");
+    let _ = res.read_message(&m1).expect("read m1");
+    let m2 = res.write_message(&[]).expect("m2");
+    let _ = ini.read_message(&m2).expect("read m2");
+    ini.raw_split_keys()
+}
+
 /// A representative small inner packet (an IPv4 UDP datagram, DSCP EF).
 pub fn sample_inner(len: usize) -> Vec<u8> {
     let mut p = vec![0u8; len.max(20)];
@@ -35,5 +48,13 @@ mod tests {
         let s = a.seal(b"x").unwrap();
         assert_eq!(b.open(s.counter, &s.ciphertext).unwrap(), b"x");
         assert_eq!(sample_inner(64).len(), 64);
+
+        let (k_send, k_recv) = established_raw_keys();
+        let mut s_tx = Session::from_raw_keys(&k_send, &k_recv, 1, 2).unwrap();
+        let mut s_rx = Session::from_raw_keys(&k_recv, &k_send, 0, 1).unwrap();
+        let sealed = s_tx.seal(b"stride test").unwrap();
+        assert_eq!(sealed.counter, 1);
+        let opened = s_rx.open(sealed.counter, &sealed.ciphertext).unwrap();
+        assert_eq!(opened, b"stride test");
     }
 }

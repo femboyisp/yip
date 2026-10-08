@@ -21,9 +21,9 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Instant;
 
-use yip_crypto::{ChaCha20Poly1305Cipher, ReplayWindow};
+use yip_bench::established_raw_keys;
+use yip_crypto::{ChaCha20Poly1305Cipher, ReplayWindow, Session};
 use yip_io::af_xdp::{CompletionRing, FillRing, RxRing, TxRing, UmemPool, XskDesc};
-use yip_io::nonce::ChunkedNonceDispenser;
 
 /// Inner 5-tuple extracted from plaintext IP packets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -278,13 +278,10 @@ fn run_component_microbenchmarks() {
 }
 
 fn run_af_xdp_scale(num_workers: usize, baseline_gbps: Option<f64>) -> RunResult {
-    // 1. Shared symmetric cipher for peer connection
-    let cipher = Arc::new(ChaCha20Poly1305Cipher::new([0x7a; 32]));
+    // 1. Establish raw transport keys for single peer connection
+    let (k_send, k_recv) = established_raw_keys();
 
-    // 2. Shared chunked nonce dispenser for this peer connection (chunk size 64)
-    let dispenser = Arc::new(ChunkedNonceDispenser::new(64));
-
-    // 3. Pre-assign streams to worker shards based on 5-tuple flow hashing
+    // 2. Pre-assign streams to worker shards based on 5-tuple flow hashing
     let mut streams_for_worker: Vec<Vec<u16>> = vec![Vec::new(); num_workers];
     let mut dummy_buf = vec![0u8; PACKET_SIZE];
     for s in 0..NUM_STREAMS as u16 {
@@ -301,13 +298,19 @@ fn run_af_xdp_scale(num_workers: usize, baseline_gbps: Option<f64>) -> RunResult
     let mut handles = Vec::with_capacity(num_workers);
 
     for (worker_id, assigned_streams) in streams_for_worker.into_iter().enumerate() {
-        let ciph = Arc::clone(&cipher);
-        let disp = Arc::clone(&dispenser);
         let bar = Arc::clone(&barrier);
 
         let handle = thread::spawn(move || {
             // Topology-aware core pinning
             let _ = yip_io::pin_current_thread(worker_id);
+
+            // Per-worker sharded sessions: start counter `worker_id` and stride `num_workers`
+            let mut tx_session =
+                Session::from_raw_keys(&k_send, &k_recv, worker_id as u64, num_workers as u64)
+                    .expect("tx session initialization must succeed");
+
+            let mut rx_session = Session::from_raw_keys(&k_recv, &k_send, 0, 1)
+                .expect("rx session initialization must succeed");
 
             // Per-worker unprivileged UMEM shared memory pool
             let mut umem = UmemPool::new(CHUNKS_PER_POOL, CHUNK_SIZE).expect("create UMEM pool");
@@ -327,8 +330,7 @@ fn run_af_xdp_scale(num_workers: usize, baseline_gbps: Option<f64>) -> RunResult
                 }
             }
 
-            let mut local_nonce = disp.claim_chunk();
-            let mut replay = ReplayWindow::new();
+            let mut generated_nonces = Vec::with_capacity(packets_per_thread);
 
             // Track sequence number per assigned stream
             let mut expected_seq: HashMap<u16, u32> = HashMap::new();
@@ -367,38 +369,37 @@ fn run_af_xdp_scale(num_workers: usize, baseline_gbps: Option<f64>) -> RunResult
                         // 4. Zero-copy RX dequeue
                         let rx_desc = rx_ring.consume().expect("RX descriptor available");
 
-                        // 5. Claim nonce without atomic contention
-                        let nonce = local_nonce
-                            .next_nonce(&disp)
-                            .expect("nonce dispenser must succeed");
-
-                        // 6. In-place AEAD seal directly inside UMEM chunk buffer
+                        // 5. In-place AEAD seal directly inside UMEM chunk buffer using Session with stride nonces
                         let chunk_buf = umem.chunk_slice_mut(rx_desc.addr, PACKET_SIZE + 16);
-                        let sealed_len = ciph
-                            .seal_in_place(nonce, chunk_buf, PACKET_SIZE)
+                        let nonce = tx_session
+                            .seal_in_place(chunk_buf, PACKET_SIZE)
                             .expect("in-place AEAD seal must succeed");
+                        let sealed_len = PACKET_SIZE + 16;
 
-                        // 7. Enqueue to TX ring
+                        // Verify local stride assignment invariant
+                        assert_eq!(
+                            nonce % num_workers as u64,
+                            worker_id as u64,
+                            "Nonce stride invariant violated for worker {worker_id}"
+                        );
+                        generated_nonces.push(nonce);
+
+                        // 6. Enqueue to TX ring
                         let tx_enqueued =
                             tx_ring.produce(XskDesc::new(rx_desc.addr, sealed_len as u32, 0));
                         assert!(tx_enqueued, "TX ring full");
 
-                        // 8. Simulated driver TX transmission dequeue
+                        // 7. Simulated driver TX transmission dequeue
                         let tx_desc = tx_ring.consume().expect("TX descriptor available");
 
-                        // 9. Peer in-place zero-copy AEAD open & replay check inside UMEM buffer
+                        // 8. Peer in-place zero-copy AEAD open & replay check inside UMEM buffer
                         let tx_buf = umem.chunk_slice_mut(tx_desc.addr, tx_desc.len as usize);
-                        let plain_len = ciph
-                            .open_in_place_with_window(
-                                nonce,
-                                tx_buf,
-                                tx_desc.len as usize,
-                                &mut replay,
-                            )
+                        let plain_len = rx_session
+                            .open_in_place(nonce, tx_buf, tx_desc.len as usize)
                             .expect("in-place AEAD open must succeed");
                         assert_eq!(plain_len, PACKET_SIZE);
 
-                        // 10. Strict monotonic FIFO verification per stream
+                        // 9. Strict monotonic FIFO verification per stream
                         if let Some((s_id, seq)) = extract_seq_and_stream(&tx_buf[..plain_len]) {
                             assert_eq!(s_id, stream_id, "Stream ID mismatch");
                             let exp = expected_seq.get_mut(&s_id).unwrap();
@@ -414,11 +415,11 @@ fn run_af_xdp_scale(num_workers: usize, baseline_gbps: Option<f64>) -> RunResult
                             panic!("Corrupt decrypted packet format");
                         }
 
-                        // 11. TX completion: push chunk to completion ring
+                        // 10. TX completion: push chunk to completion ring
                         let comp_enqueued = completion_ring.produce(tx_desc.addr);
                         assert!(comp_enqueued, "Completion ring full");
 
-                        // 12. Recycle completed chunk back to fill ring
+                        // 11. Recycle completed chunk back to fill ring
                         let comp_addr = completion_ring
                             .consume()
                             .expect("completion descriptor available");
@@ -432,7 +433,13 @@ fn run_af_xdp_scale(num_workers: usize, baseline_gbps: Option<f64>) -> RunResult
                 }
             }
 
-            (thread_packets, thread_bytes, thread_drops, thread_ooo)
+            (
+                thread_packets,
+                thread_bytes,
+                thread_drops,
+                thread_ooo,
+                generated_nonces,
+            )
         });
 
         handles.push(handle);
@@ -446,14 +453,30 @@ fn run_af_xdp_scale(num_workers: usize, baseline_gbps: Option<f64>) -> RunResult
     let mut total_bytes = 0u64;
     let mut total_drops = 0u64;
     let mut total_ooo = 0u64;
+    let mut all_nonces = std::collections::HashSet::new();
 
     for h in handles {
-        let (pkts, bytes, drops, ooo) = h.join().expect("worker thread panicked");
+        let (pkts, bytes, drops, ooo, nonces) = h.join().expect("worker thread panicked");
         total_packets += pkts;
         total_bytes += bytes;
         total_drops += drops;
         total_ooo += ooo;
+        for nonce in nonces {
+            assert!(
+                all_nonces.insert(nonce),
+                "Strict nonce collision detected: nonce {nonce} was generated more than once!"
+            );
+        }
     }
+
+    // Verify strict nonce uniqueness across all worker threads
+    assert_eq!(
+        all_nonces.len(),
+        total_packets as usize,
+        "Total unique nonces ({}) does not match total packets ({})",
+        all_nonces.len(),
+        total_packets
+    );
 
     let duration = start.elapsed();
     let secs = duration.as_secs_f64();
@@ -546,6 +569,9 @@ fn main() {
     println!("  [PASS] 0 packet drops verified across all worker configurations.");
     println!(
         "  [PASS] 0 out-of-order deliveries verified (strict monotonic FIFO ordering per stream)."
+    );
+    println!(
+        "  [PASS] Strict nonce uniqueness confirmed across all worker threads (0 collisions)."
     );
     println!("  [PASS] Non-root user space UMEM shared memory mapping verified (0 CAP_NET_ADMIN needed).");
     println!(
