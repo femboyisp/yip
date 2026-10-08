@@ -439,3 +439,59 @@ fn test_session_epoch_replication_across_shards() {
         assert_eq!(opened, plaintext);
     }
 }
+
+#[test]
+fn test_cross_shard_arq_feedback_routes_to_encoder_shard() {
+    use yipd::handshake::PacketType;
+    use yipd::sharding::{shard_for_fec_control, shard_for_fec_symbol, ShardMsg};
+
+    let conn_tag = 0x0102_0304_0506_0708u64;
+    let object_id = 42u16;
+    let num_shards = 4;
+    let target_shard = shard_for_fec_symbol(conn_tag, object_id, num_shards);
+
+    // Build Control datagram: [PacketType::Control, conn_tag (8b), object_id (2b), ...]
+    let mut ctrl_dg = vec![PacketType::Control as u8];
+    ctrl_dg.extend_from_slice(&conn_tag.to_be_bytes());
+    ctrl_dg.extend_from_slice(&object_id.to_be_bytes());
+    ctrl_dg.extend_from_slice(&[0xaa, 0xbb, 0xcc]); // payload / loss feedback
+
+    // Verifies shard_for_fec_control returns Some(target_shard)
+    assert_eq!(
+        shard_for_fec_control(&ctrl_dg, num_shards),
+        Some(target_shard)
+    );
+
+    // Verifies non-control packets return None
+    let mut data_dg = ctrl_dg.clone();
+    data_dg[0] = PacketType::Data as u8;
+    assert_eq!(shard_for_fec_control(&data_dg, num_shards), None);
+
+    let mut hs_dg = ctrl_dg.clone();
+    hs_dg[0] = PacketType::HandshakeInit as u8;
+    assert_eq!(shard_for_fec_control(&hs_dg, num_shards), None);
+
+    // Short datagram (< 11 bytes) returns None
+    assert_eq!(shard_for_fec_control(&ctrl_dg[..10], num_shards), None);
+
+    // num_shards <= 1 returns None
+    assert_eq!(shard_for_fec_control(&ctrl_dg, 1), None);
+    assert_eq!(shard_for_fec_control(&ctrl_dg, 0), None);
+
+    // Also verify SPSC ring routing with ShardMsg::ArqFeedback
+    let (tx, rx) = spsc_pair::<ShardMsg, 2048>();
+    let client_addr = "127.0.0.1:9999".parse().unwrap();
+    let msg = ShardMsg::ArqFeedback(ctrl_dg.clone(), client_addr);
+    tx.push(msg).expect("push must succeed");
+
+    let mut drained = Vec::new();
+    rx.drain_batch(&mut drained, 1);
+    assert_eq!(drained.len(), 1);
+    match &drained[0] {
+        ShardMsg::ArqFeedback(bytes, addr) => {
+            assert_eq!(bytes, &ctrl_dg);
+            assert_eq!(*addr, client_addr);
+        }
+        _ => panic!("unexpected ShardMsg variant"),
+    }
+}
