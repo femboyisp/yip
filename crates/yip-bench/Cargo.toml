@@ -37,6 +37,10 @@ harness = false
 name = "af_xdp_scale"
 harness = false
 
+[[bench]]
+name = "rs_simd_bench"
+harness = false
+
 
 [lints]
 workspace = true
