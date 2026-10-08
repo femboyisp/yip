@@ -49,6 +49,37 @@ pub fn shard_for_pubkey(pubkey: &[u8; 32], num_shards: usize) -> usize {
     shard_for_addr(crate::addr::node_addr(pubkey), num_shards)
 }
 
+/// Deterministically map an incoming TUN packet to a target shard index in `0..num_shards`.
+///
+/// Uses inner 5-tuple flow hashing (`FlowTuple::extract`) to pin each connection
+/// to a single worker shard in strict FIFO sequence, preventing TCP reordering (Regime B).
+/// For non-IP packets or packets where flow extraction fails, falls back to destination
+/// address hashing (`dst_for_packet` + `shard_for_addr`), or shard 0.
+pub fn shard_for_packet(pkt: &[u8], is_tap: bool, num_shards: usize) -> usize {
+    if num_shards <= 1 {
+        return 0;
+    }
+    let ip_pkt = if is_tap {
+        if pkt.len() >= 14
+            && ((pkt[12] == 0x08 && pkt[13] == 0x00) || (pkt[12] == 0x86 && pkt[13] == 0xdd))
+        {
+            &pkt[14..]
+        } else {
+            &[]
+        }
+    } else {
+        pkt
+    };
+
+    if let Some(flow) = crate::flow::FlowTuple::extract(ip_pkt) {
+        (flow.flow_hash() as usize) % num_shards
+    } else if let Some(dst) = dst_for_packet(pkt, is_tap) {
+        shard_for_addr(dst, num_shards)
+    } else {
+        0
+    }
+}
+
 use std::io;
 use std::net::ToSocketAddrs;
 use std::os::fd::AsRawFd;
@@ -62,6 +93,69 @@ use crate::config::Config;
 #[derive(Debug, Clone)]
 pub struct OutboundPacket {
     pub bytes: Vec<u8>,
+}
+
+/// Coalesced timer for 20 Hz cadence ticks under multi-core packet traffic.
+#[derive(Debug, Clone)]
+pub struct CoalescedTimer {
+    interval: std::time::Duration,
+    packet_batch_mask: u64,
+    last_tick: std::time::Instant,
+    packet_count: u64,
+}
+
+impl CoalescedTimer {
+    pub const DEFAULT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+    pub const DEFAULT_BATCH_MASK: u64 = 2047; // 2048 packets
+
+    pub fn new() -> Self {
+        Self::with_interval_and_mask(Self::DEFAULT_INTERVAL, Self::DEFAULT_BATCH_MASK)
+    }
+
+    pub fn with_interval_and_mask(interval: std::time::Duration, packet_batch_mask: u64) -> Self {
+        Self {
+            interval,
+            packet_batch_mask,
+            last_tick: std::time::Instant::now(),
+            packet_count: 0,
+        }
+    }
+
+    /// Record `n` processed packets.
+    #[inline]
+    pub fn on_packets(&mut self, n: u64) {
+        self.packet_count = self.packet_count.wrapping_add(n);
+    }
+
+    /// Current cumulative packet count.
+    #[inline]
+    pub fn packet_count(&self) -> u64 {
+        self.packet_count
+    }
+
+    /// Check whether a timer tick should fire given the current time and packets processed
+    /// in this loop iteration.
+    pub fn should_tick(&mut self, now: std::time::Instant, packets_this_iter: u64) -> bool {
+        let eligible = if packets_this_iter == 0 {
+            now.duration_since(self.last_tick) >= self.interval
+        } else {
+            (self.packet_count & self.packet_batch_mask == 0)
+                && (now.duration_since(self.last_tick) >= self.interval)
+        };
+
+        if eligible {
+            self.last_tick = now;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Default for CoalescedTimer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -85,6 +179,33 @@ fn owned_out(
         yip_io::poll::DispatchOut::Udp(dgs) => (None, dgs.to_vec()),
         yip_io::poll::DispatchOut::Both(inner, dgs) => (Some(inner.to_vec()), dgs.to_vec()),
     }
+}
+
+fn select_egress_socket<'a>(
+    default_sock: &'a std::net::UdpSocket,
+    pool: &'a [std::net::UdpSocket],
+    pkt: &[u8],
+    is_tap: bool,
+) -> &'a std::net::UdpSocket {
+    if pool.is_empty() {
+        return default_sock;
+    }
+    let ip_pkt = if is_tap {
+        if pkt.len() >= 14
+            && ((pkt[12] == 0x08 && pkt[13] == 0x00) || (pkt[12] == 0x86 && pkt[13] == 0xdd))
+        {
+            &pkt[14..]
+        } else {
+            &[]
+        }
+    } else {
+        pkt
+    };
+
+    let flow_hash = crate::flow::FlowTuple::extract(ip_pkt)
+        .map(|f| f.flow_hash())
+        .unwrap_or(0);
+    &pool[(flow_hash as usize) % pool.len()]
 }
 
 fn write_tun(tun_fd: std::os::fd::RawFd, inner: &[u8], vnet_hdr: bool) {
@@ -312,6 +433,8 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                 let poller = yip_io::epoll::Epoll::new(sock_fd, tun_fd)?;
                 let vnet_len = tun_dev.vnet_hdr_len().unwrap_or(0);
                 let is_tap = cfg.device_kind == crate::mode::TunnelMode::L2Tap;
+                let egress_pool = crate::port::bind_udp_egress_pool(0, 64).unwrap_or_default();
+                let mut coalesced_timer = CoalescedTimer::new();
 
                 let mut udp_buf = [0u8; yip_io::MAX_WIRE_DATAGRAM];
                 let mut tun_buf = vec![0u8; vnet_len + yip_io::MAX_WIRE_DATAGRAM];
@@ -329,12 +452,14 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                     }
 
                     let now_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    let mut packets_this_iter: u64 = 0;
 
                     // 1. Drain local UDP socket via on_udp
                     if ready.udp {
                         loop {
                             match sock.recv_from(&mut udp_buf) {
                                 Ok((n, src)) => {
+                                    packets_this_iter = packets_this_iter.wrapping_add(1);
                                     let (tun_out, egress) =
                                         owned_out(manager.on_udp(src, &udp_buf[..n], now_ms));
                                     if let Some(inner) = tun_out {
@@ -358,16 +483,15 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                 Ok(0) => break,
                                 Ok(n) => {
                                     if n > vnet_len {
+                                        packets_this_iter = packets_this_iter.wrapping_add(1);
                                         let pkt = &tun_buf[vnet_len..n];
-                                        let target_shard = match dst_for_packet(pkt, is_tap) {
-                                            Some(dst) => shard_for_addr(dst, num_shards),
-                                            None => shard_id,
-                                        };
+                                        let target_shard = shard_for_packet(pkt, is_tap, num_shards);
 
                                         if target_shard == shard_id {
                                             let egress = manager.on_tun(pkt, now_ms);
+                                            let send_sock = select_egress_socket(&sock, &egress_pool, pkt, is_tap);
                                             for dg in egress {
-                                                let _ = sock.send_to(&dg.bytes, dg.dst);
+                                                let _ = send_sock.send_to(&dg.bytes, dg.dst);
                                             }
                                         } else if let Some(Some(ref tx)) =
                                             tx_channels.get(target_shard)
@@ -392,18 +516,25 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                     for rx in &rx_channels {
                         spsc_batch.clear();
                         rx.drain_batch(&mut spsc_batch, 64);
+                        packets_this_iter = packets_this_iter.wrapping_add(spsc_batch.len() as u64);
                         for pkt in &spsc_batch {
                             let egress = manager.on_tun(&pkt.bytes, now_ms);
+                            let send_sock = select_egress_socket(&sock, &egress_pool, &pkt.bytes, is_tap);
                             for dg in egress {
-                                let _ = sock.send_to(&dg.bytes, dg.dst);
+                                let _ = send_sock.send_to(&dg.bytes, dg.dst);
                             }
                         }
                     }
 
                     // 4. Cadence tick (feedback / keepalive / retransmit / cover)
-                    if let Some(egress) = manager.tick(now_ms) {
-                        for dg in egress {
-                            let _ = sock.send_to(&dg.bytes, dg.dst);
+                    // Coalesced to 20 Hz (50 ms interval) or every 2048 packets
+                    coalesced_timer.on_packets(packets_this_iter);
+                    let now = std::time::Instant::now();
+                    if coalesced_timer.should_tick(now, packets_this_iter) {
+                        if let Some(egress) = manager.tick(now_ms) {
+                            for dg in egress {
+                                let _ = sock.send_to(&dg.bytes, dg.dst);
+                            }
                         }
                     }
                 }
@@ -640,5 +771,139 @@ mod tests {
         let res = handle.join().expect("thread join");
         assert!(res.is_ok(), "run_sharded should exit cleanly on shutdown");
         reset_shutdown();
+    }
+
+    #[test]
+    fn test_shard_for_packet_flow_pinning() {
+        let mut pkt1 = vec![0u8; 40];
+        pkt1[0] = 0x45; // IPv4
+        pkt1[9] = 6; // TCP
+        pkt1[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        pkt1[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        pkt1[20..22].copy_from_slice(&8080u16.to_be_bytes());
+        pkt1[22..24].copy_from_slice(&443u16.to_be_bytes());
+
+        let flow1 = crate::flow::FlowTuple::extract(&pkt1).unwrap();
+        let expected_shard = (flow1.flow_hash() as usize) % 4;
+
+        assert_eq!(shard_for_packet(&pkt1, false, 4), expected_shard);
+        assert_eq!(shard_for_packet(&pkt1, false, 1), 0);
+        assert_eq!(shard_for_packet(&pkt1, false, 0), 0);
+
+        // Different port pair -> different flow
+        let mut pkt2 = pkt1.clone();
+        pkt2[20..22].copy_from_slice(&9090u16.to_be_bytes());
+        let flow2 = crate::flow::FlowTuple::extract(&pkt2).unwrap();
+        assert_eq!(
+            shard_for_packet(&pkt2, false, 4),
+            (flow2.flow_hash() as usize) % 4
+        );
+    }
+
+    #[test]
+    fn test_shard_for_packet_tap() {
+        let mut tap_pkt = vec![0u8; 14 + 40];
+        tap_pkt[12] = 0x08; // EtherType IPv4
+        tap_pkt[13] = 0x00;
+        tap_pkt[14] = 0x45; // IPv4
+        tap_pkt[14 + 9] = 6; // TCP
+        tap_pkt[14 + 12..14 + 16].copy_from_slice(&[192, 168, 1, 10]);
+        tap_pkt[14 + 16..14 + 20].copy_from_slice(&[192, 168, 1, 20]);
+        tap_pkt[14 + 20..14 + 22].copy_from_slice(&12345u16.to_be_bytes());
+        tap_pkt[14 + 22..14 + 24].copy_from_slice(&80u16.to_be_bytes());
+
+        let inner_flow = crate::flow::FlowTuple::extract(&tap_pkt[14..]).unwrap();
+        let expected_shard = (inner_flow.flow_hash() as usize) % 4;
+        assert_eq!(shard_for_packet(&tap_pkt, true, 4), expected_shard);
+    }
+
+    #[test]
+    fn test_shard_for_packet_fallback() {
+        // Non-IP packet (e.g. ARP or truncated)
+        let arp_pkt = vec![0u8; 28];
+        assert_eq!(shard_for_packet(&arp_pkt, false, 4), 0);
+
+        // Fallback to destination IP if flow extraction fails (e.g. invalid IHL)
+        let mut bad_v4 = vec![0u8; 20];
+        bad_v4[0] = 0x44; // IPv4 with invalid IHL = 4 (16 bytes < 20)
+        bad_v4[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        let dst_mapped = std::net::Ipv4Addr::new(10, 0, 0, 2).to_ipv6_mapped();
+        let expected_shard = shard_for_addr(dst_mapped, 4);
+        assert_eq!(shard_for_packet(&bad_v4, false, 4), expected_shard);
+    }
+
+    #[test]
+    fn test_coalesced_timer_idle_and_traffic() {
+        let mut timer =
+            CoalescedTimer::with_interval_and_mask(std::time::Duration::from_millis(50), 2047);
+
+        let t0 = std::time::Instant::now();
+        // Initially at t0 with 0 packets -> 0 ms elapsed, should not tick
+        assert!(!timer.should_tick(t0, 0));
+
+        // Advance 40 ms while idle (< 50 ms) -> should not tick
+        let t40 = t0 + std::time::Duration::from_millis(40);
+        assert!(!timer.should_tick(t40, 0));
+
+        // Advance 51 ms while idle (>= 50 ms) -> should tick at 20 Hz
+        let t51 = t0 + std::time::Duration::from_millis(51);
+        assert!(timer.should_tick(t51, 0));
+
+        // Immediately after ticking, should not tick again
+        assert!(!timer.should_tick(t51, 0));
+
+        // Under traffic: packets arriving
+        let t_traffic_start = t51;
+        timer.on_packets(500); // packet_count = 500 (500 & 2047 != 0)
+        let t_traffic_later = t_traffic_start + std::time::Duration::from_millis(60);
+        // Even though >50ms elapsed, packet_count is not aligned to 2048 batch cap -> suppressed
+        assert!(!timer.should_tick(t_traffic_later, 500));
+
+        // Advance to 2048 packets
+        timer.on_packets(1548); // total = 2048, 2048 & 2047 == 0
+                                // Now batch cap aligns AND >50ms elapsed -> should tick!
+        assert!(timer.should_tick(t_traffic_later, 1548));
+
+        // Next check right after should not tick
+        assert!(!timer.should_tick(t_traffic_later, 1));
+    }
+
+    #[test]
+    fn test_10000_tcp_packets_monotonic_ordering() {
+        let num_shards = 4;
+        let mut queues: Vec<Vec<u32>> = vec![Vec::new(); num_shards];
+
+        let mut pkt = vec![0u8; 44];
+        pkt[0] = 0x45;
+        pkt[9] = 6; // TCP
+        pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        pkt[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        pkt[20..22].copy_from_slice(&12345u16.to_be_bytes());
+        pkt[22..24].copy_from_slice(&80u16.to_be_bytes());
+
+        let target_shard = shard_for_packet(&pkt, false, num_shards);
+
+        // Send 10,000 packets of this flow
+        for seq in 0..10_000u32 {
+            pkt[24..28].copy_from_slice(&seq.to_be_bytes());
+            pkt[40..44].copy_from_slice(&seq.to_be_bytes());
+
+            let shard = shard_for_packet(&pkt, false, num_shards);
+            assert_eq!(shard, target_shard, "all packets must pin to target shard");
+            queues[shard].push(seq);
+        }
+
+        // Verify target shard queue received all 10,000 packets in strict monotonic order
+        assert_eq!(queues[target_shard].len(), 10_000);
+        for (i, &seq) in queues[target_shard].iter().enumerate() {
+            assert_eq!(seq, i as u32, "monotonic order preserved at index {i}");
+        }
+
+        // Verify all other shards received 0 packets
+        for (idx, q) in queues.iter().enumerate() {
+            if idx != target_shard {
+                assert_eq!(q.len(), 0, "other shard {idx} must receive 0 packets");
+            }
+        }
     }
 }

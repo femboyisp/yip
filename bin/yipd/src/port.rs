@@ -83,13 +83,6 @@ pub(crate) fn bind_udp_reuseport(
     Ok(sockets)
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by Task 5 sharding and tunnel egress pool"
-    )
-)]
 pub(crate) fn bind_udp_egress_pool(base_port: u16, pool_size: usize) -> io::Result<Vec<UdpSocket>> {
     let mut sockets = Vec::with_capacity(pool_size);
     for i in 0..pool_size {
