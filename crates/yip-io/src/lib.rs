@@ -15,6 +15,7 @@ pub(crate) mod tun_offload;
 pub mod uring;
 
 pub use addr::{sockaddr_to_std, std_to_sockaddr};
+pub use bpf::{BpfFilterStatus, XdpRedirectFilter};
 
 /// Maximum number of datagrams in a single batched send/recv call.
 pub const MAX_DATAGRAM_BATCH: usize = 64;

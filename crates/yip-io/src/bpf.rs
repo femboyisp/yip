@@ -529,12 +529,23 @@ impl XdpRedirectFilter {
         (map_fd, prog_fd)
     }
 
-    /// Loads and attaches an XDP redirect filter to `ifname` for `listen_port`.
-    pub fn load_and_attach(
+    /// Dynamically sets or updates the AF_XDP socket file descriptor for a specific queue ID in the map.
+    pub fn set_socket_for_queue(&mut self, queue_id: u32, xsk_fd: RawFd) -> io::Result<()> {
+        if self.map_fd < 0 {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        if xsk_fd < 0 {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        bpf_map_update_xsk(self.map_fd, queue_id, xsk_fd)
+    }
+
+    /// Loads and attaches a multi-queue XDP redirect filter to `ifname` for `listen_port`
+    /// across the specified `queue_fds`.
+    pub fn load_multi_queue(
         ifname: &str,
         listen_port: u16,
-        queue_id: u32,
-        xsk_fd: RawFd,
+        queue_fds: &[(u32, RawFd)],
     ) -> Result<Self, BpfFilterStatus> {
         let c_ifname = match CString::new(ifname) {
             Ok(c) => c,
@@ -547,8 +558,14 @@ impl XdpRedirectFilter {
             return Err(BpfFilterStatus::Unsupported);
         }
 
-        // 1. Create BPF_MAP_TYPE_XSKMAP
-        let max_entries = queue_id.checked_add(1).unwrap_or(64).max(64);
+        // 1. Create BPF_MAP_TYPE_XSKMAP dimensioned to hold all specified queues.
+        let max_queue_id = queue_fds.iter().map(|(q, _)| *q).max().unwrap_or(0);
+        let max_entries = max_queue_id
+            .checked_add(1)
+            .unwrap_or(64)
+            .max(queue_fds.len() as u32)
+            .max(64);
+
         let map_fd = match bpf_map_create_xsk(max_entries) {
             Ok(fd) => fd,
             Err(e) => {
@@ -560,17 +577,21 @@ impl XdpRedirectFilter {
         };
         let map_guard = AutoCloseFd(map_fd);
 
-        // 2. Update map with xsk_fd if valid
-        if xsk_fd >= 0 {
-            if let Err(e) = bpf_map_update_xsk(map_fd, queue_id, xsk_fd) {
-                return match e.raw_os_error() {
-                    Some(libc::EPERM | libc::EACCES) => Err(BpfFilterStatus::FallbackUnprivileged),
-                    _ => Err(BpfFilterStatus::Unsupported),
-                };
+        // 2. Populate each (queue_id, xsk_fd) entry into the map if valid.
+        for &(queue_id, xsk_fd) in queue_fds {
+            if xsk_fd >= 0 {
+                if let Err(e) = bpf_map_update_xsk(map_fd, queue_id, xsk_fd) {
+                    return match e.raw_os_error() {
+                        Some(libc::EPERM | libc::EACCES) => {
+                            Err(BpfFilterStatus::FallbackUnprivileged)
+                        }
+                        _ => Err(BpfFilterStatus::Unsupported),
+                    };
+                }
+            } else {
+                // Negative xsk_fd is invalid for map update
+                return Err(BpfFilterStatus::Unsupported);
             }
-        } else {
-            // Negative xsk_fd is invalid for map update
-            return Err(BpfFilterStatus::Unsupported);
         }
 
         // 3. Load XDP program
@@ -598,7 +619,35 @@ impl XdpRedirectFilter {
         Ok(Self { map_fd, prog_fd })
     }
 
-    /// Opportunistically attempts to attach the eBPF XDP redirect filter.
+    /// Loads and attaches an XDP redirect filter to `ifname` for `listen_port` on a single queue.
+    pub fn load_and_attach(
+        ifname: &str,
+        listen_port: u16,
+        queue_id: u32,
+        xsk_fd: RawFd,
+    ) -> Result<Self, BpfFilterStatus> {
+        Self::load_multi_queue(ifname, listen_port, &[(queue_id, xsk_fd)])
+    }
+
+    /// Opportunistically attempts to attach the eBPF XDP redirect filter across multiple queues.
+    ///
+    /// Degrades fail-soft to `FallbackUnprivileged` or `Unsupported` without panicking.
+    pub fn attach_multi_queue(
+        ifname: &str,
+        listen_port: u16,
+        queue_fds: &[(u32, RawFd)],
+    ) -> BpfFilterStatus {
+        match Self::load_multi_queue(ifname, listen_port, queue_fds) {
+            Ok(filter) => {
+                let prog_fd = filter.prog_fd;
+                let _ = filter.into_raw();
+                BpfFilterStatus::Attached(prog_fd)
+            }
+            Err(status) => status,
+        }
+    }
+
+    /// Opportunistically attempts to attach the eBPF XDP redirect filter on a single queue.
     ///
     /// Degrades fail-soft to `FallbackUnprivileged` or `Unsupported` without panicking.
     pub fn attach_opportunistic(
@@ -607,14 +656,7 @@ impl XdpRedirectFilter {
         queue_id: u32,
         xsk_fd: RawFd,
     ) -> BpfFilterStatus {
-        match Self::load_and_attach(ifname, listen_port, queue_id, xsk_fd) {
-            Ok(filter) => {
-                let prog_fd = filter.prog_fd;
-                let _ = filter.into_raw();
-                BpfFilterStatus::Attached(prog_fd)
-            }
-            Err(status) => status,
-        }
+        Self::attach_multi_queue(ifname, listen_port, &[(queue_id, xsk_fd)])
     }
 }
 

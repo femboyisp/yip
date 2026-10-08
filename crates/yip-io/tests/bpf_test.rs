@@ -101,3 +101,42 @@ fn test_direct_bpf_syscall_unprivileged_failsoft() {
         }
     }
 }
+
+#[test]
+fn test_bpf_multi_queue_attach_opportunistic() {
+    let queues = vec![(0, -1), (1, -1), (2, -1), (3, -1)];
+    let status = XdpRedirectFilter::attach_multi_queue("lo", 52820, &queues);
+    match status {
+        BpfFilterStatus::Attached(_) => {}
+        BpfFilterStatus::FallbackUnprivileged => {}
+        BpfFilterStatus::Unsupported => {}
+    }
+}
+
+#[test]
+fn test_bpf_filter_set_socket_for_queue() {
+    let mut filter = XdpRedirectFilter::new(-1, -1);
+    let res = filter.set_socket_for_queue(0, 10);
+    assert!(res.is_err());
+
+    let res_neg = filter.set_socket_for_queue(1, -1);
+    assert!(res_neg.is_err());
+}
+
+#[test]
+fn test_bpf_multi_queue_invalid_interface() {
+    let queues = vec![(0, -1)];
+    let status = XdpRedirectFilter::attach_multi_queue("nonexistent_if_99", 52820, &queues);
+    assert_eq!(status, BpfFilterStatus::Unsupported);
+}
+
+#[test]
+fn test_xsk_socket_multi_queue_filter_integration() {
+    let mut sock = XskSocket::fallback();
+    let queues = vec![(0, -1), (1, -1)];
+    let status = sock.attach_bpf_filter_multi_queue("lo", 52820, &queues);
+    assert_eq!(status, BpfFilterStatus::Unsupported);
+
+    let res = sock.set_bpf_filter_queue_socket(0, 5);
+    assert!(res.is_err());
+}

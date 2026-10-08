@@ -216,3 +216,17 @@ fn test_xsk_send_sync() {
     assert_send_sync::<TxRing>();
     assert_send_sync::<XskSocket>();
 }
+
+#[test]
+fn test_bind_multi_queue() {
+    let umem = UmemPool::new(16, UMEM_CHUNK_SIZE).expect("allocate UMEM pool");
+    let queue_ids = vec![0, 1, 2, 3];
+    let res = XskSocket::bind_multi_queue("lo", &queue_ids, &umem);
+    assert!(res.is_ok());
+    let sockets = res.unwrap();
+    assert_eq!(sockets.len(), 4);
+    for (i, (qid, sock)) in sockets.iter().enumerate() {
+        assert_eq!(*qid, i as u32);
+        assert!(sock.rx_ring().is_empty());
+    }
+}
