@@ -1,9 +1,10 @@
 //! Normative RS-v1 systematic Reed–Solomon over GF(256) (spec §3.2.1): a Cauchy
 //! generator `[ I_K ; C ]` with `C[m][i] = inv((K+m) ^ i)`, giving MDS (any K of
 //! K+R shards decode). Source rows are identity, so no-loss decode is a copy.
-#![forbid(unsafe_code)]
+#![allow(unsafe_code)]
 
 use crate::gf256;
+pub use crate::rs_simd::avx2_supported;
 
 /// Generator scheme for the repair rows (packed into `payload_id[3]` on the wire).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +71,32 @@ pub fn cauchy_coef(k: usize, m: usize, i: usize) -> u8 {
     gf256::inv(gf256::add(x, y)) // x ^ y != 0 since {y_i} and {x_m} are disjoint
 }
 
+/// Multiply `src` by `coeff` in GF(2^8) and accumulate (XOR) into `dst`.
+///
+/// Uses runtime CPU feature detection to dispatch to AVX2 SIMD (`rs_simd::mul_add_avx2`)
+/// when available, with fast paths for `coeff == 0` (no-op) and `coeff == 1` (direct XOR),
+/// and pure-Rust scalar fallback via `gf256::mul_slice_into`.
+pub fn mul_add_row(coeff: u8, src: &[u8], dst: &mut [u8]) {
+    assert_eq!(src.len(), dst.len(), "src and dst lengths must match");
+    if coeff == 0 {
+        return;
+    }
+    if coeff == 1 {
+        for (d, &s) in dst.iter_mut().zip(src.iter()) {
+            *d ^= s;
+        }
+        return;
+    }
+    if crate::rs_simd::avx2_supported() {
+        // SAFETY: avx2_supported() confirmed CPU supports AVX2, and lengths of src and dst were verified equal.
+        unsafe {
+            crate::rs_simd::mul_add_avx2(coeff, src, dst);
+        }
+        return;
+    }
+    crate::gf256::mul_slice_into(dst, src, coeff);
+}
+
 /// Generate `r` repair shards from the `source` shards (all equal length) under `scheme`.
 pub fn encode_repair(source: &[Vec<u8>], r: usize, scheme: Scheme) -> Vec<Vec<u8>> {
     let k = source.len();
@@ -78,14 +105,7 @@ pub fn encode_repair(source: &[Vec<u8>], r: usize, scheme: Scheme) -> Vec<Vec<u8
     for (m, rep) in repair.iter_mut().enumerate() {
         let coefs = repair_row(scheme, k, m);
         for (src, &c) in source.iter().zip(coefs.iter()) {
-            if c == 1 {
-                // Pure-XOR fast path (the entire P row; Q's i=0 term).
-                for (d, &s) in rep.iter_mut().zip(src.iter()) {
-                    *d ^= s;
-                }
-            } else if c != 0 {
-                gf256::mul_slice_into(rep, src, c);
-            }
+            mul_add_row(c, src, rep);
         }
     }
     repair
@@ -149,10 +169,49 @@ pub fn decode_source(
     let mut out = vec![vec![0u8; shard_len]; k];
     for i in 0..k {
         for (row, &(_, bytes)) in rows.iter().enumerate() {
-            gf256::mul_slice_into(&mut out[i], bytes, minv[i][row]);
+            mul_add_row(minv[i][row], bytes, &mut out[i]);
         }
     }
     Some(out)
+}
+
+/// Test helper that runs `mul_add_row` and compares against scalar `crate::gf256::mul_slice_into`.
+#[doc(hidden)]
+pub fn test_mul_add_row_differential(coeff: u8, src: &[u8]) {
+    let mut dst_simd = vec![0u8; src.len()];
+    let mut dst_scalar = vec![0u8; src.len()];
+    for (i, d) in dst_simd.iter_mut().enumerate() {
+        *d = (i as u8).wrapping_mul(31).wrapping_add(7);
+    }
+    dst_scalar.copy_from_slice(&dst_simd);
+
+    mul_add_row(coeff, src, &mut dst_simd);
+    crate::gf256::mul_slice_into(&mut dst_scalar, src, coeff);
+
+    assert_eq!(
+        dst_simd,
+        dst_scalar,
+        "mismatch between mul_add_row and scalar GF(2^8) for coeff={coeff}, len={}",
+        src.len()
+    );
+
+    #[cfg(target_arch = "x86_64")]
+    if crate::rs_simd::avx2_supported() {
+        let mut dst_avx2 = vec![0u8; src.len()];
+        for (i, d) in dst_avx2.iter_mut().enumerate() {
+            *d = (i as u8).wrapping_mul(31).wrapping_add(7);
+        }
+        // SAFETY: avx2_supported() confirmed AVX2 is available, src and dst_avx2 lengths match.
+        unsafe {
+            crate::rs_simd::mul_add_avx2(coeff, src, &mut dst_avx2);
+        }
+        assert_eq!(
+            dst_avx2,
+            dst_scalar,
+            "mismatch between mul_add_avx2 and scalar GF(2^8) for coeff={coeff}, len={}",
+            src.len()
+        );
+    }
 }
 
 /// Gauss–Jordan inverse of a K×K GF(256) matrix; `None` if singular.

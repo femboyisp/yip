@@ -1,7 +1,10 @@
 //! Adaptive Reed–Solomon-FEC transport: per-flow classification, the adaptive
 //! redundancy controller, and thin ARQ. Implemented across M5; this
 //! milestone fixes the public surface and the flow taxonomy.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+
+pub mod rs_simd;
+pub use rs_simd::avx2_supported;
 
 pub mod classify;
 pub use classify::{Classifier, PolicyRule};
