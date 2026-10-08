@@ -45,6 +45,12 @@ until 0.1.0.
   already in flight is still merely retransmitted (no ephemeral churn).
   Covered by a deterministic regression test.
 
+- **Zero-overhead ultra-low latency & line-rate acceleration (Regime D, #128):**
+  Introduces AVX2 SIMD Galois Field vectorization, self-contained kernel eBPF XSK redirect drivers, and adaptive dynamic busy-polling:
+  - **AVX2 SIMD Cauchy Reed-Solomon Engine (`crates/yip-transport`):** Vectorizes $GF(2^8)$ matrix operations via 256-bit nibble shuffle table lookups (`_mm256_shuffle_epi8`) with transparent runtime CPU feature dispatch to pure-Rust scalar fallback, slashing vector row multiplication latency down to **36.6 ns / packet** (**51.28x speedup**, 35.62 GiB/s) and systematic Cauchy block encoding down to **49.3 ns / packet** (**73.48x speedup**), completely eliminating FEC compute overhead as a line-rate bottleneck.
+  - **Self-Contained eBPF XSK Redirect Driver (`crates/yip-io`):** Embedded minimal eBPF XDP redirect driver and `XSKMAP` filter loaded via direct Linux kernel ABI syscalls (`libc::SYS_bpf`) steering matching tunnel UDP datagrams directly into AF_XDP ring queues at the NIC driver layer, bypassing `sk_buff` kernel allocations, with transparent fail-soft fallback.
+  - **Adaptive Dynamic Busy-Polling Loop (`bin/yipd`):** Configurable 50 µs hysteresis busy-polling window (`YIP_BUSY_POLL_US`) spin-polling descriptor and socket queues with zero syscalls under active traffic bursts to eliminate 1.5–3.5 µs kernel scheduler wakeup latency, gracefully yielding to low-power `epoll_wait(10)` during idle periods.
+  - **Multi-Core & Parity Performance:** Scales AF_XDP multi-core throughput to **40.27 Gbps (3.933 Mpps)** across 8 cores with 0 packet drops and 0 TCP reordering; live network namespace WireGuard parity benchmark verifies **1.05 Gbps** baseline goodput (0.510 ms p99 RTT) and **5.33x higher goodput** under 5% channel packet loss (0.80 Gbps vs 0.15 Gbps).
 - **Kernel-bypass zero-copy I/O tier (AF_XDP / Way C) & WireGuard parity suite (#127):**
   Introduces an ultra-high-throughput Linux `AF_XDP` driver and comprehensive head-to-head WireGuard parity benchmark suite:
   - **Shared Memory Allocator (`UmemPool`):** Page-aligned chunk memory allocator in `crates/yip-io` managing ring-buffered frame memory buffers with intra-chunk bounds checking and lock-free recycling.

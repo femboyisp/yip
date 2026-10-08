@@ -58,15 +58,15 @@ Live comparative benchmark in isolated Linux network namespaces (`run-netns-wire
 
 | Channel Loss | Protocol | Multi-Stream TCP Throughput | Goodput Retention | ICMP RTT p50 | ICMP RTT p99 |
 |:-------------|:---------|----------------------------:|------------------:|-------------:|-------------:|
-| **0% (Baseline)** | **Linux WireGuard (`wg0`)** | **2.80 Gbps** | 100.0% | 0.192 ms | 3.090 ms |
-| | **`yip` Daemon (`yip0`)** | **0.95 Gbps** | 100.0% | 0.222 ms | **0.513 ms** |
-| **1% Channel Loss** | **Linux WireGuard (`wg0`)** | **2.77 Gbps** | 98.9% | 0.274 ms | 3.010 ms |
-| | **`yip` Daemon (`yip0`)** | **0.95 Gbps** | **100.0%** | 0.232 ms | 5.600 ms |
-| **5% Channel Loss** | **Linux WireGuard (`wg0`)** | **0.19 Gbps** | 6.8% *(Collapses)* | 0.229 ms | 3.690 ms |
-| | **`yip` Daemon (`yip0`)** | **0.78 Gbps** | **81.4%** *(Sustains)* | 0.222 ms | 5.650 ms |
+| **0% (Baseline)** | **Linux WireGuard (`wg0`)** | **2.71 Gbps** | 100.0% | 0.162 ms | 2.750 ms |
+| | **`yip` Daemon (`yip0`)** | **1.05 Gbps** | 100.0% | 0.227 ms | **0.510 ms** |
+| **1% Channel Loss** | **Linux WireGuard (`wg0`)** | **2.61 Gbps** | 96.3% | 0.268 ms | 2.590 ms |
+| | **`yip` Daemon (`yip0`)** | **0.98 Gbps** | **92.9%** | 0.231 ms | 5.960 ms |
+| **5% Channel Loss** | **Linux WireGuard (`wg0`)** | **0.15 Gbps** | 5.5% *(Collapses)* | 0.244 ms | 3.090 ms |
+| | **`yip` Daemon (`yip0`)** | **0.80 Gbps** | **76.2%** *(Sustains)* | 0.243 ms | 5.390 ms |
 
-- **4.1x Higher Throughput under Loss:** At 5% packet loss, kernel WireGuard throughput collapses by **93.2%** due to TCP window halving from packet drops. `yip`'s systematic Cauchy Reed–Solomon FEC (GF(256)) and hybrid ARQ recover lost packets in-place, preserving **81.4%** of line rate (0.78 Gbps vs 0.19 Gbps).
-- **Sub-Millisecond Baseline Jitter:** Core-pinned bidirectional symmetric flow hashing and coalesced timers achieve a baseline RTT p99 of **0.513 ms** (vs 3.090 ms on WireGuard).
+- **5.3x Higher Throughput under Loss:** At 5% packet loss, kernel WireGuard throughput collapses by **94.5%** due to TCP window halving from packet drops. `yip`'s systematic Cauchy Reed–Solomon FEC (GF(256)) and hybrid ARQ recover lost packets in-place, preserving **76.2%** of line rate (0.80 Gbps vs 0.15 Gbps).
+- **Sub-Millisecond Baseline Jitter:** Core-pinned bidirectional symmetric flow hashing, AVX2 SIMD FEC acceleration, and adaptive busy-polling achieve a baseline RTT p99 of **0.510 ms** (vs 2.750 ms on WireGuard).
 
 ### 2. Multi-Core Line-Rate Throughput Scaling
 
@@ -74,12 +74,15 @@ Single-peer multi-stream scaling benchmarks across 1, 2, 4, and 8 worker CPU cor
 
 | Worker Threads | Vectorized Sockets (`recvmmsg`) | Kernel-Bypass AF_XDP Zero-Copy | Scaling Efficiency | Drops | Out-of-Order |
 |:--------------:|--------------------------------:|-------------------------------:|:------------------:|:-----:|:------------:|
-| **1 Core** | 4.58 Gbps (0.45 Mpps) | 7.93 Gbps (0.77 Mpps) | 100.0% | **0** | **0** |
-| **2 Cores** | 6.04 Gbps (0.59 Mpps) | 11.45 Gbps (1.12 Mpps) | 72.2% | **0** | **0** |
-| **4 Cores** | 11.43 Gbps (1.12 Mpps) | 21.05 Gbps (2.06 Mpps) | 66.4% | **0** | **0** |
-| **8 Cores** | **21.29–21.56 Gbps (2.10 Mpps)** | **35.21 Gbps (3.44 Mpps)** | 55.5% | **0** | **0** |
+| **1 Core** | 4.58 Gbps (0.45 Mpps) | 8.68 Gbps (0.85 Mpps) | 100.0% | **0** | **0** |
+| **2 Cores** | 6.04 Gbps (0.59 Mpps) | 11.26 Gbps (1.10 Mpps) | 64.8% | **0** | **0** |
+| **4 Cores** | 11.43 Gbps (1.12 Mpps) | 21.22 Gbps (2.07 Mpps) | 61.1% | **0** | **0** |
+| **8 Cores** | **21.29–21.56 Gbps (2.10 Mpps)** | **40.27 Gbps (3.93 Mpps)** | 58.0% | **0** | **0** |
 
 - **Zero Lock Contention:** Lock-free chunked nonces (`ChunkedNonceDispenser`), power-of-two circular descriptor queues (`FillRing`, `RxRing`, `TxRing`, `CompletionRing`), and cache-line padded SPSC matrix queues.
+- **AVX2 SIMD Reed-Solomon Acceleration (< 200 ns):** Vectorized $GF(2^8)$ Galois Field arithmetic via 256-bit nibble shuffle lookups (`_mm256_shuffle_epi8`) accelerating row operations to **36.6 ns / packet** (over **51x speedup** vs scalar) and Cauchy block encoding to **49.3 ns / packet**.
+- **Self-Contained eBPF XSK Driver:** Embedded minimal eBPF XDP redirect driver and `XSKMAP` filter steering matching tunnel UDP packets directly into AF_XDP rings at the NIC driver layer, bypassing `sk_buff` allocations.
+- **Adaptive Dynamic Busy-Polling:** 50 µs zero-syscall hysteresis spin-polling window under active traffic bursts eliminating kernel scheduler wakeup latency, gracefully yielding to low-power `epoll_wait(10)` during idle periods.
 - **Three-Tier Fallback:** AF_XDP socket initialization seamlessly negotiates `XDP_ZERO_COPY` (hardware NIC DMA) $\to$ `XDP_COPY` (driver zero-copy emulation) $\to$ `recvmmsg` vectorized batching, ensuring line-rate operation without panics in unprivileged containers.
 
 Full Criterion microbenchmarks, component metrics, and historical WAN data are detailed in [`crates/yip-bench/RESULTS.md`](crates/yip-bench/RESULTS.md).
@@ -97,6 +100,7 @@ The project is decomposed into sub-projects, each built and merged independently
 | 4 | Traffic-analysis defense (DAITA-style padding/timing; optional onion routing) | not started |
 | 5 | Multi-core throughput sharding (Way A + Regime B/B+ line-rate scaling) | merged |
 | — | Kernel-bypass zero-copy I/O tier (AF_XDP / Way C) & WireGuard parity suite | merged |
+| — | Zero-overhead ultra-low latency & line-rate acceleration (Regime D: AVX2 SIMD RS, eBPF XSK driver, adaptive poller) | merged |
 | — | Platform expansion (macOS/Windows) | backlog |
 
 The workspace is a set of focused crates behind clean interfaces:
