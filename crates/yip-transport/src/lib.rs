@@ -4,7 +4,9 @@
 #![deny(unsafe_code)]
 
 pub mod rs_simd;
-pub use rs_simd::avx2_supported;
+pub use rs_simd::{
+    avx2_supported, avx512bw_supported, gfni_supported, neon_supported, ssse3_supported,
+};
 
 pub mod classify;
 pub use classify::{Classifier, PolicyRule};

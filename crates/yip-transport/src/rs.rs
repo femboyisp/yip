@@ -4,7 +4,9 @@
 #![allow(unsafe_code)]
 
 use crate::gf256;
-pub use crate::rs_simd::avx2_supported;
+pub use crate::rs_simd::{
+    avx2_supported, avx512bw_supported, gfni_supported, neon_supported, ssse3_supported,
+};
 
 /// Generator scheme for the repair rows (packed into `payload_id[3]` on the wire).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,9 +75,9 @@ pub fn cauchy_coef(k: usize, m: usize, i: usize) -> u8 {
 
 /// Multiply `src` by `coeff` in GF(2^8) and accumulate (XOR) into `dst`.
 ///
-/// Uses runtime CPU feature detection to dispatch to AVX2 SIMD (`rs_simd::mul_add_avx2`)
-/// when available, with fast paths for `coeff == 0` (no-op) and `coeff == 1` (direct XOR),
-/// and pure-Rust scalar fallback via `gf256::mul_slice_into`.
+/// Uses tiered runtime CPU feature detection dispatch:
+/// GFNI -> AVX-512BW -> AVX2 -> SSSE3 -> ARM64 NEON -> pure-Rust scalar fallback.
+/// Short-circuits for `coeff == 0` (no-op) and `coeff == 1` (direct XOR).
 pub fn mul_add_row(coeff: u8, src: &[u8], dst: &mut [u8]) {
     assert_eq!(src.len(), dst.len(), "src and dst lengths must match");
     if coeff == 0 {
@@ -87,13 +89,50 @@ pub fn mul_add_row(coeff: u8, src: &[u8], dst: &mut [u8]) {
         }
         return;
     }
-    if crate::rs_simd::avx2_supported() {
-        // SAFETY: avx2_supported() confirmed CPU supports AVX2, and lengths of src and dst were verified equal.
-        unsafe {
-            crate::rs_simd::mul_add_avx2(coeff, src, dst);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::rs_simd::gfni_supported() {
+            // SAFETY: gfni_supported() confirmed CPU supports GFNI, and slice lengths were verified equal.
+            unsafe {
+                crate::rs_simd::mul_add_gfni(coeff, src, dst);
+            }
+            return;
         }
-        return;
+        if crate::rs_simd::avx512bw_supported() {
+            // SAFETY: avx512bw_supported() confirmed CPU supports AVX-512BW, and slice lengths were verified equal.
+            unsafe {
+                crate::rs_simd::mul_add_avx512(coeff, src, dst);
+            }
+            return;
+        }
+        if crate::rs_simd::avx2_supported() {
+            // SAFETY: avx2_supported() confirmed CPU supports AVX2, and slice lengths were verified equal.
+            unsafe {
+                crate::rs_simd::mul_add_avx2(coeff, src, dst);
+            }
+            return;
+        }
+        if crate::rs_simd::ssse3_supported() {
+            // SAFETY: ssse3_supported() confirmed CPU supports SSSE3, and slice lengths were verified equal.
+            unsafe {
+                crate::rs_simd::mul_add_ssse3(coeff, src, dst);
+            }
+            return;
+        }
     }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if crate::rs_simd::neon_supported() {
+            // SAFETY: neon_supported() confirmed CPU supports ARM64 NEON, and slice lengths were verified equal.
+            unsafe {
+                crate::rs_simd::mul_add_neon(coeff, src, dst);
+            }
+            return;
+        }
+    }
+
     crate::gf256::mul_slice_into(dst, src, coeff);
 }
 
@@ -196,21 +235,91 @@ pub fn test_mul_add_row_differential(coeff: u8, src: &[u8]) {
     );
 
     #[cfg(target_arch = "x86_64")]
-    if crate::rs_simd::avx2_supported() {
-        let mut dst_avx2 = vec![0u8; src.len()];
-        for (i, d) in dst_avx2.iter_mut().enumerate() {
-            *d = (i as u8).wrapping_mul(31).wrapping_add(7);
+    {
+        if crate::rs_simd::gfni_supported() {
+            let mut dst_gfni = vec![0u8; src.len()];
+            for (i, d) in dst_gfni.iter_mut().enumerate() {
+                *d = (i as u8).wrapping_mul(31).wrapping_add(7);
+            }
+            // SAFETY: gfni_supported() confirmed GFNI is available, src and dst_gfni lengths match.
+            unsafe {
+                crate::rs_simd::mul_add_gfni(coeff, src, &mut dst_gfni);
+            }
+            assert_eq!(
+                dst_gfni,
+                dst_scalar,
+                "mismatch between mul_add_gfni and scalar GF(2^8) for coeff={coeff}, len={}",
+                src.len()
+            );
         }
-        // SAFETY: avx2_supported() confirmed AVX2 is available, src and dst_avx2 lengths match.
-        unsafe {
-            crate::rs_simd::mul_add_avx2(coeff, src, &mut dst_avx2);
+        if crate::rs_simd::avx512bw_supported() {
+            let mut dst_avx512 = vec![0u8; src.len()];
+            for (i, d) in dst_avx512.iter_mut().enumerate() {
+                *d = (i as u8).wrapping_mul(31).wrapping_add(7);
+            }
+            // SAFETY: avx512bw_supported() confirmed AVX-512BW is available, src and dst_avx512 lengths match.
+            unsafe {
+                crate::rs_simd::mul_add_avx512(coeff, src, &mut dst_avx512);
+            }
+            assert_eq!(
+                dst_avx512,
+                dst_scalar,
+                "mismatch between mul_add_avx512 and scalar GF(2^8) for coeff={coeff}, len={}",
+                src.len()
+            );
         }
-        assert_eq!(
-            dst_avx2,
-            dst_scalar,
-            "mismatch between mul_add_avx2 and scalar GF(2^8) for coeff={coeff}, len={}",
-            src.len()
-        );
+        if crate::rs_simd::avx2_supported() {
+            let mut dst_avx2 = vec![0u8; src.len()];
+            for (i, d) in dst_avx2.iter_mut().enumerate() {
+                *d = (i as u8).wrapping_mul(31).wrapping_add(7);
+            }
+            // SAFETY: avx2_supported() confirmed AVX2 is available, src and dst_avx2 lengths match.
+            unsafe {
+                crate::rs_simd::mul_add_avx2(coeff, src, &mut dst_avx2);
+            }
+            assert_eq!(
+                dst_avx2,
+                dst_scalar,
+                "mismatch between mul_add_avx2 and scalar GF(2^8) for coeff={coeff}, len={}",
+                src.len()
+            );
+        }
+        if crate::rs_simd::ssse3_supported() {
+            let mut dst_ssse3 = vec![0u8; src.len()];
+            for (i, d) in dst_ssse3.iter_mut().enumerate() {
+                *d = (i as u8).wrapping_mul(31).wrapping_add(7);
+            }
+            // SAFETY: ssse3_supported() confirmed SSSE3 is available, src and dst_ssse3 lengths match.
+            unsafe {
+                crate::rs_simd::mul_add_ssse3(coeff, src, &mut dst_ssse3);
+            }
+            assert_eq!(
+                dst_ssse3,
+                dst_scalar,
+                "mismatch between mul_add_ssse3 and scalar GF(2^8) for coeff={coeff}, len={}",
+                src.len()
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if crate::rs_simd::neon_supported() {
+            let mut dst_neon = vec![0u8; src.len()];
+            for (i, d) in dst_neon.iter_mut().enumerate() {
+                *d = (i as u8).wrapping_mul(31).wrapping_add(7);
+            }
+            // SAFETY: neon_supported() confirmed ARM64 NEON is available, src and dst_neon lengths match.
+            unsafe {
+                crate::rs_simd::mul_add_neon(coeff, src, &mut dst_neon);
+            }
+            assert_eq!(
+                dst_neon,
+                dst_scalar,
+                "mismatch between mul_add_neon and scalar GF(2^8) for coeff={coeff}, len={}",
+                src.len()
+            );
+        }
     }
 }
 
