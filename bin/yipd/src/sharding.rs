@@ -602,17 +602,19 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                 packets_this_iter =
                                     packets_this_iter.wrapping_add(count as u64);
                                 for desc in &descs[..count] {
-                                    let payload =
-                                        pool.chunk_slice(desc.addr, desc.len as usize);
-                                    let (tun_out, egress) =
-                                        owned_out(manager.on_udp(cfg.listen, payload, cached_now_ms));
-                                    if let Some(inner) = tun_out {
-                                        write_tun(tun_fd, &inner, vnet_len > 0);
-                                    }
-                                    if !egress.is_empty() {
-                                        let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
-                                            egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
-                                        let _ = batch_sock.sendmmsg_batch(&egress_batch);
+                                    if (desc.len as usize) <= pool.chunk_size() {
+                                        let payload =
+                                            pool.chunk_slice(desc.addr, desc.len as usize);
+                                        let (tun_out, egress) =
+                                            owned_out(manager.on_udp(cfg.listen, payload, cached_now_ms));
+                                        if let Some(inner) = tun_out {
+                                            write_tun(tun_fd, &inner, vnet_len > 0);
+                                        }
+                                        if !egress.is_empty() {
+                                            let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
+                                                egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
+                                            let _ = batch_sock.sendmmsg_batch(&egress_batch);
+                                        }
                                     }
                                     if !fill_ring.produce(desc.addr) {
                                         pool.free_chunk(desc.addr);
