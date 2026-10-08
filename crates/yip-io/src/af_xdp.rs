@@ -76,6 +76,12 @@ impl UmemPool {
 
     /// Returns a chunk address to the free pool.
     pub fn free_chunk(&mut self, addr: u64) {
+        debug_assert!(
+            (addr as usize) < self.size && addr.is_multiple_of(self.chunk_size as u64),
+            "corrupt chunk address returned to free pool: addr={addr}, size={}, chunk_size={}",
+            self.size,
+            self.chunk_size
+        );
         self.free_chunks.push(addr);
     }
 
@@ -88,9 +94,12 @@ impl UmemPool {
             "UMEM slice out of bounds: addr={addr}, len={len}, total size={}",
             self.size
         );
+        let offset = (addr as usize) % self.chunk_size;
         assert!(
-            len <= self.chunk_size,
-            "UMEM slice len={len} exceeds chunk_size={}",
+            offset
+                .checked_add(len)
+                .is_some_and(|end| end <= self.chunk_size),
+            "UMEM slice len={len} with intra-chunk offset={offset} exceeds chunk_size={}",
             self.chunk_size
         );
 
@@ -113,9 +122,12 @@ impl UmemPool {
             "UMEM slice out of bounds: addr={addr}, len={len}, total size={}",
             self.size
         );
+        let offset = (addr as usize) % self.chunk_size;
         assert!(
-            len <= self.chunk_size,
-            "UMEM slice len={len} exceeds chunk_size={}",
+            offset
+                .checked_add(len)
+                .is_some_and(|end| end <= self.chunk_size),
+            "UMEM slice len={len} with intra-chunk offset={offset} exceeds chunk_size={}",
             self.chunk_size
         );
 
@@ -183,8 +195,12 @@ pub struct FillRing {
 }
 
 impl FillRing {
-    /// Creates a new fill ring with `capacity` descriptors.
+    /// Creates a new fill ring with `capacity` descriptors. `capacity` must be a power of two.
     pub fn new(capacity: u32) -> Self {
+        assert!(
+            capacity > 0 && capacity.is_power_of_two(),
+            "FillRing capacity must be a power of two, got {capacity}"
+        );
         Self {
             entries: vec![0u64; capacity as usize],
             capacity,
@@ -218,7 +234,7 @@ impl FillRing {
         if self.is_full() {
             return false;
         }
-        let idx = (self.tail % self.capacity) as usize;
+        let idx = (self.tail as usize) & ((self.capacity - 1) as usize);
         self.entries[idx] = addr;
         self.tail = self.tail.wrapping_add(1);
         true
@@ -241,7 +257,7 @@ impl FillRing {
         if self.is_empty() {
             return None;
         }
-        let idx = (self.head % self.capacity) as usize;
+        let idx = (self.head as usize) & ((self.capacity - 1) as usize);
         let addr = self.entries[idx];
         self.head = self.head.wrapping_add(1);
         Some(addr)
@@ -273,8 +289,12 @@ pub struct CompletionRing {
 }
 
 impl CompletionRing {
-    /// Creates a new completion ring with `capacity` descriptors.
+    /// Creates a new completion ring with `capacity` descriptors. `capacity` must be a power of two.
     pub fn new(capacity: u32) -> Self {
+        assert!(
+            capacity > 0 && capacity.is_power_of_two(),
+            "CompletionRing capacity must be a power of two, got {capacity}"
+        );
         Self {
             entries: vec![0u64; capacity as usize],
             capacity,
@@ -308,7 +328,7 @@ impl CompletionRing {
         if self.is_full() {
             return false;
         }
-        let idx = (self.tail % self.capacity) as usize;
+        let idx = (self.tail as usize) & ((self.capacity - 1) as usize);
         self.entries[idx] = addr;
         self.tail = self.tail.wrapping_add(1);
         true
@@ -331,7 +351,7 @@ impl CompletionRing {
         if self.is_empty() {
             return None;
         }
-        let idx = (self.head % self.capacity) as usize;
+        let idx = (self.head as usize) & ((self.capacity - 1) as usize);
         let addr = self.entries[idx];
         self.head = self.head.wrapping_add(1);
         Some(addr)
