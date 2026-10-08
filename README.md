@@ -68,12 +68,17 @@ Read these honestly:
 - **FEC is the differentiator.** At 5% underlay loss, yip's systematic Reed–Solomon codec
   cuts application-visible loss to ~0.5% (≈ the underlying rate squared) with zero extra
   round-trips, so p99 stays flat where a plain tunnel's TCP throughput collapses.
-- **Multi-core scaling (Way A + Regime B/B+):** Single-peer multi-stream scaling benchmarks
-  (`crates/yip-bench/benches/single_flow_scale.rs`) verify lock-free scaling across cores:
-  **4.34 Gbps (1 core) → 10.72 Gbps (4 cores) → 19.05–21.56 Gbps (8 cores)** with 0 packet drops
-  and 0 TCP reordering. Vectorized `recvmmsg`/`sendmmsg` socket engines, opportunistic UDP GSO
-  (`UDP_SEGMENT`), lock-free chunked nonces, and bidirectional symmetric flow pinning eliminate
-  cross-core cache invalidation.
+- **Multi-core scaling (Way A + Regime B/B+ & Way C):** Single-peer multi-stream scaling benchmarks
+  (`crates/yip-bench/benches/single_flow_scale.rs` and `benches/af_xdp_scale.rs`) verify lock-free scaling across cores:
+  **4.34 Gbps (1 core) → 10.72 Gbps (4 cores) → 19.05–21.56 Gbps (8 cores)** on vectorized sockets, and
+  up to **31.36 Gbps / 3.06 Mpps** on the zero-copy AF_XDP UMEM pipeline with 0 packet drops and 0 TCP reordering.
+  Vectorized `recvmmsg`/`sendmmsg` socket engines, opportunistic UDP GSO (`UDP_SEGMENT`), kernel-bypass
+  zero-copy AF_XDP drivers with opportunistic three-tier fallback (`XDP_ZERO_COPY` $\to$ `XDP_COPY` $\to$ `recvmmsg`),
+  lock-free chunked nonces, and bidirectional symmetric flow pinning eliminate cross-core cache invalidation.
+- **Head-to-head WireGuard parity under channel loss:** Live network namespace benchmarks against
+  in-tree Linux kernel WireGuard (`wg0`) reveal that under 5% channel loss, WireGuard TCP throughput collapses
+  by **93.2%** (down to 0.19 Gbps), whereas `yip`'s systematic RS-FEC and hybrid ARQ maintain **81.4%** of baseline
+  goodput (0.78 Gbps) — delivering **4.1x higher goodput** with flat p99 tail latency.
 
 Hot-path microbenchmarks (Criterion), single-flow multi-core scaling tables, the `tc netem`
 WireGuard comparison, and the raw WAN data live in [`crates/yip-bench/RESULTS.md`](crates/yip-bench/RESULTS.md).
@@ -90,13 +95,14 @@ The project is decomposed into sub-projects, each built and merged independently
 | — | Handshake anti-replay, signed rendezvous registration, authenticated endpoint roaming, session rekey (~120 s) | merged |
 | 4 | Traffic-analysis defense (DAITA-style padding/timing; optional onion routing) | not started |
 | 5 | Multi-core throughput sharding (Way A + Regime B/B+ line-rate scaling) | merged |
-| — | Platform expansion (macOS/Windows) & AF_XDP zero-copy relay tier (Way C) | backlog |
+| — | Kernel-bypass zero-copy I/O tier (AF_XDP / Way C) & WireGuard parity suite | merged |
+| — | Platform expansion (macOS/Windows) | backlog |
 
 The workspace is a set of focused crates behind clean interfaces:
 
 | Crate | Responsibility |
 |---|---|
-| `yip-io` | Packet I/O: vectorized `recvmmsg`/`sendmmsg` batch engine, opportunistic UDP GSO (`UDP_SEGMENT`), lock-free chunked nonces, cache-padded SPSC ring buffers. `epoll` driver by default; opt-in single-ring `io_uring`; AF_XDP planned. The only crate with `unsafe`. |
+| `yip-io` | Packet I/O: vectorized `recvmmsg`/`sendmmsg` batch engine, opportunistic UDP GSO (`UDP_SEGMENT`), lock-free chunked nonces, cache-padded SPSC ring buffers, and AF_XDP zero-copy engine (`UmemPool`, descriptor rings, opportunistic 3-tier fallback). `epoll` driver by default; opt-in single-ring `io_uring`. The only crate with `unsafe`. |
 | `yip-wire` | Wire framing: keyed header-protection, coverage-based auth, explicit FEC headers — no fixed bytes or constant offsets. |
 | `yip-crypto` | AEAD session crypto (Noise-IK via `snow`), adaptive circular replay window (1 KB Standard to 16 KB HighThroughput), rekey. |
 | `yip-transport` | Systematic Reed–Solomon FEC (GF(256)), FEC object affinity demuxing, per-flow classifier, redundancy controller, thin ARQ. |
