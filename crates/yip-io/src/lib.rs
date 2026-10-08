@@ -5,6 +5,7 @@
 pub mod addr;
 pub mod af_xdp;
 pub mod batch;
+pub mod bpf;
 pub mod epoll;
 pub(crate) mod gso;
 pub mod nonce;

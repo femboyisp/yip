@@ -630,6 +630,7 @@ pub struct XskSocket {
     mode: XskBindMode,
     rx_ring: RxRing,
     tx_ring: TxRing,
+    filter: Option<crate::bpf::XdpRedirectFilter>,
 }
 
 impl XskSocket {
@@ -793,6 +794,7 @@ impl XskSocket {
                 mode: XskBindMode::ZeroCopy,
                 rx_ring: RxRing::new(UMEM_RING_SIZE),
                 tx_ring: TxRing::new(UMEM_RING_SIZE),
+                filter: None,
             });
         }
 
@@ -822,6 +824,7 @@ impl XskSocket {
                     mode: XskBindMode::Copy,
                     rx_ring: RxRing::new(UMEM_RING_SIZE),
                     tx_ring: TxRing::new(UMEM_RING_SIZE),
+                    filter: None,
                 });
             }
         }
@@ -837,6 +840,7 @@ impl XskSocket {
             mode: XskBindMode::FallbackRecvmmsg,
             rx_ring: RxRing::new(UMEM_RING_SIZE),
             tx_ring: TxRing::new(UMEM_RING_SIZE),
+            filter: None,
         }
     }
 
@@ -868,6 +872,33 @@ impl XskSocket {
     /// Immutable reference to the socket's TX ring buffer.
     pub fn tx_ring(&self) -> &TxRing {
         &self.tx_ring
+    }
+
+    /// Reference to the attached eBPF redirect filter, if active.
+    pub fn filter(&self) -> Option<&crate::bpf::XdpRedirectFilter> {
+        self.filter.as_ref()
+    }
+
+    /// Opportunistically attaches an eBPF XDP redirect filter steering incoming UDP traffic
+    /// for `listen_port` on `ifname` into this socket's RX ring.
+    pub fn attach_bpf_filter(
+        &mut self,
+        ifname: &str,
+        listen_port: u16,
+        queue_id: u32,
+    ) -> crate::bpf::BpfFilterStatus {
+        if self.fd < 0 {
+            return crate::bpf::BpfFilterStatus::Unsupported;
+        }
+        match crate::bpf::XdpRedirectFilter::load_and_attach(ifname, listen_port, queue_id, self.fd)
+        {
+            Ok(f) => {
+                let prog_fd = f.prog_fd();
+                self.filter = Some(f);
+                crate::bpf::BpfFilterStatus::Attached(prog_fd)
+            }
+            Err(status) => status,
+        }
     }
 }
 
