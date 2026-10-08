@@ -270,3 +270,90 @@ fn test_adaptive_poller_active_after_simulated_sleep_wakeup() {
     let t_next = t_wakeup + std::time::Duration::from_micros(5);
     assert!(poller.should_busy_poll(t_next));
 }
+
+#[test]
+fn test_auto_tuned_poller_dynamic_jitter_adaptation() {
+    let mut poller = yipd::sharding::AutoTunedPoller::new(10, 200);
+
+    // 1. Verify initial window is 50 µs and initially does not busy-poll
+    let t0 = std::time::Instant::now();
+    assert_eq!(poller.current_spin_window_us(), 50);
+    assert!(!poller.should_busy_poll(t0));
+
+    // First burst at t0: window stays 50 µs, but now busy-poll is active
+    poller.record_packet_burst(t0, 1);
+    assert_eq!(poller.current_spin_window_us(), 50);
+    assert!(poller.should_busy_poll(t0));
+    assert!(poller.should_busy_poll(t0 + std::time::Duration::from_micros(49)));
+    assert!(!poller.should_busy_poll(t0 + std::time::Duration::from_micros(50)));
+
+    // 2. Simulate high-jitter packet arrivals (120 µs intervals)
+    let mut cur_time = t0;
+    for _ in 0..10 {
+        cur_time += std::time::Duration::from_micros(120);
+        poller.record_packet_burst(cur_time, 1);
+    }
+    // Verify spin window adapts upwards (above 50 µs)
+    let high_window = poller.current_spin_window_us();
+    assert!(
+        high_window > 50,
+        "window must adapt upwards under high inter-arrival intervals, got {high_window}"
+    );
+
+    // 3. Simulate tight packet arrivals (15 µs intervals)
+    for _ in 0..50 {
+        cur_time += std::time::Duration::from_micros(15);
+        poller.record_packet_burst(cur_time, 1);
+    }
+    // Verify spin window adapts downwards towards min (< high_window and <= 25 µs)
+    let low_window = poller.current_spin_window_us();
+    assert!(
+        low_window < high_window,
+        "window must adapt downwards under tight intervals, got {low_window} vs {high_window}"
+    );
+    assert!(
+        low_window <= 25,
+        "window must approach min (10-15 µs) under tight 15 µs bursts, got {low_window}"
+    );
+
+    // 4. Verify spin window never exceeds 200 µs or falls below 10 µs
+    // Push with very large intervals (1500 µs)
+    for _ in 0..50 {
+        cur_time += std::time::Duration::from_micros(1500);
+        poller.record_packet_burst(cur_time, 1);
+    }
+    assert!(
+        poller.current_spin_window_us() <= 200,
+        "window must never exceed max_spin (200 µs), got {}",
+        poller.current_spin_window_us()
+    );
+
+    // Push with 0 µs intervals
+    for _ in 0..50 {
+        poller.record_packet_burst(cur_time, 1);
+    }
+    assert!(
+        poller.current_spin_window_us() >= 10,
+        "window must never fall below min_spin (10 µs), got {}",
+        poller.current_spin_window_us()
+    );
+
+    // 5. Verify idle gaps > 2 ms (2000 µs) are ignored and do not distort EWMA/jitter
+    let window_before_idle = poller.current_spin_window_us();
+    cur_time += std::time::Duration::from_micros(5000);
+    poller.record_packet_burst(cur_time, 1);
+    assert_eq!(
+        poller.current_spin_window_us(),
+        window_before_idle,
+        "idle gap > 2ms must not update spin window"
+    );
+
+    // 6. Verify zero packet count is ignored
+    cur_time += std::time::Duration::from_micros(10);
+    poller.record_packet_burst(cur_time, 0);
+    assert_eq!(
+        poller.current_spin_window_us(),
+        window_before_idle,
+        "0 packet count must not update spin window"
+    );
+}

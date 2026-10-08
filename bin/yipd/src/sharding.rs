@@ -220,15 +220,94 @@ impl Default for CoalescedTimer {
     }
 }
 
-/// Adaptive dynamic busy-polling engine for sub-microsecond latency.
+/// Dynamic auto-tuned busy-polling engine tracking inter-arrival jitter (Regime E).
 ///
 /// Under active traffic bursts, busy-polls descriptor and socket queues with zero
-/// syscalls / zero sleep-wakeup overhead for a configured duration (`busy_poll_duration`,
-/// default 50 µs), gracefully yielding to `epoll_wait(10)` when traffic subsides.
+/// syscalls / zero sleep-wakeup overhead. The spin duration is dynamically scaled
+/// between `min_spin` (default 10 µs) and `max_spin` (default 200 µs) using an EWMA
+/// of packet inter-arrival intervals and observed jitter, gracefully yielding to
+/// `epoll_wait(10)` when traffic subsides.
+#[derive(Debug, Clone)]
+pub struct AutoTunedPoller {
+    min_spin: std::time::Duration,
+    max_spin: std::time::Duration,
+    ewma_us: f64,
+    jitter_us: f64,
+    current_window: std::time::Duration,
+    last_active: std::time::Instant,
+    last_burst: Option<std::time::Instant>,
+}
+
+impl AutoTunedPoller {
+    /// Default minimum spin duration in microseconds.
+    pub const DEFAULT_MIN_US: u64 = 10;
+    /// Default maximum spin duration in microseconds.
+    pub const DEFAULT_MAX_US: u64 = 200;
+    /// Default initial spin duration in microseconds.
+    pub const DEFAULT_INITIAL_US: u64 = 50;
+
+    /// Create a new `AutoTunedPoller` with specified minimum and maximum spin bounds in microseconds.
+    pub fn new(min_spin_us: u64, max_spin_us: u64) -> Self {
+        let max_spin_us = max_spin_us.max(min_spin_us);
+        let initial_us = Self::DEFAULT_INITIAL_US.clamp(min_spin_us, max_spin_us);
+        Self {
+            min_spin: std::time::Duration::from_micros(min_spin_us),
+            max_spin: std::time::Duration::from_micros(max_spin_us),
+            ewma_us: initial_us as f64,
+            jitter_us: 0.0,
+            current_window: std::time::Duration::from_micros(initial_us),
+            last_active: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap_or_else(std::time::Instant::now),
+            last_burst: None,
+        }
+    }
+
+    /// Return the currently adapted spin window in microseconds.
+    #[inline]
+    pub fn current_spin_window_us(&self) -> u64 {
+        self.current_window.as_micros() as u64
+    }
+
+    /// Record a packet burst of `packet_count` packets at `now`, updating inter-arrival EWMA and jitter.
+    pub fn record_packet_burst(&mut self, now: std::time::Instant, packet_count: u64) {
+        if packet_count == 0 {
+            return;
+        }
+        if let Some(last_burst) = self.last_burst {
+            let dt_us = now.saturating_duration_since(last_burst).as_micros() as f64;
+            if dt_us <= 2000.0 {
+                self.ewma_us = 0.875 * self.ewma_us + 0.125 * dt_us;
+                self.jitter_us = 0.75 * self.jitter_us + 0.25 * (dt_us - self.ewma_us).abs();
+                let min_us = self.min_spin.as_micros() as f64;
+                let max_us = self.max_spin.as_micros() as f64;
+                let target = (self.ewma_us + 2.0 * self.jitter_us).clamp(min_us, max_us);
+                self.current_window = std::time::Duration::from_micros(target as u64);
+            }
+        }
+        self.last_burst = Some(now);
+        self.last_active = now;
+    }
+
+    /// Check whether the worker should busy-poll (spin loop with non-blocking wait(0)).
+    #[inline]
+    pub fn should_busy_poll(&self, now: std::time::Instant) -> bool {
+        now.saturating_duration_since(self.last_active) < self.current_window
+    }
+
+    /// Record that packets were processed at `now`, resetting the busy-polling window.
+    #[inline]
+    pub fn record_active(&mut self, now: std::time::Instant) {
+        self.record_packet_burst(now, 1);
+    }
+}
+
+/// Adaptive busy-polling engine for sub-microsecond latency.
+///
+/// Backwards-compatible wrapper around [`AutoTunedPoller`] with a fixed busy-polling window.
 #[derive(Debug, Clone)]
 pub struct AdaptivePoller {
-    busy_poll_duration: std::time::Duration,
-    last_active: std::time::Instant,
+    inner: AutoTunedPoller,
 }
 
 impl AdaptivePoller {
@@ -237,24 +316,28 @@ impl AdaptivePoller {
     /// Initializes `last_active` 1 second in the past so the poller does not busy-poll
     /// on initial startup before any packets arrive.
     pub fn new(busy_poll_us: u64) -> Self {
-        Self {
-            busy_poll_duration: std::time::Duration::from_micros(busy_poll_us),
-            last_active: std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_secs(1))
-                .unwrap_or_else(std::time::Instant::now),
-        }
+        let mut poller = AutoTunedPoller::new(busy_poll_us, busy_poll_us);
+        poller.current_window = std::time::Duration::from_micros(busy_poll_us);
+        poller.ewma_us = busy_poll_us as f64;
+        Self { inner: poller }
     }
 
     /// Check whether the worker should busy-poll (spin loop with non-blocking wait(0)).
     #[inline]
     pub fn should_busy_poll(&self, now: std::time::Instant) -> bool {
-        now.saturating_duration_since(self.last_active) < self.busy_poll_duration
+        self.inner.should_busy_poll(now)
     }
 
     /// Record that packets were processed at `now`, resetting the busy-polling window.
     #[inline]
     pub fn record_active(&mut self, now: std::time::Instant) {
-        self.last_active = now;
+        self.inner.record_active(now);
+    }
+
+    /// Record a packet burst of `packet_count` packets at `now`.
+    #[inline]
+    pub fn record_packet_burst(&mut self, now: std::time::Instant, packet_count: u64) {
+        self.inner.record_packet_burst(now, packet_count);
     }
 }
 
@@ -576,11 +659,23 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                 let egress_pool =
                     crate::port::bind_udp_egress_pool(egress_bind, 64).unwrap_or_default();
                 let mut coalesced_timer = CoalescedTimer::new();
-                let busy_poll_us = std::env::var("YIP_BUSY_POLL_US")
+                let (min_spin_us, max_spin_us) = if let Some(fixed) = std::env::var("YIP_BUSY_POLL_US")
                     .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(50);
-                let mut adaptive_poller = AdaptivePoller::new(busy_poll_us);
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    (fixed, fixed)
+                } else {
+                    let min_spin_us = std::env::var("YIP_MIN_BUSY_POLL_US")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(AutoTunedPoller::DEFAULT_MIN_US);
+                    let max_spin_us = std::env::var("YIP_MAX_BUSY_POLL_US")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(AutoTunedPoller::DEFAULT_MAX_US);
+                    (min_spin_us, max_spin_us)
+                };
+                let mut auto_poller = AutoTunedPoller::new(min_spin_us, max_spin_us);
 
                 let mut batch_sock = yip_io::batch::BatchUdpSocket::new(&sock);
                 let mut rx_buffers = [[0u8; yip_io::MAX_WIRE_DATAGRAM]; yip_io::batch::BATCH_SIZE];
@@ -597,7 +692,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                     }
 
                     let is_busy_polling =
-                        adaptive_poller.should_busy_poll(std::time::Instant::now());
+                        auto_poller.should_busy_poll(std::time::Instant::now());
                     let ready = if is_busy_polling {
                         std::hint::spin_loop();
                         poller.wait(0)?
@@ -738,7 +833,8 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                     }
 
                     if packets_this_iter > 0 {
-                        adaptive_poller.record_active(std::time::Instant::now());
+                        auto_poller
+                            .record_packet_burst(std::time::Instant::now(), packets_this_iter);
                     }
 
                     // 4. Cadence tick (feedback / keepalive / retransmit / cover)
@@ -1371,5 +1467,32 @@ mod tests {
             !poller.should_busy_poll(now),
             "0-microsecond poller should never busy poll"
         );
+    }
+
+    #[test]
+    fn test_auto_tuned_poller_unit_behavior() {
+        let mut poller = AutoTunedPoller::new(10, 200);
+        assert_eq!(poller.current_spin_window_us(), 50);
+
+        let t0 = std::time::Instant::now();
+        assert!(!poller.should_busy_poll(t0));
+
+        poller.record_packet_burst(t0, 5);
+        assert_eq!(poller.current_spin_window_us(), 50);
+        assert!(poller.should_busy_poll(t0));
+
+        // 0 count does not alter state
+        poller.record_packet_burst(t0 + std::time::Duration::from_micros(10), 0);
+        assert_eq!(poller.current_spin_window_us(), 50);
+
+        // Gap > 2ms (e.g. 3000 µs) is ignored by jitter tracker
+        let t1 = t0 + std::time::Duration::from_micros(3000);
+        poller.record_packet_burst(t1, 1);
+        assert_eq!(poller.current_spin_window_us(), 50);
+
+        // Subsequent burst within 2ms updates jitter
+        let t2 = t1 + std::time::Duration::from_micros(100);
+        poller.record_packet_burst(t2, 2);
+        assert!(poller.current_spin_window_us() > 50);
     }
 }
