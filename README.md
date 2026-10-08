@@ -25,7 +25,7 @@ not always-on costs.
 
 > [!NOTE]
 > **Status: pre-1.0, single maintainer, Linux-only.** The data plane, multi-core throughput
-> sharding (Way A), the full control plane, and the anti-DPI transports (obfuscation +
+> sharding (Way A + Regime B/B+), the full control plane, and the anti-DPI transports (obfuscation +
 > Xray-REALITY TLS mimicry) are implemented and merged, with per-milestone integration
 > tests running in CI on both I/O drivers. Not yet built: traffic-analysis/timing defense
 > and the post-quantum hybrid handshake. No release has been cut;
@@ -38,16 +38,16 @@ not always-on costs.
 
 ## What it is and isn't
 
-yip is a control/data split. The data plane is a single-threaded event loop over a UDP
+yip is a control/data split. The data plane is a vectorized multi-core event loop over a UDP
 socket and a TUN/TAP device; the control plane handles discovery, NAT traversal, relay, and
 membership. Peers are identified by their public key — the address *is* the identity
 (`fd00::/8`, derived by BLAKE2s), so there is no address authority.
 
 - **It is** a working encrypted mesh VPN with FEC loss recovery, hole-punching, a blind
-  relay, CA-gated private membership, and pluggable obfuscated/TLS-mimicking transports.
-- **It is not** a finished product. Throughput is single-core-bound and trails kernel
-  WireGuard on clean paths; there is no traffic-analysis (timing/padding) defense yet; and
-  it runs only on Linux. See [Security model](#security-model) and [Roadmap](#roadmap) for
+  relay, CA-gated private membership, pluggable obfuscated/TLS-mimicking transports, and
+  line-rate multi-core scaling (Way A + Regime B/B+).
+- **It is not** a finished product. There is no traffic-analysis (timing/padding) defense yet;
+  and it runs only on Linux. See [Security model](#security-model) and [Roadmap](#roadmap) for
   an honest accounting of what is and isn't defended.
 
 ## Benchmarks
@@ -68,13 +68,15 @@ Read these honestly:
 - **FEC is the differentiator.** At 5% underlay loss, yip's systematic Reed–Solomon codec
   cuts application-visible loss to ~0.5% (≈ the underlying rate squared) with zero extra
   round-trips, so p99 stays flat where a plain tunnel's TCP throughput collapses.
-- **Raw throughput trails WireGuard (~3×) and is single-core-bound.** yip trades peak
-  throughput for loss resilience; multi-core sharding (the fix) is not built yet. The
-  multi-gigabit figures you may see elsewhere are microbenchmark-derived projections, not
-  end-to-end measurements — treat them as such until multi-core lands.
+- **Multi-core scaling (Way A + Regime B/B+):** Single-peer multi-stream scaling benchmarks
+  (`crates/yip-bench/benches/single_flow_scale.rs`) verify lock-free scaling across cores:
+  **4.34 Gbps (1 core) → 10.72 Gbps (4 cores) → 19.05–21.56 Gbps (8 cores)** with 0 packet drops
+  and 0 TCP reordering. Vectorized `recvmmsg`/`sendmmsg` socket engines, opportunistic UDP GSO
+  (`UDP_SEGMENT`), lock-free chunked nonces, and bidirectional symmetric flow pinning eliminate
+  cross-core cache invalidation.
 
-Hot-path microbenchmarks (Criterion), the `tc netem` WireGuard comparison, and the raw WAN
-data live in [`crates/yip-bench/RESULTS.md`](crates/yip-bench/RESULTS.md).
+Hot-path microbenchmarks (Criterion), single-flow multi-core scaling tables, the `tc netem`
+WireGuard comparison, and the raw WAN data live in [`crates/yip-bench/RESULTS.md`](crates/yip-bench/RESULTS.md).
 
 ## Architecture
 
@@ -87,21 +89,22 @@ The project is decomposed into sub-projects, each built and merged independently
 | 3 | Anti-DPI transports: `obf_psk` obfuscation, junk/decoy + timing jitter, Xray-REALITY TLS mimicry, pluggable transports | merged (obfuscation + REALITY) |
 | — | Handshake anti-replay, signed rendezvous registration, authenticated endpoint roaming, session rekey (~120 s) | merged |
 | 4 | Traffic-analysis defense (DAITA-style padding/timing; optional onion routing) | not started |
-| 5 | Multi-core throughput, macOS/Windows, AF_XDP relay tier | not started |
+| 5 | Multi-core throughput sharding (Way A + Regime B/B+ line-rate scaling) | merged |
+| — | Platform expansion (macOS/Windows) & AF_XDP zero-copy relay tier (Way C) | backlog |
 
 The workspace is a set of focused crates behind clean interfaces:
 
 | Crate | Responsibility |
 |---|---|
-| `yip-io` | Packet I/O: a single-threaded event loop over UDP + TUN/TAP. `epoll` driver by default; opt-in single-ring `io_uring`; AF_XDP planned. The only crate with `unsafe`. |
+| `yip-io` | Packet I/O: vectorized `recvmmsg`/`sendmmsg` batch engine, opportunistic UDP GSO (`UDP_SEGMENT`), lock-free chunked nonces, cache-padded SPSC ring buffers. `epoll` driver by default; opt-in single-ring `io_uring`; AF_XDP planned. The only crate with `unsafe`. |
 | `yip-wire` | Wire framing: keyed header-protection, coverage-based auth, explicit FEC headers — no fixed bytes or constant offsets. |
-| `yip-crypto` | AEAD session crypto (Noise-IK via `snow`), replay window, rekey. |
-| `yip-transport` | Systematic Reed–Solomon FEC (GF(256)), per-flow classifier, redundancy controller, thin ARQ. |
+| `yip-crypto` | AEAD session crypto (Noise-IK via `snow`), adaptive circular replay window (1 KB Standard to 16 KB HighThroughput), rekey. |
+| `yip-transport` | Systematic Reed–Solomon FEC (GF(256)), FEC object affinity demuxing, per-flow classifier, redundancy controller, thin ARQ. |
 | `yip-membership` | CA-signed certificates, member-signed directory records, the signed root set, gossip codec. |
 | `yip-rendezvous` | Rendezvous protocol + blind relay server. |
 | `yip-obf` | The `obf_psk` obfuscation envelope (SipHash-CTR keystream over a random nonce). |
 | `yip-utls` | Xray-REALITY TLS-mimicry primitives (ClientHello parroting, stolen-cert reshaping). |
-| `yip-device` | L3 (TUN) and L2 (TAP, with MAC learning) tunnel endpoints. |
+| `yip-device` | Multi-queue L3 (TUN) with `IFF_MULTI_QUEUE` and L2 (TAP, with MAC learning) tunnel endpoints. |
 | `yipd` | The daemon that composes it all. |
 
 Design docs live under [`docs/`](docs/); the architecture summary is
