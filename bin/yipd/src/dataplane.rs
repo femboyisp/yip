@@ -269,6 +269,11 @@ impl DataPlane {
         self.peer_addr = addr;
     }
 
+    /// Reconfigure shard start object id and stride increment for multi-core scaling.
+    pub fn set_shard(&mut self, shard_id: usize, num_shards: usize) {
+        self.transport.set_shard(shard_id, num_shards);
+    }
+
     /// Seal `inner`, FEC-encode, frame each symbol, and return the resulting
     /// egress datagrams as a borrow of an internal reused scratch buffer.
     ///
@@ -438,7 +443,9 @@ impl DataPlane {
                 let plaintext = match self.session.open(counter, ct) {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("dataplane ingress: control open error: {e}");
+                        eprintln!(
+                            "dataplane ingress: control open error on counter={counter}: {e}"
+                        );
                         return Outcome::None;
                     }
                 };

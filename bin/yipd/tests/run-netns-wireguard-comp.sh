@@ -177,6 +177,7 @@ listen=${VETH_A_IP}:${YIP_PORT_A}
 peer_endpoint=${VETH_B_IP}:${YIP_PORT_B}
 device=${YIP_DEV}
 initiate=false
+shards=4
 EOF
 
 cat > "$CFG_YIP_B" <<EOF
@@ -188,6 +189,7 @@ listen=${VETH_B_IP}:${YIP_PORT_B}
 peer_endpoint=${VETH_A_IP}:${YIP_PORT_A}
 device=${YIP_DEV}
 initiate=true
+shards=4
 EOF
 
 # Start yipd daemons
@@ -247,7 +249,7 @@ echo "[setup] yip tunnel active and responsive (${YIP_A_IP} <-> ${YIP_B_IP})."
 
 # ── 4. Head-to-Head Comparative Benchmark Suite ──────────────────────────────
 CONDITIONS=("0" "1" "5")
-IPERF_DURATION=4
+IPERF_DURATION=3
 IPERF_STREAMS=4
 PING_COUNT=50
 PING_INTERVAL=0.05

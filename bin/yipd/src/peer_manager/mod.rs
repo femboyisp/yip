@@ -432,6 +432,8 @@ pub struct PeerManager {
     /// costs an Ed25519 `verify_cert` and `tick` can run far more often than
     /// that on the busy-poll path.
     last_cert_sweep_ms: u64,
+    /// Worker shard index for multi-core scaling.
+    shard_id: usize,
     /// Number of worker shards for multi-core scaling.
     num_shards: usize,
     /// Newly established session epochs queued for cross-shard broadcast.
@@ -544,6 +546,7 @@ impl PeerManager {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(crate::epoch::REKEY_INTERVAL_MS),
             last_cert_sweep_ms: 0,
+            shard_id: 0,
             num_shards: 1,
             new_epochs: Vec::new(),
         };
@@ -655,6 +658,11 @@ impl PeerManager {
         self.num_shards = num_shards.max(1);
     }
 
+    /// Set current worker shard id for multi-queue worker scaling.
+    pub fn set_shard_id(&mut self, shard_id: usize) {
+        self.shard_id = shard_id;
+    }
+
     /// Get total worker shards count.
     #[expect(dead_code, reason = "helper for inspecting configured shard count")]
     pub fn num_shards(&self) -> usize {
@@ -675,7 +683,10 @@ impl PeerManager {
                 epochs
                     .current_mut()
                     .session_mut()
-                    .set_stride(0, self.num_shards as u64);
+                    .set_stride(self.shard_id as u64, self.num_shards as u64);
+                epochs
+                    .current_mut()
+                    .set_shard(self.shard_id, self.num_shards);
             }
             let dp = epochs.current();
             let send_key = *dp.raw_send_key();
@@ -735,7 +746,7 @@ impl PeerManager {
             self.peers[idx].path.on_direct_addr(ep);
         }
 
-        let dp = Box::new(DataPlane::new(
+        let mut dp = Box::new(DataPlane::new(
             established,
             conn_tag,
             self.mode,
@@ -743,6 +754,9 @@ impl PeerManager {
             self.obf_key.is_some(),
             self.data_symbol_size,
         ));
+        if self.num_shards > 1 {
+            dp.set_shard(self.shard_id, self.num_shards);
+        }
 
         self.by_tag.insert(conn_tag, idx);
         let addr = node_addr(peer_pk);

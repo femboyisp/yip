@@ -416,8 +416,15 @@ impl Session {
 
     /// Reconfigure the send counter and stride increment for this session.
     pub fn set_stride(&mut self, start_counter: u64, stride: u64) {
-        self.send_counter = start_counter;
-        self.stride = if stride == 0 { 1 } else { stride };
+        let stride = if stride == 0 { 1 } else { stride };
+        if self.send_counter == 0 {
+            self.send_counter = start_counter;
+        } else {
+            while self.send_counter % stride != start_counter % stride {
+                self.send_counter = self.send_counter.saturating_add(1);
+            }
+        }
+        self.stride = stride;
     }
 
     /// The current nonce stride increment.

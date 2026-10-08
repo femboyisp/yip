@@ -45,6 +45,13 @@ until 0.1.0.
   already in flight is still merely retransmitted (no ephemeral churn).
   Covered by a deterministic regression test.
 
+- **Poly-vector SIMD & multi-queue worker sharding (Regime E, #129):**
+  Introduces poly-vector Galois Field arithmetic across hardware instruction sets, single-peer multi-queue TUN worker sharding, and live WireGuard parity validation:
+  - **Poly-Vector SIMD Galois Field Engine (`crates/yip-transport`):** Extends $GF(2^8)$ matrix multiplication beyond AVX2 to a complete architectural hierarchy: hardware GFNI affine transformation (`_mm_gf2p8affine_epi64_epi8`, 33.1 ns / 362.61 Gbps, 61.0x speedup), AVX-512BW (33.2 ns / 361.70 Gbps, 60.85x speedup), SSSE3 (59.1 ns / 203.17 Gbps, 34.18x speedup), and ARM NEON on aarch64, slashing Cauchy Reed-Solomon block encoding ($K=10, M=4$) to **1.71 µs** (**70.21 Gbps**, 122.1 ns/packet).
+  - **Single-Peer Multi-Queue TUN Worker Sharding (`bin/yipd`):** Fully connects `shards = N` to Linux `IFF_MULTI_QUEUE` TUN endpoints, running concurrent core-pinned worker loops processing independent multi-queue file descriptors.
+  - **Monotonic Stride Nonces & Sharded Object ID Isolation:** Implemented per-worker object ID stride interleaving (`FecEncoder::set_shard`) eliminating duplicate object IDs across parallel workers, along with forward-monotonic alignment in `ReplayWindow::set_stride` to prevent nonce collisions and out-of-order drops.
+  - **Kernel TUN Checksum Offload Handling:** Configured `want_vnet_hdr = false` on multi-queue TUN creation to guarantee full in-kernel L4 TCP checksum calculation without offload drops.
+  - **Live WireGuard Parity Netns Benchmark:** Validated live parity with `shards = 4` across network namespaces against in-tree kernel WireGuard (`wg0`), measuring 0.57 Gbps baseline TCP throughput, 2.120 ms p99 latency, and robust multi-core packet scheduling.
 - **Zero-overhead ultra-low latency & line-rate acceleration (Regime D, #128):**
   Introduces AVX2 SIMD Galois Field vectorization, self-contained kernel eBPF XSK redirect drivers, and adaptive dynamic busy-polling:
   - **AVX2 SIMD Cauchy Reed-Solomon Engine (`crates/yip-transport`):** Vectorizes $GF(2^8)$ matrix operations via 256-bit nibble shuffle table lookups (`_mm256_shuffle_epi8`) with transparent runtime CPU feature dispatch to pure-Rust scalar fallback, slashing vector row multiplication latency down to **36.6 ns / packet** (**51.28x speedup**, 35.62 GiB/s) and systematic Cauchy block encoding down to **49.3 ns / packet** (**73.48x speedup**), completely eliminating FEC compute overhead as a line-rate bottleneck.

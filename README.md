@@ -72,16 +72,17 @@ Live comparative benchmark in isolated Linux network namespaces (`run-netns-wire
 
 Single-peer multi-stream scaling benchmarks across 1, 2, 4, and 8 worker CPU cores (64 concurrent TCP streams, 0 packet drops, 0 TCP reordering):
 
-| Worker Threads | Vectorized Sockets (`recvmmsg`) | Kernel-Bypass AF_XDP Zero-Copy | Scaling Efficiency | Drops | Out-of-Order |
-|:--------------:|--------------------------------:|-------------------------------:|:------------------:|:-----:|:------------:|
-| **1 Core** | 4.58 Gbps (0.45 Mpps) | 8.68 Gbps (0.85 Mpps) | 100.0% | **0** | **0** |
-| **2 Cores** | 6.04 Gbps (0.59 Mpps) | 11.26 Gbps (1.10 Mpps) | 64.8% | **0** | **0** |
-| **4 Cores** | 11.43 Gbps (1.12 Mpps) | 21.22 Gbps (2.07 Mpps) | 61.1% | **0** | **0** |
-| **8 Cores** | **21.29–21.56 Gbps (2.10 Mpps)** | **40.27 Gbps (3.93 Mpps)** | 58.0% | **0** | **0** |
+| Worker Threads | Vectorized Sockets (`recvmmsg`) | Kernel-Bypass AF_XDP Zero-Copy | Scaling Speedup | Drops | Out-of-Order |
+|:--------------:|--------------------------------:|-------------------------------:|:---------------:|:-----:|:------------:|
+| **1 Core** | 4.58 Gbps (0.45 Mpps) | 7.60–8.68 Gbps (0.74–0.85 Mpps) | 1.00x | **0** | **0** |
+| **2 Cores** | 6.04 Gbps (0.59 Mpps) | 10.45–11.26 Gbps (1.02–1.10 Mpps) | 1.38x | **0** | **0** |
+| **4 Cores** | 11.43 Gbps (1.12 Mpps) | 18.84–21.22 Gbps (1.84–2.07 Mpps) | 2.48x | **0** | **0** |
+| **8 Cores** | **21.29–21.56 Gbps (2.10 Mpps)** | **29.20–40.27 Gbps (2.85–3.93 Mpps)** | 3.84x–4.64x | **0** | **0** |
 
 - **Zero Lock Contention:** Lock-free chunked nonces (`ChunkedNonceDispenser`), power-of-two circular descriptor queues (`FillRing`, `RxRing`, `TxRing`, `CompletionRing`), and cache-line padded SPSC matrix queues.
-- **AVX2 SIMD Reed-Solomon Acceleration (< 200 ns):** Vectorized $GF(2^8)$ Galois Field arithmetic via 256-bit nibble shuffle lookups (`_mm256_shuffle_epi8`) accelerating row operations to **36.6 ns / packet** (over **51x speedup** vs scalar) and Cauchy block encoding to **49.3 ns / packet**.
-- **Self-Contained eBPF XSK Driver:** Embedded minimal eBPF XDP redirect driver and `XSKMAP` filter steering matching tunnel UDP packets directly into AF_XDP rings at the NIC driver layer, bypassing `sk_buff` allocations.
+- **Poly-Vector SIMD Galois Field Acceleration (GFNI / AVX-512 / AVX2 / SSSE3 / NEON):** Runtime CPU dispatch delivering hardware Galois Field New Instructions (`_mm_gf2p8affine_epi64_epi8`) with **33.1 ns / packet** row multiplication (**61.00x speedup**) and **1.71 µs** Cauchy block encoding (**70.21 Gbps**, **48.95x speedup**, 122.1 ns/packet), supported across AVX-512BW, AVX2, SSSE3, and ARM NEON.
+- **Single-Peer Multi-Queue TUN Worker Sharding (`shards = N`):** Core-pinned worker threads consuming multi-queue TUN queues (`IFF_MULTI_QUEUE`) with per-shard object ID stride partitioning (`object_id = shard_id + k * num_shards`) and monotonic nonces, eliminating cross-worker contention.
+- **Self-Contained Multi-Queue eBPF XSK Driver:** Embedded minimal eBPF XDP redirect driver and `XSKMAP` filter steering matching tunnel UDP packets directly into AF_XDP rings at the NIC driver layer, bypassing `sk_buff` allocations.
 - **Adaptive Dynamic Busy-Polling:** 50 µs zero-syscall hysteresis spin-polling window under active traffic bursts eliminating kernel scheduler wakeup latency, gracefully yielding to low-power `epoll_wait(10)` during idle periods.
 - **Three-Tier Fallback:** AF_XDP socket initialization seamlessly negotiates `XDP_ZERO_COPY` (hardware NIC DMA) $\to$ `XDP_COPY` (driver zero-copy emulation) $\to$ `recvmmsg` vectorized batching, ensuring line-rate operation without panics in unprivileged containers.
 
@@ -101,6 +102,7 @@ The project is decomposed into sub-projects, each built and merged independently
 | 5 | Multi-core throughput sharding (Way A + Regime B/B+ line-rate scaling) | merged |
 | — | Kernel-bypass zero-copy I/O tier (AF_XDP / Way C) & WireGuard parity suite | merged |
 | — | Zero-overhead ultra-low latency & line-rate acceleration (Regime D: AVX2 SIMD RS, eBPF XSK driver, adaptive poller) | merged |
+| — | Poly-vector SIMD & multi-queue worker sharding (Regime E: GFNI/AVX-512/NEON RS, multi-queue TUN/eBPF, auto-tuned polling) | merged |
 | — | Platform expansion (macOS/Windows) | backlog |
 
 The workspace is a set of focused crates behind clean interfaces:

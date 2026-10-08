@@ -128,6 +128,11 @@ impl Transport {
         }
     }
 
+    /// Reconfigure shard start object id and stride increment for multi-core scaling.
+    pub fn set_shard(&mut self, shard_id: usize, num_shards: usize) {
+        self.encoder.set_shard(shard_id as u16, num_shards as u16);
+    }
+
     /// `class`'s default [`FlowParams`], with `symbol_size` overridden by the
     /// value this `Transport` was constructed with.
     fn params_for(&self, class: FlowClass) -> FlowParams {

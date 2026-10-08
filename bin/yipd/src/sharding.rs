@@ -565,8 +565,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
         crate::mode::TunnelMode::L3Tun => yip_device::DeviceKind::Tun,
         crate::mode::TunnelMode::L2Tap => yip_device::DeviceKind::Tap,
     };
-    let use_uring = std::env::var_os("YIP_USE_URING").is_some() && yip_io::uring::uring_available();
-    let want_vnet_hdr = !use_uring;
+    let want_vnet_hdr = false;
 
     let mut tun_queues = yip_device::TunTap::create_multi_queue(
         &config.device,
@@ -634,15 +633,18 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
 
                 let mut manager = create_peer_manager(&cfg, &peers)?;
                 manager.set_num_shards(num_shards);
+                manager.set_shard_id(shard_id);
                 let tun_fd = tun_dev.as_raw_fd();
 
                 // Probe opportunistic AF_XDP socket with 3-tier fallback
                 let mut umem_pool = UmemPool::new(2048, 4096).ok();
-                let xsk_ifname =
-                    std::env::var("YIP_XDP_IFNAME").unwrap_or_else(|_| "lo".to_string());
                 let mut xsk_sock = if let Some(ref pool) = umem_pool {
-                    XskSocket::bind_opportunistic(&xsk_ifname, shard_id as u32, pool)
-                        .unwrap_or_else(|_| XskSocket::fallback())
+                    if let Ok(xsk_ifname) = std::env::var("YIP_XDP_IFNAME") {
+                        XskSocket::bind_opportunistic(&xsk_ifname, shard_id as u32, pool)
+                            .unwrap_or_else(|_| XskSocket::fallback())
+                    } else {
+                        XskSocket::fallback()
+                    }
                 } else {
                     XskSocket::fallback()
                 };
@@ -667,13 +669,16 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                 let poller = yip_io::epoll::Epoll::new(sock_fd, tun_fd)?;
                 let vnet_len = tun_dev.vnet_hdr_len().unwrap_or(0);
                 let is_tap = cfg.device_kind == crate::mode::TunnelMode::L2Tap;
-                let egress_bind = if cfg.listen.is_ipv6() {
-                    std::net::SocketAddr::from(([0u8; 16], 0))
+                let egress_pool: Vec<std::net::UdpSocket> = if std::env::var_os("YIP_EGRESS_POOL").is_some() {
+                    let egress_bind = if cfg.listen.is_ipv6() {
+                        std::net::SocketAddr::from(([0u8; 16], 0))
+                    } else {
+                        std::net::SocketAddr::from(([0u8; 4], 0))
+                    };
+                    crate::port::bind_udp_egress_pool(egress_bind, 64).unwrap_or_default()
                 } else {
-                    std::net::SocketAddr::from(([0u8; 4], 0))
+                    Vec::new()
                 };
-                let egress_pool =
-                    crate::port::bind_udp_egress_pool(egress_bind, 64).unwrap_or_default();
                 let mut coalesced_timer = CoalescedTimer::new();
                 let (min_spin_us, max_spin_us) = if let Some(fixed) = std::env::var("YIP_BUSY_POLL_US")
                     .ok()
@@ -738,10 +743,10 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                             let dg = &rx_datagrams[i];
                                             let payload = &rx_buffers[i][..dg.len];
 
-                                            if shard_id != 0
-                                                && !payload.is_empty()
-                                                && payload[0] != crate::handshake::PacketType::Data as u8
-                                            {
+                                            let is_hs = !payload.is_empty()
+                                                && (payload[0] == crate::handshake::PacketType::HandshakeInit as u8
+                                                    || payload[0] == crate::handshake::PacketType::HandshakeResp as u8);
+                                            if shard_id != 0 && is_hs {
                                                 if let Some(Some(ref tx)) = tx_channels.first() {
                                                     let _ = tx.push(ShardMsg::HandshakeForward(
                                                         payload.to_vec(),
@@ -790,10 +795,10 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                     if (desc.len as usize) <= pool.chunk_size() {
                                         let payload =
                                             pool.chunk_slice(desc.addr, desc.len as usize);
-                                        if shard_id != 0
-                                            && !payload.is_empty()
-                                            && payload[0] != crate::handshake::PacketType::Data as u8
-                                        {
+                                        let is_hs = !payload.is_empty()
+                                            && (payload[0] == crate::handshake::PacketType::HandshakeInit as u8
+                                                || payload[0] == crate::handshake::PacketType::HandshakeResp as u8);
+                                        if shard_id != 0 && is_hs {
                                             if let Some(Some(ref tx)) = tx_channels.first() {
                                                 let _ = tx.push(ShardMsg::HandshakeForward(
                                                     payload.to_vec(),
@@ -843,25 +848,35 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                         if manager.is_tun_target_established(pkt) {
                                             let egress = manager.on_tun(pkt, cached_now_ms);
                                             for dg in egress {
-                                                let send_sock = select_egress_socket(
-                                                    &sock,
-                                                    &egress_pool,
-                                                    pkt,
-                                                    is_tap,
-                                                    dg.dst,
-                                                );
+                                                let is_data = dg.bytes.first() == Some(&(crate::handshake::PacketType::Data as u8));
+                                                let send_sock = if is_data {
+                                                    select_egress_socket(
+                                                        &sock,
+                                                        &egress_pool,
+                                                        pkt,
+                                                        is_tap,
+                                                        dg.dst,
+                                                    )
+                                                } else {
+                                                    &sock
+                                                };
                                                 let _ = send_sock.send_to(&dg.bytes, dg.dst);
                                             }
                                         } else if shard_id == 0 {
                                             let egress = manager.on_tun(pkt, cached_now_ms);
                                             for dg in egress {
-                                                let send_sock = select_egress_socket(
-                                                    &sock,
-                                                    &egress_pool,
-                                                    pkt,
-                                                    is_tap,
-                                                    dg.dst,
-                                                );
+                                                let is_data = dg.bytes.first() == Some(&(crate::handshake::PacketType::Data as u8));
+                                                let send_sock = if is_data {
+                                                    select_egress_socket(
+                                                        &sock,
+                                                        &egress_pool,
+                                                        pkt,
+                                                        is_tap,
+                                                        dg.dst,
+                                                    )
+                                                } else {
+                                                    &sock
+                                                };
                                                 let _ = send_sock.send_to(&dg.bytes, dg.dst);
                                             }
                                             for epoch in manager.drain_new_epochs() {
@@ -896,13 +911,18 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                 ShardMsg::Packet(pkt) => {
                                     let egress = manager.on_tun(pkt, cached_now_ms);
                                     for dg in egress {
-                                        let send_sock = select_egress_socket(
-                                            &sock,
-                                            &egress_pool,
-                                            pkt,
-                                            is_tap,
-                                            dg.dst,
-                                        );
+                                        let is_data = dg.bytes.first() == Some(&(crate::handshake::PacketType::Data as u8));
+                                        let send_sock = if is_data {
+                                            select_egress_socket(
+                                                &sock,
+                                                &egress_pool,
+                                                pkt,
+                                                is_tap,
+                                                dg.dst,
+                                            )
+                                        } else {
+                                            &sock
+                                        };
                                         let _ = send_sock.send_to(&dg.bytes, dg.dst);
                                     }
                                     if shard_id == 0 {
