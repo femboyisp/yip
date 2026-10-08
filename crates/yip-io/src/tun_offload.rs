@@ -1,32 +1,17 @@
 //! Local TUN `virtio_net_hdr` (GSO/GRO) framing + the RX coalescer / TX splitter.
 //! Purely local to the yipd↔kernel-TUN boundary — never touches the wire.
 
-pub(crate) const VNET_HDR_LEN: usize = 10;
-pub(crate) const GSO_NONE: u8 = 0;
-pub(crate) const GSO_TCPV4: u8 = 1;
-#[expect(
-    dead_code,
-    reason = "virtio_net_hdr gso_type value for a future IPv6 TSO coalescer/splitter; the \
-              Task 5 Coalescer/split_gro only handle IPv4 TCP GSO"
-)]
-pub(crate) const GSO_TCPV6: u8 = 4;
-#[expect(
-    dead_code,
-    reason = "virtio_net_hdr gso_type value for a future UDP GSO coalescer/splitter; the \
-              Task 5 Coalescer/split_gro only handle IPv4 TCP GSO"
-)]
-pub(crate) const GSO_UDP_L4: u8 = 5;
-pub(crate) const F_NEEDS_CSUM: u8 = 1;
-#[expect(
-    dead_code,
-    reason = "virtio_net_hdr flags bit set by a kernel GRO read whose checksum is already \
-              verified; the Task 5 split_gro path recomputes checksums itself and never reads \
-              this flag"
-)]
-pub(crate) const F_DATA_VALID: u8 = 2;
+pub const VNET_HDR_LEN: usize = 10;
+pub const GSO_NONE: u8 = 0;
+pub const GSO_TCPV4: u8 = 1;
+pub const GSO_TCPV6: u8 = 4;
+pub const GSO_UDP_L4: u8 = 5;
+pub const F_NEEDS_CSUM: u8 = 1;
+pub const F_DATA_VALID: u8 = 2;
 
+#[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct VnetHdr {
+pub struct VirtioNetHdr {
     pub flags: u8,
     pub gso_type: u8,
     pub hdr_len: u16,
@@ -35,12 +20,33 @@ pub(crate) struct VnetHdr {
     pub csum_offset: u16,
 }
 
-pub(crate) fn read_vnet_hdr(buf: &[u8]) -> Option<VnetHdr> {
+pub type VnetHdr = VirtioNetHdr;
+
+/// Slices a GSO super-packet payload into segments of at most `mss` bytes.
+///
+/// Returns an empty vector if `buf` is empty. If `mss == 0`, returns a single slice containing `buf`.
+pub fn slice_gso_payload(buf: &[u8], mss: usize) -> Vec<&[u8]> {
+    if buf.is_empty() {
+        return Vec::new();
+    }
+    if mss == 0 {
+        return vec![buf];
+    }
+    buf.chunks(mss).collect()
+}
+
+/// Slices a GSO super-packet into segments of at most `mss` bytes.
+#[inline]
+pub fn slice_gso_packet(buf: &[u8], mss: usize) -> Vec<&[u8]> {
+    slice_gso_payload(buf, mss)
+}
+
+pub fn read_vnet_hdr(buf: &[u8]) -> Option<VirtioNetHdr> {
     if buf.len() < VNET_HDR_LEN {
         return None;
     }
     let u16h = |a: usize| u16::from_ne_bytes([buf[a], buf[a + 1]]);
-    Some(VnetHdr {
+    Some(VirtioNetHdr {
         flags: buf[0],
         gso_type: buf[1],
         hdr_len: u16h(2),
@@ -50,7 +56,7 @@ pub(crate) fn read_vnet_hdr(buf: &[u8]) -> Option<VnetHdr> {
     })
 }
 
-pub(crate) fn write_vnet_hdr(h: &VnetHdr, out: &mut [u8]) {
+pub fn write_vnet_hdr(h: &VirtioNetHdr, out: &mut [u8]) {
     assert!(out.len() >= VNET_HDR_LEN);
     out[0] = h.flags;
     out[1] = h.gso_type;
@@ -223,11 +229,7 @@ fn complete_partial_csum(pkt: &mut [u8], csum_start: usize, csum_offset: usize) 
     pkt[field..field + 2].copy_from_slice(&ck.to_be_bytes());
 }
 
-pub(crate) fn split_gro(
-    frame: &[u8],
-    out: &mut Vec<u8>,
-    offsets: &mut Vec<(usize, usize)>,
-) -> bool {
+pub fn split_gro(frame: &[u8], out: &mut Vec<u8>, offsets: &mut Vec<(usize, usize)>) -> bool {
     out.clear();
     offsets.clear();
     let Some(h) = read_vnet_hdr(frame) else {
@@ -287,10 +289,10 @@ pub(crate) fn split_gro(
     true
 }
 
-pub(crate) const MAX_GSO_SEGMENTS: usize = 64;
-pub(crate) const MAX_GSO_PAYLOAD: usize = 65_535;
+pub const MAX_GSO_SEGMENTS: usize = 64;
+pub const MAX_GSO_PAYLOAD: usize = 65_535;
 
-pub(crate) struct Coalescer {
+pub struct Coalescer {
     pending: Vec<u8>, // [vnet_hdr | ip+tcp hdr | payloads]; empty ⇒ nothing pending
     out: Vec<u8>,     // holds a flushed frame for the returned borrow
     has_pending: bool,
@@ -305,7 +307,7 @@ pub(crate) struct Coalescer {
 }
 
 impl Coalescer {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             pending: Vec::with_capacity(MAX_GSO_PAYLOAD + 64),
             out: Vec::with_capacity(MAX_GSO_PAYLOAD + 64),
@@ -388,7 +390,7 @@ impl Coalescer {
         self.sealed = true;
     }
 
-    pub(crate) fn push(&mut self, pkt: &[u8]) -> Option<&[u8]> {
+    pub fn push(&mut self, pkt: &[u8]) -> Option<&[u8]> {
         let parsed = parse_ipv4_tcp(pkt);
         // Can this packet extend the current (open, tcp) pending run?
         if self.has_pending && self.is_tcp_run && !self.sealed {
@@ -432,8 +434,14 @@ impl Coalescer {
         }
     }
 
-    pub(crate) fn flush(&mut self) -> Option<&[u8]> {
+    pub fn flush(&mut self) -> Option<&[u8]> {
         self.take_pending()
+    }
+}
+
+impl Default for Coalescer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

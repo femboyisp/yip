@@ -11,7 +11,7 @@ pub(crate) mod gso;
 pub mod nonce;
 pub mod poll;
 pub mod spsc;
-pub(crate) mod tun_offload;
+pub mod tun_offload;
 pub mod uring;
 
 pub use addr::{sockaddr_to_std, std_to_sockaddr};

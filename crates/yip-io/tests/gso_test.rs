@@ -34,3 +34,13 @@ fn test_send_gso_superpacket_or_unsupported() {
         }
     }
 }
+
+#[test]
+fn test_gso_super_packet_slicing() {
+    let payload = vec![0x42u8; 64000];
+    let mss = 1420;
+    let segments = yip_io::tun_offload::slice_gso_payload(&payload, mss);
+    assert_eq!(segments.len(), 46);
+    assert_eq!(segments[0].len(), 1420);
+    assert_eq!(segments.last().unwrap().len(), 64000 - 45 * 1420);
+}

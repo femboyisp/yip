@@ -590,7 +590,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
         crate::mode::TunnelMode::L3Tun => yip_device::DeviceKind::Tun,
         crate::mode::TunnelMode::L2Tap => yip_device::DeviceKind::Tap,
     };
-    let want_vnet_hdr = false;
+    let want_vnet_hdr = true;
 
     let mut tun_queues = yip_device::TunTap::create_multi_queue(
         &config.device,
@@ -727,7 +727,14 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                 let mut rx_buffers = [[0u8; yip_io::MAX_WIRE_DATAGRAM]; yip_io::batch::BATCH_SIZE];
                 let mut rx_datagrams =
                     [const { yip_io::batch::ReceivedDatagram::empty() }; yip_io::batch::BATCH_SIZE];
-                let mut tun_buf = vec![0u8; vnet_len + yip_io::MAX_WIRE_DATAGRAM];
+                let tun_buf_len = if vnet_len > 0 {
+                    vnet_len + 65536
+                } else {
+                    yip_io::MAX_WIRE_DATAGRAM
+                };
+                let mut tun_buf = vec![0u8; tun_buf_len];
+                let mut split_out = Vec::new();
+                let mut split_offs = Vec::new();
                 let start = std::time::Instant::now();
                 let mut cached_now_ms: u64 = 0;
                 let mut spsc_batch = Vec::new();
@@ -910,52 +917,83 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                 Ok(0) => break,
                                 Ok(n) => {
                                     if n > vnet_len {
-                                        packets_this_iter = packets_this_iter.wrapping_add(1);
-                                        let pkt = &tun_buf[vnet_len..n];
-
-                                        if manager.is_tun_target_established(pkt) {
-                                            let egress = manager.on_tun(pkt, cached_now_ms);
-                                            for dg in egress {
-                                                let is_data = dg.bytes.first() == Some(&(crate::handshake::PacketType::Data as u8));
-                                                let send_sock = if is_data {
-                                                    select_egress_socket(
-                                                        &sock,
-                                                        &egress_pool,
-                                                        pkt,
-                                                        is_tap,
-                                                        dg.dst,
-                                                    )
-                                                } else {
-                                                    &sock
-                                                };
-                                                let _ = send_sock.send_to(&dg.bytes, dg.dst);
-                                            }
-                                        } else if shard_id == 0 {
-                                            let egress = manager.on_tun(pkt, cached_now_ms);
-                                            for dg in egress {
-                                                let is_data = dg.bytes.first() == Some(&(crate::handshake::PacketType::Data as u8));
-                                                let send_sock = if is_data {
-                                                    select_egress_socket(
-                                                        &sock,
-                                                        &egress_pool,
-                                                        pkt,
-                                                        is_tap,
-                                                        dg.dst,
-                                                    )
-                                                } else {
-                                                    &sock
-                                                };
-                                                let _ = send_sock.send_to(&dg.bytes, dg.dst);
-                                            }
-                                            for epoch in manager.drain_new_epochs() {
-                                                for k in 1..num_shards {
-                                                    if let Some(Some(ref tx)) = tx_channels.get(k) {
-                                                        let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
+                                        let dispatch_pkt = |pkt: &[u8],
+                                                            mgr: &mut crate::peer_manager::PeerManager,
+                                                            tx_chans: &[Option<
+                                            yip_io::spsc::SpscProducer<OutboundPacket, 2048>,
+                                        >]| {
+                                            if mgr.is_tun_target_established(pkt) {
+                                                let egress = mgr.on_tun(pkt, cached_now_ms);
+                                                for dg in egress {
+                                                    let is_data = dg.bytes.first()
+                                                        == Some(&(crate::handshake::PacketType::Data as u8));
+                                                    let send_sock = if is_data {
+                                                        select_egress_socket(
+                                                            &sock,
+                                                            &egress_pool,
+                                                            pkt,
+                                                            is_tap,
+                                                            dg.dst,
+                                                        )
+                                                    } else {
+                                                        &sock
+                                                    };
+                                                    let _ = send_sock.send_to(&dg.bytes, dg.dst);
+                                                }
+                                            } else if shard_id == 0 {
+                                                let egress = mgr.on_tun(pkt, cached_now_ms);
+                                                for dg in egress {
+                                                    let is_data = dg.bytes.first()
+                                                        == Some(&(crate::handshake::PacketType::Data as u8));
+                                                    let send_sock = if is_data {
+                                                        select_egress_socket(
+                                                            &sock,
+                                                            &egress_pool,
+                                                            pkt,
+                                                            is_tap,
+                                                            dg.dst,
+                                                        )
+                                                    } else {
+                                                        &sock
+                                                    };
+                                                    let _ = send_sock.send_to(&dg.bytes, dg.dst);
+                                                }
+                                                for epoch in mgr.drain_new_epochs() {
+                                                    for k in 1..num_shards {
+                                                        if let Some(Some(ref tx)) = tx_chans.get(k) {
+                                                            let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
+                                                        }
                                                     }
                                                 }
+                                            } else if let Some(Some(ref tx)) = tx_chans.first() {
+                                                let _ = tx.push(ShardMsg::Packet(pkt.to_vec()));
                                             }
-                                        } else if let Some(Some(ref tx)) = tx_channels.first() {
-                                            let _ = tx.push(ShardMsg::Packet(pkt.to_vec()));
+                                        };
+
+                                        if vnet_len > 0
+                                            && yip_io::tun_offload::split_gro(
+                                                &tun_buf[..n],
+                                                &mut split_out,
+                                                &mut split_offs,
+                                            )
+                                        {
+                                            for &(s, l) in &split_offs {
+                                                packets_this_iter =
+                                                    packets_this_iter.wrapping_add(1);
+                                                dispatch_pkt(
+                                                    &split_out[s..s + l],
+                                                    &mut manager,
+                                                    &tx_channels,
+                                                );
+                                            }
+                                        } else {
+                                            packets_this_iter =
+                                                packets_this_iter.wrapping_add(1);
+                                            dispatch_pkt(
+                                                &tun_buf[vnet_len..n],
+                                                &mut manager,
+                                                &tx_channels,
+                                            );
                                         }
                                     }
                                 }
