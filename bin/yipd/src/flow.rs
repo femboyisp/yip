@@ -115,6 +115,29 @@ impl FlowTuple {
         self.hash(&mut hasher);
         hasher.finish()
     }
+
+    /// Compute a canonical bidirectional flow hash.
+    /// Guarantees that hash(A -> B) == hash(B -> A) for identical protocols and ports,
+    /// pinning both directions of a TCP/UDP connection to the same physical CPU core.
+    #[inline]
+    pub fn symmetric_flow_hash(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+
+        let is_canonical = (self.src_ip, self.src_port) <= (self.dst_ip, self.dst_port);
+        let (low_ip, low_port, high_ip, high_port) = if is_canonical {
+            (self.src_ip, self.src_port, self.dst_ip, self.dst_port)
+        } else {
+            (self.dst_ip, self.dst_port, self.src_ip, self.src_port)
+        };
+
+        let mut hasher = DefaultHasher::new();
+        low_ip.hash(&mut hasher);
+        high_ip.hash(&mut hasher);
+        self.proto.hash(&mut hasher);
+        low_port.hash(&mut hasher);
+        high_port.hash(&mut hasher);
+        hasher.finish()
+    }
 }
 
 #[cfg(test)]
@@ -356,5 +379,33 @@ mod tests {
         pkt_diff[20..22].copy_from_slice(&8081u16.to_be_bytes());
         let flow3 = FlowTuple::extract(&pkt_diff).unwrap();
         assert_ne!(flow1.flow_hash(), flow3.flow_hash());
+    }
+
+    #[test]
+    fn test_symmetric_flow_hash_bidirectional_equality() {
+        let mut pkt_fwd = vec![0u8; 40];
+        pkt_fwd[0] = 0x45;
+        pkt_fwd[9] = 6; // TCP
+        pkt_fwd[12..16].copy_from_slice(&[192, 168, 1, 10]);
+        pkt_fwd[16..20].copy_from_slice(&[10, 0, 0, 1]);
+        pkt_fwd[20..22].copy_from_slice(&54321u16.to_be_bytes());
+        pkt_fwd[22..24].copy_from_slice(&443u16.to_be_bytes());
+
+        let mut pkt_rev = vec![0u8; 40];
+        pkt_rev[0] = 0x45;
+        pkt_rev[9] = 6; // TCP
+        pkt_rev[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        pkt_rev[16..20].copy_from_slice(&[192, 168, 1, 10]);
+        pkt_rev[20..22].copy_from_slice(&443u16.to_be_bytes());
+        pkt_rev[22..24].copy_from_slice(&54321u16.to_be_bytes());
+
+        let fwd = FlowTuple::extract(&pkt_fwd).expect("extract fwd");
+        let rev = FlowTuple::extract(&pkt_rev).expect("extract rev");
+
+        assert_eq!(
+            fwd.symmetric_flow_hash(),
+            rev.symmetric_flow_hash(),
+            "forward and reverse packets of a TCP connection must yield identical symmetric flow hashes"
+        );
     }
 }

@@ -51,29 +51,32 @@ pub fn shard_for_pubkey(pubkey: &[u8; 32], num_shards: usize) -> usize {
 
 /// Deterministically map an incoming TUN packet to a target shard index in `0..num_shards`.
 ///
-/// Uses inner 5-tuple flow hashing (`FlowTuple::extract`) to pin each connection
-/// to a single worker shard in strict FIFO sequence, preventing TCP reordering (Regime B).
+/// Uses inner 5-tuple symmetric flow hashing (`FlowTuple::extract` + `symmetric_flow_hash`)
+/// to pin both directions of each connection to a single worker shard in strict FIFO sequence,
+/// preventing TCP reordering and cross-core cache invalidation on TCP ACKs (Regime B+).
 /// For non-IP packets or packets where flow extraction fails, falls back to destination
 /// address hashing (`dst_for_packet` + `shard_for_addr`), or shard 0.
-pub fn shard_for_packet(pkt: &[u8], is_tap: bool, num_shards: usize) -> usize {
+pub fn shard_for_packet(packet: &[u8], is_tap: bool, num_shards: usize) -> usize {
     if num_shards <= 1 {
         return 0;
     }
-    let ip_pkt = if is_tap {
-        if pkt.len() >= 14
-            && ((pkt[12] == 0x08 && pkt[13] == 0x00) || (pkt[12] == 0x86 && pkt[13] == 0xdd))
-        {
-            &pkt[14..]
+    let ip_payload = if is_tap {
+        if packet.len() < 14 {
+            return 0;
+        }
+        let ethertype = u16::from_be_bytes([packet[12], packet[13]]);
+        if ethertype == 0x0800 || ethertype == 0x86dd {
+            &packet[14..]
         } else {
-            &[]
+            return 0;
         }
     } else {
-        pkt
+        packet
     };
 
-    if let Some(flow) = crate::flow::FlowTuple::extract(ip_pkt) {
-        (flow.flow_hash() as usize) % num_shards
-    } else if let Some(dst) = dst_for_packet(pkt, is_tap) {
+    if let Some(flow) = crate::flow::FlowTuple::extract(ip_payload) {
+        (flow.symmetric_flow_hash() as usize) % num_shards
+    } else if let Some(dst) = dst_for_packet(packet, is_tap) {
         shard_for_addr(dst, num_shards)
     } else {
         0
@@ -834,7 +837,7 @@ mod tests {
         pkt1[22..24].copy_from_slice(&443u16.to_be_bytes());
 
         let flow1 = crate::flow::FlowTuple::extract(&pkt1).unwrap();
-        let expected_shard = (flow1.flow_hash() as usize) % 4;
+        let expected_shard = (flow1.symmetric_flow_hash() as usize) % 4;
 
         assert_eq!(shard_for_packet(&pkt1, false, 4), expected_shard);
         assert_eq!(shard_for_packet(&pkt1, false, 1), 0);
@@ -846,7 +849,7 @@ mod tests {
         let flow2 = crate::flow::FlowTuple::extract(&pkt2).unwrap();
         assert_eq!(
             shard_for_packet(&pkt2, false, 4),
-            (flow2.flow_hash() as usize) % 4
+            (flow2.symmetric_flow_hash() as usize) % 4
         );
     }
 
@@ -863,8 +866,35 @@ mod tests {
         tap_pkt[14 + 22..14 + 24].copy_from_slice(&80u16.to_be_bytes());
 
         let inner_flow = crate::flow::FlowTuple::extract(&tap_pkt[14..]).unwrap();
-        let expected_shard = (inner_flow.flow_hash() as usize) % 4;
+        let expected_shard = (inner_flow.symmetric_flow_hash() as usize) % 4;
         assert_eq!(shard_for_packet(&tap_pkt, true, 4), expected_shard);
+    }
+
+    #[test]
+    fn test_shard_for_packet_bidirectional_symmetric() {
+        let mut pkt_fwd = vec![0u8; 40];
+        pkt_fwd[0] = 0x45;
+        pkt_fwd[9] = 6; // TCP
+        pkt_fwd[12..16].copy_from_slice(&[192, 168, 1, 10]);
+        pkt_fwd[16..20].copy_from_slice(&[10, 0, 0, 1]);
+        pkt_fwd[20..22].copy_from_slice(&54321u16.to_be_bytes());
+        pkt_fwd[22..24].copy_from_slice(&443u16.to_be_bytes());
+
+        let mut pkt_rev = vec![0u8; 40];
+        pkt_rev[0] = 0x45;
+        pkt_rev[9] = 6; // TCP
+        pkt_rev[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        pkt_rev[16..20].copy_from_slice(&[192, 168, 1, 10]);
+        pkt_rev[20..22].copy_from_slice(&443u16.to_be_bytes());
+        pkt_rev[22..24].copy_from_slice(&54321u16.to_be_bytes());
+
+        for shards in [2, 3, 4, 7, 8, 16, 32] {
+            assert_eq!(
+                shard_for_packet(&pkt_fwd, false, shards),
+                shard_for_packet(&pkt_rev, false, shards),
+                "forward and reverse packets must route to identical shard for {shards} shards"
+            );
+        }
     }
 
     #[test]
