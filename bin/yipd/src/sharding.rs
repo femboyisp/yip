@@ -127,6 +127,26 @@ pub fn shard_for_outer_udp(datagram: &[u8], num_shards: usize) -> Option<usize> 
     }
 }
 
+/// Deterministically map an incoming FEC Control datagram (`PacketType::Control`)
+/// to its target encoder/worker shard by `(conn_tag, object_id)`.
+///
+/// If `payload` contains at least 11 bytes (1-byte packet type + 8-byte conn_tag + 2-byte object_id)
+/// and `payload[0] == PacketType::Control as u8`, extracts `(conn_tag, object_id)` and returns
+/// `Some(shard_for_fec_symbol(conn_tag, object_id, num_shards))`.
+/// Returns `None` if `payload` is shorter than 11 bytes, not a Control packet, or `num_shards <= 1`.
+pub fn shard_for_fec_control(payload: &[u8], num_shards: usize) -> Option<usize> {
+    if num_shards <= 1 || payload.len() < 11 {
+        return None;
+    }
+    if payload[0] == crate::handshake::PacketType::Control as u8 {
+        let conn_tag = u64::from_be_bytes(payload[1..9].try_into().ok()?);
+        let object_id = u16::from_be_bytes(payload[9..11].try_into().ok()?);
+        Some(shard_for_fec_symbol(conn_tag, object_id, num_shards))
+    } else {
+        None
+    }
+}
+
 use std::io;
 use std::net::ToSocketAddrs;
 use std::os::fd::AsRawFd;
@@ -137,11 +157,32 @@ use yip_io::poll::Dispatch;
 
 use crate::config::Config;
 
-/// An outbound inner packet transferred across worker shards via SPSC ring buffers.
+/// Message passed across worker shards via lock-free SPSC ring buffers.
 #[derive(Debug, Clone)]
-pub struct OutboundPacket {
-    pub bytes: Vec<u8>,
+pub enum ShardMsg {
+    /// Inner TUN/TAP packet to be processed or routed.
+    Packet(Vec<u8>),
+    /// Session epoch replication message broadcast from Shard 0 to worker shards.
+    SessionEpoch(SessionEpochMsg),
+    /// Handshake/control datagram received on non-0 worker forwarded to Shard 0.
+    HandshakeForward(Vec<u8>, std::net::SocketAddr),
+    /// ARQ loss feedback datagram forwarded to the target worker shard owning the FEC block.
+    ArqFeedback(Vec<u8>, std::net::SocketAddr),
 }
+
+/// Established session epoch parameters replicated across worker shards.
+#[derive(Debug, Clone)]
+pub struct SessionEpochMsg {
+    pub peer_pk: [u8; 32],
+    pub send_key: [u8; 32],
+    pub recv_key: [u8; 32],
+    pub auth_key: [u8; 16],
+    pub hp_key: [u8; 16],
+    pub endpoint: Option<std::net::SocketAddr>,
+}
+
+/// Backwards-compatible alias for cross-shard packet messages.
+pub type OutboundPacket = ShardMsg;
 
 /// Coalesced timer for 20 Hz cadence ticks under multi-core packet traffic.
 #[derive(Debug, Clone)]
@@ -217,6 +258,130 @@ impl CoalescedTimer {
 impl Default for CoalescedTimer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Dynamic auto-tuned busy-polling engine tracking inter-arrival jitter (Regime E).
+///
+/// Under active traffic bursts, busy-polls descriptor and socket queues with zero
+/// syscalls / zero sleep-wakeup overhead. The spin duration is dynamically scaled
+/// between `min_spin` (default 10 µs) and `max_spin` (default 200 µs) using an EWMA
+/// of packet inter-arrival intervals and observed jitter, gracefully yielding to
+/// `epoll_wait(10)` when traffic subsides.
+#[derive(Debug, Clone)]
+pub struct AutoTunedPoller {
+    min_spin: std::time::Duration,
+    max_spin: std::time::Duration,
+    ewma_us: f64,
+    jitter_us: f64,
+    current_window: std::time::Duration,
+    last_active: std::time::Instant,
+    last_burst: Option<std::time::Instant>,
+}
+
+impl AutoTunedPoller {
+    /// Default minimum spin duration in microseconds.
+    pub const DEFAULT_MIN_US: u64 = 10;
+    /// Default maximum spin duration in microseconds.
+    pub const DEFAULT_MAX_US: u64 = 200;
+    /// Default initial spin duration in microseconds.
+    pub const DEFAULT_INITIAL_US: u64 = 50;
+    /// Maximum inter-arrival interval (in microseconds) considered for burst tracking.
+    /// Arrivals spaced further than 2 ms represent idle intervals and are excluded from EWMA updates.
+    pub const MAX_BURST_INTERVAL_US: f64 = 2000.0;
+
+    /// Create a new `AutoTunedPoller` with specified minimum and maximum spin bounds in microseconds.
+    pub fn new(min_spin_us: u64, max_spin_us: u64) -> Self {
+        let max_spin_us = max_spin_us.max(min_spin_us);
+        let initial_us = Self::DEFAULT_INITIAL_US.clamp(min_spin_us, max_spin_us);
+        Self {
+            min_spin: std::time::Duration::from_micros(min_spin_us),
+            max_spin: std::time::Duration::from_micros(max_spin_us),
+            ewma_us: initial_us as f64,
+            jitter_us: 0.0,
+            current_window: std::time::Duration::from_micros(initial_us),
+            last_active: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap_or_else(std::time::Instant::now),
+            last_burst: None,
+        }
+    }
+
+    /// Return the currently adapted spin window in microseconds.
+    #[inline]
+    pub fn current_spin_window_us(&self) -> u64 {
+        self.current_window.as_micros() as u64
+    }
+
+    /// Record a packet burst of `packet_count` packets at `now`, updating inter-arrival EWMA and jitter.
+    pub fn record_packet_burst(&mut self, now: std::time::Instant, packet_count: u64) {
+        if packet_count == 0 {
+            return;
+        }
+        if let Some(last_burst) = self.last_burst {
+            let dt_us = now.saturating_duration_since(last_burst).as_micros() as f64;
+            if dt_us <= Self::MAX_BURST_INTERVAL_US {
+                self.ewma_us = 0.875 * self.ewma_us + 0.125 * dt_us;
+                self.jitter_us = 0.75 * self.jitter_us + 0.25 * (dt_us - self.ewma_us).abs();
+                let min_us = self.min_spin.as_micros() as f64;
+                let max_us = self.max_spin.as_micros() as f64;
+                let target = (self.ewma_us + 2.0 * self.jitter_us).clamp(min_us, max_us);
+                self.current_window = std::time::Duration::from_micros(target as u64);
+            }
+        }
+        self.last_burst = Some(now);
+        self.last_active = now;
+    }
+
+    /// Check whether the worker should busy-poll (spin loop with non-blocking wait(0)).
+    #[inline]
+    pub fn should_busy_poll(&self, now: std::time::Instant) -> bool {
+        now.saturating_duration_since(self.last_active) < self.current_window
+    }
+
+    /// Record that packets were processed at `now`, resetting the busy-polling window.
+    #[inline]
+    pub fn record_active(&mut self, now: std::time::Instant) {
+        self.record_packet_burst(now, 1);
+    }
+}
+
+/// Adaptive busy-polling engine for sub-microsecond latency.
+///
+/// Backwards-compatible wrapper around [`AutoTunedPoller`] with a fixed busy-polling window.
+#[derive(Debug, Clone)]
+pub struct AdaptivePoller {
+    inner: AutoTunedPoller,
+}
+
+impl AdaptivePoller {
+    /// Create a new `AdaptivePoller` with a busy-poll duration of `busy_poll_us` microseconds.
+    ///
+    /// Initializes `last_active` 1 second in the past so the poller does not busy-poll
+    /// on initial startup before any packets arrive.
+    pub fn new(busy_poll_us: u64) -> Self {
+        let mut poller = AutoTunedPoller::new(busy_poll_us, busy_poll_us);
+        poller.current_window = std::time::Duration::from_micros(busy_poll_us);
+        poller.ewma_us = busy_poll_us as f64;
+        Self { inner: poller }
+    }
+
+    /// Check whether the worker should busy-poll (spin loop with non-blocking wait(0)).
+    #[inline]
+    pub fn should_busy_poll(&self, now: std::time::Instant) -> bool {
+        self.inner.should_busy_poll(now)
+    }
+
+    /// Record that packets were processed at `now`, resetting the busy-polling window.
+    #[inline]
+    pub fn record_active(&mut self, now: std::time::Instant) {
+        self.inner.record_active(now);
+    }
+
+    /// Record a packet burst of `packet_count` packets at `now`.
+    #[inline]
+    pub fn record_packet_burst(&mut self, now: std::time::Instant, packet_count: u64) {
+        self.inner.record_packet_burst(now, packet_count);
     }
 }
 
@@ -425,8 +590,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
         crate::mode::TunnelMode::L3Tun => yip_device::DeviceKind::Tun,
         crate::mode::TunnelMode::L2Tap => yip_device::DeviceKind::Tap,
     };
-    let use_uring = std::env::var_os("YIP_USE_URING").is_some() && yip_io::uring::uring_available();
-    let want_vnet_hdr = !use_uring;
+    let want_vnet_hdr = true;
 
     let mut tun_queues = yip_device::TunTap::create_multi_queue(
         &config.device,
@@ -461,12 +625,8 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
         }
     }
 
-    // Partition peers across shards
-    let mut shard_peers: Vec<Vec<crate::config::PeerConfig>> = vec![Vec::new(); num_shards];
-    for peer in &config.peers {
-        let shard_idx = shard_for_pubkey(&peer.public_key, num_shards);
-        shard_peers[shard_idx].push(peer.clone());
-    }
+    // Configure all peers in all shard managers so IP routing tables are valid on all workers.
+    let all_peers = config.peers.clone();
 
     struct ShutdownGuard;
     impl Drop for ShutdownGuard {
@@ -482,7 +642,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
         let tun_dev = tun_queues.remove(0);
         let tx_channels = std::mem::take(&mut tx_matrix[shard_id]);
         let rx_channels = std::mem::take(&mut rx_matrix[shard_id]);
-        let peers = std::mem::take(&mut shard_peers[shard_id]);
+        let peers = all_peers.clone();
         let cfg = config.clone();
 
         let handle = std::thread::Builder::new()
@@ -497,15 +657,19 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                 }
 
                 let mut manager = create_peer_manager(&cfg, &peers)?;
+                manager.set_num_shards(num_shards);
+                manager.set_shard_id(shard_id);
                 let tun_fd = tun_dev.as_raw_fd();
 
                 // Probe opportunistic AF_XDP socket with 3-tier fallback
                 let mut umem_pool = UmemPool::new(2048, 4096).ok();
-                let xsk_ifname =
-                    std::env::var("YIP_XDP_IFNAME").unwrap_or_else(|_| "lo".to_string());
                 let mut xsk_sock = if let Some(ref pool) = umem_pool {
-                    XskSocket::bind_opportunistic(&xsk_ifname, shard_id as u32, pool)
-                        .unwrap_or_else(|_| XskSocket::fallback())
+                    if let Ok(xsk_ifname) = std::env::var("YIP_XDP_IFNAME") {
+                        XskSocket::bind_opportunistic(&xsk_ifname, shard_id as u32, pool)
+                            .unwrap_or_else(|_| XskSocket::fallback())
+                    } else {
+                        XskSocket::fallback()
+                    }
                 } else {
                     XskSocket::fallback()
                 };
@@ -530,20 +694,47 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                 let poller = yip_io::epoll::Epoll::new(sock_fd, tun_fd)?;
                 let vnet_len = tun_dev.vnet_hdr_len().unwrap_or(0);
                 let is_tap = cfg.device_kind == crate::mode::TunnelMode::L2Tap;
-                let egress_bind = if cfg.listen.is_ipv6() {
-                    std::net::SocketAddr::from(([0u8; 16], 0))
+                let egress_pool: Vec<std::net::UdpSocket> = if std::env::var_os("YIP_EGRESS_POOL").is_some() {
+                    let egress_bind = if cfg.listen.is_ipv6() {
+                        std::net::SocketAddr::from(([0u8; 16], 0))
+                    } else {
+                        std::net::SocketAddr::from(([0u8; 4], 0))
+                    };
+                    crate::port::bind_udp_egress_pool(egress_bind, 64).unwrap_or_default()
                 } else {
-                    std::net::SocketAddr::from(([0u8; 4], 0))
+                    Vec::new()
                 };
-                let egress_pool =
-                    crate::port::bind_udp_egress_pool(egress_bind, 64).unwrap_or_default();
                 let mut coalesced_timer = CoalescedTimer::new();
+                let (min_spin_us, max_spin_us) = if let Some(fixed) = std::env::var("YIP_BUSY_POLL_US")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    (fixed, fixed)
+                } else {
+                    let min_spin_us = std::env::var("YIP_MIN_BUSY_POLL_US")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(AutoTunedPoller::DEFAULT_MIN_US);
+                    let max_spin_us = std::env::var("YIP_MAX_BUSY_POLL_US")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(AutoTunedPoller::DEFAULT_MAX_US);
+                    (min_spin_us, max_spin_us)
+                };
+                let mut auto_poller = AutoTunedPoller::new(min_spin_us, max_spin_us);
 
                 let mut batch_sock = yip_io::batch::BatchUdpSocket::new(&sock);
                 let mut rx_buffers = [[0u8; yip_io::MAX_WIRE_DATAGRAM]; yip_io::batch::BATCH_SIZE];
                 let mut rx_datagrams =
                     [const { yip_io::batch::ReceivedDatagram::empty() }; yip_io::batch::BATCH_SIZE];
-                let mut tun_buf = vec![0u8; vnet_len + yip_io::MAX_WIRE_DATAGRAM];
+                let tun_buf_len = if vnet_len > 0 {
+                    vnet_len + 65536
+                } else {
+                    yip_io::MAX_WIRE_DATAGRAM
+                };
+                let mut tun_buf = vec![0u8; tun_buf_len];
+                let mut split_out = Vec::new();
+                let mut split_offs = Vec::new();
                 let start = std::time::Instant::now();
                 let mut cached_now_ms: u64 = 0;
                 let mut spsc_batch = Vec::new();
@@ -553,7 +744,15 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                         break;
                     }
 
-                    let ready = poller.wait(10)?;
+                    let is_busy_polling =
+                        auto_poller.should_busy_poll(std::time::Instant::now());
+                    let ready = if is_busy_polling {
+                        std::hint::spin_loop();
+                        poller.wait(0)?
+                    } else {
+                        poller.wait(10)?
+                    };
+
                     if SHUTDOWN.load(Ordering::Relaxed) {
                         break;
                     }
@@ -575,6 +774,44 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                         for i in 0..count {
                                             let dg = &rx_datagrams[i];
                                             let payload = &rx_buffers[i][..dg.len];
+
+                                            let is_hs = !payload.is_empty()
+                                                && (payload[0] == crate::handshake::PacketType::HandshakeInit as u8
+                                                    || payload[0] == crate::handshake::PacketType::HandshakeResp as u8);
+                                            if shard_id != 0 && is_hs {
+                                                if let Some(Some(ref tx)) = tx_channels.first() {
+                                                    let _ = tx.push(ShardMsg::HandshakeForward(
+                                                        payload.to_vec(),
+                                                        dg.src,
+                                                    ));
+                                                }
+                                                continue;
+                                            }
+
+                                            if !payload.is_empty()
+                                                && payload[0] == crate::handshake::PacketType::Control as u8
+                                            {
+                                                if let Some(target_shard) =
+                                                    shard_for_fec_control(payload, num_shards)
+                                                {
+                                                    if target_shard != shard_id {
+                                                        if let Some(Some(ref tx)) =
+                                                            tx_channels.get(target_shard)
+                                                        {
+                                                            if tx
+                                                                .push(ShardMsg::ArqFeedback(
+                                                                    payload.to_vec(),
+                                                                    dg.src,
+                                                                ))
+                                                                .is_ok()
+                                                            {
+                                                                continue;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+
                                             let (tun_out, egress) =
                                                 owned_out(manager.on_udp(dg.src, payload, cached_now_ms));
                                             if let Some(inner) = tun_out {
@@ -584,6 +821,15 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                                 let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
                                                     egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
                                                 let _ = batch_sock.sendmmsg_batch(&egress_batch);
+                                            }
+                                            if shard_id == 0 {
+                                                for epoch in manager.drain_new_epochs() {
+                                                    for k in 1..num_shards {
+                                                        if let Some(Some(ref tx)) = tx_channels.get(k) {
+                                                            let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -605,15 +851,55 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                     if (desc.len as usize) <= pool.chunk_size() {
                                         let payload =
                                             pool.chunk_slice(desc.addr, desc.len as usize);
-                                        let (tun_out, egress) =
-                                            owned_out(manager.on_udp(cfg.listen, payload, cached_now_ms));
-                                        if let Some(inner) = tun_out {
-                                            write_tun(tun_fd, &inner, vnet_len > 0);
-                                        }
-                                        if !egress.is_empty() {
-                                            let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
-                                                egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
-                                            let _ = batch_sock.sendmmsg_batch(&egress_batch);
+                                        let is_hs = !payload.is_empty()
+                                            && (payload[0] == crate::handshake::PacketType::HandshakeInit as u8
+                                                || payload[0] == crate::handshake::PacketType::HandshakeResp as u8);
+                                        let forwarded_ctrl = !payload.is_empty()
+                                            && payload[0] == crate::handshake::PacketType::Control as u8
+                                            && shard_for_fec_control(payload, num_shards).is_some_and(
+                                                |target_shard| {
+                                                    target_shard != shard_id
+                                                        && tx_channels
+                                                            .get(target_shard)
+                                                            .and_then(|opt| opt.as_ref())
+                                                            .is_some_and(|tx| {
+                                                                tx.push(ShardMsg::ArqFeedback(
+                                                                    payload.to_vec(),
+                                                                    cfg.listen,
+                                                                ))
+                                                                .is_ok()
+                                                            })
+                                                },
+                                            );
+                                        if shard_id != 0 && is_hs {
+                                            if let Some(Some(ref tx)) = tx_channels.first() {
+                                                let _ = tx.push(ShardMsg::HandshakeForward(
+                                                    payload.to_vec(),
+                                                    cfg.listen,
+                                                ));
+                                            }
+                                        } else if forwarded_ctrl {
+                                            // Forwarded to target worker shard via SPSC
+                                        } else {
+                                            let (tun_out, egress) =
+                                                owned_out(manager.on_udp(cfg.listen, payload, cached_now_ms));
+                                            if let Some(inner) = tun_out {
+                                                write_tun(tun_fd, &inner, vnet_len > 0);
+                                            }
+                                            if !egress.is_empty() {
+                                                let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
+                                                    egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
+                                                let _ = batch_sock.sendmmsg_batch(&egress_batch);
+                                            }
+                                            if shard_id == 0 {
+                                                for epoch in manager.drain_new_epochs() {
+                                                    for k in 1..num_shards {
+                                                        if let Some(Some(ref tx)) = tx_channels.get(k) {
+                                                            let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     if !fill_ring.produce(desc.addr) {
@@ -631,28 +917,83 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                 Ok(0) => break,
                                 Ok(n) => {
                                     if n > vnet_len {
-                                        packets_this_iter = packets_this_iter.wrapping_add(1);
-                                        let pkt = &tun_buf[vnet_len..n];
-                                        let target_shard = shard_for_packet(pkt, is_tap, num_shards);
-
-                                        if target_shard == shard_id {
-                                            let egress = manager.on_tun(pkt, cached_now_ms);
-                                            for dg in egress {
-                                                let send_sock = select_egress_socket(
-                                                    &sock,
-                                                    &egress_pool,
-                                                    pkt,
-                                                    is_tap,
-                                                    dg.dst,
-                                                );
-                                                let _ = send_sock.send_to(&dg.bytes, dg.dst);
+                                        let dispatch_pkt = |pkt: &[u8],
+                                                            mgr: &mut crate::peer_manager::PeerManager,
+                                                            tx_chans: &[Option<
+                                            yip_io::spsc::SpscProducer<OutboundPacket, 2048>,
+                                        >]| {
+                                            if mgr.is_tun_target_established(pkt) {
+                                                let egress = mgr.on_tun(pkt, cached_now_ms);
+                                                for dg in egress {
+                                                    let is_data = dg.bytes.first()
+                                                        == Some(&(crate::handshake::PacketType::Data as u8));
+                                                    let send_sock = if is_data {
+                                                        select_egress_socket(
+                                                            &sock,
+                                                            &egress_pool,
+                                                            pkt,
+                                                            is_tap,
+                                                            dg.dst,
+                                                        )
+                                                    } else {
+                                                        &sock
+                                                    };
+                                                    let _ = send_sock.send_to(&dg.bytes, dg.dst);
+                                                }
+                                            } else if shard_id == 0 {
+                                                let egress = mgr.on_tun(pkt, cached_now_ms);
+                                                for dg in egress {
+                                                    let is_data = dg.bytes.first()
+                                                        == Some(&(crate::handshake::PacketType::Data as u8));
+                                                    let send_sock = if is_data {
+                                                        select_egress_socket(
+                                                            &sock,
+                                                            &egress_pool,
+                                                            pkt,
+                                                            is_tap,
+                                                            dg.dst,
+                                                        )
+                                                    } else {
+                                                        &sock
+                                                    };
+                                                    let _ = send_sock.send_to(&dg.bytes, dg.dst);
+                                                }
+                                                for epoch in mgr.drain_new_epochs() {
+                                                    for k in 1..num_shards {
+                                                        if let Some(Some(ref tx)) = tx_chans.get(k) {
+                                                            let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
+                                                        }
+                                                    }
+                                                }
+                                            } else if let Some(Some(ref tx)) = tx_chans.first() {
+                                                let _ = tx.push(ShardMsg::Packet(pkt.to_vec()));
                                             }
-                                        } else if let Some(Some(ref tx)) =
-                                            tx_channels.get(target_shard)
+                                        };
+
+                                        if vnet_len > 0
+                                            && yip_io::tun_offload::split_gro(
+                                                &tun_buf[..n],
+                                                &mut split_out,
+                                                &mut split_offs,
+                                            )
                                         {
-                                            let _ = tx.push(OutboundPacket {
-                                                bytes: pkt.to_vec(),
-                                            });
+                                            for &(s, l) in &split_offs {
+                                                packets_this_iter =
+                                                    packets_this_iter.wrapping_add(1);
+                                                dispatch_pkt(
+                                                    &split_out[s..s + l],
+                                                    &mut manager,
+                                                    &tx_channels,
+                                                );
+                                            }
+                                        } else {
+                                            packets_this_iter =
+                                                packets_this_iter.wrapping_add(1);
+                                            dispatch_pkt(
+                                                &tun_buf[vnet_len..n],
+                                                &mut manager,
+                                                &tx_channels,
+                                            );
                                         }
                                     }
                                 }
@@ -671,19 +1012,105 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                         spsc_batch.clear();
                         rx.drain_batch(&mut spsc_batch, 64);
                         packets_this_iter = packets_this_iter.wrapping_add(spsc_batch.len() as u64);
-                        for pkt in &spsc_batch {
-                            let egress = manager.on_tun(&pkt.bytes, cached_now_ms);
-                            for dg in egress {
-                                let send_sock = select_egress_socket(
-                                    &sock,
-                                    &egress_pool,
-                                    &pkt.bytes,
-                                    is_tap,
-                                    dg.dst,
-                                );
-                                let _ = send_sock.send_to(&dg.bytes, dg.dst);
+                        for msg in &spsc_batch {
+                            match msg {
+                                ShardMsg::Packet(pkt) => {
+                                    let egress = manager.on_tun(pkt, cached_now_ms);
+                                    for dg in egress {
+                                        let is_data = dg.bytes.first() == Some(&(crate::handshake::PacketType::Data as u8));
+                                        let send_sock = if is_data {
+                                            select_egress_socket(
+                                                &sock,
+                                                &egress_pool,
+                                                pkt,
+                                                is_tap,
+                                                dg.dst,
+                                            )
+                                        } else {
+                                            &sock
+                                        };
+                                        let _ = send_sock.send_to(&dg.bytes, dg.dst);
+                                    }
+                                    if shard_id == 0 {
+                                        for epoch in manager.drain_new_epochs() {
+                                            for k in 1..num_shards {
+                                                if let Some(Some(ref tx)) = tx_channels.get(k) {
+                                                    let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                ShardMsg::SessionEpoch(epoch) => {
+                                    if let Ok(shard_session) = yip_crypto::Session::from_raw_keys(
+                                        &epoch.send_key,
+                                        &epoch.recv_key,
+                                        shard_id as u64,
+                                        num_shards as u64,
+                                    ) {
+                                        let established = crate::handshake::Established {
+                                            session: shard_session,
+                                            auth_key: epoch.auth_key,
+                                            hp_key: epoch.hp_key,
+                                            raw_send_key: epoch.send_key,
+                                            raw_recv_key: epoch.recv_key,
+                                        };
+                                        manager.install_established_session(
+                                            &epoch.peer_pk,
+                                            established,
+                                            epoch.endpoint,
+                                        );
+                                    }
+                                }
+                                ShardMsg::HandshakeForward(bytes, src) => {
+                                    let (tun_out, egress) =
+                                        owned_out(manager.on_udp(*src, bytes, cached_now_ms));
+                                    if let Some(inner) = tun_out {
+                                        write_tun(tun_fd, &inner, vnet_len > 0);
+                                    }
+                                    if !egress.is_empty() {
+                                        let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
+                                            egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
+                                        let _ = batch_sock.sendmmsg_batch(&egress_batch);
+                                    }
+                                    if shard_id == 0 {
+                                        for epoch in manager.drain_new_epochs() {
+                                            for k in 1..num_shards {
+                                                if let Some(Some(ref tx)) = tx_channels.get(k) {
+                                                    let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                ShardMsg::ArqFeedback(bytes, src) => {
+                                    let (tun_out, egress) =
+                                        owned_out(manager.on_udp(*src, bytes, cached_now_ms));
+                                    if let Some(inner) = tun_out {
+                                        write_tun(tun_fd, &inner, vnet_len > 0);
+                                    }
+                                    if !egress.is_empty() {
+                                        let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
+                                            egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
+                                        let _ = batch_sock.sendmmsg_batch(&egress_batch);
+                                    }
+                                    if shard_id == 0 {
+                                        for epoch in manager.drain_new_epochs() {
+                                            for k in 1..num_shards {
+                                                if let Some(Some(ref tx)) = tx_channels.get(k) {
+                                                    let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
+                    }
+
+                    if packets_this_iter > 0 {
+                        auto_poller
+                            .record_packet_burst(std::time::Instant::now(), packets_this_iter);
                     }
 
                     // 4. Cadence tick (feedback / keepalive / retransmit / cover)
@@ -704,6 +1131,15 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                     let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
                                         egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
                                     let _ = batch_sock.sendmmsg_batch(&egress_batch);
+                                }
+                            }
+                            if shard_id == 0 {
+                                for epoch in manager.drain_new_epochs() {
+                                    for k in 1..num_shards {
+                                        if let Some(Some(ref tx)) = tx_channels.get(k) {
+                                            let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1270,5 +1706,109 @@ mod tests {
         // num_shards <= 1 -> None
         assert_eq!(shard_for_outer_udp(&data_dg, 1), None);
         assert_eq!(shard_for_outer_udp(&data_dg, 0), None);
+    }
+
+    #[test]
+    fn test_shard_for_fec_control() {
+        let conn_tag = 0x0102_0304_0506_0708u64;
+        let object_id = 123u16;
+        let num_shards = 8;
+        let expected = shard_for_fec_symbol(conn_tag, object_id, num_shards);
+
+        // Valid Control datagram: [PacketType::Control, conn_tag (8b), object_id (2b), ...]
+        let mut ctrl_dg = vec![crate::handshake::PacketType::Control as u8];
+        ctrl_dg.extend_from_slice(&conn_tag.to_be_bytes());
+        ctrl_dg.extend_from_slice(&object_id.to_be_bytes());
+        ctrl_dg.extend_from_slice(&[0u8; 20]); // payload
+        assert_eq!(shard_for_fec_control(&ctrl_dg, num_shards), Some(expected));
+
+        // Non-Control packet (e.g. Data or HandshakeInit) -> None
+        let mut data_dg = ctrl_dg.clone();
+        data_dg[0] = crate::handshake::PacketType::Data as u8;
+        assert_eq!(shard_for_fec_control(&data_dg, num_shards), None);
+
+        let mut hs_dg = ctrl_dg.clone();
+        hs_dg[0] = crate::handshake::PacketType::HandshakeInit as u8;
+        assert_eq!(shard_for_fec_control(&hs_dg, num_shards), None);
+
+        // Short datagram (< 11 bytes) -> None
+        assert_eq!(shard_for_fec_control(&ctrl_dg[..10], num_shards), None);
+
+        // num_shards <= 1 -> None
+        assert_eq!(shard_for_fec_control(&ctrl_dg, 1), None);
+        assert_eq!(shard_for_fec_control(&ctrl_dg, 0), None);
+    }
+
+    #[test]
+    fn test_adaptive_poller_initial_state_does_not_busy_poll() {
+        let poller = AdaptivePoller::new(50);
+        let now = std::time::Instant::now();
+        assert!(
+            !poller.should_busy_poll(now),
+            "poller must not busy poll initially before traffic is recorded"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_poller_record_active_and_window_expiry() {
+        let mut poller = AdaptivePoller::new(100);
+        let t0 = std::time::Instant::now();
+        poller.record_active(t0);
+
+        // Within busy-poll window (50 µs < 100 µs)
+        let t1 = t0 + std::time::Duration::from_micros(50);
+        assert!(poller.should_busy_poll(t1));
+
+        // Exactly at window boundary (100 µs not < 100 µs)
+        let t2 = t0 + std::time::Duration::from_micros(100);
+        assert!(!poller.should_busy_poll(t2));
+
+        // Past window boundary (150 µs > 100 µs)
+        let t3 = t0 + std::time::Duration::from_micros(150);
+        assert!(!poller.should_busy_poll(t3));
+
+        // Re-activating traffic at t3 extends the window
+        poller.record_active(t3);
+        assert!(poller.should_busy_poll(t3));
+        assert!(poller.should_busy_poll(t3 + std::time::Duration::from_micros(80)));
+        assert!(!poller.should_busy_poll(t3 + std::time::Duration::from_micros(101)));
+    }
+
+    #[test]
+    fn test_adaptive_poller_zero_duration() {
+        let mut poller = AdaptivePoller::new(0);
+        let now = std::time::Instant::now();
+        poller.record_active(now);
+        assert!(
+            !poller.should_busy_poll(now),
+            "0-microsecond poller should never busy poll"
+        );
+    }
+
+    #[test]
+    fn test_auto_tuned_poller_unit_behavior() {
+        let mut poller = AutoTunedPoller::new(10, 200);
+        assert_eq!(poller.current_spin_window_us(), 50);
+
+        let t0 = std::time::Instant::now();
+        assert!(!poller.should_busy_poll(t0));
+
+        poller.record_packet_burst(t0, 5);
+        assert_eq!(poller.current_spin_window_us(), 50);
+        assert!(poller.should_busy_poll(t0));
+
+        // 0 count does not alter state
+        poller.record_packet_burst(t0 + std::time::Duration::from_micros(10), 0);
+        assert_eq!(poller.current_spin_window_us(), 50);
+
+        // Gap > 2ms (e.g. 3000 µs) is ignored by jitter tracker
+        let t1 = t0 + std::time::Duration::from_micros(3000);
+        poller.record_packet_burst(t1, 1);
+        assert_eq!(poller.current_spin_window_us(), 50);
+
+        // Subsequent burst within 2ms updates jitter
+        let t2 = t1 + std::time::Duration::from_micros(100);
+        poller.record_packet_burst(t2, 2);
+        assert!(poller.current_spin_window_us() > 50);
     }
 }

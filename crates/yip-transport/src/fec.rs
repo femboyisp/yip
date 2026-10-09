@@ -74,15 +74,31 @@ fn split_source(ciphertext: &[u8], k: usize, sym: usize) -> Vec<Vec<u8>> {
 }
 
 /// Encodes ciphertext frames into RS symbols, assigning monotonic object ids.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct FecEncoder {
     next_object_id: u16,
+    stride: u16,
+}
+
+impl Default for FecEncoder {
+    fn default() -> Self {
+        Self {
+            next_object_id: 0,
+            stride: 1,
+        }
+    }
 }
 
 impl FecEncoder {
     /// Create an encoder starting at object id 0.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Reconfigure shard start object id and stride increment.
+    pub fn set_shard(&mut self, shard_id: u16, num_shards: u16) {
+        self.next_object_id = shard_id;
+        self.stride = if num_shards == 0 { 1 } else { num_shards };
     }
 
     /// Encode one ciphertext frame into K source + `repair` repair symbols.
@@ -93,7 +109,7 @@ impl FecEncoder {
         repair: u32,
     ) -> Vec<Symbol> {
         let object_id = self.next_object_id;
-        self.next_object_id = self.next_object_id.wrapping_add(1);
+        self.next_object_id = self.next_object_id.wrapping_add(self.stride);
         self.build(ciphertext, params, object_id, repair)
     }
 
@@ -822,5 +838,26 @@ mod tests {
             2,
             "in_flight must settle at exactly max_objects (2) after churning past capacity"
         );
+    }
+
+    #[test]
+    fn test_fec_encoder_set_shard() {
+        let mut enc = FecEncoder::new();
+        enc.set_shard(2, 4);
+        assert_eq!(enc.next_object_id, 2);
+        assert_eq!(enc.stride, 4);
+
+        let params = FlowClass::Default.params();
+        let syms1 = enc.encode(&[1, 2, 3], params, 0);
+        let id1 = syms1[0].object_id;
+        assert_eq!(id1, 2);
+
+        let syms2 = enc.encode(&[4, 5, 6], params, 0);
+        let id2 = syms2[0].object_id;
+        assert_eq!(id2, 6);
+
+        // Zero shards falls back to stride 1
+        enc.set_shard(5, 0);
+        assert_eq!(enc.stride, 1);
     }
 }

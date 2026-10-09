@@ -17,6 +17,10 @@ const IFF_VNET_HDR: libc::c_short = 0x4000;
 const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
 // _IOW('T', 208, unsigned int) on Linux.
 const TUNSETOFFLOAD: libc::c_ulong = 0x4004_54d0;
+// _IOW('T', 216, int) on Linux.
+pub const TUNSETVNETHDRSZ: libc::c_ulong = 0x4004_54d8;
+/// Alias for `TUNSETVNETHDRSZ`.
+pub const TUNSETVNETHDR: libc::c_ulong = TUNSETVNETHDRSZ;
 const TUN_F_CSUM: libc::c_uint = 0x01;
 const TUN_F_TSO4: libc::c_uint = 0x02;
 const TUN_F_TSO6: libc::c_uint = 0x04;
@@ -287,6 +291,12 @@ impl TunTap {
             return Ok(None);
         }
 
+        // Set or verify vnet header size to VNET_HDR_LEN (10).
+        let mut hdr_sz: libc::c_int = VNET_HDR_LEN as libc::c_int;
+        // SAFETY: `file` is a valid open /dev/net/tun fd. TUNSETVNETHDRSZ takes an int pointer
+        // specifying the virtio_net_hdr byte size.
+        let _ = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETVNETHDRSZ, &raw mut hdr_sz) };
+
         if let Some(_mode) = negotiate_offload(file.as_raw_fd()) {
             bring_up(&req.name)?;
             let actual_name = decode_ifname(&req.name)?;
@@ -367,6 +377,10 @@ impl TunTap {
             return Ok(None);
         }
 
+        let mut hdr_sz0: libc::c_int = VNET_HDR_LEN as libc::c_int;
+        // SAFETY: file0 is a valid open /dev/net/tun fd. TUNSETVNETHDRSZ takes an int pointer.
+        let _ = unsafe { libc::ioctl(file0.as_raw_fd(), TUNSETVNETHDRSZ, &raw mut hdr_sz0) };
+
         let offload_mode = match negotiate_offload(file0.as_raw_fd()) {
             Some(mode) => mode,
             None => return Ok(None),
@@ -403,6 +417,10 @@ impl TunTap {
             if rc != 0 {
                 return Err(DeviceError::Io(io::Error::last_os_error()));
             }
+
+            let mut hdr_sz: libc::c_int = VNET_HDR_LEN as libc::c_int;
+            // SAFETY: file is a valid open /dev/net/tun fd. TUNSETVNETHDRSZ takes an int pointer.
+            let _ = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETVNETHDRSZ, &raw mut hdr_sz) };
 
             apply_offload(file.as_raw_fd(), offload_mode)?;
 

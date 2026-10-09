@@ -630,6 +630,7 @@ pub struct XskSocket {
     mode: XskBindMode,
     rx_ring: RxRing,
     tx_ring: TxRing,
+    filter: Option<crate::bpf::XdpRedirectFilter>,
 }
 
 impl XskSocket {
@@ -793,6 +794,7 @@ impl XskSocket {
                 mode: XskBindMode::ZeroCopy,
                 rx_ring: RxRing::new(UMEM_RING_SIZE),
                 tx_ring: TxRing::new(UMEM_RING_SIZE),
+                filter: None,
             });
         }
 
@@ -822,6 +824,7 @@ impl XskSocket {
                     mode: XskBindMode::Copy,
                     rx_ring: RxRing::new(UMEM_RING_SIZE),
                     tx_ring: TxRing::new(UMEM_RING_SIZE),
+                    filter: None,
                 });
             }
         }
@@ -837,6 +840,7 @@ impl XskSocket {
             mode: XskBindMode::FallbackRecvmmsg,
             rx_ring: RxRing::new(UMEM_RING_SIZE),
             tx_ring: TxRing::new(UMEM_RING_SIZE),
+            filter: None,
         }
     }
 
@@ -868,6 +872,87 @@ impl XskSocket {
     /// Immutable reference to the socket's TX ring buffer.
     pub fn tx_ring(&self) -> &TxRing {
         &self.tx_ring
+    }
+
+    /// Reference to the attached eBPF redirect filter, if active.
+    pub fn filter(&self) -> Option<&crate::bpf::XdpRedirectFilter> {
+        self.filter.as_ref()
+    }
+
+    /// Mutable reference to the attached eBPF redirect filter, if active.
+    pub fn filter_mut(&mut self) -> Option<&mut crate::bpf::XdpRedirectFilter> {
+        self.filter.as_mut()
+    }
+
+    /// Opportunistically attaches an eBPF XDP redirect filter steering incoming UDP traffic
+    /// for `listen_port` on `ifname` into this socket's RX ring.
+    pub fn attach_bpf_filter(
+        &mut self,
+        ifname: &str,
+        listen_port: u16,
+        queue_id: u32,
+    ) -> crate::bpf::BpfFilterStatus {
+        if self.fd < 0 {
+            return crate::bpf::BpfFilterStatus::Unsupported;
+        }
+        match crate::bpf::XdpRedirectFilter::load_and_attach(ifname, listen_port, queue_id, self.fd)
+        {
+            Ok(f) => {
+                let prog_fd = f.prog_fd();
+                self.filter = Some(f);
+                crate::bpf::BpfFilterStatus::Attached(prog_fd)
+            }
+            Err(status) => status,
+        }
+    }
+
+    /// Opportunistically attaches a multi-queue eBPF XDP redirect filter steering incoming UDP traffic
+    /// for `listen_port` on `ifname` across multiple RX queues into core-pinned AF_XDP rings.
+    pub fn attach_bpf_filter_multi_queue(
+        &mut self,
+        ifname: &str,
+        listen_port: u16,
+        queue_fds: &[(u32, RawFd)],
+    ) -> crate::bpf::BpfFilterStatus {
+        if self.fd < 0 {
+            return crate::bpf::BpfFilterStatus::Unsupported;
+        }
+        match crate::bpf::XdpRedirectFilter::load_multi_queue(ifname, listen_port, queue_fds) {
+            Ok(f) => {
+                let prog_fd = f.prog_fd();
+                self.filter = Some(f);
+                crate::bpf::BpfFilterStatus::Attached(prog_fd)
+            }
+            Err(status) => status,
+        }
+    }
+
+    /// Sets or updates the socket file descriptor for a specific queue ID in the attached BPF filter.
+    pub fn set_bpf_filter_queue_socket(&mut self, queue_id: u32, xsk_fd: RawFd) -> io::Result<()> {
+        match self.filter.as_mut() {
+            Some(filter) => filter.set_socket_for_queue(queue_id, xsk_fd),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no BPF filter attached to socket",
+            )),
+        }
+    }
+
+    /// Binds multiple AF_XDP sockets across `queue_ids` for the given interface and UMEM pool.
+    ///
+    /// Returns a list of `(queue_id, XskSocket)` pairs. If binding fails for a queue,
+    /// a socket in fallback mode is returned for that queue.
+    pub fn bind_multi_queue(
+        ifname: &str,
+        queue_ids: &[u32],
+        umem: &UmemPool,
+    ) -> io::Result<Vec<(u32, Self)>> {
+        let mut sockets = Vec::with_capacity(queue_ids.len());
+        for &qid in queue_ids {
+            let sock = Self::bind_opportunistic(ifname, qid, umem)?;
+            sockets.push((qid, sock));
+        }
+        Ok(sockets)
     }
 }
 

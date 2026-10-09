@@ -109,3 +109,50 @@ impl From<getrandom::Error> for Error {
         Error::Rng(e)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_error_display_and_source() {
+        let io_err = std::io::Error::other("test io error");
+        let err_io: Error = io_err.into();
+        assert!(format!("{err_io}").contains("I/O error"));
+        assert!(std::error::Error::source(&err_io).is_some());
+
+        let hs_err = crate::handshake::Error::RecordTooLarge;
+        let err_hs: Error = hs_err.into();
+        assert!(format!("{err_hs}").contains("TLS handshake error"));
+        assert!(std::error::Error::source(&err_hs).is_some());
+
+        let rng_err = getrandom::Error::UNSUPPORTED;
+        let err_rng: Error = rng_err.into();
+        assert!(format!("{err_rng}").contains("OS RNG failure"));
+        assert!(std::error::Error::source(&err_rng).is_some());
+
+        let proto = Error::Protocol("bad proto");
+        assert!(format!("{proto}").contains("bad proto"));
+        assert!(std::error::Error::source(&proto).is_none());
+
+        let clock = Error::Clock;
+        assert!(format!("{clock}").contains("system clock"));
+        assert!(std::error::Error::source(&clock).is_none());
+
+        let reality = Error::RealityVerify("bad verify");
+        assert!(format!("{reality}").contains("bad verify"));
+        assert!(std::error::Error::source(&reality).is_none());
+
+        let group = Error::UnsupportedGroup(99);
+        assert!(format!("{group}").contains("99"));
+        assert!(std::error::Error::source(&group).is_none());
+
+        let flight = Error::FlightTooLarge;
+        assert!(format!("{flight}").contains("flight exceeds"));
+        assert!(std::error::Error::source(&flight).is_none());
+
+        let msg = Error::MessageTooLarge;
+        assert!(format!("{msg}").contains("message exceeds"));
+        assert!(std::error::Error::source(&msg).is_none());
+    }
+}

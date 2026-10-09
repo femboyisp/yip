@@ -112,6 +112,10 @@ pub enum Outcome<'a> {
 /// method.
 pub struct DataPlane {
     session: yip_crypto::Session,
+    raw_send_key: [u8; 32],
+    raw_recv_key: [u8; 32],
+    auth_key: [u8; 16],
+    hp_key: [u8; 16],
     transport: Transport,
     codec: Codec,
     conn_tag: u64,
@@ -161,6 +165,37 @@ pub struct DataPlane {
 }
 
 impl DataPlane {
+    /// 32-byte raw Noise send key.
+    pub fn raw_send_key(&self) -> &[u8; 32] {
+        &self.raw_send_key
+    }
+
+    /// 32-byte raw Noise receive key.
+    pub fn raw_recv_key(&self) -> &[u8; 32] {
+        &self.raw_recv_key
+    }
+
+    /// 16-byte authentication key.
+    pub fn auth_key(&self) -> &[u8; 16] {
+        &self.auth_key
+    }
+
+    /// 16-byte header-protection key.
+    pub fn hp_key(&self) -> &[u8; 16] {
+        &self.hp_key
+    }
+
+    /// Access the underlying AEAD session.
+    #[expect(dead_code, reason = "helper for inspecting session")]
+    pub fn session(&self) -> &yip_crypto::Session {
+        &self.session
+    }
+
+    /// Mutable access to the underlying AEAD session.
+    pub fn session_mut(&mut self) -> &mut yip_crypto::Session {
+        &mut self.session
+    }
+
     /// Build a [`DataPlane`] from an already-established session.
     ///
     /// The wire codec keys are derived from the same channel-binding sub-keys
@@ -182,9 +217,17 @@ impl DataPlane {
         obf_on: bool,
         symbol_size: u16,
     ) -> Self {
-        let codec = Codec::new(established.auth_key, established.hp_key);
+        let auth_key = established.auth_key;
+        let hp_key = established.hp_key;
+        let raw_send_key = established.raw_send_key;
+        let raw_recv_key = established.raw_recv_key;
+        let codec = Codec::new(auth_key, hp_key);
         Self {
             session: established.session,
+            raw_send_key,
+            raw_recv_key,
+            auth_key,
+            hp_key,
             transport: Transport::new(vec![], symbol_size),
             codec,
             conn_tag,
@@ -224,6 +267,11 @@ impl DataPlane {
     /// spoofed source.
     pub fn set_peer_addr(&mut self, addr: SocketAddr) {
         self.peer_addr = addr;
+    }
+
+    /// Reconfigure shard start object id and stride increment for multi-core scaling.
+    pub fn set_shard(&mut self, shard_id: usize, num_shards: usize) {
+        self.transport.set_shard(shard_id, num_shards);
     }
 
     /// Seal `inner`, FEC-encode, frame each symbol, and return the resulting
@@ -395,7 +443,9 @@ impl DataPlane {
                 let plaintext = match self.session.open(counter, ct) {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("dataplane ingress: control open error: {e}");
+                        eprintln!(
+                            "dataplane ingress: control open error on counter={counter}: {e}"
+                        );
                         return Outcome::None;
                     }
                 };
@@ -696,17 +746,23 @@ mod tests {
         assert_eq!(cb_i, cb_r);
 
         let (auth_key, hp_key) = derive_wire_keys(&cb_i);
+        let (ini_send_k, ini_recv_k) = ini.raw_split_keys();
+        let (res_send_k, res_recv_k) = res.raw_split_keys();
 
         // Build Established structs directly (mirrors what handshake.rs does).
         let est_i = Established {
             session: ini.into_session().unwrap(),
             auth_key,
             hp_key,
+            raw_send_key: ini_send_k,
+            raw_recv_key: ini_recv_k,
         };
         let est_r = Established {
             session: res.into_session().unwrap(),
             auth_key,
             hp_key,
+            raw_send_key: res_send_k,
+            raw_recv_key: res_recv_k,
         };
 
         // Both peers derive the same conn_tag from the same keys.

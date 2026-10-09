@@ -1,9 +1,13 @@
 //! Normative RS-v1 systematic Reed–Solomon over GF(256) (spec §3.2.1): a Cauchy
 //! generator `[ I_K ; C ]` with `C[m][i] = inv((K+m) ^ i)`, giving MDS (any K of
 //! K+R shards decode). Source rows are identity, so no-loss decode is a copy.
-#![forbid(unsafe_code)]
+#![allow(unsafe_code)]
 
 use crate::gf256;
+pub use crate::rs_simd::{
+    avx2_supported, avx512bw_supported, gfni_supported, neon_supported, ssse3_supported,
+    wasm_simd_supported,
+};
 
 /// Generator scheme for the repair rows (packed into `payload_id[3]` on the wire).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +74,80 @@ pub fn cauchy_coef(k: usize, m: usize, i: usize) -> u8 {
     gf256::inv(gf256::add(x, y)) // x ^ y != 0 since {y_i} and {x_m} are disjoint
 }
 
+/// Multiply `src` by `coeff` in GF(2^8) and accumulate (XOR) into `dst`.
+///
+/// Uses tiered runtime CPU feature detection dispatch:
+/// GFNI -> AVX-512BW -> AVX2 -> SSSE3 -> ARM64 NEON -> pure-Rust scalar fallback.
+/// Short-circuits for `coeff == 0` (no-op) and `coeff == 1` (direct XOR).
+pub fn mul_add_row(coeff: u8, src: &[u8], dst: &mut [u8]) {
+    assert_eq!(src.len(), dst.len(), "src and dst lengths must match");
+    if coeff == 0 {
+        return;
+    }
+    if coeff == 1 {
+        for (d, &s) in dst.iter_mut().zip(src.iter()) {
+            *d ^= s;
+        }
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::rs_simd::gfni_supported() {
+            // SAFETY: gfni_supported() confirmed CPU supports GFNI, and slice lengths were verified equal.
+            unsafe {
+                crate::rs_simd::mul_add_gfni(coeff, src, dst);
+            }
+            return;
+        }
+        if crate::rs_simd::avx512bw_supported() {
+            // SAFETY: avx512bw_supported() confirmed CPU supports AVX-512BW, and slice lengths were verified equal.
+            unsafe {
+                crate::rs_simd::mul_add_avx512(coeff, src, dst);
+            }
+            return;
+        }
+        if crate::rs_simd::avx2_supported() {
+            // SAFETY: avx2_supported() confirmed CPU supports AVX2, and slice lengths were verified equal.
+            unsafe {
+                crate::rs_simd::mul_add_avx2(coeff, src, dst);
+            }
+            return;
+        }
+        if crate::rs_simd::ssse3_supported() {
+            // SAFETY: ssse3_supported() confirmed CPU supports SSSE3, and slice lengths were verified equal.
+            unsafe {
+                crate::rs_simd::mul_add_ssse3(coeff, src, dst);
+            }
+            return;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if crate::rs_simd::neon_supported() {
+            // SAFETY: neon_supported() confirmed CPU supports ARM64 NEON, and slice lengths were verified equal.
+            unsafe {
+                crate::rs_simd::mul_add_neon(coeff, src, dst);
+            }
+            return;
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        if crate::rs_simd::wasm_simd_supported() {
+            // SAFETY: wasm_simd_supported() confirmed target is wasm32, and slice lengths were verified equal.
+            unsafe {
+                crate::rs_simd::mul_add_wasm128(coeff, src, dst);
+            }
+            return;
+        }
+    }
+
+    crate::gf256::mul_slice_into(dst, src, coeff);
+}
+
 /// Generate `r` repair shards from the `source` shards (all equal length) under `scheme`.
 pub fn encode_repair(source: &[Vec<u8>], r: usize, scheme: Scheme) -> Vec<Vec<u8>> {
     let k = source.len();
@@ -78,14 +156,7 @@ pub fn encode_repair(source: &[Vec<u8>], r: usize, scheme: Scheme) -> Vec<Vec<u8
     for (m, rep) in repair.iter_mut().enumerate() {
         let coefs = repair_row(scheme, k, m);
         for (src, &c) in source.iter().zip(coefs.iter()) {
-            if c == 1 {
-                // Pure-XOR fast path (the entire P row; Q's i=0 term).
-                for (d, &s) in rep.iter_mut().zip(src.iter()) {
-                    *d ^= s;
-                }
-            } else if c != 0 {
-                gf256::mul_slice_into(rep, src, c);
-            }
+            mul_add_row(c, src, rep);
         }
     }
     repair
@@ -149,7 +220,7 @@ pub fn decode_source(
     let mut out = vec![vec![0u8; shard_len]; k];
     for i in 0..k {
         for (row, &(_, bytes)) in rows.iter().enumerate() {
-            gf256::mul_slice_into(&mut out[i], bytes, minv[i][row]);
+            mul_add_row(minv[i][row], bytes, &mut out[i]);
         }
     }
     Some(out)
@@ -377,5 +448,27 @@ mod tests {
             (u16::try_from(k + 2).unwrap(), bogus.as_slice()),
         ];
         assert_eq!(decode_source(k, len, &recv, Scheme::Pq), None);
+    }
+
+    #[test]
+    fn test_mul_add_row_coeff_0_and_1() {
+        let src = vec![1, 2, 3, 4];
+        let mut dst = vec![10, 20, 30, 40];
+        // Coeff 0 is no-op
+        mul_add_row(0, &src, &mut dst);
+        assert_eq!(dst, vec![10, 20, 30, 40]);
+
+        // Coeff 1 is XOR
+        mul_add_row(1, &src, &mut dst);
+        assert_eq!(dst, vec![10 ^ 1, 20 ^ 2, 30 ^ 3, 40 ^ 4]);
+    }
+
+    #[test]
+    fn test_repair_row_pq_fallback_and_singular_invert() {
+        let row = repair_row(Scheme::Pq, 4, 3);
+        assert_eq!(row, vec![0u8; 4]);
+
+        let mut singular = vec![vec![0u8; 2], vec![0u8; 2]];
+        assert_eq!(invert(&mut singular), None);
     }
 }

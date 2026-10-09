@@ -1,7 +1,16 @@
 //! Adaptive Reed–Solomon-FEC transport: per-flow classification, the adaptive
 //! redundancy controller, and thin ARQ. Implemented across M5; this
 //! milestone fixes the public surface and the flow taxonomy.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+
+pub mod rs_simd;
+pub use rs_simd::{
+    avx2_supported, avx512bw_supported, gfni_supported, neon_supported, ssse3_supported,
+    wasm_simd_supported,
+};
+
+pub mod rlnc;
+pub use rlnc::{RlncDecoder, RlncEncoder};
 
 pub mod classify;
 pub use classify::{Classifier, PolicyRule};
@@ -121,6 +130,11 @@ impl Transport {
             reassemblers: HashMap::new(),
             symbol_size,
         }
+    }
+
+    /// Reconfigure shard start object id and stride increment for multi-core scaling.
+    pub fn set_shard(&mut self, shard_id: usize, num_shards: usize) {
+        self.encoder.set_shard(shard_id as u16, num_shards as u16);
     }
 
     /// `class`'s default [`FlowParams`], with `symbol_size` overridden by the

@@ -243,3 +243,255 @@ fn test_af_xdp_zero_copy_rx_ring_processing_simulation() {
     assert_eq!(&mock.received_packets[0], dummy_packet);
     assert_eq!(fill_ring.len(), 16);
 }
+
+#[test]
+fn test_adaptive_poller_transitions_between_spin_and_sleep() {
+    let mut poller = yipd::sharding::AdaptivePoller::new(50);
+    let start = std::time::Instant::now();
+    poller.record_active(start);
+    assert!(poller.should_busy_poll(start));
+    assert!(poller.should_busy_poll(start + std::time::Duration::from_micros(30)));
+    assert!(!poller.should_busy_poll(start + std::time::Duration::from_micros(60)));
+}
+
+#[test]
+fn test_adaptive_poller_active_after_simulated_sleep_wakeup() {
+    let mut poller = yipd::sharding::AdaptivePoller::new(50);
+    // Initially not busy polling
+    let t0 = std::time::Instant::now();
+    assert!(!poller.should_busy_poll(t0));
+
+    // Simulate 10 ms sleep in epoll_wait
+    let t_wakeup = t0 + std::time::Duration::from_millis(10);
+    // After wakeup, packet arrived and drained, timestamp is recorded
+    poller.record_active(t_wakeup);
+
+    // Subsequent loop iteration (e.g. 5 micros later) MUST enter busy polling!
+    let t_next = t_wakeup + std::time::Duration::from_micros(5);
+    assert!(poller.should_busy_poll(t_next));
+}
+
+#[test]
+fn test_auto_tuned_poller_dynamic_jitter_adaptation() {
+    let mut poller = yipd::sharding::AutoTunedPoller::new(10, 200);
+
+    // 1. Verify initial window is 50 µs and initially does not busy-poll
+    let t0 = std::time::Instant::now();
+    assert_eq!(poller.current_spin_window_us(), 50);
+    assert!(!poller.should_busy_poll(t0));
+
+    // First burst at t0: window stays 50 µs, but now busy-poll is active
+    poller.record_packet_burst(t0, 1);
+    assert_eq!(poller.current_spin_window_us(), 50);
+    assert!(poller.should_busy_poll(t0));
+    assert!(poller.should_busy_poll(t0 + std::time::Duration::from_micros(49)));
+    assert!(!poller.should_busy_poll(t0 + std::time::Duration::from_micros(50)));
+
+    // 2. Simulate high-jitter packet arrivals (120 µs intervals)
+    let mut cur_time = t0;
+    for _ in 0..10 {
+        cur_time += std::time::Duration::from_micros(120);
+        poller.record_packet_burst(cur_time, 1);
+    }
+    // Verify spin window adapts upwards (above 50 µs)
+    let high_window = poller.current_spin_window_us();
+    assert!(
+        high_window > 50,
+        "window must adapt upwards under high inter-arrival intervals, got {high_window}"
+    );
+
+    // 3. Simulate tight packet arrivals (15 µs intervals)
+    for _ in 0..50 {
+        cur_time += std::time::Duration::from_micros(15);
+        poller.record_packet_burst(cur_time, 1);
+    }
+    // Verify spin window adapts downwards towards min (< high_window and <= 25 µs)
+    let low_window = poller.current_spin_window_us();
+    assert!(
+        low_window < high_window,
+        "window must adapt downwards under tight intervals, got {low_window} vs {high_window}"
+    );
+    assert!(
+        low_window <= 25,
+        "window must approach min (10-15 µs) under tight 15 µs bursts, got {low_window}"
+    );
+
+    // 4. Verify spin window never exceeds 200 µs or falls below 10 µs
+    // Push with very large intervals (1500 µs)
+    for _ in 0..50 {
+        cur_time += std::time::Duration::from_micros(1500);
+        poller.record_packet_burst(cur_time, 1);
+    }
+    assert!(
+        poller.current_spin_window_us() <= 200,
+        "window must never exceed max_spin (200 µs), got {}",
+        poller.current_spin_window_us()
+    );
+
+    // Push with 0 µs intervals
+    for _ in 0..50 {
+        poller.record_packet_burst(cur_time, 1);
+    }
+    assert!(
+        poller.current_spin_window_us() >= 10,
+        "window must never fall below min_spin (10 µs), got {}",
+        poller.current_spin_window_us()
+    );
+
+    // 5. Verify idle gaps > 2 ms (2000 µs) are ignored and do not distort EWMA/jitter
+    let window_before_idle = poller.current_spin_window_us();
+    cur_time += std::time::Duration::from_micros(5000);
+    poller.record_packet_burst(cur_time, 1);
+    assert_eq!(
+        poller.current_spin_window_us(),
+        window_before_idle,
+        "idle gap > 2ms must not update spin window"
+    );
+
+    // 6. Verify zero packet count is ignored
+    cur_time += std::time::Duration::from_micros(10);
+    poller.record_packet_burst(cur_time, 0);
+    assert_eq!(
+        poller.current_spin_window_us(),
+        window_before_idle,
+        "0 packet count must not update spin window"
+    );
+}
+
+#[test]
+fn test_stride_nonce_allocation_guarantees_uniqueness_across_shards() {
+    for num_shards in [2, 4, 8, 16] {
+        let mut shard_nonces: Vec<Vec<u64>> = vec![Vec::new(); num_shards];
+        for (shard, nonces) in shard_nonces.iter_mut().enumerate() {
+            let mut n = shard as u64;
+            for _ in 0..10_000 {
+                nonces.push(n);
+                n += num_shards as u64;
+            }
+        }
+        // Verify no collisions across shards
+        let mut all_nonces: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for nonces in shard_nonces {
+            for n in nonces {
+                assert!(
+                    all_nonces.insert(n),
+                    "Collision detected for nonce {n} with {num_shards} shards"
+                );
+            }
+        }
+        assert_eq!(all_nonces.len(), num_shards * 10_000);
+    }
+}
+
+#[test]
+fn test_session_epoch_replication_across_shards() {
+    use yip_crypto::generate_keypair;
+    use yip_crypto::Handshake;
+    use yipd::handshake::Established;
+
+    let init_kp = generate_keypair();
+    let resp_kp = generate_keypair();
+
+    let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
+    let mut res = Handshake::responder(&resp_kp.private).unwrap();
+
+    let m1 = ini.write_message(&[]).unwrap();
+    let _ = res.read_message(&m1).unwrap();
+    let m2 = res.write_message(&[]).unwrap();
+    let _ = ini.read_message(&m2).unwrap();
+
+    let (ini_send_k, ini_recv_k) = ini.raw_split_keys();
+    let (res_send_k, res_recv_k) = res.raw_split_keys();
+    assert_eq!(ini_send_k, res_recv_k);
+    assert_eq!(ini_recv_k, res_send_k);
+
+    let num_shards = 4;
+    let base_est = Established {
+        session: ini.into_session().unwrap(),
+        auth_key: [1u8; 16],
+        hp_key: [2u8; 16],
+        raw_send_key: ini_send_k,
+        raw_recv_key: ini_recv_k,
+    };
+
+    // Replicate across shards
+    let mut shard_senders = Vec::new();
+    for shard_id in 0..num_shards {
+        let shard_est = base_est.clone_for_shard(shard_id, num_shards).unwrap();
+        assert_eq!(shard_est.session.stride(), num_shards as u64);
+        shard_senders.push(shard_est);
+    }
+
+    // Receiver session
+    let mut receiver_session =
+        yip_crypto::Session::from_raw_keys(&res_send_k, &res_recv_k, 0, 1).unwrap();
+
+    // Round-robin seal from all shards and open on receiver
+    for i in 0..100 {
+        let shard_id = i % num_shards;
+        let plaintext = format!("hello shard {shard_id} packet {i}").into_bytes();
+        let sealed = shard_senders[shard_id].session.seal(&plaintext).unwrap();
+        assert_eq!(sealed.counter % num_shards as u64, shard_id as u64);
+
+        let opened = receiver_session
+            .open(sealed.counter, &sealed.ciphertext)
+            .unwrap();
+        assert_eq!(opened, plaintext);
+    }
+}
+
+#[test]
+fn test_cross_shard_arq_feedback_routes_to_encoder_shard() {
+    use yipd::handshake::PacketType;
+    use yipd::sharding::{shard_for_fec_control, shard_for_fec_symbol, ShardMsg};
+
+    let conn_tag = 0x0102_0304_0506_0708u64;
+    let object_id = 42u16;
+    let num_shards = 4;
+    let target_shard = shard_for_fec_symbol(conn_tag, object_id, num_shards);
+
+    // Build Control datagram: [PacketType::Control, conn_tag (8b), object_id (2b), ...]
+    let mut ctrl_dg = vec![PacketType::Control as u8];
+    ctrl_dg.extend_from_slice(&conn_tag.to_be_bytes());
+    ctrl_dg.extend_from_slice(&object_id.to_be_bytes());
+    ctrl_dg.extend_from_slice(&[0xaa, 0xbb, 0xcc]); // payload / loss feedback
+
+    // Verifies shard_for_fec_control returns Some(target_shard)
+    assert_eq!(
+        shard_for_fec_control(&ctrl_dg, num_shards),
+        Some(target_shard)
+    );
+
+    // Verifies non-control packets return None
+    let mut data_dg = ctrl_dg.clone();
+    data_dg[0] = PacketType::Data as u8;
+    assert_eq!(shard_for_fec_control(&data_dg, num_shards), None);
+
+    let mut hs_dg = ctrl_dg.clone();
+    hs_dg[0] = PacketType::HandshakeInit as u8;
+    assert_eq!(shard_for_fec_control(&hs_dg, num_shards), None);
+
+    // Short datagram (< 11 bytes) returns None
+    assert_eq!(shard_for_fec_control(&ctrl_dg[..10], num_shards), None);
+
+    // num_shards <= 1 returns None
+    assert_eq!(shard_for_fec_control(&ctrl_dg, 1), None);
+    assert_eq!(shard_for_fec_control(&ctrl_dg, 0), None);
+
+    // Also verify SPSC ring routing with ShardMsg::ArqFeedback
+    let (tx, rx) = spsc_pair::<ShardMsg, 2048>();
+    let client_addr = "127.0.0.1:9999".parse().unwrap();
+    let msg = ShardMsg::ArqFeedback(ctrl_dg.clone(), client_addr);
+    tx.push(msg).expect("push must succeed");
+
+    let mut drained = Vec::new();
+    rx.drain_batch(&mut drained, 1);
+    assert_eq!(drained.len(), 1);
+    match &drained[0] {
+        ShardMsg::ArqFeedback(bytes, addr) => {
+            assert_eq!(bytes, &ctrl_dg);
+            assert_eq!(*addr, client_addr);
+        }
+        _ => panic!("unexpected ShardMsg variant"),
+    }
+}

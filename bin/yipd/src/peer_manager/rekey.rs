@@ -514,6 +514,7 @@ impl PeerManager {
         };
         self.by_tag.remove(&old_tag);
         self.by_tag.insert(conn_tag, idx);
+        self.record_new_epoch(idx);
 
         if self.egress.is_empty() {
             DispatchOut::None

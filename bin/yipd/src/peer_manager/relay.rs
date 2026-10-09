@@ -308,6 +308,7 @@ impl PeerManager {
                 }
                 self.peers[idx].state =
                     PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, now_ms)));
+                self.record_new_epoch(idx);
                 for b in owned {
                     if let Some(d) = self.relay_wrap(idx, b) {
                         self.egress.push(d);
@@ -380,6 +381,7 @@ impl PeerManager {
                 }
                 self.peers[idx].state =
                     PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, now_ms)));
+                self.record_new_epoch(idx);
                 for b in owned {
                     if let Some(d) = self.relay_wrap(idx, b) {
                         self.egress.push(d);

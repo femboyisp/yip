@@ -354,6 +354,7 @@ impl PeerManager {
                 }
                 self.peers[idx].state =
                     PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, now_ms)));
+                self.record_new_epoch(idx);
 
                 DispatchOut::Udp(&self.egress)
             }
@@ -437,6 +438,7 @@ impl PeerManager {
                 }
                 self.peers[idx].state =
                     PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, now_ms)));
+                self.record_new_epoch(idx);
 
                 if self.egress.is_empty() {
                     DispatchOut::None
