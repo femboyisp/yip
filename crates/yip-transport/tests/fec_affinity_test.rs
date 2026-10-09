@@ -85,3 +85,21 @@ fn test_shard_distribution_uniformity() {
         );
     }
 }
+
+#[test]
+fn test_shard_for_fec_symbol_exact_hash() {
+    let conn_tag = 0x1234_5678_9abc_def0;
+    let object_id = 42;
+    let num_shards = 8;
+    let mixed_factor = (object_id as u64).wrapping_mul(0x9e3779b97f4a7c15);
+    let xor_val = ((conn_tag ^ mixed_factor) as usize) % num_shards;
+    let and_val = ((conn_tag & mixed_factor) as usize) % num_shards;
+    assert_ne!(
+        xor_val, and_val,
+        "test precondition: xor and and must differ"
+    );
+    assert_eq!(
+        shard_for_fec_symbol(conn_tag, object_id, num_shards),
+        xor_val
+    );
+}

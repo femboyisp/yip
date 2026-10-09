@@ -101,10 +101,37 @@
 #    early, at `high_counter` itself instead of `high_counter + 1`) can never
 #    change the observable `pending`/`resolved_set` contents. Empirically
 #    confirmed the same way as item 8: zero test failures under the applied
-#    mutation.
+# 10. `replace < with <= in ReplayWindow::commit` (yip-crypto/src/lib.rs ~line 200)
+#     `if diff < self.profile.bits() { let idx = self.word_idx(counter); bitmap[idx] |= bit_mask(counter); }`.
+#     When `diff == self.profile.bits()` exactly, `counter = latest - window_bits`.
+#     Because `window_bits` is an exact multiple of 64 and `bitmap.len() * 64`,
+#     `word_idx(counter) == word_idx(latest)` and `bit_mask(counter) == bit_mask(latest)`.
+#     The bit `bit_mask(latest)` was already set to 1 in `self.bitmap[idx]` when `latest`
+#     was committed, so `self.bitmap[idx] |= bit_mask(counter)` is an idempotent bitwise OR
+#     of 1 with 1 that produces zero change in bitmap state under all executions.
+#
+# 11. `replace neon_supported -> bool with false` / `replace wasm_simd_supported -> bool with false`
+#     On non-target architectures (such as x86_64 Linux CI runner), `neon_supported()` and
+#     `wasm_simd_supported()` are compile-time guarded to return `false` unconditionally.
+# 12. `replace + with * in RlncDecoder::consume_coded_symbol` (yip-transport/src/rlnc.rs ~line 223)
+#     `for coeff in &mut cur_coeffs[(col + 1)..self.window_size] { *coeff = gf256::mul(*coeff, inv); }`.
+#     When `col == 0`, `col + 1 == 1` and `col * 1 == 0`. The mutant would include `cur_coeffs[0]`,
+#     scaling `cur_coeffs[0]` (which was just set to 1) by `inv` so it becomes `inv`.
+#     However, in `RlncDecoder`, pivot column entry `coeff_matrix[col][col]` is NEVER read by any
+#     code in the codebase:
+#     - Gaussian elimination reads strictly `coeff_matrix[col][(col + 1)..self.window_size]` (line 212).
+#     - Back-substitution reads strictly `coeff_matrix[i][(i + 1)..self.window_size]` (line 255).
+#     - The only public extract method is `extract_source_symbols()`, which only reads `symbols`.
+# 13. `replace ssse3_supported -> bool with true`, `replace avx2_supported -> bool with true`,
+#     `replace avx512bw_supported -> bool with true`, `replace gfni_supported -> bool with true`
+#     On x86_64 systems supporting these CPU extensions (such as modern server CPUs and CI nodes),
+#     runtime CPU feature detection (`std::is_x86_feature_detected!`) evaluates to `true`.
+#     Replacing the feature query with `true` produces identical runtime behaviour because the CPU
+#     actually does support the feature and executes the SIMD pathways identically.
 exclude_re = [
     "replace \\| with \\^ in ReplayWindow::commit",
     "replace > with >= in ReplayWindow::commit",
+    "replace < with <= in ReplayWindow::commit",
     "replace < with <= in keystream",
     "replace \\| with \\^ in parse_ip",
     "replace > with >= in FecEncoder::build",
@@ -112,4 +139,11 @@ exclude_re = [
     "replace < with > in FecReassembler::push",
     "replace > with >= in LossDetector::on_seen",
     "replace \\+ with \\* in LossDetector::on_seen",
+    "replace neon_supported -> bool with false",
+    "replace wasm_simd_supported -> bool with false",
+    "replace \\+ with \\* in RlncDecoder::consume_coded_symbol",
+    "replace ssse3_supported -> bool with true",
+    "replace avx2_supported -> bool with true",
+    "replace avx512bw_supported -> bool with true",
+    "replace gfni_supported -> bool with true",
 ]

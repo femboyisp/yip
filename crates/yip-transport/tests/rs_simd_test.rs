@@ -22,12 +22,36 @@ fn make_pseudo_random_buffer(len: usize, seed: u8) -> Vec<u8> {
 
 #[test]
 fn test_simd_feature_flags_do_not_panic() {
-    let _ = ssse3_supported();
-    let _ = avx2_supported();
-    let _ = avx512bw_supported();
-    let _ = gfni_supported();
+    #[cfg(target_arch = "x86_64")]
+    {
+        assert_eq!(ssse3_supported(), std::is_x86_feature_detected!("ssse3"));
+        assert_eq!(avx2_supported(), std::is_x86_feature_detected!("avx2"));
+        assert_eq!(
+            avx512bw_supported(),
+            std::is_x86_feature_detected!("avx512bw")
+        );
+        assert_eq!(gfni_supported(), std::is_x86_feature_detected!("gfni"));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        assert!(!ssse3_supported());
+        assert!(!avx2_supported());
+        assert!(!avx512bw_supported());
+        assert!(!gfni_supported());
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    assert!(!neon_supported(), "neon must be false on non-aarch64");
+    #[cfg(target_arch = "aarch64")]
     let _ = neon_supported();
-    let _ = wasm_simd_supported();
+
+    #[cfg(not(target_arch = "wasm32"))]
+    assert!(
+        !wasm_simd_supported(),
+        "wasm_simd must be false on non-wasm32"
+    );
+    #[cfg(target_arch = "wasm32")]
+    assert!(wasm_simd_supported(), "wasm_simd must be true on wasm32");
 }
 
 #[test]
