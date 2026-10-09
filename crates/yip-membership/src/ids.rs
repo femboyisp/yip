@@ -25,3 +25,22 @@ pub fn node_addr(pubkey: &[u8; 32]) -> Ipv6Addr {
     o[1..].copy_from_slice(&d);
     Ipv6Addr::from(o)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_node_id_and_addr_deterministic() {
+        let pk = [42u8; 32];
+        let id1 = node_id(&pk);
+        let id2 = node_id(&pk);
+        assert_eq!(id1, id2);
+        assert_eq!(id1.len(), 16);
+
+        let addr1 = node_addr(&pk);
+        let addr2 = node_addr(&pk);
+        assert_eq!(addr1, addr2);
+        assert_eq!(addr1.octets()[0], 0xfd);
+    }
+}

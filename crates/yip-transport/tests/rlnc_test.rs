@@ -213,3 +213,48 @@ fn test_scale_row() {
         .collect();
     assert_eq!(test_row, expected);
 }
+
+#[test]
+fn test_rlnc_accessors_and_edge_cases() {
+    let mut encoder = RlncEncoder::new(5);
+    assert_eq!(encoder.window_size(), 5);
+    assert_eq!(encoder.len(), 0);
+    assert!(encoder.is_empty());
+
+    // Empty encoder produce_coded_symbol
+    let (c, p) = encoder.produce_coded_symbol(123);
+    assert_eq!(c.len(), 5);
+    assert_eq!(p.len(), 0);
+
+    encoder.push_source(&[1, 2, 3]);
+    assert_eq!(encoder.len(), 1);
+    assert!(!encoder.is_empty());
+
+    let mut decoder = RlncDecoder::new(1, 3);
+    assert_eq!(decoder.window_size(), 1);
+    assert_eq!(decoder.symbol_len(), 3);
+    assert_eq!(decoder.rank(), 0);
+
+    let (c1, p1) = encoder.produce_coded_symbol(999);
+    assert!(decoder.consume_coded_symbol(&c1[..1], &p1));
+    assert!(decoder.is_complete());
+
+    // Consume when already complete returns false
+    assert!(!decoder.consume_coded_symbol(&c1[..1], &p1));
+}
+
+#[test]
+#[should_panic(expected = "cannot push more than window_size symbols")]
+fn test_rlnc_push_exceeds_window() {
+    let mut encoder = RlncEncoder::new(1);
+    encoder.push_source(&[1, 2, 3]);
+    encoder.push_source(&[4, 5, 6]);
+}
+
+#[test]
+#[should_panic(expected = "all source symbols must have identical length")]
+fn test_rlnc_push_mismatched_length() {
+    let mut encoder = RlncEncoder::new(2);
+    encoder.push_source(&[1, 2, 3]);
+    encoder.push_source(&[1, 2]);
+}

@@ -544,4 +544,60 @@ mod tests {
         // it returns Ok or an OS error without crashing or corrupting memory.
         let _ = pin_current_thread(0);
     }
+
+    #[test]
+    fn test_plain_io_single_send_recv_and_defaults() {
+        use std::net::UdpSocket;
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        tx.connect(rx.local_addr().unwrap()).unwrap();
+        rx.connect(tx.local_addr().unwrap()).unwrap();
+        let mut tx_io = PlainIo::new(tx);
+        let mut rx_io = PlainIo::new(rx);
+
+        // Test single send and recv
+        tx_io.send(b"single-packet").unwrap();
+        let mut buf = [0u8; 64];
+        let n = rx_io.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"single-packet");
+
+        // Test empty send_batch and recv_batch
+        assert_eq!(tx_io.send_batch(&[]).unwrap(), 0);
+        let mut empty_lens = [0usize; 1];
+        assert_eq!(rx_io.recv_batch(&mut [], &mut empty_lens).unwrap(), 0);
+
+        // Test Backend variants
+        assert_ne!(Backend::AfXdpZeroCopy, Backend::AfXdpCopy);
+
+        // Test default DataPlaneIo trait implementation
+        struct DefaultDataPlane {
+            payload: Vec<u8>,
+        }
+        impl DataPlaneIo for DefaultDataPlane {
+            fn backend(&self) -> Backend {
+                Backend::Mmsg
+            }
+            fn send(&mut self, datagram: &[u8]) -> std::io::Result<()> {
+                self.payload = datagram.to_vec();
+                Ok(())
+            }
+            fn recv(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.payload.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.payload[..n]);
+                Ok(n)
+            }
+        }
+
+        let mut ddp = DefaultDataPlane {
+            payload: Vec::new(),
+        };
+        let sent = ddp.send_batch(&[b"test-1", b"test-2"]).unwrap();
+        assert_eq!(sent, 2);
+        let mut bufs = vec![[0u8; MAX_WIRE_DATAGRAM]; 2];
+        let mut lens = [0usize; 2];
+        let recvd = ddp.recv_batch(&mut bufs, &mut lens).unwrap();
+        assert_eq!(recvd, 1);
+        assert_eq!(&bufs[0][..lens[0]], b"test-2");
+        assert_eq!(ddp.recv_batch(&mut [], &mut lens).unwrap(), 0);
+    }
 }

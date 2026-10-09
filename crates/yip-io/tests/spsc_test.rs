@@ -209,3 +209,17 @@ fn non_power_of_two_capacity_panics() {
 fn zero_capacity_panics() {
     let (_tx, _rx) = spsc_pair::<u32, 0>();
 }
+
+#[test]
+fn test_spsc_debug_and_zero_drain() {
+    let (tx, rx) = spsc_pair::<u32, 8>();
+    let tx_dbg = format!("{tx:?}");
+    let rx_dbg = format!("{rx:?}");
+    assert!(tx_dbg.contains("SpscProducer"));
+    assert!(rx_dbg.contains("SpscConsumer"));
+    assert_eq!(tx.capacity(), 8);
+
+    let mut out = Vec::new();
+    assert_eq!(rx.drain_batch(&mut out, 0), 0);
+    assert!(out.is_empty());
+}

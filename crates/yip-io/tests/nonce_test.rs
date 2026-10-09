@@ -33,3 +33,14 @@ fn test_chunked_nonce_dispenser_concurrency() {
     }
     assert_eq!(all_nonces.len(), threads * nonces_per_thread);
 }
+
+#[test]
+fn test_local_nonce_window_empty_and_replenish() {
+    let dispenser = ChunkedNonceDispenser::new(yip_io::nonce::DEFAULT_NONCE_CHUNK_SIZE);
+    let mut empty_win = yip_io::nonce::LocalNonceWindow::empty();
+    // empty window triggers claim_chunk branch in next_nonce
+    let n1 = empty_win.next_nonce(&dispenser);
+    assert_eq!(n1, Some(0));
+    let n2 = empty_win.next_nonce(&dispenser);
+    assert_eq!(n2, Some(1));
+}

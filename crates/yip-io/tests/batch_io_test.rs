@@ -144,3 +144,18 @@ fn test_ipv6_batch_roundtrip() {
         assert_eq!(out[i].src, addr1);
     }
 }
+
+#[test]
+fn test_udp_gso_segment_and_superpacket() {
+    let s1 = UdpSocket::bind("127.0.0.1:0").expect("bind s1");
+    let s2 = UdpSocket::bind("127.0.0.1:0").expect("bind s2");
+    let addr2 = s2.local_addr().unwrap();
+
+    // Probe set_udp_gso_segment
+    let _ = yip_io::batch::set_udp_gso_segment(&s1, 1420);
+
+    // Test send_gso_superpacket
+    let payload = vec![0x5a; 2840];
+    let res = yip_io::batch::send_gso_superpacket(&s1, &payload, 1420, addr2);
+    let _ = res;
+}

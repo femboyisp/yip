@@ -839,4 +839,25 @@ mod tests {
             "in_flight must settle at exactly max_objects (2) after churning past capacity"
         );
     }
+
+    #[test]
+    fn test_fec_encoder_set_shard() {
+        let mut enc = FecEncoder::new();
+        enc.set_shard(2, 4);
+        assert_eq!(enc.next_object_id, 2);
+        assert_eq!(enc.stride, 4);
+
+        let params = FlowClass::Default.params();
+        let syms1 = enc.encode(&[1, 2, 3], params, 0);
+        let id1 = syms1[0].object_id;
+        assert_eq!(id1, 2);
+
+        let syms2 = enc.encode(&[4, 5, 6], params, 0);
+        let id2 = syms2[0].object_id;
+        assert_eq!(id2, 6);
+
+        // Zero shards falls back to stride 1
+        enc.set_shard(5, 0);
+        assert_eq!(enc.stride, 1);
+    }
 }

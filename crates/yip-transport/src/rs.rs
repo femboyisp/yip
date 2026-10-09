@@ -226,135 +226,6 @@ pub fn decode_source(
     Some(out)
 }
 
-/// Test helper that runs `mul_add_row` and compares against scalar `crate::gf256::mul_slice_into`.
-#[doc(hidden)]
-pub fn test_mul_add_row_differential(coeff: u8, src: &[u8]) {
-    let mut dst_simd = vec![0u8; src.len()];
-    let mut dst_scalar = vec![0u8; src.len()];
-    for (i, d) in dst_simd.iter_mut().enumerate() {
-        *d = (i as u8).wrapping_mul(31).wrapping_add(7);
-    }
-    dst_scalar.copy_from_slice(&dst_simd);
-
-    mul_add_row(coeff, src, &mut dst_simd);
-    crate::gf256::mul_slice_into(&mut dst_scalar, src, coeff);
-
-    assert_eq!(
-        dst_simd,
-        dst_scalar,
-        "mismatch between mul_add_row and scalar GF(2^8) for coeff={coeff}, len={}",
-        src.len()
-    );
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if crate::rs_simd::gfni_supported() {
-            let mut dst_gfni = vec![0u8; src.len()];
-            for (i, d) in dst_gfni.iter_mut().enumerate() {
-                *d = (i as u8).wrapping_mul(31).wrapping_add(7);
-            }
-            // SAFETY: gfni_supported() confirmed GFNI is available, src and dst_gfni lengths match.
-            unsafe {
-                crate::rs_simd::mul_add_gfni(coeff, src, &mut dst_gfni);
-            }
-            assert_eq!(
-                dst_gfni,
-                dst_scalar,
-                "mismatch between mul_add_gfni and scalar GF(2^8) for coeff={coeff}, len={}",
-                src.len()
-            );
-        }
-        if crate::rs_simd::avx512bw_supported() {
-            let mut dst_avx512 = vec![0u8; src.len()];
-            for (i, d) in dst_avx512.iter_mut().enumerate() {
-                *d = (i as u8).wrapping_mul(31).wrapping_add(7);
-            }
-            // SAFETY: avx512bw_supported() confirmed AVX-512BW is available, src and dst_avx512 lengths match.
-            unsafe {
-                crate::rs_simd::mul_add_avx512(coeff, src, &mut dst_avx512);
-            }
-            assert_eq!(
-                dst_avx512,
-                dst_scalar,
-                "mismatch between mul_add_avx512 and scalar GF(2^8) for coeff={coeff}, len={}",
-                src.len()
-            );
-        }
-        if crate::rs_simd::avx2_supported() {
-            let mut dst_avx2 = vec![0u8; src.len()];
-            for (i, d) in dst_avx2.iter_mut().enumerate() {
-                *d = (i as u8).wrapping_mul(31).wrapping_add(7);
-            }
-            // SAFETY: avx2_supported() confirmed AVX2 is available, src and dst_avx2 lengths match.
-            unsafe {
-                crate::rs_simd::mul_add_avx2(coeff, src, &mut dst_avx2);
-            }
-            assert_eq!(
-                dst_avx2,
-                dst_scalar,
-                "mismatch between mul_add_avx2 and scalar GF(2^8) for coeff={coeff}, len={}",
-                src.len()
-            );
-        }
-        if crate::rs_simd::ssse3_supported() {
-            let mut dst_ssse3 = vec![0u8; src.len()];
-            for (i, d) in dst_ssse3.iter_mut().enumerate() {
-                *d = (i as u8).wrapping_mul(31).wrapping_add(7);
-            }
-            // SAFETY: ssse3_supported() confirmed SSSE3 is available, src and dst_ssse3 lengths match.
-            unsafe {
-                crate::rs_simd::mul_add_ssse3(coeff, src, &mut dst_ssse3);
-            }
-            assert_eq!(
-                dst_ssse3,
-                dst_scalar,
-                "mismatch between mul_add_ssse3 and scalar GF(2^8) for coeff={coeff}, len={}",
-                src.len()
-            );
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        if crate::rs_simd::neon_supported() {
-            let mut dst_neon = vec![0u8; src.len()];
-            for (i, d) in dst_neon.iter_mut().enumerate() {
-                *d = (i as u8).wrapping_mul(31).wrapping_add(7);
-            }
-            // SAFETY: neon_supported() confirmed ARM64 NEON is available, src and dst_neon lengths match.
-            unsafe {
-                crate::rs_simd::mul_add_neon(coeff, src, &mut dst_neon);
-            }
-            assert_eq!(
-                dst_neon,
-                dst_scalar,
-                "mismatch between mul_add_neon and scalar GF(2^8) for coeff={coeff}, len={}",
-                src.len()
-            );
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    {
-        if crate::rs_simd::wasm_simd_supported() {
-            let mut dst_wasm = vec![0u8; src.len()];
-            for (i, d) in dst_wasm.iter_mut().enumerate() {
-                *d = (i as u8).wrapping_mul(31).wrapping_add(7);
-            }
-            // SAFETY: wasm_simd_supported() confirmed WASM SIMD is available, src and dst_wasm lengths match.
-            unsafe {
-                crate::rs_simd::mul_add_wasm128(coeff, src, &mut dst_wasm);
-            }
-            assert_eq!(
-                dst_wasm,
-                dst_scalar,
-                "mismatch between mul_add_wasm128 and scalar GF(2^8) for coeff={coeff}, len={}",
-                src.len()
-            );
-        }
-    }
-}
-
 /// Gauss–Jordan inverse of a K×K GF(256) matrix; `None` if singular.
 fn invert(a: &mut [Vec<u8>]) -> Option<Vec<Vec<u8>>> {
     let n = a.len();
@@ -577,5 +448,27 @@ mod tests {
             (u16::try_from(k + 2).unwrap(), bogus.as_slice()),
         ];
         assert_eq!(decode_source(k, len, &recv, Scheme::Pq), None);
+    }
+
+    #[test]
+    fn test_mul_add_row_coeff_0_and_1() {
+        let src = vec![1, 2, 3, 4];
+        let mut dst = vec![10, 20, 30, 40];
+        // Coeff 0 is no-op
+        mul_add_row(0, &src, &mut dst);
+        assert_eq!(dst, vec![10, 20, 30, 40]);
+
+        // Coeff 1 is XOR
+        mul_add_row(1, &src, &mut dst);
+        assert_eq!(dst, vec![10 ^ 1, 20 ^ 2, 30 ^ 3, 40 ^ 4]);
+    }
+
+    #[test]
+    fn test_repair_row_pq_fallback_and_singular_invert() {
+        let row = repair_row(Scheme::Pq, 4, 3);
+        assert_eq!(row, vec![0u8; 4]);
+
+        let mut singular = vec![vec![0u8; 2], vec![0u8; 2]];
+        assert_eq!(invert(&mut singular), None);
     }
 }

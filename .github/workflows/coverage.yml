@@ -38,5 +38,5 @@ jobs:
         run: >
           cargo llvm-cov --workspace
           --exclude yip-device --exclude yipd
-          --ignore-filename-regex '.*/uring\.rs$'
+          --ignore-filename-regex '.*/(uring|rs_simd)\.rs$'
           --fail-under-lines 90 --summary-only

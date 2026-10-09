@@ -230,4 +230,24 @@ mod tests {
             "idle fds must report nothing ready"
         );
     }
+
+    #[test]
+    fn test_read_write_fd_and_error_paths() {
+        let sock1 = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sock2 = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock1.connect(sock2.local_addr().unwrap()).unwrap();
+
+        let written = write_fd(sock1.as_raw_fd(), b"hello").unwrap();
+        assert_eq!(written, 5);
+
+        let mut buf = [0u8; 16];
+        let read = read_fd(sock2.as_raw_fd(), &mut buf).unwrap();
+        assert_eq!(read, 5);
+        assert_eq!(&buf[..5], b"hello");
+
+        // Error paths
+        assert!(set_nonblocking(-1).is_err());
+        assert!(read_fd(-1, &mut buf).is_err());
+        assert!(write_fd(-1, b"fail").is_err());
+    }
 }
