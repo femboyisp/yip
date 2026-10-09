@@ -17,10 +17,13 @@ fn test_rlnc_rateless_encode_decode_round_trip() {
     let mut decoder = RlncDecoder::new(window_size, symbol_len);
 
     let mut seed = 12345u32;
+    let mut packets_sent = 0;
     while !decoder.is_complete() {
         let (coeffs, coded) = encoder.produce_coded_symbol(seed);
         decoder.consume_coded_symbol(&coeffs, &coded);
         seed += 1;
+        packets_sent += 1;
+        assert!(packets_sent < 100, "Too many packets without decoding");
     }
 
     let decoded = decoder.extract_source_symbols().unwrap();
@@ -131,10 +134,13 @@ fn test_rlnc_linear_dependence_and_duplicate_rejection() {
 
     // Supply more packets until full rank
     let mut seed = 2000u32;
+    let mut packets_sent = 0;
     while !decoder.is_complete() {
         let (coeffs, coded) = encoder.produce_coded_symbol(seed);
         decoder.consume_coded_symbol(&coeffs, &coded);
         seed += 1;
+        packets_sent += 1;
+        assert!(packets_sent < 100, "Too many packets without decoding");
     }
 
     assert_eq!(decoder.rank(), window_size);
@@ -230,17 +236,72 @@ fn test_rlnc_accessors_and_edge_cases() {
     assert_eq!(encoder.len(), 1);
     assert!(!encoder.is_empty());
 
-    let mut decoder = RlncDecoder::new(1, 3);
-    assert_eq!(decoder.window_size(), 1);
+    let mut decoder = RlncDecoder::new(5, 3);
+    assert_eq!(decoder.window_size(), 5);
+    assert_ne!(decoder.window_size(), 1);
     assert_eq!(decoder.symbol_len(), 3);
     assert_eq!(decoder.rank(), 0);
 
+    // Test produce_coded_symbol with seed=33 where first byte is 0 and second byte is 59
+    let mut enc2 = RlncEncoder::new(2);
+    enc2.push_source(&[10, 20]);
+    enc2.push_source(&[30, 40]);
+    let (c_seed, p_seed) = enc2.produce_coded_symbol(33);
+    assert_eq!(c_seed[0], 0);
+    assert_eq!(c_seed[1], 59);
+    assert_eq!(p_seed.len(), 2);
+
+    // Test produce_coded_symbol with seed=1640531527 where first 4-byte draw is ALL zero.
+    // Must loop to draw second round where bytes are non-zero:
+    let mut enc4 = RlncEncoder::new(4);
+    for i in 0..4 {
+        enc4.push_source(&[i as u8, (i * 2) as u8]);
+    }
+    let (c_zero_draw, _) = enc4.produce_coded_symbol(1640531527);
+    // In first iteration, rand_val is 0. If loop doesn't re-draw (or doesn't detect all-zero),
+    // c_zero_draw would be all 0 (or fallback coeffs[0]=1 with others 0).
+    // In second iteration, rand_val = 2462723854 = 0x92c90f0e.
+    assert_eq!(c_zero_draw[0], 14);
+    assert_eq!(c_zero_draw[1], 47);
+    assert_eq!(c_zero_draw[2], 202);
+    assert_eq!(c_zero_draw[3], 146);
+
     let (c1, p1) = encoder.produce_coded_symbol(999);
-    assert!(decoder.consume_coded_symbol(&c1[..1], &p1));
-    assert!(decoder.is_complete());
+    assert!(decoder.consume_coded_symbol(&c1[..5], &p1));
+    assert_eq!(decoder.rank(), 1);
+    assert!(!decoder.is_complete());
+
+    // Test pivot normalization: row with non-zero trailing coefficient scaled by inv
+    // col = 0, cur_coeffs = [2, 3], inv = inv(2) = 142.
+    // cur_coeffs[1] = mul(3, 142) = 217.
+    let mut dec2 = RlncDecoder::new(2, 2);
+    let coeffs = vec![2u8, 3u8];
+    let payload = vec![4u8, 5u8];
+    assert!(dec2.consume_coded_symbol(&coeffs, &payload));
+    assert_eq!(dec2.rank(), 1);
+
+    // Test pivot normalization when col = 2 (col > 0 so (col + 1) != (col * 1)):
+    // window_size = 4. Pivot at col = 2 with coeffs = [0, 0, 5, 7].
+    // If (col + 1) is mutated to (col * 1), slice starts at col = 2 instead of col + 1 = 3.
+    // Submitting a second packet that cancels col = 2 and checks col = 3 tests normalized value!
+    let mut dec3 = RlncDecoder::new(4, 2);
+    let coeffs_pivot = vec![0u8, 0u8, 5u8, 7u8];
+    assert!(dec3.consume_coded_symbol(&coeffs_pivot, &[10, 20]));
+    // Pivot normalized cur_coeffs[2] to 1, cur_coeffs[3] = mul(7, inv(5)) = mul(7, 167) = 82.
+    // Normalized payload: scale_row(inv(5), &[10, 20]) = [2, 4].
+    // Now submit packet with [0, 0, 1, 82] and payload [2, 4].
+    // It must be rejected as linearly dependent!
+    // Under mutant `*`, cur_coeffs[2] gets overwritten or cur_coeffs[3] is wrong!
+    assert!(
+        !dec3.consume_coded_symbol(&[0u8, 0u8, 1u8, 82u8], &[2, 4]),
+        "normalized row must detect exact linearly dependent row"
+    );
 
     // Consume when already complete returns false
-    assert!(!decoder.consume_coded_symbol(&c1[..1], &p1));
+    let mut dec_comp = RlncDecoder::new(1, 3);
+    assert!(dec_comp.consume_coded_symbol(&c1[..1], &p1));
+    assert!(dec_comp.is_complete());
+    assert!(!dec_comp.consume_coded_symbol(&c1[..1], &p1));
 }
 
 #[test]
@@ -257,4 +318,20 @@ fn test_rlnc_push_mismatched_length() {
     let mut encoder = RlncEncoder::new(2);
     encoder.push_source(&[1, 2, 3]);
     encoder.push_source(&[1, 2]);
+}
+
+#[test]
+fn test_splitmix32_exact_vectors() {
+    use yip_transport::rlnc::splitmix32;
+    let mut s = 1u32;
+    assert_eq!(splitmix32(&mut s), 0x96a0f96b);
+    assert_eq!(s, 0x9e3779ba);
+    assert_eq!(splitmix32(&mut s), 0x12bc8390);
+    assert_eq!(s, 0x3c6ef373);
+    assert_eq!(splitmix32(&mut s), 0x971e9964);
+    assert_eq!(s, 0xdaa66d2c);
+    assert_eq!(splitmix32(&mut s), 0x79adc7e7);
+    assert_eq!(s, 0x78dde6e5);
+    assert_eq!(splitmix32(&mut s), 0x591c8dd8);
+    assert_eq!(s, 0x1715609e);
 }

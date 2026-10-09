@@ -8,7 +8,7 @@ use crate::rs::mul_add_row;
 
 /// SplitMix32 pseudorandom generator for deterministic coefficient generation.
 #[inline]
-fn splitmix32(state: &mut u32) -> u32 {
+pub fn splitmix32(state: &mut u32) -> u32 {
     *state = state.wrapping_add(0x9e3779b9);
     let mut z = *state;
     z = (z ^ (z >> 16)).wrapping_mul(0x85ebca6b);
@@ -103,7 +103,7 @@ impl RlncEncoder {
         let mut coeffs = vec![0u8; self.window_size];
 
         // Draw coefficients until at least one non-zero coefficient is drawn.
-        loop {
+        for _ in 0..16 {
             let mut all_zero = true;
             for i in (0..n).step_by(4) {
                 let rand_val = splitmix32(&mut s);
@@ -120,6 +120,9 @@ impl RlncEncoder {
             if !all_zero {
                 break;
             }
+        }
+        if coeffs[..n].iter().all(|&c| c == 0) {
+            coeffs[0] = 1;
         }
 
         let mut coded = vec![0u8; self.symbol_len];

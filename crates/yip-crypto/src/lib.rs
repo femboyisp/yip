@@ -1347,4 +1347,267 @@ mod tests {
             Err(CryptoError::Replay)
         );
     }
+
+    #[test]
+    fn test_chacha20_poly1305_cipher_debug_and_boundaries() {
+        let key = [0x5au8; 32];
+        let cipher = ChaCha20Poly1305Cipher::new(key);
+        let debug_str = format!("{cipher:?}");
+        assert!(debug_str.contains("ChaCha20Poly1305Cipher"));
+
+        let mut buf = [0u8; 32];
+        // Exact buffer length (buf.len() == plaintext_len + 16): must succeed
+        assert_eq!(cipher.seal_in_place(1, &mut buf[..16], 0).unwrap(), 16);
+
+        // Buffer smaller than total_len (buf.len() < plaintext_len + 16): must fail
+        assert_eq!(
+            cipher.seal_in_place(1, &mut buf[..15], 0),
+            Err(CryptoError::Decrypt)
+        );
+
+        // open_in_place: sealed_len < 16 must fail
+        assert_eq!(
+            cipher.open_in_place(1, &mut buf, 15),
+            Err(CryptoError::Decrypt)
+        );
+        assert_eq!(
+            cipher.open_in_place(1, &mut buf, 0),
+            Err(CryptoError::Decrypt)
+        );
+
+        // open_in_place: buf.len() < sealed_len must fail (even when sealed_len >= 16)
+        assert_eq!(
+            cipher.open_in_place(1, &mut buf[..10], 16),
+            Err(CryptoError::Decrypt)
+        );
+
+        // open_in_place: exact boundary sealed_len == 16 and buf.len() == 16
+        let mut exact = [0u8; 16];
+        cipher.seal_in_place(2, &mut exact, 0).unwrap();
+        assert_eq!(cipher.open_in_place(2, &mut exact, 16).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_seal_into_with_counter_and_open_into_with_window() {
+        let (a, b) = crate::test_session_pair();
+        let payload = b"buffer test payload";
+        let mut sealed_buf = Vec::new();
+        a.seal_into_with_counter(42, payload, &mut sealed_buf)
+            .unwrap();
+        assert_ne!(sealed_buf, payload);
+        assert_eq!(sealed_buf.len(), payload.len() + 16);
+
+        let mut replay = ReplayWindow::new();
+        let mut out = Vec::new();
+        b.open_into_with_window(42, &sealed_buf, &mut replay, &mut out)
+            .unwrap();
+        assert_eq!(out, payload);
+
+        // Replay attempt must fail and not modify output buffer
+        out.clear();
+        let err = b.open_into_with_window(42, &sealed_buf, &mut replay, &mut out);
+        assert_eq!(err, Err(CryptoError::Replay));
+        assert!(out.is_empty());
+
+        // Forged tag must fail
+        let mut bad_buf = sealed_buf.clone();
+        bad_buf[0] ^= 1;
+        let mut fresh_replay = ReplayWindow::new();
+        let bad_err = b.open_into_with_window(43, &bad_buf, &mut fresh_replay, &mut out);
+        assert_eq!(bad_err, Err(CryptoError::Decrypt));
+    }
+
+    #[test]
+    fn test_replay_window_word_idx_distinct_words() {
+        let mut w = ReplayWindow::new();
+        w.commit(0);
+        // Counters across different word indices (64, 128) must not falsely collide with 0
+        assert!(w.check(64));
+        assert!(w.check(128));
+        w.commit(64);
+        assert!(!w.check(64));
+        assert!(!w.check(0));
+        assert!(w.check(128));
+    }
+
+    #[test]
+    fn test_promote_to_high_throughput_preserves_multi_word_state() {
+        let mut w = ReplayWindow::new_with_profile(ReplayProfile::Standard);
+        w.commit(100);
+        w.commit(200);
+        w.commit(1000);
+        w.commit(1500);
+        w.promote_to_high_throughput();
+        assert_eq!(w.profile(), ReplayProfile::HighThroughput);
+
+        assert!(!w.check(100));
+        assert!(!w.check(200));
+        assert!(!w.check(1000));
+        assert!(!w.check(1500));
+
+        assert!(w.check(101));
+        assert!(w.check(201));
+        assert!(w.check(1001));
+        assert!(w.check(1499));
+    }
+
+    #[test]
+    fn test_promote_to_high_throughput_large_latest() {
+        // Case 1: latest_word is small (< old_words = 128 words).
+        // latest_word = 10, so saturating_sub(127) == 0.
+        // Under mutant `old_words + 1` = 129, saturating_sub(129) == 0 (no diff).
+        // But under mutant `old_words / 1` = 128, saturating_sub(128) == 0.
+        //
+        // Case 2: latest_word >= old_words (e.g. latest_word = 200).
+        // start_word should be 200 - 127 = 73.
+        // Under mutant `+`: (old_words + 1) = 129 -> 200 - 129 = 71.
+        // Under mutant `/`: (old_words / 1) = 128 -> 200 - 128 = 72.
+        // Counter at word 72 is (72 * 64). Under the correct code (start_word = 73),
+        // word 72 is NOT copied (it's older than 127 words from latest).
+        // BUT wait: in standard window of 128 words, word 72 is diff = 200 - 72 = 128 words = 8192 bits!
+        // 8192 bits is beyond standard window bits (8192), so its slot in old_bitmap is actually word 200's slot!
+        // Notice: 72 & 127 = 72. 200 & 127 = 72!
+        // If word 72 is copied to new_bitmap[72], while word 200 is copied to new_bitmap[200],
+        // then word 72 in new_bitmap would receive the contents of old_bitmap[72]!
+        // In the correct code (start_word = 73), word 72 is NOT visited, so new_bitmap[72] is 0!
+        // Under mutant `+` or `/`: start_word <= 72, so loop visits w = 72 and copies old_bitmap[72] into new_bitmap[72]!
+        // Therefore, counter (72 * 64 + bit) would falsely appear as committed in new_bitmap!
+        let mut w = ReplayWindow::new_with_profile(ReplayProfile::Standard);
+        let latest = 200 * 64 + 10;
+        w.commit(latest);
+        w.promote_to_high_throughput();
+
+        // Counter at word 72 (e.g. 72 * 64 + 10) was never committed (it is 128 words older than latest).
+        // In correct code, new_bitmap[72] == 0, so check(72 * 64 + 10) is true (not seen, acceptable).
+        // Under mutant `-` -> `+` or `/`, w = 72 is included in the loop, copying old_bitmap[72] (which has bit 10 set from latest!)
+        // into new_bitmap[72], so check(72 * 64 + 10) would falsely return false (already seen)!
+        assert!(
+            w.check(72 * 64 + 10),
+            "counter 72 * 64 + 10 was never committed and must be acceptable"
+        );
+
+        // Also test that actual valid tail counter (word 73: 73 * 64 + 10) was committed and preserved:
+        let mut w2 = ReplayWindow::new_with_profile(ReplayProfile::Standard);
+        w2.commit(73 * 64 + 10);
+        w2.commit(latest);
+        w2.promote_to_high_throughput();
+        assert!(!w2.check(latest), "latest must still be marked seen");
+        assert!(
+            !w2.check(73 * 64 + 10),
+            "tail counter in word 73 must be marked seen"
+        );
+    }
+
+    #[test]
+    fn test_replay_window_circular_word_clearing() {
+        let mut w = ReplayWindow::new_with_profile(ReplayProfile::Standard);
+        w.commit(69);
+        assert!(!w.check(69));
+
+        w.commit(8192 + 74);
+        assert!(!w.check(8192 + 74));
+
+        assert!(
+            w.check(8192 + 69),
+            "counter 8192 + 69 must not be blocked by stale bit from counter 69"
+        );
+    }
+
+    #[test]
+    fn test_replay_window_consecutive_word_clearing() {
+        let mut w = ReplayWindow::new_with_profile(ReplayProfile::Standard);
+        w.commit(130);
+        w.commit(8192 + 70);
+        w.commit(8192 + 135);
+        assert!(
+            w.check(8192 + 130),
+            "counter 8192 + 130 must be accepted after word 2 is overtaken and cleared"
+        );
+
+        // Kills: replace - with + in diff = counter - self.latest
+        w.commit(3000);
+        w.commit(3001);
+        w.commit(3500); // 3500 - 3001 = 499 < 8192. Under +, 3500 + 3001 = 6501, wait!
+                        // Under +, diff = 3500 + 3001 = 6501, which is < 8192! We need counter + latest >= 8192:
+                        // Say latest = 5000, counter = 5100: diff = 5100 - 5000 = 100 < 8192.
+                        // Under +, diff = 5100 + 5000 = 10100 >= 8192 (large leap clears bitmap!).
+        w.commit(5000);
+        w.commit(5001);
+        w.commit(5100);
+        assert!(!w.check(5001), "counter 5001 must still be marked seen");
+    }
+
+    #[test]
+    fn test_session_set_stride_and_send_counter() {
+        let (mut a, _) = crate::test_session_pair();
+        assert_eq!(a.send_counter(), 0);
+        assert_ne!(a.send_counter(), 1);
+
+        // Initial configuration on fresh session (send_counter == 0):
+        a.set_stride(5, 4);
+        assert_eq!(a.stride(), 4);
+        assert_eq!(a.send_counter(), 5);
+
+        // Stride 0 falls back to 1:
+        // send_counter was 5. With stride 1, target_rem = 10 % 1 = 0, rem = 5 % 1 = 0.
+        // send_counter remains 5.
+        a.set_stride(10, 0);
+        assert_eq!(a.stride(), 1);
+        assert_eq!(a.send_counter(), 5);
+
+        // Reconfiguration with send_counter > 0 and rem <= target_rem:
+        // currently send_counter is 5.
+        // stride = 4, start_counter = 3.
+        // rem = 5 % 4 = 1.
+        // target_rem = 3 % 4 = 3.
+        // rem (1) <= target_rem (3) -> diff = 3 - 1 = 2.
+        // send_counter becomes 5 + 2 = 7. 7 % 4 == 3.
+        a.set_stride(3, 4);
+        assert_eq!(a.stride(), 4);
+        assert_eq!(a.send_counter(), 7);
+        assert_eq!(a.send_counter() % 4, 3);
+
+        // Reconfiguration with send_counter > 0 and rem > target_rem where (rem - target_rem) > 1:
+        // currently send_counter is 7.
+        // Let's set stride = 8, start_counter = 1.
+        // rem = 7 % 8 = 7.
+        // target_rem = 1 % 8 = 1.
+        // rem (7) > target_rem (1) -> (rem - target_rem) = 6.
+        // Correct diff: 8 - 6 = 2. send_counter becomes 7 + 2 = 9. 9 % 8 = 1.
+        // Mutant diff: 8 / 6 = 1. send_counter becomes 7 + 1 = 8. 8 % 8 = 0 != 1.
+        a.set_stride(1, 8);
+        assert_eq!(a.stride(), 8);
+        assert_eq!(a.send_counter(), 9);
+        assert_eq!(a.send_counter() % 8, 1);
+    }
+
+    #[test]
+    fn test_session_seal_in_place_and_open_in_place_boundaries() {
+        let (mut a, mut b) = crate::test_session_pair();
+        let mut buf = [0u8; 32];
+        // Exact length buf.len() == plaintext_len + 16: succeeds
+        let ctr = a.seal_in_place(&mut buf[..16], 0).unwrap();
+        assert_eq!(ctr, 0);
+
+        // Buffer smaller than total_len: fails
+        assert_eq!(
+            a.seal_in_place(&mut buf[..15], 0),
+            Err(CryptoError::Decrypt)
+        );
+
+        // open_in_place: sealed_len < 16 fails
+        assert_eq!(b.open_in_place(0, &mut buf, 15), Err(CryptoError::Decrypt));
+        assert_eq!(b.open_in_place(0, &mut buf, 0), Err(CryptoError::Decrypt));
+
+        // open_in_place: buf.len() < sealed_len fails
+        assert_eq!(
+            b.open_in_place(0, &mut buf[..10], 16),
+            Err(CryptoError::Decrypt)
+        );
+
+        // open_in_place: exact boundary sealed_len == 16 and buf.len() == 16: succeeds
+        let mut exact = [0u8; 16];
+        let ctr2 = a.seal_in_place(&mut exact, 0).unwrap();
+        assert_eq!(b.open_in_place(ctr2, &mut exact, 16).unwrap(), 0);
+    }
 }

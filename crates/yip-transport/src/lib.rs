@@ -383,4 +383,20 @@ mod tests {
             assert_eq!(t.params_for(class).symbol_size, 1200);
         }
     }
+
+    #[test]
+    fn test_transport_set_shard() {
+        let mut t = Transport::new(vec![], 1200);
+        t.set_shard(3, 8);
+        let ciphertext = vec![0x42u8; 100];
+        let inner = vec![0x42u8; 100];
+        let (_class, symbols) = t.encode(&ciphertext, &inner, false, 0);
+        assert!(!symbols.is_empty());
+        let sym = &symbols[0];
+        assert_eq!(
+            sym.object_id % 8,
+            3,
+            "object_id must match configured shard"
+        );
+    }
 }
