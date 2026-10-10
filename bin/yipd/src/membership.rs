@@ -379,18 +379,35 @@ impl Membership {
 
     /// Whether `pubkey` is still an admissible member at wall-clock `now`:
     /// `true` if it is an always-admit root, OR the directory holds a valid
+    /// (unexpired, verifying) cert for it. If not in directory yet (e.g. gossip
+    /// still in flight right after initial admission), falls back to checking
+    /// `admitted_not_after` against wall clock plus clock-skew grace.
+    pub fn member_or_admitted_cert_valid(
+        &self,
+        pubkey: &[u8; 32],
+        admitted_not_after: Option<u64>,
+        now: u64,
+    ) -> bool {
+        if self.roots.roots.iter().any(|(pk, _)| pk == pubkey) {
+            return true;
+        }
+        if let Some(rec) = self.directory.get(&node_id(pubkey)) {
+            return self.verify_cert(&rec.cert, pubkey, now);
+        }
+        if let Some(not_after) = admitted_not_after {
+            return now <= not_after.saturating_add(clock_skew_secs());
+        }
+        false
+    }
+
+    /// Whether `pubkey` is still an admissible member at wall-clock `now`:
+    /// `true` if it is an always-admit root, OR the directory holds a valid
     /// (unexpired, verifying) cert for it. `false` only when a non-root member's
     /// record was evicted (expired) or its cert no longer verifies — i.e.
     /// revoked-by-non-renewal. Folding the root check in here keeps roots exempt
     /// from the #41 liveness sweep (they have no directory-cert dependency).
     pub fn member_cert_valid(&self, pubkey: &[u8; 32], now: u64) -> bool {
-        if self.roots.roots.iter().any(|(pk, _)| pk == pubkey) {
-            return true;
-        }
-        match self.directory.get(&node_id(pubkey)) {
-            Some(rec) => self.verify_cert(&rec.cert, pubkey, now),
-            None => false,
-        }
+        self.member_or_admitted_cert_valid(pubkey, None, now)
     }
 
     // ── internal helpers ───────────────────────────────────────────────
@@ -910,6 +927,22 @@ mod tests {
             !m.member_cert_valid(&never_seen, now),
             "an unknown non-root member is invalid"
         );
+    }
+
+    #[test]
+    fn member_or_admitted_cert_valid_fallback_while_gossip_in_flight() {
+        let (m, _live_pubkey, root_pubkey, _expired_pubkey, now) =
+            membership_with_live_root_and_expired();
+        let fresh_peer = [0x55u8; 32];
+        // Absent from directory and roots, but has valid admitted_not_after (e.g. 1000 > now 900)
+        assert!(m.member_or_admitted_cert_valid(&fresh_peer, Some(1000), now));
+        // Absent from directory, and admitted_not_after expired (e.g. 500 + 300 < now 900)
+        assert!(!m.member_or_admitted_cert_valid(&fresh_peer, Some(500), now));
+        // Absent from directory, and no admitted_not_after
+        assert!(!m.member_or_admitted_cert_valid(&fresh_peer, None, now));
+        // Root is always valid regardless of admitted_not_after
+        assert!(m.member_or_admitted_cert_valid(&root_pubkey, None, now));
+        assert!(m.member_or_admitted_cert_valid(&root_pubkey, Some(1), now));
     }
 
     // (i) Fix-pass (Task 6): a `PullRequest` naming more `node_id`s than fit

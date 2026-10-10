@@ -472,6 +472,9 @@ impl PeerManager {
             eprintln!("peer_manager: rekey responder cert rejected");
             return DispatchOut::None;
         }
+        if let Some(cert) = Cert::decode(&responder_payload) {
+            self.peers[idx].admitted_cert_not_after = Some(cert.not_after);
+        }
 
         let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
         let mut dp = Box::new(DataPlane::new(

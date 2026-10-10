@@ -107,7 +107,7 @@ impl PeerManager {
     /// for why source-address matching is primary and the raw `dg[1..9]`
     /// `by_tag` hint is secondary.
     fn route_data(&self, src: SocketAddr, dg: &[u8]) -> Option<usize> {
-        if dg.len() >= 9 {
+        if dg.len() >= 9 && dg[0] == PacketType::Data as u8 {
             let tag_bytes: [u8; 8] = dg[1..9].try_into().expect("checked len >= 9 above");
             let tag = u64::from_be_bytes(tag_bytes);
             if let Some(&idx) = self.by_tag.get(&tag) {
