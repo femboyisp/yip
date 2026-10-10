@@ -253,6 +253,12 @@ struct Peer {
     /// `drop_session`: a peer that is dropped and later re-establishes must
     /// still reject a replay of an Init from before the drop.
     last_accepted_init_ts: Option<[u8; 12]>,
+    /// The `not_after` expiration timestamp (wall-clock seconds) of the CA-signed
+    /// certificate presented by the peer when it was admitted during handshake.
+    /// Used by the periodic cert-liveness sweep as a fallback while gossip
+    /// discovery is in flight, so a freshly-admitted peer is not prematurely
+    /// dropped before its directory record arrives.
+    admitted_cert_not_after: Option<u64>,
     /// This peer's self-certifying rendezvous node id (`node_id(pubkey)`),
     /// used to `lookup`/`relay` for it and to demux `RdvEvent`s back to it.
     node: NodeId,
@@ -508,6 +514,7 @@ impl PeerManager {
                 cached_resp: None,
                 cached_resp_init_eph: None,
                 last_accepted_init_ts: None,
+                admitted_cert_not_after: None,
                 node,
                 path,
                 path_kind: None,
@@ -600,6 +607,7 @@ impl PeerManager {
             cached_resp: None,
             cached_resp_init_eph: None,
             last_accepted_init_ts: None,
+            admitted_cert_not_after: None,
             node,
             path,
             path_kind: None,
@@ -1305,7 +1313,11 @@ impl PeerManager {
                 .enumerate()
                 .filter(|(_, p)| {
                     matches!(p.state, PeerState::Established(_))
-                        && !m.member_cert_valid(&p.pubkey, now_s)
+                        && !m.member_or_admitted_cert_valid(
+                            &p.pubkey,
+                            p.admitted_cert_not_after,
+                            now_s,
+                        )
                 })
                 .map(|(i, _)| i)
                 .collect();

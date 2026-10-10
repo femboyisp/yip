@@ -280,7 +280,7 @@ dump_logs() {
 }
 
 echo "[start] starting yipRevR (seed root)"
-ip netns exec "$NS_R" "$YIPD" "$CFG_R" >"$LOG_R" 2>&1 &
+ip netns exec "$NS_R" env -u YIP_REKEY_INTERVAL_MS "$YIPD" "$CFG_R" >"$LOG_R" 2>&1 &
 PID_R=$!
 
 echo "[start] starting yipRevA (YIP_REKEY_INTERVAL_MS=$YIP_REKEY_INTERVAL_MS)"

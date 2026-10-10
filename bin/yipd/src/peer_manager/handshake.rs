@@ -168,6 +168,7 @@ impl PeerManager {
             self.by_tag.remove(&tag);
         }
         self.peers[idx].state = PeerState::Idle;
+        self.peers[idx].admitted_cert_not_after = None;
     }
 
     pub(super) fn handle_handshake_init(
@@ -269,6 +270,9 @@ impl PeerManager {
                     self.drop_session(idx);
                     return DispatchOut::None;
                 }
+                if let Some(cert) = Cert::decode(initiator_cert) {
+                    self.peers[idx].admitted_cert_not_after = Some(cert.not_after);
+                }
                 let init_eph = crate::handshake::init_ephemeral(dg).expect(
                     "start_responder already parsed dg's msg1; its leading 32 bytes are `e`",
                 );
@@ -325,6 +329,8 @@ impl PeerManager {
                 self.peers[idx].session_obf_key = sess_obf;
                 self.peers[idx].endpoint = Some(src); // learn the observed endpoint
                 self.peers[idx].last_accepted_init_ts = Some(init_ts);
+                self.peers[idx].admitted_cert_not_after =
+                    Cert::decode(initiator_cert).map(|c| c.not_after);
                 self.peers[idx].cached_resp = Some(resp_pkt.clone());
                 self.peers[idx].cached_resp_init_eph = crate::handshake::init_ephemeral(dg);
                 self.by_tag.insert(dp.conn_tag(), idx);
@@ -418,6 +424,8 @@ impl PeerManager {
                 ));
                 self.by_tag.insert(dp.conn_tag(), idx);
                 self.peers[idx].session_obf_key = sess_obf;
+                self.peers[idx].admitted_cert_not_after =
+                    Cert::decode(&responder_payload).map(|c| c.not_after);
                 // `src` == this peer's `endpoint` (matched above). Commit the
                 // path stage we completed over (Direct or Punched); a relayed
                 // resp is handled by `relayed_handshake_resp` instead.

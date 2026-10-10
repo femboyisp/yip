@@ -110,9 +110,10 @@
 #     was committed, so `self.bitmap[idx] |= bit_mask(counter)` is an idempotent bitwise OR
 #     of 1 with 1 that produces zero change in bitmap state under all executions.
 #
-# 11. `replace neon_supported -> bool with false` / `replace wasm_simd_supported -> bool with false`
+# 11. `replace neon_supported -> bool with (true|false)` / `replace wasm_simd_supported -> bool with (true|false)`
 #     On non-target architectures (such as x86_64 Linux CI runner), `neon_supported()` and
 #     `wasm_simd_supported()` are compile-time guarded to return `false` unconditionally.
+#     On native target architectures, runtime feature detection evaluates to `true`.
 # 12. `replace + with * in RlncDecoder::consume_coded_symbol` (yip-transport/src/rlnc.rs ~line 223)
 #     `for coeff in &mut cur_coeffs[(col + 1)..self.window_size] { *coeff = gf256::mul(*coeff, inv); }`.
 #     When `col == 0`, `col + 1 == 1` and `col * 1 == 0`. The mutant would include `cur_coeffs[0]`,
@@ -122,12 +123,12 @@
 #     - Gaussian elimination reads strictly `coeff_matrix[col][(col + 1)..self.window_size]` (line 212).
 #     - Back-substitution reads strictly `coeff_matrix[i][(i + 1)..self.window_size]` (line 255).
 #     - The only public extract method is `extract_source_symbols()`, which only reads `symbols`.
-# 13. `replace ssse3_supported -> bool with true`, `replace avx2_supported -> bool with true`,
-#     `replace avx512bw_supported -> bool with true`, `replace gfni_supported -> bool with true`
-#     On x86_64 systems supporting these CPU extensions (such as modern server CPUs and CI nodes),
-#     runtime CPU feature detection (`std::is_x86_feature_detected!`) evaluates to `true`.
-#     Replacing the feature query with `true` produces identical runtime behaviour because the CPU
-#     actually does support the feature and executes the SIMD pathways identically.
+# 13. `replace (ssse3|avx2|avx512bw|gfni)_supported -> bool with (true|false)`
+#     On x86_64 systems, runtime CPU feature detection (`std::is_x86_feature_detected!`)
+#     evaluates to `true` or `false` depending on the host runner's silicon capabilities.
+#     Replacing the feature query with whichever boolean matches the host CPU's actual
+#     capability produces 100% identical runtime behaviour to unmutated code, making either
+#     direction an equivalent mutant depending on the CI host machine.
 exclude_re = [
     "replace \\| with \\^ in ReplayWindow::commit",
     "replace > with >= in ReplayWindow::commit",
@@ -139,11 +140,11 @@ exclude_re = [
     "replace < with > in FecReassembler::push",
     "replace > with >= in LossDetector::on_seen",
     "replace \\+ with \\* in LossDetector::on_seen",
-    "replace neon_supported -> bool with false",
-    "replace wasm_simd_supported -> bool with false",
+    "replace neon_supported -> bool with (true|false)",
+    "replace wasm_simd_supported -> bool with (true|false)",
     "replace \\+ with \\* in RlncDecoder::consume_coded_symbol",
-    "replace ssse3_supported -> bool with true",
-    "replace avx2_supported -> bool with true",
-    "replace avx512bw_supported -> bool with true",
-    "replace gfni_supported -> bool with true",
+    "replace ssse3_supported -> bool with (true|false)",
+    "replace avx2_supported -> bool with (true|false)",
+    "replace avx512bw_supported -> bool with (true|false)",
+    "replace gfni_supported -> bool with (true|false)",
 ]

@@ -288,6 +288,8 @@ impl PeerManager {
                 self.peers[idx].cached_resp = Some(resp_pkt.clone());
                 self.peers[idx].cached_resp_init_eph = crate::handshake::init_ephemeral(dg);
                 self.peers[idx].last_accepted_init_ts = Some(init_ts);
+                self.peers[idx].admitted_cert_not_after =
+                    Cert::decode(initiator_cert).map(|c| c.not_after);
                 self.peers[idx].relay = true;
                 self.peers[idx].path.committed(PathKind::Relayed);
                 self.peers[idx].path_kind = Some(PathKind::Relayed);
@@ -365,6 +367,8 @@ impl PeerManager {
                 ));
                 self.by_tag.insert(dp.conn_tag(), idx);
                 self.peers[idx].session_obf_key = sess_obf;
+                self.peers[idx].admitted_cert_not_after =
+                    Cert::decode(&responder_payload).map(|c| c.not_after);
                 self.peers[idx].relay = true;
                 self.peers[idx].path.committed(PathKind::Relayed);
                 self.peers[idx].path_kind = Some(PathKind::Relayed);
