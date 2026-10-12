@@ -303,7 +303,12 @@ pub fn tai64n_sub_duration(
     }
 
     let min_secs = 1u64 << 62;
-    secs = secs.saturating_sub(sub_secs).max(min_secs);
+    if secs < min_secs || secs.saturating_sub(sub_secs) < min_secs {
+        secs = min_secs;
+        nanos = 0;
+    } else {
+        secs -= sub_secs;
+    }
 
     let mut out = [0u8; TAI64N_LEN];
     out[..8].copy_from_slice(&secs.to_be_bytes());

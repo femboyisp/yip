@@ -1178,4 +1178,56 @@ mod tests {
             "replayed registration after sweep must yield NotFound"
         );
     }
+
+    #[test]
+    fn register_signed_rejects_future_seq_record() {
+        let (ca_pub, network_id, _rec, member_src) = valid_registration();
+        let mut s = RendezvousServer::new_with_roots(0, vec![ca_pub], network_id);
+        let now_s: u64 = 1_700_000_000;
+        let now_wall_ms = now_s.saturating_mul(1000);
+        // Mint a record with sequence 10 minutes in the future (beyond 300s skew)
+        let future_seq = now_wall_ms + 600_000;
+
+        let ca = ca_signing_key();
+        let member_pub = [1u8; 32];
+        let member_sign_key = SigningKey::generate(&mut UnwrapErr(SysRng));
+        let member_sign_pub = member_sign_key.verifying_key().to_bytes();
+        let cert = mk_cert(&ca, member_pub, member_sign_pub, network_id);
+        let member_sign_priv: [u8; 32] = member_sign_key.to_bytes();
+        let future_rec = build_signed_record(
+            cert,
+            vec![addr("192.0.2.1:9")],
+            future_seq,
+            &member_sign_priv,
+        );
+
+        let out = s.handle(
+            member_src,
+            Message::RegisterSigned {
+                record: future_rec.clone(),
+            },
+            1_000,
+            now_s,
+        );
+        assert!(out.is_empty(), "future seq register produces no reply");
+
+        let lookup = s.handle(
+            addr("203.0.113.9:5"),
+            Message::Lookup {
+                node: future_rec.node_id,
+            },
+            1_010,
+            now_s,
+        );
+        assert_eq!(
+            lookup,
+            vec![(
+                addr("203.0.113.9:5"),
+                Message::NotFound {
+                    node: future_rec.node_id
+                }
+            )],
+            "future seq record must not be registered"
+        );
+    }
 }
