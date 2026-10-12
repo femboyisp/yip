@@ -135,7 +135,13 @@ impl PeerManager {
     /// rides only inside the encrypted msg1 payload.
     pub(super) fn accept_fresh_init(&self, idx: usize, ts: &[u8; 12]) -> bool {
         match self.peers[idx].last_accepted_init_ts {
-            None => true,
+            None => {
+                let fresh = *ts > self.boot_floor_ts;
+                if !fresh {
+                    eprintln!("peer_manager: stale/replayed Init refused (boot floor gate)");
+                }
+                fresh
+            }
             Some(last) => {
                 let fresh = *ts > last;
                 if !fresh {
@@ -671,6 +677,27 @@ mod tests {
             pm_r.by_tag.is_empty(),
             "no session (hence no conn_tag) must have been admitted"
         );
+    }
+
+    #[test]
+    fn accept_fresh_init_rejects_ts_older_than_boot_floor_on_cold_start() {
+        let pm = test_peer_manager();
+        // Simulate boot floor set to current time
+        let boot = pm.boot_floor_ts;
+        // An Init timestamp from 10 seconds before boot
+        let old_ts =
+            crate::handshake::tai64n_sub_duration(boot, std::time::Duration::from_secs(10));
+        assert_eq!(pm.peers[0].last_accepted_init_ts, None);
+        assert!(!pm.accept_fresh_init(0, &old_ts));
+        assert_eq!(pm.peers[0].last_accepted_init_ts, None);
+    }
+
+    #[test]
+    fn accept_fresh_init_accepts_ts_newer_than_boot_floor_on_cold_start() {
+        let pm = test_peer_manager();
+        let fresh_ts = crate::handshake::now_tai64n();
+        assert!(fresh_ts > pm.boot_floor_ts);
+        assert!(pm.accept_fresh_init(0, &fresh_ts));
     }
 
     #[test]

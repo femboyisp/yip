@@ -285,13 +285,6 @@ pub fn now_tai64n() -> [u8; TAI64N_LEN] {
 
 /// Subtract `duration` from a big-endian TAI64N timestamp, clamping at the
 /// UNIX epoch baseline `(1u64 << 62)` seconds.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "helper for PeerManager's boot_floor_ts anti-replay gate (#104)"
-    )
-)]
 pub fn tai64n_sub_duration(
     ts: [u8; TAI64N_LEN],
     duration: std::time::Duration,

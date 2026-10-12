@@ -438,6 +438,9 @@ pub struct PeerManager {
     /// costs an Ed25519 `verify_cert` and `tick` can run far more often than
     /// that on the busy-poll path.
     last_cert_sweep_ms: u64,
+    /// Boot-time anti-replay floor timestamp (#104). Any cold-start Init older
+    /// than this floor is rejected immediately as a replay across daemon restarts.
+    pub(crate) boot_floor_ts: [u8; crate::handshake::TAI64N_LEN],
     /// Worker shard index for multi-core scaling.
     shard_id: usize,
     /// Number of worker shards for multi-core scaling.
@@ -553,6 +556,10 @@ impl PeerManager {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(crate::epoch::REKEY_INTERVAL_MS),
             last_cert_sweep_ms: 0,
+            boot_floor_ts: crate::handshake::tai64n_sub_duration(
+                crate::handshake::now_tai64n(),
+                std::time::Duration::from_secs(5),
+            ),
             shard_id: 0,
             num_shards: 1,
             new_epochs: Vec::new(),
