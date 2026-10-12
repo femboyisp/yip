@@ -283,6 +283,41 @@ pub fn now_tai64n() -> [u8; TAI64N_LEN] {
     out
 }
 
+/// Subtract `duration` from a big-endian TAI64N timestamp, clamping at the
+/// UNIX epoch baseline `(1u64 << 62)` seconds.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "helper for PeerManager's boot_floor_ts anti-replay gate (#104)"
+    )
+)]
+pub fn tai64n_sub_duration(
+    ts: [u8; TAI64N_LEN],
+    duration: std::time::Duration,
+) -> [u8; TAI64N_LEN] {
+    let mut secs = u64::from_be_bytes(ts[..8].try_into().unwrap());
+    let mut nanos = u32::from_be_bytes(ts[8..].try_into().unwrap());
+
+    let sub_secs = duration.as_secs();
+    let sub_nanos = duration.subsec_nanos();
+
+    if nanos < sub_nanos {
+        secs = secs.saturating_sub(1);
+        nanos = nanos + 1_000_000_000 - sub_nanos;
+    } else {
+        nanos -= sub_nanos;
+    }
+
+    let min_secs = 1u64 << 62;
+    secs = secs.saturating_sub(sub_secs).max(min_secs);
+
+    let mut out = [0u8; TAI64N_LEN];
+    out[..8].copy_from_slice(&secs.to_be_bytes());
+    out[8..].copy_from_slice(&nanos.to_be_bytes());
+    out
+}
+
 /// Build the msg1 Noise payload: the anti-replay TAI64N label followed by the
 /// (optional) membership cert. Empty `cert` (2a/2b) yields a 12-byte payload.
 pub fn frame_init_payload(cert: &[u8]) -> Vec<u8> {
@@ -603,5 +638,20 @@ mod tests {
     fn parse_init_payload_rejects_short_payload() {
         assert!(parse_init_payload(&[0u8; TAI64N_LEN - 1]).is_none());
         assert!(parse_init_payload(&[]).is_none());
+    }
+
+    #[test]
+    fn tai64n_sub_duration_handles_subtraction_and_nanosecond_borrow() {
+        let now = now_tai64n();
+        let subtracted_5s = tai64n_sub_duration(now, std::time::Duration::from_secs(5));
+        assert!(subtracted_5s < now);
+
+        let base = now_tai64n();
+        let sub_1ns = tai64n_sub_duration(base, std::time::Duration::from_nanos(1));
+        assert!(sub_1ns < base);
+
+        // Clamping at UNIX epoch base
+        let zero_dur = std::time::Duration::from_secs(0);
+        assert_eq!(tai64n_sub_duration(base, zero_dur), base);
     }
 }
