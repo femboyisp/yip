@@ -90,8 +90,8 @@ impl PeerManager {
                     // do not call begin_handshake (drop without outbound datagrams).
                     let verified = match self.membership.as_ref() {
                         Some(m) => {
-                            m.member_cert_valid(&self.peers[idx].pubkey, now_secs())
-                                || self.peers[idx].admitted_cert_not_after.is_none()
+                            self.peers[idx].is_static
+                                || m.member_cert_valid(&self.peers[idx].pubkey, now_secs())
                         }
                         None => true,
                     };
@@ -1292,6 +1292,127 @@ mod tests {
         assert!(
             matches!(out_recognized, DispatchOut::Udp(_)),
             "PunchTo for a recognized peer must initiate a handshake"
+        );
+    }
+
+    /// #102: in mesh mode, `PunchTo` for a dynamically admitted peer (`is_static: false`)
+    /// whose cert is missing or expired in the directory must not emit outbound handshakes.
+    #[test]
+    fn punch_to_refuses_dynamically_admitted_peer_with_expired_cert() {
+        use ed25519_dalek::Signer;
+        use yip_membership::cert::cert_signing_body;
+        use yip_membership::record::{record_signing_body, sign as record_sign};
+        use yip_membership::Record;
+
+        let ca = test_ca();
+        let local = generate_keypair();
+        let membership = membership_trusting_ca_via_roots(&ca, local.public);
+        let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[], membership);
+
+        // 1. Dynamically admit a peer with no cert in the directory.
+        let dynamic_kp = generate_keypair();
+        pm.admit_member(dynamic_kp.public, vec![], 0);
+        let dynamic_idx = *pm.by_node.get(&node_id(&dynamic_kp.public)).unwrap();
+        assert!(
+            !pm.peers[dynamic_idx].is_static,
+            "dynamically admitted peer must not be static"
+        );
+
+        let target_addr: SocketAddr = "203.0.113.77:40000".parse().unwrap();
+        let mut buf = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PunchHint {
+                node: node_id(&dynamic_kp.public),
+                reflexive: target_addr,
+            },
+            &mut buf,
+        );
+        let out_missing = pm.on_udp(mock_server(), &buf, 0);
+        assert!(
+            matches!(out_missing, DispatchOut::None),
+            "PunchTo for dynamically admitted peer with missing cert must return DispatchOut::None"
+        );
+
+        // 2. Ingest an expired cert for another dynamically admitted peer.
+        let expired_kp = generate_keypair();
+        let expired_sign = SigningKey::from_bytes(&[123u8; 32]);
+        let mut expired_cert = Cert {
+            version: 1,
+            member_pubkey: expired_kp.public,
+            member_sign_pubkey: expired_sign.verifying_key().to_bytes(),
+            network_id: TEST_NET,
+            not_before: 0,
+            not_after: 1, // expired in UNIX epoch past CLOCK_SKEW_SECS
+            tags: vec![],
+            ca_sig: [0u8; 64],
+        };
+        expired_cert.ca_sig = ca.sign(&cert_signing_body(&expired_cert)).to_bytes();
+        let mut expired_rec = Record {
+            node_id: yip_membership::node_id(&expired_kp.public),
+            cert: expired_cert,
+            endpoints: vec!["10.0.0.5:5000".parse().unwrap()],
+            seq: 1,
+            sig: [0u8; 64],
+        };
+        let body = record_signing_body(&expired_rec);
+        expired_rec.sig = record_sign(&body, &expired_sign.to_bytes());
+
+        // Ingest at t=0 when not_after=1 is within clock skew tolerance.
+        assert!(pm
+            .membership
+            .as_mut()
+            .unwrap()
+            .ingest_record(expired_rec, 0));
+
+        // Dynamically admit the expired peer.
+        pm.admit_member(expired_kp.public, vec!["10.0.0.5:5000".parse().unwrap()], 0);
+        let exp_idx = *pm.by_node.get(&node_id(&expired_kp.public)).unwrap();
+        assert!(!pm.peers[exp_idx].is_static);
+
+        buf.clear();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PunchHint {
+                node: node_id(&expired_kp.public),
+                reflexive: target_addr,
+            },
+            &mut buf,
+        );
+        let out_expired = pm.on_udp(mock_server(), &buf, 0);
+        assert!(
+            matches!(out_expired, DispatchOut::None),
+            "PunchTo for dynamically admitted peer with expired cert must return DispatchOut::None"
+        );
+
+        // 3. In contrast, dynamically admitted peer with a currently VALID cert succeeds.
+        let valid_kp = generate_keypair();
+        let valid_rec = mk_record(
+            &ca,
+            200,
+            valid_kp.public,
+            vec!["10.0.0.6:6000".parse().unwrap()],
+            1,
+        );
+        assert!(pm
+            .membership
+            .as_mut()
+            .unwrap()
+            .ingest_record(valid_rec, now_secs()));
+        pm.admit_member(valid_kp.public, vec!["10.0.0.6:6000".parse().unwrap()], 0);
+        let valid_idx = *pm.by_node.get(&node_id(&valid_kp.public)).unwrap();
+        assert!(!pm.peers[valid_idx].is_static);
+
+        buf.clear();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PunchHint {
+                node: node_id(&valid_kp.public),
+                reflexive: target_addr,
+            },
+            &mut buf,
+        );
+        let out_valid = pm.on_udp(mock_server(), &buf, 0);
+        assert!(
+            matches!(out_valid, DispatchOut::Udp(_)),
+            "PunchTo for dynamically admitted peer with valid cert must initiate a handshake"
         );
     }
 }

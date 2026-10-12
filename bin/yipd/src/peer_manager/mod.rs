@@ -259,6 +259,9 @@ struct Peer {
     /// discovery is in flight, so a freshly-admitted peer is not prematurely
     /// dropped before its directory record arrives.
     admitted_cert_not_after: Option<u64>,
+    /// Whether this peer is statically configured in `peers_cfg` (config file),
+    /// or was dynamically admitted via discovery/membership.
+    is_static: bool,
     /// This peer's self-certifying rendezvous node id (`node_id(pubkey)`),
     /// used to `lookup`/`relay` for it and to demux `RdvEvent`s back to it.
     node: NodeId,
@@ -518,6 +521,7 @@ impl PeerManager {
                 cached_resp_init_eph: None,
                 last_accepted_init_ts: None,
                 admitted_cert_not_after: None,
+                is_static: true,
                 node,
                 path,
                 path_kind: None,
@@ -615,6 +619,7 @@ impl PeerManager {
             cached_resp_init_eph: None,
             last_accepted_init_ts: None,
             admitted_cert_not_after: None,
+            is_static: false,
             node,
             path,
             path_kind: None,
