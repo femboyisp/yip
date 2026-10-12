@@ -63,15 +63,39 @@ impl PeerManager {
                 if record_ok {
                     if let Some(&idx) = self.by_node.get(&node) {
                         if !matches!(self.peers[idx].state, PeerState::Established(_)) {
-                            self.peers[idx].path.on_peer_candidate(addr, now_ms);
+                            match (self.membership.as_ref(), record.as_deref()) {
+                                (Some(_), Some(r)) => {
+                                    self.peers[idx].path.on_peer_candidate(addr, now_ms);
+                                    for ep in r.endpoints.iter().rev() {
+                                        self.peers[idx].path.on_peer_candidate(*ep, now_ms);
+                                    }
+                                }
+                                _ => {
+                                    self.peers[idx].path.on_peer_candidate(addr, now_ms);
+                                }
+                            }
                         }
                     }
                 }
                 DispatchOut::None
             }
             RdvEvent::PunchTo { node, addr } => {
-                if let Some(&idx) = self.by_node.get(&node) {
-                    if !matches!(self.peers[idx].state, PeerState::Established(_)) {
+                let Some(&idx) = self.by_node.get(&node) else {
+                    return DispatchOut::None;
+                };
+                if !matches!(self.peers[idx].state, PeerState::Established(_)) {
+                    // Mesh mode: only fire proactive begin_handshake if node is
+                    // known and verified in membership.directory or is a statically
+                    // configured peer in self.by_node. If unrecognized/unverified,
+                    // do not call begin_handshake (drop without outbound datagrams).
+                    let verified = match self.membership.as_ref() {
+                        Some(m) => {
+                            m.member_cert_valid(&self.peers[idx].pubkey, now_secs())
+                                || self.peers[idx].admitted_cert_not_after.is_none()
+                        }
+                        None => true,
+                    };
+                    if verified {
                         self.peers[idx].path.on_peer_candidate(addr, now_ms);
                         // Open our own binding toward `addr` immediately so the
                         // two NATs punch simultaneously — but only if we are not
@@ -1175,5 +1199,99 @@ mod tests {
             "an expired cert must not re-admit a tabled relay peer"
         );
         assert!(matches!(pm.peers[0].state, PeerState::Idle));
+    }
+
+    /// #102: when a `PeerCandidate` arrives with a verified `Record`, all
+    /// `record.endpoints` are added to candidate paths and prioritized over
+    /// the unauthenticated reflexive address.
+    #[test]
+    fn peer_candidate_probes_signed_endpoints() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let membership = membership_trusting_ca_via_roots(&ca, local.public);
+        let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[peer], membership);
+
+        let signed_ep1: SocketAddr = "198.51.100.10:41000".parse().unwrap();
+        let signed_ep2: SocketAddr = "198.51.100.11:41000".parse().unwrap();
+        let reflexive: SocketAddr = "203.0.113.50:50000".parse().unwrap();
+        let valid_rec = mk_record(&ca, 55, peer_kp.public, vec![signed_ep1, signed_ep2], 1);
+        let mut buf = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PeerInfo {
+                node: node_id(&peer_kp.public),
+                reflexive,
+                record: Some(valid_rec),
+            },
+            &mut buf,
+        );
+        let out = pm.on_udp(mock_server(), &buf, 0);
+        assert!(matches!(out, DispatchOut::None));
+
+        assert_eq!(
+            pm.peers[0].path.candidate(),
+            Some(signed_ep1),
+            "signed endpoint must be prioritized over reflexive address"
+        );
+
+        let out = pm.tick(1).map(<[_]>::to_vec).unwrap_or_default();
+        assert!(
+            out.iter().any(|d| d.dst == signed_ep1),
+            "probe Init must be sent toward signed endpoint"
+        );
+        assert!(
+            !out.iter().any(|d| d.dst == reflexive),
+            "probe Init must not be sent toward reflexive address when signed endpoint is present"
+        );
+    }
+
+    /// #102: in mesh mode, `PunchTo` for an unknown/unrecognized node must not emit
+    /// outbound handshake datagrams, while a recognized peer triggers handshake.
+    #[test]
+    fn punch_to_refuses_unrecognized_node() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let membership = membership_trusting_ca_via_roots(&ca, local.public);
+        let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[peer], membership);
+
+        let unknown_node = [99u8; 16];
+        let target_addr: SocketAddr = "203.0.113.77:40000".parse().unwrap();
+        let mut buf = Vec::new();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PunchHint {
+                node: unknown_node,
+                reflexive: target_addr,
+            },
+            &mut buf,
+        );
+        let out = pm.on_udp(mock_server(), &buf, 0);
+        assert!(
+            matches!(out, DispatchOut::None),
+            "PunchTo for an unrecognized node must not emit any outbound datagrams"
+        );
+
+        // In contrast, PunchTo for a recognized peer triggers immediate handshake.
+        buf.clear();
+        yip_rendezvous::encode(
+            &yip_rendezvous::Message::PunchHint {
+                node: node_id(&peer_kp.public),
+                reflexive: target_addr,
+            },
+            &mut buf,
+        );
+        let out_recognized = pm.on_udp(mock_server(), &buf, 0);
+        assert!(
+            matches!(out_recognized, DispatchOut::Udp(_)),
+            "PunchTo for a recognized peer must initiate a handshake"
+        );
     }
 }
