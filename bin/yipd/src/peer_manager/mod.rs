@@ -542,7 +542,7 @@ impl PeerManager {
             last_register_ms: 0,
             reg_refresh_ms: REG_REFRESH_MS,
             registered_once: false,
-            reg_seq: 0,
+            reg_seq: now_wall_clock_ms(),
             egress: Vec::new(),
             tick_egress: Vec::new(),
             tun_scratch: Vec::new(),
@@ -1054,11 +1054,12 @@ impl PeerManager {
             // registration record at the current `reg_seq` so the server can
             // verify authenticity instead of trusting an unauthenticated
             // `counter` (#37 Task 5). Non-mesh keeps the legacy `Register`.
+            let wall_ms = now_wall_clock_ms();
+            self.reg_seq = self.reg_seq.max(wall_ms).saturating_add(1);
             let signed = self
                 .membership
                 .as_ref()
                 .map(|m| m.sign_registration(self.reg_seq));
-            self.reg_seq = self.reg_seq.saturating_add(1);
             if let Some(r) = self.rendezvous.as_mut() {
                 if let Some(dg) = r.register(node, signed) {
                     self.tick_egress.push(dg);
@@ -1447,6 +1448,13 @@ pub(crate) fn jitter_ms(base: u64) -> u64 {
     let v = u64::from_le_bytes(b);
     let span = spread.saturating_mul(2).saturating_add(1);
     (base - spread) + (v % span)
+}
+
+fn now_wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -3652,4 +3660,22 @@ mod tests {
     // touch the Init path (it never calls `inbound_open`), so the existing
     // guard covers this; see `stale_replayed_cold_start_init_does_not_hijack_endpoint`
     // and `stale_replayed_init_is_rejected_and_endpoint_unchanged` above.
+
+    #[test]
+    fn reg_seq_monotonic_across_daemon_restarts() {
+        let pm1 = crate::peer_manager::testutil::test_peer_manager();
+        assert!(
+            pm1.reg_seq > 0,
+            "reg_seq must initialize to non-zero wall clock ms"
+        );
+
+        // Sleep 2ms so wall clock advances
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        let pm2 = crate::peer_manager::testutil::test_peer_manager();
+        assert!(
+            pm2.reg_seq > pm1.reg_seq,
+            "restart must yield strictly higher reg_seq"
+        );
+    }
 }
