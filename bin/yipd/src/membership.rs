@@ -210,15 +210,18 @@ impl Membership {
         )
     }
 
-    /// Verify a registration/directory `Record` against our own roots +
+    /// Verify a registration/directory `Record` against our configured CA
+    /// trust anchors (`self.ca_pubkeys` and any CA keys in `self.roots`) +
     /// network, at wall-clock `now_secs`. True iff the cert chains to a
-    /// root, the record signature is valid, and the `node_id` binds the
-    /// cert (squatting closed). Mirrors `bin/yip-rendezvous`'s own
-    /// `roots.roots.iter().map(|(pk, _)| *pk)` convention: the signed
-    /// `RootSet`'s member pubkeys double as the trusted CA set for this
-    /// verification (#37).
+    /// trusted CA, the record signature is valid, and the `node_id` binds the
+    /// cert (squatting closed).
     pub fn verify_record(&self, r: &Record, now_secs: u64) -> bool {
-        let ca_pubkeys: Vec<[u8; 32]> = self.roots.roots.iter().map(|(pk, _)| *pk).collect();
+        let mut ca_pubkeys = self.ca_pubkeys.clone();
+        for (pk, _) in &self.roots.roots {
+            if !ca_pubkeys.contains(pk) {
+                ca_pubkeys.push(*pk);
+            }
+        }
         r.verify(&ca_pubkeys, &self.network_id, now_secs, clock_skew_secs())
             .is_ok()
     }
@@ -1065,6 +1068,33 @@ mod tests {
         let m = test_membership();
         let foreign = record_signed_by_unrelated_ca();
         assert!(!m.verify_record(&foreign, now_secs()));
+    }
+
+    #[test]
+    fn verify_record_uses_ca_pubkeys_anchor() {
+        let ca = ca_key(1);
+        let ca_pub = ca.verifying_key().to_bytes();
+        let other_root = [99u8; 32];
+        let roots = RootSet {
+            roots: vec![(other_root, "198.51.100.1:9000".parse().unwrap())],
+            version: 0,
+            ca_sig: [0u8; 64],
+        };
+        let net = [7u8; 16];
+        let own_member_pk = [10u8; 32];
+        let own_sign_key = SigningKey::from_bytes(&[11u8; 32]);
+        let own_sign_pub = own_sign_key.verifying_key().to_bytes();
+        let own_cert = make_cert(&ca, own_member_pk, own_sign_pub, net, 0, 1_000_000);
+        let m = Membership::new(
+            vec![ca_pub],
+            net,
+            own_cert,
+            own_sign_key.to_bytes(),
+            roots,
+            vec!["10.0.0.1:51820".parse().unwrap()],
+        );
+        let rec = m.sign_registration(1);
+        assert!(m.verify_record(&rec, now_secs()));
     }
 
     // (j) #44 fix: a directory holding more than `MAX_GOSSIP_DIGEST_ENTRIES`

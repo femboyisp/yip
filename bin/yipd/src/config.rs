@@ -696,6 +696,20 @@ impl Config {
                     "root set signature does not verify against any configured ca_public",
                 ));
             }
+
+            // Issue #106: Check that at least one configured ca_public anchor is
+            // represented in the roots list. If an operator configures roots without
+            // including the CA pubkey (e.g. roots only list peer keys), emit a warning.
+            if !ca_public.is_empty()
+                && !ca_public
+                    .iter()
+                    .any(|ca| r.roots.iter().any(|(pk, _)| pk == ca))
+            {
+                eprintln!(
+                    "yipd: warning: configured ca_public is not represented in roots entries; \
+                     standalone rendezvous servers using roots as CA trust anchors will reject member records"
+                );
+            }
         }
 
         // `transport=quic`/`transport=tls` each provide their own wire
@@ -1658,6 +1672,66 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
             err.to_string().contains("root set signature"),
             "unexpected error: {err}"
         );
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&roots_path);
+    }
+
+    #[test]
+    fn roots_without_ca_public_parses() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use yip_membership::cert::{cert_signing_body, rootset_signing_body};
+
+        let ca = SigningKey::from_bytes(&[9u8; 32]);
+        let mut cert = Cert {
+            version: 1,
+            member_pubkey: [2u8; 32],
+            member_sign_pubkey: [3u8; 32],
+            network_id: [4u8; 16],
+            not_before: 0,
+            not_after: 1_000_000,
+            tags: vec![],
+            ca_sig: [0u8; 64],
+        };
+        cert.ca_sig = ca.sign(&cert_signing_body(&cert)).to_bytes();
+        let mut cert_bytes = Vec::new();
+        cert.encode(&mut cert_bytes);
+
+        // RootSet lists only another peer's key, not the CA's key.
+        let other_peer_pk = [88u8; 32];
+        let mut roots = RootSet {
+            roots: vec![(other_peer_pk, "198.51.100.1:9000".parse().unwrap())],
+            version: 1,
+            ca_sig: [0u8; 64],
+        };
+        roots.ca_sig = ca.sign(&rootset_signing_body(&roots)).to_bytes();
+        let mut roots_bytes = Vec::new();
+        roots.encode(&mut roots_bytes);
+
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join("yipd_test_roots_no_ca_cert.hex");
+        let roots_path = dir.join("yipd_test_roots_no_ca_roots.hex");
+        std::fs::write(&cert_path, hex_encode_bytes(&cert_bytes)).unwrap();
+        std::fs::write(&roots_path, hex_encode_bytes(&roots_bytes)).unwrap();
+
+        let text = format!(
+            "device=yip0\n\
+             listen=0.0.0.0:51820\n\
+             local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             ca_public={}\n\
+             member_sign_private={}\n\
+             network_id={}\n\
+             cert={}\n\
+             roots={}\n",
+            hex_encode_bytes(&ca.verifying_key().to_bytes()),
+            hex_encode_bytes(&[0x33u8; 32]),
+            hex_encode_bytes(&[0x44u8; 16]),
+            cert_path.display(),
+            roots_path.display(),
+        );
+        let cfg = Config::parse(&text).expect("parses even if ca_public not in roots");
+        assert_eq!(cfg.roots.unwrap().roots.len(), 1);
 
         let _ = std::fs::remove_file(&cert_path);
         let _ = std::fs::remove_file(&roots_path);
