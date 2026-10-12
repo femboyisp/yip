@@ -310,10 +310,7 @@ impl Membership {
     pub fn ingest_record(&mut self, rec: Record, now: u64) -> bool {
         let mut changed = self.sweep_expired(now);
 
-        if rec
-            .verify(&self.ca_pubkeys, &self.network_id, now, clock_skew_secs())
-            .is_ok()
-        {
+        if self.verify_record(&rec, now) {
             changed |= self.insert_if_newer(rec);
         }
 

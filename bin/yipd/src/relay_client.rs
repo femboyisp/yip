@@ -81,7 +81,7 @@ const REG_KEEPALIVE_MS: u64 = 30_000;
 /// backward clock step) and is accepted as-is.
 pub(crate) struct Counter(u64);
 impl Counter {
-    /// Seed from the current wall-clock time (whole seconds since the Unix
+    /// Seed from the current wall-clock time (milliseconds since the Unix
     /// epoch) rather than 0 — see the type doc for why. Falls back to a seed
     /// of 0 if the clock reads before the epoch (a broken/unset clock);
     /// `next()` still produces a valid, if not restart-safe, sequence in

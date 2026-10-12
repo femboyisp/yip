@@ -88,7 +88,7 @@ five** of these keys puts the node in *mesh mode*, where it may carry no
 |---|---|---|
 | `ca_public` | 64 hex chars (32 bytes) | Trusted CA Ed25519 public key. **Repeatable** — one line per CA. |
 | `cert` | file path | File containing this node's CA-signed cert (hex, from `yip-ca sign-cert`). |
-| `roots` | file path | File containing the CA-signed root set (hex, from `yip-ca sign-roots`). Its signature is **verified against `ca_public` at load time**; a bad signature is a fatal error. |
+| `roots` | file path | File containing the CA-signed root set (hex, from `yip-ca sign-roots`). Its signature is **verified against `ca_public` at load time**; a bad signature is a fatal error. Standalone rendezvous servers operating in rooted mesh mode (`--roots`) derive their trusted CA anchors from the public keys listed in this root set. |
 | `member_sign_private` | 64 hex chars (32 bytes) | This node's **Ed25519** record-signing private key (distinct from `local_private`). **Secret.** |
 | `network_id` | **32 hex chars (16 bytes)** | Mesh network id. Note the length is **half** that of the other hex keys. |
 
@@ -171,8 +171,11 @@ yip-rendezvous --version | -V
   registration that doesn't carry a valid signed `Record` verified against the
   root set's CA keys. `--roots` takes the same CA-signed root-set file `yip-ca
   sign-roots` produces (see the `yip-ca` CLI below); `--network-id` is the
-  16-byte network id, 32 hex chars. Closes registration-squatting/overwrite on
-  the plain UDP rendezvous path — without it, the server accepts any
+  16-byte network id, 32 hex chars. Note: Standalone rendezvous servers derive
+  their trusted CA anchors directly from the public keys listed in this root set
+  to verify member registrations over both UDP and the TLS Trojan front (#101, #106).
+  Closes registration-squatting/overwrite on the plain UDP rendezvous path and
+  unauthenticated registration on the TLS Trojan front — without it, the server accepts any
   registration and trusts self-reported endpoints.
 
 It logs `relay-forwarded=<N>` to stderr every 5 s (how many datagrams the blind
