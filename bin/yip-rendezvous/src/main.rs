@@ -630,9 +630,10 @@ async fn run_udp(
 ) -> std::io::Result<()> {
     let now_ms =
         |base: Instant| -> u64 { u64::try_from(base.elapsed().as_millis()).unwrap_or(u64::MAX) };
-    // WALL-CLOCK seconds, used ONLY by `handle`'s `RegisterSigned` verify
-    // path to check a cert's `not_before`/`not_after` window — distinct
-    // from `now_ms`'s monotonic `Instant`-based clock used for TTL/rate.
+    // WALL-CLOCK seconds, used by `handle`'s `RegisterSigned` verify
+    // path to check a cert's `not_before`/`not_after` window and sequence
+    // freshness window — distinct from `now_ms`'s monotonic `Instant`-based
+    // clock used for TTL/rate.
     let now_secs = || -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

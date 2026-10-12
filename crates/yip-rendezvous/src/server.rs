@@ -234,10 +234,10 @@ impl RendezvousServer {
     /// Process one received message; return datagrams to send as `(dst, msg)`.
     /// `now_ms` is the monotonic clock used for TTL/rate-limit bookkeeping
     /// (unchanged from before this task); `now_secs` is WALL-CLOCK seconds,
-    /// used ONLY to validate a `RegisterSigned` record's embedded cert
-    /// window — the two are intentionally distinct clocks and must not be
-    /// conflated (a monotonic clock has no relation to a cert's
-    /// `not_before`/`not_after`, which are wall-clock UNIX timestamps).
+    /// used to validate a `RegisterSigned` record's embedded cert
+    /// window and sequence freshness window — the two are intentionally distinct
+    /// clocks and must not be conflated (a monotonic clock has no relation to
+    /// wall-clock UNIX timestamps).
     pub fn handle(
         &mut self,
         src: SocketAddr,
@@ -278,6 +278,15 @@ impl RendezvousServer {
                     // real entry with a record that fails verification).
                     return Vec::new();
                 }
+                let now_wall_ms = now_secs.saturating_mul(1000);
+                let skew_ms = REGISTRATION_SKEW_SECS.saturating_mul(1000);
+                let min_seq = now_wall_ms.saturating_sub(REG_TTL_MS.saturating_add(skew_ms));
+                let max_seq = now_wall_ms.saturating_add(skew_ms);
+
+                if record.seq < min_seq || record.seq > max_seq {
+                    return Vec::new();
+                }
+
                 let node = record.node_id;
                 if self.register_if_fresh(node, record.seq, src, now_ms) {
                     if let Some(reg) = self.regs.get_mut(&node) {
@@ -1031,5 +1040,142 @@ mod tests {
         assert!(out
             .iter()
             .any(|(_, m)| matches!(m, Message::PeerInfo { .. })));
+    }
+
+    #[test]
+    fn register_signed_rejects_historical_stale_record() {
+        let (ca_pub, network_id, _rec, member_src) = valid_registration();
+        let mut s = RendezvousServer::new_with_roots(0, vec![ca_pub], network_id);
+        let now_s: u64 = 1_700_000_000;
+        let now_wall_ms = now_s.saturating_mul(1000);
+        let stale_seq = now_wall_ms.saturating_sub(600_000);
+
+        // Mint a record with stale_seq
+        let ca = ca_signing_key();
+        let member_pub = [1u8; 32];
+        let member_sign_key = SigningKey::generate(&mut UnwrapErr(SysRng));
+        let member_sign_pub = member_sign_key.verifying_key().to_bytes();
+        let cert = mk_cert(&ca, member_pub, member_sign_pub, network_id);
+        let member_sign_priv: [u8; 32] = member_sign_key.to_bytes();
+        let stale_rec = build_signed_record(
+            cert,
+            vec![addr("192.0.2.1:9")],
+            stale_seq,
+            &member_sign_priv,
+        );
+
+        let out = s.handle(
+            member_src,
+            Message::RegisterSigned {
+                record: stale_rec.clone(),
+            },
+            1_000,
+            now_s,
+        );
+        assert!(out.is_empty(), "stale register produces no reply");
+
+        let lookup = s.handle(
+            addr("203.0.113.9:5"),
+            Message::Lookup {
+                node: stale_rec.node_id,
+            },
+            1_010,
+            now_s,
+        );
+        assert_eq!(
+            lookup,
+            vec![(
+                addr("203.0.113.9:5"),
+                Message::NotFound {
+                    node: stale_rec.node_id
+                }
+            )],
+            "stale registration must yield NotFound"
+        );
+    }
+
+    #[test]
+    fn register_signed_rejects_post_ttl_replay_after_sweep() {
+        let (ca_pub, network_id, _, _) = valid_registration();
+        let mut s = RendezvousServer::new_with_roots(0, vec![ca_pub], network_id);
+        let now_s: u64 = 1_700_000_000;
+        let now_wall_ms = now_s.saturating_mul(1000);
+
+        // 1. Initial valid registration at seq = now_wall_ms
+        let ca = ca_signing_key();
+        let member_pub = [1u8; 32];
+        let member_sign_key = SigningKey::generate(&mut UnwrapErr(SysRng));
+        let member_sign_pub = member_sign_key.verifying_key().to_bytes();
+        let cert = mk_cert(&ca, member_pub, member_sign_pub, network_id);
+        let member_sign_priv: [u8; 32] = member_sign_key.to_bytes();
+        let rec = build_signed_record(
+            cert,
+            vec![addr("192.0.2.1:9")],
+            now_wall_ms,
+            &member_sign_priv,
+        );
+
+        let member_src = addr("198.51.100.42:41000");
+        let _ = s.handle(
+            member_src,
+            Message::RegisterSigned {
+                record: rec.clone(),
+            },
+            0,
+            now_s,
+        );
+
+        let lookup1 = s.handle(
+            addr("203.0.113.9:5"),
+            Message::Lookup { node: rec.node_id },
+            10,
+            now_s,
+        );
+        assert!(lookup1.iter().any(|(_, m)| matches!(m,
+            Message::PeerInfo { reflexive, record: Some(r), .. }
+                if *reflexive == member_src && r.node_id == rec.node_id)));
+
+        // 2. Advance time by 600s, sweep
+        s.sweep(600_000);
+        let lookup_swept = s.handle(
+            addr("203.0.113.9:5"),
+            Message::Lookup { node: rec.node_id },
+            600_001,
+            now_s + 600,
+        );
+        assert_eq!(
+            lookup_swept,
+            vec![(
+                addr("203.0.113.9:5"),
+                Message::NotFound { node: rec.node_id }
+            )]
+        );
+
+        // 3. Attacker replays original record from a different address
+        let attacker_src = addr("203.0.113.66:9");
+        let out = s.handle(
+            attacker_src,
+            Message::RegisterSigned {
+                record: rec.clone(),
+            },
+            600_002,
+            now_s + 600,
+        );
+        assert!(out.is_empty());
+
+        let lookup2 = s.handle(
+            addr("203.0.113.9:5"),
+            Message::Lookup { node: rec.node_id },
+            600_003,
+            now_s + 600,
+        );
+        assert_eq!(
+            lookup2,
+            vec![(
+                addr("203.0.113.9:5"),
+                Message::NotFound { node: rec.node_id }
+            )],
+            "replayed registration after sweep must yield NotFound"
+        );
     }
 }
