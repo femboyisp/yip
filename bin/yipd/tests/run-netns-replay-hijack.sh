@@ -98,6 +98,10 @@
 #      ephemeral + newer wall-clock ts) re-establishes A<->B within a
 #      generous bounded ping window (bounded, unlike the pre-#34 stuck state
 #      this replaces).
+#   4. responder_restart_boot_floor: killing and restarting responder B
+#      (simulating cold reboot) and replaying the old captured round-1 Init
+#      at restarted B is refused by the boot floor gate, and fresh traffic
+#      subsequently recovers within a bounded window.
 set -euo pipefail
 
 YIPD="${1:?Usage: $0 <yipd-binary> <yip-rendezvous-binary>}"
@@ -327,6 +331,10 @@ dump_logs() {
     fi
     echo "=== yipReplB log ==="
     cat "$LOG_B" || true
+    if [ -n "${LOG_B_RESTART:-}" ] && [ -f "$LOG_B_RESTART" ]; then
+        echo "=== yipReplB log (post-restart) ==="
+        cat "$LOG_B_RESTART" || true
+    fi
 }
 
 echo "[start] starting yipReplA (YIP_REKEY_INTERVAL_MS=$YIP_REKEY_INTERVAL_MS)"
@@ -559,5 +567,69 @@ if [ "$RESTART_PING_STATUS" -ne 0 ]; then
     exit 1
 fi
 echo "[PASS] restart_recovery: A<->B re-established within the bounded ping window"
+
+# ── 12. responder restart leg: kill B, restart it, replay old captured Init, assert boot-floor refusal ────
+echo "[test] responder restart leg: killing yipReplB"
+kill "$PID_B" 2>/dev/null || true
+sleep 0.3
+kill -9 "$PID_B" 2>/dev/null || true
+wait "$PID_B" 2>/dev/null || true
+PID_B=""
+
+# Killing the process tears down its TUN device; wait for it to disappear
+elapsed=0
+while ip netns exec "$NS_B" ip link show "$TUN_DEV" >/dev/null 2>&1; do
+    elapsed=$(awk "BEGIN {print $elapsed + 0.25}")
+    if awk "BEGIN {exit ($elapsed >= $TUN_GONE_WAIT) ? 0 : 1}"; then
+        echo "[error] yipReplB's old TUN device did not disappear after kill"; dump_logs; exit 1
+    fi
+    sleep 0.25
+done
+
+LOG_B_RESTART="$TMPDIR_TEST/yipB-restart.log"
+echo "[start] restarting yipReplB (cold start boot_floor_ts initialized)"
+ip netns exec "$NS_B" "$YIPD" "$CFG_B" >"$LOG_B_RESTART" 2>&1 &
+PID_B=$!
+
+wait_for_tun "$NS_B" "yipReplB (restarted)" "$PID_B"
+assign_mesh "$NS_B" "$ADDR_B"
+
+# Before restarted B accepts fresh traffic from A, attacker S replays the captured old round-1 Init at restarted B
+echo "[attack] S (${IP_S}) replaying captured round-1 Init at restarted B (${IP_B}:${PORT_B})"
+ip netns exec "$NS_S" python3 "$REPLAY_PY" "$INIT_HEX" "$IP_B" "$PORT_B"
+REPLAY_RESTART_STATUS=$?
+
+if [ "$REPLAY_RESTART_STATUS" -ne 0 ]; then
+    echo "[FAIL] the replay send from S to restarted B failed (exit $REPLAY_RESTART_STATUS)"
+    dump_logs
+    exit 1
+fi
+
+sleep 0.5
+
+# Assert that restarted B's log contains the boot-floor refusal marker
+if grep -q "stale/replayed Init refused (boot floor gate)" "$LOG_B_RESTART"; then
+    echo "[PASS] responder_restart_boot_floor: restarted B's stderr shows replayed Init was refused by boot floor gate"
+else
+    echo "[FAIL] responder_restart_boot_floor: boot floor gate marker not found in restarted B's stderr"
+    dump_logs
+    exit 1
+fi
+
+# Then initiate ping from A to restarted B and verify recovery within a bounded window
+RESTART_B_PING_LOG="$TMPDIR_TEST/restart_b_ping.log"
+echo "[test] responder restart recovery: pinging ${ADDR_B} from yipReplA (bounded window)"
+set +e
+ip netns exec "$NS_A" ping -6 -c 30 -W 2 "$ADDR_B" >"$RESTART_B_PING_LOG" 2>&1
+RESTART_B_PING_STATUS=$?
+set -e
+cat "$RESTART_B_PING_LOG"
+
+if [ "$RESTART_B_PING_STATUS" -ne 0 ]; then
+    echo "[FAIL] responder_restart_recovery: ping A->B did not succeed after B's restart (exit $RESTART_B_PING_STATUS)"
+    dump_logs
+    exit 1
+fi
+echo "[PASS] responder_restart_recovery: A<->B re-established within bounded window following B restart"
 
 echo "[PASS] run-netns-replay-hijack: replay refused with no session disruption, restart recovered"
