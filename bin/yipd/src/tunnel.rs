@@ -181,6 +181,7 @@ pub fn run(config: Config) -> io::Result<()> {
     // peer straight in Relaying and skips Direct/UDP-punch, since UDP is
     // blocked on that path.
     let relay_only = relay_tls.is_some() || relay_reality.is_some();
+    let signer = membership.as_ref().map(|m| m.registration_signer());
     let mut manager = PeerManager::new(
         config.local_private,
         config.local_public,
@@ -304,7 +305,15 @@ pub fn run(config: Config) -> io::Result<()> {
         let self_node = yip_rendezvous::node_id(&config.local_public);
         let (relay_thread_sock, data_plane_sock) = UnixDatagram::pair()?;
         let sni = host.clone();
-        crate::relay_client::spawn(host, port, sni, obf_key, self_node, relay_thread_sock);
+        crate::relay_client::spawn(
+            host,
+            port,
+            sni,
+            obf_key,
+            self_node,
+            relay_thread_sock,
+            signer,
+        );
         return crate::relay_client::run_relay_tls(
             tun_fd,
             &mut manager,
@@ -341,6 +350,7 @@ pub fn run(config: Config) -> io::Result<()> {
             obf_key,
             self_node,
             relay_thread_sock,
+            signer,
         );
         return crate::relay_client::run_relay_tls(
             tun_fd,

@@ -87,15 +87,13 @@ impl Counter {
     /// `next()` still produces a valid, if not restart-safe, sequence in
     /// that degenerate case.
     pub(crate) fn seeded_now() -> Self {
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let seed = now_wall_clock_ms();
         Counter(seed)
     }
 
     pub(crate) fn next(&mut self) -> u64 {
-        self.0 += 1;
+        let now = now_wall_clock_ms();
+        self.0 = self.0.max(now).saturating_add(1);
         self.0
     }
 }
@@ -109,6 +107,31 @@ pub(crate) fn build_register(obf_key: &[u8; 16], node: NodeId, counter: u64) -> 
     let mut out = Vec::new();
     crate::tls::frame_datagram(&env, &mut out).expect("register envelope within frame cap");
     out
+}
+
+/// Build the framed `[u16 len][obf(RDV_TYPE, RegisterSigned{record})]` bytes.
+pub(crate) fn build_register_signed(obf_key: &[u8; 16], record: yip_membership::Record) -> Vec<u8> {
+    let mut plain = Vec::new();
+    encode(&Message::RegisterSigned { record }, &mut plain);
+    let env = yip_obf::obfuscate(obf_key, yip_obf::RDV_TYPE, &plain, 0)
+        .expect("RegisterSigned body is within frame cap");
+    let mut out = Vec::new();
+    crate::tls::frame_datagram(&env, &mut out).expect("register envelope within frame cap");
+    out
+}
+
+/// Build the appropriate framed registration message depending on whether
+/// a mesh membership registration signer is present.
+pub(crate) fn build_registration_frame(
+    obf_key: &[u8; 16],
+    node: NodeId,
+    counter: u64,
+    signer: Option<&crate::membership::RegistrationSigner>,
+) -> Vec<u8> {
+    match signer {
+        Some(s) => build_register_signed(obf_key, s.sign(counter)),
+        None => build_register(obf_key, node, counter),
+    }
 }
 
 // ── public entry point ─────────────────────────────────────────────────────
@@ -125,8 +148,9 @@ pub(crate) fn spawn(
     obf_key: [u8; 16],
     self_node: NodeId,
     sock: UnixDatagram,
+    signer: Option<crate::membership::RegistrationSigner>,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || run(&host, port, &sni, &obf_key, self_node, sock))
+    std::thread::spawn(move || run(&host, port, &sni, &obf_key, self_node, sock, signer))
 }
 
 /// The reconnect-with-backoff loop. Only returns if `sock` can no longer be
@@ -139,6 +163,7 @@ fn run(
     obf_key: &[u8; 16],
     self_node: NodeId,
     sock: UnixDatagram,
+    signer: Option<crate::membership::RegistrationSigner>,
 ) {
     if let Err(e) = sock.set_nonblocking(true) {
         eprintln!("relay_client: could not set socketpair non-blocking, thread exiting: {e}");
@@ -177,7 +202,7 @@ fn run(
         // Register FIRST — the relay classifies the connection on the first
         // frame it reads; a `RelaySend` written before `Register` gets this
         // connection served the decoy instead of the real relay role.
-        let reg = build_register(obf_key, self_node, counter.next());
+        let reg = build_registration_frame(obf_key, self_node, counter.next(), signer.as_ref());
         if let Err(e) = write_all_tls(&mut stream, &poller, &reg) {
             eprintln!("relay_client: failed to send initial Register, reconnecting: {e}");
             std::thread::sleep(Duration::from_millis(backoff_ms));
@@ -192,6 +217,7 @@ fn run(
             obf_key,
             self_node,
             &mut counter,
+            signer.as_ref(),
         ) {
             eprintln!("relay_client: connection error, reconnecting: {e}");
         }
@@ -274,6 +300,7 @@ pub(crate) fn spawn_reality(
     obf_key: [u8; 16],
     self_node: NodeId,
     sock: UnixDatagram,
+    signer: Option<crate::membership::RegistrationSigner>,
 ) {
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
@@ -287,7 +314,7 @@ pub(crate) fn spawn_reality(
             }
         };
         rt.block_on(run_reality(
-            &host, port, &pubkey, short_id, &sni, verify, &obf_key, self_node, sock,
+            &host, port, &pubkey, short_id, &sni, verify, &obf_key, self_node, sock, signer,
         ));
     });
 }
@@ -307,6 +334,7 @@ async fn run_reality(
     obf_key: &[u8; 16],
     self_node: NodeId,
     sock: UnixDatagram,
+    signer: Option<crate::membership::RegistrationSigner>,
 ) {
     // Wrap the socketpair as tokio (datagram boundaries preserved by SOCK_DGRAM).
     if let Err(e) = sock.set_nonblocking(true) {
@@ -378,7 +406,16 @@ async fn run_reality(
         // Handshake done → reset backoff for the next disconnect.
         backoff_ms = INITIAL_BACKOFF_MS;
 
-        if let Err(e) = pump_reality(stream, &sock, obf_key, self_node, &mut counter).await {
+        if let Err(e) = pump_reality(
+            stream,
+            &sock,
+            obf_key,
+            self_node,
+            &mut counter,
+            signer.as_ref(),
+        )
+        .await
+        {
             eprintln!("relay_client(reality): connection error, reconnecting: {e}");
         }
         // Loop back and reconnect (fresh backoff since the last connection did
@@ -396,6 +433,7 @@ async fn pump_reality<S>(
     obf_key: &[u8; 16],
     self_node: NodeId,
     counter: &mut Counter,
+    signer: Option<&crate::membership::RegistrationSigner>,
 ) -> io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -403,7 +441,7 @@ where
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // Register FIRST — the relay classifies the connection on its first frame.
-    let reg = build_register(obf_key, self_node, counter.next());
+    let reg = build_registration_frame(obf_key, self_node, counter.next(), signer);
     stream.write_all(&reg).await?;
 
     let mut reader = crate::tls::FrameReader::default();
@@ -453,7 +491,7 @@ where
                 stream.write_all(&framed).await?;
             }
             _ = keepalive.tick() => {
-                let reg = build_register(obf_key, self_node, counter.next());
+                let reg = build_registration_frame(obf_key, self_node, counter.next(), signer);
                 stream.write_all(&reg).await?;
             }
         }
@@ -571,6 +609,7 @@ fn pump(
     obf_key: &[u8; 16],
     self_node: NodeId,
     counter: &mut Counter,
+    signer: Option<&crate::membership::RegistrationSigner>,
 ) -> io::Result<()> {
     let mut tls_reader = FrameReader::default();
     let mut tls_read_buf = [0u8; TLS_FRAME_MAX];
@@ -614,7 +653,7 @@ fn pump(
         }
 
         if last_reg.elapsed() >= Duration::from_millis(REG_KEEPALIVE_MS) {
-            let reg = build_register(obf_key, self_node, counter.next());
+            let reg = build_registration_frame(obf_key, self_node, counter.next(), signer);
             write_all_tls(stream, poller, &reg)?;
             last_reg = Instant::now();
         }
@@ -809,6 +848,78 @@ mod tests {
         assert_eq!(
             yip_rendezvous::decode(&body),
             Some(yip_rendezvous::Message::Register { node, counter: 1 })
+        );
+    }
+
+    #[test]
+    fn registration_frame_with_signer_emits_register_signed() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use yip_membership::cert::cert_signing_body;
+
+        let ca = SigningKey::from_bytes(&[1u8; 32]);
+        let ca_pub = ca.verifying_key().to_bytes();
+        let member_pk = [20u8; 32];
+        let member_sign_key = SigningKey::from_bytes(&[21u8; 32]);
+        let member_sign_pub = member_sign_key.verifying_key().to_bytes();
+        let net = [7u8; 16];
+
+        let mut cert = yip_membership::Cert {
+            version: 1,
+            member_pubkey: member_pk,
+            member_sign_pubkey: member_sign_pub,
+            network_id: net,
+            not_before: 0,
+            not_after: 1_000_000,
+            tags: vec![],
+            ca_sig: [0u8; 64],
+        };
+        cert.ca_sig = ca.sign(&cert_signing_body(&cert)).to_bytes();
+
+        let root_set = yip_membership::RootSet {
+            roots: vec![],
+            version: 0,
+            ca_sig: [0u8; 64],
+        };
+
+        let m = crate::membership::Membership::new(
+            vec![ca_pub],
+            net,
+            cert,
+            member_sign_key.to_bytes(),
+            root_set,
+            vec!["127.0.0.1:51820".parse().unwrap()],
+        );
+        let signer = m.registration_signer();
+
+        let key = yip_obf::derive_key(&[9u8; 32]);
+        let node = yip_rendezvous::node_id(&member_pk);
+
+        // Frame with signer produces RegisterSigned
+        let framed_signed = build_registration_frame(&key, node, 42, Some(&signer));
+        let mut r = crate::tls::FrameReader::default();
+        r.push(&framed_signed);
+        let env = r.next().unwrap().unwrap();
+        let (pt, body) = yip_obf::deobfuscate(&key, &env).unwrap();
+        assert_eq!(pt, yip_obf::RDV_TYPE);
+        match yip_rendezvous::decode(&body) {
+            Some(yip_rendezvous::Message::RegisterSigned { record }) => {
+                assert_eq!(record.seq, 42);
+                assert_eq!(record.endpoints, vec!["127.0.0.1:51820".parse().unwrap()]);
+                assert_eq!(record.cert.member_pubkey, member_pk);
+            }
+            other => panic!("expected RegisterSigned, got {other:?}"),
+        }
+
+        // Frame without signer produces bare Register
+        let framed_bare = build_registration_frame(&key, node, 42, None);
+        let mut r = crate::tls::FrameReader::default();
+        r.push(&framed_bare);
+        let env = r.next().unwrap().unwrap();
+        let (pt, body) = yip_obf::deobfuscate(&key, &env).unwrap();
+        assert_eq!(pt, yip_obf::RDV_TYPE);
+        assert_eq!(
+            yip_rendezvous::decode(&body),
+            Some(yip_rendezvous::Message::Register { node, counter: 42 })
         );
     }
 
@@ -1042,6 +1153,7 @@ mod tests {
             obf_key,
             self_node,
             client_sock,
+            None,
         );
 
         // Recv the RelayDeliver envelope piped through to the data-plane
@@ -1154,6 +1266,7 @@ mod tests {
             obf_key,
             self_node,
             relay_sock,
+            None,
         );
 
         // The data-plane end must receive exactly the inbound datagram (deobf'd on

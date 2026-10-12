@@ -210,6 +210,37 @@ impl Membership {
         )
     }
 
+    /// Return a lightweight, thread-safe handle for signing registration records
+    /// (used by the TLS relay client thread without borrowing Membership).
+    pub fn registration_signer(&self) -> RegistrationSigner {
+        RegistrationSigner {
+            own_cert: self.own_cert.clone(),
+            own_endpoints: self.own_endpoints.clone(),
+            sign_priv: self.sign_priv,
+        }
+    }
+}
+
+/// Standalone registration signer that can be moved across threads.
+#[derive(Clone, Debug)]
+pub struct RegistrationSigner {
+    own_cert: Cert,
+    own_endpoints: Vec<SocketAddr>,
+    sign_priv: [u8; 32],
+}
+
+impl RegistrationSigner {
+    pub fn sign(&self, seq: u64) -> Record {
+        build_signed_record(
+            self.own_cert.clone(),
+            self.own_endpoints.clone(),
+            seq,
+            &self.sign_priv,
+        )
+    }
+}
+
+impl Membership {
     /// Verify a registration/directory `Record` against our configured CA
     /// trust anchors (`self.ca_pubkeys` and any CA keys in `self.roots`) +
     /// network, at wall-clock `now_secs`. True iff the cert chains to a
