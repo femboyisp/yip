@@ -157,16 +157,19 @@ NETWORK_ID="abadcafeabadcafeabadcafeabadcafe"
 PID_A=""
 PID_B=""
 PID_RDV=""
+PID_RDV_TLS=""
 
 cleanup() {
     echo "[cleanup] killing daemons and removing namespaces/bridge"
     [ -n "$PID_A" ] && kill "$PID_A" 2>/dev/null || true
     [ -n "$PID_B" ] && kill "$PID_B" 2>/dev/null || true
     [ -n "$PID_RDV" ] && kill "$PID_RDV" 2>/dev/null || true
+    [ -n "$PID_RDV_TLS" ] && kill "$PID_RDV_TLS" 2>/dev/null || true
     sleep 0.2
     [ -n "$PID_A" ] && kill -9 "$PID_A" 2>/dev/null || true
     [ -n "$PID_B" ] && kill -9 "$PID_B" 2>/dev/null || true
     [ -n "$PID_RDV" ] && kill -9 "$PID_RDV" 2>/dev/null || true
+    [ -n "$PID_RDV_TLS" ] && kill -9 "$PID_RDV_TLS" 2>/dev/null || true
     ip netns del "$NS_A" 2>/dev/null || true
     ip netns del "$NS_B" 2>/dev/null || true
     ip netns del "$NS_S" 2>/dev/null || true
@@ -302,6 +305,10 @@ LOG_B="$TMPDIR_TEST/yipB.log"
 dump_logs() {
     echo "=== yip-rendezvous log ==="
     cat "$LOG_RDV" || true
+    if [ -n "${LOG_RDV_TLS:-}" ] && [ -f "$LOG_RDV_TLS" ]; then
+        echo "=== yip-rendezvous TLS log ==="
+        cat "$LOG_RDV_TLS" || true
+    fi
     echo "=== yipHijkA log ==="
     cat "$LOG_A" || true
     echo "=== yipHijkB log ==="
@@ -405,11 +412,89 @@ echo "[PASS] establishment: B<->A established via signed registration + discover
 PROBE_PY="$TMPDIR_TEST/rdv_probe.py"
 cat > "$PROBE_PY" <<'PYEOF'
 import hashlib
+import os
 import socket
+import ssl
 import struct
 import sys
 
 DOMAIN = b"yip-rdv-v1"
+
+
+def rotl(x, b):
+    return ((x << b) | (x >> (64 - b))) & 0xFFFFFFFFFFFFFFFF
+
+
+def sipround(v):
+    v0, v1, v2, v3 = v
+    v0 = (v0 + v1) & 0xFFFFFFFFFFFFFFFF
+    v1 = rotl(v1, 13) ^ v0
+    v0 = rotl(v0, 32)
+    v2 = (v2 + v3) & 0xFFFFFFFFFFFFFFFF
+    v3 = rotl(v3, 16) ^ v2
+    v0 = (v0 + v3) & 0xFFFFFFFFFFFFFFFF
+    v3 = rotl(v3, 21) ^ v0
+    v2 = (v2 + v1) & 0xFFFFFFFFFFFFFFFF
+    v1 = rotl(v1, 17) ^ v2
+    v2 = rotl(v2, 32)
+    return [v0, v1, v2, v3]
+
+
+def siphash24(k, msg):
+    k0 = int.from_bytes(k[0:8], "little")
+    k1 = int.from_bytes(k[8:16], "little")
+    v = [
+        k0 ^ 0x736F6D6570736575,
+        k1 ^ 0x646F72616E646F6D,
+        k0 ^ 0x6C7967656E657261,
+        k1 ^ 0x7465646279746573,
+    ]
+    m0 = int.from_bytes(msg[0:8], "little")
+    m1 = int.from_bytes(msg[8:16], "little")
+    v[3] ^= m0
+    v = sipround(v)
+    v = sipround(v)
+    v[0] ^= m0
+    v[3] ^= m1
+    v = sipround(v)
+    v = sipround(v)
+    v[0] ^= m1
+    b = (16 & 0xFF) << 56
+    v[3] ^= b
+    v = sipround(v)
+    v = sipround(v)
+    v[0] ^= b
+    v[2] ^= 0xFF
+    v = sipround(v)
+    v = sipround(v)
+    v = sipround(v)
+    v = sipround(v)
+    return v[0] ^ v[1] ^ v[2] ^ v[3]
+
+
+def derive_key(psk):
+    h = hashlib.blake2s(digest_size=16)
+    h.update(b"yip-obf-v1")
+    h.update(psk)
+    return h.digest()
+
+
+def keystream(key, nonce, n):
+    out = bytearray()
+    counter = 0
+    while len(out) < n:
+        msg = nonce + counter.to_bytes(8, "big")
+        out += siphash24(key, msg).to_bytes(8, "big")
+        counter += 1
+    return bytes(out[:n])
+
+
+def obfuscate(key, ptype, body, nonce):
+    body_len = len(body)
+    region = bytearray([ptype]) + body_len.to_bytes(2, "big") + body
+    ks = keystream(key, nonce, len(region))
+    masked = bytes(b ^ k for b, k in zip(region, ks))
+    return nonce + masked
 
 
 def node_id_hex(pubkey_hex):
@@ -433,6 +518,48 @@ def cmd_register(argv):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.sendto(pkt, (rdv_ip, rdv_port))
     s.close()
+
+
+def cmd_register_tls(argv):
+    rdv_ip, rdv_port, psk_hex, node_hex, counter = (
+        argv[0],
+        int(argv[1]),
+        argv[2],
+        argv[3],
+        int(argv[4]),
+    )
+    node = bytes.fromhex(node_hex)
+    assert len(node) == 16
+    plain = bytes([0]) + node + struct.pack(">Q", counter)
+    psk = bytes.fromhex(psk_hex)
+    key = derive_key(psk)
+    nonce = os.urandom(8)
+    env = obfuscate(key, 5, plain, nonce)
+    frame = struct.pack(">H", len(env)) + env
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    s = socket.create_connection((rdv_ip, rdv_port), timeout=5.0)
+    tls_s = ctx.wrap_socket(s)
+    tls_s.sendall(frame)
+    resp = b""
+    while True:
+        try:
+            chunk = tls_s.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+        except Exception:
+            break
+    tls_s.close()
+
+    if resp.startswith(b"HTTP/1.1 200 OK") or b"<!doctype html>" in resp:
+        print("DECOY_REFUSED")
+    elif len(resp) >= 2:
+        print(f"UPGRADE_ACCEPTED: {resp.hex()[:32]}")
+    else:
+        print("CLOSED_EMPTY")
 
 
 def cmd_lookup(argv):
@@ -478,12 +605,17 @@ def cmd_lookup(argv):
     print(f"REFLEXIVE={ip}:{port}")
 
 
-CMDS = {"nodeid": cmd_nodeid, "register": cmd_register, "lookup": cmd_lookup}
+CMDS = {
+    "nodeid": cmd_nodeid,
+    "register": cmd_register,
+    "register_tls": cmd_register_tls,
+    "lookup": cmd_lookup,
+}
 
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] not in CMDS:
-        print(f"usage: {sys.argv[0]} <nodeid|register|lookup> ...", file=sys.stderr)
+        print(f"usage: {sys.argv[0]} <nodeid|register|register_tls|lookup> ...", file=sys.stderr)
         sys.exit(2)
     CMDS[sys.argv[1]](sys.argv[2:])
 
@@ -570,4 +702,74 @@ if [ "$AFTER" != "$EXPECT_REFLEXIVE" ]; then
 fi
 echo "[PASS] no_overwrite: A's registration is unchanged after the forged-Register attack -- the rooted server refused it"
 
-echo "[PASS] run-netns-registration-hijack: the rooted server refused the forged registration; B<->A stayed reachable throughout"
+# ── 13. TLS Trojan front hijack refusal: unsigned Register over TLS is routed to decoy (#101) ──
+RDV_TCP_PORT="51822"
+RDV_UDP_PORT2="51823"
+TLS_CERT="$TMPDIR_TEST/relay-cert.pem"
+TLS_KEY="$TMPDIR_TEST/relay-key.pem"
+LOG_RDV_TLS="$TMPDIR_TEST/rdv_tls.log"
+OBF_PSK="$(openssl rand -hex 32)"
+
+echo "[setup] generating TLS certificate and key for rendezvous TLS Trojan front"
+openssl req -x509 -newkey rsa:2048 -nodes \
+    -keyout "$TLS_KEY" -out "$TLS_CERT" \
+    -days 1 -subj '/CN=relay.test' >/dev/null 2>&1
+
+echo "[start] starting rooted rendezvous with TLS Trojan front in R on 0.0.0.0:${RDV_TCP_PORT}"
+ip netns exec "$NS_R" "$RDV" "0.0.0.0:${RDV_UDP_PORT2}" \
+    --listen-tcp "0.0.0.0:${RDV_TCP_PORT}" \
+    --tls-cert "$TLS_CERT" \
+    --tls-key "$TLS_KEY" \
+    --obf-psk "$OBF_PSK" \
+    --roots "$ROOTS_FILE" \
+    --network-id "$NETWORK_ID" \
+    >"$LOG_RDV_TLS" 2>&1 &
+PID_RDV_TLS=$!
+
+echo "[wait] waiting for rendezvous TLS front to accept connections"
+elapsed=0
+while ! ip netns exec "$NS_S" bash -c "exec 3<>/dev/tcp/${IP_R}/${RDV_TCP_PORT}" >/dev/null 2>&1; do
+    if ! kill -0 "$PID_RDV_TLS" 2>/dev/null; then
+        echo "[error] yip-rendezvous TLS front died unexpectedly"
+        dump_logs
+        exit 1
+    fi
+    sleep 0.1
+    elapsed=$(awk "BEGIN {print $elapsed + 0.1}")
+    if awk "BEGIN {exit ($elapsed >= 5.0) ? 0 : 1}"; then
+        echo "[error] timed out waiting for yip-rendezvous TLS front"
+        dump_logs
+        exit 1
+    fi
+done
+echo "[wait] rendezvous TLS front is up and accepting connections"
+
+echo "[attack] S attempting to hijack A's identity via unsigned Register over TLS front"
+TLS_ATTACK_OUT="$(ip netns exec "$NS_S" python3 "$PROBE_PY" register_tls "$IP_R" "$RDV_TCP_PORT" "$OBF_PSK" "$A_NODE_ID" 999999999)"
+echo "[check] TLS front response to unsigned Register: $TLS_ATTACK_OUT"
+if [ "$TLS_ATTACK_OUT" != "DECOY_REFUSED" ]; then
+    echo "[FAIL] TLS front did not route unsigned Register to decoy (got $TLS_ATTACK_OUT) -- forged registration accepted or leaked!"
+    dump_logs
+    exit 1
+fi
+echo "[PASS] tls_refusal: forged unsigned Register over TLS front routed to decoy, not upgraded (#101)"
+
+# Steady ping B->A must remain fully functional
+if ! ip netns exec "$NS_B" ping -6 -c 5 -W 1 "$ADDR_A" >/dev/null 2>&1; then
+    echo "[FAIL] ping B->A disrupted after TLS front attack attempt"
+    dump_logs
+    exit 1
+fi
+echo "[PASS] no_disruption_tls: B<->A ping unaffected by TLS front hijack attempt"
+
+# Post-attack lookup on primary rendezvous still yields A's real address
+AFTER_TLS="$(ip netns exec "$NS_S" python3 "$PROBE_PY" lookup "$IP_R" "$RDV_PORT" "$A_NODE_ID" 3)"
+echo "[check] post-TLS-attack Lookup(A) from S: $AFTER_TLS"
+if [ "$AFTER_TLS" != "$EXPECT_REFLEXIVE" ]; then
+    echo "[FAIL] no_overwrite_tls: A's registration changed after TLS attack (expected $EXPECT_REFLEXIVE, got $AFTER_TLS)"
+    dump_logs
+    exit 1
+fi
+echo "[PASS] no_overwrite_tls: A's registration intact across TLS hijack attempt"
+
+echo "[PASS] run-netns-registration-hijack: the rooted server refused both UDP and TLS forged registrations; B<->A stayed reachable throughout"
