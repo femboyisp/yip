@@ -21,15 +21,33 @@ pub enum Classify {
 }
 
 /// Pure classification of the first frame. De-frames `[u16 len][obf env]`,
-/// deobfuscates with `obf_key` (requiring RDV_TYPE), decodes, and accepts only
-/// a fresh `Register` (monotonic counter enforced by
-/// `server.register_if_fresh_tls`, kept separate from the UDP-servable `regs`
-/// map — see `RendezvousServer::register_if_fresh_tls`).
+/// deobfuscates with `obf_key` (requiring RDV_TYPE), decodes, and:
+/// - In rooted mesh mode (`server.roots_cfg().is_some()`): requires a verified
+///   `Message::RegisterSigned` (cert chain and signature verified against roots,
+///   sequence within wall-clock bounds, and fresh on the TLS path). Rejects bare
+///   `Register` as decoy.
+/// - In rootless mode (`server.roots_cfg().is_none()`): accepts a fresh
+///   `Message::Register` as before.
 pub fn classify_first_frame(
     buf: &[u8],
     obf_key: &[u8; 16],
     server: &mut RendezvousServer,
     now_ms: u64,
+) -> Classify {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    classify_first_frame_at(buf, obf_key, server, now_ms, now_secs)
+}
+
+/// Pure classification with explicit wall-clock `now_secs` for testing.
+pub fn classify_first_frame_at(
+    buf: &[u8],
+    obf_key: &[u8; 16],
+    server: &mut RendezvousServer,
+    now_ms: u64,
+    now_secs: u64,
 ) -> Classify {
     // Length prefix present and plausible?
     let Some(len_bytes) = buf.get(..2) else {
@@ -49,24 +67,41 @@ pub fn classify_first_frame(
     if ptype != yip_obf::RDV_TYPE {
         return Classify::Decoy;
     }
-    // Must be a Register.
-    let Some(Message::Register { node, counter }) = decode(&body) else {
+    let Some(msg) = decode(&body) else {
         return Classify::Decoy;
     };
-    // The state machine reports whether THIS Register was accepted (fresh
-    // insert / counter advance). A stale replay — even one in the same
-    // millisecond — or a first-seen node at capacity returns false ⇒ decoy.
-    // Uses the TLS-only freshness state (`register_if_fresh_tls`), NOT the
-    // UDP-servable `regs` map: a TLS peer is not UDP-reachable and must never
-    // appear in a UDP `Lookup`/`RelaySend` result with the synthetic
-    // `0.0.0.0:0` address this path would otherwise register (I4).
-    if !server.register_if_fresh_tls(node, counter, now_ms) {
-        return Classify::Decoy;
+    if server.roots_cfg().is_some() {
+        // Rooted mode: reject bare Register, require verified RegisterSigned.
+        let Message::RegisterSigned { record } = msg else {
+            return Classify::Decoy;
+        };
+        if !server.verify_signed_record(&record, now_secs) {
+            return Classify::Decoy;
+        }
+        if !server.register_if_fresh_tls(record.node_id, record.seq, now_ms) {
+            return Classify::Decoy;
+        }
+        let reply = crate::frame_obf(
+            obf_key,
+            &Message::RegisterSigned {
+                record: record.clone(),
+            },
+        );
+        Classify::Upgrade {
+            node: record.node_id,
+            reply,
+        }
+    } else {
+        // Rootless mode: accept bare Register.
+        let Message::Register { node, counter } = msg else {
+            return Classify::Decoy;
+        };
+        if !server.register_if_fresh_tls(node, counter, now_ms) {
+            return Classify::Decoy;
+        }
+        let reply = crate::frame_obf(obf_key, &Message::Register { node, counter });
+        Classify::Upgrade { node, reply }
     }
-    // Build the framed obfuscated ack (an empty-payload Register echo is
-    // enough for 3c.3; 3c.4's client only needs to see a well-formed reply).
-    let reply = crate::frame_obf(obf_key, &Message::Register { node, counter });
-    Classify::Upgrade { node, reply }
 }
 
 /// Short budget to decide tunnel-vs-decoy. NOT a connection lifetime: on the
@@ -386,6 +421,160 @@ mod tests {
         ));
         assert!(matches!(
             classify_first_frame(&frame, &key, &mut s, 100),
+            Classify::Decoy
+        ));
+    }
+
+    fn frame_obf_message(obf_key: &[u8; 16], msg: &Message) -> Vec<u8> {
+        crate::frame_obf(obf_key, msg)
+    }
+
+    fn valid_registration() -> (
+        [u8; 32],
+        [u8; 16],
+        yip_membership::Record,
+        std::net::SocketAddr,
+    ) {
+        const CA_PRIV: [u8; 32] = [0x42; 32];
+        const CA_PUB: [u8; 32] = [
+            33, 82, 248, 209, 155, 121, 29, 36, 69, 50, 66, 225, 95, 46, 171, 108, 183, 207, 250,
+            123, 106, 94, 211, 0, 151, 150, 14, 6, 152, 129, 219, 18,
+        ];
+        const MEMBER_SIGN_PRIV: [u8; 32] = [0x43; 32];
+        const MEMBER_SIGN_PUB: [u8; 32] = [
+            34, 252, 41, 119, 146, 240, 182, 255, 192, 191, 207, 219, 126, 219, 12, 10, 161, 78, 2,
+            90, 54, 94, 192, 227, 66, 232, 110, 56, 41, 203, 116, 182,
+        ];
+        let network_id = [7u8; 16];
+        let member_pub = [1u8; 32];
+        let mut cert = yip_membership::Cert {
+            version: 1,
+            member_pubkey: member_pub,
+            member_sign_pubkey: MEMBER_SIGN_PUB,
+            network_id,
+            not_before: 0,
+            not_after: u64::MAX,
+            tags: vec![],
+            ca_sig: [0u8; 64],
+        };
+        cert.ca_sig =
+            yip_membership::record::sign(&yip_membership::cert::cert_signing_body(&cert), &CA_PRIV);
+
+        let now_wall_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let mut rec = yip_membership::Record {
+            node_id: yip_rendezvous::node_id(&member_pub),
+            cert,
+            endpoints: vec!["192.0.2.1:9".parse().unwrap()],
+            seq: now_wall_ms,
+            sig: [0u8; 64],
+        };
+        rec.sig = yip_membership::record::sign(
+            &yip_membership::record::record_signing_body(&rec),
+            &MEMBER_SIGN_PRIV,
+        );
+        (
+            CA_PUB,
+            network_id,
+            rec,
+            "198.51.100.42:41000".parse().unwrap(),
+        )
+    }
+
+    #[test]
+    fn classify_first_frame_accepts_valid_register_signed_in_rooted_mode() {
+        let (ca_pub, net_id, rec, _) = valid_registration();
+        let mut server = RendezvousServer::new_with_roots(0, vec![ca_pub], net_id);
+        let obf_key = yip_obf::derive_key(&[4u8; 32]);
+        let buf = frame_obf_message(
+            &obf_key,
+            &Message::RegisterSigned {
+                record: rec.clone(),
+            },
+        );
+        let classified = classify_first_frame(&buf, &obf_key, &mut server, 0);
+        match classified {
+            Classify::Upgrade { node, reply } => {
+                assert_eq!(node, rec.node_id);
+                let len = usize::from(u16::from_be_bytes([reply[0], reply[1]]));
+                let (ptype, body) = yip_obf::deobfuscate(&obf_key, &reply[2..2 + len]).unwrap();
+                assert_eq!(ptype, yip_obf::RDV_TYPE);
+                assert_eq!(decode(&body), Some(Message::RegisterSigned { record: rec }));
+            }
+            Classify::Decoy => panic!("valid RegisterSigned must upgrade in rooted mode"),
+        }
+    }
+
+    #[test]
+    fn classify_first_frame_rejects_unsigned_register_in_rooted_mode() {
+        let (ca_pub, net_id, _, _) = valid_registration();
+        let mut server = RendezvousServer::new_with_roots(0, vec![ca_pub], net_id);
+        let obf_key = yip_obf::derive_key(&[4u8; 32]);
+        let buf = frame_obf_message(
+            &obf_key,
+            &Message::Register {
+                node: [1u8; 16],
+                counter: 1,
+            },
+        );
+        let classified = classify_first_frame(&buf, &obf_key, &mut server, 0);
+        assert!(matches!(classified, Classify::Decoy));
+    }
+
+    #[test]
+    fn classify_first_frame_rejects_forged_signed_record_in_rooted_mode() {
+        let (ca_pub, net_id, rec, _) = valid_registration();
+        let obf_key = yip_obf::derive_key(&[4u8; 32]);
+
+        // 1. Corrupted signature
+        let mut forged_sig = rec.clone();
+        forged_sig.sig[0] ^= 0xff;
+        let mut server = RendezvousServer::new_with_roots(0, vec![ca_pub], net_id);
+        let buf = frame_obf_message(&obf_key, &Message::RegisterSigned { record: forged_sig });
+        assert!(matches!(
+            classify_first_frame(&buf, &obf_key, &mut server, 0),
+            Classify::Decoy
+        ));
+
+        // 2. Untrusted CA
+        let other_ca = [99u8; 32];
+        let mut server2 = RendezvousServer::new_with_roots(0, vec![other_ca], net_id);
+        let buf2 = frame_obf_message(
+            &obf_key,
+            &Message::RegisterSigned {
+                record: rec.clone(),
+            },
+        );
+        assert!(matches!(
+            classify_first_frame(&buf2, &obf_key, &mut server2, 0),
+            Classify::Decoy
+        ));
+
+        // 3. Squatting node_id
+        let mut squatting = rec.clone();
+        squatting.node_id = [99u8; 16];
+        let mut server3 = RendezvousServer::new_with_roots(0, vec![ca_pub], net_id);
+        let buf3 = frame_obf_message(&obf_key, &Message::RegisterSigned { record: squatting });
+        assert!(matches!(
+            classify_first_frame(&buf3, &obf_key, &mut server3, 0),
+            Classify::Decoy
+        ));
+
+        // 4. Stale sequence number (past expiry window)
+        let mut stale = rec.clone();
+        stale.seq = 1; // 1 ms since epoch is decades in the past
+        const MEMBER_SIGN_PRIV: [u8; 32] = [0x43; 32];
+        stale.sig = yip_membership::record::sign(
+            &yip_membership::record::record_signing_body(&stale),
+            &MEMBER_SIGN_PRIV,
+        );
+        let mut server4 = RendezvousServer::new_with_roots(0, vec![ca_pub], net_id);
+        let buf4 = frame_obf_message(&obf_key, &Message::RegisterSigned { record: stale });
+        assert!(matches!(
+            classify_first_frame(&buf4, &obf_key, &mut server4, 0),
             Classify::Decoy
         ));
     }

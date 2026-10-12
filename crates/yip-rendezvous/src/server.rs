@@ -16,7 +16,7 @@ use crate::proto::{Message, NodeId};
 /// override) — this crate has no access to that binary-local constant, so
 /// the value is duplicated here rather than reused; keep the two in sync by
 /// hand if the #41 default ever changes.
-const REGISTRATION_SKEW_SECS: u64 = 300;
+pub const REGISTRATION_SKEW_SECS: u64 = 300;
 
 /// Registration lifetime; clients refresh well within this.
 pub const REG_TTL_MS: u64 = 60_000;
@@ -133,6 +133,35 @@ impl RendezvousServer {
     /// front to distinguish an upgraded tunnel client from a decoy request.
     pub fn is_registered(&self, node: &NodeId, now_ms: u64) -> bool {
         self.regs.get(node).is_some_and(|r| r.expiry_ms > now_ms)
+    }
+
+    /// Returns `Some((ca_pubkeys, network_id))` if this server is in rooted (mesh) mode,
+    /// or `None` if running rootless.
+    pub fn roots_cfg(&self) -> Option<&(Vec<[u8; 32]>, [u8; 16])> {
+        self.roots_cfg.as_ref()
+    }
+
+    /// Verifies a `RegisterSigned` record's cert, signature, network ID, and
+    /// sequence freshness window against this server's `roots_cfg`.
+    pub fn verify_signed_record(&self, record: &Record, now_secs: u64) -> bool {
+        let Some((ca_pubkeys, network_id)) = self.roots_cfg.as_ref() else {
+            return false;
+        };
+        if record
+            .verify(ca_pubkeys, network_id, now_secs, REGISTRATION_SKEW_SECS)
+            .is_err()
+        {
+            return false;
+        }
+        let now_wall_ms = now_secs.saturating_mul(1000);
+        let skew_ms = REGISTRATION_SKEW_SECS.saturating_mul(1000);
+        let min_seq = now_wall_ms.saturating_sub(REG_TTL_MS.saturating_add(skew_ms));
+        let max_seq = now_wall_ms.saturating_add(skew_ms);
+
+        if record.seq < min_seq || record.seq > max_seq {
+            return false;
+        }
+        true
     }
 
     /// True iff `src` is within its per-window budget (and records the hit).
@@ -260,30 +289,7 @@ impl RendezvousServer {
                 Vec::new()
             }
             Message::RegisterSigned { record } => {
-                let Some((ca_pubkeys, network_id)) = self.roots_cfg.as_ref() else {
-                    // Rootless server: `RegisterSigned` has no roots to
-                    // verify against, so it is meaningless here — drop
-                    // rather than trust it unverified.
-                    return Vec::new();
-                };
-                if record
-                    .verify(ca_pubkeys, network_id, now_secs, REGISTRATION_SKEW_SECS)
-                    .is_err()
-                {
-                    // Forged signature, expired/not-yet-valid cert, untrusted
-                    // CA, or a node_id that doesn't match the signer's own
-                    // key (squatting) — drop; no store, no reply, and
-                    // crucially no touch of any EXISTING registration under
-                    // this node_id (an attacker can't clobber a victim's
-                    // real entry with a record that fails verification).
-                    return Vec::new();
-                }
-                let now_wall_ms = now_secs.saturating_mul(1000);
-                let skew_ms = REGISTRATION_SKEW_SECS.saturating_mul(1000);
-                let min_seq = now_wall_ms.saturating_sub(REG_TTL_MS.saturating_add(skew_ms));
-                let max_seq = now_wall_ms.saturating_add(skew_ms);
-
-                if record.seq < min_seq || record.seq > max_seq {
+                if !self.verify_signed_record(&record, now_secs) {
                     return Vec::new();
                 }
 
