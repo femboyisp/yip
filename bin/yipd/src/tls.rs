@@ -511,6 +511,10 @@ fn accept_and_handshake(
 /// Returns `Ok(())` when the connection was torn down for a connection-level
 /// reason (logged; the caller reconnects). A fatal error (the epoll primitive
 /// itself failing) propagates via `?` and ends [`run_tls`] entirely.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "pump requires stream, epoll poller, tun fd, manager, peer identity, timeout, and timing state"
+)]
 fn pump(
     mut stream: SslStream<TcpStream>,
     poller: &Epoll,
@@ -518,6 +522,7 @@ fn pump(
     manager: &mut PeerManager,
     peer_addr: SocketAddr,
     peer_public: [u8; 32],
+    inner_timeout: Duration,
     start: Instant,
 ) -> io::Result<()> {
     let mut reader = FrameReader::default();
@@ -526,11 +531,12 @@ fn pump(
     let mut write_buf: Vec<u8> = Vec::new();
     let conn_start = Instant::now();
     let mut inner_confirmed = false;
+    let was_established = manager.is_peer_established(&peer_public);
 
     loop {
-        if !inner_confirmed && conn_start.elapsed() >= INNER_HANDSHAKE_TIMEOUT {
+        if !inner_confirmed && conn_start.elapsed() >= inner_timeout {
             eprintln!(
-                "tls: inner handshake did not complete within {INNER_HANDSHAKE_TIMEOUT:?}, tearing down"
+                "tls: inner handshake did not complete within {inner_timeout:?}, tearing down"
             );
             return Ok(());
         }
@@ -548,7 +554,10 @@ fn pump(
                 match reader.next() {
                     Ok(Some(dg)) => {
                         let (tun, egress) = owned_out(manager.on_udp(peer_addr, &dg, now_ms));
-                        if manager.is_peer_established(&peer_public) {
+                        if (!was_established && manager.is_peer_established(&peer_public))
+                            || tun.is_some()
+                            || !egress.is_empty()
+                        {
                             inner_confirmed = true;
                         }
                         if let Some(inner) = tun {
@@ -686,6 +695,7 @@ pub(crate) fn run_tls(
             manager,
             peer_addr,
             peer_public,
+            INNER_HANDSHAKE_TIMEOUT,
             start,
         )?;
         // `pump` returns `Ok(())` only on a connection-level teardown (already
@@ -879,21 +889,22 @@ mod tests {
     }
 
     /// A completed outer TLS connection where the peer sends no inner Noise-IK
-    /// packets must tear down after `INNER_HANDSHAKE_TIMEOUT`, returning `Ok(())`
+    /// packets must tear down after `inner_timeout`, returning `Ok(())`
     /// so the single connection slot can be recycled.
     #[test]
     fn drive_inner_handshake_timeout_on_idle_stream() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("local_addr");
         let sni = "example.test";
+        let test_timeout = Duration::from_millis(150);
 
         let server = std::thread::spawn(move || {
             let (tcp, _from) = listener.accept().expect("accept");
             let acceptor = build_server_acceptor(sni).expect("acceptor");
             let mut stream = acceptor.accept(tcp).expect("server handshake");
             // Outer TLS completed; server stays idle (sends no inner frames)
-            // for longer than INNER_HANDSHAKE_TIMEOUT.
-            std::thread::sleep(INNER_HANDSHAKE_TIMEOUT + Duration::from_millis(500));
+            // for longer than test_timeout.
+            std::thread::sleep(test_timeout + Duration::from_millis(100));
             stream.shutdown().ok();
         });
 
@@ -931,6 +942,7 @@ mod tests {
             &mut manager,
             addr,
             peer_pub,
+            test_timeout,
             t0,
         );
 
@@ -940,8 +952,81 @@ mod tests {
         );
         let elapsed = t0.elapsed();
         assert!(
-            elapsed >= INNER_HANDSHAKE_TIMEOUT,
-            "pump must have waited at least INNER_HANDSHAKE_TIMEOUT ({INNER_HANDSHAKE_TIMEOUT:?}), elapsed: {elapsed:?}"
+            elapsed >= test_timeout,
+            "pump must have waited at least test_timeout ({test_timeout:?}), elapsed: {elapsed:?}"
+        );
+
+        server.join().expect("server thread panicked");
+    }
+
+    /// A completed outer TLS connection where the peer sends garbage datagrams
+    /// (which fail inner decryption/handshake) must not confirm the session and
+    /// must tear down after `inner_timeout`.
+    #[test]
+    fn drive_inner_handshake_timeout_on_garbage_ingress() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local_addr");
+        let sni = "example.test";
+        let test_timeout = Duration::from_millis(150);
+
+        let server = std::thread::spawn(move || {
+            let (tcp, _from) = listener.accept().expect("accept");
+            let acceptor = build_server_acceptor(sni).expect("acceptor");
+            let mut stream = acceptor.accept(tcp).expect("server handshake");
+            // Send garbage frames to client
+            let mut wire = Vec::new();
+            frame_datagram(b"scanner-garbage-noise", &mut wire).unwrap();
+            blocking_write_all(&mut stream, &wire);
+            std::thread::sleep(test_timeout + Duration::from_millis(100));
+            stream.shutdown().ok();
+        });
+
+        let connector = build_client_connector().expect("connector");
+        let tcp = TcpStream::connect(addr).expect("connect");
+        let tcp_fd = tcp.as_raw_fd();
+        let dummy = std::net::UdpSocket::bind("127.0.0.1:0").expect("dummy socket");
+        let poller = Epoll::new(tcp_fd, dummy.as_raw_fd()).expect("epoll");
+        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        let stream = drive_handshake(connector.connect(sni, tcp), &poller, deadline)
+            .expect("client handshake");
+
+        let peer_pub = [3u8; 32];
+        let local_priv = [1u8; 32];
+        let local_pub = [2u8; 32];
+        let peer_cfg = crate::config::PeerConfig {
+            public_key: peer_pub,
+            endpoint: Some(addr),
+        };
+        let mut manager = PeerManager::new(
+            local_priv,
+            local_pub,
+            &[peer_cfg],
+            crate::mode::TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
+
+        let t0 = Instant::now();
+        let res = pump(
+            stream,
+            &poller,
+            dummy.as_raw_fd(),
+            &mut manager,
+            addr,
+            peer_pub,
+            test_timeout,
+            t0,
+        );
+
+        assert!(
+            res.is_ok(),
+            "pump should exit with Ok(()) on timeout teardown"
+        );
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= test_timeout,
+            "pump must have waited at least test_timeout ({test_timeout:?}), elapsed: {elapsed:?}"
         );
 
         server.join().expect("server thread panicked");
