@@ -1455,7 +1455,7 @@ mod tests {
     }
 
     #[test]
-    fn relayed_gossip_ingests_and_emits_relay_wrapped_replies() {
+    fn relayed_gossip_without_membership_is_noop() {
         let local = generate_keypair();
         let peer_kp = generate_keypair();
         let cfg_peer = PeerConfig {
