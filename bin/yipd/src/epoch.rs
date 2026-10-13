@@ -96,18 +96,10 @@ impl EpochSet {
         &mut self.current
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by peer_manager in later tasks (#105)")
-    )]
     pub fn current_obf_key(&self) -> Option<[u8; 16]> {
         self.current.obf_key()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by peer_manager in later tasks (#105)")
-    )]
     pub fn candidate_obf_keys(&self) -> Vec<[u8; 16]> {
         let mut keys = Vec::with_capacity(3);
         if let Some(k) = self.current.obf_key() {

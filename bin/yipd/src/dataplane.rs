@@ -139,10 +139,6 @@ pub struct DataPlane {
     /// at construction). Gates whether the feedback cadence is jittered (3b Task 5).
     obf_on: bool,
     /// 16-byte data-plane obfuscation key, derived from hp_key if obfuscation is enabled.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by peer_manager in later tasks (#105)")
-    )]
     obf_key: Option<[u8; 16]>,
     /// Current feedback emission interval, in ms. Starts at `FEEDBACK_INTERVAL_MS`
     /// and is re-rolled after each emission: jittered ±25% when `obf_on`, held at
@@ -192,10 +188,6 @@ impl DataPlane {
     }
 
     /// 16-byte data-plane obfuscation key, if obfuscation is enabled.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by peer_manager in later tasks (#105)")
-    )]
     pub fn obf_key(&self) -> Option<[u8; 16]> {
         self.obf_key
     }

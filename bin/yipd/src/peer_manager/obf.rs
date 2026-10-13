@@ -41,29 +41,33 @@ impl PeerManager {
     /// filters and, ultimately, the inner Noise/AEAD/frame verify make every
     /// mismatch a safe drop — never a mis-dispatch with side effects.
     pub(super) fn deobf_ingress(&self, src: SocketAddr, dg: &[u8]) -> Option<Vec<u8>> {
-        // (a) established peer whose endpoint matches src → session key.
-        if let Some(key) = self.peers.iter().find_map(|p| {
-            if p.endpoint == Some(src) && matches!(p.state, PeerState::Established(_)) {
-                p.session_obf_key
-            } else {
-                None
-            }
-        }) {
-            if let Some((ptype, body)) = yip_obf::deobfuscate(&key, dg) {
-                if ptype == yip_obf::JUNK_TYPE {
-                    return None; // idle-cover decoy: inert, dropped, no fall-through
+        // (a) established peer whose endpoint matches src → session candidate keys.
+        if let Some(peer) = self.peers.iter().find(|p| p.endpoint == Some(src)) {
+            if let PeerState::Established(ref epochs) = peer.state {
+                let mut keys = epochs.candidate_obf_keys();
+                if keys.is_empty() {
+                    if let Some(k) = peer.session_obf_key {
+                        keys.push(k);
+                    }
                 }
-                if ptype == PacketType::Data as u8
-                    || ptype == PacketType::Control as u8
-                    || ptype == PacketType::Gossip as u8
-                {
-                    return Some(reassemble(ptype, &body));
+                for key in keys {
+                    if let Some((ptype, body)) = yip_obf::deobfuscate(&key, dg) {
+                        if ptype == yip_obf::JUNK_TYPE {
+                            return None; // idle-cover decoy: inert, dropped, no fall-through
+                        }
+                        if ptype == PacketType::Data as u8
+                            || ptype == PacketType::Control as u8
+                            || ptype == PacketType::Gossip as u8
+                        {
+                            return Some(reassemble(ptype, &body));
+                        }
+                    }
                 }
             }
         }
         // (a') Roaming fallback: no endpoint match, but the datagram may be a
-        // roamed Established peer's Data/Control/Gossip under its session key.
-        // Trial each Established peer's session key; a wrong key yields None or a
+        // roamed Established peer's Data/Control/Gossip under its candidate session keys.
+        // Trial each Established peer's candidate keys; a wrong key yields None or a
         // garbage type that the type-set + the downstream inner Noise/AEAD verify
         // drop safely. NOTE: `deobfuscate` is an unauthenticated keystream XOR, so
         // a wrong key CAN spuriously produce a Data/Control/Gossip type here — the
@@ -73,21 +77,25 @@ impl PeerManager {
         // an interfering peer's trial false-positives; FEC/ARQ absorb it, and the
         // endpoint self-heals on the next datagram that reaches (a).
         for p in &self.peers {
-            if !matches!(p.state, PeerState::Established(_)) {
-                continue;
-            }
-            let Some(key) = p.session_obf_key else {
-                continue;
-            };
-            if let Some((ptype, body)) = yip_obf::deobfuscate(&key, dg) {
-                if ptype == yip_obf::JUNK_TYPE {
-                    return None;
+            if let PeerState::Established(ref epochs) = p.state {
+                let mut keys = epochs.candidate_obf_keys();
+                if keys.is_empty() {
+                    if let Some(k) = p.session_obf_key {
+                        keys.push(k);
+                    }
                 }
-                if ptype == PacketType::Data as u8
-                    || ptype == PacketType::Control as u8
-                    || ptype == PacketType::Gossip as u8
-                {
-                    return Some(reassemble(ptype, &body));
+                for key in keys {
+                    if let Some((ptype, body)) = yip_obf::deobfuscate(&key, dg) {
+                        if ptype == yip_obf::JUNK_TYPE {
+                            return None;
+                        }
+                        if ptype == PacketType::Data as u8
+                            || ptype == PacketType::Control as u8
+                            || ptype == PacketType::Gossip as u8
+                        {
+                            return Some(reassemble(ptype, &body));
+                        }
+                    }
                 }
             }
         }
@@ -129,7 +137,7 @@ impl PeerManager {
 
     /// The obfuscation key to wrap an egress datagram to `dst` whose plaintext
     /// leads with `ptype`: the network `obf_key` for handshakes (pre-session);
-    /// otherwise the `session_obf_key` of the `Established` peer reached at
+    /// otherwise the current epoch obf key of the `Established` peer reached at
     /// `dst`. Falls back to the network key when no session key is found (e.g. a
     /// gossip digest to a not-yet-`Established` root) so wrapping never silently
     /// drops a datagram.
@@ -140,11 +148,12 @@ impl PeerManager {
         self.peers
             .iter()
             .find_map(|p| {
-                if p.endpoint == Some(dst) && matches!(p.state, PeerState::Established(_)) {
-                    p.session_obf_key
-                } else {
-                    None
+                if p.endpoint == Some(dst) {
+                    if let PeerState::Established(ref epochs) = p.state {
+                        return epochs.current_obf_key().or(p.session_obf_key);
+                    }
                 }
+                None
             })
             .or(self.obf_key)
     }
@@ -226,11 +235,10 @@ mod tests {
         );
         pm.set_obf_psk(Some([0xCCu8; 32]));
 
-        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
-            Box::new(fake_established_dataplane(TAG, peer_ep)),
-            0,
-        )));
-        let sess = [0xDDu8; 16];
+        let dp = fake_established_dataplane_with_obf(TAG, peer_ep, true);
+        let sess = dp.obf_key().unwrap();
+        pm.peers[0].state =
+            PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
         pm.peers[0].session_obf_key = Some(sess);
         pm.by_tag.insert(TAG, 0);
 
@@ -329,11 +337,10 @@ mod tests {
         );
         pm.set_obf_psk(Some([0x66u8; 32]));
 
-        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
-            Box::new(fake_established_dataplane(TAG, peer_ep)),
-            0,
-        )));
-        let sess = [0x77u8; 16];
+        let dp = fake_established_dataplane_with_obf(TAG, peer_ep, true);
+        let sess = dp.obf_key().unwrap();
+        pm.peers[0].state =
+            PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
         pm.peers[0].session_obf_key = Some(sess);
         pm.by_tag.insert(TAG, 0);
 
@@ -417,5 +424,56 @@ mod tests {
         let src: SocketAddr = "203.0.113.66:6666".parse().unwrap();
         assert!(matches!(pm.on_udp(src, &dg, 0), DispatchOut::None));
         assert!(matches!(pm.peers[0].state, PeerState::Idle));
+    }
+
+    #[test]
+    fn deobf_ingress_trials_candidate_epoch_keys() {
+        const TAG1: u64 = 0x1111_2222_3333_4444;
+        const TAG2: u64 = 0x5555_6666_7777_8888;
+        let peer_ep: SocketAddr = "10.0.0.40:4040".parse().unwrap();
+        let peer = peer_cfg(40, "10.0.0.40:4040");
+        let mut pm = PeerManager::new(
+            [41u8; 32],
+            [42u8; 32],
+            &[peer],
+            TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
+        pm.set_obf_psk(Some([0xEEu8; 32]));
+
+        let dp_curr = fake_established_dataplane_with_obf(TAG1, peer_ep, true);
+        let k_curr = dp_curr.obf_key().unwrap();
+        let mut epochs = crate::epoch::EpochSet::new(Box::new(dp_curr), 0);
+
+        let dp_next = fake_established_dataplane_with_obf(TAG2, peer_ep, true);
+        let k_next = dp_next.obf_key().unwrap();
+        assert_ne!(k_curr, k_next);
+
+        epochs.install_next(Box::new(dp_next), [1u8; 32], vec![]);
+        pm.peers[0].state = PeerState::Established(Box::new(epochs));
+        // pm.peers[0].session_obf_key is deliberately left None or pointing to k_curr
+        pm.peers[0].session_obf_key = Some(k_curr);
+
+        let plain = [PacketType::Data as u8, 1, 2, 3, 4, 5];
+        let dg = yip_obf::obfuscate(&k_next, PacketType::Data as u8, &[1, 2, 3, 4, 5], 0).unwrap();
+
+        // Datagram arriving from matching endpoint masked with next epoch key:
+        let out = pm.deobf_ingress(peer_ep, &dg);
+        assert_eq!(
+            out.as_deref(),
+            Some(plain.as_slice()),
+            "packet masked with next epoch candidate key must deobfuscate on matching endpoint"
+        );
+
+        // Datagram arriving from roamed endpoint masked with next epoch key:
+        let roamed_ep: SocketAddr = "198.51.100.99:5050".parse().unwrap();
+        let out_roamed = pm.deobf_ingress(roamed_ep, &dg);
+        assert_eq!(
+            out_roamed.as_deref(),
+            Some(plain.as_slice()),
+            "packet masked with next epoch candidate key must deobfuscate on roamed endpoint"
+        );
     }
 }
