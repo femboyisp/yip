@@ -359,6 +359,15 @@ if [ "$PING_STATUS" -ne 0 ] && [ "$LOSS_PCT" != "100" ]; then
     echo "[note] ping exited $PING_STATUS despite <=1% loss (non-fatal; proceeding)"
 fi
 
+# ── assertion: positive witness — B logged that it relearned A's new IP ─────
+if grep -qE "relearn_endpoint: peer [0-9]+ roamed to ${IP_A2}:" "$LOG_B"; then
+    echo "[PASS] positive witness: yipRoamB logged endpoint relearn for roamed source ${IP_A2}"
+else
+    echo "[FAIL] positive witness: yipRoamB did not log endpoint relearn for ${IP_A2}"
+    dump_logs
+    exit 1
+fi
+
 # ── assertion: relay was NOT used, before or after the rebind ───────────────
 sleep 5.5
 FINAL_COUNT="$(grep -oE 'relay-forwarded=[0-9]+' "$LOG_RDV" | tail -1 | cut -d= -f2)"
