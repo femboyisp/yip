@@ -100,6 +100,12 @@ const QUIC_ALPN: &[u8] = b"h3";
 /// this name is never actually checked.
 const QUIC_SNI: &str = "www.cloudflare.com";
 
+/// Maximum number of concurrent QUIC connections permitted on one endpoint (#49).
+const MAX_QUIC_CONNS: usize = 256;
+
+/// Timeout for inbound unestablished QUIC handshakes before pruning (#49).
+const QUIC_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// FEC-safe symbol size for a QUIC path whose current `max_datagram_size` is
 /// `mds`: `min(1200, mds − QUIC_YIP_OVERHEAD)`. Computed via `try_from` (no
 /// `as` truncation). With `mds` settling at 1414 on a normal Ethernet path this
@@ -345,6 +351,8 @@ struct ConnEntry {
     up: bool,
     /// Set on `Event::ConnectionLost`; the entry is reaped after the drive pass.
     dead: bool,
+    /// When the connection was instantiated.
+    created_at: Instant,
 }
 
 /// A single `quinn-proto` [`Endpoint`] multiplexing every peer connection. The
@@ -377,6 +385,7 @@ impl QuicEndpoint {
             peer_addr,
             up: false,
             dead: false,
+            created_at: now,
         });
         Ok(())
     }
@@ -414,6 +423,14 @@ impl QuicEndpoint {
                 });
             }
             DatagramEvent::NewConnection(incoming) => {
+                // Prune expired unestablished connections first
+                conns.retain(|c| {
+                    !(now.saturating_duration_since(c.created_at) > QUIC_HANDSHAKE_TIMEOUT && !c.up)
+                });
+                if conns.len() >= MAX_QUIC_CONNS {
+                    // Capacity reached; drop to protect against accept-flood state exhaustion
+                    return;
+                }
                 let mut buf = Vec::new();
                 match endpoint.accept(incoming, now, &mut buf, None) {
                     Ok((handle, conn)) => conns.push(ConnEntry {
@@ -422,6 +439,7 @@ impl QuicEndpoint {
                         peer_addr: from,
                         up: false,
                         dead: false,
+                        created_at: now,
                     }),
                     Err(e) => {
                         if let Some(t) = e.response {
@@ -476,6 +494,11 @@ impl QuicEndpoint {
                     Event::ConnectionLost { .. } => entry.dead = true,
                     _ => {}
                 }
+            }
+
+            if !entry.up && now.saturating_duration_since(entry.created_at) > QUIC_HANDSHAKE_TIMEOUT
+            {
+                entry.dead = true;
             }
 
             drain_transmits(&mut entry.conn, now, out);
@@ -966,5 +989,81 @@ mod tests {
             usize::from(sym) + QUIC_YIP_OVERHEAD <= mds || sym == QUIC_SYMBOL_CAP,
             "symbol size {sym} + overhead must fit MDS {mds}"
         );
+    }
+
+    #[test]
+    fn quic_endpoint_enforces_max_conns_cap() {
+        let mut server = QuicEndpoint::new();
+        let now = Instant::now();
+
+        // Fill server connections to capacity
+        for i in 0..MAX_QUIC_CONNS {
+            let addr: SocketAddr = format!("10.0.{}.{}:1234", i / 256, i % 256)
+                .parse()
+                .unwrap();
+            server
+                .connect(now, addr)
+                .expect("server connect to fill capacity");
+        }
+        assert_eq!(server.conns.len(), MAX_QUIC_CONNS);
+
+        // A new inbound connection attempt arrives from a client
+        let mut client = QuicEndpoint::new();
+        let client_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let server_addr: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        client.connect(now, server_addr).expect("client connect");
+
+        let mut pending = Vec::new();
+        let mut recv = Vec::new();
+        let mut newly_up = Vec::new();
+        client.drive(now, &mut pending, &mut recv, &mut newly_up);
+        assert!(!pending.is_empty(), "client should emit initial packet");
+
+        // Deliver initial packet to server
+        server.handle_datagram(
+            now,
+            client_addr,
+            BytesMut::from(&pending[0].bytes[..]),
+            &mut Vec::new(),
+        );
+
+        // Connection cap must be enforced: conns count unchanged, and client_addr not admitted
+        assert_eq!(server.conns.len(), MAX_QUIC_CONNS);
+        assert!(!server.has_conn_to(client_addr));
+    }
+
+    #[test]
+    fn quic_endpoint_prunes_stalled_unauthenticated_connections() {
+        let mut server = QuicEndpoint::new();
+        let now = Instant::now();
+
+        let mut client = QuicEndpoint::new();
+        let client_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let server_addr: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        client.connect(now, server_addr).expect("client connect");
+
+        let mut pending = Vec::new();
+        let mut recv = Vec::new();
+        let mut newly_up = Vec::new();
+        client.drive(now, &mut pending, &mut recv, &mut newly_up);
+        assert!(!pending.is_empty());
+
+        // Ingest initial datagram on server so an unestablished connection is created
+        server.handle_datagram(
+            now,
+            client_addr,
+            BytesMut::from(&pending[0].bytes[..]),
+            &mut Vec::new(),
+        );
+        assert_eq!(server.conns.len(), 1);
+        assert!(!server.conns[0].up);
+
+        // Advance time past QUIC_HANDSHAKE_TIMEOUT and drive
+        let later = now + QUIC_HANDSHAKE_TIMEOUT + Duration::from_secs(1);
+        let mut out = Vec::new();
+        server.drive(later, &mut out, &mut recv, &mut newly_up);
+
+        // Stalled unauthenticated connection must be reaped
+        assert!(server.conns.is_empty());
     }
 }
