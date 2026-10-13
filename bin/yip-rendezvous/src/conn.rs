@@ -124,7 +124,38 @@ where
     // (I4) — there is nothing left to key on this path.
 
     let mut buf = Vec::new();
-    let decision = read_and_classify(&mut stream, &cfg, &mut buf, now_ms).await;
+    let (decision, backend_stream) = {
+        let classify_fut = read_and_classify(&mut stream, &cfg, &mut buf, now_ms);
+        tokio::pin!(classify_fut);
+
+        if let Some(decoy_addr) = cfg.decoy.filter(|_| cfg.reality.is_none()) {
+            let decoy_fut = TcpStream::connect(decoy_addr);
+            tokio::pin!(decoy_fut);
+            let mut backend_conn = None;
+            let decision = loop {
+                tokio::select! {
+                    biased;
+                    d = &mut classify_fut => {
+                        break d;
+                    }
+                    res = &mut decoy_fut, if backend_conn.is_none() => {
+                        backend_conn = Some(res);
+                    }
+                }
+            };
+
+            let backend = match decision {
+                Some(Classify::Upgrade { .. }) => None,
+                _ => match backend_conn {
+                    Some(res) => res.ok(),
+                    None => decoy_fut.await.ok(),
+                },
+            };
+            (decision, backend)
+        } else {
+            (classify_fut.await, None)
+        }
+    };
 
     match decision {
         Some(Classify::Upgrade { node, reply }) => {
@@ -149,6 +180,8 @@ where
                 // check, so only a key-holding own-peer with a malformed inner
                 // frame reaches here. Do NOT proxy (spec §3) — reject generically.
                 reality_reject(stream).await;
+            } else if let Some(backend) = backend_stream {
+                into_decoy_with_stream(stream, &cfg, buf, backend).await;
             } else {
                 into_decoy(stream, &cfg, buf).await;
             }
@@ -215,7 +248,7 @@ where
 
 /// Proxy this connection to the decoy backend: replay the buffered bytes, then
 /// splice bidirectionally. The decoy's own behavior/timing governs from here.
-async fn into_decoy<St>(mut stream: St, cfg: &TlsFrontCfg, buffered: Vec<u8>)
+pub(crate) async fn into_decoy<St>(mut stream: St, cfg: &TlsFrontCfg, buffered: Vec<u8>)
 where
     St: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -234,9 +267,20 @@ where
         let _ = stream.write_all(&page).await;
         return;
     };
-    let Ok(mut backend) = TcpStream::connect(decoy_addr).await else {
+    let Ok(backend) = TcpStream::connect(decoy_addr).await else {
         return;
     };
+    into_decoy_with_stream(stream, cfg, buffered, backend).await;
+}
+
+pub(crate) async fn into_decoy_with_stream<St>(
+    mut stream: St,
+    _cfg: &TlsFrontCfg,
+    buffered: Vec<u8>,
+    mut backend: TcpStream,
+) where
+    St: AsyncRead + AsyncWrite + Unpin + Send,
+{
     if !buffered.is_empty() && backend.write_all(&buffered).await.is_err() {
         return;
     }
@@ -387,6 +431,130 @@ mod tests {
             got.contains("200 OK") && got.contains("hi"),
             "probe must be transparently proxied to the decoy backend, got: {got:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn silent_probe_initiates_decoy_connect_at_handshake_start() {
+        let decoy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let decoy_addr = decoy_listener.local_addr().unwrap();
+
+        let dir = crate::tls_front::unique_tmp_dir("conn-decoy-silent");
+        let (cert, key) = crate::tls_front::write_self_signed(&dir);
+        let acceptor = std::sync::Arc::new(crate::tls_front::build_acceptor(&cert, &key).unwrap());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = RendezvousServer::new(0);
+        let forwarded = server.forwarded_handle();
+        let cfg = Arc::new(TlsFrontCfg {
+            server: Arc::new(tokio::sync::Mutex::new(server)),
+            forwarded,
+            obf_key: yip_obf::derive_key(&[4u8; 32]),
+            decoy: Some(decoy_addr),
+            base: std::time::Instant::now(),
+            routes: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            reality: None,
+            max_conns: 1024,
+        });
+        tokio::spawn(crate::tls_front::run_tls_front(listener, acceptor, cfg));
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let connector = crate::tls_front::build_test_client_connector();
+        let config = connector.configure().unwrap();
+        let _client = tokio_boring::connect(config, "relay.test", tcp)
+            .await
+            .expect("client TLS handshake completes");
+
+        // The client stays completely silent.
+        // Before #63 fix, relay waits CLASSIFY_TIMEOUT (3s) before connecting to decoy.
+        // With #63 fix, relay speculatively initiates decoy connect right at handshake start.
+        let start = std::time::Instant::now();
+        let accept_res = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            decoy_listener.accept(),
+        )
+        .await;
+        assert!(
+            accept_res.is_ok(),
+            "decoy backend must receive connection immediately at handshake start, rather than waiting for 3s classify timeout"
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "decoy connect took too long: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrade_aborts_speculative_decoy_connect() {
+        let decoy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let decoy_addr = decoy_listener.local_addr().unwrap();
+
+        let dir = crate::tls_front::unique_tmp_dir("conn-decoy-upgrade");
+        let (cert, key) = crate::tls_front::write_self_signed(&dir);
+        let acceptor = std::sync::Arc::new(crate::tls_front::build_acceptor(&cert, &key).unwrap());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let obf_key = yip_obf::derive_key(&[4u8; 32]);
+        let node = node_id(&[1u8; 32]);
+        let server = RendezvousServer::new(0);
+        let forwarded = server.forwarded_handle();
+        let cfg = Arc::new(TlsFrontCfg {
+            server: Arc::new(tokio::sync::Mutex::new(server)),
+            forwarded,
+            obf_key,
+            decoy: Some(decoy_addr),
+            base: std::time::Instant::now(),
+            routes: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            reality: None,
+            max_conns: 1024,
+        });
+        tokio::spawn(crate::tls_front::run_tls_front(listener, acceptor, cfg));
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let connector = crate::tls_front::build_test_client_connector();
+        let config = connector.configure().unwrap();
+        let mut client = tokio_boring::connect(config, "relay.test", tcp)
+            .await
+            .expect("client TLS handshake completes");
+
+        // Send valid Register frame immediately
+        let frame = framed_register(&obf_key, node, 1);
+        client.write_all(&frame).await.unwrap();
+
+        // Read upgrade reply from relay
+        let mut reply_len_bytes = [0u8; 2];
+        client.read_exact(&mut reply_len_bytes).await.unwrap();
+        let reply_len = u16::from_be_bytes(reply_len_bytes) as usize;
+        let mut reply_body = vec![0u8; reply_len];
+        client.read_exact(&mut reply_body).await.unwrap();
+        let (ptype, _) = yip_obf::deobfuscate(&obf_key, &reply_body).expect("valid reply");
+        assert_eq!(ptype, yip_obf::RDV_TYPE);
+
+        // If the decoy listener accepted a speculative connection, that connection
+        // must be closed (reading returns EOF) because Upgrade aborted/dropped it.
+        if let Ok(Ok((mut decoy_stream, _))) = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            decoy_listener.accept(),
+        )
+        .await
+        {
+            let mut buf = [0u8; 16];
+            let read_res = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                decoy_stream.read(&mut buf),
+            )
+            .await;
+            match read_res {
+                Ok(Ok(0)) => { /* EOF: correctly closed/aborted */ }
+                Ok(Ok(n)) => panic!("decoy backend received unexpected data: {n} bytes"),
+                Ok(Err(_)) => { /* Connection reset/error: also closed */ }
+                Err(_) => panic!("speculative decoy connection was not closed on upgrade"),
+            }
+        }
     }
 
     #[tokio::test]
