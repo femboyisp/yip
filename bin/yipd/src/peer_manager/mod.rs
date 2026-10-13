@@ -188,16 +188,12 @@ struct HandshakingState {
 }
 
 /// Summary telemetry and status for an individual peer.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by control socket server (#124 Task 2)")
-)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PeerStats {
     pub public_key: [u8; 32],
     pub endpoint: Option<SocketAddr>,
     pub node_addr: std::net::Ipv6Addr,
-    pub state: &'static str,
+    pub state: String,
     pub last_activity_ms: u64,
 }
 
@@ -908,7 +904,7 @@ impl PeerManager {
                     public_key: p.pubkey,
                     endpoint: p.endpoint,
                     node_addr: p.addr,
-                    state: state_str,
+                    state: state_str.to_string(),
                     last_activity_ms: p.last_activity_ms,
                 }
             })
@@ -1592,7 +1588,7 @@ fn now_wall_clock_ms() -> u64 {
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod testutil;
+pub(crate) mod testutil;
 
 #[cfg(test)]
 mod tests {

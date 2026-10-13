@@ -4,6 +4,7 @@
 
 mod addr;
 mod config;
+pub mod control;
 mod dataplane;
 mod epoch;
 pub mod flow;

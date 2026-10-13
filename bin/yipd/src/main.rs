@@ -5,6 +5,7 @@
 
 mod addr;
 mod config;
+mod control;
 mod dataplane;
 mod epoch;
 pub(crate) mod flow;
