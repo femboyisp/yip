@@ -750,6 +750,14 @@ impl PeerManager {
         }
     }
 
+    /// Returns true if the peer with public key `pubkey` has an Established session.
+    #[cfg_attr(not(test), expect(dead_code, reason = "used by tls pump in #61"))]
+    pub fn is_peer_established(&self, pubkey: &[u8; 32]) -> bool {
+        self.peers
+            .iter()
+            .any(|p| p.pubkey == *pubkey && matches!(p.state, PeerState::Established(_)))
+    }
+
     /// Check whether the target peer for this inner packet is already established locally.
     pub fn is_tun_target_established(&self, inner: &[u8]) -> bool {
         if let Some(idx) = self.route_tun_index(inner) {
