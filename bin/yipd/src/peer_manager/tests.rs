@@ -2288,3 +2288,26 @@ fn peer_stats_reports_current_telemetry() {
     assert_eq!(stats[0].state, "idle");
     assert_eq!(stats[0].endpoint, Some("10.0.0.1:1000".parse().unwrap()));
 }
+
+#[test]
+fn is_peer_established_reports_correct_state() {
+    let local = generate_keypair();
+    let peer = peer_cfg(1, "10.0.0.1:1000");
+    let mut pm = PeerManager::new(
+        local.private,
+        local.public,
+        &[peer],
+        TunnelMode::L3Tun,
+        None,
+        None,
+        false,
+    );
+    assert!(!pm.is_peer_established(&[1u8; 32]));
+    assert!(!pm.is_peer_established(&[2u8; 32]));
+
+    let fake_dp = fake_established_dataplane(42, "10.0.0.1:1000".parse().unwrap());
+    pm.peers[0].state =
+        PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(fake_dp), 0)));
+    assert!(pm.is_peer_established(&[1u8; 32]));
+    assert!(!pm.is_peer_established(&[2u8; 32]));
+}

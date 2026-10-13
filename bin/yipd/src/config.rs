@@ -762,6 +762,14 @@ impl Config {
             SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), DEFAULT_LISTEN_PORT)
         });
 
+        if transport == TransportMode::Tls && peers.len() > 1 {
+            eprintln!(
+                "yipd: warning: transport=tls configured with {} peers, but transport=tls \
+                 currently serves only the first peer; remaining peers will be ignored",
+                peers.len()
+            );
+        }
+
         Ok(Config {
             local_private: local_private.ok_or_else(|| missing("local_private"))?,
             local_public: local_public.ok_or_else(|| missing("local_public"))?,
@@ -1985,6 +1993,26 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         assert_eq!(cfg.transport, TransportMode::Tls);
         assert_eq!(cfg.obf_psk, None);
         assert_eq!(cfg.cover_traffic_ms, None);
+    }
+
+    #[test]
+    fn multi_peer_transport_tls_parses_and_warns() {
+        let text = "\
+device=yip0
+listen=0.0.0.0:51820
+local_private=0000000000000000000000000000000000000000000000000000000000000001
+local_public=0000000000000000000000000000000000000000000000000000000000000002
+transport=tls
+[peer]
+public_key=0000000000000000000000000000000000000000000000000000000000000003
+endpoint=10.0.0.2:51820
+[peer]
+public_key=0000000000000000000000000000000000000000000000000000000000000004
+endpoint=10.0.0.3:51820
+";
+        let cfg = Config::parse(text).unwrap();
+        assert_eq!(cfg.transport, TransportMode::Tls);
+        assert_eq!(cfg.peers.len(), 2);
     }
 
     #[test]
