@@ -3,7 +3,7 @@
 #![allow(unfulfilled_lint_expectations)]
 
 mod addr;
-mod config;
+pub mod config;
 pub mod control;
 mod dataplane;
 mod epoch;
@@ -11,7 +11,7 @@ pub mod flow;
 pub mod handshake;
 mod mac_table;
 mod membership;
-mod mode;
+pub mod mode;
 mod path;
 pub mod peer_manager;
 mod port;

@@ -166,6 +166,8 @@ pub struct Config {
     /// Number of worker shards for multi-core throughput scaling (`shards=N` or `threads=N`).
     /// Defaults to 1 (single-threaded).
     pub shards: usize,
+    /// Optional path to UNIX domain control socket (`control_socket=<path>` or `--control <path>`).
+    pub control_socket: Option<std::path::PathBuf>,
 }
 
 // ── hex decode helper ─────────────────────────────────────────────────────────
@@ -509,6 +511,7 @@ impl Config {
         let mut transport = TransportMode::default();
         let mut tls_sni: Option<String> = None;
         let mut shards: Option<usize> = None;
+        let mut control_socket: Option<std::path::PathBuf> = None;
 
         for line in text.lines() {
             let line = line.trim();
@@ -637,6 +640,9 @@ impl Config {
                         ));
                     }
                     shards = Some(n);
+                }
+                "control_socket" | "control" => {
+                    control_socket = Some(std::path::PathBuf::from(val));
                 }
                 // Silently ignore unknown keys for forward-compatibility. The
                 // netns config files still contain `initiate=true|false` from
@@ -775,6 +781,7 @@ impl Config {
             transport,
             tls_sni: tls_sni.unwrap_or_else(|| DEFAULT_TLS_SNI.to_owned()),
             shards: shards.unwrap_or(1),
+            control_socket,
         })
     }
 }
@@ -2041,5 +2048,19 @@ local_public=0000000000000000000000000000000000000000000000000000000000000002
         .unwrap();
         assert_eq!(cfg.listen, "0.0.0.0:9999".parse().unwrap());
         assert!(!cfg.listen_port_auto);
+    }
+
+    #[test]
+    fn parses_control_socket_when_present() {
+        let cfg = Config::parse(
+            "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             device=yip0\ncontrol_socket=/run/yipd/control.sock\n[peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.control_socket,
+            Some(std::path::PathBuf::from("/run/yipd/control.sock"))
+        );
     }
 }

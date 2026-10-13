@@ -213,14 +213,8 @@ struct Peer {
     /// This peer's self-certifying inner IPv6 address (`node_addr(pubkey)`).
     /// Routing itself goes through `by_addr` (kept alongside for tests and
     /// future logging/debugging use).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "kept for tests/future logging; routing uses by_addr"
-        )
-    )]
     addr: Ipv6Addr,
+
     /// This peer's UDP endpoint: the configured value until a `HandshakeInit`
     /// admission *learns* the actual observed source address (see
     /// `PeerManager::handle_handshake_init`). `None` until a direct candidate
@@ -460,6 +454,12 @@ pub struct PeerManager {
     num_shards: usize,
     /// Newly established session epochs queued for cross-shard broadcast.
     new_epochs: Vec<crate::sharding::SessionEpochMsg>,
+    /// Background UNIX domain control socket handle, if configured.
+    control: Option<crate::control::ControlHandle>,
+    /// Device name for control socket reporting.
+    device_name: String,
+    /// Loop start time for uptime reporting.
+    start_time: std::time::Instant,
 }
 
 /// MTU budget (bytes) used to size obfuscation padding: handshakes are padded
@@ -577,7 +577,11 @@ impl PeerManager {
             shard_id: 0,
             num_shards: 1,
             new_epochs: Vec::new(),
+            control: None,
+            device_name: "yip0".into(),
+            start_time: std::time::Instant::now(),
         };
+
         // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
         // exactly like configured peers: seed them into the peer table so an
         // incoming handshake from a root is admitted and `tick` can bootstrap
@@ -667,6 +671,18 @@ impl PeerManager {
     /// keeps the existing `PeerManager::new` call sites untouched.
     pub fn set_cover_traffic_ms(&mut self, cover_traffic_ms: Option<u64>) {
         self.cover_traffic_ms = cover_traffic_ms;
+    }
+
+    /// Attach a UNIX domain control socket handle and device metadata.
+    pub fn set_control(
+        &mut self,
+        control: Option<crate::control::ControlHandle>,
+        device_name: String,
+        start_time: std::time::Instant,
+    ) {
+        self.control = control;
+        self.device_name = device_name;
+        self.start_time = start_time;
     }
 
     /// Set the RaptorQ symbol size passed to `DataPlane::new` at every
@@ -799,10 +815,6 @@ impl PeerManager {
     }
 
     /// Dynamically add a new remote peer.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by control socket server (#124 Task 2)")
-    )]
     pub fn add_peer(&mut self, cfg: PeerConfig) -> Result<(), &'static str> {
         let node = node_id(&cfg.public_key);
         if self.by_node.contains_key(&node) {
@@ -845,10 +857,6 @@ impl PeerManager {
 
     /// Dynamically remove an existing peer by public key, tearing down any session
     /// and cleaning up internal index mappings without invalidating remaining peer indices.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by control socket server (#124 Task 2)")
-    )]
     pub fn remove_peer(&mut self, pubkey: &[u8; 32]) -> Result<(), &'static str> {
         let node = node_id(pubkey);
         let Some(&idx) = self.by_node.get(&node) else {
@@ -887,10 +895,6 @@ impl PeerManager {
     }
 
     /// Retrieve summary status telemetry for all known peers.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by control socket server (#124 Task 2)")
-    )]
     pub fn peer_stats(&self) -> Vec<PeerStats> {
         self.peers
             .iter()
@@ -1459,6 +1463,22 @@ impl PeerManager {
                 .collect();
             for i in stale {
                 self.drop_session(i);
+            }
+        }
+
+        // ── control socket dispatch ───────────────────────────────────────────
+        if let Some(ctrl) = self.control.as_ref() {
+            let mut reqs = Vec::new();
+            while let Ok(req) = ctrl.try_recv() {
+                reqs.push(req);
+            }
+            if !reqs.is_empty() {
+                let dev = self.device_name.clone();
+                let start = self.start_time;
+                for req in reqs {
+                    let resp = crate::control::dispatch_cmd(self, req.cmd, &dev, start);
+                    let _ = req.responder.send(resp);
+                }
             }
         }
 

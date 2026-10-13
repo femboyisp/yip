@@ -197,6 +197,16 @@ pub fn run(config: Config) -> io::Result<()> {
     // Opt-in idle cover traffic (3b Task 4): a no-op unless obf is also on
     // (`PeerManager::tick_dispatch` gates cover emission on both).
     manager.set_cover_traffic_ms(config.cover_traffic_ms);
+    let control_handle = if let Some(ref path) = config.control_socket {
+        Some(crate::control::ControlHandle::bind(path)?)
+    } else {
+        None
+    };
+    manager.set_control(
+        control_handle,
+        config.device.clone(),
+        std::time::Instant::now(),
+    );
     let local_addr = manager.local_addr();
 
     // ── create the tunnel device (TUN or TAP) ────────────────────────────────

@@ -69,13 +69,39 @@ fn main() -> std::io::Result<()> {
             println!("{}", addr::node_addr(&pubkey));
             Ok(())
         }
+        Some(arg) if arg.starts_with('-') => {
+            eprintln!("usage: yipd <config-file> [--control <socket-path>]");
+            eprintln!("       yipd --version");
+            eprintln!("       yipd --genkey");
+            eprintln!("       yipd --addr <pubkey-hex>");
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unrecognized option: {arg}"),
+            ))
+        }
         Some(path) => {
+            let mut control_override = None;
+            while let Some(arg) = args.next() {
+                if arg == "--control" || arg == "-c" {
+                    let cpath = args.next().ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "--control requires a socket path argument",
+                        )
+                    })?;
+                    control_override = Some(std::path::PathBuf::from(cpath));
+                }
+            }
+
             let text = std::fs::read_to_string(path)?;
-            let config = Config::parse(&text)?;
+            let mut config = Config::parse(&text)?;
+            if let Some(sock_path) = control_override {
+                config.control_socket = Some(sock_path);
+            }
             tunnel::run(config)
         }
         None => {
-            eprintln!("usage: yipd <config-file>");
+            eprintln!("usage: yipd <config-file> [--control <socket-path>]");
             eprintln!("       yipd --version");
             eprintln!("       yipd --genkey");
             eprintln!("       yipd --addr <pubkey-hex>");

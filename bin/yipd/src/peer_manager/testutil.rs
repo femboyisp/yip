@@ -19,7 +19,7 @@ pub(super) fn peer_cfg(tag_byte: u8, endpoint: &str) -> PeerConfig {
     }
 }
 
-pub(crate) fn test_peer_manager() -> PeerManager {
+pub fn test_peer_manager() -> PeerManager {
     let kp = generate_keypair();
     let peer = peer_cfg(1, "10.0.0.1:1000");
     PeerManager::new(
