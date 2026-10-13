@@ -149,6 +149,7 @@ impl PeerManager {
                 if let PeerState::Established(epochs) = &mut self.peers[idx].state {
                     epochs.set_peer_addr(new_endpoint);
                 }
+                eprintln!("peer_manager: relearn_endpoint: peer {idx} roamed to {new_endpoint}");
             }
         } else {
             self.peers[idx].endpoint = Some(src);
