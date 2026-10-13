@@ -14,6 +14,47 @@ use crate::TLS_FRAME_CAP;
 
 const CHANNEL_DEPTH: usize = 64;
 
+/// Per-connection token bucket rate limiter to prevent TLS frame flooding (#65).
+#[derive(Debug)]
+pub(crate) struct FrameRateLimiter {
+    capacity: f64,
+    tokens: f64,
+    replenish_rate: f64,
+    last_update: std::time::Instant,
+    violations: u32,
+}
+
+impl FrameRateLimiter {
+    pub(crate) fn new(capacity: f64, replenish_rate: f64) -> Self {
+        Self {
+            capacity,
+            tokens: capacity,
+            replenish_rate,
+            last_update: std::time::Instant::now(),
+            violations: 0,
+        }
+    }
+
+    pub(crate) fn acquire(&mut self, cost: f64, now: std::time::Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last_update);
+        self.last_update = now;
+        self.tokens =
+            (self.tokens + elapsed.as_secs_f64() * self.replenish_rate).min(self.capacity);
+        if self.tokens >= cost {
+            self.tokens -= cost;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Default for FrameRateLimiter {
+    fn default() -> Self {
+        Self::new(1000.0, 250.0)
+    }
+}
+
 /// Drive one upgraded TLS connection to completion: register `node`'s
 /// delivery channel, then pump reads/writes until the peer disconnects or a
 /// malformed frame is seen (fail-closed teardown). `prefix` carries any bytes
@@ -32,11 +73,12 @@ where
     let tx_id = tx.clone();
     cfg.routes.lock().await.insert(node, tx);
 
+    let mut limiter = FrameRateLimiter::default();
     let mut read_buf = prefix;
     // Drain any complete frame(s) already sitting in the prefix before ever
     // touching the socket — a client that pipelines Register + RelaySend in
     // one TLS write must not have the second frame silently dropped.
-    let mut ok = drain_frames(&mut read_buf, &cfg, node).await;
+    let mut ok = drain_frames(&mut read_buf, &cfg, node, &mut limiter).await;
 
     let mut chunk = [0u8; 4096];
     while ok {
@@ -49,7 +91,7 @@ where
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     read_buf.extend_from_slice(&chunk[..n]);
-                    ok = drain_frames(&mut read_buf, &cfg, node).await;
+                    ok = drain_frames(&mut read_buf, &cfg, node, &mut limiter).await;
                 }
             },
         }
@@ -70,7 +112,12 @@ where
 
 /// Parse and act on every complete `[u16 len][obf Message]` frame in `buf`.
 /// Returns false on a fail-closed condition (malformed frame ⇒ tear down).
-async fn drain_frames(buf: &mut Vec<u8>, cfg: &TlsFrontCfg, _self_node: NodeId) -> bool {
+async fn drain_frames(
+    buf: &mut Vec<u8>,
+    cfg: &TlsFrontCfg,
+    _self_node: NodeId,
+    limiter: &mut FrameRateLimiter,
+) -> bool {
     loop {
         if buf.len() < 2 {
             return true;
@@ -93,6 +140,14 @@ async fn drain_frames(buf: &mut Vec<u8>, cfg: &TlsFrontCfg, _self_node: NodeId) 
         let Some(msg) = decode(&body) else {
             return false;
         };
+        if !limiter.acquire(1.0, std::time::Instant::now()) {
+            limiter.violations = limiter.violations.saturating_add(1);
+            if limiter.violations > 2000 {
+                return false; // sustained abuse fail-closed disconnect
+            }
+            continue; // drop throttled frame
+        }
+        limiter.violations = 0;
         route(msg, cfg).await;
     }
 }
@@ -193,7 +248,8 @@ mod tests {
                 payload: b"hello".to_vec(),
             },
         );
-        assert!(drain_frames(&mut prefix, &cfg, a).await);
+        let mut limiter = FrameRateLimiter::default();
+        assert!(drain_frames(&mut prefix, &cfg, a, &mut limiter).await);
         assert!(prefix.is_empty(), "the complete frame must be consumed");
 
         let got_frame = rx.try_recv().expect("B's channel got a delivery");
@@ -216,6 +272,96 @@ mod tests {
             cfg.server.lock().await.forwarded_count(),
             1,
             "a TLS-tunnel relay hop must be counted on the shared forwarded_count"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_permits_burst_and_throttles_excess() {
+        let now = Instant::now();
+        let mut limiter = FrameRateLimiter::new(1000.0, 250.0);
+
+        // Burst of 1,000 frames should all succeed
+        for _ in 0..1000 {
+            assert!(limiter.acquire(1.0, now));
+        }
+
+        // 1001st frame without time elapsed must fail
+        assert!(!limiter.acquire(1.0, now));
+
+        // After 1 second, 250 tokens replenished
+        let later = now + std::time::Duration::from_secs(1);
+        for _ in 0..250 {
+            assert!(limiter.acquire(1.0, later));
+        }
+        assert!(!limiter.acquire(1.0, later));
+    }
+
+    #[tokio::test]
+    async fn drain_frames_throttles_excess_relay_sends() {
+        let key = yip_obf::derive_key(&[1u8; 32]);
+        let cfg = test_cfg(key);
+        let a = node_id(&[10u8; 32]);
+        let b = node_id(&[11u8; 32]);
+
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(2000);
+        cfg.routes.lock().await.insert(b, tx);
+
+        // Test with 0 replenish rate to test exact quota enforcement deterministically under high CPU load
+        let mut limiter = FrameRateLimiter::new(1000.0, 0.0);
+        let mut buf = Vec::new();
+        // Frame 1,200 RelaySend messages into the buffer
+        let msg = Message::RelaySend {
+            src: a,
+            dst: b,
+            payload: b"spam".to_vec(),
+        };
+        let frame = framed(&key, &msg);
+        for _ in 0..1200 {
+            buf.extend_from_slice(&frame);
+        }
+
+        let ok = drain_frames(&mut buf, &cfg, a, &mut limiter).await;
+        assert!(
+            ok,
+            "drain_frames should not fail-closed on first 200 excess frames"
+        );
+
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 1000, "only capacity quota should be routed");
+        assert_eq!(limiter.violations, 200);
+    }
+
+    #[tokio::test]
+    async fn drain_frames_disconnects_on_sustained_abuse() {
+        let key = yip_obf::derive_key(&[1u8; 32]);
+        let cfg = test_cfg(key);
+        let a = node_id(&[10u8; 32]);
+        let b = node_id(&[11u8; 32]);
+
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(4000);
+        cfg.routes.lock().await.insert(b, tx);
+
+        // FrameRateLimiter with no replenishment so violations accumulate deterministically
+        let mut limiter = FrameRateLimiter::new(100.0, 0.0);
+        let mut buf = Vec::new();
+        // 100 capacity + 2001 violations = 2101 frames
+        let msg = Message::RelaySend {
+            src: a,
+            dst: b,
+            payload: b"flood".to_vec(),
+        };
+        let frame = framed(&key, &msg);
+        for _ in 0..2102 {
+            buf.extend_from_slice(&frame);
+        }
+
+        let ok = drain_frames(&mut buf, &cfg, a, &mut limiter).await;
+        assert!(
+            !ok,
+            "sustained abuse (>2000 violations) must fail-closed disconnect"
         );
     }
 
