@@ -87,38 +87,31 @@ pub fn write_fd(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
 }
 
 impl Epoll {
-    /// Create an `epoll` instance registered for `EPOLLIN` on both `udp_fd`
-    /// and `tun_fd`. Both fds are set non-blocking as a side effect (the
-    /// driver drains them edge-safely with `MSG_DONTWAIT`/non-blocking reads).
-    pub fn new(udp_fd: RawFd, tun_fd: RawFd) -> io::Result<Self> {
-        set_nonblocking(udp_fd)?;
-        set_nonblocking(tun_fd)?;
-
+    /// Create a new, empty `epoll` instance with `EPOLL_CLOEXEC`.
+    pub fn create() -> io::Result<Self> {
         // SAFETY: `epoll_create1` creates a new epoll instance. `EPOLL_CLOEXEC`
         // is the only flag passed; the return value is checked below.
         let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if epoll_fd < 0 {
             return Err(io::Error::last_os_error());
         }
-
-        let this = Self {
+        Ok(Self {
             epoll_fd,
-            udp_fd,
-            tun_fd,
-        };
-        this.register(udp_fd)?;
-        this.register(tun_fd)?;
-        Ok(this)
+            udp_fd: -1,
+            tun_fd: -1,
+        })
     }
 
-    /// Register one fd for `EPOLLIN`, tagging its epoll user-data with the raw
-    /// fd so [`Epoll::wait`] can identify which fd is ready.
-    fn register(&self, fd: RawFd) -> io::Result<()> {
+    /// Register one fd for `EPOLLIN` with the given `token` user-data.
+    ///
+    /// Sets `fd` to non-blocking mode as a side effect.
+    pub fn add(&self, fd: RawFd, token: u64) -> io::Result<()> {
+        set_nonblocking(fd)?;
         let mut ev = libc::epoll_event {
             events: libc::EPOLLIN as u32,
-            u64: fd as u64,
+            u64: token,
         };
-        // SAFETY: `self.epoll_fd` is a valid epoll fd we created and still own;
+        // SAFETY: `self.epoll_fd` is a valid epoll fd we created and own;
         // `fd` is a valid fd supplied by the caller; `ev` is a correctly
         // initialised `epoll_event` living on this stack frame for the duration
         // of the call.
@@ -127,6 +120,64 @@ impl Epoll {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// Unregister an fd from the epoll instance (`EPOLL_CTL_DEL`).
+    pub fn remove(&self, fd: RawFd) -> io::Result<()> {
+        // SAFETY: `self.epoll_fd` is a valid epoll fd we created and own.
+        // For `EPOLL_CTL_DEL`, Linux ignores the event pointer; passing null is safe.
+        let rc = unsafe {
+            libc::epoll_ctl(self.epoll_fd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut())
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Block until at least one registered fd is readable, or `timeout_ms`
+    /// milliseconds elapse (`-1` blocks indefinitely).
+    ///
+    /// Clears `out` and appends all ready tokens. On timeout or `EINTR`, `out`
+    /// is left empty and `Ok(())` is returned.
+    pub fn wait_tokens(&self, timeout_ms: i32, out: &mut Vec<u64>) -> io::Result<()> {
+        out.clear();
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 64];
+        // SAFETY: `self.epoll_fd` is a valid epoll fd. `events` is a valid,
+        // stack-allocated array whose length we pass as `maxevents`. The kernel
+        // writes at most `maxevents` initialised entries, which we read below.
+        let nfds = unsafe {
+            libc::epoll_wait(
+                self.epoll_fd,
+                events.as_mut_ptr(),
+                libc::c_int::try_from(events.len()).expect("event array len fits c_int"),
+                timeout_ms,
+            )
+        };
+        if nfds < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                return Ok(());
+            }
+            return Err(e);
+        }
+
+        for ev in &events[..usize::try_from(nfds).expect("non-negative nfds fits usize")] {
+            out.push(ev.u64);
+        }
+        Ok(())
+    }
+
+    /// Create an `epoll` instance registered for `EPOLLIN` on both `udp_fd`
+    /// and `tun_fd`. Both fds are set non-blocking as a side effect (the
+    /// driver drains them edge-safely with `MSG_DONTWAIT`/non-blocking reads).
+    pub fn new(udp_fd: RawFd, tun_fd: RawFd) -> io::Result<Self> {
+        let mut this = Self::create()?;
+        this.udp_fd = udp_fd;
+        this.tun_fd = tun_fd;
+        this.add(udp_fd, udp_fd as u64)?;
+        this.add(tun_fd, tun_fd as u64)?;
+        Ok(this)
     }
 
     /// Block until one of the watched fds is readable, or `timeout_ms`
@@ -249,5 +300,41 @@ mod tests {
         assert!(set_nonblocking(-1).is_err());
         assert!(read_fd(-1, &mut buf).is_err());
         assert!(write_fd(-1, b"fail").is_err());
+    }
+
+    #[test]
+    fn epoll_dynamic_add_remove_and_wait_tokens() {
+        let epoll = Epoll::create().expect("create epoll");
+        let mut fds = [0; 2];
+        // SAFETY: `fds` is a valid 2-element array passed as a mutable pointer to pipe(2).
+        unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+        }
+        let (rx, tx) = (fds[0], fds[1]);
+
+        epoll.add(rx, 42).expect("add rx fd");
+
+        let mut ready = Vec::new();
+        epoll.wait_tokens(0, &mut ready).expect("wait");
+        assert!(ready.is_empty());
+
+        // Write byte to pipe
+        // SAFETY: `tx` is a valid open pipe write end; 1-byte array buffer is valid and readable.
+        let written = unsafe { libc::write(tx, [1u8].as_ptr().cast(), 1) };
+        assert_eq!(written, 1);
+
+        epoll.wait_tokens(50, &mut ready).expect("wait");
+        assert_eq!(ready, vec![42]);
+
+        epoll.remove(rx).expect("remove rx fd");
+        ready.clear();
+        epoll.wait_tokens(0, &mut ready).expect("wait");
+        assert!(ready.is_empty());
+
+        // SAFETY: `rx` and `tx` are valid open pipe fds created by pipe(2) above.
+        unsafe {
+            libc::close(rx);
+            libc::close(tx);
+        }
     }
 }
