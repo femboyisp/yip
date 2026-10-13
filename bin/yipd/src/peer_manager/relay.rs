@@ -138,6 +138,8 @@ impl PeerManager {
             self.relayed_handshake_init(idx, payload, now_ms)
         } else if payload[0] == PacketType::HandshakeResp as u8 {
             self.relayed_handshake_resp(idx, payload, now_ms)
+        } else if self.membership.is_some() && payload[0] == PacketType::Gossip as u8 {
+            self.relayed_gossip(idx, payload, now_ms)
         } else {
             self.relayed_data(idx, payload, now_ms)
         }
@@ -468,6 +470,42 @@ impl PeerManager {
             }
             (None, false) => DispatchOut::Udp(&self.egress),
             (None, true) => DispatchOut::None,
+        }
+    }
+
+    /// Relay-path counterpart of `on_gossip`: handle an inbound relayed `[Gossip]`
+    /// datagram from peer `idx`. Feeds the decoded `GossipMsg` to
+    /// `Membership::on_gossip` and emits bounded reply datagrams relay-wrapped
+    /// back through the server.
+    ///
+    /// Fail-closed gate: strictly restricted to peers in `PeerState::Established`.
+    fn relayed_gossip(&mut self, idx: usize, dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
+        if !matches!(self.peers[idx].state, PeerState::Established(_)) {
+            return DispatchOut::None;
+        }
+        let Some(msg) = GossipMsg::decode(&dg[1..]) else {
+            return DispatchOut::None;
+        };
+        let replies = match self.membership.as_mut() {
+            Some(m) => m.on_gossip(msg, now_secs()),
+            None => return DispatchOut::None,
+        };
+        if replies.is_empty() {
+            return DispatchOut::None;
+        }
+        self.egress.clear();
+        for reply in replies.iter().take(MAX_GOSSIP_REPLIES) {
+            let mut bytes = Vec::new();
+            bytes.push(PacketType::Gossip as u8);
+            reply.encode(&mut bytes);
+            if let Some(d) = self.relay_wrap(idx, bytes) {
+                self.egress.push(d);
+            }
+        }
+        if self.egress.is_empty() {
+            DispatchOut::None
+        } else {
+            DispatchOut::Udp(&self.egress)
         }
     }
 }
@@ -1414,5 +1452,170 @@ mod tests {
             matches!(out_valid, DispatchOut::Udp(_)),
             "PunchTo for dynamically admitted peer with valid cert must initiate a handshake"
         );
+    }
+
+    #[test]
+    fn relayed_gossip_without_membership_is_noop() {
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let cfg_peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let (mut pm, _sent) = pm_with_mock_rdv(&local, &[cfg_peer]);
+
+        // Establish a session over relay
+        let t1 = crate::handshake::now_tai64n();
+        let (_hs1, init_pkt_1) = HandshakeState::start_initiator(
+            &peer_kp.private,
+            &local.public,
+            &init_payload_with_ts(t1, &[]),
+        )
+        .unwrap();
+        let out1 = pm.on_udp(mock_server(), &relay_deliver(&peer_kp, init_pkt_1), 0);
+        assert!(has_relayed_handshake_resp(&out1));
+        assert!(pm.peers[0].relay);
+        assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+
+        // Send a relayed Gossip PullRequest
+        let pull = GossipMsg::PullRequest(vec![yip_membership::node_id(&local.public)]);
+        let mut gossip_bytes = vec![PacketType::Gossip as u8];
+        pull.encode(&mut gossip_bytes);
+
+        let out2 = pm.on_udp(mock_server(), &relay_deliver(&peer_kp, gossip_bytes), 10);
+        // With membership None in pm_with_mock_rdv, it should return None.
+        assert!(matches!(out2, DispatchOut::None));
+    }
+
+    #[test]
+    fn relayed_gossip_with_membership_emits_relay_wrapped_replies() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let cfg_peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let mem = membership_for(&ca, local.public);
+        let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[cfg_peer], mem);
+
+        let peer_sign = SigningKey::from_bytes(&[210u8; 32]);
+        let peer_cert = mk_cert(&ca, peer_kp.public, peer_sign.verifying_key().to_bytes());
+        let mut peer_cert_bytes = Vec::new();
+        peer_cert.encode(&mut peer_cert_bytes);
+
+        // Establish a session over relay
+        let t1 = crate::handshake::now_tai64n();
+        let (_hs1, init_pkt_1) = HandshakeState::start_initiator(
+            &peer_kp.private,
+            &local.public,
+            &init_payload_with_ts(t1, &peer_cert_bytes),
+        )
+        .unwrap();
+        let out1 = pm.on_udp(mock_server(), &relay_deliver(&peer_kp, init_pkt_1), 0);
+        assert!(has_relayed_handshake_resp(&out1));
+        assert!(pm.peers[0].relay);
+        assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+
+        // Ingest a record for another member into pm so a PullRequest has something to return
+        let other_kp = generate_keypair();
+        let other_ep: SocketAddr = "192.0.2.55:5000".parse().unwrap();
+        let other_rec = mk_record(&ca, 222, other_kp.public, vec![other_ep], 1);
+        assert!(pm
+            .membership
+            .as_mut()
+            .unwrap()
+            .ingest_record(other_rec.clone(), now_secs()));
+
+        // Peer sends PullRequest for other_kp
+        let pull = GossipMsg::PullRequest(vec![yip_membership::node_id(&other_kp.public)]);
+        let mut gossip_bytes = vec![PacketType::Gossip as u8];
+        pull.encode(&mut gossip_bytes);
+
+        let out2 = pm.on_udp(mock_server(), &relay_deliver(&peer_kp, gossip_bytes), 10);
+        let egress: &[EgressDatagram] = match &out2 {
+            DispatchOut::Udp(e) => e,
+            _ => panic!("expected DispatchOut::Udp with relay-wrapped reply"),
+        };
+        assert!(!egress.is_empty());
+        assert_eq!(egress[0].dst, mock_server());
+        // Verify it is relay-wrapped RelaySend containing a Gossip packet
+        let decoded_msg =
+            yip_rendezvous::decode(&egress[0].bytes).expect("must decode rendezvous msg");
+        match decoded_msg {
+            yip_rendezvous::Message::RelaySend { dst, payload, .. } => {
+                assert_eq!(dst, node_id(&peer_kp.public));
+                assert_eq!(payload[0], PacketType::Gossip as u8);
+                let gossip_reply =
+                    GossipMsg::decode(&payload[1..]).expect("must decode gossip msg");
+                match gossip_reply {
+                    GossipMsg::Records(records) => {
+                        assert_eq!(records.len(), 1);
+                        assert_eq!(
+                            records[0].node_id,
+                            yip_membership::node_id(&other_kp.public)
+                        );
+                    }
+                    _ => panic!("expected GossipMsg::Records reply"),
+                }
+            }
+            _ => panic!("expected RelaySend message"),
+        }
+    }
+
+    #[test]
+    fn relayed_gossip_refuses_non_established_peer() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let cfg_peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let mem = membership_for(&ca, local.public);
+        let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[cfg_peer], mem);
+        assert!(matches!(pm.peers[0].state, PeerState::Idle));
+
+        let pull = GossipMsg::PullRequest(vec![yip_membership::node_id(&local.public)]);
+        let mut gossip_bytes = vec![PacketType::Gossip as u8];
+        pull.encode(&mut gossip_bytes);
+
+        let out = pm.on_udp(mock_server(), &relay_deliver(&peer_kp, gossip_bytes), 0);
+        assert!(matches!(out, DispatchOut::None));
+    }
+
+    #[test]
+    fn relayed_gossip_drops_malformed_payload() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let peer_kp = generate_keypair();
+        let cfg_peer = PeerConfig {
+            public_key: peer_kp.public,
+            endpoint: None,
+        };
+        let mem = membership_for(&ca, local.public);
+        let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[cfg_peer], mem);
+
+        let peer_sign = SigningKey::from_bytes(&[211u8; 32]);
+        let peer_cert = mk_cert(&ca, peer_kp.public, peer_sign.verifying_key().to_bytes());
+        let mut peer_cert_bytes = Vec::new();
+        peer_cert.encode(&mut peer_cert_bytes);
+
+        // Establish a session over relay
+        let t1 = crate::handshake::now_tai64n();
+        let (_hs1, init_pkt_1) = HandshakeState::start_initiator(
+            &peer_kp.private,
+            &local.public,
+            &init_payload_with_ts(t1, &peer_cert_bytes),
+        )
+        .unwrap();
+        let out1 = pm.on_udp(mock_server(), &relay_deliver(&peer_kp, init_pkt_1), 0);
+        assert!(has_relayed_handshake_resp(&out1));
+        assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+
+        // Malformed payload: Gossip tag followed by garbage that cannot decode
+        let malformed_bytes = vec![PacketType::Gossip as u8, 0xff, 0xff, 0xff];
+        let out = pm.on_udp(mock_server(), &relay_deliver(&peer_kp, malformed_bytes), 10);
+        assert!(matches!(out, DispatchOut::None));
     }
 }
