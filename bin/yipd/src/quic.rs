@@ -428,7 +428,13 @@ impl QuicEndpoint {
                     !(now.saturating_duration_since(c.created_at) > QUIC_HANDSHAKE_TIMEOUT && !c.up)
                 });
                 if conns.len() >= MAX_QUIC_CONNS {
-                    // Capacity reached; drop to protect against accept-flood state exhaustion
+                    // Capacity reached; cleanly refuse to protect against accept-flood state exhaustion
+                    let mut buf = Vec::new();
+                    let t = endpoint.refuse(incoming, &mut buf);
+                    out.push(OutPacket {
+                        dst: t.destination,
+                        bytes: buf[..t.size].to_vec(),
+                    });
                     return;
                 }
                 let mut buf = Vec::new();
