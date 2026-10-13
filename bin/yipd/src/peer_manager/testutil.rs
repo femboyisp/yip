@@ -286,6 +286,72 @@ pub(super) fn established_pm_pair(
     (pm_a, pm_b, ep_a, ep_b, kp_a, kp_b)
 }
 
+pub(super) fn established_pm_pair_with_obf(
+    interval_ms: u64,
+    psk: [u8; 32],
+) -> (
+    PeerManager,
+    PeerManager,
+    SocketAddr,
+    SocketAddr,
+    yip_crypto::Keypair,
+    yip_crypto::Keypair,
+) {
+    let kp_a = generate_keypair();
+    let kp_b = generate_keypair();
+    let ep_a: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+    let ep_b: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+    let cfg_b = PeerConfig {
+        public_key: kp_b.public,
+        endpoint: Some(ep_b),
+    };
+    let cfg_a = PeerConfig {
+        public_key: kp_a.public,
+        endpoint: Some(ep_a),
+    };
+    let mut pm_a = PeerManager::new(
+        kp_a.private,
+        kp_a.public,
+        &[cfg_b],
+        TunnelMode::L3Tun,
+        None,
+        None,
+        false,
+    );
+    let mut pm_b = PeerManager::new(
+        kp_b.private,
+        kp_b.public,
+        &[cfg_a],
+        TunnelMode::L3Tun,
+        None,
+        None,
+        false,
+    );
+    pm_a.rekey_interval_ms = interval_ms;
+    pm_b.rekey_interval_ms = interval_ms;
+    pm_a.set_obf_psk(Some(psk));
+    pm_b.set_obf_psk(Some(psk));
+
+    let dgs = pm_a.on_tun(&dummy_tun_pkt(), 0);
+    // When obf is on, begin_handshake emits junk bursts followed by the HandshakeInit
+    // In on_tun, all egress is wrapped via obf_egress.
+    // The Init datagram is the last egress datagram.
+    let init_dg = dgs.last().expect("must have egress").bytes.clone();
+    let out_b = pm_b.on_udp(ep_a, &init_dg, 0);
+    let resp_dg = match out_b {
+        DispatchOut::Udp(e) | DispatchOut::Both(_, e) => {
+            assert_eq!(e.len(), 1, "cold-start init must produce one resp");
+            e[0].bytes.clone()
+        }
+        _ => panic!("cold-start init must produce UDP egress"),
+    };
+    pm_a.on_udp(ep_b, &resp_dg, 0);
+    assert!(established_tag(&pm_a, 0).is_some());
+    assert_eq!(established_tag(&pm_a, 0), established_tag(&pm_b, 0));
+
+    (pm_a, pm_b, ep_a, ep_b, kp_a, kp_b)
+}
+
 /// Build a two-`PeerManager` Established pair via `established_pm_pair`
 /// (a large `rekey_interval_ms` so `on_tun`'s drive-rekey-schedule never
 /// fires), returning `(pm_i, pm_r, old_ep)`: `pm_i` is the initiator

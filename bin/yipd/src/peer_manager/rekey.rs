@@ -411,18 +411,15 @@ impl PeerManager {
     /// observes a `next`-epoch datagram and confirms its own switch inside
     /// `EpochSet::inbound_open` (Task 1).
     ///
-    /// `session_obf_key` (the outer anti-DPI wrap key, keyed off `hp_key`)
-    /// is intentionally left untouched across the promotion: it is derived
-    /// once at cold start and shared by both peers for the connection's
-    /// lifetime. The responder's own confirmed-switch promotion happens
-    /// entirely inside `EpochSet::inbound_open`, which has no access to
-    /// `PeerManager`/`Peer` fields — so it has no way to resync
-    /// `session_obf_key` on that side. Rotating it here, on the initiator
-    /// side only, would desync the two peers' outer-wrap keys rather than
-    /// fix anything; leaving it alone keeps both sides on the one key they
-    /// already agree on. (The security-relevant per-epoch key material — the
-    /// inner AEAD/wire `Codec` — DOES rotate correctly: it is rebuilt fresh
-    /// inside `DataPlane::new` from this epoch's own `auth_key`/`hp_key`.)
+    /// Per-epoch obfuscation key rotation (#105):
+    /// The outer anti-DPI obfuscation key is derived per epoch from `hp_key`
+    /// and stored inside each `DataPlane`. When `promote_from_rekey` advances
+    /// the initiator's current epoch, `epochs.current_obf_key()` updates to
+    /// the new epoch key, and `self.peers[idx].session_obf_key` is synchronized.
+    /// The responder trials all candidate epoch keys (`current`, `next`,
+    /// `previous`) via `EpochSet::candidate_obf_keys()`, guaranteeing seamless
+    /// deobfuscation during the confirmed switch window before its own
+    /// `EpochSet::inbound_open` promotes to `current`.
     pub(super) fn handle_rekey_resp(
         &mut self,
         idx: usize,
@@ -513,6 +510,7 @@ impl PeerManager {
             };
             let old_tag = epochs.current().conn_tag();
             epochs.promote_from_rekey(dp, now_ms);
+            self.peers[idx].session_obf_key = epochs.current_obf_key();
             old_tag
         };
         self.by_tag.remove(&old_tag);
@@ -1222,6 +1220,111 @@ mod tests {
                 "a cold-start retransmit must NOT install a rekey `next`"
             ),
             _ => panic!("responder must stay Established"),
+        }
+    }
+
+    #[test]
+    fn rekey_rotates_obf_key_and_preserves_traffic_flow() {
+        let (mut pm_a, mut pm_b, ep_a, ep_b, kp_a, kp_b) =
+            established_pm_pair_with_obf(100, [0x42u8; 32]);
+
+        // Ensure obfuscation is active on initial established session
+        let initial_obf_a = match &pm_a.peers[0].state {
+            PeerState::Established(epochs) => epochs.current_obf_key(),
+            _ => unreachable!(),
+        };
+        assert!(initial_obf_a.is_some(), "initial epoch must have obf_key");
+
+        // Craft an explicit rekey Init from A to B
+        let (_hs, init_pkt) = HandshakeState::start_initiator(
+            &kp_a.private,
+            &kp_b.public,
+            &crate::handshake::frame_init_payload(&[]),
+        )
+        .unwrap();
+
+        // Install RekeyInFlight on A
+        if let PeerState::Established(epochs) = &mut pm_a.peers[0].state {
+            epochs.rekey = Some(crate::epoch::RekeyInFlight {
+                hs: _hs,
+                init_pkt: init_pkt.clone(),
+                started_ms: 100,
+                last_sent_ms: 100,
+                retry_ms: 1000,
+                target: ep_b,
+            });
+        }
+
+        // B receives wrapped rekey Init and responds with wrapped rekey Resp
+        let mut dgs = vec![EgressDatagram {
+            fate: 0,
+            dst: ep_b,
+            bytes: init_pkt,
+        }];
+        pm_a.obf_egress(&mut dgs);
+        let wrapped_init = dgs[0].bytes.clone();
+
+        let out_b = pm_b.on_udp(ep_a, &wrapped_init, 100);
+        let resp_bytes = match out_b {
+            DispatchOut::Udp(e) | DispatchOut::Both(_, e) => {
+                assert_eq!(e.len(), 1, "rekey Init produces a Resp");
+                e[0].bytes.clone()
+            }
+            _ => panic!("expected Udp egress with wrapped Resp"),
+        };
+
+        // A receives rekey Resp -> promotes new epoch!
+        let out_a = pm_a.on_udp(ep_b, &resp_bytes, 100);
+        let primed = match out_a {
+            DispatchOut::Udp(e) => e.to_vec(),
+            DispatchOut::Both(_, e) => e.to_vec(),
+            _ => panic!("expected primed new-epoch frames on promotion"),
+        };
+        assert!(
+            !primed.is_empty(),
+            "initiator must prime new epoch with egress"
+        );
+
+        // Verify A's current_obf_key rotated to a new key
+        let new_obf_a = match &pm_a.peers[0].state {
+            PeerState::Established(epochs) => epochs.current_obf_key(),
+            _ => unreachable!(),
+        };
+        assert_ne!(
+            initial_obf_a, new_obf_a,
+            "initiator obf key must rotate after rekey promotion"
+        );
+        assert_eq!(
+            pm_a.peers[0].session_obf_key, new_obf_a,
+            "pm_a.session_obf_key must synchronize with current_obf_key"
+        );
+
+        // B receives A's primed datagram -> B confirms switch and promotes to new epoch!
+        let out_b = pm_b.on_udp(ep_a, &primed[0].bytes, 100);
+        let _ = out_b;
+
+        let new_obf_b = match &pm_b.peers[0].state {
+            PeerState::Established(epochs) => epochs.current_obf_key(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            new_obf_a, new_obf_b,
+            "both sides must agree on the new rotated obf key"
+        );
+
+        // Verify traffic flow under the new rotated key:
+        // A sends a TUN packet
+        let tun_data = dummy_tun_pkt();
+        let dgs = pm_a.on_tun(&tun_data, 110);
+        assert!(!dgs.is_empty());
+
+        // B receives the data packet, deobfuscates under new key, and yields Tun out
+        let received = pm_b.on_udp(ep_a, &dgs[0].bytes, 110);
+        match received {
+            DispatchOut::Tun(buf) => {
+                assert_eq!(buf, &tun_data[..]);
+            }
+            _ => panic!("expected DispatchOut::Tun with decrypted packet"),
         }
     }
 }
