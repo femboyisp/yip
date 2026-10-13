@@ -187,6 +187,20 @@ struct HandshakingState {
     via_relay: bool,
 }
 
+/// Summary telemetry and status for an individual peer.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by control socket server (#124 Task 2)")
+)]
+pub struct PeerStats {
+    pub public_key: [u8; 32],
+    pub endpoint: Option<SocketAddr>,
+    pub node_addr: std::net::Ipv6Addr,
+    pub state: &'static str,
+    pub last_activity_ms: u64,
+}
+
 /// One remote peer's handshake/session state.
 enum PeerState {
     /// No handshake has been attempted yet.
@@ -786,6 +800,119 @@ impl PeerManager {
         self.peers[idx].path_kind = Some(PathKind::Direct);
         self.peers[idx].state =
             PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, 0)));
+    }
+
+    /// Dynamically add a new remote peer.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by control socket server (#124 Task 2)")
+    )]
+    pub fn add_peer(&mut self, cfg: PeerConfig) -> Result<(), &'static str> {
+        let node = node_id(&cfg.public_key);
+        if self.by_node.contains_key(&node) {
+            return Err("peer already exists");
+        }
+        let idx = self.peers.len();
+        let addr = node_addr(&cfg.public_key);
+        let mut path = if self.relay_only {
+            PathState::relay_only(0)
+        } else {
+            PathState::new(cfg.endpoint.is_some(), self.rendezvous.is_some(), 0)
+        };
+        if let Some(ep) = cfg.endpoint {
+            path.on_direct_addr(ep);
+        }
+        self.by_node.insert(node, idx);
+        self.by_addr.insert(addr, idx);
+        self.peers.push(Peer {
+            pubkey: cfg.public_key,
+            addr,
+            endpoint: cfg.endpoint,
+            state: PeerState::Idle,
+            pending_tun: Vec::new(),
+            cached_resp: None,
+            cached_resp_init_eph: None,
+            last_accepted_init_ts: None,
+            admitted_cert_not_after: None,
+            is_static: false,
+            node,
+            path,
+            path_kind: None,
+            relay: false,
+            last_lookup_ms: None,
+            session_obf_key: None,
+            last_activity_ms: 0,
+            last_cover_ms: 0,
+        });
+        Ok(())
+    }
+
+    /// Dynamically remove an existing peer by public key, tearing down any session
+    /// and cleaning up internal index mappings without invalidating remaining peer indices.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by control socket server (#124 Task 2)")
+    )]
+    pub fn remove_peer(&mut self, pubkey: &[u8; 32]) -> Result<(), &'static str> {
+        let node = node_id(pubkey);
+        let Some(&idx) = self.by_node.get(&node) else {
+            return Err("peer not found");
+        };
+
+        // 1. Tear down live session if established (removes conn_tags from by_tag).
+        self.drop_session(idx);
+
+        // 2. Remove mappings for the target peer.
+        let addr = node_addr(pubkey);
+        self.by_node.remove(&node);
+        self.by_addr.remove(&addr);
+
+        // 3. Remove peer from peers vector.
+        self.peers.remove(idx);
+
+        // 4. Shift down indices greater than idx in by_node, by_addr, and by_tag.
+        for v in self.by_node.values_mut() {
+            if *v > idx {
+                *v -= 1;
+            }
+        }
+        for v in self.by_addr.values_mut() {
+            if *v > idx {
+                *v -= 1;
+            }
+        }
+        for v in self.by_tag.values_mut() {
+            if *v > idx {
+                *v -= 1;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Retrieve summary status telemetry for all known peers.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by control socket server (#124 Task 2)")
+    )]
+    pub fn peer_stats(&self) -> Vec<PeerStats> {
+        self.peers
+            .iter()
+            .map(|p| {
+                let state_str = match &p.state {
+                    PeerState::Idle => "idle",
+                    PeerState::Handshaking(_) => "handshaking",
+                    PeerState::Established(_) => "established",
+                };
+                PeerStats {
+                    public_key: p.pubkey,
+                    endpoint: p.endpoint,
+                    node_addr: p.addr,
+                    state: state_str,
+                    last_activity_ms: p.last_activity_ms,
+                }
+            })
+            .collect()
     }
 
     // ── rendezvous / path helpers ─────────────────────────────────────────
@@ -3682,5 +3809,81 @@ mod tests {
             pm2.reg_seq > pm1.reg_seq,
             "restart must yield strictly higher reg_seq"
         );
+    }
+
+    #[test]
+    fn dynamic_add_peer_updates_mappings_and_routes() {
+        let mut pm = crate::peer_manager::testutil::test_peer_manager();
+        assert_eq!(pm.peers.len(), 1);
+
+        let new_pk = [42u8; 32];
+        let new_ep: SocketAddr = "198.51.100.42:51820".parse().unwrap();
+        let new_cfg = PeerConfig {
+            public_key: new_pk,
+            endpoint: Some(new_ep),
+        };
+
+        // Add peer
+        assert!(pm.add_peer(new_cfg.clone()).is_ok());
+        assert_eq!(pm.peers.len(), 2);
+
+        // Duplicate peer returns error
+        assert!(pm.add_peer(new_cfg).is_err());
+
+        // Verify routing to new peer initiates handshake
+        let target_addr = node_addr(&new_pk);
+        let mut pkt = [0u8; 48];
+        pkt[0] = 0x60; // IPv6
+        pkt[24..40].copy_from_slice(&target_addr.octets());
+        let egress = pm.on_tun(&pkt, 1_000).to_vec();
+        assert_eq!(egress.len(), 1);
+        assert_eq!(egress[0].dst, new_ep);
+    }
+
+    #[test]
+    fn dynamic_remove_peer_cleans_mappings_and_tears_down() {
+        let mut pm = crate::peer_manager::testutil::test_peer_manager();
+        let p1_pk = [1u8; 32];
+        let p2_pk = [2u8; 32];
+        let p3_pk = [3u8; 32];
+
+        assert!(pm
+            .add_peer(PeerConfig {
+                public_key: p2_pk,
+                endpoint: Some("10.0.0.2:2000".parse().unwrap()),
+            })
+            .is_ok());
+        assert!(pm
+            .add_peer(PeerConfig {
+                public_key: p3_pk,
+                endpoint: Some("10.0.0.3:3000".parse().unwrap()),
+            })
+            .is_ok());
+        assert_eq!(pm.peers.len(), 3);
+
+        // Remove middle peer (p2)
+        assert!(pm.remove_peer(&p2_pk).is_ok());
+        assert_eq!(pm.peers.len(), 2);
+        assert!(!pm.by_node.contains_key(&node_id(&p2_pk)));
+        assert!(!pm.by_addr.contains_key(&node_addr(&p2_pk)));
+
+        // p1 and p3 mappings remain correct
+        assert_eq!(pm.by_node.get(&node_id(&p1_pk)).copied(), Some(0));
+        assert_eq!(pm.by_node.get(&node_id(&p3_pk)).copied(), Some(1));
+        assert_eq!(pm.peers[0].pubkey, p1_pk);
+        assert_eq!(pm.peers[1].pubkey, p3_pk);
+
+        // Removing non-existent peer returns Err
+        assert!(pm.remove_peer(&p2_pk).is_err());
+    }
+
+    #[test]
+    fn peer_stats_reports_current_telemetry() {
+        let pm = crate::peer_manager::testutil::test_peer_manager();
+        let stats = pm.peer_stats();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].public_key, [1u8; 32]);
+        assert_eq!(stats[0].state, "idle");
+        assert_eq!(stats[0].endpoint, Some("10.0.0.1:1000".parse().unwrap()));
     }
 }
