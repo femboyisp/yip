@@ -138,6 +138,12 @@ pub struct DataPlane {
     /// Whether obfuscation is on for this session (`PeerManager::obf_key.is_some()`
     /// at construction). Gates whether the feedback cadence is jittered (3b Task 5).
     obf_on: bool,
+    /// 16-byte data-plane obfuscation key, derived from hp_key if obfuscation is enabled.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by peer_manager in later tasks (#105)")
+    )]
+    obf_key: Option<[u8; 16]>,
     /// Current feedback emission interval, in ms. Starts at `FEEDBACK_INTERVAL_MS`
     /// and is re-rolled after each emission: jittered ±25% when `obf_on`, held at
     /// the constant otherwise (3a's stored-jittered-interval pattern, e.g. `retry_ms`).
@@ -183,6 +189,15 @@ impl DataPlane {
     /// 16-byte header-protection key.
     pub fn hp_key(&self) -> &[u8; 16] {
         &self.hp_key
+    }
+
+    /// 16-byte data-plane obfuscation key, if obfuscation is enabled.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by peer_manager in later tasks (#105)")
+    )]
+    pub fn obf_key(&self) -> Option<[u8; 16]> {
+        self.obf_key
     }
 
     /// Access the underlying AEAD session.
@@ -241,6 +256,11 @@ impl DataPlane {
             last_log_ms: 0,
             last_sweep_ms: 0,
             obf_on,
+            obf_key: if obf_on {
+                Some(yip_obf::derive_key(&established.hp_key))
+            } else {
+                None
+            },
             feedback_interval_ms: FEEDBACK_INTERVAL_MS,
             arq_retx_count: 0,
             egress_scratch: Vec::new(),
@@ -970,5 +990,56 @@ mod tests {
             emissions, 5,
             "expected 5 obf-off feedback emissions at the exact 30 ms cadence"
         );
+    }
+
+    fn test_established() -> Established {
+        let resp_kp = generate_keypair();
+        let init_kp = generate_keypair();
+
+        let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
+        let mut res = Handshake::responder(&resp_kp.private).unwrap();
+
+        let m1 = ini.write_message(&[]).unwrap();
+        let _ = res.read_message(&m1).unwrap();
+        let m2 = res.write_message(&[]).unwrap();
+        let _ = ini.read_message(&m2).unwrap();
+
+        let cb_i = ini.channel_binding();
+        let (auth_key, hp_key) = derive_wire_keys(&cb_i);
+        let (ini_send_k, ini_recv_k) = ini.raw_split_keys();
+
+        Established {
+            session: ini.into_session().unwrap(),
+            auth_key,
+            hp_key,
+            raw_send_key: ini_send_k,
+            raw_recv_key: ini_recv_k,
+        }
+    }
+
+    #[test]
+    fn dataplane_derives_and_exposes_obf_key_when_obf_on() {
+        let established = test_established();
+        let expected_obf = yip_obf::derive_key(&established.hp_key);
+        let dp_obf = DataPlane::new(
+            established,
+            123,
+            TunnelMode::L3Tun,
+            "127.0.0.1:1234".parse().unwrap(),
+            true, // obf_on
+            1200,
+        );
+        assert_eq!(dp_obf.obf_key(), Some(expected_obf));
+
+        let established_plain = test_established();
+        let dp_plain = DataPlane::new(
+            established_plain,
+            123,
+            TunnelMode::L3Tun,
+            "127.0.0.1:1234".parse().unwrap(),
+            false, // obf_off
+            1200,
+        );
+        assert_eq!(dp_plain.obf_key(), None);
     }
 }

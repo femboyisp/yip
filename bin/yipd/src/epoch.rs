@@ -96,6 +96,40 @@ impl EpochSet {
         &mut self.current
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by peer_manager in later tasks (#105)")
+    )]
+    pub fn current_obf_key(&self) -> Option<[u8; 16]> {
+        self.current.obf_key()
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by peer_manager in later tasks (#105)")
+    )]
+    pub fn candidate_obf_keys(&self) -> Vec<[u8; 16]> {
+        let mut keys = Vec::with_capacity(3);
+        if let Some(k) = self.current.obf_key() {
+            keys.push(k);
+        }
+        if let Some(ref n) = self.next {
+            if let Some(k) = n.dp.obf_key() {
+                if !keys.contains(&k) {
+                    keys.push(k);
+                }
+            }
+        }
+        if let Some(ref p) = self.previous {
+            if let Some(k) = p.obf_key() {
+                if !keys.contains(&k) {
+                    keys.push(k);
+                }
+            }
+        }
+        keys
+    }
+
     /// Point every live epoch's egress at `addr` — WireGuard-style roaming after
     /// the peer's authenticated source moved (M2). Applies to `current`, the
     /// unconfirmed `next`, and the grace `previous`, so a roam is not undone by a
@@ -251,7 +285,7 @@ mod tests {
     /// in-process Noise-IK handshake — mirrors `dataplane::tests::dataplane_pair`.
     /// Returns `(sender, opener)`: `sender.on_tun_packet` produces frames that
     /// `opener` (fed into an `EpochSet` under test) must be able to open.
-    fn epoch_pair() -> (Box<DataPlane>, Box<DataPlane>) {
+    fn epoch_pair_obf(obf_on: bool) -> (Box<DataPlane>, Box<DataPlane>) {
         let resp_kp = generate_keypair();
         let init_kp = generate_keypair();
 
@@ -297,7 +331,7 @@ mod tests {
                 conn_tag,
                 TunnelMode::L3Tun,
                 addr_b,
-                false,
+                obf_on,
                 1200,
             )),
             Box::new(DataPlane::new(
@@ -305,10 +339,14 @@ mod tests {
                 conn_tag,
                 TunnelMode::L3Tun,
                 addr_a,
-                false,
+                obf_on,
                 1200,
             )),
         )
+    }
+
+    fn epoch_pair() -> (Box<DataPlane>, Box<DataPlane>) {
+        epoch_pair_obf(false)
     }
 
     /// Seal `payload` with `sender`, feed every resulting datagram into
@@ -563,5 +601,32 @@ mod tests {
             .to_vec();
         assert!(!dg.is_empty());
         assert_eq!(dg[0].dst, new, "current epoch egress must follow the roam");
+    }
+
+    #[test]
+    fn epoch_set_yields_candidate_obf_keys_across_lifecycle() {
+        let (_peer1, dp1) = epoch_pair_obf(true);
+        let k1 = dp1.obf_key().unwrap();
+        let mut epochs = EpochSet::new(dp1, 1000);
+        assert_eq!(epochs.current_obf_key(), Some(k1));
+        assert_eq!(epochs.candidate_obf_keys(), vec![k1]);
+
+        // Staging next epoch adds its key
+        let (_peer3, dp3) = epoch_pair_obf(true);
+        let k3 = dp3.obf_key().unwrap();
+        epochs.install_next(dp3, [1u8; 32], vec![]);
+        assert_eq!(epochs.candidate_obf_keys().len(), 2);
+        assert!(epochs.candidate_obf_keys().contains(&k1));
+        assert!(epochs.candidate_obf_keys().contains(&k3));
+
+        // Promoting next makes it current, moves old current to previous
+        let (_peer4, dp4) = epoch_pair_obf(true);
+        let k4 = dp4.obf_key().unwrap();
+        epochs.promote_from_rekey(dp4, 2000);
+        assert_eq!(epochs.current_obf_key(), Some(k4));
+        let candidates = epochs.candidate_obf_keys();
+        assert!(candidates.len() >= 2);
+        assert!(candidates.contains(&k4));
+        assert!(candidates.contains(&k1));
     }
 }
