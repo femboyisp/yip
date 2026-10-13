@@ -42,7 +42,11 @@ impl PeerManager {
     /// mismatch a safe drop — never a mis-dispatch with side effects.
     pub(super) fn deobf_ingress(&self, src: SocketAddr, dg: &[u8]) -> Option<Vec<u8>> {
         // (a) established peer whose endpoint matches src → session candidate keys.
-        if let Some(peer) = self.peers.iter().find(|p| p.endpoint == Some(src)) {
+        if let Some(peer) = self
+            .peers
+            .iter()
+            .find(|p| p.endpoint == Some(src) && matches!(p.state, PeerState::Established(_)))
+        {
             if let PeerState::Established(ref epochs) = peer.state {
                 let mut keys = epochs.candidate_obf_keys();
                 if keys.is_empty() {
