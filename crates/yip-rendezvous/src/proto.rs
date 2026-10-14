@@ -43,12 +43,10 @@ pub fn verify_register_mac(
     counter: u64,
     mac: &[u8; 16],
 ) -> bool {
+    use subtle::ConstantTimeEq;
+
     let expected = compute_register_mac(obf_key, node, counter);
-    let mut diff = 0u8;
-    for (a, b) in mac.iter().zip(expected.iter()) {
-        diff |= a ^ b;
-    }
-    diff == 0
+    expected.ct_eq(mac).into()
 }
 
 /// Message-type discriminants (the only permitted `as u8` in this crate).
@@ -295,6 +293,9 @@ pub fn decode(buf: &[u8]) -> Option<Message> {
             Some(Message::RegisterSigned { record })
         }
         t if t == Tag::RegisterAuth as u8 => {
+            if rest.len() != 40 {
+                return None;
+            }
             let node = node16(rest)?;
             let counter = u64::from_be_bytes(rest.get(16..24)?.try_into().ok()?);
             let mac: [u8; 16] = rest.get(24..40)?.try_into().ok()?;
@@ -568,5 +569,34 @@ mod tests {
         assert_eq!(buf[0], 8);
         let decoded = decode(&buf).expect("decodes RegisterAuth");
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn register_auth_rejects_trailing_garbage_or_truncation() {
+        let node = node_id(&[0x55u8; 32]);
+        let counter = 9999u64;
+        let mac = [0x77u8; 16];
+        let msg = Message::RegisterAuth { node, counter, mac };
+        let mut buf = Vec::new();
+        encode(&msg, &mut buf);
+        assert_eq!(decode(&buf), Some(msg));
+
+        // Trailing garbage
+        let mut with_trailing = buf.clone();
+        with_trailing.push(0x00);
+        assert_eq!(
+            decode(&with_trailing),
+            None,
+            "trailing garbage must be rejected"
+        );
+
+        // Truncation
+        let mut truncated = buf;
+        truncated.pop();
+        assert_eq!(
+            decode(&truncated),
+            None,
+            "truncated datagram must be rejected"
+        );
     }
 }
