@@ -21,7 +21,20 @@ jobs:
       # taiki-e/install-action is not mirrored on this Forgejo instance.
       - name: Install cargo-mutants
         run: cargo install cargo-mutants --locked
-      - name: Mutation test (logic crates)
+      - name: Mutation test (logic & control crates)
         run: >
-          cargo mutants --package yip-wire --package yip-transport
-          --package yip-crypto -- --all-targets
+          cargo mutants
+          --package yip-wire
+          --package yip-transport
+          --package yip-crypto
+          --package yip-obf
+          --package yip-membership
+          --package yip-rendezvous
+          -- --all-targets
+      - name: Upload mutants artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-report
+          path: mutants.out/
+          retention-days: 14
