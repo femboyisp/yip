@@ -26,8 +26,9 @@ pub enum Classify {
 ///   `Message::RegisterSigned` (cert chain and signature verified against roots,
 ///   sequence within wall-clock bounds, and fresh on the TLS path). Rejects bare
 ///   `Register` as decoy.
-/// - In rootless mode (`server.roots_cfg().is_none()`): accepts a fresh
-///   `Message::Register` as before.
+/// - In rootless mode (`server.roots_cfg().is_none()`): requires a verified
+///   `Message::RegisterAuth` (valid MAC under `obf_key` and fresh on the TLS path).
+///   Rejects bare `Register` as decoy (#64).
 pub fn classify_first_frame(
     buf: &[u8],
     obf_key: &[u8; 16],
@@ -92,14 +93,18 @@ pub fn classify_first_frame_at(
             reply,
         }
     } else {
-        // Rootless mode: accept bare Register.
-        let Message::Register { node, counter } = msg else {
+        // Rootless mode: require verified RegisterAuth with valid MAC.
+        // Bare Register is intentionally rejected as Decoy (#64).
+        let Message::RegisterAuth { node, counter, mac } = msg else {
             return Classify::Decoy;
         };
+        if !yip_rendezvous::verify_register_mac(obf_key, &node, counter, &mac) {
+            return Classify::Decoy;
+        }
         if !server.register_if_fresh_tls(node, counter, now_ms) {
             return Classify::Decoy;
         }
-        let reply = crate::frame_obf(obf_key, &Message::Register { node, counter });
+        let reply = crate::frame_obf(obf_key, &Message::RegisterAuth { node, counter, mac });
         Classify::Upgrade { node, reply }
     }
 }
@@ -290,17 +295,11 @@ pub(crate) async fn into_decoy_with_stream<St>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yip_rendezvous::{encode, node_id, Message};
+    use yip_rendezvous::{node_id, Message};
 
-    fn framed_register(obf_key: &[u8; 16], node: yip_rendezvous::NodeId, counter: u64) -> Vec<u8> {
-        let mut plain = Vec::new();
-        encode(&Message::Register { node, counter }, &mut plain);
-        let env = yip_obf::obfuscate(obf_key, yip_obf::RDV_TYPE, &plain, 0)
-            .expect("small test body fits u16");
-        let mut framed = Vec::new();
-        framed.extend_from_slice(&u16::try_from(env.len()).unwrap().to_be_bytes());
-        framed.extend_from_slice(&env);
-        framed
+    fn framed_register_auth(obf_key: &[u8; 16], node: NodeId, counter: u64) -> Vec<u8> {
+        let mac = yip_rendezvous::compute_register_mac(obf_key, &node, counter);
+        crate::frame_obf(obf_key, &Message::RegisterAuth { node, counter, mac })
     }
 
     #[test]
@@ -308,7 +307,7 @@ mod tests {
         let key = yip_obf::derive_key(&[4u8; 32]);
         let node = node_id(&[1u8; 32]);
         let mut s = RendezvousServer::new(0);
-        let frame = framed_register(&key, node, 1);
+        let frame = framed_register_auth(&key, node, 1);
         match classify_first_frame(&frame, &key, &mut s, 0) {
             Classify::Upgrade { node: got, reply } => {
                 assert_eq!(got, node);
@@ -346,7 +345,7 @@ mod tests {
         let attacker = yip_obf::derive_key(&[5u8; 32]);
         let node = node_id(&[1u8; 32]);
         let mut s = RendezvousServer::new(0);
-        let frame = framed_register(&attacker, node, 1); // obf'd with the WRONG key
+        let frame = framed_register_auth(&attacker, node, 1); // obf'd with the WRONG key
         assert!(matches!(
             classify_first_frame(&frame, &real, &mut s, 0),
             Classify::Decoy
@@ -358,7 +357,7 @@ mod tests {
         let key = yip_obf::derive_key(&[4u8; 32]);
         let node = node_id(&[1u8; 32]);
         let mut s = RendezvousServer::new(0);
-        let frame = framed_register(&key, node, 7);
+        let frame = framed_register_auth(&key, node, 7);
         assert!(matches!(
             classify_first_frame(&frame, &key, &mut s, 0),
             Classify::Upgrade { .. }
@@ -521,8 +520,8 @@ mod tests {
             .await
             .expect("client TLS handshake completes");
 
-        // Send valid Register frame immediately
-        let frame = framed_register(&obf_key, node, 1);
+        // Send valid RegisterAuth frame immediately
+        let frame = framed_register_auth(&obf_key, node, 1);
         client.write_all(&frame).await.unwrap();
 
         // Read upgrade reply from relay
@@ -582,7 +581,7 @@ mod tests {
         let key = yip_obf::derive_key(&[4u8; 32]);
         let node = node_id(&[1u8; 32]);
         let mut s = RendezvousServer::new(0);
-        let frame = framed_register(&key, node, 7);
+        let frame = framed_register_auth(&key, node, 7);
         assert!(matches!(
             classify_first_frame(&frame, &key, &mut s, 100),
             Classify::Upgrade { .. }
@@ -745,5 +744,83 @@ mod tests {
             classify_first_frame(&buf4, &obf_key, &mut server4, 0),
             Classify::Decoy
         ));
+    }
+
+    #[test]
+    fn rootless_valid_register_auth_upgrades() {
+        let key = yip_obf::derive_key(b"test-obf-psk");
+        let node = node_id(&[1u8; 32]);
+        let counter = 100u64;
+        let mac = yip_rendezvous::compute_register_mac(&key, &node, counter);
+        let mut s = RendezvousServer::new(0);
+
+        let frame = crate::frame_obf(&key, &Message::RegisterAuth { node, counter, mac });
+        let class = classify_first_frame_at(&frame, &key, &mut s, 1000, 1000);
+        assert!(matches!(class, Classify::Upgrade { node: n, .. } if n == node));
+    }
+
+    #[test]
+    fn rootless_bare_register_is_decoy() {
+        let key = yip_obf::derive_key(b"test-obf-psk");
+        let node = node_id(&[1u8; 32]);
+        let mut s = RendezvousServer::new(0);
+
+        // An unauthenticated bare Register must be rejected as Decoy in rootless mode (#64)
+        let frame = crate::frame_obf(&key, &Message::Register { node, counter: 1 });
+        let class = classify_first_frame_at(&frame, &key, &mut s, 1000, 1000);
+        assert!(matches!(class, Classify::Decoy));
+    }
+
+    #[test]
+    fn rootless_bad_mac_register_auth_is_decoy() {
+        let key = yip_obf::derive_key(b"test-obf-psk");
+        let node = node_id(&[1u8; 32]);
+        let counter = 100u64;
+        let bad_mac = [0xffu8; 16];
+        let mut s = RendezvousServer::new(0);
+
+        let frame = crate::frame_obf(
+            &key,
+            &Message::RegisterAuth {
+                node,
+                counter,
+                mac: bad_mac,
+            },
+        );
+        let class = classify_first_frame_at(&frame, &key, &mut s, 1000, 1000);
+        assert!(matches!(class, Classify::Decoy));
+    }
+
+    #[test]
+    fn rootless_random_probe_resistance() {
+        let key = yip_obf::derive_key(b"test-obf-psk");
+        let mut s = RendezvousServer::new(0);
+        let mut rng = yip_obf::XorShift64::from_getrandom();
+
+        for _ in 0..10_000 {
+            let len = (rng.next_u64() % 200 + 10) as usize;
+            let mut probe = vec![0u8; len];
+            for b in &mut probe {
+                *b = rng.next_u64() as u8;
+            }
+            let class = classify_first_frame_at(&probe, &key, &mut s, 1000, 1000);
+            assert!(matches!(class, Classify::Decoy));
+        }
+    }
+
+    #[test]
+    fn rootless_replay_is_decoy() {
+        let key = yip_obf::derive_key(b"test-obf-psk");
+        let node = node_id(&[1u8; 32]);
+        let counter = 100u64;
+        let mac = yip_rendezvous::compute_register_mac(&key, &node, counter);
+        let mut s = RendezvousServer::new(0);
+
+        let frame = crate::frame_obf(&key, &Message::RegisterAuth { node, counter, mac });
+        let class1 = classify_first_frame_at(&frame, &key, &mut s, 1000, 1000);
+        assert!(matches!(class1, Classify::Upgrade { node: n, .. } if n == node));
+
+        let class2 = classify_first_frame_at(&frame, &key, &mut s, 1001, 1000);
+        assert!(matches!(class2, Classify::Decoy));
     }
 }
