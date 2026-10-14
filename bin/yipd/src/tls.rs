@@ -100,7 +100,7 @@ pub(crate) fn frame_datagram(dg: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
 }
 
 /// Reassembles length-prefixed datagrams from a TLS plaintext byte-stream.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct FrameReader {
     buf: Vec<u8>,
 }
@@ -419,11 +419,10 @@ fn drain_tun_tls(
 
 // ── role tiebreak (mirrors quic.rs's connection_role) ──────────────────────
 
-/// The TCP+TLS role this node takes toward the (single, first-configured)
-/// peer, decided by static-key order to avoid glare (two connections racing
-/// for one pair).
+/// The TCP+TLS role this node takes toward a peer, decided by static-key order
+/// to avoid glare (two connections racing for one pair).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Role {
+pub(crate) enum Role {
     /// Smaller `local_public` ⇒ we `TcpStream::connect` + TLS client handshake.
     Client,
     /// Larger `local_public` ⇒ we `TcpListener::accept` + TLS server handshake.
@@ -432,7 +431,7 @@ enum Role {
 
 /// Decide our TCP+TLS role toward `peer_pub`: the smaller static key is the
 /// client. Equal keys cannot occur for a genuine distinct peer.
-fn connection_role(local_pub: &[u8; 32], peer_pub: &[u8; 32]) -> io::Result<Role> {
+pub(crate) fn connection_role(local_pub: &[u8; 32], peer_pub: &[u8; 32]) -> io::Result<Role> {
     match local_pub.cmp(peer_pub) {
         Ordering::Less => Ok(Role::Client),
         Ordering::Greater => Ok(Role::Server),
@@ -441,6 +440,306 @@ fn connection_role(local_pub: &[u8; 32], peer_pub: &[u8; 32]) -> io::Result<Role
             "local_public == peer public key: impossible for a distinct peer",
         )),
     }
+}
+
+/// Assign pairwise connection roles for each peer relative to `local_pub`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by multi-peer pump in Task 3")
+)]
+pub(crate) fn assign_peer_roles(
+    local_pub: &[u8; 32],
+    peers: &[([u8; 32], SocketAddr)],
+) -> io::Result<Vec<([u8; 32], SocketAddr, Role)>> {
+    peers
+        .iter()
+        .map(|&(peer_pub, addr)| {
+            let role = connection_role(local_pub, &peer_pub)?;
+            Ok((peer_pub, addr, role))
+        })
+        .collect()
+}
+
+// ── multi-peer connection state machine ────────────────────────────────────
+
+/// Multi-peer connection state machine and lifecycle manager.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by multi-peer pump in Task 3")
+)]
+#[derive(Debug)]
+pub(crate) enum PeerConn {
+    Disconnected {
+        backoff_ms: u64,
+        next_dial: Instant,
+    },
+    Connecting {
+        stream: SslStream<TcpStream>,
+        start: Instant,
+    },
+    Connected {
+        stream: SslStream<TcpStream>,
+        reader: FrameReader,
+        start: Instant,
+        inner_confirmed: bool,
+        was_established: bool,
+    },
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by multi-peer pump in Task 3")
+)]
+impl PeerConn {
+    /// Create a new disconnected connection ready to dial immediately.
+    pub(crate) fn new_disconnected(now: Instant) -> Self {
+        Self::Disconnected {
+            backoff_ms: INITIAL_BACKOFF_MS,
+            next_dial: now,
+        }
+    }
+
+    /// Record a failure / disconnect and advance exponential backoff.
+    /// Caps backoff at [`MAX_BACKOFF_MS`].
+    pub(crate) fn record_failure(&mut self, now: Instant) {
+        let current_backoff = match self {
+            Self::Disconnected { backoff_ms, .. } => *backoff_ms,
+            _ => INITIAL_BACKOFF_MS,
+        };
+        let next_dial = now + Duration::from_millis(current_backoff);
+        let next_backoff = (current_backoff * 2).min(MAX_BACKOFF_MS);
+        *self = Self::Disconnected {
+            backoff_ms: next_backoff,
+            next_dial,
+        };
+    }
+
+    /// Current backoff delay in ms if disconnected.
+    pub(crate) fn backoff_ms(&self) -> Option<u64> {
+        match self {
+            Self::Disconnected { backoff_ms, .. } => Some(*backoff_ms),
+            _ => None,
+        }
+    }
+
+    /// Next dial instant if disconnected.
+    pub(crate) fn next_dial(&self) -> Option<Instant> {
+        match self {
+            Self::Disconnected { next_dial, .. } => Some(*next_dial),
+            _ => None,
+        }
+    }
+
+    /// True if currently in `Disconnected` state.
+    pub(crate) fn is_disconnected(&self) -> bool {
+        matches!(self, Self::Disconnected { .. })
+    }
+
+    /// True if currently in `Connecting` state.
+    pub(crate) fn is_connecting(&self) -> bool {
+        matches!(self, Self::Connecting { .. })
+    }
+
+    /// True if currently in `Connected` state.
+    pub(crate) fn is_connected(&self) -> bool {
+        matches!(self, Self::Connected { .. })
+    }
+
+    /// Whether this connection should attempt dialing now.
+    pub(crate) fn should_dial(&self, now: Instant) -> bool {
+        match self {
+            Self::Disconnected { next_dial, .. } => now >= *next_dial,
+            _ => false,
+        }
+    }
+
+    /// Check if the inner Noise-IK handshake has timed out.
+    pub(crate) fn is_inner_handshake_timeout(&self, now: Instant) -> bool {
+        self.is_inner_expired(now, INNER_HANDSHAKE_TIMEOUT)
+    }
+
+    /// Check if the inner Noise-IK handshake has exceeded `timeout`.
+    pub(crate) fn is_inner_expired(&self, now: Instant, timeout: Duration) -> bool {
+        match self {
+            Self::Connected {
+                start,
+                inner_confirmed,
+                ..
+            } => !inner_confirmed && now.duration_since(*start) >= timeout,
+            _ => false,
+        }
+    }
+
+    /// Mark the inner handshake as confirmed.
+    pub(crate) fn mark_inner_confirmed(&mut self) {
+        if let Self::Connected {
+            inner_confirmed, ..
+        } = self
+        {
+            *inner_confirmed = true;
+        }
+    }
+
+    /// Reference to the underlying TLS stream, if connecting or connected.
+    pub(crate) fn stream(&self) -> Option<&SslStream<TcpStream>> {
+        match self {
+            Self::Connecting { stream, .. } | Self::Connected { stream, .. } => Some(stream),
+            Self::Disconnected { .. } => None,
+        }
+    }
+
+    /// Mutable reference to the underlying TLS stream, if connecting or connected.
+    pub(crate) fn stream_mut(&mut self) -> Option<&mut SslStream<TcpStream>> {
+        match self {
+            Self::Connecting { stream, .. } | Self::Connected { stream, .. } => Some(stream),
+            Self::Disconnected { .. } => None,
+        }
+    }
+
+    /// Raw file descriptor of the TCP socket, if connecting or connected.
+    pub(crate) fn raw_fd(&self) -> Option<RawFd> {
+        self.stream().map(|s| s.get_ref().as_raw_fd())
+    }
+
+    /// Connection start timestamp, if connecting or connected.
+    pub(crate) fn start(&self) -> Option<Instant> {
+        match self {
+            Self::Connecting { start, .. } | Self::Connected { start, .. } => Some(*start),
+            Self::Disconnected { .. } => None,
+        }
+    }
+
+    /// Reference to the plaintext frame reader, if connected.
+    pub(crate) fn reader(&self) -> Option<&FrameReader> {
+        match self {
+            Self::Connected { reader, .. } => Some(reader),
+            _ => None,
+        }
+    }
+
+    /// Mutable reference to the plaintext frame reader, if connected.
+    pub(crate) fn reader_mut(&mut self) -> Option<&mut FrameReader> {
+        match self {
+            Self::Connected { reader, .. } => Some(reader),
+            _ => None,
+        }
+    }
+
+    /// Whether this peer was established prior to the current connection.
+    pub(crate) fn was_established(&self) -> Option<bool> {
+        match self {
+            Self::Connected {
+                was_established, ..
+            } => Some(*was_established),
+            _ => None,
+        }
+    }
+
+    /// Check if the TLS handshake in `Connecting` state has exceeded `timeout`.
+    pub(crate) fn is_handshake_expired(&self, now: Instant, timeout: Duration) -> bool {
+        match self {
+            Self::Connecting { start, .. } => now.duration_since(*start) >= timeout,
+            _ => false,
+        }
+    }
+
+    /// Check if the TLS handshake has timed out against [`HANDSHAKE_TIMEOUT`].
+    pub(crate) fn is_handshake_timeout(&self, now: Instant) -> bool {
+        self.is_handshake_expired(now, HANDSHAKE_TIMEOUT)
+    }
+
+    /// Advance the TLS handshake if this connection is in `Connecting` state.
+    ///
+    /// Returns `Ok(true)` if handshake just finished (transitioning `*self` to `Connected`),
+    /// `Ok(false)` if still in progress,
+    /// or `Err(e)` if handshake failed.
+    pub(crate) fn drive_handshake(
+        &mut self,
+        now: Instant,
+        was_established: bool,
+    ) -> io::Result<bool> {
+        let (done, err) = match self {
+            Self::Connecting { stream, .. } => match stream.connect() {
+                Ok(()) => (true, None),
+                Err(e) if e.code() == ErrorCode::WANT_READ || e.code() == ErrorCode::WANT_WRITE => {
+                    (false, None)
+                }
+                Err(e) => (false, Some(ssl_error_to_io(e))),
+            },
+            _ => (false, None),
+        };
+
+        if let Some(e) = err {
+            return Err(e);
+        }
+
+        if done {
+            let old = std::mem::replace(
+                self,
+                Self::Disconnected {
+                    backoff_ms: INITIAL_BACKOFF_MS,
+                    next_dial: now,
+                },
+            );
+            if let Self::Connecting { stream, .. } = old {
+                *self = Self::Connected {
+                    stream,
+                    reader: FrameReader::default(),
+                    start: now,
+                    inner_confirmed: false,
+                    was_established,
+                };
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+}
+
+/// Initiate a non-blocking TCP connect and BoringSSL TLS client handshake.
+///
+/// Returns an [`SslStream`] whose handshake is in-flight (or completed).
+/// The stream's socket is non-blocking with `TCP_NODELAY` set.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by multi-peer pump in Task 3")
+)]
+pub(crate) fn try_connect(
+    peer_addr: SocketAddr,
+    tls_sni: &str,
+) -> io::Result<SslStream<TcpStream>> {
+    let domain = if peer_addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::STREAM, None)?;
+    sock.set_nonblocking(true)?;
+    sock.set_nodelay(true)?;
+
+    match sock.connect(&peer_addr.into()) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(115) || e.kind() == io::ErrorKind::WouldBlock => {}
+        Err(e) => return Err(e),
+    }
+
+    let tcp: TcpStream = sock.into();
+    let connector = build_client_connector()?;
+    let ssl = connector
+        .configure()
+        .map_err(io::Error::other)?
+        .into_ssl(tls_sni)
+        .map_err(io::Error::other)?;
+    let mut stream = SslStream::new(ssl, tcp).map_err(io::Error::other)?;
+
+    match stream.connect() {
+        Ok(()) => {}
+        Err(e) if e.code() == ErrorCode::WANT_READ || e.code() == ErrorCode::WANT_WRITE => {}
+        Err(e) => return Err(ssl_error_to_io(e)),
+    }
+
+    Ok(stream)
 }
 
 // ── connect / accept ────────────────────────────────────────────────────────
@@ -1210,5 +1509,156 @@ mod tests {
 
         assert_eq!(client_curve.as_deref(), Some("X25519MLKEM768"));
         assert_eq!(server_curve.as_deref(), Some("X25519MLKEM768"));
+    }
+
+    #[test]
+    fn multi_peer_role_assignment() {
+        let local_pub = [10u8; 32];
+        let peer_smaller = ([5u8; 32], "127.0.0.1:8001".parse().unwrap());
+        let peer_greater_1 = ([15u8; 32], "127.0.0.1:8002".parse().unwrap());
+        let peer_greater_2 = ([20u8; 32], "127.0.0.1:8003".parse().unwrap());
+
+        let peers = [peer_smaller, peer_greater_1, peer_greater_2];
+        let roles = assign_peer_roles(&local_pub, &peers).expect("role assignment");
+
+        assert_eq!(roles.len(), 3);
+        assert_eq!(roles[0].2, Role::Server);
+        assert_eq!(roles[1].2, Role::Client);
+        assert_eq!(roles[2].2, Role::Client);
+
+        // Individual pairwise verification
+        assert_eq!(
+            connection_role(&local_pub, &peers[0].0).unwrap(),
+            Role::Server
+        );
+        assert_eq!(
+            connection_role(&local_pub, &peers[1].0).unwrap(),
+            Role::Client
+        );
+        assert_eq!(
+            connection_role(&local_pub, &peers[2].0).unwrap(),
+            Role::Client
+        );
+
+        // Identity check: same key is an error
+        let peer_equal = ([10u8; 32], "127.0.0.1:8004".parse().unwrap());
+        assert!(assign_peer_roles(&local_pub, &[peer_equal]).is_err());
+    }
+
+    #[test]
+    fn multi_peer_reconnect_backoff_timing() {
+        let now = Instant::now();
+        let mut conn = PeerConn::new_disconnected(now);
+
+        // Initially at INITIAL_BACKOFF_MS (100ms), ready to dial immediately.
+        assert_eq!(conn.backoff_ms(), Some(INITIAL_BACKOFF_MS));
+        assert!(conn.should_dial(now));
+
+        // Sequence of failures: backoff should double at each step:
+        // 100 -> 200 -> 400 -> 800 -> 1600 -> 3200 -> 5000 (capped at MAX_BACKOFF_MS) -> 5000
+        let expected_delays = [100, 200, 400, 800, 1600, 3200, 5000, 5000];
+        let expected_next_backoff = [200, 400, 800, 1600, 3200, 5000, 5000, 5000];
+
+        for (delay_ms, next_backoff) in expected_delays.into_iter().zip(expected_next_backoff) {
+            conn.record_failure(now);
+            assert_eq!(conn.backoff_ms(), Some(next_backoff));
+            assert_eq!(
+                conn.next_dial(),
+                Some(now + Duration::from_millis(delay_ms))
+            );
+        }
+
+        assert_eq!(conn.backoff_ms(), Some(MAX_BACKOFF_MS));
+    }
+
+    #[test]
+    fn multi_peer_inner_handshake_timeout_lifecycle() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let sni = "example.test";
+
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().expect("accept");
+            let acceptor = build_server_acceptor(sni).expect("acceptor");
+            acceptor.accept(tcp).expect("handshake")
+        });
+
+        let connector = build_client_connector().expect("connector");
+        let tcp = TcpStream::connect(addr).expect("connect");
+        let stream = connector.connect(sni, tcp).expect("client handshake");
+        let _server_stream = server.join().expect("server join");
+
+        let t0 = Instant::now();
+        let mut conn = PeerConn::Connected {
+            stream,
+            reader: FrameReader::default(),
+            start: t0,
+            inner_confirmed: false,
+            was_established: false,
+        };
+
+        assert!(conn.is_connected());
+        assert!(!conn.is_disconnected());
+        assert!(!conn.is_connecting());
+        assert!(conn.raw_fd().is_some());
+        assert!(conn.stream().is_some());
+        assert!(conn.stream_mut().is_some());
+        assert_eq!(conn.start(), Some(t0));
+        assert!(conn.reader().is_some());
+        assert!(conn.reader_mut().is_some());
+        assert_eq!(conn.was_established(), Some(false));
+
+        // Before timeout: not expired
+        assert!(!conn.is_inner_handshake_timeout(t0 + Duration::from_secs(5)));
+        assert!(!conn.is_inner_expired(t0 + Duration::from_secs(5), Duration::from_secs(10)));
+
+        // After timeout: expired
+        assert!(conn.is_inner_handshake_timeout(t0 + Duration::from_secs(10)));
+        assert!(conn.is_inner_expired(t0 + Duration::from_secs(10), Duration::from_secs(10)));
+
+        // Once confirmed: no longer expired even after deadline
+        conn.mark_inner_confirmed();
+        assert!(!conn.is_inner_handshake_timeout(t0 + Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn multi_peer_try_connect_and_drive_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let sni = "example.test";
+
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().expect("accept");
+            let acceptor = build_server_acceptor(sni).expect("acceptor");
+            acceptor.accept(tcp).expect("handshake")
+        });
+
+        let start_time = Instant::now();
+        let stream = try_connect(addr, sni).expect("try_connect");
+        let mut conn = PeerConn::Connecting {
+            stream,
+            start: start_time,
+        };
+        assert!(conn.is_connecting());
+        assert!(conn.raw_fd().is_some());
+        assert_eq!(conn.start(), Some(start_time));
+        assert!(!conn.is_handshake_timeout(start_time));
+        assert!(conn.is_handshake_expired(
+            start_time + Duration::from_secs(10),
+            Duration::from_secs(10)
+        ));
+
+        let t0 = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while conn.is_connecting() && Instant::now() < deadline {
+            let _ = conn.drive_handshake(t0, false);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            conn.is_connected(),
+            "connection should transition to Connected"
+        );
+        let _server_stream = server.join().expect("server join");
     }
 }
