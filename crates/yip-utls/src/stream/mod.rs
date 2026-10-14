@@ -45,8 +45,10 @@ use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+pub mod cert;
 pub mod record;
 
+pub(crate) use cert::*;
 pub(crate) use record::*;
 
 /// Byte length of an ML-KEM-768 ciphertext (FIPS 203 §7.2) — the length of
@@ -160,18 +162,6 @@ async fn read_raw_record<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(u8, Ve
 
 /// Handshake message type for `EncryptedExtensions` (RFC 8446 §4.3.1).
 const HS_TYPE_ENCRYPTED_EXTENSIONS: u8 = 0x08;
-/// Handshake message type for `Certificate` (RFC 8446 §4.4.2).
-const HS_TYPE_CERTIFICATE: u8 = 0x0b;
-/// Handshake message type for `CertificateVerify` (RFC 8446 §4.4.3).
-const HS_TYPE_CERTIFICATE_VERIFY: u8 = 0x0f;
-
-/// A generous sanity bound on a single leaf certificate's DER length — real
-/// leaf certs are a few KiB; 64 KiB is generous headroom. Bounds
-/// [`certificate_leaf_der`]'s allocation against a hostile/MITM peer (the
-/// outer TLS is zero-server-auth) claiming an absurd `cert_data` length
-/// within the already-bounded server flight — defense in depth alongside
-/// [`MAX_SERVER_FLIGHT_LEN`]/[`MAX_HANDSHAKE_MSG_LEN`].
-const MAX_LEAF_CERT_DER_LEN: usize = 64 * 1024;
 
 /// `AlertLevel::fatal` (RFC 8446 §6.1, value `2`) — every alert this client
 /// ever sends is fatal.
@@ -189,69 +179,6 @@ const ALERT_LEVEL_FATAL: u8 = 2;
 /// re-verifies it against a real packet capture and swaps it out if reality
 /// disagrees.
 const ALERT_DESCRIPTION_BAD_CERTIFICATE: u8 = 42;
-
-/// What REALITY.4b verification needs out of the server's
-/// EncryptedExtensions/Certificate/CertificateVerify/Finished flight: the
-/// leaf certificate's raw DER, the byte offset in the flight at which the
-/// `CertificateVerify` message begins (the RFC 8446 §4.4.3 transcript
-/// boundary — everything strictly before this offset is
-/// `Transcript-Hash(ClientHello‥Certificate)`), and the `CertificateVerify`
-/// message's raw `signature` field.
-struct CertFlightInfo {
-    leaf_der: Vec<u8>,
-    certverify_start: usize,
-    signature: Vec<u8>,
-}
-
-/// Scans `hs_flight` (see [`find_finished_end`] for its shape — the
-/// concatenation of the server's decrypted post-`ServerHello` handshake
-/// messages) for the first `Certificate` message and the `CertificateVerify`
-/// message, extracting what [`verify_reality_binding`] needs from each.
-/// Fail-closed: a missing message, truncated field, or an out-of-bounds
-/// value is `Err(Error::RealityVerify(_))`; every access is bounds-checked
-/// (`.get`, never direct indexing past a validated point) so hostile bytes
-/// cannot panic this.
-fn scan_cert_flight(hs_flight: &[u8]) -> Result<CertFlightInfo, Error> {
-    let mut pos = 0;
-    let mut leaf_der: Option<Vec<u8>> = None;
-
-    while hs_flight.len() >= pos + 4 {
-        let msg_type = hs_flight[pos];
-        let len = (usize::from(hs_flight[pos + 1]) << 16)
-            | (usize::from(hs_flight[pos + 2]) << 8)
-            | usize::from(hs_flight[pos + 3]);
-        if len > MAX_HANDSHAKE_MSG_LEN {
-            return Err(Error::RealityVerify(
-                "server handshake message exceeds sane length bound",
-            ));
-        }
-        let body_start = pos + 4;
-        let msg_end = body_start + len;
-        let Some(body) = hs_flight.get(body_start..msg_end) else {
-            break; // not fully buffered — cannot happen on an already-complete flight
-        };
-
-        if msg_type == HS_TYPE_CERTIFICATE && leaf_der.is_none() {
-            leaf_der = Some(certificate_leaf_der(body)?);
-        }
-        if msg_type == HS_TYPE_CERTIFICATE_VERIFY {
-            let signature = certificate_verify_signature(body)?;
-            let leaf_der = leaf_der.ok_or(Error::RealityVerify(
-                "server flight is missing a Certificate message",
-            ))?;
-            return Ok(CertFlightInfo {
-                leaf_der,
-                certverify_start: pos,
-                signature,
-            });
-        }
-        pos = msg_end;
-    }
-
-    Err(Error::RealityVerify(
-        "server flight is missing a CertificateVerify message",
-    ))
-}
 
 /// REALITY.5a Task 2: what capturing a dest's server flight needs beyond
 /// [`scan_cert_flight`] (which REALITY.4b's verify path already relies on and
@@ -345,165 +272,6 @@ pub fn scan_flight_shape(hs_flight: &[u8]) -> Result<FlightShapeScan, Error> {
         cert_verify_len,
         finished_len,
     })
-}
-
-/// Extracts every `CertificateEntry`'s raw DER from a `Certificate` message
-/// body (RFC 8446 §4.4.2): `context_len(1) ‖ context ‖ list_len(3) ‖
-/// [cert_data_len(3) ‖ cert_data ‖ ext_len(2) ‖ ext]…`. Returns
-/// `(leaf_der, intermediates_der)` — the FIRST entry is the leaf, every
-/// SUBSEQUENT entry is returned verbatim, in chain order, as
-/// `intermediates_der`. Fail-closed on truncation, an empty list, or a leaf
-/// exceeding [`MAX_LEAF_CERT_DER_LEN`] — this bound is intentionally NOT
-/// applied to intermediates (real intermediate CA certs can legitimately run
-/// larger than a leaf), which are instead bounded by the already-enforced
-/// [`MAX_HANDSHAKE_MSG_LEN`]/[`MAX_SERVER_FLIGHT_LEN`] on the whole
-/// message/flight.
-fn certificate_chain_ders(body: &[u8]) -> Result<(Vec<u8>, Vec<Vec<u8>>), Error> {
-    let ctx_len = usize::from(
-        *body
-            .first()
-            .ok_or(Error::RealityVerify("truncated Certificate message"))?,
-    );
-    let list_len_start = 1 + ctx_len;
-    let list_len_bytes = body
-        .get(list_len_start..list_len_start + 3)
-        .ok_or(Error::RealityVerify("truncated Certificate message"))?;
-    let list_len = (usize::from(list_len_bytes[0]) << 16)
-        | (usize::from(list_len_bytes[1]) << 8)
-        | usize::from(list_len_bytes[2]);
-    let list_start = list_len_start + 3;
-    let list_end = list_start + list_len;
-    let list = body
-        .get(list_start..list_end)
-        .ok_or(Error::RealityVerify("truncated Certificate list"))?;
-
-    let mut entries: Vec<Vec<u8>> = Vec::new();
-    let mut i = 0;
-    while let Some(cd_len_bytes) = list.get(i..i + 3) {
-        let cd_len = (usize::from(cd_len_bytes[0]) << 16)
-            | (usize::from(cd_len_bytes[1]) << 8)
-            | usize::from(cd_len_bytes[2]);
-        let cert_start = i + 3;
-        let cert_end = cert_start + cd_len;
-        let cert_data = list
-            .get(cert_start..cert_end)
-            .ok_or(Error::RealityVerify("truncated certificate entry"))?;
-        let ext_len_bytes = list
-            .get(cert_end..cert_end + 2)
-            .ok_or(Error::RealityVerify(
-                "truncated certificate entry extensions",
-            ))?;
-        let ext_len = usize::from(u16::from_be_bytes([ext_len_bytes[0], ext_len_bytes[1]]));
-        let ext_start = cert_end + 2;
-        let ext_end = ext_start + ext_len;
-        if ext_end > list.len() {
-            return Err(Error::RealityVerify(
-                "truncated certificate entry extensions",
-            ));
-        }
-        entries.push(cert_data.to_vec());
-        i = ext_end;
-    }
-
-    let mut iter = entries.into_iter();
-    let leaf = iter
-        .next()
-        .ok_or(Error::RealityVerify("empty Certificate list"))?;
-    if leaf.is_empty() || leaf.len() > MAX_LEAF_CERT_DER_LEN {
-        return Err(Error::RealityVerify(
-            "leaf certificate length out of bounds",
-        ));
-    }
-    Ok((leaf, iter.collect()))
-}
-
-/// Extracts the first `CertificateEntry`'s raw DER (the leaf) from a
-/// `Certificate` message body (RFC 8446 §4.4.2): `context_len(1) ‖ context
-/// ‖ list_len(3) ‖ [cert_data_len(3) ‖ cert_data ‖ ext_len(2) ‖ ext]…`.
-/// Fail-closed on truncation, an empty list, or a leaf exceeding
-/// [`MAX_LEAF_CERT_DER_LEN`]. A thin wrapper over
-/// [`certificate_chain_ders`] (REALITY.5a), which does the identical walk
-/// but also returns any subsequent chain certs; [`scan_cert_flight`] (and,
-/// through it, REALITY.4b's verify path) only ever needs the leaf, so it
-/// keeps calling this narrower name.
-fn certificate_leaf_der(body: &[u8]) -> Result<Vec<u8>, Error> {
-    certificate_chain_ders(body).map(|(leaf, _intermediates)| leaf)
-}
-
-/// Extracts the `signature` field from a `CertificateVerify` message body
-/// (RFC 8446 §4.4.3): `algorithm(2) ‖ signature_len(2) ‖ signature`. The
-/// `algorithm` field is intentionally never returned — REALITY.4b hard-pins
-/// `ecdsa_secp256r1_sha256` and never reads/trusts the server's announced
-/// scheme (see [`verify_certificate_verify`]). Fail-closed on truncation or
-/// an empty signature.
-fn certificate_verify_signature(body: &[u8]) -> Result<Vec<u8>, Error> {
-    let sig_len_bytes = body
-        .get(2..4)
-        .ok_or(Error::RealityVerify("truncated CertificateVerify message"))?;
-    let sig_len = usize::from(u16::from_be_bytes([sig_len_bytes[0], sig_len_bytes[1]]));
-    let sig = body.get(4..4 + sig_len).ok_or(Error::RealityVerify(
-        "truncated CertificateVerify signature",
-    ))?;
-    if sig.is_empty() {
-        return Err(Error::RealityVerify("empty CertificateVerify signature"));
-    }
-    Ok(sig.to_vec())
-}
-
-/// Extracts the P-256 subject public key from a leaf certificate's DER (RFC
-/// 5280 `Certificate` → `TBSCertificate` → `SubjectPublicKeyInfo`), returned
-/// as uncompressed SEC1 bytes (`0x04 ‖ X ‖ Y`, 65 bytes) — the same encoding
-/// [`auth::derive_cert_key`]'s `public_sec1` uses, so the two can be
-/// compared byte-for-byte.
-///
-/// Walks the DER with the `der` crate's bounds-checked, panic-free reader
-/// (never hand-rolled ASN.1 length arithmetic on untrusted bytes):
-/// `TBSCertificate`'s fields are read sequentially — `[0] EXPLICIT Version`
-/// is OPTIONAL (default v1), so it is skipped only when present, otherwise
-/// the field just peeked at IS `serialNumber` — up through
-/// `subjectPublicKeyInfo`, whose raw TLV is handed to
-/// [`p256::ecdsa::VerifyingKey::from_public_key_der`]. That call itself
-/// fail-closes on "not an EC key", "not the P-256 curve OID", and "not a
-/// valid point on the curve" — this function does not duplicate any of
-/// those checks.
-fn spki_sec1_pubkey_from_der(cert_der: &[u8]) -> Result<Vec<u8>, Error> {
-    use der::{AnyRef, Decode, Reader, SliceReader, Tag, Tagged};
-    use p256::pkcs8::DecodePublicKey;
-
-    let bad_der = || Error::RealityVerify("leaf certificate is not valid DER");
-
-    let mut top = SliceReader::new(cert_der).map_err(|_| bad_der())?;
-    let cert_any = AnyRef::decode(&mut top).map_err(|_| bad_der())?;
-    if cert_any.tag() != Tag::Sequence {
-        return Err(bad_der());
-    }
-
-    let mut cert_body = SliceReader::new(cert_any.value()).map_err(|_| bad_der())?;
-    let tbs_any = AnyRef::decode(&mut cert_body).map_err(|_| bad_der())?;
-    if tbs_any.tag() != Tag::Sequence {
-        return Err(bad_der());
-    }
-
-    let mut tbs = SliceReader::new(tbs_any.value()).map_err(|_| bad_der())?;
-
-    // version [0] EXPLICIT is OPTIONAL; if present, consume+discard it — the
-    // NEXT field is then serialNumber. If absent, the field already peeked
-    // at (still unconsumed) IS serialNumber.
-    let first_tag = der::Tag::peek(&tbs).map_err(|_| bad_der())?;
-    if first_tag.is_context_specific() {
-        tbs.tlv_bytes().map_err(|_| bad_der())?; // version
-    }
-    tbs.tlv_bytes().map_err(|_| bad_der())?; // serialNumber
-    tbs.tlv_bytes().map_err(|_| bad_der())?; // signature AlgorithmIdentifier
-    tbs.tlv_bytes().map_err(|_| bad_der())?; // issuer
-    tbs.tlv_bytes().map_err(|_| bad_der())?; // validity
-    tbs.tlv_bytes().map_err(|_| bad_der())?; // subject
-    let spki_der = tbs.tlv_bytes().map_err(|_| bad_der())?; // subjectPublicKeyInfo
-
-    let vk = p256::ecdsa::VerifyingKey::from_public_key_der(spki_der).map_err(|_| {
-        Error::RealityVerify("leaf certificate's public key is not a valid P-256 SPKI")
-    })?;
-    Ok(vk.to_sec1_point(false).as_bytes().to_vec())
 }
 
 /// Verify a TLS 1.3 server `CertificateVerify` for REALITY.4b: the leaf's
