@@ -598,7 +598,7 @@ impl PeerConn {
     pub(crate) fn drive_handshake(
         &mut self,
         now: Instant,
-        was_established: bool,
+        is_peer_established: bool,
     ) -> io::Result<bool> {
         let (done, err) = match self {
             Self::Connecting { stream, .. } => match stream.do_handshake() {
@@ -629,7 +629,7 @@ impl PeerConn {
                     reader: FrameReader::default(),
                     start: now,
                     inner_confirmed: false,
-                    was_established,
+                    was_established: is_peer_established,
                 };
                 return Ok(true);
             }
@@ -658,7 +658,9 @@ pub(crate) fn try_connect(
 
     match sock.connect(&peer_addr.into()) {
         Ok(()) => {}
-        Err(e) if e.raw_os_error() == Some(115) || e.kind() == io::ErrorKind::WouldBlock => {}
+        Err(e)
+            if e.raw_os_error() == Some(libc::EINPROGRESS)
+                || e.kind() == io::ErrorKind::WouldBlock => {}
         Err(e) => return Err(e),
     }
 
@@ -783,7 +785,7 @@ fn find_server_peer_idx(peers: &[PeerSlot], accepted_from: SocketAddr) -> Option
     }
     peers
         .iter()
-        .position(|p| p.role == Role::Server && !p.conn.is_connected())
+        .position(|p| p.role == Role::Server && p.conn.is_disconnected())
 }
 
 fn teardown_peer(idx: usize, peers: &mut [PeerSlot], poller: &Epoll, now: Instant) {
@@ -809,18 +811,20 @@ fn route_egress_to_peers(
     let mut write_buf = Vec::new();
     for d in egress {
         if let Some(idx) = peers.iter().position(|p| p.addr == d.dst) {
-            if let Some(stream) = peers[idx].conn.stream_mut() {
-                write_buf.clear();
-                if let Err(e) = frame_datagram(&d.bytes, &mut write_buf) {
-                    eprintln!("tls: framing error for peer {}: {e}", d.dst);
-                    continue;
-                }
-                if let Err(e) = write_all_tls(stream, poller, &write_buf) {
-                    eprintln!(
-                        "tls: connection write error for peer {}, tearing down: {e}",
-                        d.dst
-                    );
-                    teardown_peer(idx, peers, poller, now);
+            if peers[idx].conn.is_connected() {
+                if let Some(stream) = peers[idx].conn.stream_mut() {
+                    write_buf.clear();
+                    if let Err(e) = frame_datagram(&d.bytes, &mut write_buf) {
+                        eprintln!("tls: framing error for peer {}: {e}", d.dst);
+                        continue;
+                    }
+                    if let Err(e) = write_all_tls(stream, poller, &write_buf) {
+                        eprintln!(
+                            "tls: connection write error for peer {}, tearing down: {e}",
+                            d.dst
+                        );
+                        teardown_peer(idx, peers, poller, now);
+                    }
                 }
             } else {
                 eprintln!(
@@ -882,7 +886,6 @@ pub(crate) fn pump<M: TlsDispatch>(
                 let peer_addr = peer.addr;
                 match try_connect(peer_addr, tls_sni) {
                     Ok(mut stream) => {
-                        let was_est = peer.conn.was_established().unwrap_or(false);
                         let finished = match stream.do_handshake() {
                             Ok(()) => true,
                             Err(e)
@@ -907,7 +910,7 @@ pub(crate) fn pump<M: TlsDispatch>(
                                 reader: FrameReader::default(),
                                 start: now,
                                 inner_confirmed: false,
-                                was_established: was_est,
+                                was_established: manager.is_peer_established(&peer.public_key),
                             };
                         } else {
                             peer.conn = PeerConn::Connecting { stream, start: now };
@@ -957,10 +960,11 @@ pub(crate) fn pump<M: TlsDispatch>(
                                 let _ = tcp.set_nodelay(true);
                                 let _ = set_nonblocking(tcp.as_raw_fd());
                                 if let Some(idx) = find_server_peer_idx(peers, accepted_from) {
+                                    if !peers[idx].conn.is_disconnected() {
+                                        teardown_peer(idx, peers, poller, now);
+                                    }
                                     match try_accept(acceptor, tcp) {
                                         Ok(mut stream) => {
-                                            let was_est =
-                                                peers[idx].conn.was_established().unwrap_or(false);
                                             let finished = match stream.do_handshake() {
                                                 Ok(()) => true,
                                                 Err(e)
@@ -989,7 +993,9 @@ pub(crate) fn pump<M: TlsDispatch>(
                                                     reader: FrameReader::default(),
                                                     start: now,
                                                     inner_confirmed: false,
-                                                    was_established: was_est,
+                                                    was_established: manager.is_peer_established(
+                                                        &peers[idx].public_key,
+                                                    ),
                                                 };
                                             } else {
                                                 peers[idx].conn =
@@ -1037,8 +1043,8 @@ pub(crate) fn pump<M: TlsDispatch>(
                 let idx = (token - TOKEN_PEER_BASE) as usize;
                 if idx < peers.len() {
                     if peers[idx].conn.is_connecting() {
-                        let was_est = peers[idx].conn.was_established().unwrap_or(false);
-                        match peers[idx].conn.drive_handshake(now, was_est) {
+                        let is_est = manager.is_peer_established(&peers[idx].public_key);
+                        match peers[idx].conn.drive_handshake(now, is_est) {
                             Ok(true) => {}
                             Ok(false) => {}
                             Err(e) => {
@@ -1102,8 +1108,8 @@ pub(crate) fn pump<M: TlsDispatch>(
         // 5. Advance in-flight handshakes for any connecting peers on tick.
         for idx in 0..peers.len() {
             if peers[idx].conn.is_connecting() {
-                let was_est = peers[idx].conn.was_established().unwrap_or(false);
-                match peers[idx].conn.drive_handshake(now, was_est) {
+                let is_est = manager.is_peer_established(&peers[idx].public_key);
+                match peers[idx].conn.drive_handshake(now, is_est) {
                     Ok(true) => {}
                     Ok(false) => {}
                     Err(e) => {
@@ -1874,7 +1880,7 @@ mod tests {
         let t0 = Instant::now();
         let deadline = Instant::now() + Duration::from_secs(2);
         while conn.is_connecting() && Instant::now() < deadline {
-            let _ = conn.drive_handshake(t0, false);
+            let _ = conn.drive_handshake(t0, true);
             std::thread::sleep(Duration::from_millis(10));
         }
 
@@ -1882,6 +1888,7 @@ mod tests {
             conn.is_connected(),
             "connection should transition to Connected"
         );
+        assert_eq!(conn.was_established(), Some(true));
         let _server_stream = server.join().expect("server join");
     }
 
@@ -2037,5 +2044,74 @@ mod tests {
         let mut buf1 = [0u8; 128];
         let res1 = stream_remote_1.ssl_read(&mut buf1);
         assert!(res1.is_err(), "Peer 1 must receive no egress: {res1:?}");
+    }
+
+    #[test]
+    fn find_server_peer_idx_never_stomps_connecting_handshake() {
+        let now = Instant::now();
+        let pub1 = [1u8; 32];
+        let pub2 = [2u8; 32];
+        let addr1: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let addr2: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+
+        // Slot 0 is in Connecting state (TLS handshake in-flight)
+        // Slot 1 is Disconnected
+        let (stream1, _server, _addr) = loopback_tls_pair("example.test");
+        let peers = vec![
+            PeerSlot {
+                public_key: pub1,
+                addr: addr1,
+                role: Role::Server,
+                conn: PeerConn::Connecting {
+                    stream: stream1,
+                    start: now,
+                },
+            },
+            PeerSlot {
+                public_key: pub2,
+                addr: addr2,
+                role: Role::Server,
+                conn: PeerConn::new_disconnected(now),
+            },
+        ];
+
+        // An unknown IP arrives: Rule 3 must pick Slot 1 (Disconnected), NOT Slot 0 (Connecting)
+        let unknown: SocketAddr = "10.0.0.99:9999".parse().unwrap();
+        assert_eq!(find_server_peer_idx(&peers, unknown), Some(1));
+
+        // If only Slot 0 exists and is Connecting, Rule 3 returns None (does not stomp)
+        assert_eq!(find_server_peer_idx(&peers[..1], unknown), None);
+    }
+
+    #[test]
+    fn route_egress_drops_if_peer_is_connecting() {
+        let now = Instant::now();
+        let poller = Epoll::create().expect("epoll create");
+        let (mut stream_remote, stream_local, addr) = loopback_tls_pair("example.test");
+
+        let mut slots = vec![PeerSlot {
+            public_key: [1u8; 32],
+            addr,
+            role: Role::Client,
+            conn: PeerConn::Connecting {
+                stream: stream_local,
+                start: now,
+            },
+        }];
+
+        let egress = vec![EgressDatagram {
+            dst: addr,
+            fate: 0,
+            bytes: b"should-be-dropped-while-connecting".to_vec(),
+        }];
+
+        // Must succeed without writing into connecting stream
+        route_egress_to_peers(&egress, &mut slots, &poller, now).expect("route egress");
+
+        // Remote stream must have nothing to read
+        stream_remote.get_ref().set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 128];
+        let res = stream_remote.ssl_read(&mut buf);
+        assert!(res.is_err(), "remote must receive no data while connecting");
     }
 }
