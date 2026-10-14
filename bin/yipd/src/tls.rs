@@ -30,18 +30,14 @@
 //!   handshake, FEC, AEAD, cert admission and anti-hijack exactly as on the raw
 //!   path — this module is purely the transport.
 //!
-//! # Architecture: single-connection `run_tls` pump
+//! # Architecture: multi-peer `run_tls` pump
 //!
-//! Unlike `run_quic` (one `Endpoint` multiplexing many peer connections),
-//! [`run_tls`] is scoped to a **single** active TCP+TLS connection: the small
-//! safe [`Epoll`] primitive this pump uses (so all `unsafe` stays in `yip-io`
-//! and `yipd` keeps `#![forbid(unsafe_code)]`) watches exactly two fds, and a
-//! TCP socket's fd is not stable across reconnects the way a UDP socket's is.
+//! [`run_tls`] multiplexes multiple active TCP+TLS peer connections alongside the
+//! TUN device using dynamic epoll registration in `yip-io`.
 //! yip is peer-to-peer, so a deterministic role-by-static-key-order tiebreak
-//! (mirroring 3c.1) keeps it to one connection: the peer with the **smaller**
-//! `local_public` is the TCP **client**; the **larger** is the **server**.
-//! Multi-peer TLS mesh (more than one TLS-transport peer) is a documented
-//! follow-up — see the `TODO(3c.2 follow-up)` in [`run_tls`].
+//! (mirroring 3c.1) assigns roles: for each configured peer, the side with the
+//! **smaller** `local_public` is the TCP **client**; the side with the **larger**
+//! is the **server**.
 //!
 //! # Non-blocking BoringSSL (`WANT_READ`/`WANT_WRITE`)
 //!
@@ -163,16 +159,15 @@ pub(crate) const MAX_BACKOFF_MS: u64 = 5_000;
 
 /// Maximum wall-clock a single TLS handshake may take before it is abandoned.
 /// Without this bound a peer that opens a TCP connection and then stalls (never
-/// sending its next handshake flight) would pin `run_tls`'s single connection
-/// slot indefinitely — an off-path, zero-crypto DoS, since the outer TLS is
-/// zero-auth and `run_tls` serves one connection at a time. On timeout the
+/// sending its next handshake flight) would pin a connection slot indefinitely —
+/// an off-path, zero-crypto DoS, since the outer TLS is zero-auth. On timeout the
 /// connection is dropped and the server re-accepts (or the client re-dials).
 /// `pub(crate)`: also used by `crate::relay_client::spawn`'s connect path.
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum wall-clock time allowed for the inner Noise-IK handshake to complete
 /// after outer TLS connection establishment. If no established session is confirmed
-/// within this deadline, the connection is torn down so the single connection slot
+/// within this deadline, the connection is torn down so the peer slot
 /// can be restored / retried.
 pub(crate) const INNER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -1331,8 +1326,8 @@ mod tests {
     /// A peer that accepts the TCP connection but never speaks TLS must not pin
     /// the handshake open forever: `drive_handshake` must abandon it at its
     /// deadline so `run_tls` can reconnect / re-accept. This is the regression
-    /// guard for the single-connection accept-DoS — an idle connect cannot hold
-    /// the one connection slot indefinitely.
+    /// guard for the handshake accept-DoS — an idle connect cannot hold
+    /// the connection slot indefinitely.
     #[test]
     fn drive_handshake_times_out_against_a_silent_peer() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
@@ -1375,7 +1370,7 @@ mod tests {
 
     /// A completed outer TLS connection where the peer sends no inner Noise-IK
     /// packets must tear down after `inner_timeout`, returning `Ok(())`
-    /// so the single connection slot can be recycled.
+    /// so the connection slot can be recycled.
     #[test]
     fn drive_inner_handshake_timeout_on_idle_stream() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
