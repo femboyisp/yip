@@ -22,7 +22,7 @@ jobs:
       # taiki-e/install-action is not mirrored on this Forgejo instance.
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
-      - name: Coverage (logic crates; uring driver netns-gated)
+      - name: Coverage (logic crates + yipd control plane; root/netns files regex-excluded)
         # Same reason as the `build-test` job in ci.yml: this job runs as root in
         # a container with no netns/`ip` tooling, so `is_root()` returns true and
         # the root-gated netns/netem harness tests try to run for real and die on
@@ -37,6 +37,6 @@ jobs:
           YIP_SKIP_PRIVILEGED_TESTS: "1"
         run: >
           cargo llvm-cov --workspace
-          --exclude yip-device --exclude yipd
-          --ignore-filename-regex '.*/(uring|rs_simd)\.rs$'
+          --exclude yip-device
+          --ignore-filename-regex '.*/(uring|rs_simd|tunnel|main|sharding)\.rs$'
           --fail-under-lines 90 --summary-only
