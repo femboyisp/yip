@@ -301,6 +301,18 @@ impl RendezvousServer {
                 }
                 Vec::new()
             }
+            Message::RegisterAuth { node, counter, mac } => {
+                self.regs.insert(
+                    node,
+                    Reg {
+                        addr: src,
+                        expiry_ms: now_ms.saturating_add(REG_TTL_MS),
+                        last_counter: counter,
+                        record: None,
+                    },
+                );
+                vec![(src, Message::RegisterAuth { node, counter, mac })]
+            }
             Message::Lookup { node } => match self.regs.get(&node) {
                 Some(reg) if reg.expiry_ms > now_ms => {
                     let peer_addr = reg.addr;
@@ -1235,5 +1247,23 @@ mod tests {
             )],
             "future seq record must not be registered"
         );
+    }
+
+    #[test]
+    fn test_server_handle_register_auth() {
+        let mut s = RendezvousServer::new(0);
+        let src = addr("198.51.100.7:41000");
+        let node = [42u8; 16];
+        let counter = 1234u64;
+        let mac = [0x99u8; 16];
+        let msg = Message::RegisterAuth { node, counter, mac };
+        let out = s.handle(src, msg.clone(), 100, 10);
+        assert_eq!(out, vec![(src, msg)]);
+
+        // Verify that the node is now registered and lookup works
+        let lookup_src = addr("203.0.113.9:52000");
+        let lookup_out = s.handle(lookup_src, Message::Lookup { node }, 200, 10);
+        assert!(lookup_out.iter().any(|(d, m)| *d == lookup_src
+            && matches!(m, Message::PeerInfo { node: n, reflexive, record: None } if *n == node && *reflexive == src)));
     }
 }
