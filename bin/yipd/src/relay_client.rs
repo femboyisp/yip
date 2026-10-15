@@ -98,12 +98,13 @@ impl Counter {
     }
 }
 
-/// Build the framed `[u16 len][obf(RDV_TYPE, Register{node,counter})]` bytes.
+/// Build the framed `[u16 len][obf(RDV_TYPE, RegisterAuth{node,counter,mac})]` bytes.
 pub(crate) fn build_register(obf_key: &[u8; 16], node: NodeId, counter: u64) -> Vec<u8> {
+    let mac = yip_rendezvous::compute_register_mac(obf_key, &node, counter);
     let mut plain = Vec::new();
-    encode(&Message::Register { node, counter }, &mut plain);
+    encode(&Message::RegisterAuth { node, counter, mac }, &mut plain);
     let env = yip_obf::obfuscate(obf_key, yip_obf::RDV_TYPE, &plain, 0)
-        .expect("Register body is a small fixed-shape RDV message, always fits u16");
+        .expect("RegisterAuth body fits u16");
     let mut out = Vec::new();
     crate::tls::frame_datagram(&env, &mut out).expect("register envelope within frame cap");
     out
@@ -835,19 +836,23 @@ mod tests {
     }
 
     #[test]
-    fn register_frame_deobfuscates_to_fresh_register() {
-        let key = yip_obf::derive_key(&[9u8; 32]);
+    fn register_frame_deobfuscates_to_fresh_register_auth() {
+        let key = yip_obf::derive_key(&[7u8; 32]);
         let node = yip_rendezvous::node_id(&[1u8; 32]);
         let framed = build_register(&key, node, 1);
-        // Strip the [u16 len] TLS frame, then deobf + decode.
-        let mut r = crate::tls::FrameReader::default();
-        r.push(&framed);
-        let env = r.next().unwrap().unwrap();
-        let (pt, body) = yip_obf::deobfuscate(&key, &env).unwrap();
+        let len = u16::from_be_bytes([framed[0], framed[1]]) as usize;
+        let env = &framed[2..2 + len];
+        let (pt, body) = yip_obf::deobfuscate(&key, env).expect("deobfuscates");
         assert_eq!(pt, yip_obf::RDV_TYPE);
+        let msg = yip_rendezvous::decode(&body);
+        let mac = yip_rendezvous::compute_register_mac(&key, &node, 1);
         assert_eq!(
-            yip_rendezvous::decode(&body),
-            Some(yip_rendezvous::Message::Register { node, counter: 1 })
+            msg,
+            Some(yip_rendezvous::Message::RegisterAuth {
+                node,
+                counter: 1,
+                mac
+            })
         );
     }
 
@@ -910,16 +915,21 @@ mod tests {
             other => panic!("expected RegisterSigned, got {other:?}"),
         }
 
-        // Frame without signer produces bare Register
+        // Frame without signer produces RegisterAuth
         let framed_bare = build_registration_frame(&key, node, 42, None);
         let mut r = crate::tls::FrameReader::default();
         r.push(&framed_bare);
         let env = r.next().unwrap().unwrap();
         let (pt, body) = yip_obf::deobfuscate(&key, &env).unwrap();
         assert_eq!(pt, yip_obf::RDV_TYPE);
+        let mac = yip_rendezvous::compute_register_mac(&key, &node, 42);
         assert_eq!(
             yip_rendezvous::decode(&body),
-            Some(yip_rendezvous::Message::Register { node, counter: 42 })
+            Some(yip_rendezvous::Message::RegisterAuth {
+                node,
+                counter: 42,
+                mac
+            })
         );
     }
 
@@ -1100,10 +1110,10 @@ mod tests {
             let acceptor = crate::tls::build_server_acceptor(sni).expect("server acceptor");
             let mut stream = acceptor.accept(tcp).expect("server handshake");
 
-            // The FIRST frame this stub relay reads MUST be a fresh Register
+            // The FIRST frame this stub relay reads MUST be a fresh RegisterAuth
             // — that is the whole point of the Register-first invariant. The
             // counter is now wall-clock-seeded (FIX 2), so only its shape
-            // (a Register for the right node, with a positive counter) is
+            // (a RegisterAuth for the right node, with a positive counter) is
             // checked, not an exact value.
             let mut reader = FrameReader::default();
             let env = blocking_read_one_tls(&mut stream, &mut reader);
@@ -1111,12 +1121,17 @@ mod tests {
                 yip_obf::deobfuscate(&obf_key, &env).expect("deobfuscate register envelope");
             assert_eq!(ptype, yip_obf::RDV_TYPE);
             match yip_rendezvous::decode(&body) {
-                Some(yip_rendezvous::Message::Register { node, counter }) => {
+                Some(yip_rendezvous::Message::RegisterAuth { node, counter, mac }) => {
                     assert_eq!(node, self_node);
                     assert!(counter > 0, "seeded counter must be positive");
+                    assert!(yip_rendezvous::verify_register_mac(
+                        &obf_key, &node, counter, &mac
+                    ));
                 }
                 other => {
-                    panic!("first frame from the client must be a fresh Register, got {other:?}")
+                    panic!(
+                        "first frame from the client must be a fresh RegisterAuth, got {other:?}"
+                    )
                 }
             }
 

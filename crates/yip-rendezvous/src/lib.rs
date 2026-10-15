@@ -6,5 +6,7 @@
 pub mod proto;
 pub mod server;
 
-pub use proto::{decode, encode, node_id, Message, NodeId};
+pub use proto::{
+    compute_register_mac, decode, encode, node_id, verify_register_mac, Message, NodeId,
+};
 pub use server::RendezvousServer;

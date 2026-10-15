@@ -22,6 +22,33 @@ pub fn node_id(pubkey: &[u8; 32]) -> NodeId {
     out
 }
 
+const DOMAIN_REG_AUTH: &[u8] = b"yip-rendezvous-v1-reg-auth";
+
+/// Compute a 128-bit BLAKE2s-MAC for authenticated rootless rendezvous registration.
+pub fn compute_register_mac(obf_key: &[u8; 16], node: &NodeId, counter: u64) -> [u8; 16] {
+    let mut h = Blake2sVar::new(16).expect("16 is a valid blake2s output len");
+    h.update(DOMAIN_REG_AUTH);
+    h.update(obf_key);
+    h.update(node);
+    h.update(&counter.to_be_bytes());
+    let mut out = [0u8; 16];
+    h.finalize_variable(&mut out).expect("len matches");
+    out
+}
+
+/// Constant-time verification of `mac` against the expected BLAKE2s-MAC.
+pub fn verify_register_mac(
+    obf_key: &[u8; 16],
+    node: &NodeId,
+    counter: u64,
+    mac: &[u8; 16],
+) -> bool {
+    use subtle::ConstantTimeEq;
+
+    let expected = compute_register_mac(obf_key, node, counter);
+    expected.ct_eq(mac).into()
+}
+
 /// Message-type discriminants (the only permitted `as u8` in this crate).
 #[repr(u8)]
 enum Tag {
@@ -33,6 +60,7 @@ enum Tag {
     RelaySend = 5,
     RelayDeliver = 6,
     RegisterSigned = 7,
+    RegisterAuth = 8,
 }
 
 /// A rendezvous/relay control message. See the 2b spec for direction/semantics.
@@ -76,6 +104,13 @@ pub enum Message {
     /// itself rather than trusting an unauthenticated `counter`.
     RegisterSigned {
         record: Record,
+    },
+    /// A symmetric MAC-authenticated registration for rootless relay/rendezvous:
+    /// verified via `verify_register_mac` under `obf_psk` to prevent false upgrades.
+    RegisterAuth {
+        node: NodeId,
+        counter: u64,
+        mac: [u8; 16],
     },
 }
 
@@ -186,6 +221,12 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) {
             out.push(Tag::RegisterSigned as u8);
             put_record(out, record);
         }
+        Message::RegisterAuth { node, counter, mac } => {
+            out.push(Tag::RegisterAuth as u8);
+            out.extend_from_slice(node);
+            out.extend_from_slice(&counter.to_be_bytes());
+            out.extend_from_slice(mac);
+        }
     }
 }
 
@@ -250,6 +291,15 @@ pub fn decode(buf: &[u8]) -> Option<Message> {
         t if t == Tag::RegisterSigned as u8 => {
             let (record, _) = take_record(rest)?;
             Some(Message::RegisterSigned { record })
+        }
+        t if t == Tag::RegisterAuth as u8 => {
+            if rest.len() != 40 {
+                return None;
+            }
+            let node = node16(rest)?;
+            let counter = u64::from_be_bytes(rest.get(16..24)?.try_into().ok()?);
+            let mac: [u8; 16] = rest.get(24..40)?.try_into().ok()?;
+            Some(Message::RegisterAuth { node, counter, mac })
         }
         _ => None,
     }
@@ -319,6 +369,11 @@ mod tests {
         roundtrip(Message::RelayDeliver {
             src: n,
             payload: vec![1, 2, 3, 4],
+        });
+        roundtrip(Message::RegisterAuth {
+            node: n,
+            counter: 42,
+            mac: [0xaa; 16],
         });
     }
 
@@ -474,5 +529,74 @@ mod tests {
         buf.extend_from_slice(&0xFFFFu16.to_be_bytes()); // claims 65535 bytes
         buf.extend_from_slice(&[0u8; 4]); // far fewer bytes actually follow
         assert_eq!(decode(&buf), None);
+    }
+
+    #[test]
+    fn test_compute_register_mac_kat_and_verify() {
+        let key = [0x42u8; 16];
+        let node = node_id(&[0x11u8; 32]);
+        let counter = 12345u64;
+        let mac = compute_register_mac(&key, &node, counter);
+        assert_ne!(mac, [0u8; 16]);
+        assert!(verify_register_mac(&key, &node, counter, &mac));
+
+        // Tampered key
+        let bad_key = [0x43u8; 16];
+        assert!(!verify_register_mac(&bad_key, &node, counter, &mac));
+
+        // Tampered node
+        let bad_node = node_id(&[0x22u8; 32]);
+        assert!(!verify_register_mac(&key, &bad_node, counter, &mac));
+
+        // Tampered counter
+        assert!(!verify_register_mac(&key, &node, counter + 1, &mac));
+
+        // Tampered mac byte
+        let mut bad_mac = mac;
+        bad_mac[0] ^= 1;
+        assert!(!verify_register_mac(&key, &node, counter, &bad_mac));
+    }
+
+    #[test]
+    fn test_register_auth_encode_decode_roundtrip() {
+        let node = node_id(&[0x55u8; 32]);
+        let counter = 9999u64;
+        let mac = [0x77u8; 16];
+        let msg = Message::RegisterAuth { node, counter, mac };
+        let mut buf = Vec::new();
+        encode(&msg, &mut buf);
+        assert_eq!(buf.len(), 1 + 16 + 8 + 16);
+        assert_eq!(buf[0], 8);
+        let decoded = decode(&buf).expect("decodes RegisterAuth");
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn register_auth_rejects_trailing_garbage_or_truncation() {
+        let node = node_id(&[0x55u8; 32]);
+        let counter = 9999u64;
+        let mac = [0x77u8; 16];
+        let msg = Message::RegisterAuth { node, counter, mac };
+        let mut buf = Vec::new();
+        encode(&msg, &mut buf);
+        assert_eq!(decode(&buf), Some(msg));
+
+        // Trailing garbage
+        let mut with_trailing = buf.clone();
+        with_trailing.push(0x00);
+        assert_eq!(
+            decode(&with_trailing),
+            None,
+            "trailing garbage must be rejected"
+        );
+
+        // Truncation
+        let mut truncated = buf;
+        truncated.pop();
+        assert_eq!(
+            decode(&truncated),
+            None,
+            "truncated datagram must be rejected"
+        );
     }
 }

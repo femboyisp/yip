@@ -2344,6 +2344,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.4.3",
  "rand_core",
+ "subtle",
  "yip-membership",
 ]
 
