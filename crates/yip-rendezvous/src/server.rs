@@ -1260,4 +1260,199 @@ mod tests {
         let lookup_out = s.handle(lookup_src, Message::Lookup { node }, 200, 10);
         assert_eq!(lookup_out, vec![(lookup_src, Message::NotFound { node })]);
     }
+
+    #[test]
+    fn test_server_forwarded_handle() {
+        let s = RendezvousServer::new(0);
+        assert_eq!(s.forwarded_count(), 0);
+        let handle = s.forwarded_handle();
+        handle.fetch_add(5, Ordering::Relaxed);
+        assert_eq!(s.forwarded_count(), 5);
+        s.record_relay_forward();
+        assert_eq!(s.forwarded_count(), 6);
+    }
+
+    #[test]
+    fn test_server_roots_cfg_getter() {
+        let s_rootless = RendezvousServer::new(0);
+        assert!(s_rootless.roots_cfg().is_none());
+
+        let ca_pubs = vec![[7u8; 32]];
+        let net_id = [9u8; 16];
+        let s_rooted = RendezvousServer::new_with_roots(0, ca_pubs.clone(), net_id);
+        let roots = s_rooted.roots_cfg().expect("roots_cfg should be Some");
+        assert_eq!(roots.0, ca_pubs);
+        assert_eq!(roots.1, net_id);
+    }
+
+    #[test]
+    fn test_server_is_registered_boundary() {
+        let mut s = RendezvousServer::new(0);
+        let node = [1u8; 16];
+        let now = 1_000;
+        s.register_if_fresh(node, 1, addr("192.0.2.1:1234"), now);
+        // Expiry is now + 60_000 = 61_000
+        assert!(s.is_registered(&node, 60_999));
+        assert!(!s.is_registered(&node, 61_000));
+        assert!(!s.is_registered(&node, 61_001));
+    }
+
+    #[test]
+    fn test_server_sweep() {
+        let mut s = RendezvousServer::new(0);
+        let node1 = [1u8; 16];
+        let node2 = [2u8; 16];
+        let src = addr("192.0.2.1:1234");
+        s.register_if_fresh(node1, 1, src, 1_000);
+        s.register_if_fresh_tls(node2, 1, 1_000);
+        // Populate rates map
+        s.handle(src, Message::Lookup { node: node1 }, 1_000, 1);
+        assert_eq!(s.rates.len(), 1);
+        assert_eq!(s.tls_seen.len(), 1);
+        assert!(s.is_registered(&node1, 1_000));
+
+        // Sweep before rate window expiry (1_000 + 1_000 = 2_000)
+        s.sweep(1_999);
+        assert_eq!(s.rates.len(), 1); // 999 < 1000 -> retained
+        assert_eq!(s.tls_seen.len(), 1);
+
+        // Sweep at rate window expiry: 2000 - 1000 = 1000, not < 1000 -> evicted
+        s.sweep(2_000);
+        assert_eq!(s.rates.len(), 0);
+        assert_eq!(s.tls_seen.len(), 1);
+
+        // Sweep before tls_seen expiry (61_000)
+        s.sweep(60_999);
+        assert_eq!(s.tls_seen.len(), 1);
+        assert_eq!(s.regs.len(), 1);
+
+        // Sweep at exact expiry (61_000): 61000 > 61000 is false -> evicted
+        s.sweep(61_000);
+        assert_eq!(s.tls_seen.len(), 0);
+        assert_eq!(s.regs.len(), 0);
+        assert!(!s.is_registered(&node1, 1_000));
+    }
+
+    #[test]
+    fn test_register_if_fresh_expiry_boundaries() {
+        let mut s = RendezvousServer::new(0);
+        let node = [1u8; 16];
+        let src = addr("192.0.2.1:1234");
+        assert!(s.register_if_fresh(node, 10, src, 1_000));
+        // Expiry is 61_000.
+        // If now is 60_999, same counter 10 is rejected as replay:
+        assert!(!s.register_if_fresh(node, 10, src, 60_999));
+        // If now is 61_000 (expired), counter 10 is accepted because it has expired:
+        assert!(s.register_if_fresh(node, 10, src, 61_000));
+
+        // Test TLS variant:
+        let node_tls = [2u8; 16];
+        assert!(s.register_if_fresh_tls(node_tls, 10, 1_000));
+        assert!(!s.register_if_fresh_tls(node_tls, 10, 60_999));
+        assert!(s.register_if_fresh_tls(node_tls, 10, 61_000));
+    }
+
+    #[test]
+    fn test_verify_signed_record_boundaries() {
+        let network_id = [9u8; 16];
+        let ca = ca_signing_key();
+        let ca_pub = ca.verifying_key().to_bytes();
+        let ca_pubs = vec![ca_pub];
+        let s = RendezvousServer::new_with_roots(0, ca_pubs, network_id);
+
+        let member_pub = [1u8; 32];
+        let member_sign_key = SigningKey::generate(&mut UnwrapErr(SysRng));
+        let member_sign_pub = member_sign_key.verifying_key().to_bytes();
+        let cert = mk_cert(&ca, member_pub, member_sign_pub, network_id);
+        let member_sign_priv: [u8; 32] = member_sign_key.to_bytes();
+
+        let now_s = 100_000;
+        let now_ms = now_s * 1000;
+        let skew_ms = REGISTRATION_SKEW_SECS * 1000;
+        let min_seq = now_ms - (REG_TTL_MS + skew_ms);
+        let max_seq = now_ms + skew_ms;
+
+        // Exactly at min_seq
+        let rec_min = build_signed_record(
+            cert.clone(),
+            vec![addr("192.0.2.1:9")],
+            min_seq,
+            &member_sign_priv,
+        );
+        assert!(s.verify_signed_record(&rec_min, now_s));
+
+        // Just below min_seq
+        let rec_below = build_signed_record(
+            cert.clone(),
+            vec![addr("192.0.2.1:9")],
+            min_seq - 1,
+            &member_sign_priv,
+        );
+        assert!(!s.verify_signed_record(&rec_below, now_s));
+
+        // Exactly at max_seq
+        let rec_max = build_signed_record(
+            cert.clone(),
+            vec![addr("192.0.2.1:9")],
+            max_seq,
+            &member_sign_priv,
+        );
+        assert!(s.verify_signed_record(&rec_max, now_s));
+
+        // Just above max_seq
+        let rec_above = build_signed_record(
+            cert,
+            vec![addr("192.0.2.1:9")],
+            max_seq + 1,
+            &member_sign_priv,
+        );
+        assert!(!s.verify_signed_record(&rec_above, now_s));
+    }
+
+    #[test]
+    fn test_handle_lookup_and_relay_expiry_boundary() {
+        let mut s = RendezvousServer::new(0);
+        let node = [1u8; 16];
+        let src = addr("192.0.2.1:1234");
+        s.register_if_fresh(node, 1, src, 1_000);
+        // Expiry is 61_000
+
+        // At 60_999 (unexpired):
+        let lookup_ok = s.handle(addr("192.0.2.2:5000"), Message::Lookup { node }, 60_999, 60);
+        assert!(matches!(
+            lookup_ok.first(),
+            Some((_, Message::PeerInfo { .. }))
+        ));
+
+        let relay_ok = s.handle(
+            addr("192.0.2.2:5000"),
+            Message::RelaySend {
+                src: [2u8; 16],
+                dst: node,
+                payload: vec![1, 2],
+            },
+            60_999,
+            60,
+        );
+        assert_eq!(relay_ok.len(), 1);
+
+        // At 61_000 (expired):
+        let lookup_exp = s.handle(addr("192.0.2.2:5000"), Message::Lookup { node }, 61_000, 61);
+        assert_eq!(
+            lookup_exp,
+            vec![(addr("192.0.2.2:5000"), Message::NotFound { node })]
+        );
+
+        let relay_exp = s.handle(
+            addr("192.0.2.2:5000"),
+            Message::RelaySend {
+                src: [2u8; 16],
+                dst: node,
+                payload: vec![1, 2],
+            },
+            61_000,
+            61,
+        );
+        assert!(relay_exp.is_empty());
+    }
 }

@@ -37,10 +37,12 @@ mod tests {
         let id2 = node_id(&pk);
         assert_eq!(id1, id2);
         assert_eq!(id1.len(), 16);
+        assert_ne!(id1, [0u8; 16]);
 
         let addr1 = node_addr(&pk);
         let addr2 = node_addr(&pk);
         assert_eq!(addr1, addr2);
         assert_eq!(addr1.octets()[0], 0xfd);
+        assert_ne!(addr1.octets(), [0u8; 16]);
     }
 }
