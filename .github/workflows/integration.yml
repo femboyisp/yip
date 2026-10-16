@@ -517,6 +517,17 @@ jobs:
           # runner image, so every attempt died at run-ndpi-oracle.sh:129.
           sudo apt-get install -y libpcap-dev libjson-c-dev libgcrypt20-dev autoconf automake libtool pkg-config gettext cmake clang libclang-dev iproute2 iputils-ping tcpdump
 
+      - name: Install DPI evaluation toolchains (tshark, Suricata, Zeek)
+        run: |
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y tshark
+          sudo apt-get install -y suricata
+          UBUNTU_VER=$(lsb_release -rs)
+          echo "deb http://download.opensuse.org/repositories/security:/zeek/xUbuntu_${UBUNTU_VER}/ /" | sudo tee /etc/apt/sources.list.d/security:zeek.list
+          curl -fsSL "https://download.opensuse.org/repositories/security:zeek/xUbuntu_${UBUNTU_VER}/Release.key" | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/security_zeek.gpg > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y zeek-lts || sudo apt-get install -y zeek
+          echo "/opt/zeek/bin" >> $GITHUB_PATH
+
       # Pinned nDPI checkout: this SHA is the exact commit vendored locally at
       # refrences/nDPI (git-ignored/local per CLAUDE.md, so CI can't just use
       # the checked-out tree — it clones the same commit fresh). Pinning to a
@@ -785,3 +796,26 @@ jobs:
             echo "::error::verify=on client failed to tunnel via the REALITY relay's hand-rolled 5b+5c authed flight (ping failed, relay-forwarded stayed 0, or a wrong pbk was wrongly accepted) — REALITY.5d wiring regression"
             exit 1
           fi
+
+      - name: Run multi-engine DPI verification harness under sudo
+        run: |
+          sudo -E env PATH="$PATH:/opt/zeek/bin" bash bin/yipd/tests/run-multi-dpi-oracle.sh \
+            "$(pwd)/target/release/yipd" \
+            /tmp/nDPI/example/ndpiReader \
+            /tmp/multi-dpi-artifacts | tee /tmp/multi-dpi-oracle.log
+          if grep -q "SKIP run-multi-dpi-oracle" /tmp/multi-dpi-oracle.log; then
+            echo "::error::multi-engine DPI oracle skipped — expected root + toolchains in CI"
+            exit 1
+          fi
+          if grep -q "\[FAIL\]" /tmp/multi-dpi-oracle.log; then
+            echo "::error::DPI verification regression detected across one or more engines"
+            exit 1
+          fi
+
+      - name: Upload multi-engine DPI forensic logs & PCAPs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multi-engine-dpi-report
+          path: /tmp/multi-dpi-artifacts/
+          retention-days: 14
