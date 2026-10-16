@@ -274,6 +274,94 @@ cheap on a clean fast path where every tunnel is fast enough.
 
 ---
 
+## Real-world WAN benchmarks (Cloud / VPS Multi-Region)
+
+While the netem test suites evaluate performance under artificial kernel-injected loss and delay in isolated network namespaces, the WAN benchmark harness measures real-world inter-datacenter behavior over public internet paths across multiple cloud regions.
+
+Full historical data and conditions are recorded in [`RESULTS-wan.md`](RESULTS-wan.md) and [`wan/results/history.csv`](wan/results/history.csv).
+
+### Benchmark environment & conditions
+
+- **Endpoints:** Two 1-vCPU / 1 GB VPS instances across cloud regions (e.g. `VPS-A (Las Vegas)` ↔ `VPS-B (Utah)` or multi-region AWS EC2 `t4g.small` instances across `us-east-1` ↔ `us-west-2`).
+- **Baseline path:** ~23.25 ms RTT across public internet links.
+- **Tuning:** Uniform `net.core.rmem_max=net.core.wmem_max=16 MiB` applied across all tunnels.
+- **Tunnels tested:**
+  - **baseline**: Bare unencapsulated IP path.
+  - **yip**: Userspace `yipd` release build with systematic Reed–Solomon FEC over GF(256), `transport=raw` (epoll driver), inner MTU 1184 / outer MTU 1380.
+  - **WireGuard**: In-kernel `wireguard` module, MTU 1380.
+  - **OpenVPN**: Static-key peer mode, AES-256-GCM AEAD data channel, MTU 1380.
+
+### Clean-path throughput & latency
+
+Single-vCPU cloud instances represent realistic constrained edge environments. On a single core, `yipd` shares CPU with the userspace workload and crypto/FEC stack, whereas kernel WireGuard runs in softirq context:
+
+| tunnel | TCP 1-stream | TCP 4-stream | UDP goodput | UDP loss | idle RTT | RTT under load | CPU (Host A) |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| baseline (no tunnel) | 1161.6 Mbit/s | 4110.7 Mbit/s | 200.0 Mbit/s | 1.25% | 23.245 ms | 24.958 ms | 13.4% |
+| yip | 116.8 Mbit/s | 138.4 Mbit/s | 200.0 Mbit/s | 2.06% | 24.768 ms | 50.877 ms | 41.2% |
+| WireGuard | 438.1 Mbit/s | 447.4 Mbit/s | 200.0 Mbit/s | 4.24% | 23.282 ms | 23.760 ms | 46.2% |
+| OpenVPN | 38.5 Mbit/s | 60.5 Mbit/s | 200.0 Mbit/s | 5.61% | 26.114 ms | 23.822 ms | 48.5% |
+
+### Loss resilience on WAN links
+
+Under network impairment (simulated with `tc netem` on the WAN egress), yip's proactive systematic Reed–Solomon FEC protects TCP streams from congestion collapse:
+
+**Effective Ping Loss (lower is better):**
+
+| injected loss | baseline (no tunnel) | yip | WireGuard | OpenVPN |
+|---|--:|--:|--:|--:|
+| 0% | 0% | 0% | 0% | 0% |
+| 1% | 2% | 0% | 1% | 1% |
+| 3% | 5% | 0% | 2% | 4% |
+| 5% | 9% | 0% | 1% | 5% |
+| 10% | 7% | 1% | 9% | 11% |
+
+**TCP Goodput Under Loss (Mbit/s):**
+
+| injected loss | baseline (no tunnel) | yip | WireGuard | OpenVPN |
+|---|--:|--:|--:|--:|
+| 0% | 1155.6 | 53.2 | 442.4 | 42.1 |
+| 1% | 6.7 | 93.7 | 5.1 | 6.6 |
+| 3% | 37.6 | 35.6 | 2.5 | 2.4 |
+| 5% | 2.9 | 24.8 | 1.7 | 1.8 |
+| 10% | 1.2 | 13.0 | 1.0 | 0.9 |
+
+At 10% packet loss, WireGuard and OpenVPN collapse to ~1 Mbit/s due to TCP window backoff, while yip sustains **13.0 Mbit/s** (~13× WireGuard) with effective end-to-end loss held to 1%.
+
+### Reproducing WAN benchmarks
+
+The WAN benchmark suite is completely automated in `crates/yip-bench/wan/`.
+
+#### 1. Static VPS reproduction
+
+```sh
+cd crates/yip-bench/wan
+cp wan.env.example wan.env   # edit HOST_A, HOST_B, SSH_KEY, SSH_USER
+./provision.sh              # install dependencies, build/push yipd, configure wg & ovpn
+./run-wan-bench.sh          # execute clean-path & loss-matrix benchmarks -> results/<ts>/wan.csv
+./collect.sh                # reduce results into RESULTS-wan.md, history.csv, readme-snippet.md
+./teardown.sh               # tear down tunnels, stop daemons, flush netem qdiscs
+```
+
+#### 2. Ephemeral AWS multi-region provisioning
+
+```sh
+cd crates/yip-bench/wan
+# Provisions t4g.small Debian 13 instances across two AWS regions (default: us-east-1 and us-west-2)
+./aws-up.sh --region-a us-east-1 --region-b us-west-2
+./provision.sh
+./run-wan-bench.sh
+./collect.sh
+./teardown.sh
+./aws-down.sh               # terminates instances, security groups, and key pairs
+```
+
+#### 3. Continuous Integration
+
+The `.github/workflows/wan-benchmark.yml` workflow automatically runs the WAN benchmark on pushes to `main` (when AWS secrets are configured) or on manual `workflow_dispatch`, updating `RESULTS-wan.md` and archiving run artifacts.
+
+---
+
 ## Caveats and deferred items
 
 - **Run-to-run variance:** each data point is 100 pings at 50 ms inter-packet
@@ -302,21 +390,18 @@ cheap on a clean fast path where every tunnel is fast enough.
 ## Per-stage pipeline profile
 
 This section establishes where per-packet CPU actually goes through the egress/ingress
-pipeline, before optimization. The profile spans the FEC encode (suspected dominant),
-FEC decode, and related stages. Run with `cargo run --release -p yip-bench --example pipeline_profile`.
+pipeline. The profile spans the FEC encode, FEC decode, and related stages. Run with `cargo run --release -p yip-bench --example pipeline_profile`.
 
 Environment: Linux 6.18 · AMD Ryzen 5 7640U · release build
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| symbols/packet | 2.00 | RS output (1200-byte symbols per 1200-byte sealed packet) |
-| encode | 24.2 µs/packet | **Dominant cost** — FEC encode (object-encode + repair generation) |
-| decode (approx) | 0.8 µs/packet | Per-symbol decode cost; recovers with first successful symbol |
+| symbols/packet | 2.00 | Systematic Reed–Solomon output (1200-byte symbols per 1200-byte sealed packet) |
+| encode | ~0.2–0.3 µs/packet | Systematic Reed–Solomon over GF(256) P+Q fast path (Default/Realtime; ~1.3 µs on Cauchy general scheme). The legacy RaptorQ encoder measured ~24.2 µs — an ~18–80× speedup (#50, #51) |
+| decode (approx) | ~0.4–0.8 µs/packet | Per-symbol decode cost; recovers with first successful symbol |
 | decoded ok | 5000/5000 | 100% recovery on clean path (as expected) |
 
-The headline: **encode is the confirmed dominant term** at ~24.2 µs/packet, validating Task 2's focus on FEC
-encode throughput optimization. Decode is negligible (~0.8 µs), confirming asymmetric pipeline cost. The example uses
-a 1184-byte inner MTU (the bench standard) sealed to 1200 bytes with 16-byte AEAD tag.
+The headline: **Reed–Solomon over GF(256) eliminated FEC encode as a bottleneck**, dropping it from the legacy RaptorQ ~24.2 µs/packet to ~0.2–0.3 µs (P+Q fast path) and ~1.3 µs (general Cauchy). Decode is negligible (~0.4–0.8 µs). The example uses a 1184-byte inner MTU (the bench standard) sealed to 1200 bytes with 16-byte AEAD tag.
 
 Note the **symbols/packet = 2.00**: a single-symbol (1200-byte) object is sent as 1 source + 1 repair, because
 the repair-ratio controller floors at `max(1)`. Every packet therefore carries ≥100 % redundancy *and* runs the
@@ -334,7 +419,7 @@ A measurement-driven pass on the data-plane hot path. What landed, and the hones
 - **No per-symbol allocation** — egress frames into a reused thread-owned arena.
 - **4 MiB `SO_SNDBUF`/`SO_RCVBUF`** (set via a yip-io `set_socket_buffers` helper; yipd stays
   `#![forbid(unsafe_code)]`).
-- **FEC-encode bypass when `repair == 0`** (`yip-transport`) — skips the ~24 µs `Encoder::new` solve,
+- **FEC-encode bypass when `repair == 0`** (`yip-transport`) — skips the encoder solve,
   emitting source symbols byte-identically to the encoder. Implemented and tested.
 
 **Measured (release, kernel 6.18, Ryzen 5 7640U):** clean-link single-stream TCP ≈ 220–285 Mbit/s — **no
@@ -359,7 +444,7 @@ The throughput pass shipped a *dormant* zero-repair FEC bypass. The adaptive
 loss-feedback loop (this milestone) activates it: the receiver reports post-FEC
 residual loss in an authenticated `Control` packet, the sender feeds it to the
 per-class controller, and an ARQ-eligible (`Bulk`) flow on a clean link decays
-its repair ratio to **zero** — firing the bypass (skip the ~24 µs encode) and
+its repair ratio to **zero** — firing the bypass (skipping encoder invocation entirely) and
 halving the per-packet datagram count (1 source symbol, no repair).
 
 Measured (release, kernel 6.18, Ryzen 5 7640U; clean-link single-stream TCP over
@@ -373,9 +458,8 @@ the netns tunnel):
 The bulk controller's repair ratio was confirmed at `0.0000` throughout a 40 s
 run via yipd's diagnostic log — direct proof the loop converged, not merely
 inferred from the throughput rise. The ~60 % jump is consistent with removing the
-FEC encode (which the per-stage profile showed is ~80 % of egress CPU) and sending
-one datagram per packet instead of two. Under loss the controller snaps repair
-back up immediately (Phase B's ARQ then backstops the residual).
+FEC encode and sending one datagram per packet instead of two. Under loss the
+controller snaps repair back up immediately (Phase B's ARQ then backstops the residual).
 
 ### Phase B — reactive ARQ + loss-recovery under the feedback loop
 
