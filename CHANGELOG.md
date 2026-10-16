@@ -23,6 +23,8 @@ until 0.1.0.
   Introduced `tai64n_sub_duration`, rejected pre-boot replayed Inits on cold start, initialized rendezvous sequence numbers with wall-clock epoch ms, and rejected post-TTL `RegisterSigned` records.
 
 ### Added
+- **Automated WAN benchmark harness & ephemeral AWS multi-region testing (#109).**
+  Implemented an automated, end-to-end multi-region WAN benchmarking suite in `crates/yip-bench/wan/`. Features ephemeral AWS EC2 orchestration (`aws-up.sh` / `aws-down.sh`) provisioning isolated `t4g.small` Debian 13 instances across two regions with zero persistent cloud spend, static VPS host integration (`wan.env`, `provision.sh`), a unified 4-tunnel comparative test matrix (`run-wan-bench.sh`) evaluating baseline unencapsulated IP, `yip` (systematic Reed–Solomon FEC over GF(256)), kernel WireGuard, and OpenVPN under 0–10% packet loss, automated Markdown result reduction (`collect.sh` -> `RESULTS-wan.md`, `history.csv`, `readme-snippet.md`), and a scheduled / dispatchable GitHub Actions CI workflow (`.github/workflows/wan-benchmark.yml`) with credential guards, automatic teardown traps, and git commit integration.
 - **Headless mode & UNIX domain control socket (`yip-ctl`, #124).**
   Added a UNIX domain control socket JSON server (`/var/run/yipd.sock`) and `yip-ctl` CLI interface for live, zero-downtime daemon inspection and dynamic peer addition/removal (`add_peer`, `remove_peer`, status, counters).
 - **Multi-peer TLS transport multiplexing (#136, PR #139).**

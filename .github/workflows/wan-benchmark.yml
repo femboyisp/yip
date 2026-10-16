@@ -1,0 +1,177 @@
+---
+name: wan-benchmark
+
+'on':
+  push:
+    branches: [main]
+    paths:
+      - 'crates/yip-bench/wan/**'
+      - 'bin/yipd/**'
+      - 'crates/yip-transport/**'
+      - 'crates/yip-wire/**'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Benchmark mode (aws or static)'
+        required: true
+        type: choice
+        options:
+          - aws
+          - static
+        default: 'aws'
+      region_a:
+        description: 'AWS region A (used when mode is aws)'
+        required: false
+        type: string
+        default: 'us-east-1'
+      region_b:
+        description: 'AWS region B (used when mode is aws)'
+        required: false
+        type: string
+        default: 'us-west-2'
+
+permissions:
+  contents: write
+
+jobs:
+  wan-benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: check secrets availability
+        id: check-secrets
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          WAN_HOST_A: ${{ secrets.WAN_HOST_A }}
+          WAN_SSH_KEY: ${{ secrets.WAN_SSH_KEY }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_REGION_A: ${{ inputs.region_a }}
+          INPUT_REGION_B: ${{ inputs.region_b }}
+        run: |
+          MODE="${INPUT_MODE:-aws}"
+          REGION_A="${INPUT_REGION_A:-us-east-1}"
+          REGION_B="${INPUT_REGION_B:-us-west-2}"
+
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "region_a=$REGION_A" >> "$GITHUB_OUTPUT"
+          echo "region_b=$REGION_B" >> "$GITHUB_OUTPUT"
+
+          if [ "$MODE" = "aws" ]; then
+            if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+              echo "::notice::AWS credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) not set; skipping WAN benchmark."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          elif [ "$MODE" = "static" ]; then
+            if [ -z "$WAN_HOST_A" ] || [ -z "$WAN_SSH_KEY" ]; then
+              echo "::notice::Static WAN credentials (WAN_HOST_A / WAN_SSH_KEY) not set; skipping WAN benchmark."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            echo "::error::Unknown mode: $MODE"
+            exit 1
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: install rust toolchain
+        if: steps.check-secrets.outputs.skip != 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: build release yipd
+        if: steps.check-secrets.outputs.skip != 'true'
+        run: cargo build --release -p yipd
+
+      - name: configure aws credentials
+        if: steps.check-secrets.outputs.skip != 'true' && steps.check-secrets.outputs.mode == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ steps.check-secrets.outputs.region_a || 'us-east-1' }}
+
+      - name: spin up ephemeral aws instances
+        if: steps.check-secrets.outputs.skip != 'true' && steps.check-secrets.outputs.mode == 'aws'
+        run: |
+          bash crates/yip-bench/wan/aws-up.sh \
+            --region-a "${{ steps.check-secrets.outputs.region_a }}" \
+            --region-b "${{ steps.check-secrets.outputs.region_b }}" \
+            --ssh-user root
+
+      - name: configure static wan hosts
+        if: steps.check-secrets.outputs.skip != 'true' && steps.check-secrets.outputs.mode == 'static'
+        env:
+          WAN_HOST_A: ${{ secrets.WAN_HOST_A }}
+          WAN_HOST_B: ${{ secrets.WAN_HOST_B }}
+          WAN_HOST_A_LABEL: ${{ secrets.WAN_HOST_A_LABEL }}
+          WAN_HOST_B_LABEL: ${{ secrets.WAN_HOST_B_LABEL }}
+          WAN_SSH_USER: ${{ secrets.WAN_SSH_USER }}
+          WAN_SSH_KEY: ${{ secrets.WAN_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          KEY_PATH="$HOME/.ssh/id_wan_bench"
+          printf '%s\n' "$WAN_SSH_KEY" > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+
+          sed -e 's/^[[:space:]]*//' <<EOF > crates/yip-bench/wan/wan.env
+            HOST_A=${WAN_HOST_A}
+            HOST_B=${WAN_HOST_B:-$WAN_HOST_A}
+            HOST_A_LABEL="${WAN_HOST_A_LABEL:-Host A}"
+            HOST_B_LABEL="${WAN_HOST_B_LABEL:-Host B}"
+            SSH_USER="${WAN_SSH_USER:-root}"
+            SSH_KEY=${KEY_PATH}
+            YIP_PORT=51833
+            WG_PORT=51834
+            OVPN_PORT=51835
+            OVERLAY_MTU=1380
+          EOF
+          chmod 600 crates/yip-bench/wan/wan.env
+
+      - name: provision hosts and overlays
+        if: steps.check-secrets.outputs.skip != 'true'
+        run: bash crates/yip-bench/wan/provision.sh
+
+      - name: run benchmark matrix
+        if: steps.check-secrets.outputs.skip != 'true'
+        run: bash crates/yip-bench/wan/run-wan-bench.sh
+
+      - name: reduce results
+        if: steps.check-secrets.outputs.skip != 'true'
+        run: bash crates/yip-bench/wan/collect.sh
+
+      - name: teardown overlays
+        if: always() && steps.check-secrets.outputs.skip != 'true'
+        run: bash crates/yip-bench/wan/teardown.sh || true
+
+      - name: teardown aws instances
+        if: always() && steps.check-secrets.outputs.skip != 'true'
+        run: bash crates/yip-bench/wan/aws-down.sh || true
+
+      - name: commit results to repository
+        if: steps.check-secrets.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add crates/yip-bench/RESULTS-wan.md crates/yip-bench/wan/results/
+          if ! git diff --staged --quiet; then
+            git commit -m "bench(wan): record automated WAN benchmark results [skip ci]"
+            git push origin main
+          fi
+
+      - name: upload wan benchmark artifacts
+        if: always() && steps.check-secrets.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wan-benchmark-results
+          path: |
+            crates/yip-bench/RESULTS-wan.md
+            crates/yip-bench/wan/results/
+          retention-days: 30
+          if-no-files-found: ignore

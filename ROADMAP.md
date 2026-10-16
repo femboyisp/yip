@@ -28,14 +28,16 @@ maintainer.
 - **Quality gates & maintainability** — 90% control plane line-coverage floor in CI; widened
   mutation testing (`cargo mutants`) across logic crates; modularized `peer_manager` and
   `yip-utls/src/stream/`.
+- **Real WAN benchmark harness & ephemeral AWS multi-region testing (#109)** — automated, reproducible
+  WAN benchmarking suite across cloud VPSes and ephemeral multi-region AWS EC2 instances, comparing
+  baseline IP, yip (RS-FEC), WireGuard, and OpenVPN under real network conditions and injected packet
+  loss, with scheduled GitHub Actions automation.
 
 ## Now
 
 - **Mutation test hardening** — kill remaining surviving mutants across `yip-obf`, `yip-membership`,
   `yip-rendezvous`, `yip-crypto`, `yip-wire`, and `yip-transport` to reach zero missed mutants
   across the core logic crates.
-- **Real WAN benchmark harness (#109)** — reproducible WAN benchmark testing under real-world
-  internet topologies (loss, jitter, reordering, bandwidth throttling).
 
 ## Next
 
