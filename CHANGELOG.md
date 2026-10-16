@@ -9,6 +9,39 @@ No release has been cut yet — everything below is tracked under `[Unreleased]`
 until 0.1.0.
 
 ### Security
+- **Multi-engine DPI verification panel (nDPI, tshark, Suricata, Zeek, #70, PR #143).**
+  Expands anti-DPI verification into a full 4-engine industry verification panel evaluating network traces across all 4 `yip` transport modes (`raw/obf`, `quic`, `tls`, `relay`). Enforces deep packet inspection criteria: flow `Unknown` without `NDPI_OBFUSCATED_TRAFFIC` for obfuscated UDP, positive protocol mimicry for QUIC and TLS/REALITY (matching configured cover SNI `gateway.icloud.com`), 0 VPN dissector invocations in tshark, 0 alerts in Suricata (`eve.json`), and 0 anomaly notices in Zeek (`notice.log`), outputting a 16-cell verdict matrix (`verdict-summary.md`) with 14-day forensic artifact archiving in CI.
+- **Authenticated relay Trojan front discriminator (#64, PR #142).**
+  Hardened the TLS Trojan front on `yip-rendezvous` against unauthenticated registration probes and false upgrades by introducing `Message::RegisterAuth` (tag 8, 41-byte wire layout) protected by a constant-time 128-bit BLAKE2s-MAC (`subtle::ConstantTimeEq`). In rootless mode, bare unauthenticated `Register` frames and forged MACs are silently demoted to `Classify::Decoy` ($p < 2^{-144}$). Dropped unauthenticated `RegisterAuth` arriving over direct UDP in `RendezvousServer::handle` to prevent packet reflection and memory DoS.
+- **Relay fronting & transport hardening suite (#65, #63, #49).**
+  Added per-connection token bucket rate limiting on the relay TLS front to mitigate denial of service (#65), pre-connected decoy backend sockets to eliminate silent-probe timing side-channels (#63), and enforced connection capacity caps with stalled handshake pruning in the QUIC transport (#49).
+- **Data-plane obfuscation key rotation per epoch (#105).**
+  Keyed data-plane obfuscation to Noise session epochs, trialing candidate keys on ingress and keying egress by the current active epoch, ensuring symmetric rotation across session rekeys.
+- **Identity binding, CA trust anchors & discovery routing (#101, #102, #106).**
+  Unified CA trust anchors across discovery and handshake verification, added endpoint probing with `PunchTo` reflection guards, and enforced `RegisterSigned` on the relay front in mesh mode.
+- **Time-based anti-replay hardening & clock epoch initialization (#103, #104).**
+  Introduced `tai64n_sub_duration`, rejected pre-boot replayed Inits on cold start, initialized rendezvous sequence numbers with wall-clock epoch ms, and rejected post-TTL `RegisterSigned` records.
+
+### Added
+- **Headless mode & UNIX domain control socket (`yip-ctl`, #124).**
+  Added a UNIX domain control socket JSON server (`/var/run/yipd.sock`) and `yip-ctl` CLI interface for live, zero-downtime daemon inspection and dynamic peer addition/removal (`add_peer`, `remove_peer`, status, counters).
+- **Multi-peer TLS transport multiplexing (#136, PR #139).**
+  Implemented multi-peer TLS support with dynamic epoll token registration (`wait_tokens`), role assignment, and multiplexed ingress/egress polling in `bin/yipd/src/tls.rs`, allowing multiple concurrent TLS-mimicking peers to communicate through a single daemon instance.
+- **Relayed gossip convergence (#40, PR #134).**
+  Enabled rendezvous-blinded nodes to ingest membership gossip and emit relay-wrapped gossip replies, ensuring complete private mesh convergence across NAT-isolated topologies.
+- **Quality gates control plane coverage floor & mutation testing widening (#107, PR #141).**
+  Enforced a 90% line-coverage floor in CI across `bin/yipd`'s control plane routing, peer manager, rekeying, and membership logic (`--fail-under-lines 90`). Widened automated mutation testing (`cargo mutants`) to cover `yip-obf`, `yip-membership`, and `yip-rendezvous` alongside `yip-wire`, `yip-transport`, and `yip-crypto`, archiving `mutants.out/` artifacts for 14 days.
+
+### Refactored
+- **Modularization of `yip-utls/src/stream/` (#108, PR #140).**
+  Decomposed the monolithic 3,450-line `crates/yip-utls/src/stream.rs` into focused submodules: `record.rs` (record-layer codecs and framing), `cert.rs` (certificate chain decoding and SPKI extraction), `sig.rs` (signature verification and REALITY binding), `flight.rs` (flight shape scanning and emission), and `tests.rs` (mock server loopback integration suites), maintaining strict `#![forbid(unsafe_code)]`.
+- **Peer manager test extraction (#120, PR #135).**
+  Extracted monolithic unit test suites from `bin/yipd/src/peer_manager/mod.rs` into a dedicated `peer_manager/tests.rs` submodule.
+- **Test hygiene & roaming positive witness (#110, PR #138).**
+  Added positive witness tests verifying authenticated endpoint roaming in routing, and purged 7 dead netns test scripts and obsolete nDPI wrappers.
+- **TLS transport pump hardening & handshake deadlines (#61, PR #137).**
+  Enforced inner handshake timeout deadlines in the TLS pump to mitigate slow-loris connection hanging, and wired `is_peer_established` tracking in `PeerManager`.
+
 - **Handshake anti-replay + authenticated endpoint (#34, PR #99).** The
   Noise-IK `msg1` now frames a TAI64N timestamp alongside the existing cert
   inside the encrypted handshake payload; a freshness-gate check replaces the
