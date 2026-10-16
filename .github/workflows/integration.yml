@@ -528,6 +528,9 @@ jobs:
           sudo apt-get install -y zeek-lts || sudo apt-get install -y zeek
           echo "/opt/zeek/bin" >> $GITHUB_PATH
 
+      - name: Run multi-engine DPI parser unit tests
+        run: bash bin/yipd/tests/test-multi-dpi-oracle-parsers.sh
+
       # Pinned nDPI checkout: this SHA is the exact commit vendored locally at
       # refrences/nDPI (git-ignored/local per CLAUDE.md, so CI can't just use
       # the checked-out tree — it clones the same commit fresh). Pinning to a
@@ -807,7 +810,7 @@ jobs:
             echo "::error::multi-engine DPI oracle skipped — expected root + toolchains in CI"
             exit 1
           fi
-          if grep -q "\[FAIL\]" /tmp/multi-dpi-oracle.log; then
+          if grep -qE '(\[FAIL\]|\bFAIL\b|\*\*FAIL\*\*)' /tmp/multi-dpi-oracle.log; then
             echo "::error::DPI verification regression detected across one or more engines"
             exit 1
           fi

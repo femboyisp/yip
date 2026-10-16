@@ -961,10 +961,15 @@ eval_ndpi() {
 
     # If log doesn't exist and ndpiReader is available, execute it
     if [ ! -f "$ndpi_log" ]; then
-        if [ -n "$ndpi_bin" ] && [ -f "$pcap" ]; then
-            "$ndpi_bin" -i "$pcap" -v 2 >"$ndpi_log" 2>&1 || true
-        elif [ -f "$out_dir/ndpi.log" ]; then
+        if [ -f "$out_dir/ndpi.log" ]; then
             ndpi_log="$out_dir/ndpi.log"
+        elif [ -n "$pcap" ] && [ ! -f "$pcap" ]; then
+            echo "FAIL (PCAP file not found: $pcap)"
+            return 0
+        elif [ -n "$ndpi_bin" ] && [ -f "$pcap" ]; then
+            local abs_pcap
+            abs_pcap="$(readlink -f "$pcap" 2>/dev/null || realpath "$pcap" 2>/dev/null || echo "$pcap")"
+            "$ndpi_bin" -i "$abs_pcap" -v 2 >"$ndpi_log" 2>&1 || true
         else
             echo "SKIP (ndpiReader missing)"
             return 0
@@ -1074,12 +1079,17 @@ eval_tshark() {
 
     # If outputs don't exist and tshark is available, run tshark
     if [ ! -f "$phs_file" ] || [ ! -f "$fields_file" ]; then
-        if [ -n "$tshark_bin" ] && [ -f "$pcap" ]; then
-            "$tshark_bin" -r "$pcap" -q -z io,phs >"$phs_file" 2>&1 || true
-            "$tshark_bin" -r "$pcap" -T fields -e frame.protocols -e tls.handshake.extensions_server_name >"$fields_file" 2>&1 || true
-        elif [ -f "$out_dir/tshark-phs.txt" ] && [ -f "$out_dir/tshark-fields.txt" ]; then
+        if [ -f "$out_dir/tshark-phs.txt" ] && [ -f "$out_dir/tshark-fields.txt" ]; then
             phs_file="$out_dir/tshark-phs.txt"
             fields_file="$out_dir/tshark-fields.txt"
+        elif [ -n "$pcap" ] && [ ! -f "$pcap" ]; then
+            echo "FAIL (PCAP file not found: $pcap)"
+            return 0
+        elif [ -n "$tshark_bin" ] && [ -f "$pcap" ]; then
+            local abs_pcap
+            abs_pcap="$(readlink -f "$pcap" 2>/dev/null || realpath "$pcap" 2>/dev/null || echo "$pcap")"
+            "$tshark_bin" -r "$abs_pcap" -q -z io,phs >"$phs_file" 2>&1 || true
+            "$tshark_bin" -r "$abs_pcap" -T fields -e frame.protocols -e tls.handshake.extensions_server_name >"$fields_file" 2>&1 || true
         else
             echo "SKIP (tshark missing)"
             return 0
@@ -1164,9 +1174,14 @@ eval_suricata() {
     if [ ! -f "$eve_file" ]; then
         if [ -f "$out_dir/eve.json" ]; then
             eve_file="$out_dir/eve.json"
+        elif [ -n "$pcap" ] && [ ! -f "$pcap" ]; then
+            echo "FAIL (PCAP file not found: $pcap)"
+            return 0
         elif [ -n "$suricata_bin" ] && [ -f "$pcap" ]; then
             mkdir -p "$suricata_dir"
-            "$suricata_bin" -r "$pcap" -l "$suricata_dir" -k none --runmode single >/dev/null 2>&1 || true
+            local abs_pcap
+            abs_pcap="$(readlink -f "$pcap" 2>/dev/null || realpath "$pcap" 2>/dev/null || echo "$pcap")"
+            "$suricata_bin" -r "$abs_pcap" -l "$suricata_dir" -k none --runmode single >/dev/null 2>&1 || true
         else
             echo "SKIP (suricata missing)"
             return 0
@@ -1251,9 +1266,14 @@ eval_zeek() {
             conn_log="$out_dir/conn.log"
             notice_log="$out_dir/notice.log"
             ssl_log="$out_dir/ssl.log"
+        elif [ -n "$pcap" ] && [ ! -f "$pcap" ]; then
+            echo "FAIL (PCAP file not found: $pcap)"
+            return 0
         elif [ -n "$zeek_bin" ] && [ -f "$pcap" ]; then
             mkdir -p "$zeek_dir"
-            (cd "$zeek_dir" && "$zeek_bin" -C -r "$pcap" local >/dev/null 2>&1 || true)
+            local abs_pcap
+            abs_pcap="$(readlink -f "$pcap" 2>/dev/null || realpath "$pcap" 2>/dev/null || echo "$pcap")"
+            (cd "$zeek_dir" && "$zeek_bin" -C -r "$abs_pcap" local >/dev/null 2>&1 || true)
         else
             echo "SKIP (zeek missing)"
             return 0
