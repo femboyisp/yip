@@ -25,11 +25,13 @@ not always-on costs.
 
 > [!NOTE]
 > **Status: pre-1.0, single maintainer, Linux-only.** The data plane, multi-core throughput
-> sharding (Way A + Regime B/B+), the full control plane, and the anti-DPI transports (obfuscation +
-> Xray-REALITY TLS mimicry) are implemented and merged, with per-milestone integration
-> tests running in CI on both I/O drivers. Not yet built: traffic-analysis/timing defense
-> and the post-quantum hybrid handshake. No release has been cut;
-> [`CHANGELOG.md`](CHANGELOG.md) tracks all merged work under *Unreleased*.
+> sharding (Way A + Regime B through F with line-rate RLNC), the full control plane (including
+> headless mode with `yip-ctl` control socket), the 4 anti-DPI transports (`raw/obf`, `quic`,
+> Xray-REALITY `tls`, and authenticated `relay` Trojan front), and the 4-engine DPI verification panel
+> (nDPI, tshark, Suricata, Zeek) are implemented and merged, with per-milestone integration tests
+> running in CI on both I/O drivers. Not yet built: traffic-analysis/timing defense and the post-quantum
+> hybrid handshake. No release has been cut; [`CHANGELOG.md`](CHANGELOG.md) tracks all merged work
+> under *Unreleased*.
 
 > [!TIP]
 > New here? Read the [user guide](docs/user-guide.md) and copy
