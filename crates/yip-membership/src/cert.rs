@@ -277,6 +277,54 @@ mod tests {
     }
 
     #[test]
+    fn cert_with_multiple_tags_roundtrips() {
+        let ca = ca();
+        let mut c = make_cert(&ca, [1u8; 32], [7u8; 16], 100, 200);
+        c.tags = vec![
+            (1, vec![10, 11, 12]),
+            (2, vec![]),
+            (3, vec![20, 21, 22, 23, 24]),
+        ];
+        let sig = ca.sign(&cert_signing_body(&c));
+        c.ca_sig = sig.to_bytes();
+
+        let mut buf = Vec::new();
+        c.encode(&mut buf);
+        let decoded = Cert::decode(&buf).expect("decodes cert with tags");
+        assert_eq!(decoded, c);
+    }
+
+    #[test]
+    fn cert_validity_boundaries() {
+        let ca = ca();
+        let ca_pub = ca.verifying_key().to_bytes();
+        let member = [1u8; 32];
+        let net = [7u8; 16];
+        let c = make_cert(&ca, member, net, 100, 200);
+
+        // Exact boundary at not_before (now == 100)
+        assert!(verify_cert(&c, &[ca_pub], &net, &member, 100, 0).is_ok());
+
+        // Exact boundary with skew: not_before=100, now=90, skew=10 -> 90 + 10 == 100
+        assert!(verify_cert(&c, &[ca_pub], &net, &member, 90, 10).is_ok());
+
+        // Just before not_before: now=99, skew=0 -> NotYetValid
+        assert_eq!(
+            verify_cert(&c, &[ca_pub], &net, &member, 99, 0),
+            Err(CertError::NotYetValid)
+        );
+
+        // Exact boundary at not_after (now == 200) -> Expired
+        assert_eq!(
+            verify_cert(&c, &[ca_pub], &net, &member, 200, 0),
+            Err(CertError::Expired)
+        );
+
+        // Just before not_after (now == 199) -> Ok
+        assert!(verify_cert(&c, &[ca_pub], &net, &member, 199, 0).is_ok());
+    }
+
+    #[test]
     fn valid_cert_verifies_and_matrix_of_failures() {
         let ca = ca();
         let ca_pub = ca.verifying_key().to_bytes();

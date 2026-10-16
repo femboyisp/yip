@@ -128,13 +128,12 @@ fn put_record(out: &mut Vec<u8>, record: &Record) {
 }
 
 /// Parse a length-prefixed record from the front of `buf`. Returns the
-/// record and the number of bytes consumed, or `None` if the length prefix,
-/// slice, or record contents are invalid/truncated (fail-closed).
-fn take_record(buf: &[u8]) -> Option<(Record, usize)> {
+/// record, or `None` if the length prefix, slice, or record contents are
+/// invalid/truncated (fail-closed).
+fn take_record(buf: &[u8]) -> Option<Record> {
     let len = usize::from(u16::from_be_bytes(buf.get(..2)?.try_into().ok()?));
     let record_bytes = buf.get(2..2 + len)?;
-    let record = Record::decode(record_bytes)?;
-    Some((record, 2 + len))
+    Record::decode(record_bytes)
 }
 
 fn put_addr(out: &mut Vec<u8>, addr: &SocketAddr) {
@@ -253,7 +252,7 @@ pub fn decode(buf: &[u8]) -> Option<Message> {
             let record = match after_addr.first() {
                 Some(0) => None,
                 Some(1) => {
-                    let (record, _) = take_record(after_addr.get(1..)?)?;
+                    let record = take_record(after_addr.get(1..)?)?;
                     Some(record)
                 }
                 Some(_) => return None,
@@ -289,7 +288,7 @@ pub fn decode(buf: &[u8]) -> Option<Message> {
             })
         }
         t if t == Tag::RegisterSigned as u8 => {
-            let (record, _) = take_record(rest)?;
+            let record = take_record(rest)?;
             Some(Message::RegisterSigned { record })
         }
         t if t == Tag::RegisterAuth as u8 => {
@@ -598,5 +597,12 @@ mod tests {
             None,
             "truncated datagram must be rejected"
         );
+    }
+
+    #[test]
+    fn decode_unknown_tag_returns_none() {
+        let mut buf = vec![99u8];
+        buf.extend_from_slice(&[0u8; 40]);
+        assert_eq!(decode(&buf), None);
     }
 }

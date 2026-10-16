@@ -35,12 +35,23 @@ pub struct XorShift64 {
 }
 
 impl XorShift64 {
+    /// Nonzero seed guarantee: bitwise OR with 1 ensures state is never 0.
+    #[inline]
+    pub const fn ensure_nonzero(seed: u64) -> u64 {
+        seed | 1
+    }
+
+    /// Construct a PRNG from a known seed.
+    pub const fn from_seed(seed: u64) -> Self {
+        Self {
+            state: Self::ensure_nonzero(seed),
+        }
+    }
+
     pub fn from_getrandom() -> Self {
         let mut seed = [0u8; 8];
         getrandom::fill(&mut seed).expect("OS RNG");
-        // xorshift64* must never have a zero state.
-        let s = u64::from_le_bytes(seed) | 1;
-        Self { state: s }
+        Self::from_seed(u64::from_le_bytes(seed))
     }
 
     pub fn next_u64(&mut self) -> u64 {
@@ -64,12 +75,9 @@ impl XorShift64 {
     }
 
     pub fn fill(&mut self, buf: &mut [u8]) {
-        let mut i = 0;
-        while i < buf.len() {
+        for chunk in buf.chunks_mut(8) {
             let bytes = self.next_u64().to_le_bytes();
-            let n = core::cmp::min(8, buf.len() - i);
-            buf[i..i + n].copy_from_slice(&bytes[..n]);
-            i += n;
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
         }
     }
 }
@@ -282,5 +290,75 @@ mod tests {
         let dg = obfuscate(&key, JUNK_TYPE, &body, 7).expect("small test body fits u16");
         let (pt, _b) = deobfuscate(&key, &dg).expect("round-trips");
         assert_eq!(pt, JUNK_TYPE);
+    }
+
+    #[test]
+    fn min_envelope_constant() {
+        assert_eq!(NONCE_LEN, 8);
+        assert_eq!(MIN_ENVELOPE, 11);
+    }
+
+    #[test]
+    fn deobfuscate_boundary_lengths() {
+        let key = derive_key(b"test-boundary");
+        let dg = obfuscate(&key, 3, b"", 0).expect("empty fits");
+        assert_eq!(dg.len(), MIN_ENVELOPE);
+        // exact MIN_ENVELOPE succeeds
+        let (pt, body) = deobfuscate(&key, &dg).expect("exact MIN_ENVELOPE succeeds");
+        assert_eq!(pt, 3);
+        assert!(body.is_empty());
+        // MIN_ENVELOPE - 1 returns None
+        assert_eq!(deobfuscate(&key, &dg[..MIN_ENVELOPE - 1]), None);
+    }
+
+    #[test]
+    fn xorshift_ensure_nonzero_seed() {
+        assert_eq!(XorShift64::ensure_nonzero(0), 1);
+        assert_eq!(XorShift64::ensure_nonzero(1), 1);
+        assert_eq!(XorShift64::ensure_nonzero(2), 3);
+        assert_eq!(XorShift64::ensure_nonzero(u64::MAX), u64::MAX);
+        assert_eq!(XorShift64::ensure_nonzero(u64::MAX - 1), u64::MAX);
+    }
+
+    #[test]
+    fn xorshift_next_u64_known_sequence() {
+        let mut r = XorShift64::from_seed(1);
+        let v1 = r.next_u64();
+        let v2 = r.next_u64();
+        let v3 = r.next_u64();
+        assert_eq!(v1, 5180492295206395165);
+        assert_eq!(v2, 12380297144915551517);
+        assert_eq!(v3, 13389498078930870103);
+    }
+
+    #[test]
+    fn xorshift_gen_range_exact_math() {
+        let mut r = XorShift64::from_seed(1);
+        // next_u64 is 11849767220556743933
+        // span = 110 - 100 + 1 = 11
+        // 11849767220556743933 % 11 = 9
+        // lo + 9 = 109
+        let val = r.gen_range(100, 110);
+        assert_eq!(val, 109);
+    }
+
+    #[test]
+    fn xorshift_fill_exact_bytes_and_unaligned_slices() {
+        let mut r = XorShift64::from_seed(42);
+        let v1 = r.next_u64();
+        let v2 = r.next_u64();
+        let mut r2 = XorShift64::from_seed(42);
+        let mut buf = [0u8; 11];
+        r2.fill(&mut buf);
+        assert_eq!(&buf[..8], &v1.to_le_bytes());
+        assert_eq!(&buf[8..11], &v2.to_le_bytes()[..3]);
+
+        let mut empty = [];
+        r2.fill(&mut empty);
+
+        let mut single = [0u8; 1];
+        let v3 = r.next_u64();
+        r2.fill(&mut single);
+        assert_eq!(single[0], v3.to_le_bytes()[0]);
     }
 }
