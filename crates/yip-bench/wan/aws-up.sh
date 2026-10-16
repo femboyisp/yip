@@ -10,13 +10,20 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 # ── logging ─────────────────────────────────────────────────────────────────
 log()  { printf '\033[1;36m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 warn() { printf '\033[1;33m[%s] WARN:\033[0m %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
-die()  { printf '\033[1;31m[%s] FATAL:\033[0m %s\n' "$(date +%H:%M:%S)" "$*" >&2; exit 1; }
+die()  {
+    printf '\033[1;31m[%s] FATAL:\033[0m %s\n' "$(date +%H:%M:%S)" "$*" >&2
+    if [[ "${DRY_RUN:-0}" != "1" && -n "${SESSION_FILE:-}" && -f "$SESSION_FILE" ]]; then
+        warn "cleaning up partially provisioned resources due to fatal error..."
+        bash "$SCRIPT_DIR/aws-down.sh" --session-file "$SESSION_FILE" || true
+    fi
+    exit 1
+}
 
 # ── defaults ────────────────────────────────────────────────────────────────
 REGION_A="${AWS_REGION_A:-us-east-1}"
 REGION_B="${AWS_REGION_B:-us-west-2}"
 INSTANCE_TYPE="${AWS_INSTANCE_TYPE:-t3.small}"
-SSH_USER="${SSH_USER:-admin}"
+SSH_USER="${SSH_USER:-root}"
 AMI_A="${AWS_AMI_A:-}"
 AMI_B="${AWS_AMI_B:-}"
 KEY_FILE="${KEY_FILE:-$SCRIPT_DIR/id_ed25519_wan}"
@@ -35,7 +42,7 @@ Options:
   --region-a <region>       AWS Region for Host A (default: \${AWS_REGION_A:-us-east-1})
   --region-b <region>       AWS Region for Host B (default: \${AWS_REGION_B:-us-west-2})
   --instance-type <type>    EC2 instance type (default: \${AWS_INSTANCE_TYPE:-t3.small})
-  --ssh-user <user>         SSH username (default: \${SSH_USER:-admin})
+  --ssh-user <user>         SSH username (default: \${SSH_USER:-root})
   --ami-a <ami-id>          Override AMI ID for Region A (auto-detects Debian 12 if unset)
   --ami-b <ami-id>          Override AMI ID for Region B (auto-detects Debian 12 if unset)
   --key-file <path>         Path to write temporary private key (default: id_ed25519_wan)
@@ -131,6 +138,53 @@ TAG="yip-wan-bench-${RUN_ID}"
 KEY_NAME="yip-wan-key-${RUN_ID}"
 SG_NAME="yip-wan-sg-${RUN_ID}"
 
+# ── ephemeral resource tracking ─────────────────────────────────────────────
+INST_A=""
+INST_B=""
+SG_A=""
+SG_B=""
+IP_A=""
+IP_B=""
+
+write_session() {
+    mkdir -p "$(dirname "$SESSION_FILE")"
+    cat <<EOF > "$SESSION_FILE.tmp"
+{
+  "run_id": "$RUN_ID",
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "tag": "$TAG",
+  "key_name": "$KEY_NAME",
+  "key_file": "$KEY_FILE",
+  "ssh_user": "$SSH_USER",
+  "instance_type": "$INSTANCE_TYPE",
+  "region_a": {
+    "region": "$REGION_A",
+    "instance_id": "${INST_A:-}",
+    "security_group_id": "${SG_A:-}",
+    "public_ip": "${IP_A:-}"
+  },
+  "region_b": {
+    "region": "$REGION_B",
+    "instance_id": "${INST_B:-}",
+    "security_group_id": "${SG_B:-}",
+    "public_ip": "${IP_B:-}"
+  }
+}
+EOF
+    mv -f "$SESSION_FILE.tmp" "$SESSION_FILE"
+}
+
+cleanup_on_error() {
+    local exit_code=$?
+    trap - ERR
+    if [[ "${DRY_RUN:-0}" != "1" && -f "$SESSION_FILE" ]]; then
+        warn "aws-up.sh encountered an error (exit code $exit_code); cleaning up partially provisioned resources..."
+        bash "$SCRIPT_DIR/aws-down.sh" --session-file "$SESSION_FILE" || true
+    fi
+    exit "$exit_code"
+}
+trap cleanup_on_error ERR
+
 log "starting ephemeral WAN benchmark setup"
 log "run ID:         $RUN_ID"
 log "tag:            $TAG"
@@ -217,6 +271,7 @@ rm -f "$KEY_FILE" "$KEY_FILE.pub"
 ssh-keygen -t ed25519 -N "" -f "$KEY_FILE" -C "$TAG" >/dev/null 2>&1
 chmod 600 "$KEY_FILE"
 chmod 644 "$KEY_FILE.pub"
+write_session
 
 # ── AWS provisioning ────────────────────────────────────────────────────────
 if [[ "$DRY_RUN" == "1" ]]; then
@@ -227,6 +282,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
     IP_A="198.51.100.10"
     IP_B="203.0.113.20"
     log "dry-run: mock resources initialized"
+    write_session
 else
     # Import keypair
     log "importing keypair $KEY_NAME to $REGION_A..."
@@ -242,6 +298,7 @@ else
         --key-name "$KEY_NAME" \
         --public-key-material "fileb://$KEY_FILE.pub" \
         --tag-specifications "ResourceType=key-pair,Tags=[{Key=Name,Value=$TAG},{Key=Project,Value=yip-wan-bench}]" >/dev/null
+    write_session
 
     # Create security groups
     log "creating security group $SG_NAME in $REGION_A..."
@@ -251,6 +308,7 @@ else
         --description "Ephemeral security group for $TAG" \
         --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=$TAG},{Key=Project,Value=yip-wan-bench}]" \
         --query 'GroupId' --output text)
+    write_session
 
     log "authorizing SSH in $REGION_A from $RUNNER_CIDR..."
     aws ec2 authorize-security-group-ingress \
@@ -267,6 +325,7 @@ else
         --description "Ephemeral security group for $TAG" \
         --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=$TAG},{Key=Project,Value=yip-wan-bench}]" \
         --query 'GroupId' --output text)
+    write_session
 
     log "authorizing SSH in $REGION_B from $RUNNER_CIDR..."
     aws ec2 authorize-security-group-ingress \
@@ -302,6 +361,7 @@ EOF
         --user-data "$USER_DATA_B64" \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$TAG},{Key=Project,Value=yip-wan-bench},{Key=Role,Value=host-a}]" \
         --query 'Instances[0].InstanceId' --output text)
+    write_session
 
     log "launching instance in $REGION_B ($INSTANCE_TYPE, $AMI_B)..."
     INST_B=$(aws ec2 run-instances \
@@ -313,6 +373,7 @@ EOF
         --user-data "$USER_DATA_B64" \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$TAG},{Key=Project,Value=yip-wan-bench},{Key=Role,Value=host-b}]" \
         --query 'Instances[0].InstanceId' --output text)
+    write_session
 
     # Wait for running
     log "waiting for instance $INST_A in $REGION_A to reach running state..."
@@ -328,10 +389,11 @@ EOF
 
     [[ -n "$IP_A" && "$IP_A" != "None" ]] || die "failed to obtain public IP for instance $INST_A"
     [[ -n "$IP_B" && "$IP_B" != "None" ]] || die "failed to obtain public IP for instance $INST_B"
+    write_session
 
     # Authorize cross-region peering ports between instances
-    log "authorizing cross-region peering ingress (UDP 51833..51835, TCP/UDP 5201)..."
-    for port in 51833 51834 51835 5201; do
+    log "authorizing cross-region peering ingress (UDP 5000, 51833..51835, TCP/UDP 5201)..."
+    for port in 5000 51833 51834 51835 5201; do
         aws ec2 authorize-security-group-ingress --region "$REGION_A" --group-id "$SG_A" --protocol udp --port "$port" --cidr "$IP_B/32" >/dev/null
         aws ec2 authorize-security-group-ingress --region "$REGION_B" --group-id "$SG_B" --protocol udp --port "$port" --cidr "$IP_A/32" >/dev/null
     done
@@ -342,31 +404,7 @@ EOF
 fi
 
 # ── session metadata emission ───────────────────────────────────────────────
-mkdir -p "$(dirname "$SESSION_FILE")"
-cat <<EOF > "$SESSION_FILE.tmp"
-{
-  "run_id": "$RUN_ID",
-  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "tag": "$TAG",
-  "key_name": "$KEY_NAME",
-  "key_file": "$KEY_FILE",
-  "ssh_user": "$SSH_USER",
-  "instance_type": "$INSTANCE_TYPE",
-  "region_a": {
-    "region": "$REGION_A",
-    "instance_id": "$INST_A",
-    "security_group_id": "$SG_A",
-    "public_ip": "$IP_A"
-  },
-  "region_b": {
-    "region": "$REGION_B",
-    "instance_id": "$INST_B",
-    "security_group_id": "$SG_B",
-    "public_ip": "$IP_B"
-  }
-}
-EOF
-mv -f "$SESSION_FILE.tmp" "$SESSION_FILE"
+write_session
 log "emitted session metadata -> $SESSION_FILE"
 
 HOST_A="$IP_A"
@@ -409,6 +447,8 @@ if [[ "$SKIP_SSH_WAIT" != "1" && "$DRY_RUN" != "1" ]]; then
     wait_for_ssh "$IP_B" || die "timed out waiting for SSH on Host B ($IP_B)"
     log "SSH is ready on both hosts!"
 fi
+
+trap - ERR
 
 log "ephemeral AWS environment is UP and ready."
 log "  Host A: $IP_A ($REGION_A)"

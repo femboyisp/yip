@@ -106,9 +106,9 @@ assert_success "Dry-run created private key" test -f "$DRY_KEY"
 assert_success "Default Region A is us-east-1 in session" grep -q '"region": "us-east-1"' "$DRY_SESSION"
 assert_success "Default Region B is us-west-2 in session" grep -q '"region": "us-west-2"' "$DRY_SESSION"
 assert_success "Default Instance Type is t3.small in session" grep -q '"instance_type": "t3.small"' "$DRY_SESSION"
-assert_success "Default SSH user is admin in session" grep -q '"ssh_user": "admin"' "$DRY_SESSION"
+assert_success "Default SSH user is root in session" grep -q '"ssh_user": "root"' "$DRY_SESSION"
 
-assert_success "Default SSH user is admin in wan.env" grep -q 'SSH_USER=admin' "$DRY_ENV"
+assert_success "Default SSH user is root in wan.env" grep -q 'SSH_USER=root' "$DRY_ENV"
 assert_success "Standard YIP_PORT=51833 in wan.env" grep -q 'YIP_PORT=51833' "$DRY_ENV"
 assert_success "Standard WG_PORT=51834 in wan.env" grep -q 'WG_PORT=51834' "$DRY_ENV"
 assert_success "Standard OVPN_PORT=51835 in wan.env" grep -q 'OVPN_PORT=51835' "$DRY_ENV"
@@ -237,6 +237,7 @@ assert_success "Recorded ec2 describe-images call" grep -q "ec2 describe-images"
 assert_success "Recorded ec2 import-key-pair call" grep -q "ec2 import-key-pair" "$MOCK_LOG"
 assert_success "Recorded ec2 create-security-group call" grep -q "ec2 create-security-group" "$MOCK_LOG"
 assert_success "Recorded ec2 authorize-security-group-ingress call" grep -q "ec2 authorize-security-group-ingress" "$MOCK_LOG"
+assert_success "Recorded ec2 authorize-security-group-ingress for UDP port 5000" grep -E "authorize-security-group-ingress.*--port 5000" "$MOCK_LOG"
 assert_success "Recorded ec2 run-instances call" grep -q "ec2 run-instances" "$MOCK_LOG"
 assert_success "Recorded ec2 wait instance-running call" grep -q "ec2 wait instance-running" "$MOCK_LOG"
 
@@ -250,6 +251,60 @@ assert_success "Recorded ec2 delete-security-group call" grep -q "ec2 delete-sec
 assert_success "Recorded ec2 delete-key-pair call" grep -q "ec2 delete-key-pair" "$MOCK_LOG"
 assert_success "Mock session file removed by aws-down.sh" test ! -f "$MOCK_SESSION"
 assert_success "Mock key file removed by aws-down.sh" test ! -f "$MOCK_KEY"
+
+# ── 9. Intermediate provisioning failure triggers automatic teardown ────────
+test_start "Intermediate provisioning failure triggers automatic teardown"
+FAIL_MOCK_BIN_DIR="$TMP_DIR/fail_mock_bin"
+mkdir -p "$FAIL_MOCK_BIN_DIR"
+FAIL_MOCK_LOG="$TMP_DIR/fail_mock_aws.log"
+
+cat <<'EOF' > "$FAIL_MOCK_BIN_DIR/aws"
+#!/usr/bin/env bash
+echo "aws $*" >> "${FAIL_MOCK_LOG_FILE}"
+
+case "$*" in
+    *"ec2 describe-images"*)
+        echo "ami-0123456789mockami"
+        ;;
+    *"ec2 import-key-pair"*)
+        echo '{"KeyName": "mock-key"}'
+        ;;
+    *"ec2 create-security-group"*)
+        echo "sg-0123456789mocksg"
+        ;;
+    *"ec2 authorize-security-group-ingress"*)
+        echo '{"Return": true}'
+        ;;
+    *"ec2 run-instances"*)
+        echo "InstanceLimitExceeded" >&2
+        exit 1
+        ;;
+    *"ec2 delete-security-group"*)
+        exit 0
+        ;;
+    *"ec2 delete-key-pair"*)
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+EOF
+chmod +x "$FAIL_MOCK_BIN_DIR/aws"
+
+FAIL_SESSION="$TMP_DIR/fail_session.json"
+FAIL_ENV="$TMP_DIR/fail_wan.env"
+FAIL_KEY="$TMP_DIR/fail_key"
+
+assert_failure "aws-up.sh fails on run-instances error" \
+    env PATH="$FAIL_MOCK_BIN_DIR:$PATH" FAIL_MOCK_LOG_FILE="$FAIL_MOCK_LOG" \
+    "$UP_SCRIPT" --skip-ssh-wait \
+                 --session-file "$FAIL_SESSION" \
+                 --env-file "$FAIL_ENV" \
+                 --key-file "$FAIL_KEY"
+
+assert_success "Recorded automatic delete-security-group on failure" grep -q "ec2 delete-security-group" "$FAIL_MOCK_LOG"
+assert_success "Recorded automatic delete-key-pair on failure" grep -q "ec2 delete-key-pair" "$FAIL_MOCK_LOG"
 
 # ── Summary ─────────────────────────────────────────────────────────────────
 printf '\n\033[1;35m════════════════════════════════════════════════════\033[0m\n'

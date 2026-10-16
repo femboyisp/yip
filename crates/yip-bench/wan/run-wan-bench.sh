@@ -62,7 +62,7 @@ rnd() { awk -v v="$1" -v s="$2" -v dv="${3:-1}" 'BEGIN{printf "%.*f", s, v/dv}';
 tcp_tput() { # <tunnel> <dst> <streams>
     local j; j="$(A "iperf3 -c $2 -p $IPERF_PORT -t $DUR -P $3 -J 2>/dev/null")"
     [[ -z "$j" ]] && { warn "$1 tcp P$3: no data"; return; }
-    local mbps; mbps="$(rnd "$(jget end.sum_received.bits_per_second <<<"$j")" 1 1e6)"
+    local mbps; mbps="$(rnd "$(jget end.sum_received.bits_per_second <<<"$j" 2>/dev/null || echo 0)" 1 1e6)"
     csv_row "$1" tcp_throughput "streams=$3" mbit_s "$mbps" "clean"
     log "  $1 TCP x$3: ${mbps} Mbit/s"
 }
@@ -71,9 +71,9 @@ udp_tput() { # <tunnel> <dst>
     local j; j="$(A "iperf3 -c $2 -p $IPERF_PORT -u -b 200M -t $UDP_DUR -J 2>/dev/null")"
     [[ -z "$j" ]] && { warn "$1 udp: no data"; return; }
     local mbps jit loss
-    mbps="$(rnd "$(jget end.sum.bits_per_second <<<"$j")" 1 1e6)"
-    jit="$(rnd  "$(jget end.sum.jitter_ms <<<"$j")" 3)"
-    loss="$(rnd "$(jget end.sum.lost_percent <<<"$j")" 2)"
+    mbps="$(rnd "$(jget end.sum.bits_per_second <<<"$j" 2>/dev/null || echo 0)" 1 1e6)"
+    jit="$(rnd  "$(jget end.sum.jitter_ms <<<"$j" 2>/dev/null || echo 0)" 3)"
+    loss="$(rnd "$(jget end.sum.lost_percent <<<"$j" 2>/dev/null || echo 0)" 2)"
     csv_row "$1" udp_throughput offered=200M mbit_s "$mbps" "clean"
     csv_row "$1" udp_jitter     offered=200M ms     "$jit"  "clean"
     csv_row "$1" udp_loss       offered=200M pct    "$loss" "clean"
@@ -91,9 +91,9 @@ latency_load() { # <tunnel> <dst>
 }
 cpu_headroom() { # <tunnel> <dst>  — %CPU used on A (sender) during a TCP run
     local used
-    used="$(A "read _ a b c d0 rest < /proc/stat; i0=\$d0; t0=\$((a+b+c+d0)); \
+    used="$(A "read _ a b c d0 e0 f0 g0 h0 rest < /proc/stat; i0=\$d0; t0=\$((a+b+c+d0+e0+f0+g0+h0)); \
                iperf3 -c $2 -p $IPERF_PORT -t 6 >/dev/null 2>&1; \
-               read _ a b c d1 rest < /proc/stat; i1=\$d1; t1=\$((a+b+c+d1)); \
+               read _ a b c d1 e1 f1 g1 h1 rest < /proc/stat; i1=\$d1; t1=\$((a+b+c+d1+e1+f1+g1+h1)); \
                awk -v i0=\$i0 -v i1=\$i1 -v t0=\$t0 -v t1=\$t1 'BEGIN{printf \"%.1f\", 100-100*(i1-i0)/(t1-t0)}'")"
     csv_row "$1" cpu_used tcp_saturate pct "$used" "sender_host_A_1vcpu"
     log "  $1 CPU used (A, 1 vCPU) during TCP: ${used}%"

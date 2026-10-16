@@ -101,7 +101,8 @@ jobs:
         run: |
           bash crates/yip-bench/wan/aws-up.sh \
             --region-a "${{ steps.check-secrets.outputs.region_a }}" \
-            --region-b "${{ steps.check-secrets.outputs.region_b }}"
+            --region-b "${{ steps.check-secrets.outputs.region_b }}" \
+            --ssh-user root
 
       - name: configure static wan hosts
         if: steps.check-secrets.outputs.skip != 'true' && steps.check-secrets.outputs.mode == 'static'
