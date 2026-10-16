@@ -322,6 +322,55 @@ mod tests {
 
         // Just before not_after (now == 199) -> Ok
         assert!(verify_cert(&c, &[ca_pub], &net, &member, 199, 0).is_ok());
+
+        // Boundary with skew: not_after=200, skew=10 -> valid up to 209, expired at 210
+        assert!(verify_cert(&c, &[ca_pub], &net, &member, 209, 10).is_ok());
+        assert_eq!(
+            verify_cert(&c, &[ca_pub], &net, &member, 210, 10),
+            Err(CertError::Expired)
+        );
+        assert_eq!(
+            verify_cert(&c, &[ca_pub], &net, &member, 211, 10),
+            Err(CertError::Expired)
+        );
+    }
+
+    #[test]
+    fn verify_cert_must_reject_certificates_past_not_after_plus_skew() {
+        let ca = ca();
+        let ca_pub = ca.verifying_key().to_bytes();
+        let member = [1u8; 32];
+        let net = [7u8; 16];
+        let not_before = 1_000;
+        let not_after = 2_000;
+        let skew = 60;
+        let c = make_cert(&ca, member, net, not_before, not_after);
+
+        // Within window extended by skew: now < not_after + skew
+        assert!(verify_cert(&c, &[ca_pub], &net, &member, not_after + skew - 1, skew).is_ok());
+
+        // At boundary: now == not_after + skew -> Expired
+        assert_eq!(
+            verify_cert(&c, &[ca_pub], &net, &member, not_after + skew, skew),
+            Err(CertError::Expired)
+        );
+
+        // Strictly past not_after + skew: now > not_after + skew -> Expired
+        assert_eq!(
+            verify_cert(&c, &[ca_pub], &net, &member, not_after + skew + 1, skew),
+            Err(CertError::Expired)
+        );
+        assert_eq!(
+            verify_cert(
+                &c,
+                &[ca_pub],
+                &net,
+                &member,
+                not_after + skew + 10_000,
+                skew
+            ),
+            Err(CertError::Expired)
+        );
     }
 
     #[test]
