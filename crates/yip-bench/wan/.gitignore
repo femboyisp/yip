@@ -1,0 +1,7 @@
+wan.env
+results/.yipconf/
+results/.wgconf/
+results/.aws-session.json
+id_ed25519_wan*
+*.key
+*.priv
