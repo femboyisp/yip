@@ -15,6 +15,7 @@ set -euo pipefail
 # Global Configuration & Defaults
 TLS_SNI="${TLS_SNI:-gateway.icloud.com}"
 NDPI="${NDPI:-}"
+RDV="${RDV:-}"
 TSHARK="${TSHARK:-}"
 SURICATA="${SURICATA:-}"
 ZEEK="${ZEEK:-}"
@@ -86,6 +87,862 @@ resolve_zeek() {
     else
         echo ""
     fi
+}
+
+resolve_rdv() {
+    local rdv_candidate="${1:-}"
+    if [ -n "$rdv_candidate" ] && [ -x "$rdv_candidate" ]; then
+        echo "$rdv_candidate"
+    elif [ -n "${RDV:-}" ] && [ -x "$RDV" ]; then
+        echo "$RDV"
+    elif [ -x "target/release/yip-rendezvous" ]; then
+        echo "target/release/yip-rendezvous"
+    elif [ -x "target/debug/yip-rendezvous" ]; then
+        echo "target/debug/yip-rendezvous"
+    elif command -v yip-rendezvous >/dev/null 2>&1; then
+        command -v yip-rendezvous
+    elif command -v cargo >/dev/null 2>&1; then
+        if [ -f "Cargo.toml" ] && grep -q "yip-rendezvous" Cargo.toml; then
+            cargo build --release --bin yip-rendezvous >&2 2>/dev/null || cargo build --bin yip-rendezvous >&2 2>/dev/null || true
+            if [ -x "target/release/yip-rendezvous" ]; then
+                echo "target/release/yip-rendezvous"
+            elif [ -x "target/debug/yip-rendezvous" ]; then
+                echo "target/debug/yip-rendezvous"
+            fi
+        fi
+    else
+        echo ""
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Process & Netns Resource Management
+# -----------------------------------------------------------------------------
+
+ACTIVE_PIDS=()
+ACTIVE_NETNS=()
+CLEANUP_DIRS=()
+
+register_pid() {
+    ACTIVE_PIDS+=("$1")
+}
+
+unregister_pid() {
+    local target="$1"
+    local new_pids=()
+    for pid in "${ACTIVE_PIDS[@]+"${ACTIVE_PIDS[@]}"}"; do
+        if [ "$pid" != "$target" ]; then
+            new_pids+=("$pid")
+        fi
+    done
+    ACTIVE_PIDS=("${new_pids[@]+"${new_pids[@]}"}")
+}
+
+register_netns() {
+    ACTIVE_NETNS+=("$1")
+}
+
+unregister_netns() {
+    local target="$1"
+    local new_netns=()
+    for ns in "${ACTIVE_NETNS[@]+"${ACTIVE_NETNS[@]}"}"; do
+        if [ "$ns" != "$target" ]; then
+            new_netns+=("$ns")
+        fi
+    done
+    ACTIVE_NETNS=("${new_netns[@]+"${new_netns[@]}"}")
+}
+
+register_cleanup_dir() {
+    CLEANUP_DIRS+=("$1")
+}
+
+unregister_cleanup_dir() {
+    local target="$1"
+    local new_dirs=()
+    for dir in "${CLEANUP_DIRS[@]+"${CLEANUP_DIRS[@]}"}"; do
+        if [ "$dir" != "$target" ]; then
+            new_dirs+=("$dir")
+        fi
+    done
+    CLEANUP_DIRS=("${new_dirs[@]+"${new_dirs[@]}"}")
+}
+
+stop_pids() {
+    set +e
+    for pid in "$@"; do
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+    sleep 0.2
+    for pid in "$@"; do
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        unregister_pid "$pid"
+    done
+    set -e
+}
+
+delete_netns() {
+    set +e
+    for ns in "$@"; do
+        if [ -n "$ns" ]; then
+            ip netns del "$ns" 2>/dev/null || true
+            unregister_netns "$ns"
+        fi
+    done
+    set -e
+}
+
+remove_dir() {
+    local dir="$1"
+    if [ -n "$dir" ] && [ -d "$dir" ]; then
+        rm -rf "$dir"
+        unregister_cleanup_dir "$dir"
+    fi
+}
+
+cleanup_all() {
+    set +e
+    if [ "${#ACTIVE_PIDS[@]}" -gt 0 ]; then
+        for pid in "${ACTIVE_PIDS[@]}"; do
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null || true
+            fi
+        done
+        sleep 0.2
+        for pid in "${ACTIVE_PIDS[@]}"; do
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        done
+        ACTIVE_PIDS=()
+    fi
+    if [ "${#ACTIVE_NETNS[@]}" -gt 0 ]; then
+        for ns in "${ACTIVE_NETNS[@]}"; do
+            if [ -n "$ns" ]; then
+                ip netns del "$ns" 2>/dev/null || true
+            fi
+        done
+        ACTIVE_NETNS=()
+    fi
+    if [ "${#CLEANUP_DIRS[@]}" -gt 0 ]; then
+        for dir in "${CLEANUP_DIRS[@]}"; do
+            if [ -n "$dir" ] && [ -d "$dir" ]; then
+                rm -rf "$dir"
+            fi
+        done
+        CLEANUP_DIRS=()
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Live Netns Capture Pipeline
+# -----------------------------------------------------------------------------
+
+capture_raw_obf() {
+    local yipd_bin="${1:?Usage: capture_raw_obf <yipd-bin> <pcap_out>}"
+    local pcap_out="${2:?Usage: capture_raw_obf <yipd-bin> <pcap_out>}"
+
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "SKIP capture_raw_obf: needs root (netns + tcpdump)"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$pcap_out")"
+    local tmp_dir
+    tmp_dir="$(mktemp -d /tmp/yipd-cap-raw-obf.XXXXXX)"
+    register_cleanup_dir "$tmp_dir"
+
+    local ns_a="yipMdObfA"
+    local ns_b="yipMdObfB"
+    local veth_a="vMdObfA"
+    local veth_b="vMdObfB"
+    local veth_a_ip="10.0.9.1"
+    local veth_b_ip="10.0.9.2"
+    local tun_a_ip="10.9.9.1"
+    local tun_b_ip="10.9.9.2"
+    local veth_prefix="24"
+    local tun_prefix="24"
+    local port="34567"
+    local tun_dev="yip0"
+    local obf_psk="00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+
+    delete_netns "$ns_a" "$ns_b"
+    register_netns "$ns_a"
+    register_netns "$ns_b"
+
+    local genkey_a genkey_b priv_a pub_a priv_b pub_b
+    genkey_a="$("$yipd_bin" --genkey)"
+    genkey_b="$("$yipd_bin" --genkey)"
+    priv_a="$(echo "$genkey_a" | grep '^private=' | cut -d= -f2)"
+    pub_a="$(echo "$genkey_a" | grep '^public=' | cut -d= -f2)"
+    priv_b="$(echo "$genkey_b" | grep '^private=' | cut -d= -f2)"
+    pub_b="$(echo "$genkey_b" | grep '^public=' | cut -d= -f2)"
+
+    local cfg_a="$tmp_dir/yipA.conf"
+    local cfg_b="$tmp_dir/yipB.conf"
+
+    cat > "$cfg_a" <<EOF
+local_private=${priv_a}
+local_public=${pub_a}
+peer_public=${pub_b}
+listen=${veth_a_ip}:${port}
+peer_endpoint=${veth_b_ip}:${port}
+device=${tun_dev}
+transport=raw
+obf_psk=${obf_psk}
+EOF
+
+    cat > "$cfg_b" <<EOF
+local_private=${priv_b}
+local_public=${pub_b}
+peer_public=${pub_a}
+listen=${veth_b_ip}:${port}
+peer_endpoint=${veth_a_ip}:${port}
+device=${tun_dev}
+transport=raw
+obf_psk=${obf_psk}
+EOF
+
+    ip netns add "$ns_a"
+    ip netns add "$ns_b"
+
+    ip link add "$veth_a" netns "$ns_a" type veth peer name "$veth_b" netns "$ns_b"
+    ip netns exec "$ns_a" ip addr add "${veth_a_ip}/${veth_prefix}" dev "$veth_a"
+    ip netns exec "$ns_a" ip link set "$veth_a" up
+    ip netns exec "$ns_a" ip link set lo up
+
+    ip netns exec "$ns_b" ip addr add "${veth_b_ip}/${veth_prefix}" dev "$veth_b"
+    ip netns exec "$ns_b" ip link set "$veth_b" up
+    ip netns exec "$ns_b" ip link set lo up
+
+    local tcpdump_pid
+    ip netns exec "$ns_b" tcpdump -nn -i "$veth_b" -w "$pcap_out" -U "udp port $port" \
+        >"$tmp_dir/tcpdump.log" 2>&1 &
+    tcpdump_pid=$!
+    register_pid "$tcpdump_pid"
+    sleep 0.5
+
+    local pid_a pid_b
+    ip netns exec "$ns_a" "$yipd_bin" "$cfg_a" >"$tmp_dir/yipA.log" 2>&1 &
+    pid_a=$!
+    register_pid "$pid_a"
+
+    ip netns exec "$ns_b" "$yipd_bin" "$cfg_b" >"$tmp_dir/yipB.log" 2>&1 &
+    pid_b=$!
+    register_pid "$pid_b"
+
+    local tries=0
+    while true; do
+        local a_up=0 b_up=0
+        ip netns exec "$ns_a" ip link show "$tun_dev" >/dev/null 2>&1 && a_up=1 || true
+        ip netns exec "$ns_b" ip link show "$tun_dev" >/dev/null 2>&1 && b_up=1 || true
+        if [ "$a_up" -eq 1 ] && [ "$b_up" -eq 1 ]; then
+            break
+        fi
+        if ! kill -0 "$pid_a" 2>/dev/null || ! kill -0 "$pid_b" 2>/dev/null; then
+            echo "[error] yipd died unexpectedly during raw-obf capture"
+            cat "$tmp_dir/yipA.log" || true
+            cat "$tmp_dir/yipB.log" || true
+            stop_pids "$tcpdump_pid" "$pid_a" "$pid_b"
+            delete_netns "$ns_a" "$ns_b"
+            remove_dir "$tmp_dir"
+            return 1
+        fi
+        tries=$((tries + 1))
+        if [ "$tries" -ge 60 ]; then
+            echo "[error] timed out waiting for TUN devices in raw-obf capture"
+            cat "$tmp_dir/yipA.log" || true
+            cat "$tmp_dir/yipB.log" || true
+            stop_pids "$tcpdump_pid" "$pid_a" "$pid_b"
+            delete_netns "$ns_a" "$ns_b"
+            remove_dir "$tmp_dir"
+            return 1
+        fi
+        sleep 0.25
+    done
+
+    ip netns exec "$ns_a" ip addr add "${tun_a_ip}/${tun_prefix}" dev "$tun_dev"
+    ip netns exec "$ns_b" ip addr add "${tun_b_ip}/${tun_prefix}" dev "$tun_dev"
+    ip netns exec "$ns_a" ip link set "$tun_dev" up
+    ip netns exec "$ns_b" ip link set "$tun_dev" up
+    sleep 0.5
+
+    set +e
+    ip netns exec "$ns_a" ping -c 20 -i 0.1 -W 1 "$tun_b_ip" >"$tmp_dir/ping.log" 2>&1
+    local ping_rc=$?
+    set -e
+    if [ "$ping_rc" -ne 0 ]; then
+        echo "[error] ping across raw-obf tunnel failed (rc=$ping_rc)"
+        cat "$tmp_dir/ping.log" || true
+        cat "$tmp_dir/yipA.log" || true
+        cat "$tmp_dir/yipB.log" || true
+        stop_pids "$tcpdump_pid" "$pid_a" "$pid_b"
+        delete_netns "$ns_a" "$ns_b"
+        remove_dir "$tmp_dir"
+        return 1
+    fi
+
+    sleep 0.5
+    stop_pids "$tcpdump_pid" "$pid_a" "$pid_b"
+    delete_netns "$ns_a" "$ns_b"
+    remove_dir "$tmp_dir"
+
+    if [ ! -s "$pcap_out" ]; then
+        echo "[error] captured PCAP is empty: $pcap_out"
+        return 1
+    fi
+    echo "[capture] raw-obf: $(stat -c%s "$pcap_out") bytes written to $pcap_out"
+}
+
+capture_quic() {
+    local yipd_bin="${1:?Usage: capture_quic <yipd-bin> <pcap_out>}"
+    local pcap_out="${2:?Usage: capture_quic <yipd-bin> <pcap_out>}"
+
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "SKIP capture_quic: needs root (netns + tcpdump)"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$pcap_out")"
+    local tmp_dir
+    tmp_dir="$(mktemp -d /tmp/yipd-cap-quic.XXXXXX)"
+    register_cleanup_dir "$tmp_dir"
+
+    local ns_a="yipMdQuicA"
+    local ns_b="yipMdQuicB"
+    local veth_a="vMdQuicA"
+    local veth_b="vMdQuicB"
+    local veth_a_ip="10.0.10.1"
+    local veth_b_ip="10.0.10.2"
+    local tun_a_ip="10.10.10.1"
+    local tun_b_ip="10.10.10.2"
+    local veth_prefix="24"
+    local tun_prefix="24"
+    local port="34567"
+    local tun_dev="yip0"
+
+    delete_netns "$ns_a" "$ns_b"
+    register_netns "$ns_a"
+    register_netns "$ns_b"
+
+    local genkey_a genkey_b priv_a pub_a priv_b pub_b
+    genkey_a="$("$yipd_bin" --genkey)"
+    genkey_b="$("$yipd_bin" --genkey)"
+    priv_a="$(echo "$genkey_a" | grep '^private=' | cut -d= -f2)"
+    pub_a="$(echo "$genkey_a" | grep '^public=' | cut -d= -f2)"
+    priv_b="$(echo "$genkey_b" | grep '^private=' | cut -d= -f2)"
+    pub_b="$(echo "$genkey_b" | grep '^public=' | cut -d= -f2)"
+
+    local cfg_a="$tmp_dir/yipA.conf"
+    local cfg_b="$tmp_dir/yipB.conf"
+
+    cat > "$cfg_a" <<EOF
+local_private=${priv_a}
+local_public=${pub_a}
+peer_public=${pub_b}
+listen=${veth_a_ip}:${port}
+peer_endpoint=${veth_b_ip}:${port}
+device=${tun_dev}
+transport=quic
+EOF
+
+    cat > "$cfg_b" <<EOF
+local_private=${priv_b}
+local_public=${pub_b}
+peer_public=${pub_a}
+listen=${veth_b_ip}:${port}
+peer_endpoint=${veth_a_ip}:${port}
+device=${tun_dev}
+transport=quic
+EOF
+
+    ip netns add "$ns_a"
+    ip netns add "$ns_b"
+
+    ip link add "$veth_a" netns "$ns_a" type veth peer name "$veth_b" netns "$ns_b"
+    ip netns exec "$ns_a" ip addr add "${veth_a_ip}/${veth_prefix}" dev "$veth_a"
+    ip netns exec "$ns_a" ip link set "$veth_a" up
+    ip netns exec "$ns_a" ip link set lo up
+
+    ip netns exec "$ns_b" ip addr add "${veth_b_ip}/${veth_prefix}" dev "$veth_b"
+    ip netns exec "$ns_b" ip link set "$veth_b" up
+    ip netns exec "$ns_b" ip link set lo up
+
+    local tcpdump_pid
+    ip netns exec "$ns_b" tcpdump -nn -i "$veth_b" -w "$pcap_out" -U "udp port $port" \
+        >"$tmp_dir/tcpdump.log" 2>&1 &
+    tcpdump_pid=$!
+    register_pid "$tcpdump_pid"
+    sleep 0.5
+
+    local pid_a pid_b
+    ip netns exec "$ns_a" "$yipd_bin" "$cfg_a" >"$tmp_dir/yipA.log" 2>&1 &
+    pid_a=$!
+    register_pid "$pid_a"
+
+    ip netns exec "$ns_b" "$yipd_bin" "$cfg_b" >"$tmp_dir/yipB.log" 2>&1 &
+    pid_b=$!
+    register_pid "$pid_b"
+
+    local tries=0
+    while true; do
+        local a_up=0 b_up=0
+        ip netns exec "$ns_a" ip link show "$tun_dev" >/dev/null 2>&1 && a_up=1 || true
+        ip netns exec "$ns_b" ip link show "$tun_dev" >/dev/null 2>&1 && b_up=1 || true
+        if [ "$a_up" -eq 1 ] && [ "$b_up" -eq 1 ]; then
+            break
+        fi
+        if ! kill -0 "$pid_a" 2>/dev/null || ! kill -0 "$pid_b" 2>/dev/null; then
+            echo "[error] yipd died unexpectedly during quic capture"
+            cat "$tmp_dir/yipA.log" || true
+            cat "$tmp_dir/yipB.log" || true
+            stop_pids "$tcpdump_pid" "$pid_a" "$pid_b"
+            delete_netns "$ns_a" "$ns_b"
+            remove_dir "$tmp_dir"
+            return 1
+        fi
+        tries=$((tries + 1))
+        if [ "$tries" -ge 80 ]; then
+            echo "[error] timed out waiting for TUN devices in quic capture"
+            cat "$tmp_dir/yipA.log" || true
+            cat "$tmp_dir/yipB.log" || true
+            stop_pids "$tcpdump_pid" "$pid_a" "$pid_b"
+            delete_netns "$ns_a" "$ns_b"
+            remove_dir "$tmp_dir"
+            return 1
+        fi
+        sleep 0.25
+    done
+
+    ip netns exec "$ns_a" ip addr add "${tun_a_ip}/${tun_prefix}" dev "$tun_dev"
+    ip netns exec "$ns_b" ip addr add "${tun_b_ip}/${tun_prefix}" dev "$tun_dev"
+    ip netns exec "$ns_a" ip link set "$tun_dev" up
+    ip netns exec "$ns_b" ip link set "$tun_dev" up
+    sleep 0.5
+
+    set +e
+    ip netns exec "$ns_b" ping -c 25 -i 0.1 -W 2 "$tun_a_ip" >"$tmp_dir/ping.log" 2>&1
+    local ping_rc=$?
+    set -e
+    if [ "$ping_rc" -ne 0 ]; then
+        echo "[error] ping across quic tunnel failed (rc=$ping_rc)"
+        cat "$tmp_dir/ping.log" || true
+        cat "$tmp_dir/yipA.log" || true
+        cat "$tmp_dir/yipB.log" || true
+        stop_pids "$tcpdump_pid" "$pid_a" "$pid_b"
+        delete_netns "$ns_a" "$ns_b"
+        remove_dir "$tmp_dir"
+        return 1
+    fi
+
+    sleep 0.5
+    stop_pids "$tcpdump_pid" "$pid_a" "$pid_b"
+    delete_netns "$ns_a" "$ns_b"
+    remove_dir "$tmp_dir"
+
+    if [ ! -s "$pcap_out" ]; then
+        echo "[error] captured PCAP is empty: $pcap_out"
+        return 1
+    fi
+    echo "[capture] quic: $(stat -c%s "$pcap_out") bytes written to $pcap_out"
+}
+
+capture_tls() {
+    local yipd_bin="${1:?Usage: capture_tls <yipd-bin> <pcap_out>}"
+    local pcap_out="${2:?Usage: capture_tls <yipd-bin> <pcap_out>}"
+
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "SKIP capture_tls: needs root (netns + tcpdump)"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$pcap_out")"
+    local tmp_dir
+    tmp_dir="$(mktemp -d /tmp/yipd-cap-tls.XXXXXX)"
+    register_cleanup_dir "$tmp_dir"
+
+    local ns_a="yipMdTlsA"
+    local ns_b="yipMdTlsB"
+    local veth_a="vMdTlsA"
+    local veth_b="vMdTlsB"
+    local veth_a_ip="10.0.11.1"
+    local veth_b_ip="10.0.11.2"
+    local tun_a_ip="10.11.11.1"
+    local tun_b_ip="10.11.11.2"
+    local veth_prefix="24"
+    local tun_prefix="24"
+    local port="34567"
+    local tun_dev="yip0"
+    local cover_sni="${TLS_SNI:-gateway.icloud.com}"
+
+    delete_netns "$ns_a" "$ns_b"
+    register_netns "$ns_a"
+    register_netns "$ns_b"
+
+    local genkey_a genkey_b priv_a pub_a priv_b pub_b
+    genkey_a="$("$yipd_bin" --genkey)"
+    genkey_b="$("$yipd_bin" --genkey)"
+    priv_a="$(echo "$genkey_a" | grep '^private=' | cut -d= -f2)"
+    pub_a="$(echo "$genkey_a" | grep '^public=' | cut -d= -f2)"
+    priv_b="$(echo "$genkey_b" | grep '^private=' | cut -d= -f2)"
+    pub_b="$(echo "$genkey_b" | grep '^public=' | cut -d= -f2)"
+
+    local cfg_a="$tmp_dir/yipA.conf"
+    local cfg_b="$tmp_dir/yipB.conf"
+
+    cat > "$cfg_a" <<EOF
+local_private=${priv_a}
+local_public=${pub_a}
+peer_public=${pub_b}
+listen=${veth_a_ip}:${port}
+peer_endpoint=${veth_b_ip}:${port}
+device=${tun_dev}
+transport=tls
+tls_sni=${cover_sni}
+EOF
+
+    cat > "$cfg_b" <<EOF
+local_private=${priv_b}
+local_public=${pub_b}
+peer_public=${pub_a}
+listen=${veth_b_ip}:${port}
+peer_endpoint=${veth_a_ip}:${port}
+device=${tun_dev}
+transport=tls
+tls_sni=${cover_sni}
+EOF
+
+    ip netns add "$ns_a"
+    ip netns add "$ns_b"
+
+    ip link add "$veth_a" netns "$ns_a" type veth peer name "$veth_b" netns "$ns_b"
+    ip netns exec "$ns_a" ip addr add "${veth_a_ip}/${veth_prefix}" dev "$veth_a"
+    ip netns exec "$ns_a" ip link set "$veth_a" up
+    ip netns exec "$ns_a" ip link set lo up
+
+    ip netns exec "$ns_b" ip addr add "${veth_b_ip}/${veth_prefix}" dev "$veth_b"
+    ip netns exec "$ns_b" ip link set "$veth_b" up
+    ip netns exec "$ns_b" ip link set lo up
+
+    local tcpdump_pid
+    ip netns exec "$ns_b" tcpdump -nn -i "$veth_b" -w "$pcap_out" -U "tcp port $port" \
+        >"$tmp_dir/tcpdump.log" 2>&1 &
+    tcpdump_pid=$!
+    register_pid "$tcpdump_pid"
+    sleep 0.5
+
+    local pid_a pid_b
+    ip netns exec "$ns_a" "$yipd_bin" "$cfg_a" >"$tmp_dir/yipA.log" 2>&1 &
+    pid_a=$!
+    register_pid "$pid_a"
+
+    ip netns exec "$ns_b" "$yipd_bin" "$cfg_b" >"$tmp_dir/yipB.log" 2>&1 &
+    pid_b=$!
+    register_pid "$pid_b"
+
+    local tries=0
+    while true; do
+        local a_up=0 b_up=0
+        ip netns exec "$ns_a" ip link show "$tun_dev" >/dev/null 2>&1 && a_up=1 || true
+        ip netns exec "$ns_b" ip link show "$tun_dev" >/dev/null 2>&1 && b_up=1 || true
+        if [ "$a_up" -eq 1 ] && [ "$b_up" -eq 1 ]; then
+            break
+        fi
+        if ! kill -0 "$pid_a" 2>/dev/null || ! kill -0 "$pid_b" 2>/dev/null; then
+            echo "[error] yipd died unexpectedly during tls capture"
+            cat "$tmp_dir/yipA.log" || true
+            cat "$tmp_dir/yipB.log" || true
+            stop_pids "$tcpdump_pid" "$pid_a" "$pid_b"
+            delete_netns "$ns_a" "$ns_b"
+            remove_dir "$tmp_dir"
+            return 1
+        fi
+        tries=$((tries + 1))
+        if [ "$tries" -ge 80 ]; then
+            echo "[error] timed out waiting for TUN devices in tls capture"
+            cat "$tmp_dir/yipA.log" || true
+            cat "$tmp_dir/yipB.log" || true
+            stop_pids "$tcpdump_pid" "$pid_a" "$pid_b"
+            delete_netns "$ns_a" "$ns_b"
+            remove_dir "$tmp_dir"
+            return 1
+        fi
+        sleep 0.25
+    done
+
+    ip netns exec "$ns_a" ip addr add "${tun_a_ip}/${tun_prefix}" dev "$tun_dev"
+    ip netns exec "$ns_b" ip addr add "${tun_b_ip}/${tun_prefix}" dev "$tun_dev"
+    ip netns exec "$ns_a" ip link set "$tun_dev" up
+    ip netns exec "$ns_b" ip link set "$tun_dev" up
+    sleep 0.5
+
+    set +e
+    ip netns exec "$ns_b" ping -c 25 -i 0.1 -W 2 "$tun_a_ip" >"$tmp_dir/ping.log" 2>&1
+    local ping_rc=$?
+    set -e
+    if [ "$ping_rc" -ne 0 ]; then
+        echo "[error] ping across tls tunnel failed (rc=$ping_rc)"
+        cat "$tmp_dir/ping.log" || true
+        cat "$tmp_dir/yipA.log" || true
+        cat "$tmp_dir/yipB.log" || true
+        stop_pids "$tcpdump_pid" "$pid_a" "$pid_b"
+        delete_netns "$ns_a" "$ns_b"
+        remove_dir "$tmp_dir"
+        return 1
+    fi
+
+    sleep 0.5
+    stop_pids "$tcpdump_pid" "$pid_a" "$pid_b"
+    delete_netns "$ns_a" "$ns_b"
+    remove_dir "$tmp_dir"
+
+    if [ ! -s "$pcap_out" ]; then
+        echo "[error] captured PCAP is empty: $pcap_out"
+        return 1
+    fi
+    echo "[capture] tls: $(stat -c%s "$pcap_out") bytes written to $pcap_out"
+}
+
+capture_relay() {
+    local yipd_bin="${1:?Usage: capture_relay <yipd-bin> [rdv-bin] <pcap_out>}"
+    local rdv_bin=""
+    local pcap_out=""
+
+    if [ $# -ge 3 ]; then
+        rdv_bin="$2"
+        pcap_out="$3"
+    elif [ $# -ge 2 ]; then
+        pcap_out="$2"
+        rdv_bin="$(resolve_rdv)"
+    else
+        echo "Usage: capture_relay <yipd-bin> [rdv-bin] <pcap_out>"
+        return 1
+    fi
+
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "SKIP capture_relay: needs root (netns + tcpdump)"
+        return 0
+    fi
+
+    if [ -z "$rdv_bin" ] || [ ! -x "$rdv_bin" ]; then
+        rdv_bin="$(resolve_rdv "$rdv_bin")"
+    fi
+    if [ -z "$rdv_bin" ] || [ ! -x "$rdv_bin" ]; then
+        echo "[error] yip-rendezvous binary not found or not executable"
+        return 1
+    fi
+
+    if ! check_tool openssl; then
+        echo "[error] openssl required for relay TLS cert generation"
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$pcap_out")"
+    local tmp_dir
+    tmp_dir="$(mktemp -d /tmp/yipd-cap-relay.XXXXXX)"
+    register_cleanup_dir "$tmp_dir"
+
+    local ns_a="yipMdRlyA"
+    local ns_b="yipMdRlyB"
+    local ns_r="yipMdRlyR"
+
+    local veth_a_n="vMdRlyA1"
+    local veth_a_r="vMdRlyA0"
+    local veth_b_n="vMdRlyB1"
+    local veth_b_r="vMdRlyB0"
+
+    local ip_a="10.80.0.2"
+    local ip_r_a="10.80.0.1"
+    local ip_b="10.81.0.2"
+    local ip_r_b="10.81.0.1"
+    local prefix="24"
+
+    local port_a="51820"
+    local port_b="51820"
+    local rdv_udp_port="51821"
+    local rdv_tcp_port="8443"
+    local tun_dev="yip0"
+
+    delete_netns "$ns_a" "$ns_b" "$ns_r"
+    register_netns "$ns_a"
+    register_netns "$ns_b"
+    register_netns "$ns_r"
+
+    local genkey_a genkey_b priv_a pub_a priv_b pub_b obf_psk addr_a addr_b
+    genkey_a="$("$yipd_bin" --genkey)"
+    genkey_b="$("$yipd_bin" --genkey)"
+    priv_a="$(echo "$genkey_a" | grep '^private=' | cut -d= -f2)"
+    pub_a="$(echo "$genkey_a" | grep '^public=' | cut -d= -f2)"
+    priv_b="$(echo "$genkey_b" | grep '^private=' | cut -d= -f2)"
+    pub_b="$(echo "$genkey_b" | grep '^public=' | cut -d= -f2)"
+    obf_psk="$(openssl rand -hex 32)"
+    addr_a="$("$yipd_bin" --addr "$pub_a")"
+    addr_b="$("$yipd_bin" --addr "$pub_b")"
+
+    local cfg_a="$tmp_dir/yipA.conf"
+    local cfg_b="$tmp_dir/yipB.conf"
+
+    cat > "$cfg_a" <<EOF
+local_private=${priv_a}
+local_public=${pub_a}
+listen=${ip_a}:${port_a}
+device=${tun_dev}
+device_kind=tun
+rendezvous=tls://${ip_r_a}:${rdv_tcp_port}
+obf_psk=${obf_psk}
+[peer]
+public_key=${pub_b}
+EOF
+
+    cat > "$cfg_b" <<EOF
+local_private=${priv_b}
+local_public=${pub_b}
+listen=${ip_b}:${port_b}
+device=${tun_dev}
+device_kind=tun
+rendezvous=tls://${ip_r_b}:${rdv_tcp_port}
+obf_psk=${obf_psk}
+[peer]
+public_key=${pub_a}
+EOF
+
+    ip netns add "$ns_a"
+    ip netns add "$ns_b"
+    ip netns add "$ns_r"
+
+    ip link add "$veth_a_r" type veth peer name "$veth_a_n"
+    ip link set "$veth_a_n" netns "$ns_a"
+    ip link set "$veth_a_r" netns "$ns_r"
+    ip netns exec "$ns_a" ip addr add "${ip_a}/${prefix}" dev "$veth_a_n"
+    ip netns exec "$ns_a" ip link set "$veth_a_n" up
+    ip netns exec "$ns_a" ip link set lo up
+    ip netns exec "$ns_r" ip addr add "${ip_r_a}/${prefix}" dev "$veth_a_r"
+    ip netns exec "$ns_r" ip link set "$veth_a_r" up
+
+    ip link add "$veth_b_r" type veth peer name "$veth_b_n"
+    ip link set "$veth_b_n" netns "$ns_b"
+    ip link set "$veth_b_r" netns "$ns_r"
+    ip netns exec "$ns_b" ip addr add "${ip_b}/${prefix}" dev "$veth_b_n"
+    ip netns exec "$ns_b" ip link set "$veth_b_n" up
+    ip netns exec "$ns_b" ip link set lo up
+    ip netns exec "$ns_r" ip addr add "${ip_r_b}/${prefix}" dev "$veth_b_r"
+    ip netns exec "$ns_r" ip link set "$veth_b_r" up
+    ip netns exec "$ns_r" ip link set lo up
+
+    ip netns exec "$ns_r" sysctl -q -w net.ipv4.ip_forward=0
+    ip netns exec "$ns_r" sysctl -q -w net.ipv4.conf.all.forwarding=0
+
+    if command -v iptables >/dev/null 2>&1; then
+        ip netns exec "$ns_a" iptables -A OUTPUT -p udp -j DROP 2>/dev/null || true
+        ip netns exec "$ns_a" iptables -A INPUT -p udp -j DROP 2>/dev/null || true
+        ip netns exec "$ns_b" iptables -A OUTPUT -p udp -j DROP 2>/dev/null || true
+        ip netns exec "$ns_b" iptables -A INPUT -p udp -j DROP 2>/dev/null || true
+    fi
+
+    local cert="$tmp_dir/cert.pem"
+    local key="$tmp_dir/key.pem"
+    openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout "$key" -out "$cert" \
+        -days 1 -subj '/CN=relay.test' >"$tmp_dir/openssl.log" 2>&1
+
+    local pid_rdv
+    ip netns exec "$ns_r" "$rdv_bin" "0.0.0.0:${rdv_udp_port}" \
+        --listen-tcp "0.0.0.0:${rdv_tcp_port}" \
+        --tls-cert "$cert" \
+        --tls-key "$key" \
+        --obf-psk "$obf_psk" \
+        >"$tmp_dir/rdv.log" 2>&1 &
+    pid_rdv=$!
+    register_pid "$pid_rdv"
+    sleep 0.5
+
+    local tcpdump_pid
+    ip netns exec "$ns_a" tcpdump -nn -i "$veth_a_n" -w "$pcap_out" -U "tcp port $rdv_tcp_port" \
+        >"$tmp_dir/tcpdump.log" 2>&1 &
+    tcpdump_pid=$!
+    register_pid "$tcpdump_pid"
+    sleep 0.5
+
+    local pid_a pid_b
+    ip netns exec "$ns_a" "$yipd_bin" "$cfg_a" >"$tmp_dir/yipA.log" 2>&1 &
+    pid_a=$!
+    register_pid "$pid_a"
+
+    ip netns exec "$ns_b" "$yipd_bin" "$cfg_b" >"$tmp_dir/yipB.log" 2>&1 &
+    pid_b=$!
+    register_pid "$pid_b"
+
+    local tries=0
+    while true; do
+        local a_up=0 b_up=0
+        ip netns exec "$ns_a" ip link show "$tun_dev" >/dev/null 2>&1 && a_up=1 || true
+        ip netns exec "$ns_b" ip link show "$tun_dev" >/dev/null 2>&1 && b_up=1 || true
+        if [ "$a_up" -eq 1 ] && [ "$b_up" -eq 1 ]; then
+            break
+        fi
+        if ! kill -0 "$pid_a" 2>/dev/null || ! kill -0 "$pid_b" 2>/dev/null || ! kill -0 "$pid_rdv" 2>/dev/null; then
+            echo "[error] daemon died unexpectedly during relay capture"
+            cat "$tmp_dir/rdv.log" || true
+            cat "$tmp_dir/yipA.log" || true
+            cat "$tmp_dir/yipB.log" || true
+            stop_pids "$tcpdump_pid" "$pid_a" "$pid_b" "$pid_rdv"
+            delete_netns "$ns_a" "$ns_b" "$ns_r"
+            remove_dir "$tmp_dir"
+            return 1
+        fi
+        tries=$((tries + 1))
+        if [ "$tries" -ge 80 ]; then
+            echo "[error] timed out waiting for TUN devices in relay capture"
+            cat "$tmp_dir/rdv.log" || true
+            cat "$tmp_dir/yipA.log" || true
+            cat "$tmp_dir/yipB.log" || true
+            stop_pids "$tcpdump_pid" "$pid_a" "$pid_b" "$pid_rdv"
+            delete_netns "$ns_a" "$ns_b" "$ns_r"
+            remove_dir "$tmp_dir"
+            return 1
+        fi
+        sleep 0.25
+    done
+
+    ip netns exec "$ns_a" ip -6 addr add "${addr_a}/128" dev "$tun_dev" 2>/dev/null || true
+    ip netns exec "$ns_a" ip -6 route add fd00::/8 dev "$tun_dev" 2>/dev/null || true
+    ip netns exec "$ns_a" ip link set "$tun_dev" up
+
+    ip netns exec "$ns_b" ip -6 addr add "${addr_b}/128" dev "$tun_dev" 2>/dev/null || true
+    ip netns exec "$ns_b" ip -6 route add fd00::/8 dev "$tun_dev" 2>/dev/null || true
+    ip netns exec "$ns_b" ip link set "$tun_dev" up
+    sleep 0.5
+
+    set +e
+    ip netns exec "$ns_a" ping -6 -c 25 -i 0.2 -W 2 "$addr_b" >"$tmp_dir/ping.log" 2>&1
+    local ping_rc=$?
+    set -e
+    if [ "$ping_rc" -ne 0 ]; then
+        echo "[error] ping across relay tunnel failed (rc=$ping_rc)"
+        cat "$tmp_dir/ping.log" || true
+        cat "$tmp_dir/rdv.log" || true
+        cat "$tmp_dir/yipA.log" || true
+        cat "$tmp_dir/yipB.log" || true
+        stop_pids "$tcpdump_pid" "$pid_a" "$pid_b" "$pid_rdv"
+        delete_netns "$ns_a" "$ns_b" "$ns_r"
+        remove_dir "$tmp_dir"
+        return 1
+    fi
+
+    sleep 0.5
+    stop_pids "$tcpdump_pid" "$pid_a" "$pid_b" "$pid_rdv"
+    delete_netns "$ns_a" "$ns_b" "$ns_r"
+    remove_dir "$tmp_dir"
+
+    if [ ! -s "$pcap_out" ]; then
+        echo "[error] captured PCAP is empty: $pcap_out"
+        return 1
+    fi
+    echo "[capture] relay: $(stat -c%s "$pcap_out") bytes written to $pcap_out"
 }
 
 # -----------------------------------------------------------------------------
@@ -549,6 +1406,8 @@ format_verdict_table() {
 # -----------------------------------------------------------------------------
 
 main() {
+    trap cleanup_all EXIT INT TERM
+
     local pcap_dir=""
     local obf_pcap=""
     local quic_pcap=""
@@ -587,6 +1446,10 @@ main() {
                 ;;
             --ndpi-bin)
                 NDPI="$2"
+                shift 2
+                ;;
+            --rdv-bin)
+                RDV="$2"
                 shift 2
                 ;;
             --sni)
@@ -641,9 +1504,47 @@ main() {
                 echo "SKIP run-multi-dpi-oracle: needs root (netns + tcpdump) for live capture, or use --pcap-dir <dir>"
                 exit 0
             fi
-            # Placeholder for Task 2 live netns capture pipeline
-            echo "[notice] Live netns capture will be executed in Task 2. Run with --pcap-dir for offline evaluation."
-            exit 0
+
+            for req_tool in tcpdump ip; do
+                if ! check_tool "$req_tool"; then
+                    echo "SKIP run-multi-dpi-oracle: required tool '$req_tool' not found"
+                    exit 0
+                fi
+            done
+
+            if [ ! -x "$yipd_bin" ]; then
+                echo "Error: yipd binary not executable at '$yipd_bin'"
+                exit 1
+            fi
+
+            local rdv_bin
+            rdv_bin="$(resolve_rdv "${RDV:-}")"
+            if [ -z "$rdv_bin" ] || [ ! -x "$rdv_bin" ]; then
+                echo "Error: yip-rendezvous binary not found or not executable. Use --rdv-bin <path> or build target/release/yip-rendezvous"
+                exit 1
+            fi
+
+            local pcap_capture_dir="$out_dir/pcaps"
+            mkdir -p "$pcap_capture_dir"
+            obf_pcap="$pcap_capture_dir/raw-obf.pcap"
+            quic_pcap="$pcap_capture_dir/quic.pcap"
+            tls_pcap="$pcap_capture_dir/tls.pcap"
+            relay_pcap="$pcap_capture_dir/relay.pcap"
+
+            echo "=== Executing Live Netns Capture Pipeline ==="
+            echo "[capture 1/4] raw-obf -> $obf_pcap"
+            capture_raw_obf "$yipd_bin" "$obf_pcap"
+
+            echo "[capture 2/4] quic -> $quic_pcap"
+            capture_quic "$yipd_bin" "$quic_pcap"
+
+            echo "[capture 3/4] tls -> $tls_pcap"
+            capture_tls "$yipd_bin" "$tls_pcap"
+
+            echo "[capture 4/4] relay -> $relay_pcap"
+            capture_relay "$yipd_bin" "$rdv_bin" "$relay_pcap"
+
+            echo "=== Live Netns Captures Completed ==="
         else
             echo "Error: no PCAP inputs provided and no yipd binary specified."
             echo "Usage: $0 [--pcap-dir <dir> | <yipd-binary> <ndpiReader-binary> [out-dir]]"
