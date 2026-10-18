@@ -369,20 +369,24 @@ else
         --port 22 \
         --cidr "$RUNNER_CIDR" >/dev/null
 
-    # Cloud-init user data ensuring root ssh key matches admin key if root access is invoked
-    USER_DATA=$(cat <<'EOF'
-#!/bin/bash
-mkdir -p /root/.ssh
-if [ -f /home/admin/.ssh/authorized_keys ]; then
-  cp -f /home/admin/.ssh/authorized_keys /root/.ssh/authorized_keys
-  chmod 700 /root/.ssh
-  chmod 600 /root/.ssh/authorized_keys
-fi
-sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/* 2>/dev/null || true
-systemctl reload ssh || systemctl restart ssh || service ssh restart || true
+    # Cloud-init user data ensuring root ssh key is authorized
+    pubkey_content="$(cat "$KEY_FILE.pub")"
+    USER_DATA_FILE="$(mktemp /tmp/yip-user-data.XXXXXX)"
+    cat <<EOF > "$USER_DATA_FILE"
+#cloud-config
+disable_root: false
+ssh_pwauth: false
+ssh_authorized_keys:
+  - ${pubkey_content}
+runcmd:
+  - mkdir -p /root/.ssh
+  - echo "${pubkey_content}" >> /root/.ssh/authorized_keys
+  - chmod 700 /root/.ssh
+  - chmod 600 /root/.ssh/authorized_keys
+  - echo "PermitRootLogin prohibit-password" > /etc/ssh/sshd_config.d/99-root-login.conf
+  - sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/* 2>/dev/null || true
+  - systemctl reload ssh || systemctl restart ssh || service ssh restart || true
 EOF
-)
-    USER_DATA_B64=$(echo "$USER_DATA" | base64 | tr -d '\n')
 
     # Launch instances
     log "launching instance in $REGION_A ($INSTANCE_TYPE, $AMI_A)..."
@@ -392,7 +396,7 @@ EOF
         --instance-type "$INSTANCE_TYPE" \
         --key-name "$KEY_NAME" \
         --security-group-ids "$SG_A" \
-        --user-data "$USER_DATA_B64" \
+        --user-data "file://$USER_DATA_FILE" \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$TAG},{Key=Project,Value=yip-wan-bench},{Key=Role,Value=host-a}]" \
         --query 'Instances[0].InstanceId' --output text)
     write_session
@@ -404,10 +408,11 @@ EOF
         --instance-type "$INSTANCE_TYPE" \
         --key-name "$KEY_NAME" \
         --security-group-ids "$SG_B" \
-        --user-data "$USER_DATA_B64" \
+        --user-data "file://$USER_DATA_FILE" \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$TAG},{Key=Project,Value=yip-wan-bench},{Key=Role,Value=host-b}]" \
         --query 'Instances[0].InstanceId' --output text)
     write_session
+    rm -f "$USER_DATA_FILE"
 
     # Wait for running
     log "waiting for instance $INST_A in $REGION_A to reach running state..."
@@ -467,10 +472,19 @@ if [[ "$SKIP_SSH_WAIT" != "1" && "$DRY_RUN" != "1" ]]; then
     log "waiting for SSH accessibility on $HOST_A ($IP_A) and $HOST_B ($IP_B)..."
     wait_for_ssh() {
         local host="$1"
-        local deadline=$((SECONDS + 120))
+        local deadline=$((SECONDS + 180))
         while (( SECONDS < deadline )); do
             if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -i "$KEY_FILE" "$SSH_USER@$host" "true" >/dev/null 2>&1; then
                 return 0
+            fi
+            # If root SSH is not open yet, check if admin SSH is up and bootstrap root access
+            if [[ "$SSH_USER" == "root" ]]; then
+                if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -i "$KEY_FILE" "admin@$host" \
+                    "sudo mkdir -p /root/.ssh && sudo cp -f ~/.ssh/authorized_keys /root/.ssh/authorized_keys && sudo chmod 600 /root/.ssh/authorized_keys && sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/* 2>/dev/null; sudo systemctl reload ssh 2>/dev/null || sudo service ssh restart 2>/dev/null || true" >/dev/null 2>&1; then
+                    if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -i "$KEY_FILE" "root@$host" "true" >/dev/null 2>&1; then
+                        return 0
+                    fi
+                fi
             fi
             sleep 3
         done
