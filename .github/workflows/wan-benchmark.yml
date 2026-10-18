@@ -32,6 +32,7 @@ name: wan-benchmark
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   wan-benchmark:
@@ -156,13 +157,25 @@ jobs:
 
       - name: commit results to repository
         if: steps.check-secrets.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add crates/yip-bench/RESULTS-wan.md crates/yip-bench/wan/results/
           if ! git diff --staged --quiet; then
             git commit -m "bench(wan): record automated WAN benchmark results [skip ci]"
-            git push origin main
+            if ! git push origin main 2>/dev/null; then
+              echo "::warning::Direct push to main was blocked by branch protection rules. Creating results PR instead."
+              BRANCH="automated/wan-bench-$(date +%Y%m%d-%H%M%S)"
+              git checkout -b "$BRANCH"
+              git push origin "$BRANCH"
+              gh pr create \
+                --title "bench(wan): record automated WAN benchmark results" \
+                --body "Automated real-world WAN benchmark run results across multi-region testing." \
+                --base main \
+                --head "$BRANCH" || true
+            fi
           fi
 
       - name: upload wan benchmark artifacts
