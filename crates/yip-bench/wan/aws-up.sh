@@ -229,28 +229,62 @@ fi
 resolve_ami() {
     local region="$1"
     local arch="x86_64"
+    local deb_arch="amd64"
     if [[ "$INSTANCE_TYPE" =~ ^(t4g|c7g|m7g|r7g|c6g|m6g|r6g) ]]; then
         arch="arm64"
+        deb_arch="arm64"
     fi
 
     log "resolving Debian 12 AMI in $region ($arch)..."
-    local ami
-    # Try Debian 12 minimal first
-    ami=$(aws ec2 describe-images \
+    local ami=""
+    local err_msg=""
+    local query_out
+
+    # 1. Official Debian Cloud Team account (136693071363): debian-12-<arch>-<timestamp>-<build>
+    query_out=$(aws ec2 describe-images \
         --region "$region" \
-        --owners 136393095364 \
-        --filters "Name=name,Values=debian-12-minimal-${arch}-*,debian-12-${arch}-*" "Name=state,Values=available" "Name=architecture,Values=${arch}" \
+        --owners 136693071363 \
+        --filters "Name=name,Values=debian-12-${deb_arch}-*,debian-12-minimal-${deb_arch}-*,debian-12-${arch}-*" "Name=state,Values=available" "Name=architecture,Values=${arch}" \
         --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
-        --output text 2>/dev/null || true)
-    if [[ -z "$ami" || "$ami" == "None" || "$ami" == "null" ]]; then
-        ami=$(aws ec2 describe-images \
+        --output text 2>&1 || true)
+    query_out="$(echo "$query_out" | tr -d '[:space:]')"
+    if [[ "$query_out" =~ ^ami-[0-9a-zA-Z]+$ ]]; then
+        ami="$query_out"
+    else
+        err_msg="$query_out"
+        # 2. Wider name search from official Debian owner
+        query_out=$(aws ec2 describe-images \
             --region "$region" \
-            --owners 136393095364 \
-            --filters "Name=name,Values=*debian-12*" "Name=state,Values=available" "Name=architecture,Values=${arch}" \
+            --owners 136693071363 \
+            --filters "Name=name,Values=*debian-12*${deb_arch}*,*debian-12*${arch}*" "Name=state,Values=available" \
             --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
-            --output text 2>/dev/null || true)
+            --output text 2>&1 || true)
+        query_out="$(echo "$query_out" | tr -d '[:space:]')"
+        if [[ "$query_out" =~ ^ami-[0-9a-zA-Z]+$ ]]; then
+            ami="$query_out"
+        fi
     fi
-    [[ -n "$ami" && "$ami" != "None" && "$ami" != "null" ]] || die "could not resolve Debian 12 AMI in $region"
+
+    # 3. Fallback: Marketplace / Amazon published Debian images
+    if [[ -z "$ami" ]]; then
+        query_out=$(aws ec2 describe-images \
+            --region "$region" \
+            --owners aws-marketplace amazon \
+            --filters "Name=name,Values=*debian-12*${deb_arch}*,*debian-12*${arch}*" "Name=state,Values=available" "Name=architecture,Values=${arch}" \
+            --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
+            --output text 2>&1 || true)
+        query_out="$(echo "$query_out" | tr -d '[:space:]')"
+        if [[ "$query_out" =~ ^ami-[0-9a-zA-Z]+$ ]]; then
+            ami="$query_out"
+        fi
+    fi
+
+    if [[ -z "$ami" ]]; then
+        if [[ -n "$err_msg" && "$err_msg" != "None" && "$err_msg" != "null" ]]; then
+            warn "AWS query diagnostic: $err_msg"
+        fi
+        die "could not resolve Debian 12 AMI in $region"
+    fi
     echo "$ami"
 }
 
