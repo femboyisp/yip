@@ -30,7 +30,13 @@ build_and_ship_yipd() {
     put_A "$bin" "$REMOTE_BIN.new"; put_B "$bin" "$REMOTE_BIN.new"
     A "chmod +x $REMOTE_BIN.new && mv -f $REMOTE_BIN.new $REMOTE_BIN"
     B "chmod +x $REMOTE_BIN.new && mv -f $REMOTE_BIN.new $REMOTE_BIN"
-    A "$REMOTE_BIN --genkey >/dev/null" || die "yipd will not run on host A"
+    local test_err
+    if ! test_err=$(A "$REMOTE_BIN --genkey" 2>&1 >/dev/null); then
+        if [[ "$test_err" =~ "GLIBC_" ]]; then
+            die "yipd binary failed to run on host A due to glibc mismatch: $test_err\nEnsure local build glibc matches or is older than the server (e.g. build with ubuntu-22.04 for Debian 12)."
+        fi
+        die "yipd will not run on host A: $test_err"
+    fi
 }
 
 # ── packages ────────────────────────────────────────────────────────────────
