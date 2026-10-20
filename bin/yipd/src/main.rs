@@ -91,6 +91,28 @@ fn print_cli_usage(subcmd: &str) {
             println!("  -i, --interval <MILLIS>  Refresh interval in milliseconds [default: 500]");
             println!("  -h, --help               Print help");
         }
+        "ping" => {
+            println!("Usage: yipctl ping <PEER> [OPTIONS]");
+            println!();
+            println!("Send latency probes to a mesh peer through the active transport.");
+            println!();
+            println!("Options:");
+            println!("  -c, --control <SOCKET>  Path to yipd UNIX control socket");
+            println!("  -h, --help              Print help");
+        }
+        "peer" => {
+            println!("Usage: yipctl peer <add|rm> [ARGS] [OPTIONS]");
+            println!();
+            println!("Dynamically manage mesh peers at runtime.");
+            println!();
+            println!("Commands:");
+            println!("  add <PUBLIC_KEY> [ENDPOINT] [TRANSPORT]  Add peer dynamically");
+            println!("  rm  <PUBLIC_KEY>                         Remove peer");
+            println!();
+            println!("Options:");
+            println!("  -c, --control <SOCKET>  Path to yipd UNIX control socket");
+            println!("  -h, --help              Print help");
+        }
         _ => {
             println!("Usage: yipctl <COMMAND> [OPTIONS]");
             println!();
@@ -98,6 +120,8 @@ fn print_cli_usage(subcmd: &str) {
             println!("  status  Display daemon status and summary");
             println!("  peers   List connected peers and statistics");
             println!("  top     Real-time ANSI telemetry dashboard");
+            println!("  ping    Probe round-trip latency to a peer");
+            println!("  peer    Dynamically add or remove peers");
             println!();
             println!("Options:");
             println!("  -V, --version  Print version");
@@ -113,6 +137,7 @@ fn run_client_subcommand(
     let mut control_path = None;
     let mut json = false;
     let mut interval_ms = 500u64;
+    let mut positional: Vec<String> = Vec::new();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -143,6 +168,9 @@ fn run_client_subcommand(
                 print_cli_usage(subcmd);
                 return Ok(());
             }
+            other if !other.starts_with('-') => {
+                positional.push(other.to_string());
+            }
             other => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -158,6 +186,81 @@ fn run_client_subcommand(
         "status" => control::run_cli_status(&socket, json).map_err(std::io::Error::other),
         "peers" => control::run_cli_peers(&socket, json).map_err(std::io::Error::other),
         "top" => control::run_cli_top(&socket, interval_ms).map_err(std::io::Error::other),
+        "ping" => {
+            let target = positional.first().map(|s| s.as_str()).unwrap_or("");
+            control::run_cli_ping(&socket, target, 3).map_err(std::io::Error::other)
+        }
+        "peer" => {
+            if positional.is_empty() {
+                print_cli_usage("peer");
+                return Ok(());
+            }
+            match positional[0].as_str() {
+                "add" => {
+                    if positional.len() < 2 {
+                        eprintln!("Usage: yipctl peer add <PUBLIC_KEY> [ENDPOINT] [TRANSPORT]");
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "missing public key",
+                        ));
+                    }
+                    let pk = &positional[1];
+                    let ep = positional.get(2).map(|s| s.as_str());
+                    let tr = positional.get(3).map(|s| s.as_str());
+                    control::run_cli_peer_add(&socket, pk, ep, tr).map_err(std::io::Error::other)
+                }
+                "rm" => {
+                    if positional.len() < 2 {
+                        eprintln!("Usage: yipctl peer rm <PUBLIC_KEY>");
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "missing public key",
+                        ));
+                    }
+                    control::client_query(
+                        &socket,
+                        control::ControlCmd::RemovePeer {
+                            public_key: positional[1].clone(),
+                        },
+                    )
+                    .map(|resp| {
+                        if let control::ControlResponse::Ack { message, .. } = resp {
+                            println!("\x1b[1;32m✓\x1b[0m {message}");
+                        }
+                    })
+                    .map_err(std::io::Error::other)
+                }
+                "set-transport" => {
+                    if positional.len() < 3 {
+                        eprintln!("Usage: yipctl peer set-transport <PUBLIC_KEY> <TRANSPORT>");
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "missing parameters",
+                        ));
+                    }
+                    control::client_query(
+                        &socket,
+                        control::ControlCmd::SetTransport {
+                            public_key: positional[1].clone(),
+                            transport: positional[2..].join(" "),
+                        },
+                    )
+                    .map(|resp| {
+                        if let control::ControlResponse::Ack { message, .. } = resp {
+                            println!("\x1b[1;32m✓\x1b[0m {message}");
+                        }
+                    })
+                    .map_err(std::io::Error::other)
+                }
+                other => {
+                    eprintln!("Unknown peer action: {other}");
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "unknown peer action",
+                    ))
+                }
+            }
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("unknown subcommand: {subcmd}"),
@@ -188,6 +291,26 @@ fn main() -> std::io::Result<()> {
             Some("status") => return run_client_subcommand("status", args),
             Some("peers") => return run_client_subcommand("peers", args),
             Some("top") => return run_client_subcommand("top", args),
+            Some("ping") => return run_client_subcommand("ping", args),
+            Some("peer") => return run_client_subcommand("peer", args),
+            Some("genkey") | Some("--genkey") => {
+                let kp = yip_crypto::generate_keypair();
+                println!("private={}", hex_encode(&kp.private));
+                println!("public={}", hex_encode(&kp.public));
+                return Ok(());
+            }
+            Some("addr") | Some("--addr") => {
+                let hex = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "addr requires a 64-char hex pubkey argument",
+                    )
+                })?;
+                let pubkey = hex_decode_32(&hex)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                println!("{}", addr::node_addr(&pubkey));
+                return Ok(());
+            }
             Some(unknown) => {
                 eprintln!("yipctl: unknown command '{unknown}'");
                 eprintln!("See 'yipctl --help' for available commands.");
@@ -203,6 +326,8 @@ fn main() -> std::io::Result<()> {
         Some("status") => run_client_subcommand("status", args),
         Some("peers") => run_client_subcommand("peers", args),
         Some("top") => run_client_subcommand("top", args),
+        Some("ping") => run_client_subcommand("ping", args),
+        Some("peer") => run_client_subcommand("peer", args),
         Some("--version") | Some("-V") => {
             println!("{}", banner());
             Ok(())

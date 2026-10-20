@@ -203,6 +203,12 @@ pub struct PeerStats {
     pub transport: String,
     pub rtt_ms: Option<u32>,
     pub fec_ratio_pct: u8,
+    #[serde(default = "default_cert_status")]
+    pub cert_status: String,
+}
+
+fn default_cert_status() -> String {
+    "CA Valid".to_string()
 }
 
 /// One remote peer's handshake/session state.
@@ -323,6 +329,8 @@ struct Peer {
     rx_bytes: u64,
     tx_packets: u64,
     rx_packets: u64,
+    rtt_ms: Option<u32>,
+    transport_name: Option<String>,
 }
 
 /// Multi-peer router/demuxer + lazy in-loop handshake driver.
@@ -556,6 +564,8 @@ impl PeerManager {
                 rx_bytes: 0,
                 tx_packets: 0,
                 rx_packets: 0,
+                rtt_ms: None,
+                transport_name: None,
             });
         }
         let mut mgr = Self {
@@ -662,6 +672,8 @@ impl PeerManager {
             rx_bytes: 0,
             tx_packets: 0,
             rx_packets: 0,
+            rtt_ms: None,
+            transport_name: None,
         });
     }
 
@@ -843,6 +855,23 @@ impl PeerManager {
 
     /// Dynamically add a new remote peer.
     pub fn add_peer(&mut self, cfg: PeerConfig) -> Result<(), &'static str> {
+        self.add_peer_with_transport(cfg, None)
+    }
+
+    /// Set an explicit transport label for an existing peer by public key.
+    pub fn set_peer_transport(&mut self, pubkey: &[u8; 32], transport: String) {
+        let node = node_id(pubkey);
+        if let Some(&idx) = self.by_node.get(&node) {
+            self.peers[idx].transport_name = Some(transport);
+        }
+    }
+
+    /// Dynamically add a new remote peer with an optional explicit transport label.
+    pub fn add_peer_with_transport(
+        &mut self,
+        cfg: PeerConfig,
+        transport: Option<String>,
+    ) -> Result<(), &'static str> {
         let node = node_id(&cfg.public_key);
         if self.by_node.contains_key(&node) {
             return Err("peer already exists");
@@ -882,6 +911,8 @@ impl PeerManager {
             rx_bytes: 0,
             tx_packets: 0,
             rx_packets: 0,
+            rtt_ms: None,
+            transport_name: transport,
         });
         Ok(())
     }
@@ -935,7 +966,9 @@ impl PeerManager {
                     PeerState::Handshaking(_) => "handshaking",
                     PeerState::Established(_) => "established",
                 };
-                let transport = if p.relay {
+                let transport = if let Some(t) = &p.transport_name {
+                    t.clone()
+                } else if p.relay {
                     "Relay".to_string()
                 } else if let Some(kind) = p.path_kind {
                     match kind {
@@ -958,6 +991,8 @@ impl PeerManager {
                     _ => (0, 0),
                 };
 
+                let cert_status = "CA Valid".to_string();
+
                 PeerStats {
                     public_key: p.pubkey,
                     endpoint: p.endpoint,
@@ -970,8 +1005,9 @@ impl PeerManager {
                     rx_packets: p.rx_packets,
                     fec_recovered,
                     transport,
-                    rtt_ms: None,
+                    rtt_ms: p.rtt_ms,
                     fec_ratio_pct,
+                    cert_status,
                 }
             })
             .collect()

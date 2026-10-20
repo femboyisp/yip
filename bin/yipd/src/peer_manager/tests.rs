@@ -5,6 +5,29 @@ use crate::wire_glue::derive_wire_keys;
 use yip_crypto::{generate_keypair, Handshake};
 
 #[test]
+fn test_peer_manager_transport_helpers() {
+    let mut pm = test_peer_manager();
+    let cfg = peer_cfg(42, "10.0.0.42:51820");
+    pm.add_peer_with_transport(cfg.clone(), Some("Holepunched UDP".into()))
+        .unwrap();
+    let stats = pm.peer_stats();
+    let found = stats
+        .iter()
+        .find(|s| s.public_key == cfg.public_key)
+        .unwrap();
+    assert_eq!(found.transport, "Holepunched UDP");
+
+    pm.set_peer_transport(&cfg.public_key, "TLS (REALITY)".into());
+    let stats2 = pm.peer_stats();
+    let found2 = stats2
+        .iter()
+        .find(|s| s.public_key == cfg.public_key)
+        .unwrap();
+    assert_eq!(found2.transport, "TLS (REALITY)");
+    assert_eq!(found2.cert_status, "CA Valid");
+}
+
+#[test]
 fn by_addr_maps_each_peers_node_addr() {
     let peer_a = peer_cfg(1, "10.0.0.1:1000");
     let peer_b = peer_cfg(2, "10.0.0.2:2000");

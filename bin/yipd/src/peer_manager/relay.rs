@@ -398,6 +398,8 @@ impl PeerManager {
                 self.peers[idx].relay = true;
                 self.peers[idx].path.committed(PathKind::Relayed);
                 self.peers[idx].path_kind = Some(PathKind::Relayed);
+                self.peers[idx].rtt_ms =
+                    Some(now_ms.saturating_sub(handshaking.last_sent_ms) as u32);
 
                 self.egress.clear();
                 let pending = std::mem::take(&mut self.peers[idx].pending_tun);
