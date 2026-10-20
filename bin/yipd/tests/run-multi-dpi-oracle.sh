@@ -1094,8 +1094,16 @@ eval_tshark() {
             abs_pcap="$(readlink -f "$pcap" 2>/dev/null || realpath "$pcap" 2>/dev/null || echo "$pcap")"
             chmod a+r "$abs_pcap" 2>/dev/null || true
             chmod a+rx "$(dirname "$abs_pcap")" 2>/dev/null || true
-            "$tshark_bin" -r "$abs_pcap" -q -z io,phs >"$phs_file" 2>&1 || true
-            "$tshark_bin" -r "$abs_pcap" -T fields -e frame.protocols -e tls.handshake.extensions_server_name >"$fields_file" 2>&1 || true
+            # Feed PCAP via stdin (< "$abs_pcap" -r -) to avoid tshark permission
+            # drop and AppArmor sandbox denials on reading root-created PCAP paths.
+            "$tshark_bin" -r - -q -z io,phs < "$abs_pcap" >"$phs_file" 2>/dev/null || true
+            if [ ! -s "$phs_file" ]; then
+                "$tshark_bin" -r "$abs_pcap" -q -z io,phs >"$phs_file" 2>/dev/null || true
+            fi
+            "$tshark_bin" -r - -T fields -e frame.protocols -e tls.handshake.extensions_server_name < "$abs_pcap" >"$fields_file" 2>/dev/null || true
+            if [ ! -s "$fields_file" ]; then
+                "$tshark_bin" -r "$abs_pcap" -T fields -e frame.protocols -e tls.handshake.extensions_server_name >"$fields_file" 2>/dev/null || true
+            fi
         else
             echo "SKIP (tshark missing)"
             return 0
@@ -1550,8 +1558,11 @@ main() {
                 exit 1
             fi
 
+            mkdir -p "$out_dir"
+            chmod 777 "$out_dir" 2>/dev/null || true
             local pcap_capture_dir="$out_dir/pcaps"
             mkdir -p "$pcap_capture_dir"
+            chmod 777 "$pcap_capture_dir" 2>/dev/null || true
             obf_pcap="$pcap_capture_dir/raw-obf.pcap"
             quic_pcap="$pcap_capture_dir/quic.pcap"
             tls_pcap="$pcap_capture_dir/tls.pcap"
