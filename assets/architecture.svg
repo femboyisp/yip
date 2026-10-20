@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 720" width="1040" height="720">
+  <defs>
+    <marker id="arrow-ctrl" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L6,3 z" fill="#6366f1" />
+    </marker>
+    <marker id="arrow-data" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L6,3 z" fill="#06b6d4" />
+    </marker>
+    <marker id="arrow-fec" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L6,3 z" fill="#f97316" />
+    </marker>
+    <marker id="arrow-fast" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L6,3 z" fill="#10b981" />
+    </marker>
+    <marker id="arrow-stealth" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L6,3 z" fill="#e11d48" />
+    </marker>
+    <marker id="arrow-dim" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L6,3 z" fill="#6e7681" />
+    </marker>
+    <linearGradient id="grad-control-card" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#6366f1" stop-opacity="0.08" />
+      <stop offset="100%" stop-color="#161b22" stop-opacity="0.95" />
+    </linearGradient>
+    <linearGradient id="grad-data-card" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#06b6d4" stop-opacity="0.08" />
+      <stop offset="100%" stop-color="#161b22" stop-opacity="0.95" />
+    </linearGradient>
+    <linearGradient id="grad-fast-card" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.08" />
+      <stop offset="100%" stop-color="#161b22" stop-opacity="0.95" />
+    </linearGradient>
+    <linearGradient id="grad-stealth-card" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#e11d48" stop-opacity="0.08" />
+      <stop offset="100%" stop-color="#161b22" stop-opacity="0.95" />
+    </linearGradient>
+    <linearGradient id="grad-fec-subcard" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#f97316" stop-opacity="0.12" />
+      <stop offset="100%" stop-color="#0d1117" stop-opacity="0.98" />
+    </linearGradient>
+  </defs>
+  <!-- Canvas Background -->
+  <rect x="0.75" y="0.75" width="1038.50" height="718.50" rx="12.00" fill="#0d1117" stroke="#30363d" stroke-width="1.50" />
+  <!-- Header -->
+  <g id="header">
+    <rect x="24.00" y="20.00" width="76.00" height="24.00" rx="6.00" fill="#431407" stroke="#f97316" stroke-width="1.00" />
+    <text x="62.00" y="36.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" font-weight="700" fill="#fb923c" text-anchor="middle">🦊 YIP</text>
+    <text x="110.00" y="37.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="17" font-weight="700" fill="#f0f6fc">DUAL-PATH SYSTEM ARCHITECTURE</text>
+    <text x="110.00" y="55.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="11.5" fill="#8b949e">Zero-Lock Core Pipeline • eBPF AF_XDP Line-Rate Bypass &amp; uTLS / Xray-REALITY Anti-DPI Subsystems</text>
+    <rect x="898.50" y="24.00" width="117.50" height="22.00" rx="11.00" fill="#1e1b4b" stroke="#6366f1" stroke-width="1.00" />
+    <text x="957.25" y="39.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="600" fill="#818cf8" text-anchor="middle">Noise-IK AEAD</text>
+    <rect x="763.50" y="24.00" width="125.00" height="22.00" rx="11.00" fill="#431407" stroke="#f97316" stroke-width="1.00" />
+    <text x="826.00" y="39.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="600" fill="#fb923c" text-anchor="middle">GF(256) RS-FEC</text>
+    <rect x="636.00" y="24.00" width="117.50" height="22.00" rx="11.00" fill="#064e3b" stroke="#10b981" stroke-width="1.00" />
+    <text x="694.75" y="39.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="600" fill="#34d399" text-anchor="middle">40+ Gbps eBPF</text>
+  </g>
+  <!-- ========================================================= -->
+  <!-- SECTION 1: CONTROL PLANE                                 -->
+  <!-- ========================================================= -->
+  <g id="control-plane">
+    <rect x="24.00" y="74.00" width="992.00" height="120.00" rx="8.00" fill="url(#grad-control-card)" stroke="#6366f1" stroke-width="1.20" stroke-opacity="0.70" />
+    <rect x="36.00" y="84.00" width="112.00" height="18.00" rx="4.00" fill="#1e1b4b" stroke="#6366f1" stroke-width="1.00" />
+    <text x="92.00" y="97.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="700" fill="#818cf8" text-anchor="middle">CONTROL PLANE</text>
+    <text x="156.00" y="97.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="11" fill="#8b949e">Out-of-band orchestration, cryptographic session management &amp; topology mesh discovery</text>
+    <rect x="36.00" y="108.00" width="312.00" height="74.00" rx="6.00" fill="#0d1117" stroke="#30363d" stroke-width="1.00" />
+    <text x="48.00" y="126.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">BLAKE2s Key-Derivation</text>
+    <text x="48.00" y="143.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Static &amp; Ephemeral 256-bit Keypairs</text>
+    <text x="48.00" y="159.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Noise-IK Handshake Token Generation</text>
+    <text x="48.00" y="175.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#818cf8">• Ephemeral Rekeying State (120s Ratchet)</text>
+    <rect x="364.00" y="108.00" width="312.00" height="74.00" rx="6.00" fill="#0d1117" stroke="#30363d" stroke-width="1.00" />
+    <text x="376.00" y="126.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">CA-Gated Mesh Discovery <tspan fill="#818cf8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">(yip-ca)</tspan></text>
+    <text x="376.00" y="143.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• mTLS Node Identity &amp; Role Claims</text>
+    <text x="376.00" y="159.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Gossip Membership &amp; Dynamic Topology</text>
+    <text x="376.00" y="175.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#818cf8">• Cryptographic Access Control List (ACL)</text>
+    <rect x="692.00" y="108.00" width="312.00" height="74.00" rx="6.00" fill="#0d1117" stroke="#30363d" stroke-width="1.00" />
+    <text x="704.00" y="126.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">NAT Traversal &amp; Relay <tspan fill="#818cf8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">(yip-rendezvous)</tspan></text>
+    <text x="704.00" y="143.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• STUN/TURN Candidate Reflexive Probing</text>
+    <text x="704.00" y="159.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Symmetric NAT UDP Port Prediction</text>
+    <text x="704.00" y="175.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#818cf8">• Low-Latency Auto-Fallback Derp Relay</text>
+  </g>
+  <!-- Connectors: Control to Data Plane -->
+  <g id="connectors-control-to-data">
+    <path d="M 192.00 182.00 L 192.00 206.00 L 644.00 206.00 L 644.00 232.00" fill="none" stroke="#6366f1" stroke-width="1.40" stroke-dasharray="3,3" marker-end="url(#arrow-ctrl)" />
+    <rect x="250.00" y="198.00" width="168.00" height="16.00" rx="3.00" fill="#0d1117" stroke="#6366f1" stroke-width="0.80" />
+    <text x="334.00" y="210.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="9" font-weight="600" fill="#818cf8" text-anchor="middle">Noise Keys &amp; Ratchet State</text>
+    <path d="M 520.00 182.00 L 520.00 218.00 L 396.00 218.00 L 396.00 232.00" fill="none" stroke="#6366f1" stroke-width="1.40" stroke-dasharray="3,3" marker-end="url(#arrow-ctrl)" />
+    <rect x="428.00" y="210.00" width="144.00" height="16.00" rx="3.00" fill="#0d1117" stroke="#6366f1" stroke-width="0.80" />
+    <text x="500.00" y="222.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="9" font-weight="600" fill="#818cf8" text-anchor="middle">Peer Routing &amp; Endpoints</text>
+  </g>
+  <!-- ========================================================= -->
+  <!-- SECTION 2: DATA PLANE PIPELINE                           -->
+  <!-- ========================================================= -->
+  <g id="data-plane">
+    <rect x="24.00" y="236.00" width="992.00" height="168.00" rx="8.00" fill="url(#grad-data-card)" stroke="#06b6d4" stroke-width="1.20" stroke-opacity="0.70" />
+    <rect x="36.00" y="246.00" width="138.00" height="18.00" rx="4.00" fill="#083344" stroke="#06b6d4" stroke-width="1.00" />
+    <text x="105.00" y="259.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="700" fill="#22d3ee" text-anchor="middle">DATA PLANE PIPELINE</text>
+    <text x="182.00" y="259.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="11" fill="#8b949e">Zero-lock ingress coalescing, ring buffer sharding, SIMD cryptography, and erasure coding</text>
+    <rect x="36.00" y="278.00" width="224.00" height="114.00" rx="6.00" fill="#0d1117" stroke="#30363d" stroke-width="1.00" />
+    <text x="46.00" y="294.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="9" font-weight="700" fill="#22d3ee">STAGE 01 • INGRESS</text>
+    <text x="46.00" y="310.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">Linux TUN/TAP Device</text>
+    <text x="46.00" y="326.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="600" fill="#06b6d4">64KB GSO / GRO Coalescing</text>
+    <text x="46.00" y="346.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Multi-Queue kernel descriptors</text>
+    <text x="46.00" y="362.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Vectorized packet slicing</text>
+    <text x="46.00" y="378.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Zero-allocation page recycling</text>
+    <line x1="263.00" y1="335.00" x2="279.00" y2="335.00" stroke="#06b6d4" stroke-width="1.80" marker-end="url(#arrow-data)" />
+    <rect x="284.00" y="278.00" width="224.00" height="114.00" rx="6.00" fill="#0d1117" stroke="#30363d" stroke-width="1.00" />
+    <text x="294.00" y="294.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="9" font-weight="700" fill="#22d3ee">STAGE 02 • SHARDING</text>
+    <text x="294.00" y="310.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">Lock-Free SPSC Shards</text>
+    <text x="294.00" y="326.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="600" fill="#06b6d4">Shard 0 .. Shard N Rings</text>
+    <text x="294.00" y="346.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• 128-byte cacheline isolation</text>
+    <text x="294.00" y="362.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Dedicated core pinning &amp; affinity</text>
+    <text x="294.00" y="378.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• 0 lock contention across cores</text>
+    <line x1="511.00" y1="335.00" x2="527.00" y2="335.00" stroke="#06b6d4" stroke-width="1.80" marker-end="url(#arrow-data)" />
+    <rect x="532.00" y="278.00" width="224.00" height="114.00" rx="6.00" fill="#0d1117" stroke="#30363d" stroke-width="1.00" />
+    <text x="542.00" y="294.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="9" font-weight="700" fill="#22d3ee">STAGE 03 • CRYPTO</text>
+    <text x="542.00" y="310.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">ChaCha20-Poly1305 AEAD</text>
+    <text x="542.00" y="326.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="600" fill="#06b6d4">Noise-IK • 120s Ratchet</text>
+    <text x="542.00" y="346.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• AVX2 / NEON SIMD acceleration</text>
+    <text x="542.00" y="362.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Bitmap sliding replay window</text>
+    <text x="542.00" y="378.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• WireGuard-compatible framing</text>
+    <line x1="759.00" y1="335.00" x2="775.00" y2="335.00" stroke="#f97316" stroke-width="1.80" marker-end="url(#arrow-fec)" />
+    <rect x="780.00" y="278.00" width="224.00" height="114.00" rx="6.00" fill="url(#grad-fec-subcard)" stroke="#f97316" stroke-width="1.40" />
+    <text x="790.00" y="294.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="9" font-weight="700" fill="#fb923c">STAGE 04 • LOSS RECOVERY</text>
+    <text x="790.00" y="310.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">Systematic Cauchy RS-FEC</text>
+    <text x="790.00" y="326.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="600" fill="#f97316">GF(256) SIMD + RLNC</text>
+    <text x="790.00" y="346.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#f0f6fc">• Systematic Cauchy generator</text>
+    <text x="790.00" y="362.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#f0f6fc">• Random Linear Network Coding</text>
+    <text x="790.00" y="378.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" font-weight="600" fill="#fb923c">• 0-RTT Recovery up to 30% loss</text>
+  </g>
+  <!-- Routing Dispatch -->
+  <g id="dual-path-dispatch">
+    <path d="M 892.00 392.00 L 892.00 417.00 L 640.00 417.00" fill="none" stroke="#f97316" stroke-width="1.60" marker-end="url(#arrow-fec)" />
+    <rect x="390.00" y="405.00" width="250.00" height="24.00" rx="5.00" fill="#161b22" stroke="#30363d" stroke-width="1.20" />
+    <text x="515.00" y="421.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="700" fill="#f0f6fc" text-anchor="middle">🔀 DYNAMIC TRANSPORT ROUTER</text>
+    <path d="M 390.00 417.00 L 266.00 417.00 L 266.00 446.00" fill="none" stroke="#10b981" stroke-width="1.60" marker-end="url(#arrow-fast)" />
+    <text x="328.00" y="413.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="9" font-weight="600" fill="#34d399" text-anchor="middle">High-Throughput DC/WAN</text>
+    <path d="M 640.00 417.00 L 774.00 417.00 L 774.00 446.00" fill="none" stroke="#e11d48" stroke-width="1.60" marker-end="url(#arrow-stealth)" />
+    <text x="708.00" y="413.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="9" font-weight="600" fill="#fb7185" text-anchor="middle">Adversarial / DPI Networks</text>
+  </g>
+  <!-- ========================================================= -->
+  <!-- SECTION 3: DUAL-PATH SUBSYSTEMS                          -->
+  <!-- ========================================================= -->
+  <g id="fast-path">
+    <rect x="24.00" y="450.00" width="484.00" height="210.00" rx="8.00" fill="url(#grad-fast-card)" stroke="#10b981" stroke-width="1.30" stroke-opacity="0.80" />
+    <rect x="36.00" y="462.00" width="168.00" height="18.00" rx="4.00" fill="#064e3b" stroke="#10b981" stroke-width="1.00" />
+    <text x="120.00" y="475.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="700" fill="#34d399" text-anchor="middle">FAST PATH • KERNEL BYPASS</text>
+    <text x="214.00" y="475.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="11" fill="#8b949e">Hardware-accelerated line-rate zero-copy</text>
+    <rect x="36.00" y="488.00" width="460.00" height="58.00" rx="6.00" fill="#0d1117" stroke="#30363d" stroke-width="1.00" />
+    <text x="46.00" y="506.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">eBPF AF_XDP Zero-Copy <tspan fill="#34d399" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">(XSKMAP)</tspan></text>
+    <text x="46.00" y="522.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Direct NIC DMA via UMEM Fill &amp; Completion rings</text>
+    <text x="46.00" y="538.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Bypass Linux netfilter, SKB allocation &amp; routing stack</text>
+    <rect x="36.00" y="554.00" width="460.00" height="58.00" rx="6.00" fill="#0d1117" stroke="#30363d" stroke-width="1.00" />
+    <text x="46.00" y="572.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">Vectorized epoll sendmmsg / recvmmsg</text>
+    <text x="46.00" y="588.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• 1024-packet batch descriptor submission per syscall</text>
+    <text x="46.00" y="604.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Edge-triggered vector notification with 0 jitter</text>
+    <rect x="36.00" y="620.00" width="460.00" height="32.00" rx="6.00" fill="#064e3b" stroke="#10b981" stroke-width="1.20" />
+    <text x="266.00" y="640.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" font-weight="700" fill="#34d399" text-anchor="middle">⚡ PERFORMANCE: 40+ Gbps Line-Rate • 8.2M pps (16-Core AF_XDP)</text>
+  </g>
+  <g id="stealth-path">
+    <rect x="532.00" y="450.00" width="484.00" height="210.00" rx="8.00" fill="url(#grad-stealth-card)" stroke="#e11d48" stroke-width="1.30" stroke-opacity="0.80" />
+    <rect x="544.00" y="462.00" width="168.00" height="18.00" rx="4.00" fill="#4c0519" stroke="#e11d48" stroke-width="1.00" />
+    <text x="628.00" y="475.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="700" fill="#fb7185" text-anchor="middle">STEALTH • ANTI-DPI CAMOUFLAGE</text>
+    <text x="722.00" y="475.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="11" fill="#8b949e">Adversarial censorship &amp; stateful firewall bypass</text>
+    <rect x="544.00" y="488.00" width="460.00" height="58.00" rx="6.00" fill="#0d1117" stroke="#30363d" stroke-width="1.00" />
+    <text x="554.00" y="506.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">uTLS Chrome JA3/JA4 Parity</text>
+    <text x="554.00" y="522.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Exact TLS fingerprint emulation (Chrome 120-130)</text>
+    <text x="554.00" y="538.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Permuted cipher suites, GREASE, extensions &amp; ALPN</text>
+    <rect x="544.00" y="554.00" width="460.00" height="58.00" rx="6.00" fill="#0d1117" stroke="#30363d" stroke-width="1.00" />
+    <text x="554.00" y="572.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">Xray-REALITY TLS 1.3 / QUIC</text>
+    <text x="554.00" y="588.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Server Name Indication (SNI) authentic certificate borrowing</text>
+    <text x="554.00" y="604.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Active probe rejection with transparent upstream proxying</text>
+    <rect x="544.00" y="620.00" width="460.00" height="32.00" rx="6.00" fill="#4c0519" stroke="#e11d48" stroke-width="1.20" />
+    <text x="774.00" y="640.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" font-weight="700" fill="#fb7185" text-anchor="middle">🛡️ 4-ENGINE DPI ORACLE IMMUNE: nDPI • Zeek • Suricata • Wireshark</text>
+  </g>
+  <!-- Footer Bar -->
+  <g id="footer">
+    <line x1="24.00" y1="672.00" x2="1016.00" y2="672.00" stroke="#30363d" stroke-width="1.00" />
+    <text x="28.00" y="692.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10.5" fill="#6e7681">Target: Linux x86_64 / aarch64 • AVX2 / AVX-512 / ARM NEON • Rust 2024 Edition</text>
+    <text x="1012.00" y="692.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10.5" fill="#6e7681" text-anchor="end">Deterministic Vector Architecture • github.com/femboy/yip</text>
+  </g>
+</svg>
