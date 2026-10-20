@@ -183,6 +183,6 @@
   <g id="footer">
     <line x1="24.00" y1="688.00" x2="1016.00" y2="688.00" stroke="#30363d" stroke-width="1.00" />
     <text x="28.00" y="708.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10.5" fill="#6e7681">Target: Linux x86_64 / aarch64 • AVX2 / AVX-512 / ARM NEON • Rust 2024 Edition</text>
-    <text x="1012.00" y="708.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10.5" fill="#6e7681" text-anchor="end">Deterministic Vector Architecture • github.com/femboy/yip</text>
+    <text x="1012.00" y="708.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10.5" fill="#6e7681" text-anchor="end">Deterministic Vector Architecture • github.com/femboyisp/yip</text>
   </g>
 </svg>

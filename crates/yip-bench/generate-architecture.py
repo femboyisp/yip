@@ -398,11 +398,10 @@ def build_architecture_svg() -> str:
     lines.append('  <g id="footer">')
     lines.append(f'    <line x1="24.00" y1="688.00" x2="{w - 24:.2f}" y2="688.00" stroke="{COLOR_CANVAS_BORDER}" stroke-width="1.00" />')
     lines.append(f'    <text x="28.00" y="708.00" font-family="{FONT_MONO}" font-size="10.5" fill="{COLOR_TEXT_DIM}">Target: Linux x86_64 / aarch64 • AVX2 / AVX-512 / ARM NEON • Rust 2024 Edition</text>')
-    lines.append(f'    <text x="{w - 28:.2f}" y="708.00" font-family="{FONT_MONO}" font-size="10.5" fill="{COLOR_TEXT_DIM}" text-anchor="end">Deterministic Vector Architecture • github.com/femboy/yip</text>')
+    lines.append(f'    <text x="{w - 28:.2f}" y="708.00" font-family="{FONT_MONO}" font-size="10.5" fill="{COLOR_TEXT_DIM}" text-anchor="end">Deterministic Vector Architecture • github.com/femboyisp/yip</text>')
     lines.append('  </g>')
 
     lines.append('</svg>')
-    return "\n".join(lines) + "\n"
     return "\n".join(lines) + "\n"
 
 
