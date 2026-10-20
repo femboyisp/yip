@@ -104,20 +104,20 @@ git commit -m "feat(bench): add deterministic vector SVG benchmark graph generat
     - **Stealth / Anti-DPI Path**: `uTLS Chrome JA3/JA4 Parity` + `Xray-REALITY TLS 1.3 / QUIC` $\to$ 4-Engine Oracle (`nDPI`, `Zeek`, `Suricata`, `Wireshark`)
   - Border: `stroke="#30363d" stroke-width="1.5" rx="12"` on `#0d1117` canvas.
 
-- [ ] **Step 1: Write `crates/yip-bench/generate-architecture.py`**
+- [x] **Step 1: Write `crates/yip-bench/generate-architecture.py`**
 Script that deterministically generates `assets/architecture.svg`:
 - Defines visual containers, glowing flow arrows, box outlines, and text labels.
 - Color codes: Control Plane (`#6366f1`), Data Plane pipeline (`#06b6d4`), RS-FEC / Anti-DPI hero elements (`#f97316`), Fast Path (`#10b981`).
 - Embeds clean typography using the zero-dependency system font stack.
 
-- [ ] **Step 2: Generate `assets/architecture.svg`**
+- [x] **Step 2: Generate `assets/architecture.svg`**
 Run `python3 crates/yip-bench/generate-architecture.py` to create `assets/architecture.svg`.
 
-- [ ] **Step 3: Validate XML integrity and visual contrast**
+- [x] **Step 3: Validate XML integrity and visual contrast**
 Validate XML with `python3 -c "import xml.etree.ElementTree as ET; ET.parse('assets/architecture.svg')"`.
 Check visually or via text inspection that all box coordinates, text labels, and arrow paths align cleanly.
 
-- [ ] **Step 4: Commit Task 2**
+- [x] **Step 4: Commit Task 2**
 ```bash
 git add crates/yip-bench/generate-architecture.py assets/architecture.svg
 git commit -m "docs(arch): add dual-path vector system architecture SVG diagram"
