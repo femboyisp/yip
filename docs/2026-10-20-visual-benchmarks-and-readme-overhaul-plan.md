@@ -37,7 +37,7 @@
   - `python3 crates/yip-bench/generate-graphs.py` (generates/updates assets)
   - `python3 crates/yip-bench/generate-graphs.py --check` (exits 0 if up to date, 1 if drift detected or invalid XML)
 
-- [ ] **Step 1: Create structured multi-core scaling data file**
+- [x] **Step 1: Create structured multi-core scaling data file**
 Create `crates/yip-bench/results/sharding-scale.csv` with verified scaling metrics across 1, 2, 4, and 8 worker cores:
 ```csv
 cores,recvmmsg_gbps,recvmmsg_mpps,af_xdp_gbps,af_xdp_mpps,io_uring_gbps
@@ -47,7 +47,7 @@ cores,recvmmsg_gbps,recvmmsg_mpps,af_xdp_gbps,af_xdp_mpps,io_uring_gbps
 8,21.56,2.10,40.27,3.93,22.10
 ```
 
-- [ ] **Step 2: Write failing test script for graph generator**
+- [x] **Step 2: Write failing test script for graph generator**
 Create `crates/yip-bench/tests/test-generate-graphs.sh`:
 - Verifies `python3 crates/yip-bench/generate-graphs.py` creates all three SVGs.
 - Verifies all SVGs parse as valid XML (`xml.etree.ElementTree`).
@@ -56,7 +56,7 @@ Create `crates/yip-bench/tests/test-generate-graphs.sh`:
 - Verifies SVG card styling: checks for `stroke="#30363d"` and `rx="12"`.
 - Run `bash crates/yip-bench/tests/test-generate-graphs.sh` and ensure it fails.
 
-- [ ] **Step 3: Implement `generate-graphs.py`**
+- [x] **Step 3: Implement `generate-graphs.py`**
 Implement the standalone Python SVG generator:
 - Build reusable SVG canvas class: `#0d1117` background, `#30363d` border, system font stack, grid lines `#21262d`, axis labels, and legend badges.
 - `generate_throughput_loss_chart()`:
@@ -76,10 +76,10 @@ Implement the standalone Python SVG generator:
   - Annotations: *"40+ Gbps Line-Rate Multi-Core Scaling"*.
 - Implement `--check` mode: compares existing on-disk SVGs with newly generated strings; exits 1 if differences are found.
 
-- [ ] **Step 4: Run test script and verify pass**
+- [x] **Step 4: Run test script and verify pass**
 Run `bash crates/yip-bench/tests/test-generate-graphs.sh` to confirm all assertions pass.
 
-- [ ] **Step 5: Commit Task 1**
+- [x] **Step 5: Commit Task 1**
 ```bash
 git add crates/yip-bench/results/sharding-scale.csv crates/yip-bench/generate-graphs.py crates/yip-bench/tests/test-generate-graphs.sh assets/bench-*.svg
 git commit -m "feat(bench): add deterministic vector SVG benchmark graph generator (#109)"
