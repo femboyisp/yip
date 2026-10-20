@@ -472,6 +472,7 @@ impl PeerManager {
         if let Some(cert) = Cert::decode(&responder_payload) {
             self.peers[idx].admitted_cert_not_after = Some(cert.not_after);
         }
+        self.peers[idx].rtt_ms = Some(now_ms.saturating_sub(rk.last_sent_ms) as u32);
 
         let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
         let mut dp = Box::new(DataPlane::new(

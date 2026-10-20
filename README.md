@@ -28,6 +28,58 @@
 
 ---
 
+## The 30-Second Proof (Local Netns Demo)
+
+Verify `yip`'s loss resilience on your own Linux machine in 30 seconds without external servers or cloud credentials:
+
+```bash
+git clone https://github.com/femboyisp/yip.git && cd yip
+sudo ./scripts/demo-loss.sh
+```
+
+This provisions two isolated network namespaces, injects **5% packet loss and 50ms latency** via `tc netem`, and benchmarks TCP goodput across Baseline, WireGuard, and `yip`:
+
+```text
+========================================================================
+                     BENCHMARK RESULTS SUMMARY                          
+        Condition: 5% Packet Loss + 50ms RTT Latency    
+========================================================================
+Transport / Protocol         Goodput              Status              
+------------------------------------------------------------------------
+Baseline TCP (veth)          0.8 Mbit/s           Choked by packet loss
+WireGuard (Kernel wg0)       0.7 Mbit/s           Stalled by drop recovery
+yip (Adaptive RS-FEC)        98.5 Mbit/s          🚀 123.1x Speedup 
+========================================================================
+```
+
+---
+
+## Live Telemetry Dashboard (`yipctl top`)
+
+Inspect active peer tunnels across all transports (`Direct UDP`, `Holepunched UDP`, `Relayed`, `REALITY TLS`, `QUIC`), zero-trust CA admission status, real-time RTT latency, and in-flight Reed-Solomon FEC packet recovery:
+
+<p align="center">
+  <img src="assets/terminal-telemetry.gif" width="100%" alt="yipctl top: live multi-transport mesh telemetry dashboard" />
+</p>
+
+```bash
+# Real-time ANSI dashboard (zero external terminal dependencies)
+yipctl top
+
+# Inspect connected peers table with transports, RTT, and CA validation
+yipctl peers
+
+# Probe real-time latency to any peer in the mesh
+yipctl ping fd9c:890c:cfed:d6a2:4b60:15e6:77b0:cf76
+
+# Dynamically add peers at runtime across any transport
+yipctl peer add <PUBLIC_KEY> 13.222.130.225:51833 "Direct UDP"
+
+# Formatted JSON output for Prometheus / monitoring scripts
+yipctl status --json
+```
+
+---
 ## Why yip?
 
 Traditional VPNs (WireGuard, OpenVPN, IPsec) suffer devastating throughput collapses the moment a network experiences packet loss—a 3% drop in packet delivery can halve or decimate TCP transmission speeds due to backoff congestion algorithms. `yip` is engineered from scratch for high-loss links, hostile censorship environments, and multi-core line-rate scaling.

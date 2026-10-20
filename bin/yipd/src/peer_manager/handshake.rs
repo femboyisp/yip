@@ -443,6 +443,8 @@ impl PeerManager {
                 // stale `relay` flag from a raced escalation (see the mirror in
                 // `handle_handshake_init`).
                 self.peers[idx].relay = false;
+                self.peers[idx].rtt_ms =
+                    Some(now_ms.saturating_sub(handshaking.last_sent_ms) as u32);
 
                 self.egress.clear();
                 let pending = std::mem::take(&mut self.peers[idx].pending_tun);
