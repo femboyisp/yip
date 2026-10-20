@@ -16,7 +16,7 @@ use crate::config::PeerConfig;
 use crate::peer_manager::{PeerManager, PeerStats};
 
 /// Inbound control commands received over the UNIX socket.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "cmd")]
 pub enum ControlCmd {
     #[serde(rename = "status")]
@@ -291,6 +291,355 @@ pub fn dispatch_cmd(
     }
 }
 
+pub const DEFAULT_CONTROL_SOCKET: &str = "/run/yipd.sock";
+pub const FALLBACK_CONTROL_SOCKET: &str = "/tmp/yipd.sock";
+
+/// Resolve the control socket path from an optional override, falling back to
+/// `/run/yipd.sock` if present, or `/tmp/yipd.sock`.
+pub fn resolve_control_socket(override_path: Option<&Path>) -> PathBuf {
+    if let Some(p) = override_path {
+        return p.to_path_buf();
+    }
+    let run_path = Path::new(DEFAULT_CONTROL_SOCKET);
+    if run_path.exists() {
+        return run_path.to_path_buf();
+    }
+    let tmp_path = Path::new(FALLBACK_CONTROL_SOCKET);
+    if tmp_path.exists() {
+        return tmp_path.to_path_buf();
+    }
+    run_path.to_path_buf()
+}
+
+/// Connect to a running yipd daemon over UNIX domain socket and send a control command.
+pub fn client_query(socket_path: &Path, cmd: ControlCmd) -> Result<ControlResponse, String> {
+    let stream = UnixStream::connect(socket_path).map_err(|e| {
+        format!(
+            "failed to connect to yipd control socket at {}: {e}",
+            socket_path.display()
+        )
+    })?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(3)))
+        .map_err(|e| e.to_string())?;
+
+    let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(stream);
+
+    let mut req_str = serde_json::to_string(&cmd).map_err(|e| e.to_string())?;
+    req_str.push('\n');
+    writer
+        .write_all(req_str.as_bytes())
+        .map_err(|e| e.to_string())?;
+    writer.flush().map_err(|e| e.to_string())?;
+
+    let mut line = String::new();
+    let n = reader.read_line(&mut line).map_err(|e| e.to_string())?;
+    if n == 0 || line.trim().is_empty() {
+        return Err("empty response received from yipd daemon".into());
+    }
+
+    serde_json::from_str(line.trim()).map_err(|e| format!("failed to parse daemon response: {e}"))
+}
+
+/// Format bytes as human-readable unit (B, KiB, MiB, GiB).
+pub fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GiB", b / GB)
+    } else if b >= MB {
+        format!("{:.2} MiB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KiB", b / KB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Format transfer rate in bits per second (bps, Kbps, Mbps, Gbps).
+pub fn format_rate(bytes_per_sec: f64) -> String {
+    let bits_per_sec = bytes_per_sec * 8.0;
+    if bits_per_sec >= 1_000_000_000.0 {
+        format!("{:.2} Gbps", bits_per_sec / 1_000_000_000.0)
+    } else if bits_per_sec >= 1_000_000.0 {
+        format!("{:.2} Mbps", bits_per_sec / 1_000_000.0)
+    } else if bits_per_sec >= 1_000.0 {
+        format!("{:.1} Kbps", bits_per_sec / 1_000.0)
+    } else {
+        format!("{:.0} bps", bits_per_sec)
+    }
+}
+
+/// Format duration in seconds as human-readable time string.
+pub fn format_duration(secs: u64) -> String {
+    let d = secs / 86400;
+    let h = (secs % 86400) / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if d > 0 {
+        format!("{d}d {h}h {m}m")
+    } else if h > 0 {
+        format!("{h}h {m}m {s}s")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// Generate a Unicode block sparkline from a series of values.
+pub fn sparkline(values: &[f64]) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    const BARS: [char; 8] = [' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let max = values.iter().copied().fold(0.0, f64::max);
+    if max <= 0.0 {
+        return " ".repeat(values.len());
+    }
+    values
+        .iter()
+        .map(|&v| {
+            let fraction = (v / max).clamp(0.0, 1.0);
+            let idx = ((fraction * (BARS.len() - 1) as f64).round() as usize).min(BARS.len() - 1);
+            BARS[idx]
+        })
+        .collect()
+}
+
+/// Query and display daemon status.
+pub fn run_cli_status(socket_path: &Path, json: bool) -> Result<(), String> {
+    let resp = client_query(socket_path, ControlCmd::Status)?;
+    if json {
+        let text = serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?;
+        println!("{text}");
+        return Ok(());
+    }
+    match resp {
+        ControlResponse::Status {
+            ok,
+            version,
+            node_addr,
+            device,
+            peers_count,
+            uptime_secs,
+        } => {
+            if !ok {
+                return Err("daemon reported status error".into());
+            }
+            println!("\x1b[1;32m●\x1b[0m \x1b[1myipd\x1b[0m v{version}");
+            println!("  Device:     \x1b[1m{device}\x1b[0m");
+            println!("  Mesh IPv6:  \x1b[36m{node_addr}\x1b[0m");
+            println!("  Uptime:     {}", format_duration(uptime_secs));
+            println!("  Peers:      {peers_count} configured");
+            Ok(())
+        }
+        ControlResponse::Err { error, .. } => Err(error),
+        _ => Err("unexpected response format from daemon".into()),
+    }
+}
+
+/// Query and display peer table.
+pub fn run_cli_peers(socket_path: &Path, json: bool) -> Result<(), String> {
+    let resp = client_query(socket_path, ControlCmd::ListPeers)?;
+    if json {
+        let text = serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?;
+        println!("{text}");
+        return Ok(());
+    }
+    match resp {
+        ControlResponse::ListPeers { ok, peers } => {
+            if !ok {
+                return Err("daemon reported error listing peers".into());
+            }
+            if peers.is_empty() {
+                println!("No peers currently configured.");
+                return Ok(());
+            }
+            println!(
+                "\x1b[1;4m{:<24} {:<21} {:<12} {:<15} {:<18} {:<10} {:<12}\x1b[0m",
+                "PEER", "ENDPOINT", "STATE", "TRANSPORT", "TX / RX", "FEC PARITY", "FEC RECOVERED"
+            );
+            for p in peers {
+                let ep_str = p
+                    .endpoint
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "none".into());
+                let traffic = format!(
+                    "{} / {}",
+                    format_bytes(p.tx_bytes),
+                    format_bytes(p.rx_bytes)
+                );
+                let parity = format!("{}%", p.fec_ratio_pct);
+                let rec = format!("{} pkts", p.fec_recovered);
+                let state_colored = match p.state.as_str() {
+                    "established" => format!("\x1b[32m{}\x1b[0m", p.state),
+                    "handshaking" => format!("\x1b[33m{}\x1b[0m", p.state),
+                    _ => format!("\x1b[90m{}\x1b[0m", p.state),
+                };
+                let peer_short = p.node_addr.to_string();
+                println!(
+                    "{:<24} {:<21} {:<21} {:<15} {:<18} {:<10} {:<12}",
+                    peer_short, ep_str, state_colored, p.transport, traffic, parity, rec
+                );
+            }
+            Ok(())
+        }
+        ControlResponse::Err { error, .. } => Err(error),
+        _ => Err("unexpected response format from daemon".into()),
+    }
+}
+
+struct CursorGuard;
+impl Drop for CursorGuard {
+    fn drop(&mut self) {
+        println!("\x1b[?25h\x1b[0m");
+        let _ = std::io::stdout().flush();
+    }
+}
+
+/// Run real-time ANSI terminal top dashboard.
+pub fn run_cli_top(socket_path: &Path, interval_ms: u64) -> Result<(), String> {
+    let _guard = CursorGuard;
+    let mut rate_history: Vec<f64> = Vec::with_capacity(20);
+    let mut last_tx = 0u64;
+    let mut last_rx = 0u64;
+    let mut last_time = Instant::now();
+    let mut first_tick = true;
+
+    print!("\x1b[?25l");
+    let _ = std::io::stdout().flush();
+
+    loop {
+        let status_resp = client_query(socket_path, ControlCmd::Status);
+        let peers_resp = client_query(socket_path, ControlCmd::ListPeers);
+
+        let now = Instant::now();
+        let elapsed_secs = last_time.elapsed().as_secs_f64().max(0.001);
+        last_time = now;
+
+        print!("\x1b[2J\x1b[H");
+
+        match (status_resp, peers_resp) {
+            (
+                Ok(ControlResponse::Status {
+                    version,
+                    node_addr,
+                    device,
+                    peers_count,
+                    uptime_secs,
+                    ..
+                }),
+                Ok(ControlResponse::ListPeers { peers, .. }),
+            ) => {
+                let mut total_tx = 0u64;
+                let mut total_rx = 0u64;
+                let mut total_fec_rec = 0u64;
+                for p in &peers {
+                    total_tx += p.tx_bytes;
+                    total_rx += p.rx_bytes;
+                    total_fec_rec += p.fec_recovered;
+                }
+
+                let delta_tx = if first_tick {
+                    0.0
+                } else {
+                    (total_tx.saturating_sub(last_tx)) as f64 / elapsed_secs
+                };
+                let delta_rx = if first_tick {
+                    0.0
+                } else {
+                    (total_rx.saturating_sub(last_rx)) as f64 / elapsed_secs
+                };
+                first_tick = false;
+                last_tx = total_tx;
+                last_rx = total_rx;
+
+                let combined_rate = delta_tx + delta_rx;
+                if rate_history.len() >= 20 {
+                    rate_history.remove(0);
+                }
+                rate_history.push(combined_rate);
+
+                let spark = sparkline(&rate_history);
+
+                println!(
+                    "\x1b[1;36myipctl top\x1b[0m — \x1b[1myipd\x1b[0m v{version} (Uptime: {})",
+                    format_duration(uptime_secs)
+                );
+                println!(
+                    "Device: \x1b[1m{}\x1b[0m  Node: \x1b[32m{}\x1b[0m  Peers: \x1b[1m{}\x1b[0m  FEC Recoveries: \x1b[1;32m{}\x1b[0m",
+                    device, node_addr, peers_count, total_fec_rec
+                );
+                println!(
+                    "Traffic: \x1b[34m↑ {}\x1b[0m (Live: {}/s)  \x1b[35m↓ {}\x1b[0m (Live: {}/s)  Spark: [\x1b[33m{}\x1b[0m]",
+                    format_bytes(total_tx),
+                    format_rate(delta_tx),
+                    format_bytes(total_rx),
+                    format_rate(delta_rx),
+                    spark
+                );
+                println!("{}", "─".repeat(80));
+
+                println!(
+                    "\x1b[1;4m{:<24} {:<21} {:<12} {:<15} {:<18} {:<10} {:<12}\x1b[0m",
+                    "PEER",
+                    "ENDPOINT",
+                    "STATE",
+                    "TRANSPORT",
+                    "TX / RX",
+                    "FEC PARITY",
+                    "FEC RECOVERED"
+                );
+                for p in peers {
+                    let ep_str = p
+                        .endpoint
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|| "none".into());
+                    let traffic = format!(
+                        "{} / {}",
+                        format_bytes(p.tx_bytes),
+                        format_bytes(p.rx_bytes)
+                    );
+                    let parity = format!("{}%", p.fec_ratio_pct);
+                    let rec = format!("{} pkts", p.fec_recovered);
+                    let state_colored = match p.state.as_str() {
+                        "established" => format!("\x1b[32m{}\x1b[0m", p.state),
+                        "handshaking" => format!("\x1b[33m{}\x1b[0m", p.state),
+                        _ => format!("\x1b[90m{}\x1b[0m", p.state),
+                    };
+                    println!(
+                        "{:<24} {:<21} {:<21} {:<15} {:<18} {:<10} {:<12}",
+                        p.node_addr.to_string(),
+                        ep_str,
+                        state_colored,
+                        p.transport,
+                        traffic,
+                        parity,
+                        rec
+                    );
+                }
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                println!("\x1b[1;31mError connecting to yipd control socket:\x1b[0m {e}");
+                println!("Retrying in {}ms... (press Ctrl+C to exit)", interval_ms);
+            }
+            _ => {
+                println!("Waiting for daemon telemetry...");
+            }
+        }
+
+        let _ = std::io::stdout().flush();
+        std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +730,29 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
         assert!(line.contains("\"device\":\"yip0\""));
+    }
+
+    #[test]
+    fn test_format_helpers_and_sparkline() {
+        assert_eq!(format_bytes(500), "500 B");
+        assert_eq!(format_bytes(2048), "2.0 KiB");
+        assert_eq!(format_bytes(1048576 * 5), "5.00 MiB");
+        assert_eq!(format_bytes(1073741824 * 3), "3.00 GiB");
+
+        assert_eq!(format_rate(100.0), "800 bps");
+        assert_eq!(format_rate(12500.0), "100.0 Kbps");
+        assert_eq!(format_rate(1250000.0), "10.00 Mbps");
+        assert_eq!(format_rate(125000000.0), "1.00 Gbps");
+
+        assert_eq!(format_duration(45), "45s");
+        assert_eq!(format_duration(125), "2m 5s");
+        assert_eq!(format_duration(3665), "1h 1m 5s");
+        assert_eq!(format_duration(86400 * 2 + 3600 * 3), "2d 3h 0m");
+
+        let values = [0.0, 10.0, 50.0, 100.0];
+        let spark = sparkline(&values);
+        assert_eq!(spark.chars().count(), 4);
+        assert_eq!(spark.chars().next().unwrap(), ' ');
+        assert_eq!(spark.chars().last().unwrap(), '█');
     }
 }

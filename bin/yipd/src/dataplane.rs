@@ -281,6 +281,16 @@ impl DataPlane {
         self.peer_addr = addr;
     }
 
+    /// Current FEC bulk repair ratio (0.0 = no proactive parity, 0.2 = 20% parity).
+    pub fn bulk_repair_ratio(&self) -> f32 {
+        self.transport.bulk_repair_ratio()
+    }
+
+    /// Total count of FEC objects reconstructed via repair shards.
+    pub fn fec_recovered_count(&self) -> u64 {
+        self.transport.fec_recovered_count()
+    }
+
     /// Reconfigure shard start object id and stride increment for multi-core scaling.
     pub fn set_shard(&mut self, shard_id: usize, num_shards: usize) {
         self.transport.set_shard(shard_id, num_shards);

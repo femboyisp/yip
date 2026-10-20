@@ -199,6 +199,7 @@ pub struct FecReassembler {
     objects: HashMap<u16, ObjState>,
     order: VecDeque<u16>,
     max_objects: usize,
+    recovered_count: u64,
 }
 
 impl FecReassembler {
@@ -210,7 +211,13 @@ impl FecReassembler {
             objects: HashMap::new(),
             order: VecDeque::new(),
             max_objects: max_objects.max(1),
+            recovered_count: 0,
         }
+    }
+
+    /// Number of objects reconstructed via repair/parity shards.
+    pub fn recovered_count(&self) -> u64 {
+        self.recovered_count
     }
 
     /// Number of objects currently being reassembled.
@@ -289,6 +296,10 @@ impl FecReassembler {
             state.scheme,
         )?;
         state.done = true;
+
+        if state.shards.keys().any(|&idx| usize::from(idx) >= state.k) {
+            self.recovered_count += 1;
+        }
 
         // Concatenate source shards and trim to the original object_size.
         let size = usize::try_from(symbol.object_size).expect("size fits usize");

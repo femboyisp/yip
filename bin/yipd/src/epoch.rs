@@ -96,6 +96,14 @@ impl EpochSet {
         &mut self.current
     }
 
+    pub fn bulk_repair_ratio(&self) -> f32 {
+        self.current.bulk_repair_ratio()
+    }
+
+    pub fn fec_recovered_count(&self) -> u64 {
+        self.current.fec_recovered_count()
+    }
+
     pub fn current_obf_key(&self) -> Option<[u8; 16]> {
         self.current.obf_key()
     }

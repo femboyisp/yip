@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 440" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#0d1117" />
+      <stop offset="100%" stop-color="#090d13" />
+    </linearGradient>
+    <filter id="shadow" x="-5%" y="-5%" width="110%" height="110%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#000000" flood-opacity="0.6"/>
+    </filter>
+  </defs>
+
+  <style>
+    .terminal-window { fill: url(#bgGrad); stroke: #30363d; stroke-width: 1px; rx: 10px; }
+    .window-header { fill: #161b22; }
+    .dot-red { fill: #ff5f56; }
+    .dot-yellow { fill: #ffbd2e; }
+    .dot-green { fill: #27c93f; }
+    .title-text { fill: #8b949e; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; font-size: 13px; font-weight: 500; text-anchor: middle; }
+    .mono { font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", "SF Mono", monospace; font-size: 13px; line-height: 20px; }
+    .cyan { fill: #58a6ff; font-weight: bold; }
+    .green { fill: #3fb950; font-weight: bold; }
+    .green-dim { fill: #3fb950; }
+    .yellow { fill: #d29922; }
+    .blue { fill: #79c0ff; }
+    .purple { fill: #d2a8ff; }
+    .white { fill: #f0f6fc; font-weight: bold; }
+    .gray { fill: #8b949e; }
+    .border-line { stroke: #30363d; stroke-width: 1px; }
+  </style>
+
+  <!-- Window Container with Shadow -->
+  <g filter="url(#shadow)">
+    <rect x="20" y="20" width="880" height="400" class="terminal-window" />
+    
+    <!-- Title Bar -->
+    <path d="M 20 30 Q 20 20 30 20 L 890 20 Q 900 20 900 30 L 900 58 L 20 58 Z" class="window-header" />
+    <circle cx="42" cy="39" r="6" class="dot-red" />
+    <circle cx="62" cy="39" r="6" class="dot-yellow" />
+    <circle cx="82" cy="39" r="6" class="dot-green" />
+    <text x="460" y="44" class="title-text">yipctl top — live adaptive telemetry dashboard</text>
+    <line x1="20" y1="58" x2="900" y2="58" class="border-line" />
+  </g>
+
+  <!-- Terminal Content -->
+  <g transform="translate(45, 90)" class="mono">
+    <!-- Header Row -->
+    <text x="0" y="0">
+      <tspan class="cyan">yipctl top</tspan>
+      <tspan class="gray"> — </tspan>
+      <tspan class="white">yipd</tspan>
+      <tspan class="gray"> v0.1.0 </tspan>
+      <tspan class="gray">(Uptime: </tspan>
+      <tspan class="white">4h 12m 08s</tspan>
+      <tspan class="gray">)</tspan>
+    </text>
+
+    <!-- Meta Info Row -->
+    <text x="0" y="24">
+      <tspan class="gray">Device: </tspan><tspan class="white">yip0</tspan>
+      <tspan class="gray">   Node: </tspan><tspan class="green">fd00:7a81:c912:0000:3a91:88ff:fe21:04a1</tspan>
+      <tspan class="gray">   Peers: </tspan><tspan class="white">2</tspan>
+    </text>
+
+    <!-- Traffic & Sparkline Row -->
+    <text x="0" y="48">
+      <tspan class="gray">Traffic: </tspan>
+      <tspan class="blue">↑ 142.8 MiB</tspan>
+      <tspan class="gray"> (Live: </tspan><tspan class="white">98.4 Mbps</tspan><tspan class="gray">)   </tspan>
+      <tspan class="purple">↓ 284.1 MiB</tspan>
+      <tspan class="gray"> (Live: </tspan><tspan class="white">104.2 Mbps</tspan><tspan class="gray">)   </tspan>
+      <tspan class="gray">Spark: [</tspan><tspan class="yellow"> ▂▄▅▆▇██▇▆▅▄▃ ▂▄▆██</tspan><tspan class="gray">]</tspan>
+    </text>
+
+    <!-- Divider Line -->
+    <line x1="0" y1="65" x2="830" y2="65" class="border-line" />
+
+    <!-- Table Header -->
+    <text x="0" y="90" class="gray" font-weight="bold">
+      <tspan x="0">PEER</tspan>
+      <tspan x="200">ENDPOINT</tspan>
+      <tspan x="390">STATE</tspan>
+      <tspan x="495">TRANSPORT</tspan>
+      <tspan x="625">TX / RX</tspan>
+      <tspan x="745">FEC RECOVERED</tspan>
+    </text>
+
+    <!-- Peer Row 1 -->
+    <text x="0" y="122">
+      <tspan x="0" class="cyan">fd00:7a81:c912:0001</tspan>
+      <tspan x="200" class="gray">198.51.100.2:51820</tspan>
+      <tspan x="390" class="green">established</tspan>
+      <tspan x="495" class="white">Direct UDP</tspan>
+      <tspan x="625" class="gray">74.2 MiB / 141.0 MiB</tspan>
+      <tspan x="745" class="green">8,421 pkts (100%)</tspan>
+    </text>
+
+    <!-- Peer Row 2 -->
+    <text x="0" y="152">
+      <tspan x="0" class="cyan">fd00:4412:beef:0002</tspan>
+      <tspan x="200" class="gray">203.0.113.88:8443</tspan>
+      <tspan x="390" class="green">established</tspan>
+      <tspan x="495" class="white">REALITY TLS</tspan>
+      <tspan x="625" class="gray">68.6 MiB / 143.1 MiB</tspan>
+      <tspan x="745" class="green">6,471 pkts (100%)</tspan>
+    </text>
+
+    <!-- Bottom Status Bar -->
+    <line x1="0" y1="180" x2="830" y2="180" class="border-line" />
+    <text x="0" y="205" class="gray">
+      <tspan class="green">●</tspan>
+      <tspan class="gray"> FEC Controller: Active (12% adaptive redundancy under 5% packet loss)  |  Press </tspan>
+      <tspan class="white">Ctrl+C</tspan>
+      <tspan class="gray"> to exit</tspan>
+    </text>
+  </g>
+</svg>
