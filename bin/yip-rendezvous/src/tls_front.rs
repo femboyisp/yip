@@ -105,8 +105,9 @@ pub fn build_acceptor(cert_path: &str, key_path: &str) -> Result<SslAcceptor, Er
     b.set_certificate_chain_file(cert_path)?;
     b.set_private_key_file(key_path, SslFiletype::PEM)?;
     b.check_private_key()?;
-    // ALPN in the conventional browser-server order.
-    b.set_alpn_protos(b"\x02h2\x08http/1.1")?;
+    // ALPN in the conventional browser-server order. When forwarding to an HTTP/1.1
+    // decoy backend without an in-process H2 multiplexer, negotiate http/1.1.
+    b.set_alpn_protos(b"\x08http/1.1")?;
     Ok(b.build())
 }
 
@@ -134,7 +135,7 @@ pub fn build_throwaway_acceptor() -> Result<SslAcceptor, String> {
     b.set_certificate(&x509).map_err(|e| e.to_string())?;
     b.set_private_key(&pkey).map_err(|e| e.to_string())?;
     b.check_private_key().map_err(|e| e.to_string())?;
-    b.set_alpn_protos(b"\x02h2\x08http/1.1")
+    b.set_alpn_protos(b"\x08http/1.1")
         .map_err(|e| e.to_string())?;
     Ok(b.build())
 }
@@ -756,7 +757,7 @@ mod tests {
         b.set_certificate_chain_file(&cert).unwrap();
         b.set_private_key_file(&key, SslFiletype::PEM).unwrap();
         b.check_private_key().unwrap();
-        b.set_alpn_protos(b"\x02h2\x08http/1.1").unwrap();
+        b.set_alpn_protos(b"\x08http/1.1").unwrap();
         // X25519 only ⇒ the probe's hybrid 4588 offer is declined, group 29 wins.
         b.set_curves_list("X25519").unwrap();
         let acceptor = Arc::new(b.build());

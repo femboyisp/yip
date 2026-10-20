@@ -388,6 +388,7 @@ EOF
 
     sleep 0.5
     stop_pids "$tcpdump_pid" "$pid_a" "$pid_b"
+    chmod 666 "$pcap_out" 2>/dev/null || true
     delete_netns "$ns_a" "$ns_b"
     remove_dir "$tmp_dir"
 
@@ -541,6 +542,7 @@ EOF
 
     sleep 0.5
     stop_pids "$tcpdump_pid" "$pid_a" "$pid_b"
+    chmod 666 "$pcap_out" 2>/dev/null || true
     delete_netns "$ns_a" "$ns_b"
     remove_dir "$tmp_dir"
 
@@ -697,6 +699,7 @@ EOF
 
     sleep 0.5
     stop_pids "$tcpdump_pid" "$pid_a" "$pid_b"
+    chmod 666 "$pcap_out" 2>/dev/null || true
     delete_netns "$ns_a" "$ns_b"
     remove_dir "$tmp_dir"
 
@@ -935,6 +938,7 @@ EOF
 
     sleep 0.5
     stop_pids "$tcpdump_pid" "$pid_a" "$pid_b" "$pid_rdv"
+    chmod 666 "$pcap_out" 2>/dev/null || true
     delete_netns "$ns_a" "$ns_b" "$ns_r"
     remove_dir "$tmp_dir"
 
@@ -1088,8 +1092,18 @@ eval_tshark() {
         elif [ -n "$tshark_bin" ] && [ -f "$pcap" ]; then
             local abs_pcap
             abs_pcap="$(readlink -f "$pcap" 2>/dev/null || realpath "$pcap" 2>/dev/null || echo "$pcap")"
-            "$tshark_bin" -r "$abs_pcap" -q -z io,phs >"$phs_file" 2>&1 || true
-            "$tshark_bin" -r "$abs_pcap" -T fields -e frame.protocols -e tls.handshake.extensions_server_name >"$fields_file" 2>&1 || true
+            chmod a+r "$abs_pcap" 2>/dev/null || true
+            chmod a+rx "$(dirname "$abs_pcap")" 2>/dev/null || true
+            # Feed PCAP via stdin (< "$abs_pcap" -r -) to avoid tshark permission
+            # drop and AppArmor sandbox denials on reading root-created PCAP paths.
+            "$tshark_bin" -r - -q -z io,phs < "$abs_pcap" >"$phs_file" 2>/dev/null || true
+            if [ ! -s "$phs_file" ]; then
+                "$tshark_bin" -r "$abs_pcap" -q -z io,phs >"$phs_file" 2>/dev/null || true
+            fi
+            "$tshark_bin" -r - -T fields -e frame.protocols -e tls.handshake.extensions_server_name < "$abs_pcap" >"$fields_file" 2>/dev/null || true
+            if [ ! -s "$fields_file" ]; then
+                "$tshark_bin" -r "$abs_pcap" -T fields -e frame.protocols -e tls.handshake.extensions_server_name >"$fields_file" 2>/dev/null || true
+            fi
         else
             echo "SKIP (tshark missing)"
             return 0
@@ -1544,8 +1558,11 @@ main() {
                 exit 1
             fi
 
+            mkdir -p "$out_dir"
+            chmod 777 "$out_dir" 2>/dev/null || true
             local pcap_capture_dir="$out_dir/pcaps"
             mkdir -p "$pcap_capture_dir"
+            chmod 777 "$pcap_capture_dir" 2>/dev/null || true
             obf_pcap="$pcap_capture_dir/raw-obf.pcap"
             quic_pcap="$pcap_capture_dir/quic.pcap"
             tls_pcap="$pcap_capture_dir/tls.pcap"
@@ -1564,6 +1581,7 @@ main() {
             echo "[capture 4/4] relay -> $relay_pcap"
             capture_relay "$yipd_bin" "$rdv_bin" "$relay_pcap"
 
+            chmod -R a+rwX "$out_dir" 2>/dev/null || true
             echo "=== Live Netns Captures Completed ==="
         else
             echo "Error: no PCAP inputs provided and no yipd binary specified."

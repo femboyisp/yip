@@ -45,33 +45,33 @@
   <text x="805.00" y="428.00" fill="#8b949e" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">10%</text>
   <text x="442.50" y="446.00" fill="#f0f6fc" font-size="12" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="middle">Injected Network Loss (netem)</text>
   <text x="34.00" y="262.50" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="middle" transform="rotate(-90 34.00 262.50)">Effective Ping Packet Loss %</text>
-  <polygon points="80.00,410.00 80.00,410.00 261.25,410.00 442.50,390.33 623.75,390.33 805.00,410.00 805.00,410.00" fill="#f97316" stroke="none" opacity="0.15"/>
-  <polyline points="80.00,410.00 261.25,410.00 442.50,311.67 623.75,272.33 805.00,174.00" fill="none" stroke="#64748b" stroke-width="1.50" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="4,4"/>
+  <polygon points="80.00,410.00 80.00,410.00 261.25,410.00 442.50,410.00 623.75,390.33 805.00,410.00 805.00,410.00" fill="#f97316" stroke="none" opacity="0.15"/>
+  <polyline points="80.00,410.00 261.25,390.33 442.50,390.33 623.75,351.00 805.00,331.33" fill="none" stroke="#64748b" stroke-width="1.50" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="4,4"/>
   <circle cx="80.00" cy="410.00" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="261.25" cy="410.00" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="442.50" cy="311.67" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="623.75" cy="272.33" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="805.00" cy="174.00" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
-  <polyline points="80.00,410.00 261.25,410.00 442.50,351.00 623.75,311.67 805.00,292.00" fill="none" stroke="#a855f7" stroke-width="2.00" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="261.25" cy="390.33" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
+  <circle cx="442.50" cy="390.33" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
+  <circle cx="623.75" cy="351.00" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
+  <circle cx="805.00" cy="331.33" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
+  <polyline points="80.00,410.00 261.25,410.00 442.50,292.00 623.75,331.33 805.00,233.00" fill="none" stroke="#a855f7" stroke-width="2.00" stroke-linecap="round" stroke-linejoin="round"/>
   <circle cx="80.00" cy="410.00" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
   <circle cx="261.25" cy="410.00" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="442.50" cy="351.00" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="623.75" cy="311.67" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="805.00" cy="292.00" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
-  <polyline points="80.00,410.00 261.25,410.00 442.50,351.00 623.75,331.33 805.00,193.67" fill="none" stroke="#38bdf8" stroke-width="2.50" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="442.50" cy="292.00" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
+  <circle cx="623.75" cy="331.33" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
+  <circle cx="805.00" cy="233.00" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
+  <polyline points="80.00,410.00 261.25,390.33 442.50,351.00 623.75,311.67 805.00,174.00" fill="none" stroke="#38bdf8" stroke-width="2.50" stroke-linecap="round" stroke-linejoin="round"/>
   <circle cx="80.00" cy="410.00" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="261.25" cy="410.00" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
+  <circle cx="261.25" cy="390.33" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
   <circle cx="442.50" cy="351.00" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="623.75" cy="331.33" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="805.00" cy="193.67" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
-  <polyline points="80.00,410.00 261.25,410.00 442.50,390.33 623.75,390.33 805.00,410.00" fill="none" stroke="#f97316" stroke-width="3.50" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="623.75" cy="311.67" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
+  <circle cx="805.00" cy="174.00" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
+  <polyline points="80.00,410.00 261.25,410.00 442.50,410.00 623.75,390.33 805.00,410.00" fill="none" stroke="#f97316" stroke-width="3.50" stroke-linecap="round" stroke-linejoin="round"/>
   <circle cx="80.00" cy="410.00" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
   <circle cx="261.25" cy="410.00" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="442.50" cy="390.33" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
+  <circle cx="442.50" cy="410.00" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
   <circle cx="623.75" cy="390.33" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
   <circle cx="805.00" cy="410.00" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
-  <rect x="659.80" y="167.67" width="131.20" height="20.00" fill="#0d1117" rx="6.00" stroke="#30363d" stroke-width="1.00"/>
-  <text x="725.40" y="181.67" fill="#38bdf8" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">11% effective loss</text>
+  <rect x="659.80" y="148.00" width="131.20" height="20.00" fill="#0d1117" rx="6.00" stroke="#30363d" stroke-width="1.00"/>
+  <text x="725.40" y="162.00" fill="#38bdf8" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">12% effective loss</text>
   <rect x="621.40" y="372.00" width="169.60" height="20.00" fill="#1f1610" rx="6.00" stroke="#f97316" stroke-width="1.00"/>
   <text x="706.20" y="386.00" fill="#fb923c" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">0% loss (100% recovered)</text>
   <rect x="104.00" y="139.00" width="387.20" height="22.00" fill="#161b22" rx="6.00" stroke="#30363d" stroke-width="1.00"/>
