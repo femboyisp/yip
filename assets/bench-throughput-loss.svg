@@ -7,85 +7,89 @@
   <rect width="100%" height="100%" rx="12" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
   <text x="32.00" y="34.00" fill="#f0f6fc" font-size="18" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="start">WAN TCP Goodput vs Packet Loss</text>
   <text x="32.00" y="56.00" fill="#8b949e" font-size="12" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="start">AWS Multi-Region WAN: us-east-1 ↔ us-west-2 (~60.6ms RTT, 1 vCPU, 10% FEC Parity)</text>
-  <line x1="75.00" y1="82.00" x2="95.00" y2="82.00" stroke="#f97316" stroke-width="2.50"/>
-  <circle cx="85.00" cy="82.00" r="3.50" fill="#f97316"/>
-  <text x="101.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">yip (10% FEC)</text>
-  <line x1="175.00" y1="82.00" x2="195.00" y2="82.00" stroke="#38bdf8" stroke-width="2.50"/>
-  <circle cx="185.00" cy="82.00" r="3.50" fill="#38bdf8"/>
-  <text x="201.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">WireGuard</text>
-  <line x1="260.00" y1="82.00" x2="280.00" y2="82.00" stroke="#64748b" stroke-width="2.50" stroke-dasharray="4,3"/>
-  <circle cx="270.00" cy="82.00" r="3.50" fill="#64748b"/>
-  <text x="286.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">Baseline</text>
-  <line x1="340.00" y1="82.00" x2="360.00" y2="82.00" stroke="#a855f7" stroke-width="2.50"/>
-  <circle cx="350.00" cy="82.00" r="3.50" fill="#a855f7"/>
-  <text x="366.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">OpenVPN</text>
+  <line x1="80.00" y1="82.00" x2="100.00" y2="82.00" stroke="#f97316" stroke-width="2.50"/>
+  <circle cx="90.00" cy="82.00" r="3.50" fill="#f97316"/>
+  <text x="106.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">yip (10% FEC)</text>
+  <line x1="215.60" y1="82.00" x2="235.60" y2="82.00" stroke="#38bdf8" stroke-width="2.50"/>
+  <circle cx="225.60" cy="82.00" r="3.50" fill="#38bdf8"/>
+  <text x="241.60" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">WireGuard</text>
+  <line x1="322.40" y1="82.00" x2="342.40" y2="82.00" stroke="#64748b" stroke-width="2.50" stroke-dasharray="4,3"/>
+  <circle cx="332.40" cy="82.00" r="3.50" fill="#64748b"/>
+  <text x="348.40" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">Baseline</text>
+  <line x1="422.00" y1="82.00" x2="442.00" y2="82.00" stroke="#a855f7" stroke-width="2.50"/>
+  <circle cx="432.00" cy="82.00" r="3.50" fill="#a855f7"/>
+  <text x="448.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">OpenVPN</text>
   <rect x="539.40" y="72.00" width="265.60" height="24.00" fill="#1f1610" rx="6.00" stroke="#f97316" stroke-width="1.00"/>
   <text x="672.20" y="88.80" fill="#fb923c" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">33× to 98× higher throughput under loss</text>
-  <line x1="75.00" y1="390.17" x2="805.00" y2="390.17" stroke="#21262d" stroke-width="1.00"/>
-  <text x="67.00" y="394.17" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">0.5</text>
-  <line x1="75.00" y1="363.27" x2="805.00" y2="363.27" stroke="#21262d" stroke-width="1.00"/>
-  <text x="67.00" y="367.27" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">1</text>
-  <line x1="75.00" y1="336.37" x2="805.00" y2="336.37" stroke="#161b22" stroke-width="1.00"/>
-  <text x="67.00" y="340.37" fill="#6e7681" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">2</text>
-  <line x1="75.00" y1="300.81" x2="805.00" y2="300.81" stroke="#161b22" stroke-width="1.00"/>
-  <text x="67.00" y="304.81" fill="#6e7681" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">5</text>
-  <line x1="75.00" y1="273.91" x2="805.00" y2="273.91" stroke="#21262d" stroke-width="1.00"/>
-  <text x="67.00" y="277.91" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">10</text>
-  <line x1="75.00" y1="247.00" x2="805.00" y2="247.00" stroke="#161b22" stroke-width="1.00"/>
-  <text x="67.00" y="251.00" fill="#6e7681" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">20</text>
-  <line x1="75.00" y1="211.44" x2="805.00" y2="211.44" stroke="#161b22" stroke-width="1.00"/>
-  <text x="67.00" y="215.44" fill="#6e7681" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">50</text>
-  <line x1="75.00" y1="184.54" x2="805.00" y2="184.54" stroke="#21262d" stroke-width="1.00"/>
-  <text x="67.00" y="188.54" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">100</text>
-  <line x1="75.00" y1="157.64" x2="805.00" y2="157.64" stroke="#161b22" stroke-width="1.00"/>
-  <text x="67.00" y="161.64" fill="#6e7681" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">200</text>
-  <line x1="75.00" y1="122.08" x2="805.00" y2="122.08" stroke="#21262d" stroke-width="1.00"/>
-  <text x="67.00" y="126.08" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">500</text>
-  <line x1="75.00" y1="115.00" x2="75.00" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
-  <text x="75.00" y="428.00" fill="#8b949e" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">0%</text>
-  <line x1="257.50" y1="115.00" x2="257.50" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
-  <text x="257.50" y="428.00" fill="#8b949e" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">1%</text>
-  <line x1="440.00" y1="115.00" x2="440.00" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
-  <text x="440.00" y="428.00" fill="#8b949e" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">3%</text>
-  <line x1="622.50" y1="115.00" x2="622.50" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
-  <text x="622.50" y="428.00" fill="#8b949e" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">5%</text>
+  <line x1="80.00" y1="390.17" x2="805.00" y2="390.17" stroke="#21262d" stroke-width="1.00"/>
+  <text x="72.00" y="394.17" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">0.5</text>
+  <line x1="80.00" y1="363.27" x2="805.00" y2="363.27" stroke="#21262d" stroke-width="1.00"/>
+  <text x="72.00" y="367.27" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">1</text>
+  <line x1="80.00" y1="336.37" x2="805.00" y2="336.37" stroke="#161b22" stroke-width="1.00"/>
+  <text x="72.00" y="340.37" fill="#6e7681" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">2</text>
+  <line x1="80.00" y1="300.81" x2="805.00" y2="300.81" stroke="#161b22" stroke-width="1.00"/>
+  <text x="72.00" y="304.81" fill="#6e7681" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">5</text>
+  <line x1="80.00" y1="273.91" x2="805.00" y2="273.91" stroke="#21262d" stroke-width="1.00"/>
+  <text x="72.00" y="277.91" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">10</text>
+  <line x1="80.00" y1="247.00" x2="805.00" y2="247.00" stroke="#161b22" stroke-width="1.00"/>
+  <text x="72.00" y="251.00" fill="#6e7681" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">20</text>
+  <line x1="80.00" y1="211.44" x2="805.00" y2="211.44" stroke="#161b22" stroke-width="1.00"/>
+  <text x="72.00" y="215.44" fill="#6e7681" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">50</text>
+  <line x1="80.00" y1="184.54" x2="805.00" y2="184.54" stroke="#21262d" stroke-width="1.00"/>
+  <text x="72.00" y="188.54" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">100</text>
+  <line x1="80.00" y1="157.64" x2="805.00" y2="157.64" stroke="#161b22" stroke-width="1.00"/>
+  <text x="72.00" y="161.64" fill="#6e7681" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">200</text>
+  <line x1="80.00" y1="122.08" x2="805.00" y2="122.08" stroke="#21262d" stroke-width="1.00"/>
+  <text x="72.00" y="126.08" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">500</text>
+  <line x1="80.00" y1="115.00" x2="80.00" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
+  <text x="80.00" y="428.00" fill="#8b949e" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">0%</text>
+  <line x1="261.25" y1="115.00" x2="261.25" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
+  <text x="261.25" y="428.00" fill="#8b949e" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">1%</text>
+  <line x1="442.50" y1="115.00" x2="442.50" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
+  <text x="442.50" y="428.00" fill="#8b949e" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">3%</text>
+  <line x1="623.75" y1="115.00" x2="623.75" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
+  <text x="623.75" y="428.00" fill="#8b949e" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">5%</text>
   <line x1="805.00" y1="115.00" x2="805.00" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
   <text x="805.00" y="428.00" fill="#8b949e" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">10%</text>
-  <text x="440.00" y="446.00" fill="#f0f6fc" font-size="12" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="middle">Netem Injected Packet Loss</text>
-  <text x="33.00" y="262.50" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="middle" transform="rotate(-90 33.00 262.50)">TCP Goodput (Mbit/s, log scale)</text>
-  <polyline points="75.00,128.80 257.50,320.63 440.00,342.68 622.50,345.03 805.00,383.10" fill="none" stroke="#64748b" stroke-width="1.50" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="4,4"/>
-  <circle cx="75.00" cy="128.80" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="257.50" cy="320.63" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="440.00" cy="342.68" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="622.50" cy="345.03" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
+  <text x="442.50" y="446.00" fill="#f0f6fc" font-size="12" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="middle">Netem Injected Packet Loss</text>
+  <text x="34.00" y="262.50" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="middle" transform="rotate(-90 34.00 262.50)">TCP Goodput (Mbit/s, log scale)</text>
+  <polyline points="80.00,128.80 261.25,320.63 442.50,342.68 623.75,345.03 805.00,383.10" fill="none" stroke="#64748b" stroke-width="1.50" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="4,4"/>
+  <circle cx="80.00" cy="128.80" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
+  <circle cx="261.25" cy="320.63" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
+  <circle cx="442.50" cy="342.68" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
+  <circle cx="623.75" cy="345.03" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
   <circle cx="805.00" cy="383.10" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
-  <polyline points="75.00,251.09 257.50,324.72 440.00,345.03 622.50,367.36 805.00,390.17" fill="none" stroke="#a855f7" stroke-width="2.00" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="75.00" cy="251.09" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="257.50" cy="324.72" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="440.00" cy="345.03" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="622.50" cy="367.36" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
+  <polyline points="80.00,251.09 261.25,324.72 442.50,345.03 623.75,367.36 805.00,390.17" fill="none" stroke="#a855f7" stroke-width="2.00" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="80.00" cy="251.09" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
+  <circle cx="261.25" cy="324.72" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
+  <circle cx="442.50" cy="345.03" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
+  <circle cx="623.75" cy="367.36" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
   <circle cx="805.00" cy="390.17" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
-  <polyline points="75.00,128.77 257.50,318.13 440.00,356.20 622.50,363.27 805.00,390.17" fill="none" stroke="#38bdf8" stroke-width="2.50" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="75.00" cy="128.77" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="257.50" cy="318.13" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="440.00" cy="356.20" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="622.50" cy="363.27" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
+  <polyline points="80.00,128.77 261.25,318.13 442.50,356.20 623.75,363.27 805.00,390.17" fill="none" stroke="#38bdf8" stroke-width="2.50" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="80.00" cy="128.77" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
+  <circle cx="261.25" cy="318.13" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
+  <circle cx="442.50" cy="356.20" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
+  <circle cx="623.75" cy="363.27" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
   <circle cx="805.00" cy="390.17" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
-  <polyline points="75.00,167.08 257.50,269.16 440.00,178.25 622.50,192.48 805.00,254.24" fill="none" stroke="#f97316" stroke-width="3.20" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="75.00" cy="167.08" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="257.50" cy="269.16" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="440.00" cy="178.25" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="622.50" cy="192.48" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
+  <polyline points="80.00,167.08 261.25,269.16 442.50,178.25 623.75,192.48 805.00,254.24" fill="none" stroke="#f97316" stroke-width="3.20" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="80.00" cy="167.08" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
+  <circle cx="261.25" cy="269.16" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
+  <circle cx="442.50" cy="178.25" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
+  <circle cx="623.75" cy="192.48" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
   <circle cx="805.00" cy="254.24" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
-  <text x="448.00" y="172.25" fill="#f97316" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="bold" text-anchor="start">117.6M</text>
-  <rect x="350.00" y="144.25" width="240.00" height="20.00" fill="#161b22" rx="6.00" stroke="#30363d" stroke-width="1.00"/>
-  <text x="470.00" y="158.25" fill="#f0f6fc" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">98× advantage (117.6 vs 1.2 Mbit/s)</text>
-  <text x="791.00" y="246.24" fill="#f97316" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="bold" text-anchor="end">16.6 Mbit/s</text>
-  <text x="791.00" y="406.17" fill="#38bdf8" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="bold" text-anchor="end">0.5 Mbit/s</text>
+  <text x="450.50" y="172.25" fill="#f97316" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="bold" text-anchor="start">117.6M</text>
+  <rect x="352.50" y="144.25" width="240.00" height="20.00" fill="#161b22" rx="6.00" stroke="#30363d" stroke-width="1.00"/>
+  <text x="472.50" y="158.25" fill="#f0f6fc" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">98× advantage (117.6 vs 1.2 Mbit/s)</text>
+  <rect x="702.60" y="230.24" width="86.40" height="20.00" fill="#1f1610" rx="6.00" stroke="#f97316" stroke-width="1.00"/>
+  <text x="745.80" y="244.24" fill="#f97316" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">16.6 Mbit/s</text>
+  <rect x="709.00" y="396.17" width="80.00" height="20.00" fill="#141c2b" rx="6.00" stroke="#38bdf8" stroke-width="1.00"/>
+  <text x="749.00" y="410.17" fill="#38bdf8" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">0.5 Mbit/s</text>
   <line x1="811.00" y1="254.24" x2="811.00" y2="390.17" stroke="#f97316" stroke-width="1.50"/>
   <line x1="807.00" y1="254.24" x2="811.00" y2="254.24" stroke="#f97316" stroke-width="1.50"/>
   <line x1="807.00" y1="390.17" x2="811.00" y2="390.17" stroke="#f97316" stroke-width="1.50"/>
   <rect x="611.40" y="312.21" width="169.60" height="20.00" fill="#1f1610" rx="6.00" stroke="#f97316" stroke-width="1.00"/>
   <text x="696.20" y="326.21" fill="#fb923c" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">33× higher (16.6 vs 0.5)</text>
-  <text x="75.00" y="462.00" fill="#6e7681" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">ℹ Systematic Reed–Solomon FEC trades minor clean-path overhead for near-complete immunity against TCP backoff under packet loss.</text>
+  <rect x="80.00" y="450.00" width="37.60" height="16.00" fill="#161b22" rx="6.00" stroke="#30363d" stroke-width="1.00"/>
+  <text x="98.80" y="461.20" fill="#8b949e" font-size="9" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">NOTE</text>
+  <text x="125.60" y="462.00" fill="#6e7681" font-size="10.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">Systematic Reed–Solomon FEC trades minor clean-path overhead for near-complete immunity against loss.</text>
 </svg>

@@ -52,9 +52,10 @@ def build_social_card_svg() -> str:
 
     # Brand Title Group
     lines.append('  <g id="brand" transform="translate(80, 110)">')
-    # Fox Icon Badge
+    # Fox Icon Badge (vector polygon + text)
     lines.append('    <rect x="0" y="0" width="112" height="42" rx="10" fill="#431407" stroke="#f97316" stroke-width="1.5" />')
-    lines.append(f'    <text x="56" y="27" font-family="{FONT_MONO}" font-size="19" font-weight="800" fill="#fb923c" text-anchor="middle">🦊 YIP</text>')
+    lines.append('    <polygon points="18,30 25,14 32,22 39,14 46,30 32,34" fill="#fb923c" />')
+    lines.append(f'    <text x="74" y="28" font-family="{FONT_MONO}" font-size="18" font-weight="800" fill="#fb923c" text-anchor="middle">YIP</text>')
 
     # Main Hero Title
     lines.append(f'    <text x="136" y="32" font-family="{FONT_SANS}" font-size="38" font-weight="800" fill="#f0f6fc">yip mesh vpn</text>')
@@ -64,46 +65,58 @@ def build_social_card_svg() -> str:
     lines.append(f'    <text x="0" y="118" font-family="{FONT_MONO}" font-size="14.5" fill="#8b949e">Systematic Cauchy RS-FEC (GF(256)) • 40 Gbps eBPF AF_XDP • Anti-DPI REALITY</text>')
     lines.append('  </g>')
 
-    # Feature Badges
+    # Feature Badges (with inline vector icons instead of emojis)
     badges = [
-        ("🛡️ 0% TCP Backoff Under Loss", "#1f1610", "#fb923c", "#f97316"),
-        ("⚡ 40+ Gbps Multi-Core Line Rate", "#064e3b", "#34d399", "#10b981"),
-        ("🔒 Noise-IK &amp; REALITY Anti-DPI", "#1e1b4b", "#818cf8", "#6366f1"),
-        ("🦀 100% Rust • AGPL-3.0", "#161b22", "#e6edf3", "#30363d"),
+        ("shield", "0% TCP Backoff Under Loss", "#1f1610", "#fb923c", "#f97316"),
+        ("bolt", "40+ Gbps Multi-Core Line Rate", "#064e3b", "#34d399", "#10b981"),
+        ("lock", "Noise-IK &amp; REALITY Anti-DPI", "#1e1b4b", "#818cf8", "#6366f1"),
+        ("rust", "100% Rust • AGPL-3.0", "#161b22", "#e6edf3", "#30363d"),
     ]
     bx = 80
     by = 280
-    for text, bg, fg, border in badges:
-        bw = len(text.replace("&amp;", "&")) * 7.8 + 24
+    for icon_type, text, bg, fg, border in badges:
+        clean_text = text.replace("&amp;", "&")
+        bw = 34 + len(clean_text) * 7.4 + 16
         lines.append(f'  <rect x="{bx}" y="{by}" width="{bw:.2f}" height="32" rx="16" fill="{bg}" stroke="{border}" stroke-width="1.2" />')
-        lines.append(f'  <text x="{bx + bw/2:.2f}" y="{by + 21}" font-family="{FONT_MONO}" font-size="12" font-weight="600" fill="{fg}" text-anchor="middle">{text}</text>')
+        
+        # Render vector icon
+        if icon_type == "shield":
+            lines.append(f'  <path d="M {bx + 14},{by + 11} L {bx + 20},{by + 8} L {bx + 26},{by + 11} L {bx + 26},{by + 17} C {bx + 26},{by + 22} {bx + 20},{by + 25} {bx + 20},{by + 25} C {bx + 20},{by + 25} {bx + 14},{by + 22} {bx + 14},{by + 17} Z" fill="{fg}" />')
+        elif icon_type == "bolt":
+            lines.append(f'  <polygon points="{bx + 20},{by + 8} {bx + 13},{by + 16} {bx + 19},{by + 16} {bx + 16},{by + 24} {bx + 26},{by + 14} {bx + 20},{by + 14}" fill="{fg}" />')
+        elif icon_type == "lock":
+            lines.append(f'  <rect x="{bx + 15}" y="{by + 14}" width="12" height="9" rx="2" fill="{fg}" />')
+            lines.append(f'  <path d="M {bx + 17},{by + 14} L {bx + 17},{by + 11} C {bx + 17},{by + 9} {bx + 19},{by + 8} {bx + 21},{by + 8} C {bx + 23},{by + 8} {bx + 25},{by + 9} {bx + 25},{by + 11} L {bx + 25},{by + 14}" stroke="{fg}" stroke-width="1.6" fill="none" />')
+        elif icon_type == "rust":
+            lines.append(f'  <circle cx="{bx + 21}" cy="{by + 16}" r="6" stroke="{fg}" stroke-width="1.6" fill="none" />')
+            lines.append(f'  <circle cx="{bx + 21}" cy="{by + 16}" r="2.5" fill="{fg}" />')
+
+        lines.append(f'  <text x="{bx + 32:.2f}" y="{by + 21}" font-family="{FONT_MONO}" font-size="12" font-weight="600" fill="{fg}">{text}</text>')
         bx += bw + 14
 
     # Visual Curve Preview Card (Right-hand Hero Graphic)
     lines.append('  <g id="mini-graph" transform="translate(80, 345)">')
     gw = 1120
-    gh = 215
+    gh = 225
     lines.append(f'    <rect width="{gw}" height="{gh}" rx="12" fill="#0d1117" stroke="#30363d" stroke-width="1.2" />')
     
     # Graph title
     lines.append(f'    <text x="24" y="32" font-family="{FONT_SANS}" font-size="14" font-weight="700" fill="#f0f6fc">Throughput Under Network Packet Loss (AWS us-east-1 ↔ us-west-2, 60ms RTT)</text>')
     lines.append(f'    <text x="{gw - 24}" y="32" font-family="{FONT_MONO}" font-size="12" font-weight="700" fill="#fb923c" text-anchor="end">33× to 98× Higher Goodput at 3%–10% Loss</text>')
     
-    # Simple stylised curves
-    # x: 0% (x=80), 1% (x=300), 3% (x=550), 5% (x=800), 10% (x=1040)
-    # yip curve (sustains high): y=65, y=75, y=85, y=105, y=145
-    # wg curve (collapses): y=55, y=120, y=185, y=190, y=195
-    yip_pts = [(80, 65), (300, 75), (550, 85), (800, 105), (1040, 145)]
-    wg_pts = [(80, 55), (300, 120), (550, 185), (800, 190), (1040, 195)]
+    # Simple stylised curves - ending at x=900 so labels at x=925 fit inside 1120 card
+    # x: 0% (x=80), 1% (x=280), 3% (x=490), 5% (x=700), 10% (x=900)
+    yip_pts = [(80, 65), (280, 75), (490, 85), (700, 105), (900, 140)]
+    wg_pts = [(80, 55), (280, 120), (490, 180), (700, 186), (900, 190)]
 
     # Grid line
-    lines.append('    <line x1="80" y1="195" x2="1040" y2="195" stroke="#21262d" stroke-width="1" />')
-    lines.append(f'    <text x="60" y="200" font-family="{FONT_MONO}" font-size="10" fill="#6e7681" text-anchor="end">0</text>')
-    lines.append('    <line x1="80" y1="60" x2="1040" y2="60" stroke="#21262d" stroke-width="1" stroke-dasharray="3,3" />')
+    lines.append('    <line x1="80" y1="190" x2="900" y2="190" stroke="#21262d" stroke-width="1" />')
+    lines.append(f'    <text x="60" y="194" font-family="{FONT_MONO}" font-size="10" fill="#6e7681" text-anchor="end">0</text>')
+    lines.append('    <line x1="80" y1="60" x2="900" y2="60" stroke="#21262d" stroke-width="1" stroke-dasharray="3,3" />')
     lines.append(f'    <text x="60" y="65" font-family="{FONT_MONO}" font-size="10" fill="#6e7681" text-anchor="end">400M</text>')
 
     # Shaded area under yip
-    shade_pts = [(80, 195)] + yip_pts + [(1040, 195)]
+    shade_pts = [(80, 190)] + yip_pts + [(900, 190)]
     shade_str = " ".join(f"{x},{y}" for x, y in shade_pts)
     lines.append(f'    <polygon points="{shade_str}" fill="url(#plot-fill)" />')
 
@@ -115,13 +128,13 @@ def build_social_card_svg() -> str:
     yip_str = " ".join(f"{x},{y}" for x, y in yip_pts)
     lines.append(f'    <polyline points="{yip_str}" fill="none" stroke="#f97316" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" />')
 
-    # Labels at end of curves
-    lines.append(f'    <text x="1055" y="150" font-family="{FONT_MONO}" font-size="11.5" font-weight="700" fill="#f97316">yip (16.6 Mbit/s)</text>')
-    lines.append(f'    <text x="1055" y="198" font-family="{FONT_MONO}" font-size="11" font-weight="600" fill="#38bdf8">WireGuard (0.5 Mbit/s)</text>')
+    # Labels at end of curves (comfortably inside card)
+    lines.append(f'    <text x="918" y="144" font-family="{FONT_MONO}" font-size="11.5" font-weight="700" fill="#f97316">yip (16.6 Mbit/s)</text>')
+    lines.append(f'    <text x="918" y="194" font-family="{FONT_MONO}" font-size="11" font-weight="600" fill="#38bdf8">WireGuard (0.5 Mbit/s)</text>')
 
     # X-axis markers
-    for x_pos, loss_lbl in [(80, "0% Loss"), (300, "1%"), (550, "3%"), (800, "5%"), (1040, "10% Loss")]:
-        lines.append(f'    <text x="{x_pos}" y="210" font-family="{FONT_MONO}" font-size="10" fill="#8b949e" text-anchor="middle">{loss_lbl}</text>')
+    for x_pos, loss_lbl in [(80, "0% Loss"), (280, "1%"), (490, "3%"), (700, "5%"), (900, "10% Loss")]:
+        lines.append(f'    <text x="{x_pos}" y="208" font-family="{FONT_MONO}" font-size="10" fill="#8b949e" text-anchor="middle">{loss_lbl}</text>')
 
     lines.append('  </g>')
 
