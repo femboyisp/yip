@@ -205,6 +205,14 @@ impl Transport {
     pub fn bulk_repair_ratio(&self) -> f32 {
         self.controllers[class_index(FlowClass::Bulk)].ratio()
     }
+
+    /// Total number of objects reconstructed via repair/parity shards across all classes.
+    pub fn fec_recovered_count(&self) -> u64 {
+        self.reassemblers
+            .values()
+            .map(|r| r.recovered_count())
+            .sum()
+    }
 }
 
 #[cfg(test)]

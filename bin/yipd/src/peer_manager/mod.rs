@@ -195,6 +195,14 @@ pub struct PeerStats {
     pub node_addr: std::net::Ipv6Addr,
     pub state: String,
     pub last_activity_ms: u64,
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
+    pub tx_packets: u64,
+    pub rx_packets: u64,
+    pub fec_recovered: u64,
+    pub transport: String,
+    pub rtt_ms: Option<u32>,
+    pub fec_ratio_pct: u8,
 }
 
 /// One remote peer's handshake/session state.
@@ -311,6 +319,10 @@ struct Peer {
     /// to this peer (3b Task 4). Defaults to `0`. Bounds cover emission to at
     /// most one datagram per peer per `cover_traffic_ms` interval.
     last_cover_ms: u64,
+    tx_bytes: u64,
+    rx_bytes: u64,
+    tx_packets: u64,
+    rx_packets: u64,
 }
 
 /// Multi-peer router/demuxer + lazy in-loop handshake driver.
@@ -540,6 +552,10 @@ impl PeerManager {
                 session_obf_key: None,
                 last_activity_ms: 0,
                 last_cover_ms: 0,
+                tx_bytes: 0,
+                rx_bytes: 0,
+                tx_packets: 0,
+                rx_packets: 0,
             });
         }
         let mut mgr = Self {
@@ -642,6 +658,10 @@ impl PeerManager {
             session_obf_key: None,
             last_activity_ms: 0,
             last_cover_ms: 0,
+            tx_bytes: 0,
+            rx_bytes: 0,
+            tx_packets: 0,
+            rx_packets: 0,
         });
     }
 
@@ -858,6 +878,10 @@ impl PeerManager {
             session_obf_key: None,
             last_activity_ms: 0,
             last_cover_ms: 0,
+            tx_bytes: 0,
+            rx_bytes: 0,
+            tx_packets: 0,
+            rx_packets: 0,
         });
         Ok(())
     }
@@ -911,12 +935,43 @@ impl PeerManager {
                     PeerState::Handshaking(_) => "handshaking",
                     PeerState::Established(_) => "established",
                 };
+                let transport = if p.relay {
+                    "Relay".to_string()
+                } else if let Some(kind) = p.path_kind {
+                    match kind {
+                        PathKind::Direct => "Direct UDP".to_string(),
+                        PathKind::Punched => "Holepunched UDP".to_string(),
+                        PathKind::Relayed => "Relayed".to_string(),
+                    }
+                } else if p.endpoint.is_some() {
+                    "Direct UDP".to_string()
+                } else {
+                    "None".to_string()
+                };
+
+                let (fec_ratio_pct, fec_recovered) = match &p.state {
+                    PeerState::Established(epochs) => {
+                        let ratio = (epochs.bulk_repair_ratio() * 100.0).round() as u8;
+                        let rec = epochs.fec_recovered_count();
+                        (ratio, rec)
+                    }
+                    _ => (0, 0),
+                };
+
                 PeerStats {
                     public_key: p.pubkey,
                     endpoint: p.endpoint,
                     node_addr: p.addr,
                     state: state_str.to_string(),
                     last_activity_ms: p.last_activity_ms,
+                    tx_bytes: p.tx_bytes,
+                    rx_bytes: p.rx_bytes,
+                    tx_packets: p.tx_packets,
+                    rx_packets: p.rx_packets,
+                    fec_recovered,
+                    transport,
+                    rtt_ms: None,
+                    fec_ratio_pct,
                 }
             })
             .collect()
@@ -1110,6 +1165,8 @@ impl PeerManager {
             // the idle-cover-traffic gate in `tick_dispatch` does not fire
             // while real traffic is flowing.
             self.peers[idx].last_activity_ms = now_ms;
+            self.peers[idx].tx_bytes += inner.len() as u64;
+            self.peers[idx].tx_packets += 1;
             // A relay-reached peer's data-plane egress must be re-wrapped
             // through the server (dst = server); copy the bytes out first (the
             // DataPlane borrows `self.peers[idx]`) then wrap. A direct/punched

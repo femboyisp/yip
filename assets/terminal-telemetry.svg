@@ -1,0 +1,123 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 420" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#0d1117" />
+      <stop offset="100%" stop-color="#090d13" />
+    </linearGradient>
+    <style>
+      text { text-rendering: geometricPrecision; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12.5px; }
+    </style>
+  </defs>
+
+  <!-- Window Container -->
+  <rect x="15" y="15" width="930" height="390" rx="10" fill="url(#bgGrad)" stroke="#30363d" stroke-width="1.5" />
+
+  <!-- Window Title Bar -->
+  <path d="M 15 25 Q 15 15 25 15 L 935 15 Q 945 15 945 25 L 945 48 L 15 48 Z" fill="#161b22" />
+  <line x1="15" y1="48" x2="945" y2="48" stroke="#30363d" stroke-width="1" />
+  
+  <!-- Window Controls -->
+  <circle cx="38" cy="32" r="6" fill="#ff5f56" />
+  <circle cx="58" cy="32" r="6" fill="#ffbd2e" />
+  <circle cx="78" cy="32" r="6" fill="#27c93f" />
+
+  <!-- Window Title -->
+  <text x="480" y="36" fill="#8b949e" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="600" text-anchor="middle">
+    yipctl top — live adaptive telemetry dashboard
+  </text>
+
+  <!-- Content Group -->
+  <g class="mono">
+    <!-- Row 1: Header -->
+    <text x="40" y="76">
+      <tspan fill="#58a6ff" font-weight="bold">● yipctl top</tspan>
+      <tspan fill="#8b949e"> — </tspan>
+      <tspan fill="#f0f6fc" font-weight="bold">yipd</tspan>
+      <tspan fill="#8b949e"> v0.1.0  (Daemon Uptime: </tspan>
+      <tspan fill="#f0f6fc">4h 12m 08s</tspan>
+      <tspan fill="#8b949e">)</tspan>
+    </text>
+
+    <!-- Row 2: Node Info -->
+    <text x="40" y="100">
+      <tspan fill="#8b949e">Device: </tspan>
+      <tspan fill="#f0f6fc" font-weight="bold">yip0</tspan>
+      <tspan fill="#8b949e">   Mesh IPv6: </tspan>
+      <tspan fill="#3fb950" font-weight="bold">fd00:7a81:c912:0000:3a91:88ff:fe21:04a1</tspan>
+      <tspan fill="#8b949e">   Peers: </tspan>
+      <tspan fill="#f0f6fc" font-weight="bold">2 active</tspan>
+    </text>
+
+    <!-- Row 3: Traffic & Live Sparkline -->
+    <text x="40" y="124">
+      <tspan fill="#8b949e">Live Traffic: </tspan>
+      <tspan fill="#79c0ff" font-weight="bold">↑ 98.4 Mbps</tspan>
+      <tspan fill="#8b949e"> (142.8 MiB)   </tspan>
+      <tspan fill="#d2a8ff" font-weight="bold">↓ 104.2 Mbps</tspan>
+      <tspan fill="#8b949e"> (284.1 MiB)   </tspan>
+      <tspan fill="#8b949e">Spark: [</tspan>
+      <tspan fill="#e3b341" font-weight="bold"> ▂▄▅▆▇██▇▆▅▄▃ ▂▄▆██</tspan>
+      <tspan fill="#8b949e">]</tspan>
+    </text>
+
+    <!-- Divider Line -->
+    <line x1="40" y1="140" x2="920" y2="140" stroke="#30363d" stroke-width="1" />
+
+    <!-- Table Header (Independent Coordinates) -->
+    <text x="40" y="162" fill="#8b949e" font-weight="bold">PEER</text>
+    <text x="215" y="162" fill="#8b949e" font-weight="bold">ENDPOINT</text>
+    <text x="385" y="162" fill="#8b949e" font-weight="bold">STATE</text>
+    <text x="500" y="162" fill="#8b949e" font-weight="bold">TRANSPORT</text>
+    <text x="635" y="162" fill="#8b949e" font-weight="bold">TX / RX</text>
+    <text x="785" y="162" fill="#8b949e" font-weight="bold">FEC RECOVERY</text>
+
+    <!-- Subtle Sub-header Border -->
+    <line x1="40" y1="174" x2="920" y2="174" stroke="#21262d" stroke-width="1" />
+
+    <!-- Peer Row 1 -->
+    <text x="40" y="200" fill="#58a6ff">fd00:7a81:c912:0001</text>
+    <text x="215" y="200" fill="#8b949e">198.51.100.2:51820</text>
+    <text x="385" y="200" fill="#3fb950" font-weight="bold">established</text>
+    <text x="500" y="200" fill="#f0f6fc">Direct UDP</text>
+    <text x="635" y="200" fill="#8b949e">74.2M / 141.0M</text>
+    <text x="785" y="200" fill="#3fb950" font-weight="bold">8,421 pkts (100%)</text>
+
+    <!-- Peer Row 2 -->
+    <text x="40" y="228" fill="#58a6ff">fd00:4412:beef:0002</text>
+    <text x="215" y="228" fill="#8b949e">203.0.113.88:8443</text>
+    <text x="385" y="228" fill="#3fb950" font-weight="bold">established</text>
+    <text x="500" y="228" fill="#f0f6fc">REALITY TLS 1.3</text>
+    <text x="635" y="228" fill="#8b949e">68.6M / 143.1M</text>
+    <text x="785" y="228" fill="#3fb950" font-weight="bold">6,471 pkts (100%)</text>
+
+    <!-- Bottom Status Card -->
+    <rect x="40" y="254" width="880" height="114" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1" />
+
+    <text x="58" y="282">
+      <tspan fill="#3fb950" font-weight="bold">● FEC Adaptive Controller:</tspan>
+      <tspan fill="#f0f6fc"> Active (12% Cauchy Reed-Solomon redundancy dynamically injected)</tspan>
+    </text>
+
+    <text x="58" y="308">
+      <tspan fill="#8b949e">Network Link Condition: </tspan>
+      <tspan fill="#e3b341" font-weight="bold">5.0% Packet Loss</tspan>
+      <tspan fill="#8b949e"> | RTT: </tspan>
+      <tspan fill="#f0f6fc">50.2ms</tspan>
+      <tspan fill="#8b949e"> | Effective Loss to Kernel TCP: </tspan>
+      <tspan fill="#3fb950" font-weight="bold">0.00% (Zero Drops)</tspan>
+    </text>
+
+    <text x="58" y="334">
+      <tspan fill="#8b949e">Sustained Goodput: </tspan>
+      <tspan fill="#3fb950" font-weight="bold">98.5 Mbit/s</tspan>
+      <tspan fill="#8b949e"> (WireGuard: 0.7 Mbit/s — </tspan>
+      <tspan fill="#58a6ff" font-weight="bold">123.1× Speedup</tspan>
+      <tspan fill="#8b949e">) | Press </tspan>
+      <tspan fill="#f0f6fc" font-weight="bold">q</tspan>
+      <tspan fill="#8b949e"> or </tspan>
+      <tspan fill="#f0f6fc" font-weight="bold">Ctrl+C</tspan>
+      <tspan fill="#8b949e"> to exit</tspan>
+    </text>
+  </g>
+</svg>

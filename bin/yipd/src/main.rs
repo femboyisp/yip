@@ -42,13 +42,173 @@ fn hex_decode_32(hex: &str) -> Result<[u8; 32], String> {
     crate::config::hex_to_32(hex).map_err(|e| e.to_string())
 }
 
+fn print_daemon_usage() {
+    println!("Usage: yipd <config-file> [OPTIONS]");
+    println!("       yipd <COMMAND> [OPTIONS]");
+    println!();
+    println!("Commands:");
+    println!("  status       Display daemon status and summary");
+    println!("  peers        List connected peers and statistics");
+    println!("  top          Real-time ANSI telemetry dashboard");
+    println!();
+    println!("Options:");
+    println!("  -c, --control <SOCKET>  UNIX domain control socket path");
+    println!("      --genkey            Generate a fresh X25519 keypair");
+    println!("      --addr <HEX-KEY>    Derive self-certifying mesh IPv6 address");
+    println!("  -V, --version           Print version");
+    println!("  -h, --help              Print help");
+}
+
+fn print_cli_usage(subcmd: &str) {
+    match subcmd {
+        "status" => {
+            println!("Usage: yipctl status [OPTIONS]");
+            println!();
+            println!("Display status and summary telemetry of the local yipd daemon.");
+            println!();
+            println!("Options:");
+            println!("  -c, --control <SOCKET>  Path to yipd UNIX control socket");
+            println!("      --json              Output raw JSON");
+            println!("  -h, --help              Print help");
+        }
+        "peers" => {
+            println!("Usage: yipctl peers [OPTIONS]");
+            println!();
+            println!("List peers and transport telemetry from the local yipd daemon.");
+            println!();
+            println!("Options:");
+            println!("  -c, --control <SOCKET>  Path to yipd UNIX control socket");
+            println!("      --json              Output raw JSON");
+            println!("  -h, --help              Print help");
+        }
+        "top" => {
+            println!("Usage: yipctl top [OPTIONS]");
+            println!();
+            println!("Real-time terminal dashboard of daemon throughput, loss & FEC recovery.");
+            println!();
+            println!("Options:");
+            println!("  -c, --control <SOCKET>   Path to yipd UNIX control socket");
+            println!("  -i, --interval <MILLIS>  Refresh interval in milliseconds [default: 500]");
+            println!("  -h, --help               Print help");
+        }
+        _ => {
+            println!("Usage: yipctl <COMMAND> [OPTIONS]");
+            println!();
+            println!("Commands:");
+            println!("  status  Display daemon status and summary");
+            println!("  peers   List connected peers and statistics");
+            println!("  top     Real-time ANSI telemetry dashboard");
+            println!();
+            println!("Options:");
+            println!("  -V, --version  Print version");
+            println!("  -h, --help     Print help");
+        }
+    }
+}
+
+fn run_client_subcommand(
+    subcmd: &str,
+    mut args: impl Iterator<Item = String>,
+) -> std::io::Result<()> {
+    let mut control_path = None;
+    let mut json = false;
+    let mut interval_ms = 500u64;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--control" | "-c" => {
+                let p = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--control requires a socket path",
+                    )
+                })?;
+                control_path = Some(std::path::PathBuf::from(p));
+            }
+            "--json" => {
+                json = true;
+            }
+            "--interval" | "-i" => {
+                let s = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--interval requires milliseconds (e.g. 500)",
+                    )
+                })?;
+                interval_ms = s.parse::<u64>().map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+                })?;
+            }
+            "--help" | "-h" => {
+                print_cli_usage(subcmd);
+                return Ok(());
+            }
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unrecognized option: {other}"),
+                ));
+            }
+        }
+    }
+
+    let socket = control::resolve_control_socket(control_path.as_deref());
+
+    match subcmd {
+        "status" => control::run_cli_status(&socket, json).map_err(std::io::Error::other),
+        "peers" => control::run_cli_peers(&socket, json).map_err(std::io::Error::other),
+        "top" => control::run_cli_top(&socket, interval_ms).map_err(std::io::Error::other),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unknown subcommand: {subcmd}"),
+        )),
+    }
+}
+
 fn main() -> std::io::Result<()> {
     let mut args = std::env::args();
-    let _prog = args.next();
+    let prog_name = args.next();
+
+    let is_yipctl = prog_name
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .map(|f| f == "yipctl")
+        .unwrap_or(false);
+
+    if is_yipctl {
+        match args.next().as_deref() {
+            Some("--version") | Some("-V") => {
+                println!("{}", banner());
+                return Ok(());
+            }
+            Some("--help") | Some("-h") | None => {
+                print_cli_usage("");
+                return Ok(());
+            }
+            Some("status") => return run_client_subcommand("status", args),
+            Some("peers") => return run_client_subcommand("peers", args),
+            Some("top") => return run_client_subcommand("top", args),
+            Some(unknown) => {
+                eprintln!("yipctl: unknown command '{unknown}'");
+                eprintln!("See 'yipctl --help' for available commands.");
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unknown command: {unknown}"),
+                ));
+            }
+        }
+    }
 
     match args.next().as_deref() {
+        Some("status") => run_client_subcommand("status", args),
+        Some("peers") => run_client_subcommand("peers", args),
+        Some("top") => run_client_subcommand("top", args),
         Some("--version") | Some("-V") => {
             println!("{}", banner());
+            Ok(())
+        }
+        Some("--help") | Some("-h") => {
+            print_daemon_usage();
             Ok(())
         }
         Some("--genkey") => {
@@ -70,10 +230,7 @@ fn main() -> std::io::Result<()> {
             Ok(())
         }
         Some(arg) if arg.starts_with('-') => {
-            eprintln!("usage: yipd <config-file> [--control <socket-path>]");
-            eprintln!("       yipd --version");
-            eprintln!("       yipd --genkey");
-            eprintln!("       yipd --addr <pubkey-hex>");
+            print_daemon_usage();
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("unrecognized option: {arg}"),
@@ -101,10 +258,7 @@ fn main() -> std::io::Result<()> {
             tunnel::run(config)
         }
         None => {
-            eprintln!("usage: yipd <config-file> [--control <socket-path>]");
-            eprintln!("       yipd --version");
-            eprintln!("       yipd --genkey");
-            eprintln!("       yipd --addr <pubkey-hex>");
+            print_daemon_usage();
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "no config file specified",

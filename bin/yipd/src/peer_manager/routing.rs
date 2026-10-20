@@ -187,6 +187,8 @@ impl PeerManager {
         match opened {
             crate::epoch::EpochInbound::None => DispatchOut::None,
             crate::epoch::EpochInbound::Tun(buf) => {
+                self.peers[idx].rx_bytes += buf.len() as u64;
+                self.peers[idx].rx_packets += 1;
                 self.tun_scratch = buf;
                 DispatchOut::Tun(&self.tun_scratch)
             }
@@ -195,6 +197,8 @@ impl PeerManager {
                 DispatchOut::Udp(&self.egress)
             }
             crate::epoch::EpochInbound::TunThenSend(buf, dgs) => {
+                self.peers[idx].rx_bytes += buf.len() as u64;
+                self.peers[idx].rx_packets += 1;
                 self.tun_scratch = buf;
                 self.egress = dgs;
                 DispatchOut::Both(&self.tun_scratch, &self.egress)
@@ -253,6 +257,10 @@ impl PeerManager {
             let Some((tun, udp)) = hit else {
                 continue;
             };
+            if let Some(ref t) = tun {
+                self.peers[idx].rx_bytes += t.len() as u64;
+                self.peers[idx].rx_packets += 1;
+            }
             // Authenticated + non-replayed (M2 roaming) — safe to roam.
             self.relearn_endpoint(idx, src);
             // `udp` already carries each datagram's real `dst`/`fate` (see
