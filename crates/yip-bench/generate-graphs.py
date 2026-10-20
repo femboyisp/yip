@@ -274,10 +274,10 @@ def generate_throughput_loss_chart(data: dict) -> str:
 
     # Legend at Row 3 (y = 84)
     legend_items = [
-        ("yip (10% FEC)", COLOR_YIP, False, 105.0),
-        ("WireGuard", COLOR_WIREGUARD, False, 90.0),
-        ("Baseline (direct)", COLOR_BASELINE, True, 120.0),
-        ("OpenVPN", COLOR_OPENVPN, False, 85.0),
+        ("yip (10% FEC)", COLOR_YIP, False, 100.0),
+        ("WireGuard", COLOR_WIREGUARD, False, 85.0),
+        ("Baseline", COLOR_BASELINE, True, 80.0),
+        ("OpenVPN", COLOR_OPENVPN, False, 80.0),
     ]
     cur_lx = plot_left
     for label, color, dashed, spacing in legend_items:
@@ -382,19 +382,21 @@ def generate_throughput_loss_chart(data: dict) -> str:
         y_yip_10 = val_to_y(yip_data[10])
         y_wg_10 = val_to_y(wg_data[10])
 
-        canvas.text(x10 - 64.0, y_yip_10 - 8.0, f"{yip_data[10]:.1f} Mbit/s",
-                    fill=COLOR_YIP, font_size=11, font_family=FONT_MONO, font_weight="bold")
-        canvas.text(x10 - 58.0, y_wg_10 + 16.0, f"{wg_data[10]:.1f} Mbit/s",
-                    fill=COLOR_WIREGUARD, font_size=10, font_family=FONT_MONO, font_weight="bold")
+        canvas.text(x10 - 14.0, y_yip_10 - 8.0, f"{yip_data[10]:.1f} Mbit/s",
+                    fill=COLOR_YIP, font_size=11, font_family=FONT_MONO, font_weight="bold",
+                    text_anchor="end")
+        canvas.text(x10 - 14.0, y_wg_10 + 16.0, f"{wg_data[10]:.1f} Mbit/s",
+                    fill=COLOR_WIREGUARD, font_size=10, font_family=FONT_MONO, font_weight="bold",
+                    text_anchor="end")
 
         # 33x bracket annotation
-        canvas.line(x10 + 8.0, y_yip_10, x10 + 8.0, y_wg_10,
+        canvas.line(x10 + 6.0, y_yip_10, x10 + 6.0, y_wg_10,
                     stroke=COLOR_YIP, stroke_width=1.5)
-        canvas.line(x10 + 4.0, y_yip_10, x10 + 8.0, y_yip_10,
+        canvas.line(x10 + 2.0, y_yip_10, x10 + 6.0, y_yip_10,
                     stroke=COLOR_YIP, stroke_width=1.5)
-        canvas.line(x10 + 4.0, y_wg_10, x10 + 8.0, y_wg_10,
+        canvas.line(x10 + 2.0, y_wg_10, x10 + 6.0, y_wg_10,
                     stroke=COLOR_YIP, stroke_width=1.5)
-        canvas.badge(x=x10 - 150.0, y=(y_yip_10 + y_wg_10) / 2.0 - 10.0,
+        canvas.badge(right=x10 - 24.0, y=(y_yip_10 + y_wg_10) / 2.0 - 10.0,
                      text="33\u00d7 higher (16.6 vs 0.5)",
                      bg_fill="#1f1610", border_color="#f97316", text_color="#fb923c",
                      font_size=10, font_weight="bold", height=20.0)
@@ -430,10 +432,10 @@ def generate_fec_recovery_chart(data: dict) -> str:
 
     # Legend at Row 3 (y = 84)
     legend_items = [
-        ("yip (0% flatline)", COLOR_YIP, False, 115.0),
-        ("WireGuard", COLOR_WIREGUARD, False, 90.0),
-        ("Baseline (direct)", COLOR_BASELINE, True, 120.0),
-        ("OpenVPN", COLOR_OPENVPN, False, 85.0),
+        ("yip (0% flatline)", COLOR_YIP, False, 110.0),
+        ("WireGuard", COLOR_WIREGUARD, False, 85.0),
+        ("Baseline", COLOR_BASELINE, True, 80.0),
+        ("OpenVPN", COLOR_OPENVPN, False, 80.0),
     ]
     cur_lx = plot_left
     for label, color, dashed, spacing in legend_items:
@@ -445,7 +447,7 @@ def generate_fec_recovery_chart(data: dict) -> str:
         cur_lx += spacing
 
     # Inset badge header
-    canvas.badge(right=plot_right, y=72.0, text="Zero TCP backoff penalty via systematic Reed\u2013Solomon FEC",
+    canvas.badge(right=plot_right, y=72.0, text="Zero TCP Backoff via Systematic RS-FEC",
                  bg_fill="#141c2b", border_color="#38bdf8", text_color="#38bdf8",
                  font_size=11, font_weight="bold", height=24.0)
 
@@ -526,19 +528,21 @@ def generate_fec_recovery_chart(data: dict) -> str:
     x10 = x_coords[4]
     if "yip" in effective and 10 in effective["yip"]:
         y_yip = val_to_y(effective["yip"][10])
-        canvas.text(x10 - 78.0, y_yip - 10.0, "0% loss (100% recovered)",
-                    fill=COLOR_YIP, font_size=10, font_family=FONT_MONO, font_weight="bold")
+        canvas.text(x10 - 12.0, y_yip - 10.0, "0% loss (100% recovered)",
+                    fill=COLOR_YIP, font_size=10, font_family=FONT_MONO, font_weight="bold",
+                    text_anchor="end")
 
     if "wireguard" in effective and 10 in effective["wireguard"]:
         y_wg = val_to_y(effective["wireguard"][10])
-        canvas.text(x10 - 64.0, y_wg - 8.0, f"{int(effective['wireguard'][10])}% effective loss",
-                    fill=COLOR_WIREGUARD, font_size=10, font_family=FONT_MONO, font_weight="bold")
+        canvas.text(x10 - 12.0, y_wg - 8.0, f"{int(effective['wireguard'][10])}% effective loss",
+                    fill=COLOR_WIREGUARD, font_size=10, font_family=FONT_MONO, font_weight="bold",
+                    text_anchor="end")
 
-    # Explanatory badge inside plot
-    canvas.badge(x=plot_left + 120.0, y=plot_top + 40.0,
-                 text="Cauchy RS GF(256) reconstructs dropped packets before kernel IP stack detects drop",
+    # Explanatory badge inside plot (placed in clear upper-left quadrant)
+    canvas.badge(x=plot_left + 24.0, y=plot_top + 24.0,
+                 text="Cauchy RS GF(256): 100% recovery before kernel TCP timeout",
                  bg_fill="#161b22", border_color="#30363d", text_color="#c9d1d9",
-                 font_size=11, font_weight="normal", height=24.0)
+                 font_size=10, font_weight="bold", height=22.0)
 
     # Bottom note
     canvas.text(plot_left, plot_bottom + 52.0,
@@ -571,9 +575,9 @@ def generate_multicore_scaling_chart(data: dict) -> str:
 
     # Legend at Row 3 (y = 84)
     legend_items = [
-        ("AF_XDP Zero-Copy", COLOR_AF_XDP, False, 140.0),
-        ("io_uring batch", COLOR_IO_URING, False, 125.0),
-        ("Vectorized epoll / recvmmsg", COLOR_EPOLL, False, 175.0),
+        ("AF_XDP Zero-Copy", COLOR_AF_XDP, False, 130.0),
+        ("io_uring batch", COLOR_IO_URING, False, 115.0),
+        ("Vectorized epoll", COLOR_EPOLL, False, 130.0),
     ]
     cur_lx = plot_left
     for label, color, dashed, spacing in legend_items:
@@ -661,10 +665,10 @@ def generate_multicore_scaling_chart(data: dict) -> str:
                             fill=color, font_size=10, font_family=FONT_MONO,
                             font_weight="bold", text_anchor="middle")
 
-    # Annotations for 8-core AF_XDP
+    # Annotations for 8-core AF_XDP (positioned safely inside plot box below plot_top)
     x8 = x_coords[3]
     y_af_8 = val_to_y(data["af_xdp_gbps"][3])
-    canvas.badge(right=plot_right - 10.0, y=y_af_8 - 36.0,
+    canvas.badge(right=plot_right - 14.0, y=120.0,
                  text="40.27 Gbps @ 3.93 Mpps (4.6\u00d7 speedup)",
                  bg_fill="#161b22", border_color=COLOR_BORDER, text_color="#fb923c",
                  font_size=10, font_weight="bold", height=22.0)

@@ -10,15 +10,15 @@
   <line x1="75.00" y1="82.00" x2="95.00" y2="82.00" stroke="#f97316" stroke-width="2.50"/>
   <circle cx="85.00" cy="82.00" r="3.50" fill="#f97316"/>
   <text x="101.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">yip (10% FEC)</text>
-  <line x1="180.00" y1="82.00" x2="200.00" y2="82.00" stroke="#38bdf8" stroke-width="2.50"/>
-  <circle cx="190.00" cy="82.00" r="3.50" fill="#38bdf8"/>
-  <text x="206.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">WireGuard</text>
-  <line x1="270.00" y1="82.00" x2="290.00" y2="82.00" stroke="#64748b" stroke-width="2.50" stroke-dasharray="4,3"/>
-  <circle cx="280.00" cy="82.00" r="3.50" fill="#64748b"/>
-  <text x="296.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">Baseline (direct)</text>
-  <line x1="390.00" y1="82.00" x2="410.00" y2="82.00" stroke="#a855f7" stroke-width="2.50"/>
-  <circle cx="400.00" cy="82.00" r="3.50" fill="#a855f7"/>
-  <text x="416.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">OpenVPN</text>
+  <line x1="175.00" y1="82.00" x2="195.00" y2="82.00" stroke="#38bdf8" stroke-width="2.50"/>
+  <circle cx="185.00" cy="82.00" r="3.50" fill="#38bdf8"/>
+  <text x="201.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">WireGuard</text>
+  <line x1="260.00" y1="82.00" x2="280.00" y2="82.00" stroke="#64748b" stroke-width="2.50" stroke-dasharray="4,3"/>
+  <circle cx="270.00" cy="82.00" r="3.50" fill="#64748b"/>
+  <text x="286.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">Baseline</text>
+  <line x1="340.00" y1="82.00" x2="360.00" y2="82.00" stroke="#a855f7" stroke-width="2.50"/>
+  <circle cx="350.00" cy="82.00" r="3.50" fill="#a855f7"/>
+  <text x="366.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">OpenVPN</text>
   <rect x="539.40" y="72.00" width="265.60" height="24.00" fill="#1f1610" rx="6.00" stroke="#f97316" stroke-width="1.00"/>
   <text x="672.20" y="88.80" fill="#fb923c" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">33× to 98× higher throughput under loss</text>
   <line x1="75.00" y1="390.17" x2="805.00" y2="390.17" stroke="#21262d" stroke-width="1.00"/>
@@ -80,12 +80,12 @@
   <text x="448.00" y="172.25" fill="#f97316" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="bold" text-anchor="start">117.6M</text>
   <rect x="350.00" y="144.25" width="240.00" height="20.00" fill="#161b22" rx="6.00" stroke="#30363d" stroke-width="1.00"/>
   <text x="470.00" y="158.25" fill="#f0f6fc" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">98× advantage (117.6 vs 1.2 Mbit/s)</text>
-  <text x="741.00" y="246.24" fill="#f97316" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="bold" text-anchor="start">16.6 Mbit/s</text>
-  <text x="747.00" y="406.17" fill="#38bdf8" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="bold" text-anchor="start">0.5 Mbit/s</text>
-  <line x1="813.00" y1="254.24" x2="813.00" y2="390.17" stroke="#f97316" stroke-width="1.50"/>
-  <line x1="809.00" y1="254.24" x2="813.00" y2="254.24" stroke="#f97316" stroke-width="1.50"/>
-  <line x1="809.00" y1="390.17" x2="813.00" y2="390.17" stroke="#f97316" stroke-width="1.50"/>
-  <rect x="655.00" y="312.21" width="169.60" height="20.00" fill="#1f1610" rx="6.00" stroke="#f97316" stroke-width="1.00"/>
-  <text x="739.80" y="326.21" fill="#fb923c" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">33× higher (16.6 vs 0.5)</text>
+  <text x="791.00" y="246.24" fill="#f97316" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="bold" text-anchor="end">16.6 Mbit/s</text>
+  <text x="791.00" y="406.17" fill="#38bdf8" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="bold" text-anchor="end">0.5 Mbit/s</text>
+  <line x1="811.00" y1="254.24" x2="811.00" y2="390.17" stroke="#f97316" stroke-width="1.50"/>
+  <line x1="807.00" y1="254.24" x2="811.00" y2="254.24" stroke="#f97316" stroke-width="1.50"/>
+  <line x1="807.00" y1="390.17" x2="811.00" y2="390.17" stroke="#f97316" stroke-width="1.50"/>
+  <rect x="611.40" y="312.21" width="169.60" height="20.00" fill="#1f1610" rx="6.00" stroke="#f97316" stroke-width="1.00"/>
+  <text x="696.20" y="326.21" fill="#fb923c" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">33× higher (16.6 vs 0.5)</text>
   <text x="75.00" y="462.00" fill="#6e7681" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">ℹ Systematic Reed–Solomon FEC trades minor clean-path overhead for near-complete immunity against TCP backoff under packet loss.</text>
 </svg>

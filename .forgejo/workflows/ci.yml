@@ -27,6 +27,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config
       - name: Format check
         run: cargo fmt --all -- --check
+      - name: Verify benchmark graphs are up-to-date
+        run: python3 crates/yip-bench/generate-graphs.py --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Build

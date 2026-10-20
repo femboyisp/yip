@@ -174,4 +174,43 @@ if history_path:
 
 print('wrote', out, 'and', snip)
 PY
+
+# Update graphs from new history.csv data
+if [[ -f "$REPO_ROOT/crates/yip-bench/generate-graphs.py" ]]; then
+    log "regenerating benchmark graphs..."
+    python3 "$REPO_ROOT/crates/yip-bench/generate-graphs.py"
+fi
+
+# Sync snippet into README.md between markers if markers exist
+README="$REPO_ROOT/README.md"
+if [[ -f "$README" && -f "$SNIPPET" ]] && grep -q "<!-- BENCHMARK-TABLE-START -->" "$README" && grep -q "<!-- BENCHMARK-TABLE-END -->" "$README"; then
+    log "syncing snippet into README.md markers..."
+    python3 - <<PY
+import sys
+readme_path = "$README"
+snippet_path = "$SNIPPET"
+with open(readme_path, 'r', encoding='utf-8') as f:
+    readme = f.read()
+with open(snippet_path, 'r', encoding='utf-8') as f:
+    snippet = f.read().strip()
+
+start_marker = "<!-- BENCHMARK-TABLE-START -->"
+end_marker = "<!-- BENCHMARK-TABLE-END -->"
+
+start_idx = readme.find(start_marker)
+end_idx = readme.find(end_marker)
+
+if start_idx != -1 and end_idx != -1 and start_idx < end_idx:
+    new_readme = (
+        readme[:start_idx + len(start_marker)]
+        + "\n\n"
+        + snippet
+        + "\n\n"
+        + readme[end_idx:]
+    )
+    with open(readme_path, 'w', encoding='utf-8') as f:
+        f.write(new_readme)
+PY
+fi
+
 log "done: $OUT"

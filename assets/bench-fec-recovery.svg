@@ -10,17 +10,17 @@
   <line x1="75.00" y1="82.00" x2="95.00" y2="82.00" stroke="#f97316" stroke-width="2.50"/>
   <circle cx="85.00" cy="82.00" r="3.50" fill="#f97316"/>
   <text x="101.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">yip (0% flatline)</text>
-  <line x1="190.00" y1="82.00" x2="210.00" y2="82.00" stroke="#38bdf8" stroke-width="2.50"/>
-  <circle cx="200.00" cy="82.00" r="3.50" fill="#38bdf8"/>
-  <text x="216.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">WireGuard</text>
-  <line x1="280.00" y1="82.00" x2="300.00" y2="82.00" stroke="#64748b" stroke-width="2.50" stroke-dasharray="4,3"/>
-  <circle cx="290.00" cy="82.00" r="3.50" fill="#64748b"/>
-  <text x="306.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">Baseline (direct)</text>
-  <line x1="400.00" y1="82.00" x2="420.00" y2="82.00" stroke="#a855f7" stroke-width="2.50"/>
-  <circle cx="410.00" cy="82.00" r="3.50" fill="#a855f7"/>
-  <text x="426.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">OpenVPN</text>
-  <rect x="430.60" y="72.00" width="374.40" height="24.00" fill="#141c2b" rx="6.00" stroke="#38bdf8" stroke-width="1.00"/>
-  <text x="617.80" y="88.80" fill="#38bdf8" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">Zero TCP backoff penalty via systematic Reed–Solomon FEC</text>
+  <line x1="185.00" y1="82.00" x2="205.00" y2="82.00" stroke="#38bdf8" stroke-width="2.50"/>
+  <circle cx="195.00" cy="82.00" r="3.50" fill="#38bdf8"/>
+  <text x="211.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">WireGuard</text>
+  <line x1="270.00" y1="82.00" x2="290.00" y2="82.00" stroke="#64748b" stroke-width="2.50" stroke-dasharray="4,3"/>
+  <circle cx="280.00" cy="82.00" r="3.50" fill="#64748b"/>
+  <text x="296.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">Baseline</text>
+  <line x1="350.00" y1="82.00" x2="370.00" y2="82.00" stroke="#a855f7" stroke-width="2.50"/>
+  <circle cx="360.00" cy="82.00" r="3.50" fill="#a855f7"/>
+  <text x="376.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">OpenVPN</text>
+  <rect x="545.80" y="72.00" width="259.20" height="24.00" fill="#141c2b" rx="6.00" stroke="#38bdf8" stroke-width="1.00"/>
+  <text x="675.40" y="88.80" fill="#38bdf8" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">Zero TCP Backoff via Systematic RS-FEC</text>
   <line x1="75.00" y1="410.00" x2="805.00" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
   <text x="67.00" y="414.00" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">0%</text>
   <line x1="75.00" y1="351.00" x2="805.00" y2="351.00" stroke="#21262d" stroke-width="1.00"/>
@@ -70,9 +70,9 @@
   <circle cx="440.00" cy="390.33" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
   <circle cx="622.50" cy="390.33" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
   <circle cx="805.00" cy="410.00" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
-  <text x="727.00" y="400.00" fill="#f97316" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="bold" text-anchor="start">0% loss (100% recovered)</text>
-  <text x="741.00" y="185.67" fill="#38bdf8" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="bold" text-anchor="start">11% effective loss</text>
-  <rect x="195.00" y="155.00" width="491.60" height="24.00" fill="#161b22" rx="6.00" stroke="#30363d" stroke-width="1.00"/>
-  <text x="440.80" y="171.80" fill="#c9d1d9" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Cauchy RS GF(256) reconstructs dropped packets before kernel IP stack detects drop</text>
+  <text x="793.00" y="400.00" fill="#f97316" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="bold" text-anchor="end">0% loss (100% recovered)</text>
+  <text x="793.00" y="185.67" fill="#38bdf8" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="bold" text-anchor="end">11% effective loss</text>
+  <rect x="99.00" y="139.00" width="387.20" height="22.00" fill="#161b22" rx="6.00" stroke="#30363d" stroke-width="1.00"/>
+  <text x="292.60" y="154.40" fill="#c9d1d9" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">Cauchy RS GF(256): 100% recovery before kernel TCP timeout</text>
   <text x="75.00" y="462.00" fill="#6e7681" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">ℹ While raw tunnels suffer proportional ping and TCP packet loss, yip&apos;s systematic erasure decoder maintains near-zero drop rate.</text>
 </svg>

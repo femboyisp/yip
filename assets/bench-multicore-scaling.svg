@@ -10,12 +10,12 @@
   <line x1="75.00" y1="82.00" x2="95.00" y2="82.00" stroke="#fb923c" stroke-width="2.50"/>
   <circle cx="85.00" cy="82.00" r="3.50" fill="#fb923c"/>
   <text x="101.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">AF_XDP Zero-Copy</text>
-  <line x1="215.00" y1="82.00" x2="235.00" y2="82.00" stroke="#34d399" stroke-width="2.50"/>
-  <circle cx="225.00" cy="82.00" r="3.50" fill="#34d399"/>
-  <text x="241.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">io_uring batch</text>
-  <line x1="340.00" y1="82.00" x2="360.00" y2="82.00" stroke="#38bdf8" stroke-width="2.50"/>
-  <circle cx="350.00" cy="82.00" r="3.50" fill="#38bdf8"/>
-  <text x="366.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">Vectorized epoll / recvmmsg</text>
+  <line x1="205.00" y1="82.00" x2="225.00" y2="82.00" stroke="#34d399" stroke-width="2.50"/>
+  <circle cx="215.00" cy="82.00" r="3.50" fill="#34d399"/>
+  <text x="231.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">io_uring batch</text>
+  <line x1="320.00" y1="82.00" x2="340.00" y2="82.00" stroke="#38bdf8" stroke-width="2.50"/>
+  <circle cx="330.00" cy="82.00" r="3.50" fill="#38bdf8"/>
+  <text x="346.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">Vectorized epoll</text>
   <rect x="552.20" y="72.00" width="252.80" height="24.00" fill="#1f1610" rx="6.00" stroke="#fb923c" stroke-width="1.00"/>
   <text x="678.60" y="88.80" fill="#fb923c" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">40+ Gbps Line-Rate Multi-Core Scaling</text>
   <line x1="75.00" y1="410.00" x2="805.00" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
@@ -60,7 +60,7 @@
   <text x="561.67" y="260.89" fill="#fb923c" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="bold" text-anchor="middle">21.2</text>
   <circle cx="805.00" cy="146.01" r="4.50" fill="#fb923c" stroke="#0d1117" stroke-width="1.50"/>
   <text x="805.00" y="136.01" fill="#fb923c" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="bold" text-anchor="middle">40.3</text>
-  <rect x="542.20" y="110.01" width="252.80" height="22.00" fill="#161b22" rx="6.00" stroke="#30363d" stroke-width="1.00"/>
-  <text x="668.60" y="125.41" fill="#fb923c" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">40.27 Gbps @ 3.93 Mpps (4.6× speedup)</text>
+  <rect x="538.20" y="120.00" width="252.80" height="22.00" fill="#161b22" rx="6.00" stroke="#30363d" stroke-width="1.00"/>
+  <text x="664.60" y="135.40" fill="#fb923c" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">40.27 Gbps @ 3.93 Mpps (4.6× speedup)</text>
   <text x="75.00" y="462.00" fill="#6e7681" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">ℹ SPSC ring sharding eliminates atomic contention across cores, scaling near-linearly to 40+ Gbps line-rate with AF_XDP zero-copy driver.</text>
 </svg>

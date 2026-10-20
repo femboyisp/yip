@@ -47,7 +47,7 @@
     <rect x="24.00" y="20.00" width="76.00" height="24.00" rx="6.00" fill="#431407" stroke="#f97316" stroke-width="1.00" />
     <text x="62.00" y="36.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" font-weight="700" fill="#fb923c" text-anchor="middle">🦊 YIP</text>
     <text x="110.00" y="37.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="17" font-weight="700" fill="#f0f6fc">DUAL-PATH SYSTEM ARCHITECTURE</text>
-    <text x="110.00" y="55.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="11.5" fill="#8b949e">Zero-Lock Core Pipeline • eBPF AF_XDP Line-Rate Bypass &amp; uTLS / Xray-REALITY Anti-DPI Subsystems</text>
+    <text x="110.00" y="55.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="11.5" fill="#8b949e">Zero-Lock Data Plane • eBPF AF_XDP 40 Gbps &amp; Anti-DPI Subsystems</text>
     <rect x="898.50" y="24.00" width="117.50" height="22.00" rx="11.00" fill="#1e1b4b" stroke="#6366f1" stroke-width="1.00" />
     <text x="957.25" y="39.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="600" fill="#818cf8" text-anchor="middle">Noise-IK AEAD</text>
     <rect x="763.50" y="24.00" width="125.00" height="22.00" rx="11.00" fill="#431407" stroke="#f97316" stroke-width="1.00" />
@@ -63,21 +63,21 @@
     <rect x="36.00" y="84.00" width="112.00" height="18.00" rx="4.00" fill="#1e1b4b" stroke="#6366f1" stroke-width="1.00" />
     <text x="92.00" y="97.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="700" fill="#818cf8" text-anchor="middle">CONTROL PLANE</text>
     <text x="156.00" y="97.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="11" fill="#8b949e">Out-of-band orchestration, cryptographic session management &amp; topology mesh discovery</text>
-    <rect x="36.00" y="108.00" width="312.00" height="74.00" rx="6.00" fill="#0d1117" stroke="#30363d" stroke-width="1.00" />
-    <text x="48.00" y="126.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">BLAKE2s Key-Derivation</text>
-    <text x="48.00" y="143.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Static &amp; Ephemeral 256-bit Keypairs</text>
-    <text x="48.00" y="159.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Noise-IK Handshake Token Generation</text>
-    <text x="48.00" y="175.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#818cf8">• Ephemeral Rekeying State (120s Ratchet)</text>
-    <rect x="364.00" y="108.00" width="312.00" height="74.00" rx="6.00" fill="#0d1117" stroke="#30363d" stroke-width="1.00" />
-    <text x="376.00" y="126.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">CA-Gated Mesh Discovery <tspan fill="#818cf8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">(yip-ca)</tspan></text>
-    <text x="376.00" y="143.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• mTLS Node Identity &amp; Role Claims</text>
-    <text x="376.00" y="159.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Gossip Membership &amp; Dynamic Topology</text>
-    <text x="376.00" y="175.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#818cf8">• Cryptographic Access Control List (ACL)</text>
-    <rect x="692.00" y="108.00" width="312.00" height="74.00" rx="6.00" fill="#0d1117" stroke="#30363d" stroke-width="1.00" />
-    <text x="704.00" y="126.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">NAT Traversal &amp; Relay <tspan fill="#818cf8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">(yip-rendezvous)</tspan></text>
-    <text x="704.00" y="143.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• STUN/TURN Candidate Reflexive Probing</text>
-    <text x="704.00" y="159.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Symmetric NAT UDP Port Prediction</text>
-    <text x="704.00" y="175.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#818cf8">• Low-Latency Auto-Fallback Derp Relay</text>
+    <rect x="36.00" y="106.00" width="312.00" height="76.00" rx="6.00" fill="#0d1117" stroke="#30363d" stroke-width="1.00" />
+    <text x="48.00" y="123.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">BLAKE2s Key-Derivation</text>
+    <text x="48.00" y="139.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Static &amp; Ephemeral 256-bit Keypairs</text>
+    <text x="48.00" y="155.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Noise-IK Handshake Token Generation</text>
+    <text x="48.00" y="171.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#818cf8">• Ephemeral Rekeying State (120s Ratchet)</text>
+    <rect x="364.00" y="106.00" width="312.00" height="76.00" rx="6.00" fill="#0d1117" stroke="#30363d" stroke-width="1.00" />
+    <text x="376.00" y="123.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">CA-Gated Mesh Discovery <tspan fill="#818cf8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">(yip-ca)</tspan></text>
+    <text x="376.00" y="139.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• mTLS Node Identity &amp; Role Claims</text>
+    <text x="376.00" y="155.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Gossip Membership &amp; Dynamic Topology</text>
+    <text x="376.00" y="171.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#818cf8">• Cryptographic Access Control List (ACL)</text>
+    <rect x="692.00" y="106.00" width="312.00" height="76.00" rx="6.00" fill="#0d1117" stroke="#30363d" stroke-width="1.00" />
+    <text x="704.00" y="123.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">NAT Traversal &amp; Relay <tspan fill="#818cf8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">(yip-rendezvous)</tspan></text>
+    <text x="704.00" y="139.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• STUN/TURN Candidate Reflexive Probing</text>
+    <text x="704.00" y="155.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Symmetric NAT UDP Port Prediction</text>
+    <text x="704.00" y="171.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#818cf8">• Low-Latency Auto-Fallback Derp Relay</text>
   </g>
   <!-- Connectors: Control to Data Plane -->
   <g id="connectors-control-to-data">
@@ -155,7 +155,7 @@
     <text x="46.00" y="588.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• 1024-packet batch descriptor submission per syscall</text>
     <text x="46.00" y="604.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Edge-triggered vector notification with 0 jitter</text>
     <rect x="36.00" y="620.00" width="460.00" height="32.00" rx="6.00" fill="#064e3b" stroke="#10b981" stroke-width="1.20" />
-    <text x="266.00" y="640.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" font-weight="700" fill="#34d399" text-anchor="middle">⚡ PERFORMANCE: 40+ Gbps Line-Rate • 8.2M pps (16-Core AF_XDP)</text>
+    <text x="266.00" y="640.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="700" fill="#34d399" text-anchor="middle">⚡ 40+ Gbps Line-Rate • 8.2M pps (16-Core AF_XDP Zero-Copy)</text>
   </g>
   <g id="stealth-path">
     <rect x="532.00" y="450.00" width="484.00" height="210.00" rx="8.00" fill="url(#grad-stealth-card)" stroke="#e11d48" stroke-width="1.30" stroke-opacity="0.80" />
@@ -171,7 +171,7 @@
     <text x="554.00" y="588.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Server Name Indication (SNI) authentic certificate borrowing</text>
     <text x="554.00" y="604.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Active probe rejection with transparent upstream proxying</text>
     <rect x="544.00" y="620.00" width="460.00" height="32.00" rx="6.00" fill="#4c0519" stroke="#e11d48" stroke-width="1.20" />
-    <text x="774.00" y="640.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" font-weight="700" fill="#fb7185" text-anchor="middle">🛡️ 4-ENGINE DPI ORACLE IMMUNE: nDPI • Zeek • Suricata • Wireshark</text>
+    <text x="774.00" y="640.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="700" fill="#fb7185" text-anchor="middle">🛡️ 4-ENGINE DPI ORACLE: nDPI • Zeek • Suricata • Wireshark</text>
   </g>
   <!-- Footer Bar -->
   <g id="footer">

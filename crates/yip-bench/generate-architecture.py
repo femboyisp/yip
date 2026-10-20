@@ -119,7 +119,7 @@ def build_architecture_svg() -> str:
     
     # Title & Subtitle
     lines.append(f'    <text x="110.00" y="37.00" font-family="{FONT_SANS}" font-size="17" font-weight="700" fill="{COLOR_TEXT_WHITE}">DUAL-PATH SYSTEM ARCHITECTURE</text>')
-    lines.append(f'    <text x="110.00" y="55.00" font-family="{FONT_SANS}" font-size="11.5" fill="{COLOR_TEXT_MUTED}">Zero-Lock Core Pipeline • eBPF AF_XDP Line-Rate Bypass &amp; uTLS / Xray-REALITY Anti-DPI Subsystems</text>')
+    lines.append(f'    <text x="110.00" y="55.00" font-family="{FONT_SANS}" font-size="11.5" fill="{COLOR_TEXT_MUTED}">Zero-Lock Data Plane • eBPF AF_XDP 40 Gbps &amp; Anti-DPI Subsystems</text>')
 
     # Feature Badges on right
     badges = [
@@ -152,34 +152,34 @@ def build_architecture_svg() -> str:
 
     # 3 Control Plane Modules
     card_w = 312.00
-    card_h = 74.00
+    card_h = 76.00
     gap = 16.00
     start_x = 36.00
-    card_y = 108.00
+    card_y = 106.00
 
     # Module 1: BLAKE2s Key-Derivation
     m1_x = start_x
     lines.append(f'    <rect x="{m1_x:.2f}" y="{card_y:.2f}" width="{card_w:.2f}" height="{card_h:.2f}" rx="6.00" fill="{COLOR_SUB_CARD_BG}" stroke="{COLOR_CANVAS_BORDER}" stroke-width="1.00" />')
-    lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 18:.2f}" font-family="{FONT_SANS}" font-size="12" font-weight="700" fill="{COLOR_TEXT_WHITE}">BLAKE2s Key-Derivation</text>')
-    lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 35:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• Static &amp; Ephemeral 256-bit Keypairs</text>')
-    lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 51:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• Noise-IK Handshake Token Generation</text>')
-    lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 67:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_CONTROL_LIGHT}">• Ephemeral Rekeying State (120s Ratchet)</text>')
+    lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 17:.2f}" font-family="{FONT_SANS}" font-size="12" font-weight="700" fill="{COLOR_TEXT_WHITE}">BLAKE2s Key-Derivation</text>')
+    lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 33:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• Static &amp; Ephemeral 256-bit Keypairs</text>')
+    lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 49:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• Noise-IK Handshake Token Generation</text>')
+    lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 65:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_CONTROL_LIGHT}">• Ephemeral Rekeying State (120s Ratchet)</text>')
 
     # Module 2: CA-Gated Mesh Discovery (yip-ca)
     m2_x = m1_x + card_w + gap
     lines.append(f'    <rect x="{m2_x:.2f}" y="{card_y:.2f}" width="{card_w:.2f}" height="{card_h:.2f}" rx="6.00" fill="{COLOR_SUB_CARD_BG}" stroke="{COLOR_CANVAS_BORDER}" stroke-width="1.00" />')
-    lines.append(f'    <text x="{m2_x + 12:.2f}" y="{card_y + 18:.2f}" font-family="{FONT_SANS}" font-size="12" font-weight="700" fill="{COLOR_TEXT_WHITE}">CA-Gated Mesh Discovery <tspan fill="{COLOR_CONTROL_LIGHT}" font-family="{FONT_MONO}" font-size="11">(yip-ca)</tspan></text>')
-    lines.append(f'    <text x="{m2_x + 12:.2f}" y="{card_y + 35:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• mTLS Node Identity &amp; Role Claims</text>')
-    lines.append(f'    <text x="{m2_x + 12:.2f}" y="{card_y + 51:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• Gossip Membership &amp; Dynamic Topology</text>')
-    lines.append(f'    <text x="{m2_x + 12:.2f}" y="{card_y + 67:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_CONTROL_LIGHT}">• Cryptographic Access Control List (ACL)</text>')
+    lines.append(f'    <text x="{m2_x + 12:.2f}" y="{card_y + 17:.2f}" font-family="{FONT_SANS}" font-size="12" font-weight="700" fill="{COLOR_TEXT_WHITE}">CA-Gated Mesh Discovery <tspan fill="{COLOR_CONTROL_LIGHT}" font-family="{FONT_MONO}" font-size="11">(yip-ca)</tspan></text>')
+    lines.append(f'    <text x="{m2_x + 12:.2f}" y="{card_y + 33:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• mTLS Node Identity &amp; Role Claims</text>')
+    lines.append(f'    <text x="{m2_x + 12:.2f}" y="{card_y + 49:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• Gossip Membership &amp; Dynamic Topology</text>')
+    lines.append(f'    <text x="{m2_x + 12:.2f}" y="{card_y + 65:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_CONTROL_LIGHT}">• Cryptographic Access Control List (ACL)</text>')
 
     # Module 3: NAT Hole-Punching & Relay (yip-rendezvous)
     m3_x = m2_x + card_w + gap
     lines.append(f'    <rect x="{m3_x:.2f}" y="{card_y:.2f}" width="{card_w:.2f}" height="{card_h:.2f}" rx="6.00" fill="{COLOR_SUB_CARD_BG}" stroke="{COLOR_CANVAS_BORDER}" stroke-width="1.00" />')
-    lines.append(f'    <text x="{m3_x + 12:.2f}" y="{card_y + 18:.2f}" font-family="{FONT_SANS}" font-size="12" font-weight="700" fill="{COLOR_TEXT_WHITE}">NAT Traversal &amp; Relay <tspan fill="{COLOR_CONTROL_LIGHT}" font-family="{FONT_MONO}" font-size="11">(yip-rendezvous)</tspan></text>')
-    lines.append(f'    <text x="{m3_x + 12:.2f}" y="{card_y + 35:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• STUN/TURN Candidate Reflexive Probing</text>')
-    lines.append(f'    <text x="{m3_x + 12:.2f}" y="{card_y + 51:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• Symmetric NAT UDP Port Prediction</text>')
-    lines.append(f'    <text x="{m3_x + 12:.2f}" y="{card_y + 67:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_CONTROL_LIGHT}">• Low-Latency Auto-Fallback Derp Relay</text>')
+    lines.append(f'    <text x="{m3_x + 12:.2f}" y="{card_y + 17:.2f}" font-family="{FONT_SANS}" font-size="12" font-weight="700" fill="{COLOR_TEXT_WHITE}">NAT Traversal &amp; Relay <tspan fill="{COLOR_CONTROL_LIGHT}" font-family="{FONT_MONO}" font-size="11">(yip-rendezvous)</tspan></text>')
+    lines.append(f'    <text x="{m3_x + 12:.2f}" y="{card_y + 33:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• STUN/TURN Candidate Reflexive Probing</text>')
+    lines.append(f'    <text x="{m3_x + 12:.2f}" y="{card_y + 49:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• Symmetric NAT UDP Port Prediction</text>')
+    lines.append(f'    <text x="{m3_x + 12:.2f}" y="{card_y + 65:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_CONTROL_LIGHT}">• Low-Latency Auto-Fallback Derp Relay</text>')
     lines.append('  </g>')
 
     # Connectors: Control Plane -> Data Plane
@@ -341,7 +341,7 @@ def build_architecture_svg() -> str:
     out1_y = ic2_y + ic1_h + 8.00
     out1_h = 32.00
     lines.append(f'    <rect x="{fp_x + 12:.2f}" y="{out1_y:.2f}" width="{ic1_w:.2f}" height="{out1_h:.2f}" rx="6.00" fill="{COLOR_FAST_BG}" stroke="{COLOR_FAST}" stroke-width="1.20" />')
-    lines.append(f'    <text x="{fp_x + bottom_w / 2:.2f}" y="{out1_y + 20:.2f}" font-family="{FONT_MONO}" font-size="11.5" font-weight="700" fill="{COLOR_FAST_LIGHT}" text-anchor="middle">⚡ PERFORMANCE: 40+ Gbps Line-Rate • 8.2M pps (16-Core AF_XDP)</text>')
+    lines.append(f'    <text x="{fp_x + bottom_w / 2:.2f}" y="{out1_y + 20:.2f}" font-family="{FONT_MONO}" font-size="10" font-weight="700" fill="{COLOR_FAST_LIGHT}" text-anchor="middle">⚡ 40+ Gbps Line-Rate • 8.2M pps (16-Core AF_XDP Zero-Copy)</text>')
     lines.append('  </g>')
 
     # -------------------------------------------------------------------------
@@ -374,7 +374,7 @@ def build_architecture_svg() -> str:
 
     # Outcome Banner: 4-Engine DPI Oracle Pass
     lines.append(f'    <rect x="{sp_x + 12:.2f}" y="{out1_y:.2f}" width="{sc1_w:.2f}" height="{out1_h:.2f}" rx="6.00" fill="{COLOR_STEALTH_BG}" stroke="{COLOR_STEALTH}" stroke-width="1.20" />')
-    lines.append(f'    <text x="{sp_x + bottom_w / 2:.2f}" y="{out1_y + 20:.2f}" font-family="{FONT_MONO}" font-size="11.5" font-weight="700" fill="{COLOR_STEALTH_LIGHT}" text-anchor="middle">🛡️ 4-ENGINE DPI ORACLE IMMUNE: nDPI • Zeek • Suricata • Wireshark</text>')
+    lines.append(f'    <text x="{sp_x + bottom_w / 2:.2f}" y="{out1_y + 20:.2f}" font-family="{FONT_MONO}" font-size="10" font-weight="700" fill="{COLOR_STEALTH_LIGHT}" text-anchor="middle">🛡️ 4-ENGINE DPI ORACLE: nDPI • Zeek • Suricata • Wireshark</text>')
     lines.append('  </g>')
 
     # =========================================================================
