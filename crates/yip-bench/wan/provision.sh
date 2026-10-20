@@ -56,7 +56,7 @@ install_packages() {
 # actually takes effect (the stock 208 KB cap silently throttles a userspace
 # tunnel and causes drops under load; in-kernel WireGuard is unaffected). This
 # is standard VPN-host tuning, applied equally to both hosts and disclosed in
-# RESULTS-wan.md so the comparison stays fair and reproducible.
+# RESULTS.md so the comparison stays fair and reproducible.
 tune_sysctls() {
     log "raising UDP socket-buffer ceilings (fair host tuning; disclosed in results)"
     local s="net.core.rmem_max=16777216 net.core.wmem_max=16777216 net.core.netdev_max_backlog=5000"

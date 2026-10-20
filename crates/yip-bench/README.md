@@ -278,7 +278,7 @@ cheap on a clean fast path where every tunnel is fast enough.
 
 While the netem test suites evaluate performance under artificial kernel-injected loss and delay in isolated network namespaces, the WAN benchmark harness measures real-world inter-datacenter behavior over public internet paths across multiple cloud regions.
 
-Full historical data and conditions are recorded in [`RESULTS-wan.md`](RESULTS-wan.md) and [`wan/results/history.csv`](wan/results/history.csv).
+Full historical data and conditions are recorded in [`RESULTS.md`](RESULTS.md) and [`wan/results/history.csv`](wan/results/history.csv).
 
 ### Benchmark environment & conditions
 
@@ -339,7 +339,7 @@ cd crates/yip-bench/wan
 cp wan.env.example wan.env   # edit HOST_A, HOST_B, SSH_KEY, SSH_USER
 ./provision.sh              # install dependencies, build/push yipd, configure wg & ovpn
 ./run-wan-bench.sh          # execute clean-path & loss-matrix benchmarks -> results/<ts>/wan.csv
-./collect.sh                # reduce results into RESULTS-wan.md, history.csv, readme-snippet.md
+./collect.sh                # reduce results into RESULTS.md, history.csv, readme-snippet.md
 ./teardown.sh               # tear down tunnels, stop daemons, flush netem qdiscs
 ```
 
@@ -358,7 +358,7 @@ cd crates/yip-bench/wan
 
 #### 3. Continuous Integration
 
-The `.github/workflows/wan-benchmark.yml` workflow automatically runs the WAN benchmark on pushes to `main` (when AWS secrets are configured) or on manual `workflow_dispatch`, updating `RESULTS-wan.md` and archiving run artifacts.
+The `.github/workflows/wan-benchmark.yml` workflow automatically runs the WAN benchmark on pull requests and pushes to `main` (when AWS secrets are configured) or on manual `workflow_dispatch`, updating `RESULTS.md` and archiving run artifacts.
 
 ---
 
