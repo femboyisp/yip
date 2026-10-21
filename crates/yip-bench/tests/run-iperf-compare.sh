@@ -305,10 +305,12 @@ setup_wg() {
             peer "$pubA" endpoint "${VWA_IP}:${WPORT_A}" allowed-ips "${TUN_WA_IP}/32" 2>/dev/null; then
         echo "[wg] SKIP: wg set configuration failed"; WG_AVAILABLE=false; return
     fi
-    ip netns exec "$NS_WA" ip addr add "${TUN_WA_IP}/24" dev wg0
-    ip netns exec "$NS_WB" ip addr add "${TUN_WB_IP}/24" dev wg0
-    ip netns exec "$NS_WA" ip link set wg0 up
-    ip netns exec "$NS_WB" ip link set wg0 up
+    if ! ip netns exec "$NS_WA" ip addr add "${TUN_WA_IP}/24" dev wg0 2>/dev/null || \
+       ! ip netns exec "$NS_WB" ip addr add "${TUN_WB_IP}/24" dev wg0 2>/dev/null || \
+       ! ip netns exec "$NS_WA" ip link set wg0 up 2>/dev/null || \
+       ! ip netns exec "$NS_WB" ip link set wg0 up 2>/dev/null; then
+        echo "[wg] SKIP: interface setup failed"; WG_AVAILABLE=false; return
+    fi
     sleep 0.5
     if ! ip netns exec "$NS_WB" ping -c 3 -W 5 "$TUN_WA_IP" >/dev/null 2>&1; then
         echo "[wg] SKIP: baseline ping failed"; WG_AVAILABLE=false; return
@@ -352,8 +354,26 @@ setup_awg() {
             echo "[awg] SKIP: amneziawg link add failed"; AWG_AVAILABLE=false; return
         fi
     fi
-    ip netns exec "$NS_AA" ip addr add "${TUN_AA_IP}/24" dev awg0
-    ip netns exec "$NS_AB" ip addr add "${TUN_AB_IP}/24" dev awg0
+
+    local awg_up=false
+    for i in $(seq 1 20); do
+        if ip netns exec "$NS_AA" ip link show awg0 >/dev/null 2>&1 && \
+           ip netns exec "$NS_AB" ip link show awg0 >/dev/null 2>&1; then
+            awg_up=true
+            break
+        fi
+        sleep 0.25
+    done
+    if [ "$awg_up" = false ]; then
+        echo "[awg] SKIP: awg0 interface creation failed or timed out"
+        tail -5 "$TMPDIR_TEST/awg-go-a.log" "$TMPDIR_TEST/awg-go-b.log" 2>/dev/null || true
+        AWG_AVAILABLE=false; return
+    fi
+
+    if ! ip netns exec "$NS_AA" ip addr add "${TUN_AA_IP}/24" dev awg0 2>/dev/null || \
+       ! ip netns exec "$NS_AB" ip addr add "${TUN_AB_IP}/24" dev awg0 2>/dev/null; then
+        echo "[awg] SKIP: ip addr add failed"; AWG_AVAILABLE=false; return
+    fi
 
     local CFG_AA="$TMPDIR_TEST/awgA.conf"; local CFG_AB="$TMPDIR_TEST/awgB.conf"
     cat > "$CFG_AA" <<EOF
@@ -401,8 +421,10 @@ EOF
        ! ip netns exec "$NS_AB" awg setconf awg0 "$CFG_AB" 2>/dev/null; then
         echo "[awg] SKIP: awg setconf failed"; AWG_AVAILABLE=false; return
     fi
-    ip netns exec "$NS_AA" ip link set awg0 up
-    ip netns exec "$NS_AB" ip link set awg0 up
+    if ! ip netns exec "$NS_AA" ip link set awg0 up 2>/dev/null || \
+       ! ip netns exec "$NS_AB" ip link set awg0 up 2>/dev/null; then
+        echo "[awg] SKIP: ip link set up failed"; AWG_AVAILABLE=false; return
+    fi
     sleep 0.5
     if ! ip netns exec "$NS_AB" ping -c 3 -W 5 "$TUN_AA_IP" >/dev/null 2>&1; then
         echo "[awg] SKIP: baseline ping failed"; AWG_AVAILABLE=false; return
