@@ -298,10 +298,19 @@ setup_wg
 # PART 3: sweep and emit combined table
 # ══════════════════════════════════════════════════════════════════════════════
 
+PING_COUNT="${PING_COUNT:-100}"
+if [ -n "${PING_INTERVAL:-}" ]; then
+    PING_INTERVAL="$PING_INTERVAL"
+elif [ "$PING_COUNT" -ge 1000 ] 2>/dev/null; then
+    PING_INTERVAL="0.005"
+else
+    PING_INTERVAL="0.05"
+fi
+
 LOSS_RATES="0 1 3 5 10"
 
 HEADER="yip vs kernel WireGuard — netem loss sweep"
-SUBHEADER="ping -c 100 -i 0.05 -W 1 across each tunnel; netem: loss X% delay 5ms (symmetric)"
+SUBHEADER="ping -c ${PING_COUNT} -i ${PING_INTERVAL} -W 1 across each tunnel; netem: loss X% delay 5ms (symmetric)"
 
 if [ "$WG_AVAILABLE" = true ]; then
     COL_HDR="| injected% | yip_loss% | wg_loss%  | yip_rtt_ms | wg_rtt_ms |"
@@ -342,10 +351,11 @@ for LOSS in $LOSS_RATES; do
     fi
 
     # ── ping yip tunnel ───────────────────────────────────────────────────────
-    YIP_PING="$(ip netns exec "$NS_B" ping -c 100 -i 0.05 -W 1 "$TUN_A_IP" 2>&1)" || true
+    YIP_PING="$(ip netns exec "$NS_B" ping -c "$PING_COUNT" -i "$PING_INTERVAL" -W 1 "$TUN_A_IP" 2>&1)" || true
 
     YIP_LOSS="$(echo "$YIP_PING" \
-        | grep -oP '\d+% packet loss' | grep -oP '^\d+' || echo "100")"
+        | grep -oP '[0-9.]+% packet loss' | grep -oP '^[0-9.]+' || true)"
+    [ -z "$YIP_LOSS" ] && YIP_LOSS="100"
     YIP_RTT_LINE="$(echo "$YIP_PING" | grep -oP 'rtt min/avg/max/mdev = [0-9./]+ ms' || echo "")"
     if [ -n "$YIP_RTT_LINE" ]; then
         YIP_RTT_AVG="$(echo "$YIP_RTT_LINE" | cut -d= -f2 | tr '/' ' ' | awk '{print $2}')"
@@ -355,10 +365,11 @@ for LOSS in $LOSS_RATES; do
 
     # ── ping WireGuard tunnel ─────────────────────────────────────────────────
     if [ "$WG_AVAILABLE" = true ]; then
-        WG_PING="$(ip netns exec "$NS_WGB" ping -c 100 -i 0.05 -W 1 "$WG_A_TUN_IP" 2>&1)" || true
+        WG_PING="$(ip netns exec "$NS_WGB" ping -c "$PING_COUNT" -i "$PING_INTERVAL" -W 1 "$WG_A_TUN_IP" 2>&1)" || true
 
         WG_LOSS="$(echo "$WG_PING" \
-            | grep -oP '\d+% packet loss' | grep -oP '^\d+' || echo "100")"
+            | grep -oP '[0-9.]+% packet loss' | grep -oP '^[0-9.]+' || true)"
+        [ -z "$WG_LOSS" ] && WG_LOSS="100"
         WG_RTT_LINE="$(echo "$WG_PING" | grep -oP 'rtt min/avg/max/mdev = [0-9./]+ ms' || echo "")"
         if [ -n "$WG_RTT_LINE" ]; then
             WG_RTT_AVG="$(echo "$WG_RTT_LINE" | cut -d= -f2 | tr '/' ' ' | awk '{print $2}')"

@@ -101,10 +101,20 @@ apply_netem() {
 }
 
 # ── helper: ping a tunnel IP from a netns; echo "<loss%> <avg_rtt_ms>" ─────────
+PING_COUNT="${PING_COUNT:-50}"
+if [ -n "${PING_INTERVAL:-}" ]; then
+    PING_INTERVAL="$PING_INTERVAL"
+elif [ "$PING_COUNT" -ge 1000 ] 2>/dev/null; then
+    PING_INTERVAL="0.005"
+else
+    PING_INTERVAL="0.1"
+fi
+
 measure_ping() {
     local ns="$1" dst="$2" out loss rttline rtt
-    out="$(ip netns exec "$ns" ping -c 50 -i 0.1 -W 1 "$dst" 2>&1)" || true
-    loss="$(echo "$out" | grep -oP '\d+(\.\d+)?% packet loss' | grep -oP '^[0-9.]+' || echo 100)"
+    out="$(ip netns exec "$ns" ping -c "$PING_COUNT" -i "$PING_INTERVAL" -W 1 "$dst" 2>&1)" || true
+    loss="$(echo "$out" | sed -nE 's/.* ([0-9.]+)% packet loss.*/\1/p' | head -1)"
+    [ -z "$loss" ] && loss="100"
     rttline="$(echo "$out" | grep -oP 'rtt min/avg/max/mdev = [0-9./]+ ms' || echo "")"
     if [ -n "$rttline" ]; then
         rtt="$(echo "$rttline" | cut -d= -f2 | tr '/' ' ' | awk '{print $2}')"
@@ -327,7 +337,7 @@ LOSS_RATES="0 5 10"
 echo ""
 echo "=========================================================="
 echo "  iperf3 TCP throughput + ping latency/loss under netem"
-echo "  ping -c 50 -i 0.1; iperf3 -t 8; netem: loss X% delay 5ms (symmetric)"
+echo "  ping -c ${PING_COUNT} -i ${PING_INTERVAL}; iperf3 -t 8; netem: loss X% delay 5ms (symmetric)"
 echo "=========================================================="
 
 for LOSS in $LOSS_RATES; do

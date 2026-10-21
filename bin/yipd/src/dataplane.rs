@@ -42,6 +42,13 @@ const ETHERNET_SOURCE_MAC_OFFSET: usize = 6;
 
 // ── SentLog ───────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ClassCounts {
+    pub realtime: u32,
+    pub bulk: u32,
+    pub default: u32,
+}
+
 /// A bounded ring-log that maps sealed-packet counters to their [`FlowClass`].
 ///
 /// Entries are inserted in arrival order (monotone counter sequence from the
@@ -50,7 +57,7 @@ const ETHERNET_SOURCE_MAC_OFFSET: usize = 6;
 pub(crate) struct SentLog {
     capacity: usize,
     map: HashMap<u64, FlowClass>,
-    order: VecDeque<u64>,
+    order: VecDeque<(u64, FlowClass)>,
 }
 
 impl SentLog {
@@ -64,12 +71,12 @@ impl SentLog {
 
     pub(crate) fn insert(&mut self, counter: u64, class: FlowClass) {
         if self.map.len() >= self.capacity {
-            if let Some(oldest) = self.order.pop_front() {
+            if let Some((oldest, _)) = self.order.pop_front() {
                 self.map.remove(&oldest);
             }
         }
         self.map.insert(counter, class);
-        self.order.push_back(counter);
+        self.order.push_back((counter, class));
     }
 
     pub(crate) fn get(&self, counter: u64) -> Option<FlowClass> {
@@ -79,6 +86,23 @@ impl SentLog {
     /// Number of entries in the log whose `FlowClass` matches `class`.
     pub(crate) fn count_class(&self, class: FlowClass) -> u32 {
         u32::try_from(self.map.values().filter(|&&c| c == class).count()).unwrap_or(u32::MAX)
+    }
+
+    pub(crate) fn count_classes_in_range(&self, start: u64, end: u64) -> ClassCounts {
+        if start > end {
+            return ClassCounts::default();
+        }
+        let mut counts = ClassCounts::default();
+        for &(counter, class) in &self.order {
+            if counter >= start && counter <= end {
+                match class {
+                    FlowClass::Realtime => counts.realtime = counts.realtime.saturating_add(1),
+                    FlowClass::Bulk => counts.bulk = counts.bulk.saturating_add(1),
+                    FlowClass::Default => counts.default = counts.default.saturating_add(1),
+                }
+            }
+        }
+        counts
     }
 }
 
@@ -132,6 +156,7 @@ pub struct DataPlane {
     retx: RetxBuffer,
     detector: LossDetector,
     mac_table: MacTable,
+    last_loss_report_high: u64,
 
     // Feedback / log timers (mirror what ingress thread holds in tunnel.rs).
     last_feedback_ms: u64,
@@ -246,8 +271,9 @@ impl DataPlane {
             peer_addr,
             sent_log: SentLog::new(SENT_LOG_CAPACITY),
             retx: RetxBuffer::new(RETX_BUFFER_MAX, RETX_BUFFER_TTL_MS),
-            detector: LossDetector::new(5, 1024),
+            detector: LossDetector::new(5, SENT_LOG_CAPACITY),
             mac_table: MacTable::new(DEFAULT_MAC_TABLE_CAPACITY, DEFAULT_MAC_TABLE_TTL_MS),
+            last_loss_report_high: 0,
             last_feedback_ms: 0,
             last_log_ms: 0,
             last_sweep_ms: 0,
@@ -505,9 +531,6 @@ impl DataPlane {
                 match frame {
                     ControlFrame::Feedback(report) => {
                         // Attribute missing counters to flow classes via the sent-log.
-                        //
-                        // Per-class fraction estimate:
-                        //   fraction = class_missing / max(1, class_sent_in_log)
                         let mut missing_rt: u32 = 0;
                         let mut missing_bulk: u32 = 0;
                         let mut missing_default: u32 = 0;
@@ -529,23 +552,52 @@ impl DataPlane {
                             }
                         }
 
-                        let sent_rt = self.sent_log.count_class(FlowClass::Realtime).max(1);
-                        let sent_bulk = self.sent_log.count_class(FlowClass::Bulk).max(1);
-                        let sent_default = self.sent_log.count_class(FlowClass::Default).max(1);
+                        let (sent_rt, sent_bulk, sent_default) =
+                            if report.high_counter > self.last_loss_report_high {
+                                let start = if self.last_loss_report_high == 0 {
+                                    self.sent_log.order.front().map(|(c, _)| *c).unwrap_or(0)
+                                } else {
+                                    self.last_loss_report_high.saturating_add(1)
+                                };
+                                self.last_loss_report_high = report.high_counter;
+                                let window_counts = self
+                                    .sent_log
+                                    .count_classes_in_range(start, report.high_counter);
+                                (
+                                    window_counts.realtime,
+                                    window_counts.bulk,
+                                    window_counts.default,
+                                )
+                            } else {
+                                (
+                                    self.sent_log.count_class(FlowClass::Realtime),
+                                    self.sent_log.count_class(FlowClass::Bulk),
+                                    self.sent_log.count_class(FlowClass::Default),
+                                )
+                            };
 
-                        let frac_rt = fraction_f32(missing_rt, sent_rt);
-                        let frac_bulk = fraction_f32(missing_bulk, sent_bulk);
-                        let frac_default = fraction_f32(missing_default, sent_default);
+                        let mut observe_class =
+                            |class: FlowClass, missing: u32, sent: u32| -> Option<f32> {
+                                if sent > 0 || missing > 0 {
+                                    let denom = sent.max(missing).max(1);
+                                    let frac = fraction_f32(missing, denom);
+                                    self.transport.observe_loss(class, frac);
+                                    Some(frac)
+                                } else {
+                                    None
+                                }
+                            };
 
-                        self.transport.observe_loss(FlowClass::Realtime, frac_rt);
-                        self.transport.observe_loss(FlowClass::Bulk, frac_bulk);
-                        self.transport
-                            .observe_loss(FlowClass::Default, frac_default);
+                        let _frac_rt = observe_class(FlowClass::Realtime, missing_rt, sent_rt);
+                        let frac_bulk = observe_class(FlowClass::Bulk, missing_bulk, sent_bulk);
+                        let frac_default =
+                            observe_class(FlowClass::Default, missing_default, sent_default);
 
                         // Blackhole loss detection: severe loss across default or bulk triggers fast fallback.
-                        if (frac_default >= 0.8 || frac_bulk >= 0.8)
-                            && (sent_default >= 3 || sent_bulk >= 3)
-                        {
+                        let severe_default =
+                            frac_default.is_some_and(|f| f >= 0.8) && sent_default >= 3;
+                        let severe_bulk = frac_bulk.is_some_and(|f| f >= 0.8) && sent_bulk >= 3;
+                        if severe_default || severe_bulk {
                             if let Some(floor) = self.plpmtu.on_blackhole() {
                                 self.transport.set_symbol_size(floor);
                             }
@@ -1019,10 +1071,11 @@ mod tests {
 
         let (mut tun_dp, _) = dataplane_pair(TunnelMode::L3Tun, false);
         tun_dp.on_tun_packet(&l2_inner, 0);
-        let tun_counter = *tun_dp
+        let tun_counter = tun_dp
             .sent_log
             .order
             .back()
+            .map(|(c, _)| *c)
             .expect("TUN dataplane inserts a sent-log entry");
         assert_eq!(
             tun_dp.sent_log.get(tun_counter),
@@ -1032,10 +1085,11 @@ mod tests {
 
         let (mut tap_dp, _) = dataplane_pair(TunnelMode::L2Tap, false);
         tap_dp.on_tun_packet(&l2_inner, 0);
-        let tap_counter = *tap_dp
+        let tap_counter = tap_dp
             .sent_log
             .order
             .back()
+            .map(|(c, _)| *c)
             .expect("TAP dataplane inserts a sent-log entry");
         assert_eq!(
             tap_dp.sent_log.get(tap_counter),
@@ -1210,7 +1264,12 @@ mod tests {
         // this 4th packet completes the flow heuristic warmup (4 packets within 30ms,
         // small packets < 256 bytes) and classifies it as Realtime.
         b.on_tun_packet(&rev, 30);
-        let b_counter = *b.sent_log.order.back().expect("b inserts sent-log entry");
+        let b_counter = b
+            .sent_log
+            .order
+            .back()
+            .map(|(c, _)| *c)
+            .expect("b inserts sent-log entry");
         assert_eq!(
             b.sent_log.get(b_counter),
             Some(FlowClass::Realtime),
@@ -1235,5 +1294,212 @@ mod tests {
         assert_eq!(a.peer_addr, new_addr);
         assert_eq!(a.transport.symbol_size(), 1120);
         assert_eq!(a.plpmtu.current_symbol_size(), 1120);
+    }
+
+    #[test]
+    fn sent_log_count_classes_in_range_works() {
+        // 1. Empty log / range
+        let mut log = SentLog::new(4);
+        assert_eq!(log.count_classes_in_range(0, 10), ClassCounts::default());
+
+        // 2. Out-of-order bounds (start > end)
+        assert_eq!(log.count_classes_in_range(10, 5), ClassCounts::default());
+
+        // 3. Single class
+        log.insert(1, FlowClass::Realtime);
+        log.insert(2, FlowClass::Realtime);
+        assert_eq!(
+            log.count_classes_in_range(1, 2),
+            ClassCounts {
+                realtime: 2,
+                bulk: 0,
+                default: 0,
+            }
+        );
+        assert_eq!(
+            log.count_classes_in_range(1, 1),
+            ClassCounts {
+                realtime: 1,
+                bulk: 0,
+                default: 0,
+            }
+        );
+        assert_eq!(log.count_classes_in_range(3, 10), ClassCounts::default());
+
+        // 4. Mixed classes
+        log.insert(3, FlowClass::Bulk);
+        log.insert(4, FlowClass::Default);
+        assert_eq!(
+            log.count_classes_in_range(1, 4),
+            ClassCounts {
+                realtime: 2,
+                bulk: 1,
+                default: 1,
+            }
+        );
+        assert_eq!(
+            log.count_classes_in_range(2, 3),
+            ClassCounts {
+                realtime: 1,
+                bulk: 1,
+                default: 0,
+            }
+        );
+
+        // 5. Eviction: capacity is 4, inserting 5th entry evicts counter 1 (Realtime)
+        log.insert(5, FlowClass::Bulk);
+        assert_eq!(log.get(1), None);
+        assert_eq!(log.get(5), Some(FlowClass::Bulk));
+        assert_eq!(
+            log.count_classes_in_range(1, 5),
+            ClassCounts {
+                realtime: 1, // counter 2
+                bulk: 2,     // counters 3 and 5
+                default: 1,  // counter 4
+            }
+        );
+        // Out-of-order bounds with populated log
+        assert_eq!(log.count_classes_in_range(5, 2), ClassCounts::default());
+    }
+
+    #[test]
+    fn dataplane_windowed_loss_observation() {
+        let (mut a, mut b) = dataplane_pair(TunnelMode::L3Tun, false);
+
+        // Initial setup: A sends 100 Bulk packets (counters 1..=100)
+        for c in 1..=100 {
+            a.sent_log.insert(c, FlowClass::Bulk);
+        }
+
+        // Report 1 covers counters 1..=100 with 0 missing.
+        let report1 = yip_transport::LossReport {
+            delivered_count: 100,
+            high_counter: 100,
+            missing: vec![],
+        };
+        let frame1 = ControlFrame::Feedback(report1);
+        let sealed1 = b.session.seal(&frame1.encode()).unwrap();
+        let mut dg1 = vec![PacketType::Control as u8];
+        dg1.extend_from_slice(&sealed1.counter.to_be_bytes());
+        dg1.extend_from_slice(&sealed1.ciphertext);
+
+        let _ = a.on_udp_datagram(&dg1, 10);
+        assert_eq!(a.last_loss_report_high, 100);
+
+        // Initial bulk ratio was 0.05. Clean window of 100 packets:
+        // ratio decays by 10% to 0.045.
+        let ratio_after_clean = a.bulk_repair_ratio();
+        assert!(
+            (ratio_after_clean - 0.045).abs() < 1e-4,
+            "clean report decays ratio: got {ratio_after_clean}"
+        );
+
+        // Window 2: A sends 10 more Bulk packets (counters 101..=110).
+        for c in 101..=110 {
+            a.sent_log.insert(c, FlowClass::Bulk);
+        }
+
+        // Report 2 covers counters 101..=110 with 2 missing (105, 106).
+        // In this window: sent = 10, missing = 2 -> loss fraction = 2/10 = 0.20.
+        // Under historical total denominator (110 packets):
+        // loss fraction = 2/110 ≈ 0.018 <= (0.001 + 0.045), which would cause ratio to decay.
+        // Under windowed denominator (10 packets):
+        // loss fraction = 2/10 = 0.20 > (0.001 + 0.045), which causes ratio to jump to 0.25!
+        let report2 = yip_transport::LossReport {
+            delivered_count: 108,
+            high_counter: 110,
+            missing: vec![105, 106],
+        };
+        let frame2 = ControlFrame::Feedback(report2);
+        let sealed2 = b.session.seal(&frame2.encode()).unwrap();
+        let mut dg2 = vec![PacketType::Control as u8];
+        dg2.extend_from_slice(&sealed2.counter.to_be_bytes());
+        dg2.extend_from_slice(&sealed2.ciphertext);
+
+        let _ = a.on_udp_datagram(&dg2, 20);
+        assert_eq!(a.last_loss_report_high, 110);
+
+        let ratio_after_loss = a.bulk_repair_ratio();
+        assert!(
+            (ratio_after_loss - 0.25).abs() < 1e-4,
+            "windowed loss fraction 0.20 jumps bulk ratio to 0.25; got {ratio_after_loss}"
+        );
+
+        // Window 3: consecutive report with clean traffic
+        for c in 111..=120 {
+            a.sent_log.insert(c, FlowClass::Bulk);
+        }
+        let report3 = yip_transport::LossReport {
+            delivered_count: 118,
+            high_counter: 120,
+            missing: vec![],
+        };
+        let frame3 = ControlFrame::Feedback(report3);
+        let sealed3 = b.session.seal(&frame3.encode()).unwrap();
+        let mut dg3 = vec![PacketType::Control as u8];
+        dg3.extend_from_slice(&sealed3.counter.to_be_bytes());
+        dg3.extend_from_slice(&sealed3.ciphertext);
+
+        let _ = a.on_udp_datagram(&dg3, 30);
+        assert_eq!(a.last_loss_report_high, 120);
+
+        let ratio_after_clean2 = a.bulk_repair_ratio();
+        assert!(
+            (ratio_after_clean2 - (0.25 * 0.9)).abs() < 1e-4,
+            "consecutive clean report decays bulk ratio from 0.25 to 0.225; got {ratio_after_clean2}"
+        );
+
+        // Duplicate / out-of-order high_counter fallback test:
+        // high_counter 115 <= last_loss_report_high (120)
+        let report_ooo = yip_transport::LossReport {
+            delivered_count: 118,
+            high_counter: 115,
+            missing: vec![],
+        };
+        let frame_ooo = ControlFrame::Feedback(report_ooo);
+        let sealed_ooo = b.session.seal(&frame_ooo.encode()).unwrap();
+        let mut dg_ooo = vec![PacketType::Control as u8];
+        dg_ooo.extend_from_slice(&sealed_ooo.counter.to_be_bytes());
+        dg_ooo.extend_from_slice(&sealed_ooo.ciphertext);
+
+        let _ = a.on_udp_datagram(&dg_ooo, 40);
+        assert_eq!(
+            a.last_loss_report_high, 120,
+            "out-of-order report must not rewind last_loss_report_high"
+        );
+    }
+
+    #[test]
+    fn late_spurious_nack_for_evicted_counter_safely_ignored() {
+        let (mut a, mut b) = dataplane_pair(TunnelMode::L3Tun, false);
+
+        // A spurious / late NACK arrives for counter 99999, which was never in a's retx buffer
+        // (or was evicted from retx / sender log).
+        let report = yip_transport::LossReport {
+            delivered_count: 50,
+            high_counter: 100_000,
+            missing: vec![99_999],
+        };
+        let frame = ControlFrame::Feedback(report);
+        let sealed = b.session.seal(&frame.encode()).unwrap();
+        let mut dg = vec![PacketType::Control as u8];
+        dg.extend_from_slice(&sealed.counter.to_be_bytes());
+        dg.extend_from_slice(&sealed.ciphertext);
+
+        // Ingest the datagram on peer a. It must not panic, must not retransmit anything,
+        // and must return Outcome::None.
+        let outcome = a.on_udp_datagram(&dg, 100);
+        assert!(
+            matches!(outcome, Outcome::None),
+            "expected Outcome::None for evicted/unknown counter NACK, got non-None outcome"
+        );
+        assert_eq!(
+            a.arq_retx_count, 0,
+            "spurious NACK for evicted counter must not increment arq_retx_count"
+        );
+        assert!(
+            a.retx_scratch.is_empty(),
+            "retx scratch buffer must remain empty"
+        );
     }
 }

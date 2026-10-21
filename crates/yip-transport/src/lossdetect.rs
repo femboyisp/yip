@@ -2,6 +2,25 @@
 //!
 //! Turns a stream of seen/delivered packet counters into a [`LossReport`].
 //! No I/O; pure logic.
+//!
+//! # Multi-Symbol Partial-Receive Tracking
+//!
+//! Multi-symbol FEC objects (where an object is split across multiple symbols)
+//! can experience partial reception:
+//! - When symbol 0 arrives but symbol 1 is lost, the counter remains in `pending`
+//!   awaiting delivery until `grace_ms` expires, where [`report`](LossDetector::report)
+//!   promotes it to `missing` and marks it in `resolved_set`.
+//! - When repair symbols arrive and decode, [`on_delivered`](LossDetector::on_delivered)
+//!   consumes the object, removing the counter from `pending` and marking it resolved
+//!   so it is never reported missing.
+//!
+//! # Extreme Reordering Invariant
+//!
+//! The receiver bounds both its pending set and its out-of-order `resolved_set` to
+//! `window` elements:
+//! - If extreme reordering (> `window` packets) causes eviction from `resolved_set`
+//!   above the watermark, any late duplicate arriving generates a benign spurious
+//!   NACK that the sender's bounded `RetxBuffer` / TTL drops with zero side effects.
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -41,7 +60,11 @@ use crate::{LossReport, MAX_NACK};
 /// This correctly reports:
 /// - Fully-absent counters (true sequence gaps — no symbol ever arrived).
 /// - Multi-symbol FEC objects that received ≥1 symbol but never decoded
-///   (seen but undelivered after the grace window).
+///   (seen but undelivered after the grace window). For example, when symbol 0 arrives
+///   but symbol 1 is lost, the counter remains in `pending` awaiting delivery until
+///   `grace_ms` expires, where `report()` promotes it to `missing` and marks it in
+///   `resolved_set`. When repair symbols arrive and decode, `on_delivered` consumes the
+///   object.
 /// - Single-symbol / zero-repair objects (a loss is always a full gap).
 ///
 /// Counters that arrive and are delivered within the grace window are silently
@@ -58,6 +81,11 @@ use crate::{LossReport, MAX_NACK};
 /// `report` promotion marks a counter as resolved, the watermark is advanced as
 /// far as possible (consuming any consecutive prefix of `resolved_set`) so that
 /// `resolved_set` stays small even under sequential delivery.
+///
+/// **Reordering Invariant**: If extreme reordering (> `window` packets) causes eviction
+/// from `resolved_set` above the watermark, any late duplicate arriving generates a
+/// benign spurious NACK that the sender's bounded `RetxBuffer` / TTL drops with zero
+/// side effects.
 ///
 /// # Pending-set bound
 ///
@@ -495,6 +523,86 @@ mod tests {
             !r2.missing.contains(&1),
             "already-reported counter must not be re-reported; got {:?}",
             r2.missing
+        );
+    }
+
+    #[test]
+    fn multisymbol_partial_receive_promoted_and_resolved() {
+        let mut d = LossDetector::new(5, 1024);
+        // Counter seen at t=0 (e.g. symbol 0 arrived, symbol 1 lost).
+        d.on_seen(42, 0);
+
+        // Before grace expires (t=3 < 5): not missing.
+        assert!(d.report(3).missing.is_empty());
+
+        // At t >= grace_ms (t=10 >= 5): promoted to missing and marked resolved.
+        let r1 = d.report(10);
+        assert_eq!(r1.missing, vec![42]);
+
+        // Duplicate arrives at t+100 (t=110).
+        d.on_seen(42, 110);
+
+        // Even after another grace period (t=120 or beyond), not re-reported.
+        let r2 = d.report(120);
+        assert!(
+            r2.missing.is_empty(),
+            "counter 42 must not be re-reported after resolution; got {:?}",
+            r2.missing
+        );
+    }
+
+    #[test]
+    fn watermark_advances_over_resolved_prefix_under_partial_receive() {
+        let mut d = LossDetector::new(5, 1024);
+        assert_eq!(d.resolved_below, 0);
+
+        // Counter 0: seen and delivered at t=0.
+        d.on_seen(0, 0);
+        d.on_delivered(0);
+        assert_eq!(d.resolved_below, 1);
+        assert!(d.resolved_set.is_empty());
+
+        // Counter 1: partial receive (symbol 0 received, symbol 1 lost; never delivered).
+        d.on_seen(1, 0);
+
+        // Counter 2: delivered out of order ahead of counter 1.
+        d.on_seen(2, 0);
+        d.on_delivered(2);
+        // Watermark remains at 1 because counter 1 is still pending.
+        assert_eq!(d.resolved_below, 1);
+        assert_eq!(d.resolved_set.len(), 1);
+        assert!(d.resolved_set.contains_key(&2));
+
+        // At t=10 (>= grace_ms), report() promotes counter 1 to missing.
+        // Both 1 (promoted) and 2 (delivered) now form a contiguous resolved prefix [1, 2].
+        let rep1 = d.report(10);
+        assert_eq!(rep1.missing, vec![1]);
+
+        // resolved_below advances monotonically from 1 past 1 and 2 to 3,
+        // draining resolved_set and bounding memory.
+        assert_eq!(d.resolved_below, 3);
+        assert!(
+            d.resolved_set.is_empty(),
+            "resolved_set must be drained when watermark advances"
+        );
+
+        // Consecutive pattern: counter 3 is partial receive, counters 4 and 5 delivered.
+        d.on_seen(3, 10);
+        d.on_seen(4, 10);
+        d.on_delivered(4);
+        d.on_seen(5, 10);
+        d.on_delivered(5);
+
+        assert_eq!(d.resolved_below, 3);
+        assert_eq!(d.resolved_set.len(), 2);
+
+        // Grace expires for counter 3 at t=20.
+        let rep2 = d.report(20);
+        assert_eq!(rep2.missing, vec![3]);
+        assert_eq!(d.resolved_below, 6);
+        assert!(
+            d.resolved_set.is_empty(),
+            "resolved_set must be drained when watermark advances to 6"
         );
     }
 }

@@ -10,6 +10,14 @@ SUITE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DUR="${DUR:-12}"          # seconds per throughput run
 UDP_DUR="${UDP_DUR:-10}"
+PING_COUNT="${PING_COUNT:-100}"
+if [ -n "${PING_INTERVAL:-}" ]; then
+    PING_INTERVAL="$PING_INTERVAL"
+elif [ "$PING_COUNT" -ge 1000 ] 2>/dev/null; then
+    PING_INTERVAL="0.005"
+else
+    PING_INTERVAL="0.05"
+fi
 LOSS_STEPS=(0 1 3 5 10)   # injected % on the A->B outer path
 IPERF_PORT=5201
 EGRESS="$(A "ip route get $HOST_B | grep -oE 'dev [a-z0-9]+' | awk '{print \$2}' | head -1")"
@@ -102,7 +110,7 @@ loss_sweep() { # <tunnel> <dst>
     for L in "${LOSS_STEPS[@]}"; do
         netem_on "$L"
         local eff good
-        eff="$(Aq "ping -c 100 -i 0.05 -W 2 $2 | sed -nE 's/.* ([0-9]+)% packet loss.*/\1/p' | head -1")"
+        eff="$(Aq "ping -c "${PING_COUNT:-100}" -i "${PING_INTERVAL:-0.05}" -W 2 $2 | sed -nE 's/.* ([0-9.]+)% packet loss.*/\1/p' | head -1")"
         local j; j="$(A "iperf3 -c $2 -p $IPERF_PORT -t 12 -J 2>/dev/null")"
         good="$(rnd "$(jget end.sum_received.bits_per_second <<<"$j" 2>/dev/null || echo 0)" 1 1e6)"
         [[ "$good" == "0.0" ]] && good=NA
