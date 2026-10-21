@@ -2,6 +2,19 @@
 name: wan-benchmark
 
 'on':
+  pull_request:
+    paths:
+      - 'crates/yip-bench/**'
+      - 'bin/yipd/**'
+      - 'crates/yip-transport/**'
+      - 'crates/yip-wire/**'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/yip-bench/**'
+      - 'bin/yipd/**'
+      - 'crates/yip-transport/**'
+      - 'crates/yip-wire/**'
   workflow_dispatch:
     inputs:
       mode:
@@ -152,7 +165,7 @@ jobs:
         run: bash crates/yip-bench/wan/aws-down.sh || true
 
       - name: commit results to repository
-        if: github.event_name != 'pull_request' && steps.check-secrets.outputs.skip != 'true'
+        if: steps.check-secrets.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -162,8 +175,23 @@ jobs:
           git add crates/yip-bench/RESULTS.md crates/yip-bench/wan/results/ assets/bench-*.svg README.md
           if ! git diff --staged --quiet; then
             git commit -m "bench(wan): record automated WAN benchmark results [skip ci]"
-            echo "Pushing benchmark results to main..."
-            git push origin main
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              echo "Pushing benchmark results directly to PR branch ${{ github.event.pull_request.head.ref }}..."
+              git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+            else
+              echo "Pushing benchmark results to main..."
+              if ! git push origin main 2>/dev/null; then
+                echo "::warning::Direct push to main was blocked by branch protection rules. Creating results PR instead."
+                BRANCH="automated/wan-bench-$(date +%Y%m%d-%H%M%S)"
+                git checkout -b "$BRANCH"
+                git push origin "$BRANCH"
+                gh pr create \
+                  --title "bench(wan): record automated WAN benchmark results" \
+                  --body "Automated real-world WAN benchmark run results across multi-region testing." \
+                  --base main \
+                  --head "$BRANCH" || true
+              fi
+            fi
           fi
 
       - name: upload wan benchmark artifacts
