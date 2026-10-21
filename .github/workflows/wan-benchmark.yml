@@ -188,8 +188,11 @@ jobs:
           if ! git diff --staged --quiet; then
             git commit -m "bench(wan): record automated WAN benchmark results [skip ci]"
             if [ "${{ github.event_name }}" = "pull_request" ]; then
-              echo "Pushing benchmark results directly to PR branch ${{ github.event.pull_request.head.ref }}..."
-              git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+              REF="${{ github.event.pull_request.head.ref }}"
+              echo "Fetching latest $REF and rebasing..."
+              git pull --rebase origin "$REF" || true
+              echo "Pushing benchmark results directly to PR branch $REF..."
+              git push origin "HEAD:$REF"
             else
               echo "Pushing benchmark results to main..."
               if ! git push origin main 2>/dev/null; then
