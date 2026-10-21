@@ -11,11 +11,12 @@ echo "==> Testing generate-graphs.py..."
 # 1. Run generation script
 python3 crates/yip-bench/generate-graphs.py
 
-# 2. Verify all three SVGs were generated
+# 2. Verify all four SVGs were generated
 SVGS=(
     "assets/bench-throughput-loss.svg"
     "assets/bench-fec-recovery.svg"
     "assets/bench-multicore-scaling.svg"
+    "assets/bench-latency-jitter.svg"
 )
 
 for svg in "${SVGS[@]}"; do
@@ -31,7 +32,7 @@ python3 -c "
 import xml.etree.ElementTree as ET
 import sys
 
-for path in ['assets/bench-throughput-loss.svg', 'assets/bench-fec-recovery.svg', 'assets/bench-multicore-scaling.svg']:
+for path in ['assets/bench-throughput-loss.svg', 'assets/bench-fec-recovery.svg', 'assets/bench-multicore-scaling.svg', 'assets/bench-latency-jitter.svg']:
     try:
         ET.parse(path)
         print(f'✓ Valid XML: {path}')
@@ -57,14 +58,16 @@ done
 HASH_BEFORE_1=$(sha256sum "assets/bench-throughput-loss.svg" | awk '{print $1}')
 HASH_BEFORE_2=$(sha256sum "assets/bench-fec-recovery.svg" | awk '{print $1}')
 HASH_BEFORE_3=$(sha256sum "assets/bench-multicore-scaling.svg" | awk '{print $1}')
+HASH_BEFORE_4=$(sha256sum "assets/bench-latency-jitter.svg" | awk '{print $1}')
 
 python3 crates/yip-bench/generate-graphs.py
 
 HASH_AFTER_1=$(sha256sum "assets/bench-throughput-loss.svg" | awk '{print $1}')
 HASH_AFTER_2=$(sha256sum "assets/bench-fec-recovery.svg" | awk '{print $1}')
 HASH_AFTER_3=$(sha256sum "assets/bench-multicore-scaling.svg" | awk '{print $1}')
+HASH_AFTER_4=$(sha256sum "assets/bench-latency-jitter.svg" | awk '{print $1}')
 
-if [[ "$HASH_BEFORE_1" != "$HASH_AFTER_1" || "$HASH_BEFORE_2" != "$HASH_AFTER_2" || "$HASH_BEFORE_3" != "$HASH_AFTER_3" ]]; then
+if [[ "$HASH_BEFORE_1" != "$HASH_AFTER_1" || "$HASH_BEFORE_2" != "$HASH_AFTER_2" || "$HASH_BEFORE_3" != "$HASH_AFTER_3" || "$HASH_BEFORE_4" != "$HASH_AFTER_4" ]]; then
     echo "FAIL: Non-deterministic output detected between runs!"
     exit 1
 fi

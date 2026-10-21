@@ -1,0 +1,171 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 820" width="1040" height="820">
+  <defs>
+    <marker id="arrow-dim" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L6,3 z" fill="#6e7681" /></marker>
+    <marker id="arrow-noise" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L6,3 z" fill="#38bdf8" /></marker>
+    <marker id="arrow-data" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L6,3 z" fill="#06b6d4" /></marker>
+    <marker id="arrow-obf" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L6,3 z" fill="#f97316" /></marker>
+    <marker id="arrow-pq" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L6,3 z" fill="#10b981" /></marker>
+    <marker id="arrow-epoch" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L6,3 z" fill="#a855f7" /></marker>
+    <linearGradient id="grad-card-bg" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#161b22" stop-opacity="0.95" /><stop offset="100%" stop-color="#0d1117" stop-opacity="0.98" /></linearGradient>
+    <linearGradient id="grad-panel-a" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#f97316" stop-opacity="0.08" /><stop offset="100%" stop-color="#161b22" stop-opacity="0.95" /></linearGradient>
+    <linearGradient id="grad-panel-b" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#10b981" stop-opacity="0.08" /><stop offset="100%" stop-color="#161b22" stop-opacity="0.95" /></linearGradient>
+    <linearGradient id="grad-panel-c" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#a855f7" stop-opacity="0.08" /><stop offset="100%" stop-color="#161b22" stop-opacity="0.95" /></linearGradient>
+    <linearGradient id="grad-panel-d" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#38bdf8" stop-opacity="0.08" /><stop offset="100%" stop-color="#161b22" stop-opacity="0.95" /></linearGradient>
+  </defs>
+  <rect x="0.75" y="0.75" width="1038.50" height="818.50" fill="#0d1117" rx="12.00" stroke="#30363d" stroke-width="1.50" />
+  <rect x="24.00" y="20.00" width="76.00" height="24.00" fill="#431407" rx="6.00" stroke="#f97316" stroke-width="1.00" />
+  <polygon points="34.00,36.00 39.00,26.00 44.00,31.00 49.00,26.00 54.00,36.00 44.00,39.00" fill="#fb923c" />
+  <text x="73.00" y="36.00" fill="#fb923c" font-size="11.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">YIP</text>
+  <text x="112.00" y="35.00" fill="#f0f6fc" font-size="18.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="start">yip Wire Protocol &amp; Cryptographic Ceremony</text>
+  <text x="112.00" y="52.00" fill="#8b949e" font-size="11.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">Zero-Fixed-Signature Keyed Header Protection • Noise-IKpsk2 + ML-KEM-512 PQ Hybrid • 120s Ratchet Overlap • Self-Certifying IPv6</text>
+  <rect x="24.00" y="68.00" width="486.00" height="344.00" fill="url(#grad-panel-a)" rx="8.00" stroke="#30363d" stroke-width="1.00" />
+  <rect x="40.00" y="84.00" width="82.00" height="20.00" fill="#431407" rx="4.00" stroke="#f97316" stroke-width="1.00" />
+  <text x="81.00" y="98.00" fill="#fb923c" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">PANEL A</text>
+  <text x="132.00" y="98.00" fill="#f0f6fc" font-size="13.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="start">Data-Plane Datagram Framing</text>
+  <text x="40.00" y="118.00" fill="#8b949e" font-size="10.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">Anti-DPI Keyed Header Protection (XOR Keystream &amp; SipHash MAC)</text>
+  <rect x="40.00" y="130.00" width="110.00" height="46.00" fill="#271406" rx="4.00" stroke="#f97316" stroke-width="1.00" />
+  <text x="95.00" y="144.00" fill="#fb923c" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Bytes 0..4 (4B)</text>
+  <text x="95.00" y="158.00" fill="#f0f6fc" font-size="10.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="middle">Encrypted Header</text>
+  <text x="95.00" y="170.00" fill="#8b949e" font-size="8.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">SipHash-CTR Mask</text>
+  <rect x="154.00" y="130.00" width="114.00" height="46.00" fill="#1c1917" rx="4.00" stroke="#f97316" stroke-width="1.00" />
+  <text x="211.00" y="144.00" fill="#fb923c" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Bytes 4..12 (8B)</text>
+  <text x="211.00" y="158.00" fill="#f0f6fc" font-size="10.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="middle">SipHash-2-4 MAC</text>
+  <text x="211.00" y="170.00" fill="#8b949e" font-size="8.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Header Auth Tag</text>
+  <rect x="272.00" y="130.00" width="222.00" height="46.00" fill="#083344" rx="4.00" stroke="#06b6d4" stroke-width="1.00" />
+  <text x="383.00" y="144.00" fill="#22d3ee" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Bytes 12..N (Variable MTU)</text>
+  <text x="383.00" y="158.00" fill="#f0f6fc" font-size="10.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="middle">ChaCha20-Poly1305 Ciphertext</text>
+  <text x="383.00" y="170.00" fill="#8b949e" font-size="8.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">RS-FEC Symbol / TUN Packet + 16B Poly1305 Tag</text>
+  <text x="40.00" y="195.00" fill="#8b949e" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="start">Unmasked Header Bitfield (32 bits / 4 Bytes):</text>
+  <rect x="40.00" y="204.00" width="64.00" height="36.00" fill="#1e1b4b" rx="3.00" stroke="#818cf8" stroke-width="1.00" />
+  <text x="72.00" y="218.00" fill="#818cf8" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Type (2b)</text>
+  <text x="72.00" y="232.00" fill="#8b949e" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">00=Init 10=Data</text>
+  <rect x="106.00" y="204.00" width="76.00" height="36.00" fill="#3b0764" rx="3.00" stroke="#c084fc" stroke-width="1.00" />
+  <text x="144.00" y="218.00" fill="#c084fc" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Epoch (6b)</text>
+  <text x="144.00" y="232.00" fill="#8b949e" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Key Id (0..63)</text>
+  <rect x="184.00" y="204.00" width="186.00" height="36.00" fill="#083344" rx="3.00" stroke="#22d3ee" stroke-width="1.00" />
+  <text x="277.00" y="218.00" fill="#22d3ee" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Payload Length (16b)</text>
+  <text x="277.00" y="232.00" fill="#8b949e" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Encrypted Symbol / TUN Packet Len</text>
+  <rect x="372.00" y="204.00" width="122.00" height="36.00" fill="#161b22" rx="3.00" stroke="#6e7681" stroke-width="1.00" />
+  <text x="433.00" y="218.00" fill="#8b949e" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Reserved (8b)</text>
+  <text x="433.00" y="232.00" fill="#6e7681" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Flags / Zero Padding</text>
+  <text x="40.00" y="253.00" fill="#fb923c" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="start">⊕ XOR keystream mask eliminates wire signatures: zero magic bytes or fixed discriminators.</text>
+  <rect x="40.00" y="264.00" width="454.00" height="72.00" fill="#1c1917" rx="6.00" stroke="#f97316" stroke-width="1.00" />
+  <path d="M 54.00,282.00 L 60.00,279.00 L 66.00,282.00 L 66.00,289.00 C 66.00,296.00 60.00,300.00 60.00,300.00 C 60.00,300.00 54.00,296.00 54.00,289.00 Z" fill="#fb923c" />
+  <text x="74.00" y="284.00" fill="#f0f6fc" font-size="11.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="start">Anti-DPI Guarantee: Pure High-Entropy Random Bytes</text>
+  <text x="74.00" y="300.00" fill="#8b949e" font-size="9.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">Keyed Header Protection eliminates wire signatures; packets appear as pure high-entropy</text>
+  <text x="74.00" y="314.00" fill="#8b949e" font-size="9.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">random bytes to DPI engines (nDPI, Zeek, Suricata).</text>
+  <text x="74.00" y="328.00" fill="#6e7681" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">Constant-time SipHash MAC tag check rejects forged headers in &lt;12ns prior to decode.</text>
+  <rect x="40.00" y="344.00" width="454.00" height="24.00" fill="#0d1117" rx="4.00" stroke="#30363d" stroke-width="1.00" />
+  <text x="267.00" y="360.00" fill="#34d399" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">DPI Resistance: Pass (0 signatures detected across 4-Engine Oracle)</text>
+  <rect x="530.00" y="68.00" width="486.00" height="344.00" fill="url(#grad-panel-b)" rx="8.00" stroke="#30363d" stroke-width="1.00" />
+  <rect x="546.00" y="84.00" width="82.00" height="20.00" fill="#064e3b" rx="4.00" stroke="#10b981" stroke-width="1.00" />
+  <text x="587.00" y="98.00" fill="#34d399" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">PANEL B</text>
+  <text x="638.00" y="98.00" fill="#f0f6fc" font-size="13.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="start">Post-Quantum Hybrid Handshake</text>
+  <text x="546.00" y="118.00" fill="#8b949e" font-size="10.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">Noise-IKpsk2 + ML-KEM-512 (Kyber) • Sub-1200B Single-RTT</text>
+  <text x="546.00" y="137.00" fill="#34d399" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="start">Message 1 (Initiator → Responder) — 1,028 Bytes:</text>
+  <rect x="546.00" y="144.00" width="44.00" height="34.00" fill="#161b22" rx="3.00" stroke="#f97316" stroke-width="1.00" />
+  <text x="568.00" y="158.00" fill="#fb923c" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Hdr</text>
+  <text x="568.00" y="170.00" fill="#8b949e" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">4B</text>
+  <rect x="592.00" y="144.00" width="182.00" height="34.00" fill="#064e3b" rx="3.00" stroke="#10b981" stroke-width="1.00" />
+  <text x="683.00" y="158.00" fill="#34d399" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">ek_A (800B ML-KEM-512 pk)</text>
+  <text x="683.00" y="170.00" fill="#8b949e" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Post-Quantum Encapsulation Key</text>
+  <rect x="776.00" y="144.00" width="76.00" height="34.00" fill="#1e1b4b" rx="3.00" stroke="#818cf8" stroke-width="1.00" />
+  <text x="814.00" y="158.00" fill="#818cf8" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">e_A (32B)</text>
+  <text x="814.00" y="170.00" fill="#8b949e" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Noise Ephem</text>
+  <rect x="854.00" y="144.00" width="146.00" height="34.00" fill="#083344" rx="3.00" stroke="#06b6d4" stroke-width="1.00" />
+  <text x="927.00" y="158.00" fill="#22d3ee" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Enc(s_A ‖ Cert_A) + Tag</text>
+  <text x="927.00" y="170.00" fill="#8b949e" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Static Key + CA Cert (144B)</text>
+  <text x="546.00" y="193.00" fill="#34d399" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="start">Message 2 (Responder → Initiator) — 948 Bytes:</text>
+  <rect x="546.00" y="200.00" width="44.00" height="34.00" fill="#161b22" rx="3.00" stroke="#f97316" stroke-width="1.00" />
+  <text x="568.00" y="214.00" fill="#fb923c" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Hdr</text>
+  <text x="568.00" y="226.00" fill="#8b949e" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">4B</text>
+  <rect x="592.00" y="200.00" width="182.00" height="34.00" fill="#064e3b" rx="3.00" stroke="#10b981" stroke-width="1.00" />
+  <text x="683.00" y="214.00" fill="#34d399" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">ct (768B ML-KEM-512 ct)</text>
+  <text x="683.00" y="226.00" fill="#8b949e" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Post-Quantum Ciphertext Envelope</text>
+  <rect x="776.00" y="200.00" width="76.00" height="34.00" fill="#1e1b4b" rx="3.00" stroke="#818cf8" stroke-width="1.00" />
+  <text x="814.00" y="214.00" fill="#818cf8" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">e_B (32B)</text>
+  <text x="814.00" y="226.00" fill="#8b949e" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Noise Ephem</text>
+  <rect x="854.00" y="200.00" width="146.00" height="34.00" fill="#083344" rx="3.00" stroke="#06b6d4" stroke-width="1.00" />
+  <text x="927.00" y="214.00" fill="#22d3ee" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Enc(Cert_B) + Tag</text>
+  <text x="927.00" y="226.00" fill="#8b949e" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Responder CA Cert (144B)</text>
+  <rect x="546.00" y="246.00" width="454.00" height="90.00" fill="#0d1117" rx="6.00" stroke="#30363d" stroke-width="1.00" />
+  <text x="558.00" y="264.00" fill="#34d399" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="start">✓ MTU Budget Compliant: Msg 1 (1,028B) &amp; Msg 2 (948B) &lt; 1,200B OBF_MTU_BUDGET.</text>
+  <text x="558.00" y="282.00" fill="#8b949e" font-size="9.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">• Deadlock-Free Execution: Initiator parses cleartext ct at [4..772], computes</text>
+  <text x="558.00" y="296.00" fill="#8b949e" font-size="9.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">  Decaps(dk_A, ct) -&gt; ss, and calls handshake_state.set_psk(2, &amp;ss) into slot 2.</text>
+  <text x="558.00" y="312.00" fill="#34d399" font-size="9.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="start">• FIPS 203 §7.2: Modulus (&lt; 3329) validated; IND-CCA2 implicit rejection on tampering.</text>
+  <text x="558.00" y="326.00" fill="#6e7681" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">• Ephemeral Zeroize: Decapsulation keys and intermediate secrets scrubbed on Drop.</text>
+  <rect x="546.00" y="344.00" width="454.00" height="24.00" fill="#064e3b" rx="4.00" stroke="#10b981" stroke-width="1.00" />
+  <text x="773.00" y="360.00" fill="#34d399" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">PQ Security: Quantum-Safe (FIPS 203 Cat 1 ML-KEM-512 + X25519 Hybrid)</text>
+  <rect x="24.00" y="424.00" width="486.00" height="344.00" fill="url(#grad-panel-c)" rx="8.00" stroke="#30363d" stroke-width="1.00" />
+  <rect x="40.00" y="440.00" width="82.00" height="20.00" fill="#3b0764" rx="4.00" stroke="#a855f7" stroke-width="1.00" />
+  <text x="81.00" y="454.00" fill="#c084fc" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">PANEL C</text>
+  <text x="132.00" y="454.00" fill="#f0f6fc" font-size="13.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="start">120s Epoch Ratchet Overlap</text>
+  <text x="40.00" y="474.00" fill="#8b949e" font-size="10.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">Continuous Forward Secrecy • Zero-Drop Rekey Transition</text>
+  <rect x="320.00" y="492.00" width="80.00" height="68.00" fill="#a855f7" rx="4.00" stroke="#c084fc" stroke-width="1.00" opacity="0.15" stroke-dasharray="3,3" />
+  <text x="360.00" y="488.00" fill="#c084fc" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">20s Overlap Window</text>
+  <rect x="60.00" y="500.00" width="260.00" height="24.00" fill="#3b0764" rx="4.00" stroke="#a855f7" stroke-width="1.20" />
+  <text x="190.00" y="516.00" fill="#f0f6fc" font-size="9.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="middle">Epoch N Active (TX + RX Session Keys)</text>
+  <rect x="320.00" y="500.00" width="80.00" height="24.00" fill="#2e1065" rx="4.00" stroke="#c084fc" stroke-width="1.00" stroke-dasharray="2,2" />
+  <text x="360.00" y="516.00" fill="#c084fc" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">RX Only Grace</text>
+  <rect x="320.00" y="532.00" width="20.00" height="24.00" fill="#431407" rx="3.00" stroke="#f97316" stroke-width="1.00" />
+  <text x="330.00" y="547.00" fill="#fb923c" font-size="8.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">HS</text>
+  <rect x="342.00" y="532.00" width="128.00" height="24.00" fill="#064e3b" rx="4.00" stroke="#10b981" stroke-width="1.20" />
+  <text x="406.00" y="547.00" fill="#34d399" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="middle">Epoch N+1 Active (TX + RX)</text>
+  <line x1="60.00" y1="568.00" x2="470.00" y2="568.00" stroke="#30363d" stroke-width="1.00" />
+  <line x1="60.00" y1="565.00" x2="60.00" y2="571.00" stroke="#6e7681" stroke-width="1.00" />
+  <text x="60.00" y="581.00" fill="#8b949e" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">t = 0s</text>
+  <line x1="200.00" y1="565.00" x2="200.00" y2="571.00" stroke="#6e7681" stroke-width="1.00" />
+  <text x="200.00" y="581.00" fill="#6e7681" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">t = 60s</text>
+  <line x1="320.00" y1="565.00" x2="320.00" y2="571.00" stroke="#6e7681" stroke-width="1.00" />
+  <text x="320.00" y="581.00" fill="#fb923c" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">t = 110s (Rekey)</text>
+  <line x1="360.00" y1="565.00" x2="360.00" y2="571.00" stroke="#6e7681" stroke-width="1.00" />
+  <text x="360.00" y="581.00" fill="#8b949e" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">t = 120s (Expiry)</text>
+  <line x1="400.00" y1="565.00" x2="400.00" y2="571.00" stroke="#6e7681" stroke-width="1.00" />
+  <text x="400.00" y="581.00" fill="#ef4444" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">t = 130s (Zeroize)</text>
+  <rect x="40.00" y="594.00" width="454.00" height="102.00" fill="#0d1117" rx="6.00" stroke="#30363d" stroke-width="1.00" />
+  <text x="54.00" y="612.00" fill="#8b949e" font-size="9.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">• Seamless Egress Switch: Outbound frames jump to Epoch N+1 immediately on response.</text>
+  <text x="54.00" y="630.00" fill="#8b949e" font-size="9.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">• Dual-Receive Grace Window (110s..130s): Receiver accepts datagrams encrypted under</text>
+  <text x="54.00" y="644.00" fill="#8b949e" font-size="9.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">  both Epoch N and Epoch N+1 without packet drops or decryption errors.</text>
+  <text x="54.00" y="662.00" fill="#c084fc" font-size="9.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="start">• Zeroize on Retire: At t = 130s, Epoch N secrets scrubbed from RAM with Zeroize.</text>
+  <text x="54.00" y="680.00" fill="#34d399" font-size="9.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="start">• 0% Packet Loss: Eliminates rekey stalls, head-of-line blocking, and burst drops.</text>
+  <rect x="40.00" y="704.00" width="454.00" height="24.00" fill="#2e1065" rx="4.00" stroke="#a855f7" stroke-width="1.00" />
+  <text x="267.00" y="720.00" fill="#c084fc" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Rotation Guarantee: 0% Dropped Packets During Continuous Key Refresh</text>
+  <rect x="530.00" y="424.00" width="486.00" height="344.00" fill="url(#grad-panel-d)" rx="8.00" stroke="#30363d" stroke-width="1.00" />
+  <rect x="546.00" y="440.00" width="82.00" height="20.00" fill="#1e1b4b" rx="4.00" stroke="#38bdf8" stroke-width="1.00" />
+  <text x="587.00" y="454.00" fill="#38bdf8" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">PANEL D</text>
+  <text x="638.00" y="454.00" fill="#f0f6fc" font-size="13.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="start">Cryptographic Node Addressing</text>
+  <text x="546.00" y="474.00" fill="#8b949e" font-size="10.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">Self-Certifying IPv6 ULA (fd00::/8) • Zero Central Authority</text>
+  <rect x="546.00" y="492.00" width="126.00" height="44.00" fill="#1e1b4b" rx="4.00" stroke="#818cf8" stroke-width="1.00" />
+  <text x="609.00" y="508.00" fill="#818cf8" font-size="9.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="middle">Ed25519 Identity</text>
+  <text x="609.00" y="522.00" fill="#8b949e" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">32-byte Public Key</text>
+  <line x1="674.00" y1="514.00" x2="692.00" y2="514.00" stroke="#6e7681" stroke-width="1.20" marker-end="url(#arrow-dim)" />
+  <rect x="696.00" y="492.00" width="148.00" height="44.00" fill="#083344" rx="4.00" stroke="#22d3ee" stroke-width="1.00" />
+  <text x="770.00" y="508.00" fill="#22d3ee" font-size="9.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="middle">BLAKE2s-128</text>
+  <text x="770.00" y="522.00" fill="#8b949e" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">&quot;yip-node-v1&quot; ‖ pubkey</text>
+  <line x1="846.00" y1="514.00" x2="864.00" y2="514.00" stroke="#6e7681" stroke-width="1.20" marker-end="url(#arrow-dim)" />
+  <rect x="868.00" y="492.00" width="132.00" height="44.00" fill="#064e3b" rx="4.00" stroke="#34d399" stroke-width="1.00" />
+  <text x="934.00" y="508.00" fill="#34d399" font-size="9.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="middle">IPv6 Node Address</text>
+  <text x="934.00" y="522.00" fill="#8b949e" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">fd00::/8 ULA Space</text>
+  <text x="546.00" y="551.00" fill="#8b949e" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="start">Self-Certifying IPv6 Bitfield Breakdown (128 bits / 16 Bytes):</text>
+  <rect x="546.00" y="558.00" width="74.00" height="32.00" fill="#431407" rx="3.00" stroke="#f97316" stroke-width="1.00" />
+  <text x="583.00" y="571.00" fill="#fb923c" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">0xfd (8 bits)</text>
+  <text x="583.00" y="583.00" fill="#8b949e" font-size="7.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">IPv6 ULA Prefix</text>
+  <rect x="622.00" y="558.00" width="186.00" height="32.00" fill="#1e1b4b" rx="3.00" stroke="#818cf8" stroke-width="1.00" />
+  <text x="715.00" y="571.00" fill="#818cf8" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Digest[0..7] (56 bits)</text>
+  <text x="715.00" y="583.00" fill="#8b949e" font-size="7.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Mesh Subnet / Routing ID</text>
+  <rect x="810.00" y="558.00" width="190.00" height="32.00" fill="#083344" rx="3.00" stroke="#22d3ee" stroke-width="1.00" />
+  <text x="905.00" y="571.00" fill="#22d3ee" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Digest[7..15] (64 bits)</text>
+  <text x="905.00" y="583.00" fill="#8b949e" font-size="7.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Interface Identifier (Node ID)</text>
+  <rect x="546.00" y="598.00" width="454.00" height="98.00" fill="#0d1117" rx="6.00" stroke="#30363d" stroke-width="1.00" />
+  <text x="558.00" y="616.00" fill="#8b949e" font-size="9.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">• Self-Certifying Identity: Address IS the public key digest; IP spoofing is impossible.</text>
+  <text x="558.00" y="634.00" fill="#8b949e" font-size="9.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">• Zero Central Infrastructure: Autonomous routing without DHCP, IPAM, or coordinators.</text>
+  <text x="558.00" y="652.00" fill="#8b949e" font-size="9.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">• Collision Resistance: 120-bit BLAKE2s digest provides 2^60 collision resistance floor.</text>
+  <text x="558.00" y="670.00" fill="#38bdf8" font-size="9.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="start">• Zero-Trust Admission: Node identity bound to CA Root Certificate before admission.</text>
+  <text x="558.00" y="688.00" fill="#6e7681" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">• Autonomous Routing: Nodes route directly to fd00::/8 ULA addresses across mesh.</text>
+  <rect x="546.00" y="704.00" width="454.00" height="24.00" fill="#1e1b4b" rx="4.00" stroke="#38bdf8" stroke-width="1.00" />
+  <text x="773.00" y="720.00" fill="#38bdf8" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Identity Invariant: Address = 0xfd ‖ BLAKE2s(pubkey)[0..15] (Zero Central IPAM)</text>
+  <line x1="24.00" y1="780.00" x2="1016.00" y2="780.00" stroke="#30363d" stroke-width="1.00" />
+  <text x="28.00" y="801.00" fill="#6e7681" font-size="10.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="start">Protocol Spec: Noise-IKpsk2 • NIST FIPS 203 ML-KEM-512 • SipHash-CTR / SipHash-2-4 • ChaCha20-Poly1305 • BLAKE2s</text>
+  <text x="1012.00" y="801.00" fill="#6e7681" font-size="10.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">Deterministic Vector Wire Format • github.com/femboyisp/yip</text>
+</svg>
