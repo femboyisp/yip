@@ -57,7 +57,7 @@ pub const PQ_SHARED_SECRET_LEN: usize = 32;
 pub struct PqEncapsKey(pub [u8; PQ_ENCAPS_KEY_LEN]);
 
 /// An ML-KEM-512 private decapsulation key wrapped in zeroizing memory.
-pub struct PqDecapsKey(pub Box<ml_kem_512::DecapsulationKey>);
+pub struct PqDecapsKey(Box<ml_kem_512::DecapsulationKey>);
 
 impl std::fmt::Debug for PqDecapsKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -429,8 +429,9 @@ impl Handshake {
                 if n < PQ_ENCAPS_KEY_LEN {
                     return Err(CryptoError::Handshake);
                 }
-                let mut ek_bytes = [0u8; PQ_ENCAPS_KEY_LEN];
-                ek_bytes.copy_from_slice(&buf[..PQ_ENCAPS_KEY_LEN]);
+                let ek_bytes: [u8; PQ_ENCAPS_KEY_LEN] = buf[..PQ_ENCAPS_KEY_LEN]
+                    .try_into()
+                    .map_err(|_| CryptoError::Handshake)?;
                 let ek = PqEncapsKey(ek_bytes);
                 let (ct, ss) = pq_encapsulate(&ek)?;
                 self.inner
@@ -445,8 +446,9 @@ impl Handshake {
                 if msg.len() < PQ_CIPHERTEXT_LEN {
                     return Err(CryptoError::Handshake);
                 }
-                let mut ct_bytes = [0u8; PQ_CIPHERTEXT_LEN];
-                ct_bytes.copy_from_slice(&msg[..PQ_CIPHERTEXT_LEN]);
+                let ct_bytes: [u8; PQ_CIPHERTEXT_LEN] = msg[..PQ_CIPHERTEXT_LEN]
+                    .try_into()
+                    .map_err(|_| CryptoError::Handshake)?;
                 let ct = PqCiphertext(ct_bytes);
                 let decaps_key = dk.take().ok_or(CryptoError::Handshake)?;
                 let ss = pq_decapsulate(&decaps_key, &ct)?;
@@ -521,6 +523,17 @@ impl Handshake {
     pub fn into_session(self) -> Result<Session, CryptoError> {
         let (k_send, k_recv) = self.raw_split_keys();
         Session::from_raw_keys(&k_send, &k_recv, 0, 1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn to_session_for_test(&self) -> Result<Session, CryptoError> {
+        let (k_send, k_recv) = self.raw_split_keys();
+        Session::from_raw_keys(&k_send, &k_recv, 0, 1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_inner_snow_for_test(self) -> snow::HandshakeState {
+        self.inner.into_inner().expect("handshake lock")
     }
 }
 
@@ -1283,8 +1296,9 @@ mod tests {
     /// longer match the expected output.
     ///
     /// Verify that driving completed initiator and responder handshakes yields
-    /// symmetric raw split keys, and confirm that `Session::seal` and `Session::open`
-    /// roundtrip across both peers in both directions for several counters.
+    /// symmetric raw split keys, and confirm that `Session::seal` produces
+    /// byte-identical ciphertext to `snow::StatelessTransportState::write_message`
+    /// across both peers in both directions for several counters.
     #[test]
     fn session_seal_is_byte_identical_to_snow_write_message_both_directions() {
         let resp_kp = generate_keypair();
@@ -1305,15 +1319,33 @@ mod tests {
         assert_eq!(ini_send, res_recv, "initiator send key matches responder recv key");
         assert_eq!(ini_recv, res_send, "initiator recv key matches responder send key");
 
-        let mut ini_session = ini.into_session().unwrap();
-        let mut res_session = res.into_session().unwrap();
+        let mut ini_session = ini.to_session_for_test().unwrap();
+        let mut res_session = res.to_session_for_test().unwrap();
+        let snow_ini_ref = ini
+            .into_inner_snow_for_test()
+            .into_stateless_transport_mode()
+            .unwrap();
+        let snow_res_ref = res
+            .into_inner_snow_for_test()
+            .into_stateless_transport_mode()
+            .unwrap();
 
         let plaintext: Vec<u8> = (0u8..200).collect();
 
-        // initiator -> responder: session seal and open roundtrip across peers
+        // initiator -> responder: production seal byte-identical to snow's
+        // write_message (initiator role), and the responder session opens it.
         for ctr in 0u64..=4 {
             let sealed = ini_session.seal(&plaintext).unwrap();
             assert_eq!(sealed.counter, ctr);
+            let mut snow_out = vec![0u8; plaintext.len() + 16];
+            let n = snow_ini_ref
+                .write_message(ctr, &plaintext, &mut snow_out)
+                .unwrap();
+            snow_out.truncate(n);
+            assert_eq!(
+                sealed.ciphertext, snow_out,
+                "initiator->responder ciphertext byte-identical to snow at counter {ctr}"
+            );
             assert_eq!(
                 res_session
                     .open(sealed.counter, &sealed.ciphertext)
@@ -1327,6 +1359,15 @@ mod tests {
         for ctr in 0u64..=4 {
             let sealed = res_session.seal(&plaintext).unwrap();
             assert_eq!(sealed.counter, ctr);
+            let mut snow_out = vec![0u8; plaintext.len() + 16];
+            let n = snow_res_ref
+                .write_message(ctr, &plaintext, &mut snow_out)
+                .unwrap();
+            snow_out.truncate(n);
+            assert_eq!(
+                sealed.ciphertext, snow_out,
+                "responder->initiator ciphertext byte-identical to snow at counter {ctr}"
+            );
             assert_eq!(
                 ini_session
                     .open(sealed.counter, &sealed.ciphertext)

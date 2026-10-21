@@ -10,8 +10,7 @@ thiserror = { workspace = true }
 snow = { version = "0.10.0", features = ["risky-raw-split"] }
 ring = "0.17"
 ml-kem = { version = "0.3", features = ["zeroize", "getrandom"] }
-rand = "0.8"
-zeroize = { version = "1.8", features = ["zeroize_derive"] }
+zeroize = "1.8"
 
 [lints]
 workspace = true
