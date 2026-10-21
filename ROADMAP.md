@@ -9,7 +9,8 @@ maintainer.
 - **Data plane + FEC transport** — encrypted L2/L3 tunnel over systematic Reed–Solomon-FEC
   UDP transport, streaming rateless RLNC (fountain coding), poly-vector SIMD Galois Field engine
   (GFNI, AVX-512BW, AVX2, SSSE3, ARM NEON, Wasm SIMD128), batched `sendmmsg`/`recvmmsg`,
-  `UDP_SEGMENT` GSO, and 64 KB TUN GSO/GRO superpacket offload.
+  `UDP_SEGMENT` GSO, 64 KB TUN GSO/GRO superpacket offload, deadline-based FEC reassembly eviction
+  with trailing symbol tombstoning, and zero-allocation egress buffer scavenging under obfuscation (#11).
 - **Multi-core throughput & kernel-bypass** — multi-queue TUN worker sharding (`IFF_MULTI_QUEUE`),
   core-pinned flow hashing, lock-free chunked nonce dispensers, circular replay windows, and
   AF_XDP zero-copy driver (over 40 Gbps aggregate throughput, 5.3x higher goodput than kernel
