@@ -59,7 +59,7 @@ def build_social_card_svg() -> str:
 
     # Main Hero Title
     lines.append(f'    <text x="136" y="32" font-family="{FONT_SANS}" font-size="38" font-weight="800" fill="#f0f6fc">yip mesh vpn</text>')
-    
+
     # Tagline
     lines.append(f'    <text x="0" y="85" font-family="{FONT_SANS}" font-size="21" font-weight="500" fill="#c9d1d9">Loss-Immune Peer-to-Peer Mesh VPN in Rust</text>')
     lines.append(f'    <text x="0" y="118" font-family="{FONT_MONO}" font-size="14.5" fill="#8b949e">Systematic Cauchy RS-FEC (GF(256)) • 40 Gbps eBPF AF_XDP • Anti-DPI REALITY</text>')
@@ -78,7 +78,7 @@ def build_social_card_svg() -> str:
         clean_text = text.replace("&amp;", "&")
         bw = 34 + len(clean_text) * 7.4 + 16
         lines.append(f'  <rect x="{bx}" y="{by}" width="{bw:.2f}" height="32" rx="16" fill="{bg}" stroke="{border}" stroke-width="1.2" />')
-        
+
         # Render vector icon
         if icon_type == "shield":
             lines.append(f'  <path d="M {bx + 14},{by + 11} L {bx + 20},{by + 8} L {bx + 26},{by + 11} L {bx + 26},{by + 17} C {bx + 26},{by + 22} {bx + 20},{by + 25} {bx + 20},{by + 25} C {bx + 20},{by + 25} {bx + 14},{by + 22} {bx + 14},{by + 17} Z" fill="{fg}" />')
@@ -99,11 +99,11 @@ def build_social_card_svg() -> str:
     gw = 1120
     gh = 225
     lines.append(f'    <rect width="{gw}" height="{gh}" rx="12" fill="#0d1117" stroke="#30363d" stroke-width="1.2" />')
-    
+
     # Graph title
     lines.append(f'    <text x="24" y="32" font-family="{FONT_SANS}" font-size="14" font-weight="700" fill="#f0f6fc">Throughput Under Network Packet Loss (AWS us-east-1 ↔ us-west-2, 60ms RTT)</text>')
     lines.append(f'    <text x="{gw - 24}" y="32" font-family="{FONT_MONO}" font-size="12" font-weight="700" fill="#fb923c" text-anchor="end">33× to 98× Higher Goodput at 3%–10% Loss</text>')
-    
+
     # Simple stylised curves - ending at x=900 so labels at x=925 fit inside 1120 card
     # x: 0% (x=80), 1% (x=280), 3% (x=490), 5% (x=700), 10% (x=900)
     yip_pts = [(80, 65), (280, 75), (490, 85), (700, 105), (900, 140)]

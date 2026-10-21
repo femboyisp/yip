@@ -41,14 +41,14 @@ This provisions two isolated network namespaces, injects **5% packet loss and 50
 
 ```text
 ========================================================================
-                     BENCHMARK RESULTS SUMMARY                          
-        Condition: 5% Packet Loss + 50ms RTT Latency    
+                     BENCHMARK RESULTS SUMMARY
+        Condition: 5% Packet Loss + 50ms RTT Latency
 ========================================================================
-Transport / Protocol         Goodput              Status              
+Transport / Protocol         Goodput              Status
 ------------------------------------------------------------------------
 Baseline TCP (veth)          0.8 Mbit/s           Choked by packet loss
 WireGuard (Kernel wg0)       0.7 Mbit/s           Stalled by drop recovery
-yip (Adaptive RS-FEC)        98.5 Mbit/s          🚀 123.1x Speedup 
+yip (Adaptive RS-FEC)        98.5 Mbit/s          🚀 123.1x Speedup
 ========================================================================
 ```
 
@@ -160,7 +160,7 @@ Full reproduction instructions, test scripts, and historical logs are in [`crate
 |---|---|
 | `yip-io` | Vectorized `recvmmsg`/`sendmmsg` engine, UDP GSO offload, SPSC rings, and AF_XDP zero-copy driver. |
 | `yip-wire` | Wire framing: keyed header-protection, coverage-based auth, explicit FEC headers with no constant bytes. |
-| `yip-crypto` | AEAD session crypto (Noise-IK), adaptive sliding replay window (1 KB to 16 KB), 120s rekey. `forbid(unsafe_code)`. |
+| `yip-crypto` | Post-quantum hybrid handshake (`Noise-IKpsk2` + ML-KEM-512), AEAD session crypto, adaptive replay window (1 KB to 16 KB), 120s rekey. `forbid(unsafe_code)`. |
 | `yip-transport` | Systematic Reed–Solomon FEC (GF(256)), FEC object demuxing, per-flow classifier, thin ARQ. |
 | `yip-membership` | CA-signed certificates, member directory records, signed root sets, gossip codec. |
 | `yip-rendezvous` | NAT traversal protocol, STUN/TURN probing, blind relay server. |
@@ -200,7 +200,7 @@ For two-node tunnels, mesh setups, and NAT configuration, consult the [User Guid
 
 ## Security Model
 
-- **Data Plane**: ChaCha20-Poly1305 AEAD over a Noise-IK session, per-direction keys, a WireGuard-style replay window, and ~120s rekey with epoch overlap. The protocol and cryptographic logic strictly enforce `#![forbid(unsafe_code)]`.
+- **Data Plane & Handshake**: Single-RTT post-quantum hybrid key exchange (`Noise_IKpsk2` + ML-KEM-512 / FIPS 203) with ChaCha20-Poly1305 AEAD data plane, per-direction keys, a WireGuard-style replay window, and ~120s ephemeral rekey with epoch overlap. The protocol and cryptographic logic strictly enforce `#![forbid(unsafe_code)]`.
 - **Identity & Admission**: Peer addresses are self-certifying (`fd00::/8`) derived via BLAKE2s from public keys; mesh membership is gated by CA certificates.
 - **Anti-DPI Verification**: Verified in CI against four independent DPI engines (**nDPI**, **Zeek**, **Suricata**, and **Wireshark**).
 - **What is *not* defended yet**: Traffic-analysis (timing/padding shape) defense is in development. Statistical packet-burst size classifiers can observe flow patterns without deep packet content inspection.

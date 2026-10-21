@@ -221,7 +221,11 @@ impl PeerManager {
             .first()
             .and_then(|p| p.endpoint)
             .unwrap_or_else(|| "127.0.0.1:0".parse().unwrap());
-        let mut dgs = vec![EgressDatagram { fate: 0, dst, bytes: pkt }];
+        let mut dgs = vec![EgressDatagram {
+            fate: 0,
+            dst,
+            bytes: pkt,
+        }];
         self.obf_egress(&mut dgs);
         dgs.pop().map(|d| d.bytes).unwrap_or_default()
     }

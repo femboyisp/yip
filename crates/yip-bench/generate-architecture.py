@@ -117,7 +117,7 @@ def build_architecture_svg() -> str:
     lines.append(f'    <rect x="24.00" y="20.00" width="76.00" height="24.00" rx="6.00" fill="{COLOR_FEC_BG}" stroke="{COLOR_FEC}" stroke-width="1.00" />')
     lines.append(f'    <polygon points="34.00,36.00 39.00,26.00 44.00,31.00 49.00,26.00 54.00,36.00 44.00,39.00" fill="{COLOR_FEC_LIGHT}" />')
     lines.append(f'    <text x="73.00" y="36.00" font-family="{FONT_MONO}" font-size="11" font-weight="700" fill="{COLOR_FEC_LIGHT}" text-anchor="middle">YIP</text>')
-    
+
     # Title & Subtitle
     lines.append(f'    <text x="110.00" y="37.00" font-family="{FONT_SANS}" font-size="17" font-weight="700" fill="{COLOR_TEXT_WHITE}">DUAL-PATH SYSTEM ARCHITECTURE</text>')
     lines.append(f'    <text x="110.00" y="55.00" font-family="{FONT_SANS}" font-size="11.5" fill="{COLOR_TEXT_MUTED}">Zero-Lock Data Plane • eBPF AF_XDP 40 Gbps &amp; Anti-DPI Subsystems</text>')
@@ -126,7 +126,7 @@ def build_architecture_svg() -> str:
     badges = [
         ("40+ Gbps eBPF", COLOR_FAST_BG, COLOR_FAST_LIGHT, COLOR_FAST),
         ("GF(256) RS-FEC", COLOR_FEC_BG, COLOR_FEC_LIGHT, COLOR_FEC),
-        ("Noise-IK AEAD", COLOR_CONTROL_BG, COLOR_CONTROL_LIGHT, COLOR_CONTROL),
+        ("Noise-IKpsk2 + ML-KEM-512", COLOR_CONTROL_BG, COLOR_CONTROL_LIGHT, COLOR_CONTROL),
     ]
     bx = w - 24
     for btext, bbg, bfg, bborder in reversed(badges):
@@ -145,7 +145,7 @@ def build_architecture_svg() -> str:
     lines.append('  <!-- ========================================================= -->')
     lines.append('  <g id="control-plane">')
     lines.append(f'    <rect x="24.00" y="74.00" width="992.00" height="120.00" rx="8.00" fill="url(#grad-control-card)" stroke="{COLOR_CONTROL}" stroke-width="1.20" stroke-opacity="0.70" />')
-    
+
     # Section Header Pill with generous padding
     lines.append(f'    <rect x="36.00" y="84.00" width="124.00" height="18.00" rx="4.00" fill="{COLOR_CONTROL_BG}" stroke="{COLOR_CONTROL}" stroke-width="1.00" />')
     lines.append(f'    <text x="98.00" y="97.00" font-family="{FONT_MONO}" font-size="10" font-weight="700" fill="{COLOR_CONTROL_LIGHT}" text-anchor="middle">CONTROL PLANE</text>')
@@ -158,13 +158,13 @@ def build_architecture_svg() -> str:
     start_x = 36.00
     card_y = 106.00
 
-    # Module 1: BLAKE2s Key-Derivation
+    # Module 1: PQ Hybrid Key-Derivation
     m1_x = start_x
     lines.append(f'    <rect x="{m1_x:.2f}" y="{card_y:.2f}" width="{card_w:.2f}" height="{card_h:.2f}" rx="6.00" fill="{COLOR_SUB_CARD_BG}" stroke="{COLOR_CANVAS_BORDER}" stroke-width="1.00" />')
-    lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 17:.2f}" font-family="{FONT_SANS}" font-size="12" font-weight="700" fill="{COLOR_TEXT_WHITE}">BLAKE2s Key-Derivation</text>')
-    lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 33:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• Static &amp; Ephemeral 256-bit Keypairs</text>')
-    lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 49:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• Noise-IK Handshake Token Generation</text>')
-    lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 65:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_CONTROL_LIGHT}">• Ephemeral Rekeying State (120s Ratchet)</text>')
+    lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 17:.2f}" font-family="{FONT_SANS}" font-size="12" font-weight="700" fill="{COLOR_TEXT_WHITE}">PQ Hybrid Handshake &amp; KDF</text>')
+    lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 33:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• ML-KEM-512 (FIPS 203) + X25519</text>')
+    lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 49:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• Noise-IKpsk2 Token Sequencing</text>')
+    lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 65:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_CONTROL_LIGHT}">• Ephemeral Rekeying (120s Ratchet)</text>')
 
     # Module 2: CA-Gated Mesh Discovery (yip-ca)
     m2_x = m1_x + card_w + gap
@@ -189,7 +189,7 @@ def build_architecture_svg() -> str:
     # Connector 1: Keys/Tokens from BLAKE2s to AEAD
     lines.append(f'    <path d="M 192.00 182.00 L 192.00 206.00 L 644.00 206.00 L 644.00 232.00" fill="none" stroke="{COLOR_CONTROL}" stroke-width="1.40" stroke-dasharray="3,3" marker-end="url(#arrow-ctrl)" />')
     lines.append(f'    <rect x="250.00" y="198.00" width="168.00" height="16.00" rx="3.00" fill="{COLOR_CANVAS_BG}" stroke="{COLOR_CONTROL}" stroke-width="0.80" />')
-    lines.append(f'    <text x="334.00" y="210.00" font-family="{FONT_MONO}" font-size="9" font-weight="600" fill="{COLOR_CONTROL_LIGHT}" text-anchor="middle">Noise Keys &amp; Ratchet State</text>')
+    lines.append(f'    <text x="334.00" y="210.00" font-family="{FONT_MONO}" font-size="9" font-weight="600" fill="{COLOR_CONTROL_LIGHT}" text-anchor="middle">Hybrid Keys &amp; Ratchet State</text>')
 
     # Connector 2: Topology / Peer routing from Mesh to SPSC Shards
     lines.append(f'    <path d="M 520.00 182.00 L 520.00 218.00 L 396.00 218.00 L 396.00 232.00" fill="none" stroke="{COLOR_CONTROL}" stroke-width="1.40" stroke-dasharray="3,3" marker-end="url(#arrow-ctrl)" />')
@@ -254,7 +254,7 @@ def build_architecture_svg() -> str:
     lines.append(f'    <rect x="{s3_x:.2f}" y="{d_card_y:.2f}" width="{d_card_w:.2f}" height="{d_card_h:.2f}" rx="6.00" fill="{COLOR_SUB_CARD_BG}" stroke="{COLOR_CANVAS_BORDER}" stroke-width="1.00" />')
     lines.append(f'    <text x="{s3_x + 10:.2f}" y="{d_card_y + 16:.2f}" font-family="{FONT_MONO}" font-size="9" font-weight="700" fill="{COLOR_DATA_LIGHT}">STAGE 03 • CRYPTO</text>')
     lines.append(f'    <text x="{s3_x + 10:.2f}" y="{d_card_y + 32:.2f}" font-family="{FONT_SANS}" font-size="12" font-weight="700" fill="{COLOR_TEXT_WHITE}">ChaCha20-Poly1305 AEAD</text>')
-    lines.append(f'    <text x="{s3_x + 10:.2f}" y="{d_card_y + 48:.2f}" font-family="{FONT_MONO}" font-size="10" font-weight="600" fill="{COLOR_DATA}">Noise-IK • 120s Ratchet</text>')
+    lines.append(f'    <text x="{s3_x + 10:.2f}" y="{d_card_y + 48:.2f}" font-family="{FONT_MONO}" font-size="10" font-weight="600" fill="{COLOR_DATA}">Noise-IKpsk2 • 120s Ratchet</text>')
     lines.append(f'    <text x="{s3_x + 10:.2f}" y="{d_card_y + 68:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• AVX2 / NEON SIMD acceleration</text>')
     lines.append(f'    <text x="{s3_x + 10:.2f}" y="{d_card_y + 84:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• Bitmap sliding replay window</text>')
     lines.append(f'    <text x="{s3_x + 10:.2f}" y="{d_card_y + 100:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• WireGuard-compatible framing</text>')
@@ -327,7 +327,7 @@ def build_architecture_svg() -> str:
     fp_x = 24.00
     lines.append('  <g id="fast-path">')
     lines.append(f'    <rect x="{fp_x:.2f}" y="{bottom_y:.2f}" width="{bottom_w:.2f}" height="{bottom_h:.2f}" rx="8.00" fill="url(#grad-fast-card)" stroke="{COLOR_FAST}" stroke-width="1.30" stroke-opacity="0.80" />')
-    
+
     # Header Pill with generous padding
     lines.append(f'    <rect x="{fp_x + 12:.2f}" y="{bottom_y + 12:.2f}" width="196.00" height="18.00" rx="4.00" fill="{COLOR_FAST_BG}" stroke="{COLOR_FAST}" stroke-width="1.00" />')
     lines.append(f'    <text x="{fp_x + 110:.2f}" y="{bottom_y + 25:.2f}" font-family="{FONT_MONO}" font-size="10" font-weight="700" fill="{COLOR_FAST_LIGHT}" text-anchor="middle">FAST PATH • KERNEL BYPASS</text>')

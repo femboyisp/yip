@@ -75,10 +75,7 @@ pub fn generate_pq_keypair() -> (PqEncapsKey, PqDecapsKey) {
     let ek_bytes = ek.to_bytes();
     let mut ek_arr = [0u8; PQ_ENCAPS_KEY_LEN];
     ek_arr.copy_from_slice(ek_bytes.as_slice());
-    (
-        PqEncapsKey(ek_arr),
-        PqDecapsKey(Box::new(dk)),
-    )
+    (PqEncapsKey(ek_arr), PqDecapsKey(Box::new(dk)))
 }
 
 /// Encapsulate a shared secret toward `ek`, producing `(ciphertext, shared_secret)`.
@@ -354,10 +351,7 @@ impl Handshake {
         let (ek, dk) = generate_pq_keypair();
         Ok(Handshake {
             inner: std::sync::Mutex::new(inner),
-            role: HandshakePqRole::Initiator {
-                dk: Some(dk),
-                ek,
-            },
+            role: HandshakePqRole::Initiator { dk: Some(dk), ek },
         })
     }
 
@@ -455,7 +449,9 @@ impl Handshake {
                 drop(decaps_key); // Explicit scrub of dk_A
 
                 let inner = self.inner.get_mut().expect("handshake lock");
-                inner.set_psk(2, &ss[..]).map_err(|_| CryptoError::Handshake)?;
+                inner
+                    .set_psk(2, &ss[..])
+                    .map_err(|_| CryptoError::Handshake)?;
                 let n = inner
                     .read_message(&msg[PQ_CIPHERTEXT_LEN..], &mut buf)
                     .map_err(|_| CryptoError::Handshake)?;
@@ -1316,8 +1312,14 @@ mod tests {
 
         let (ini_send, ini_recv) = ini.raw_split_keys();
         let (res_send, res_recv) = res.raw_split_keys();
-        assert_eq!(ini_send, res_recv, "initiator send key matches responder recv key");
-        assert_eq!(ini_recv, res_send, "initiator recv key matches responder send key");
+        assert_eq!(
+            ini_send, res_recv,
+            "initiator send key matches responder recv key"
+        );
+        assert_eq!(
+            ini_recv, res_send,
+            "initiator recv key matches responder send key"
+        );
 
         let mut ini_session = ini.to_session_for_test().unwrap();
         let mut res_session = res.to_session_for_test().unwrap();
@@ -1739,7 +1741,10 @@ mod tests {
         assert_eq!(ss_sender.len(), PQ_SHARED_SECRET_LEN);
 
         let ss_recipient = pq_decapsulate(&dk, &ct).expect("decapsulation succeeds");
-        assert_eq!(*ss_sender, *ss_recipient, "both sides agree on 32-byte shared secret");
+        assert_eq!(
+            *ss_sender, *ss_recipient,
+            "both sides agree on 32-byte shared secret"
+        );
     }
 
     #[test]
@@ -1750,7 +1755,10 @@ mod tests {
         ek.0[0] = 0xFF;
         ek.0[1] = 0x0F;
         let res = pq_encapsulate(&ek);
-        assert!(res.is_err(), "encapsulation must reject coefficient >= 3329");
+        assert!(
+            res.is_err(),
+            "encapsulation must reject coefficient >= 3329"
+        );
     }
 
     #[test]
@@ -1760,7 +1768,8 @@ mod tests {
 
         // Tamper with the ciphertext: flip one bit in ct
         ct.0[0] ^= 0x01;
-        let ss_recipient = pq_decapsulate(&dk, &ct).expect("decapsulation succeeds via implicit rejection");
+        let ss_recipient =
+            pq_decapsulate(&dk, &ct).expect("decapsulation succeeds via implicit rejection");
         assert_ne!(
             *ss_sender, *ss_recipient,
             "FIPS 203 implicit rejection must yield a distinct pseudorandom secret on tampered ciphertext"
@@ -1785,7 +1794,10 @@ mod tests {
         ek.0[1] = 0xF0;
         ek.0[2] = 0xFF;
         let res = pq_encapsulate(&ek);
-        assert!(res.is_err(), "encapsulation must reject second coefficient >= 3329");
+        assert!(
+            res.is_err(),
+            "encapsulation must reject second coefficient >= 3329"
+        );
     }
 
     #[test]
@@ -1829,7 +1841,9 @@ mod tests {
         let mut ini_session = ini.into_session().unwrap();
         let mut res_session = res.into_session().unwrap();
         let sealed = ini_session.seal(b"quantum safe transport payload").unwrap();
-        let opened = res_session.open(sealed.counter, &sealed.ciphertext).unwrap();
+        let opened = res_session
+            .open(sealed.counter, &sealed.ciphertext)
+            .unwrap();
         assert_eq!(opened, b"quantum safe transport payload");
     }
 

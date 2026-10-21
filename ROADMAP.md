@@ -32,6 +32,11 @@ maintainer.
   WAN benchmarking suite across cloud VPSes and ephemeral multi-region AWS EC2 instances, comparing
   baseline IP, yip (RS-FEC), WireGuard, and OpenVPN under real network conditions and injected packet
   loss, with scheduled GitHub Actions automation.
+- **Post-quantum hybrid handshake (`Noise_IKpsk2` + ML-KEM-512) (#9b, PR #152)** — single-RTT
+  quantum-resistant key exchange pairing FIPS 203 ML-KEM-512 with classical X25519 DH. Fits strictly
+  under `OBF_MTU_BUDGET = 1200` bytes with deadlock-free outer framing, FIPS 203 Section 7.2 modulus
+  validation, IND-CCA2 implicit rejection, zero allocations in the data plane, and ~120s ephemeral
+  rotation.
 
 ## Now
 
@@ -51,8 +56,6 @@ maintainer.
 
 ## Later
 
-- **Post-quantum hybrid handshake** — Classic McEliece + ML-KEM hybrid exchange behind the
-  direct UDP datapath.
 - **Multi-platform native drivers** — macOS (NetworkExtension / utun) and Windows (Wintun).
 
 ## Not goals (for now)
