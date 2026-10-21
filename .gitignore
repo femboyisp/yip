@@ -5,6 +5,10 @@
 /.superpowers/
 /mutants.out*/
 
+# Python artifacts
+__pycache__/
+*.pyc
+
 # Locally-built benchmark contender binaries (UDPspeeder etc.)
 .bench-tools/
 
