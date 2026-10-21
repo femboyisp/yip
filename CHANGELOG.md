@@ -27,6 +27,8 @@ until 0.1.0.
   Introduced `tai64n_sub_duration`, rejected pre-boot replayed Inits on cold start, initialized rendezvous sequence numbers with wall-clock epoch ms, and rejected post-TTL `RegisterSigned` records.
 
 ### Added
+- **Zero-copy datapath egress in `io_uring` driver (`crates/yip-io`, #11).**
+  Eliminated redundant `pkts.to_vec()` heap vector allocations in `handle_dispatch_udp` for both `DispatchOut::Udp` and `DispatchOut::Both` paths in `crates/yip-io/src/uring.rs`. Passes the existing borrowed datagram slice directly to `queue_udp_batch_tagged`, achieving zero-allocation datagram forwarding on the `io_uring` hot path.
 - **Bidirectional flow accounting in traffic classifier (`crates/yip-transport`, `bin/yipd`, #11).**
   Added canonical symmetric 5-tuple canonicalization to `FlowKey` and wired decrypted ingress packet observation in `DataPlane::on_udp_datagram` via `Transport::observe_ingress`. Both forward transmission and return traffic (such as return TCP ACKs and reverse RTP media bursts) now update the shared EWMA packet size and packet rate estimator, accelerating `MIN_PACKETS` convergence and enabling symmetric traffic classification across interactive, default, and bulk traffic flows.
 - **Deadline-based FEC reassembly eviction & late symbol tombstoning (`crates/yip-transport`, `bin/yipd`, #11).**

@@ -907,10 +907,9 @@ impl UringDriver {
                 }
             }
             DispatchOut::Udp(pkts) => {
-                let pkts_owned = pkts.to_vec();
                 // `allow_gso=false`: control/ARQ-retransmit traffic is never
                 // GSO-coalesced, matching pre-addressing behavior exactly.
-                if let Err(e) = self.queue_udp_batch_tagged(&pkts_owned, false) {
+                if let Err(e) = self.queue_udp_batch_tagged(pkts, false) {
                     self.dropped_sends += 1;
                     eprintln!(
                         "uring: drop udp send batch: {e} (dropped_sends={})",
@@ -926,8 +925,7 @@ impl UringDriver {
                         self.dropped_sends
                     );
                 }
-                let pkts_owned = pkts.to_vec();
-                if let Err(e) = self.queue_udp_batch_tagged(&pkts_owned, false) {
+                if let Err(e) = self.queue_udp_batch_tagged(pkts, false) {
                     self.dropped_sends += 1;
                     eprintln!(
                         "uring: drop udp send batch: {e} (dropped_sends={})",
