@@ -13,6 +13,16 @@ set -euo pipefail
 
 TARGET_BIN_DIR="/usr/local/bin"
 
+# Discover Go toolchain if not in PATH (e.g. running under bare sudo or CI)
+if ! command -v go >/dev/null 2>&1; then
+    for candidate in /usr/local/go/bin/go /usr/lib/go/bin/go /home/runner/go/bin/go /opt/hostedtoolcache/go/*/x64/bin/go; do
+        if [ -x "$candidate" ]; then
+            export PATH="$(dirname "$candidate"):$PATH"
+            break
+        fi
+    done
+fi
+
 log() { echo -e "\033[1;34m[setup-contenders]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[setup-contenders:WARN]\033[0m $*"; }
 err() { echo -e "\033[1;31m[setup-contenders:ERROR]\033[0m $*" >&2; exit 1; }
