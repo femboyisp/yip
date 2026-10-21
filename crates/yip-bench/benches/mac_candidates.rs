@@ -41,6 +41,15 @@ fn siphash13_tag(key: &[u8; 16], covered: &[u8]) -> [u8; 8] {
     h.finish().to_be_bytes()
 }
 
+/// Shipped: SipHash-1-3 streaming multi-slice (zero-alloc, header + payload).
+#[inline]
+fn siphash13_streaming_tag(key: &[u8; 16], header: &[u8; HEADER_LEN], payload: &[u8]) -> [u8; 8] {
+    let mut h = SipHasher13::new_with_key(key);
+    h.write(header);
+    h.write(payload);
+    h.finish().to_be_bytes()
+}
+
 /// Candidate: keyed BLAKE3, truncated to an 8-byte tag.
 #[inline]
 fn blake3_tag(key: &[u8; 32], covered: &[u8]) -> [u8; 8] {
@@ -67,6 +76,15 @@ fn bench_mac(c: &mut Criterion) {
             BenchmarkId::new("siphash13", covered_len),
             &covered,
             |b, cov| b.iter(|| black_box(siphash13_tag(&SIP_KEY, black_box(cov)))),
+        );
+        let header = [0xa5u8; HEADER_LEN];
+        let payload_slice = vec![0xa5u8; payload];
+        group.bench_with_input(
+            BenchmarkId::new("siphash13_streaming", covered_len),
+            &payload_slice,
+            |b, pay| {
+                b.iter(|| black_box(siphash13_streaming_tag(&SIP_KEY, &header, black_box(pay))))
+            },
         );
         group.bench_with_input(
             BenchmarkId::new("blake3_keyed", covered_len),

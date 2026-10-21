@@ -70,7 +70,7 @@ class TestWireFormatGenerator(unittest.TestCase):
         self.assertIn("Encrypted Header", svg_str)
         self.assertIn("SipHash-CTR Mask", svg_str)
         self.assertIn("Bytes 4..12 (8B)", svg_str)
-        self.assertIn("SipHash-2-4 MAC", svg_str)
+        self.assertIn("SipHash-1-3 MAC", svg_str)
         self.assertIn("Bytes 12..N (Variable MTU)", svg_str)
         self.assertIn("ChaCha20-Poly1305 Ciphertext", svg_str)
         self.assertIn("Type (2b)", svg_str)
