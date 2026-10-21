@@ -25,6 +25,10 @@ until 0.1.0.
   Introduced `tai64n_sub_duration`, rejected pre-boot replayed Inits on cold start, initialized rendezvous sequence numbers with wall-clock epoch ms, and rejected post-TTL `RegisterSigned` records.
 
 ### Added
+- **Deadline-based FEC reassembly eviction & late symbol tombstoning (`crates/yip-transport`, `bin/yipd`, #11).**
+  Added per-object deadline tracking (`expires_at_ms = first_seen_ms + deadline_ms`) to `FecReassembler` in `crates/yip-transport`. Eagerly evicts expired FEC reassembly state on incoming symbols and during FIFO queue maintenance, tombstoning expired objects to free symbol shard buffers immediately while preventing late trailing parity bursts from resurrecting expired `object_id`s or causing head-of-line blocking across traffic classes (`Realtime`, `Default`, `Bulk`).
+- **Zero-allocation egress buffer scavenging under obfuscation (`crates/yip-obf`, `bin/yipd`, #11).**
+  Introduced in-place envelope obfuscation `yip_obf::obfuscate_into` using SipHash-CTR block stream generation directly in-place without vector allocation. Scavenged TUN and tick egress datagrams in `PeerManager` via scoped `std::mem::take` and buffer ping-pong swapping (`obf_scratch`), eliminating heap vector allocations on the steady-state obfuscated data-plane hot path.
 - **P99 tail latency & jitter under loss benchmarks (`assets/bench-latency-jitter.svg`, #148).**
   Extended `crates/yip-bench/generate-graphs.py` to deterministically render P99 tail latency and jitter envelopes across 0% to 10% packet loss. Demonstrates systematic Cauchy Reed–Solomon FEC eliminating multi-RTT ARQ timeouts and head-of-line blocking, maintaining a flat ~62ms P99 round-trip latency under 10% loss while WireGuard and OpenVPN spike to 180–235ms+.
 - **Deterministic wire format & cryptographic ceremony diagram generator (`crates/yip-bench/generate-wire-format.py`, `assets/wire-format.svg`, #148).**

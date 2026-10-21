@@ -410,6 +410,7 @@ pub struct PeerManager {
     egress: Vec<EgressDatagram>,
     /// Reused scratch for `tick`'s return value.
     tick_egress: Vec<EgressDatagram>,
+    obf_scratch: Vec<u8>,
     /// Reused scratch for a `Tun`/`Both` outcome reached via the
     /// address-unmatched fallback in `handle_data_or_control`. That path
     /// must materialize owned data (see its doc comment) rather than return
@@ -585,6 +586,7 @@ impl PeerManager {
             reg_seq: now_wall_clock_ms(),
             egress: Vec::new(),
             tick_egress: Vec::new(),
+            obf_scratch: Vec::new(),
             tun_scratch: Vec::new(),
             obf_key: None,
             junk_rng: yip_obf::XorShift64::from_getrandom(),
@@ -1114,21 +1116,26 @@ impl Dispatch for PeerManager {
         if self.obf_key.is_none() {
             return self.on_tun_dispatch(inner, now_ms);
         }
-        // Copy the (borrowed) egress out so the DataPlane/self borrow ends, then
-        // wrap in place and return from `self.egress`.
-        let mut owned: Vec<EgressDatagram> = self.on_tun_dispatch(inner, now_ms).to_vec();
-        self.obf_egress(&mut owned);
-        self.egress = owned;
+        let mut scratch = std::mem::take(&mut self.egress);
+        {
+            let dispatched = self.on_tun_dispatch(inner, now_ms);
+            copy_into_reusable_egress(&mut scratch, dispatched);
+        }
+        self.obf_egress(&mut scratch);
+        self.egress = scratch;
         &self.egress
     }
 
     fn tick(&mut self, now_ms: u64) -> Option<&[EgressDatagram]> {
-        if self.obf_key.is_none() {
-            return self.tick_dispatch(now_ms);
+        let has_egress = self.tick_dispatch(now_ms).is_some();
+        if !has_egress {
+            return None;
         }
-        let mut owned: Vec<EgressDatagram> = self.tick_dispatch(now_ms)?.to_vec();
-        self.obf_egress(&mut owned);
-        self.tick_egress = owned;
+        if self.obf_key.is_some() {
+            let mut tick_egress = std::mem::take(&mut self.tick_egress);
+            self.obf_egress(&mut tick_egress);
+            self.tick_egress = tick_egress;
+        }
         Some(&self.tick_egress)
     }
 }
@@ -1626,6 +1633,24 @@ fn reassemble(ptype: u8, body: &[u8]) -> Vec<u8> {
     v.push(ptype);
     v.extend_from_slice(body);
     v
+}
+
+pub(super) fn copy_into_reusable_egress(target: &mut Vec<EgressDatagram>, src: &[EgressDatagram]) {
+    target.truncate(src.len());
+    for (i, s) in src.iter().enumerate() {
+        if i < target.len() {
+            target[i].fate = s.fate;
+            target[i].dst = s.dst;
+            target[i].bytes.clear();
+            target[i].bytes.extend_from_slice(&s.bytes);
+        } else {
+            target.push(EgressDatagram {
+                fate: s.fate,
+                dst: s.dst,
+                bytes: s.bytes.clone(),
+            });
+        }
+    }
 }
 
 /// Decompose a borrowed [`DispatchOut`] into owned `(tun, udp)` parts so the

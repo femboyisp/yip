@@ -304,10 +304,10 @@ def generate_wire_format_svg() -> str:
     canvas.rect(40.0, cb_y, 454.0, 72.0, rx=6.0, fill="#1c1917", stroke=COLOR_OBF, stroke_width=1.0)
     # Shield icon path
     canvas.path(f"M 54.00,{cb_y + 18.0:.2f} L 60.00,{cb_y + 15.0:.2f} L 66.00,{cb_y + 18.0:.2f} L 66.00,{cb_y + 25.0:.2f} C 66.00,{cb_y + 32.0:.2f} 60.00,{cb_y + 36.0:.2f} 60.00,{cb_y + 36.0:.2f} C 60.00,{cb_y + 36.0:.2f} 54.00,{cb_y + 32.0:.2f} 54.00,{cb_y + 25.0:.2f} Z", fill=COLOR_OBF_LIGHT)
-    canvas.text(74.0, cb_y + 20.0, "Anti-DPI Guarantee: Pure High-Entropy Random Bytes", fill=COLOR_TEXT_MAIN, font_size=11.0, font_weight="700")
-    canvas.text(74.0, cb_y + 36.0, "Keyed Header Protection eliminates wire signatures; packets appear as pure high-entropy", fill=COLOR_TEXT_MUTED, font_size=9.5)
-    canvas.text(74.0, cb_y + 50.0, "random bytes to DPI engines (nDPI, Zeek, Suricata).", fill=COLOR_TEXT_MUTED, font_size=9.5)
-    canvas.text(74.0, cb_y + 64.0, "Constant-time SipHash MAC tag check rejects forged headers in <12ns prior to decode.", fill=COLOR_TEXT_DIM, font_size=9.0)
+    canvas.text(74.0, cb_y + 20.0, "Anti-DPI Guarantee: Pure High-Entropy Random Bytes", fill=COLOR_TEXT_MAIN, font_size=10.5, font_weight="700")
+    canvas.text(74.0, cb_y + 35.0, "Keyed Header Protection eliminates static signatures; datagrams appear", fill=COLOR_TEXT_MUTED, font_size=9.0)
+    canvas.text(74.0, cb_y + 48.0, "as uniform random bytes to DPI engines (nDPI, Zeek, Suricata, Wireshark).", fill=COLOR_TEXT_MUTED, font_size=9.0)
+    canvas.text(74.0, cb_y + 62.0, "Constant-time SipHash MAC tag check rejects forged headers in <12ns prior to decode.", fill=COLOR_TEXT_DIM, font_size=8.5)
 
     # Outcome banner
     ob_y = 344.0
@@ -368,11 +368,11 @@ def generate_wire_format_svg() -> str:
     # Technical Details Sub-card
     info_y = 246.0
     canvas.rect(546.0, info_y, 454.0, 90.0, rx=6.0, fill=COLOR_SUB_CARD_BG, stroke=COLOR_CANVAS_BORDER, stroke_width=1.0)
-    canvas.text(558.0, info_y + 18.0, "✓ MTU Budget Compliant: Msg 1 (1,028B) & Msg 2 (948B) < 1,200B OBF_MTU_BUDGET.", fill=COLOR_PQ_LIGHT, font_size=9.5, font_family=FONT_MONO, font_weight="700")
-    canvas.text(558.0, info_y + 36.0, "• Deadlock-Free Execution: Initiator parses cleartext ct at [4..772], computes", fill=COLOR_TEXT_MUTED, font_size=9.5)
-    canvas.text(558.0, info_y + 50.0, "  Decaps(dk_A, ct) -> ss, and calls handshake_state.set_psk(2, &ss) into slot 2.", fill=COLOR_TEXT_MUTED, font_size=9.5)
-    canvas.text(558.0, info_y + 66.0, "• FIPS 203 §7.2: Modulus (< 3329) validated; IND-CCA2 implicit rejection on tampering.", fill=COLOR_PQ_LIGHT, font_size=9.5, font_weight="700")
-    canvas.text(558.0, info_y + 80.0, "• Ephemeral Zeroize: Decapsulation keys and intermediate secrets scrubbed on Drop.", fill=COLOR_TEXT_DIM, font_size=9.0)
+    canvas.text(558.0, info_y + 17.0, "✓ Sub-1,200B MTU: Msg 1 (1,028B) & Msg 2 (948B) < 1,200B OBF_MTU_BUDGET", fill=COLOR_PQ_LIGHT, font_size=9.0, font_family=FONT_MONO, font_weight="700")
+    canvas.text(558.0, info_y + 33.0, "• Deadlock-Free: Initiator parses cleartext ct at [4..772], computes", fill=COLOR_TEXT_MUTED, font_size=9.0)
+    canvas.text(558.0, info_y + 46.0, "  Decaps(dk_A, ct) -> ss, and calls set_psk(2, &ss) before decrypting.", fill=COLOR_TEXT_MUTED, font_size=9.0)
+    canvas.text(558.0, info_y + 61.0, "• FIPS 203 §7.2: Modulus (< 3329) validated; IND-CCA2 rejection on tamper.", fill=COLOR_PQ_LIGHT, font_size=9.0, font_weight="700")
+    canvas.text(558.0, info_y + 75.0, "• Ephemeral Zeroize: Decapsulation keys and intermediate secrets scrubbed on Drop.", fill=COLOR_TEXT_DIM, font_size=8.5)
 
     # Outcome banner
     ob2_y = 344.0
@@ -392,40 +392,41 @@ def generate_wire_format_svg() -> str:
 
     # Timeline diagram
     # Usable width: 454. Axis: x from 60 to 470 (w = 410).
-    # t=0s -> 60, t=60s -> 200, t=110s -> 320, t=120s -> 360, t=130s -> 400, t=140s -> 460
-    # Overlap Window Shading (110s to 130s: x = 320 to 400)
-    canvas.rect(320.0, 492.0, 80.0, 68.0, rx=4.0, fill=COLOR_EPOCH, stroke=COLOR_EPOCH_LIGHT, stroke_width=1.0, opacity=0.15, stroke_dasharray="3,3")
-    canvas.text(360.0, 488.0, "20s Overlap Window", fill=COLOR_EPOCH_LIGHT, font_size=8.5, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
+    # Overlap Window Shading (260s to 440s: x = 260 to 440, w = 180)
+    canvas.rect(260.0, 492.0, 180.0, 68.0, rx=4.0, fill=COLOR_EPOCH, stroke=COLOR_EPOCH_LIGHT, stroke_width=1.0, opacity=0.15, stroke_dasharray="3,3")
+    canvas.text(350.0, 488.0, "20s Overlap Window (110s..130s)", fill=COLOR_EPOCH_LIGHT, font_size=8.5, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
 
     # Epoch N Bar (y = 500, h = 24)
-    # Active: x=60 to 320 (w=260). Grace RX: x=320 to 400 (w=80)
-    canvas.rect(60.0, 500.0, 260.0, 24.0, rx=4.0, fill=COLOR_EPOCH_BG, stroke=COLOR_EPOCH, stroke_width=1.2)
-    canvas.text(190.0, 516.0, "Epoch N Active (TX + RX Session Keys)", fill=COLOR_TEXT_MAIN, font_size=9.5, font_weight="700", text_anchor="middle")
+    # Active: x=60 to 260 (w=200). Grace RX: x=260 to 440 (w=180)
+    canvas.rect(60.0, 500.0, 200.0, 24.0, rx=4.0, fill=COLOR_EPOCH_BG, stroke=COLOR_EPOCH, stroke_width=1.2)
+    canvas.text(160.0, 516.0, "Epoch N Active (TX + RX)", fill=COLOR_TEXT_MAIN, font_size=9.5, font_weight="700", text_anchor="middle")
 
-    canvas.rect(320.0, 500.0, 80.0, 24.0, rx=4.0, fill="#2e1065", stroke=COLOR_EPOCH_LIGHT, stroke_width=1.0, stroke_dasharray="2,2")
-    canvas.text(360.0, 516.0, "RX Only Grace", fill=COLOR_EPOCH_LIGHT, font_size=8.5, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
+    canvas.rect(260.0, 500.0, 180.0, 24.0, rx=4.0, fill="#2e1065", stroke=COLOR_EPOCH_LIGHT, stroke_width=1.0, stroke_dasharray="2,2")
+    canvas.text(350.0, 516.0, "RX Only Grace Window", fill=COLOR_EPOCH_LIGHT, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
 
     # Epoch N+1 Bar (y = 532, h = 24)
-    # Rekey handshake: x=320 to 336 (w=16). Active: x=336 to 470 (w=134)
-    canvas.rect(320.0, 532.0, 20.0, 24.0, rx=3.0, fill=COLOR_OBF_BG, stroke=COLOR_OBF, stroke_width=1.0)
-    canvas.text(330.0, 547.0, "HS", fill=COLOR_OBF_LIGHT, font_size=8.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
+    # Rekey handshake: x=260 to 290 (w=30). Active: x=295 to 470 (w=175)
+    canvas.rect(260.0, 532.0, 32.0, 24.0, rx=3.0, fill=COLOR_OBF_BG, stroke=COLOR_OBF, stroke_width=1.0)
+    canvas.text(276.0, 547.0, "HS", fill=COLOR_OBF_LIGHT, font_size=8.5, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
 
-    canvas.rect(342.0, 532.0, 128.0, 24.0, rx=4.0, fill=COLOR_PQ_BG, stroke=COLOR_PQ, stroke_width=1.2)
-    canvas.text(406.0, 547.0, "Epoch N+1 Active (TX + RX)", fill=COLOR_PQ_LIGHT, font_size=9.0, font_weight="700", text_anchor="middle")
+    canvas.rect(296.0, 532.0, 174.0, 24.0, rx=4.0, fill=COLOR_PQ_BG, stroke=COLOR_PQ, stroke_width=1.2)
+    canvas.text(383.0, 547.0, "Epoch N+1 Active (TX + RX)", fill=COLOR_PQ_LIGHT, font_size=9.0, font_weight="700", text_anchor="middle")
 
-    # Timeline axis line & ticks at y = 568.0
-    canvas.line(60.0, 568.0, 470.0, 568.0, stroke=COLOR_CANVAS_BORDER, stroke_width=1.0)
-    # Ticks
+    # Timeline axis line & ticks at y = 566.0
+    canvas.line(60.0, 566.0, 470.0, 566.0, stroke=COLOR_CANVAS_BORDER, stroke_width=1.0)
+    # Ticks with non-colliding labels (time on top line, event on bottom line)
     ticks = [
-        (60.0, "t = 0s", COLOR_TEXT_MUTED),
-        (200.0, "t = 60s", COLOR_TEXT_DIM),
-        (320.0, "t = 110s (Rekey)", COLOR_OBF_LIGHT),
-        (360.0, "t = 120s (Expiry)", COLOR_TEXT_MUTED),
-        (400.0, "t = 130s (Zeroize)", COLOR_RED),
+        (60.0, "t = 0s", None, COLOR_TEXT_MUTED),
+        (160.0, "t = 60s", None, COLOR_TEXT_DIM),
+        (260.0, "t = 110s", "Rekey HS", COLOR_OBF_LIGHT),
+        (350.0, "t = 120s", "Epoch End", COLOR_TEXT_MUTED),
+        (440.0, "t = 130s", "Zeroize", COLOR_RED),
     ]
-    for tx, tlabel, tcol in ticks:
-        canvas.line(tx, 565.0, tx, 571.0, stroke=COLOR_TEXT_DIM, stroke_width=1.0)
-        canvas.text(tx, 581.0, tlabel, fill=tcol, font_size=8.5, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
+    for tx, tlabel, sublabel, tcol in ticks:
+        canvas.line(tx, 563.0, tx, 569.0, stroke=COLOR_TEXT_DIM, stroke_width=1.0)
+        canvas.text(tx, 578.0, tlabel, fill=tcol, font_size=8.5, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
+        if sublabel:
+            canvas.text(tx, 588.0, sublabel, fill=tcol, font_size=7.5, font_family=FONT_MONO, text_anchor="middle")
 
     # Explanatory subcard
     ratchet_info_y = 594.0
@@ -494,11 +495,11 @@ def generate_wire_format_svg() -> str:
     # Explanatory subcard
     addr_info_y = 598.0
     canvas.rect(546.0, addr_info_y, 454.0, 98.0, rx=6.0, fill=COLOR_SUB_CARD_BG, stroke=COLOR_CANVAS_BORDER, stroke_width=1.0)
-    canvas.text(558.0, addr_info_y + 18.0, "• Self-Certifying Identity: Address IS the public key digest; IP spoofing is impossible.", fill=COLOR_TEXT_MUTED, font_size=9.5)
-    canvas.text(558.0, addr_info_y + 36.0, "• Zero Central Infrastructure: Autonomous routing without DHCP, IPAM, or coordinators.", fill=COLOR_TEXT_MUTED, font_size=9.5)
-    canvas.text(558.0, addr_info_y + 54.0, "• Collision Resistance: 120-bit BLAKE2s digest provides 2^60 collision resistance floor.", fill=COLOR_TEXT_MUTED, font_size=9.5)
-    canvas.text(558.0, addr_info_y + 72.0, "• Zero-Trust Admission: Node identity bound to CA Root Certificate before admission.", fill=COLOR_NOISE, font_size=9.5, font_weight="700")
-    canvas.text(558.0, addr_info_y + 90.0, "• Autonomous Routing: Nodes route directly to fd00::/8 ULA addresses across mesh.", fill=COLOR_TEXT_DIM, font_size=9.0)
+    canvas.text(558.0, addr_info_y + 17.0, "• Self-Certifying: Address IS public key digest; IP spoofing impossible.", fill=COLOR_TEXT_MUTED, font_size=9.0)
+    canvas.text(558.0, addr_info_y + 34.0, "• Zero Central Infrastructure: Autonomous routing without DHCP/IPAM/coordinators.", fill=COLOR_TEXT_MUTED, font_size=9.0)
+    canvas.text(558.0, addr_info_y + 51.0, "• Collision Resistance: 120-bit BLAKE2s digest provides 2^60 collision floor.", fill=COLOR_TEXT_MUTED, font_size=9.0)
+    canvas.text(558.0, addr_info_y + 68.0, "• Zero-Trust Admission: Node identity bound to CA Root Cert before admission.", fill=COLOR_NOISE, font_size=9.0, font_weight="700")
+    canvas.text(558.0, addr_info_y + 85.0, "• Autonomous Routing: Nodes route directly to fd00::/8 ULA addresses across mesh.", fill=COLOR_TEXT_DIM, font_size=8.5)
 
     # Outcome banner
     ob4_y = 704.0
@@ -510,14 +511,14 @@ def generate_wire_format_svg() -> str:
     # =========================================================================
     canvas.line(24.0, 780.0, w - 24.0, 780.0, stroke=COLOR_CANVAS_BORDER, stroke_width=1.0)
     canvas.text(
-        28.0, 801.0,
-        "Protocol Spec: Noise-IKpsk2 • NIST FIPS 203 ML-KEM-512 • SipHash-CTR / SipHash-2-4 • ChaCha20-Poly1305 • BLAKE2s",
-        fill=COLOR_TEXT_DIM, font_size=10.5, font_family=FONT_MONO
+        28.0, 800.0,
+        "Protocol: Noise-IKpsk2 • NIST FIPS 203 ML-KEM-512 • SipHash-CTR/2-4 • ChaCha20-Poly1305 • BLAKE2s",
+        fill=COLOR_TEXT_DIM, font_size=9.0, font_family=FONT_MONO
     )
     canvas.text(
-        w - 28.0, 801.0,
+        w - 28.0, 800.0,
         "Deterministic Vector Wire Format • github.com/femboyisp/yip",
-        fill=COLOR_TEXT_DIM, font_size=10.5, font_family=FONT_MONO, text_anchor="end"
+        fill=COLOR_TEXT_DIM, font_size=9.0, font_family=FONT_MONO, text_anchor="end"
     )
 
     return canvas.render()
