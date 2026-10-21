@@ -2381,7 +2381,7 @@ fn test_peer_manager_pq_hybrid_handshake_datagrams_fit_mtu_budget() {
     );
 
     // Verify with obfuscation
-    let (pm_obf_a, ..) = established_pm_pair_with_obf(100, [0x42u8; 32]);
+    let (mut pm_obf_a, ..) = established_pm_pair_with_obf(100, [0x42u8; 32]);
     let rekey_obf = rekey_init_with_payload(&pm_obf_a, 0, &valid_cert_bytes(&pm_obf_a, 0));
     let wrapped = pm_obf_a.obf_envelope(rekey_obf, now);
     assert!(
@@ -2400,4 +2400,74 @@ fn test_peer_manager_pq_hybrid_handshake_datagrams_fit_mtu_budget() {
 
     // Peer B is established
     assert!(pm_b.is_peer_established(&pm_a.local_pub));
+}
+
+#[test]
+fn copy_into_reusable_egress_preserves_capacity() {
+    let mut target = Vec::new();
+    let mut dg0 = EgressDatagram {
+        fate: 0,
+        dst: "127.0.0.1:1000".parse().unwrap(),
+        bytes: Vec::with_capacity(2048),
+    };
+    dg0.bytes.extend_from_slice(b"first datagram content");
+    target.push(dg0);
+    let target_cap = target[0].bytes.capacity();
+    assert!(target_cap >= 2048);
+
+    let src = vec![EgressDatagram {
+        fate: 1,
+        dst: "127.0.0.1:2000".parse().unwrap(),
+        bytes: b"updated datagram content".to_vec(),
+    }];
+
+    copy_into_reusable_egress(&mut target, &src);
+
+    assert_eq!(target.len(), 1);
+    assert_eq!(target[0].fate, 1);
+    assert_eq!(target[0].dst, "127.0.0.1:2000".parse().unwrap());
+    assert_eq!(&target[0].bytes, b"updated datagram content");
+    assert_eq!(
+        target[0].bytes.capacity(),
+        target_cap,
+        "existing datagram byte capacity must be preserved"
+    );
+}
+
+#[test]
+fn repeated_on_tun_under_obfuscation_retains_egress_and_scratch_capacity() {
+    let (mut pm_a, _pm_b, _ep_a, _ep_b, _kp_a, _kp_b) =
+        established_pm_pair_with_obf(100_000, [0x42u8; 32]);
+
+    let tun_pkt = dummy_tun_pkt();
+    // Warm up the circulating scratch buffers across a few cycles
+    for i in 0..6 {
+        let _ = pm_a.on_tun(&tun_pkt, 1000 + i);
+    }
+
+    // Capture the steady-state baseline capacities across the 3-buffer circulation cycle
+    let mut baseline_egress_caps = Vec::new();
+    let mut baseline_scratch_caps = Vec::new();
+    for i in 0..3 {
+        let egress = pm_a.on_tun(&tun_pkt, 2000 + i);
+        assert!(!egress.is_empty(), "egress must not be empty");
+        baseline_egress_caps.push(pm_a.egress[0].bytes.capacity());
+        baseline_scratch_caps.push(pm_a.obf_scratch.capacity());
+    }
+
+    // Repeated invocations with identical packet size (steady-state forwarding)
+    for i in 0..30 {
+        let egress = pm_a.on_tun(&tun_pkt, 3000 + i);
+        assert!(!egress.is_empty());
+        assert_eq!(
+            pm_a.egress[0].bytes.capacity(),
+            baseline_egress_caps[(i as usize) % 3],
+            "egress byte buffer capacity must remain stable without reallocating"
+        );
+        assert_eq!(
+            pm_a.obf_scratch.capacity(),
+            baseline_scratch_caps[(i as usize) % 3],
+            "obf_scratch capacity must remain stable without reallocating"
+        );
+    }
 }

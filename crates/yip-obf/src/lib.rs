@@ -117,6 +117,50 @@ fn random_nonce() -> [u8; NONCE_LEN] {
     n
 }
 
+/// Wrap `(ptype, body)` with `pad_len` random trailing padding bytes into the provided
+/// buffer `out`, reusing its allocated capacity without fresh heap allocations.
+///
+/// Returns `false` — instead of panicking — when `body.len()` exceeds `u16::MAX`
+/// and so cannot fit the envelope's `body_len` field (#44 fail-soft).
+pub fn obfuscate_into(
+    key: &[u8; 16],
+    ptype: u8,
+    body: &[u8],
+    pad_len: usize,
+    out: &mut Vec<u8>,
+) -> bool {
+    out.clear();
+    let body_len = match u16::try_from(body.len()).ok() {
+        Some(l) => l,
+        None => return false,
+    };
+    let total_len = NONCE_LEN + 3 + body.len() + pad_len;
+    out.reserve(total_len);
+    let nonce = random_nonce();
+    out.extend_from_slice(&nonce);
+    let plaintext_start = out.len();
+    out.push(ptype);
+    out.extend_from_slice(&body_len.to_be_bytes());
+    out.extend_from_slice(body);
+    out.resize(out.len() + pad_len, 0);
+
+    let mut counter: u64 = 0;
+    let mut offset = plaintext_start;
+    while offset < out.len() {
+        let mut h = SipHasher24::new_with_key(key);
+        h.write(&nonce);
+        h.write(&counter.to_be_bytes());
+        let ks = h.finish().to_be_bytes();
+        counter = counter.wrapping_add(1);
+        let chunk_len = (out.len() - offset).min(8);
+        for i in 0..chunk_len {
+            out[offset + i] ^= ks[i];
+        }
+        offset += chunk_len;
+    }
+    true
+}
+
 /// Wrap `(ptype, body)` with `pad_len` random trailing padding bytes.
 ///
 /// Returns `None` — instead of panicking — when `body.len()` exceeds
@@ -125,22 +169,12 @@ fn random_nonce() -> [u8; NONCE_LEN] {
 /// an unbounded gossip digest; the caller is expected to bound/chunk its
 /// input, but this is the fail-soft backstop).
 pub fn obfuscate(key: &[u8; 16], ptype: u8, body: &[u8], pad_len: usize) -> Option<Vec<u8>> {
-    let nonce = random_nonce();
-    let body_len = u16::try_from(body.len()).ok()?;
-    // plaintext region: type(1) ‖ body_len(2) ‖ body ‖ padding
-    let mut region = Vec::with_capacity(3 + body.len() + pad_len);
-    region.push(ptype);
-    region.extend_from_slice(&body_len.to_be_bytes());
-    region.extend_from_slice(body);
-    region.resize(region.len() + pad_len, 0); // padding masks to random anyway
-    let ks = keystream(key, &nonce, region.len());
-    for (b, k) in region.iter_mut().zip(ks.iter()) {
-        *b ^= *k;
+    let mut out = Vec::with_capacity(NONCE_LEN + 3 + body.len() + pad_len);
+    if obfuscate_into(key, ptype, body, pad_len, &mut out) {
+        Some(out)
+    } else {
+        None
     }
-    let mut out = Vec::with_capacity(NONCE_LEN + region.len());
-    out.extend_from_slice(&nonce);
-    out.extend_from_slice(&region);
-    Some(out)
 }
 
 /// Recover `(ptype, body)`, or `None` if too short / length-inconsistent.
@@ -360,5 +394,38 @@ mod tests {
         let v3 = r.next_u64();
         r2.fill(&mut single);
         assert_eq!(single[0], v3.to_le_bytes()[0]);
+    }
+
+    #[test]
+    fn obfuscate_into_roundtrips_with_deobfuscate() {
+        let key = derive_key(b"test-secret-key");
+        let mut buf = Vec::new();
+        let ok = obfuscate_into(&key, 3, b"zero-allocation payload", 25, &mut buf);
+        assert!(ok);
+        let (ptype, body) = deobfuscate(&key, &buf).expect("deobfuscates correctly");
+        assert_eq!(ptype, 3);
+        assert_eq!(body, b"zero-allocation payload");
+    }
+
+    #[test]
+    fn obfuscate_into_retains_capacity_across_repeated_invocations() {
+        let key = derive_key(b"test-secret-key");
+        let mut buf = Vec::with_capacity(1024);
+        let initial_cap = buf.capacity();
+        assert!(initial_cap >= 1024);
+
+        for i in 0..50 {
+            let payload = format!("datagram number {i}");
+            let ok = obfuscate_into(&key, 1, payload.as_bytes(), 16, &mut buf);
+            assert!(ok);
+            assert_eq!(
+                buf.capacity(),
+                initial_cap,
+                "buffer capacity must not drop or reallocate across repeated calls"
+            );
+            let (ptype, body) = deobfuscate(&key, &buf).expect("valid envelope");
+            assert_eq!(ptype, 1);
+            assert_eq!(body, payload.as_bytes());
+        }
     }
 }

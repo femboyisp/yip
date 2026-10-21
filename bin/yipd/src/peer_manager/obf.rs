@@ -178,7 +178,7 @@ impl PeerManager {
     /// as a stray zero-length datagram. `tick_gossip`'s digest chunking
     /// already keeps every gossip datagram well under this cap, so in
     /// practice this is defense-in-depth, not the expected path.
-    pub(super) fn obf_egress(&self, dgs: &mut Vec<EgressDatagram>) {
+    pub(super) fn obf_egress(&mut self, dgs: &mut Vec<EgressDatagram>) {
         let server = self.rendezvous.as_ref().map(|r| r.server_addr());
         dgs.retain_mut(|d| {
             if d.bytes.is_empty() {
@@ -189,25 +189,30 @@ impl PeerManager {
                     return true;
                 };
                 let pad = random_pad(obf_pad_max(yip_obf::RDV_TYPE, d.bytes.len() + 1));
-                return match yip_obf::obfuscate(&key, yip_obf::RDV_TYPE, &d.bytes, pad) {
-                    Some(wrapped) => {
-                        d.bytes = wrapped;
-                        true
-                    }
-                    None => false,
-                };
-            }
-            let ptype = d.bytes[0];
-            let Some(key) = self.obf_key_for_egress(d.dst, ptype) else {
-                return true;
-            };
-            let pad = random_pad(obf_pad_max(ptype, d.bytes.len()));
-            match yip_obf::obfuscate(&key, ptype, &d.bytes[1..], pad) {
-                Some(wrapped) => {
-                    d.bytes = wrapped;
+                if yip_obf::obfuscate_into(
+                    &key,
+                    yip_obf::RDV_TYPE,
+                    &d.bytes,
+                    pad,
+                    &mut self.obf_scratch,
+                ) {
+                    std::mem::swap(&mut d.bytes, &mut self.obf_scratch);
                     true
+                } else {
+                    false
                 }
-                None => false,
+            } else {
+                let ptype = d.bytes[0];
+                let Some(key) = self.obf_key_for_egress(d.dst, ptype) else {
+                    return true;
+                };
+                let pad = random_pad(obf_pad_max(ptype, d.bytes.len()));
+                if yip_obf::obfuscate_into(&key, ptype, &d.bytes[1..], pad, &mut self.obf_scratch) {
+                    std::mem::swap(&mut d.bytes, &mut self.obf_scratch);
+                    true
+                } else {
+                    false
+                }
             }
         });
     }
@@ -215,7 +220,7 @@ impl PeerManager {
     /// Wrap a single datagram under the obfuscation envelope (matching `obf_egress`),
     /// used in tests to verify datagram wire sizes under obfuscation.
     #[cfg(test)]
-    pub(super) fn obf_envelope(&self, pkt: Vec<u8>, _now: u64) -> Vec<u8> {
+    pub(super) fn obf_envelope(&mut self, pkt: Vec<u8>, _now: u64) -> Vec<u8> {
         let dst = self
             .peers
             .first()
