@@ -19,6 +19,26 @@ pub struct FlowKey {
     pub proto: u8,
 }
 
+impl FlowKey {
+    /// Return the canonical symmetric representation of this 5-tuple,
+    /// sorting endpoints lexicographically so forward and reverse packets
+    /// of the same bidirectional conversation produce identical keys.
+    #[inline]
+    pub fn canonical(&self) -> Self {
+        if (self.src, self.src_port) <= (self.dst, self.dst_port) {
+            self.clone()
+        } else {
+            Self {
+                src: self.dst,
+                dst: self.src,
+                src_port: self.dst_port,
+                dst_port: self.src_port,
+                proto: self.proto,
+            }
+        }
+    }
+}
+
 /// A user policy rule pinning matching flows to a class (highest precedence).
 #[derive(Debug, Clone)]
 pub struct PolicyRule {
@@ -75,12 +95,22 @@ impl Classifier {
             _ => {}
         }
         // 3. heuristic: observe this packet, then consult flow history
-        self.flows.observe(&p.key, inner.len(), now_ms);
-        if let Some(class) = self.flows.classify(&p.key) {
+        let canonical = p.key.canonical();
+        self.flows.observe(&canonical, inner.len(), now_ms);
+        if let Some(class) = self.flows.classify(&canonical) {
             return class;
         }
         // 4. default
         FlowClass::Default
+    }
+
+    /// Observe an ingress packet arriving from a peer to update the bidirectional
+    /// flow heuristic state without emitting a classification decision.
+    pub fn observe_ingress(&mut self, inner: &[u8], l2: bool, now_ms: u64) {
+        if let Some(p) = parse_ip(inner, l2) {
+            let canonical = p.key.canonical();
+            self.flows.observe(&canonical, inner.len(), now_ms);
+        }
     }
 }
 
@@ -281,5 +311,57 @@ mod tests {
         }
         // now the heuristic should kick in -> Realtime
         assert_eq!(c.classify(&pkt, false, 30), FlowClass::Realtime);
+    }
+
+    #[test]
+    fn canonical_flow_key_is_symmetric() {
+        let mut src = [0u8; 16];
+        src[..4].copy_from_slice(&[10, 0, 0, 1]);
+        let mut dst = [0u8; 16];
+        dst[..4].copy_from_slice(&[10, 0, 0, 2]);
+
+        let fwd = FlowKey {
+            src,
+            dst,
+            src_port: 1234,
+            dst_port: 5678,
+            proto: 6,
+        };
+        let rev = FlowKey {
+            src: dst,
+            dst: src,
+            src_port: 5678,
+            dst_port: 1234,
+            proto: 6,
+        };
+
+        assert_eq!(fwd.canonical(), rev.canonical());
+    }
+
+    #[test]
+    fn bidirectional_observation_accelerates_flow_classification() {
+        let mut c = Classifier::new(vec![]);
+
+        let make_udp = |src_ip: [u8; 4], dst_ip: [u8; 4], sport: u16, dport: u16| {
+            let mut p = vec![0u8; 100];
+            p[0] = 0x45; // IPv4, IHL 5
+            p[9] = 17; // UDP
+            p[12..16].copy_from_slice(&src_ip);
+            p[16..20].copy_from_slice(&dst_ip);
+            p[20..22].copy_from_slice(&sport.to_be_bytes());
+            p[22..24].copy_from_slice(&dport.to_be_bytes());
+            p
+        };
+
+        let fwd = make_udp([192, 168, 1, 10], [192, 168, 1, 20], 10000, 20000);
+        let rev = make_udp([192, 168, 1, 20], [192, 168, 1, 10], 20000, 10000);
+
+        // Feed 2 forward packets and 2 reverse packets, spaced at 10ms intervals.
+        assert_eq!(c.classify(&fwd, false, 0), FlowClass::Default);
+        c.observe_ingress(&rev, false, 10);
+        c.observe_ingress(&rev, false, 20);
+
+        // After the 4th packet (2 forward + 2 reverse), the flow heuristic kicks in -> Realtime.
+        assert_eq!(c.classify(&fwd, false, 30), FlowClass::Realtime);
     }
 }

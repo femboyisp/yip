@@ -440,6 +440,9 @@ impl DataPlane {
                 self.inner_scratch.clear();
                 self.inner_scratch.extend_from_slice(&inner);
 
+                self.transport
+                    .observe_ingress(&self.inner_scratch, self.l2, now_ms);
+
                 if self.l2 {
                     if let Some(src_mac) = source_mac_from_ethernet_frame(&self.inner_scratch) {
                         self.mac_table.learn(
@@ -1072,6 +1075,49 @@ mod tests {
         assert!(
             matches!(outcome2, Outcome::None),
             "replayed counter must produce Outcome::None"
+        );
+    }
+
+    #[test]
+    fn ingress_packet_observed_in_classifier() {
+        let (mut a, mut b) = dataplane_pair(TunnelMode::L3Tun, false);
+
+        let make_pkt = |src_ip: [u8; 4], dst_ip: [u8; 4], sport: u16, dport: u16| {
+            let mut p = vec![0u8; 100];
+            p[0] = 0x45; // IPv4, IHL 5
+            p[9] = 17; // UDP
+            p[12..16].copy_from_slice(&src_ip);
+            p[16..20].copy_from_slice(&dst_ip);
+            p[20..22].copy_from_slice(&sport.to_be_bytes());
+            p[22..24].copy_from_slice(&dport.to_be_bytes());
+            p
+        };
+
+        let fwd = make_pkt([10, 0, 0, 1], [10, 0, 0, 2], 1111, 2222);
+        let rev = make_pkt([10, 0, 0, 2], [10, 0, 0, 1], 2222, 1111);
+
+        // Feed 3 forward packets from A to B as ingress datagrams.
+        for t in [0, 10, 20] {
+            let dgrams = a.on_tun_packet(&fwd, t).to_vec();
+            let mut decoded = false;
+            for dg in &dgrams {
+                if let Outcome::TunWrite(_) = b.on_udp_datagram(&dg.bytes, t) {
+                    decoded = true;
+                }
+            }
+            assert!(decoded, "each TUN packet from A must decode on B");
+        }
+
+        // B now transmits a reverse packet on TUN.
+        // Because B observed the 3 ingress packets in its transport classifier,
+        // this 4th packet completes the flow heuristic warmup (4 packets within 30ms,
+        // small packets < 256 bytes) and classifies it as Realtime.
+        b.on_tun_packet(&rev, 30);
+        let b_counter = *b.sent_log.order.back().expect("b inserts sent-log entry");
+        assert_eq!(
+            b.sent_log.get(b_counter),
+            Some(FlowClass::Realtime),
+            "ingress packets must be observed in B's transport classifier"
         );
     }
 }

@@ -13,7 +13,7 @@ pub mod rlnc;
 pub use rlnc::{RlncDecoder, RlncEncoder};
 
 pub mod classify;
-pub use classify::{Classifier, PolicyRule};
+pub use classify::{Classifier, FlowKey, PolicyRule};
 
 pub mod flow;
 pub use flow::FlowTable;
@@ -180,6 +180,11 @@ impl Transport {
             .entry(idx)
             .or_insert_with(|| FecReassembler::new(params.symbol_size, 256))
             .push(object_key, symbol, now_ms, deadline_ms)
+    }
+
+    /// Update the classifier flow table with an observed decrypted ingress packet.
+    pub fn observe_ingress(&mut self, inner: &[u8], l2: bool, now_ms: u64) {
+        self.classifier.observe_ingress(inner, l2, now_ms);
     }
 
     /// Generate fresh FEC repair symbols for a previously-sent object,
