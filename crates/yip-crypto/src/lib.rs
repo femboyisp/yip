@@ -11,7 +11,13 @@
 //! byte-identical to snow's own transport state but faster.
 #![forbid(unsafe_code)]
 
+use ml_kem::{
+    array::Array,
+    kem::{Decapsulate, Encapsulate, Kem, KeyExport},
+    ml_kem_512::{self, MlKem512},
+};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+use zeroize::Zeroizing;
 
 /// The Noise parameter set: IK pattern, X25519, ChaCha20-Poly1305, BLAKE2s.
 pub(crate) const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
@@ -35,6 +41,82 @@ pub fn generate_keypair() -> Keypair {
     private.copy_from_slice(&kp.private);
     public.copy_from_slice(&kp.public);
     Keypair { private, public }
+}
+
+/// ML-KEM-512 encapsulation key length in bytes (FIPS 203).
+pub const PQ_ENCAPS_KEY_LEN: usize = 800;
+
+/// ML-KEM-512 ciphertext length in bytes (FIPS 203).
+pub const PQ_CIPHERTEXT_LEN: usize = 768;
+
+/// ML-KEM-512 shared secret length in bytes (FIPS 203).
+pub const PQ_SHARED_SECRET_LEN: usize = 32;
+
+/// An ML-KEM-512 public encapsulation key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PqEncapsKey(pub [u8; PQ_ENCAPS_KEY_LEN]);
+
+/// An ML-KEM-512 private decapsulation key wrapped in zeroizing memory.
+pub struct PqDecapsKey(pub Box<ml_kem_512::DecapsulationKey>);
+
+impl std::fmt::Debug for PqDecapsKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PqDecapsKey([REDACTED])")
+    }
+}
+
+/// An ML-KEM-512 encapsulated ciphertext.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PqCiphertext(pub [u8; PQ_CIPHERTEXT_LEN]);
+
+/// Generate a fresh ML-KEM-512 keypair.
+pub fn generate_pq_keypair() -> (PqEncapsKey, PqDecapsKey) {
+    let (dk, ek) = MlKem512::generate_keypair();
+    let ek_bytes = ek.to_bytes();
+    let mut ek_arr = [0u8; PQ_ENCAPS_KEY_LEN];
+    ek_arr.copy_from_slice(ek_bytes.as_slice());
+    (
+        PqEncapsKey(ek_arr),
+        PqDecapsKey(Box::new(dk)),
+    )
+}
+
+/// Encapsulate a shared secret toward `ek`, producing `(ciphertext, shared_secret)`.
+///
+/// Explicitly validates FIPS 203 Section 7.2 ByteDecode_12 (all 12-bit coefficients < 3329)
+/// across the first 768 bytes before invoking key encapsulation.
+pub fn pq_encapsulate(
+    ek: &PqEncapsKey,
+) -> Result<(PqCiphertext, Zeroizing<[u8; PQ_SHARED_SECRET_LEN]>), CryptoError> {
+    // FIPS 203 Section 7.2: ByteDecode_12 modulus check (all 12-bit coeffs < 3329)
+    for chunk in ek.0[..768].as_chunks::<3>().0 {
+        let d0 = u16::from(chunk[0]) | ((u16::from(chunk[1]) & 0x0F) << 8);
+        let d1 = (u16::from(chunk[1]) >> 4) | (u16::from(chunk[2]) << 4);
+        if d0 >= 3329 || d1 >= 3329 {
+            return Err(CryptoError::Handshake);
+        }
+    }
+
+    let ek_arr = Array::from(ek.0);
+    let key = ml_kem_512::EncapsulationKey::new(&ek_arr).map_err(|_| CryptoError::Handshake)?;
+    let (ct, ss) = key.encapsulate();
+    let mut ct_arr = [0u8; PQ_CIPHERTEXT_LEN];
+    ct_arr.copy_from_slice(ct.as_slice());
+    let mut ss_arr = Zeroizing::new([0u8; PQ_SHARED_SECRET_LEN]);
+    ss_arr.copy_from_slice(ss.as_slice());
+    Ok((PqCiphertext(ct_arr), ss_arr))
+}
+
+/// Decapsulate `ct` using `dk`, recovering the 32-byte shared secret wrapped in zeroizing memory.
+pub fn pq_decapsulate(
+    dk: &PqDecapsKey,
+    ct: &PqCiphertext,
+) -> Result<Zeroizing<[u8; PQ_SHARED_SECRET_LEN]>, CryptoError> {
+    let ct_arr = Array::from(ct.0);
+    let ss = dk.0.decapsulate(&ct_arr);
+    let mut ss_arr = Zeroizing::new([0u8; PQ_SHARED_SECRET_LEN]);
+    ss_arr.copy_from_slice(ss.as_slice());
+    Ok(ss_arr)
 }
 
 /// Standard profile replay window parameters (1 KB bitmap).
@@ -1609,5 +1691,43 @@ mod tests {
         let mut exact = [0u8; 16];
         let ctr2 = a.seal_in_place(&mut exact, 0).unwrap();
         assert_eq!(b.open_in_place(ctr2, &mut exact, 16).unwrap(), 0);
+    }
+
+    #[test]
+    fn pq_keypair_encapsulate_decapsulate_roundtrip() {
+        let (ek, dk) = generate_pq_keypair();
+        assert_eq!(ek.0.len(), PQ_ENCAPS_KEY_LEN);
+
+        let (ct, ss_sender) = pq_encapsulate(&ek).expect("encapsulation succeeds");
+        assert_eq!(ct.0.len(), PQ_CIPHERTEXT_LEN);
+        assert_eq!(ss_sender.len(), PQ_SHARED_SECRET_LEN);
+
+        let ss_recipient = pq_decapsulate(&dk, &ct).expect("decapsulation succeeds");
+        assert_eq!(*ss_sender, *ss_recipient, "both sides agree on 32-byte shared secret");
+    }
+
+    #[test]
+    fn pq_encapsulate_rejects_fips203_invalid_modulus() {
+        let (mut ek, _dk) = generate_pq_keypair();
+        // FIPS 203 Section 7.2 ByteDecode_12 requires all 12-bit coefficients < q (3329).
+        // Inject 0x0FFF (4095 >= 3329) into the first coefficient pair.
+        ek.0[0] = 0xFF;
+        ek.0[1] = 0x0F;
+        let res = pq_encapsulate(&ek);
+        assert!(res.is_err(), "encapsulation must reject coefficient >= 3329");
+    }
+
+    #[test]
+    fn pq_decapsulate_implicit_rejection_on_tampered_ciphertext() {
+        let (ek, dk) = generate_pq_keypair();
+        let (mut ct, ss_sender) = pq_encapsulate(&ek).expect("encapsulation succeeds");
+
+        // Tamper with the ciphertext: flip one bit in ct
+        ct.0[0] ^= 0x01;
+        let ss_recipient = pq_decapsulate(&dk, &ct).expect("decapsulation succeeds via implicit rejection");
+        assert_ne!(
+            *ss_sender, *ss_recipient,
+            "FIPS 203 implicit rejection must yield a distinct pseudorandom secret on tampered ciphertext"
+        );
     }
 }
