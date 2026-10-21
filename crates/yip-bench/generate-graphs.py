@@ -260,6 +260,41 @@ def parse_sharding_scale(sharding_path: Path):
     }
 
 
+def parse_latency_jitter(path: Path):
+    """
+    Parses crates/yip-bench/results/latency-jitter.csv.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Latency jitter CSV missing: {path}")
+
+    with path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    yip_vals = {}
+    wg_vals = {}
+    ovpn_vals = {}
+    base_vals = {}
+
+    for r in rows:
+        pct = int(r["loss_pct"])
+        if r.get("yip_ms") and r["yip_ms"].strip():
+            yip_vals[pct] = float(r["yip_ms"])
+        if r.get("wireguard_ms") and r["wireguard_ms"].strip():
+            wg_vals[pct] = float(r["wireguard_ms"])
+        if r.get("openvpn_ms") and r["openvpn_ms"].strip():
+            ovpn_vals[pct] = float(r["openvpn_ms"])
+        if r.get("baseline_ms") and r["baseline_ms"].strip():
+            base_vals[pct] = float(r["baseline_ms"])
+
+    return {
+        "yip": yip_vals,
+        "wireguard": wg_vals,
+        "openvpn": ovpn_vals,
+        "baseline": base_vals,
+    }
+
+
 def generate_throughput_loss_chart(data: dict) -> str:
     """
     Generates assets/bench-throughput-loss.svg
@@ -297,8 +332,29 @@ def generate_throughput_loss_chart(data: dict) -> str:
                     font_size=11, font_weight="600")
         cur_lx += len(label) * 7.2 + 42.0
 
+    goodput = data.get("goodput", {})
+    yip_data = goodput.get("yip", {})
+    wg_data = goodput.get("wireguard", {})
+
+    mult_3 = None
+    if 3 in yip_data and 3 in wg_data and wg_data[3] > 0:
+        mult_3 = round(yip_data[3] / wg_data[3])
+
+    mult_10 = None
+    if 10 in yip_data and 10 in wg_data and wg_data[10] > 0:
+        mult_10 = round(yip_data[10] / wg_data[10])
+
+    if mult_3 is not None and mult_10 is not None:
+        lo_mult = min(mult_3, mult_10)
+        hi_mult = max(mult_3, mult_10)
+        header_text = f"{lo_mult}\u00d7 to {hi_mult}\u00d7 higher throughput under loss"
+    elif mult_10 is not None:
+        header_text = f"{mult_10}\u00d7 higher throughput under loss"
+    else:
+        header_text = "Higher throughput under loss"
+
     # Highlight badge on right side of Row 3
-    canvas.badge(right=plot_right, y=72.0, text="33\u00d7 to 98\u00d7 higher throughput under loss",
+    canvas.badge(right=plot_right, y=72.0, text=header_text,
                  bg_fill="#1f1610", border_color="#f97316", text_color="#fb923c",
                  font_size=11, font_weight="bold", height=24.0)
 
@@ -373,16 +429,18 @@ def generate_throughput_loss_chart(data: dict) -> str:
             canvas.circle(px, py, 4.5 if is_primary else 3.5, fill=color,
                           stroke=COLOR_BG, stroke_width=1.5)
 
-    yip_data = goodput.get("yip", {})
-    wg_data = goodput.get("wireguard", {})
-
     # Callouts
     if 3 in yip_data and 3 in wg_data:
         x3 = x_coords[2]
         y_yip_3 = val_to_y(yip_data[3])
         canvas.text(x3 + 8.0, y_yip_3 - 6.0, f"{yip_data[3]:.1f}M",
                     fill=COLOR_YIP, font_size=10, font_family=FONT_MONO, font_weight="bold")
-        canvas.badge(x=x3 - 90.0, y=y_yip_3 - 34.0, text="98\u00d7 advantage (117.6 vs 1.2 Mbit/s)",
+        badge_text_3 = (
+            f"{mult_3}\u00d7 advantage ({yip_data[3]:.1f} vs {wg_data[3]:.1f} Mbit/s)"
+            if mult_3 is not None else
+            f"{yip_data[3]:.1f} vs {wg_data[3]:.1f} Mbit/s"
+        )
+        canvas.badge(x=x3 - 90.0, y=y_yip_3 - 34.0, text=badge_text_3,
                      bg_fill="#161b22", border_color=COLOR_BORDER, text_color="#f0f6fc",
                      font_size=10, font_weight="bold", height=20.0)
 
@@ -398,15 +456,21 @@ def generate_throughput_loss_chart(data: dict) -> str:
                      bg_fill="#141c2b", border_color="#38bdf8", text_color="#38bdf8",
                      font_size=10, font_weight="bold", height=20.0)
 
-        # 33x bracket annotation
+        # Bracket annotation
         canvas.line(x10 + 6.0, y_yip_10, x10 + 6.0, y_wg_10,
                     stroke=COLOR_YIP, stroke_width=1.5)
         canvas.line(x10 + 2.0, y_yip_10, x10 + 6.0, y_yip_10,
                     stroke=COLOR_YIP, stroke_width=1.5)
         canvas.line(x10 + 2.0, y_wg_10, x10 + 6.0, y_wg_10,
                     stroke=COLOR_YIP, stroke_width=1.5)
+
+        badge_text_10 = (
+            f"{mult_10}\u00d7 higher ({yip_data[10]:.1f} vs {wg_data[10]:.1f})"
+            if mult_10 is not None else
+            f"{yip_data[10]:.1f} vs {wg_data[10]:.1f}"
+        )
         canvas.badge(right=x10 - 24.0, y=(y_yip_10 + y_wg_10) / 2.0 - 10.0,
-                     text="33\u00d7 higher (16.6 vs 0.5)",
+                     text=badge_text_10,
                      bg_fill="#1f1610", border_color="#f97316", text_color="#fb923c",
                      font_size=10, font_weight="bold", height=20.0)
 
@@ -440,7 +504,7 @@ def generate_fec_recovery_chart(data: dict) -> str:
 
     # Legend at Row 3 (y = 84)
     legend_items = [
-        ("yip (0% flatline)", COLOR_YIP, False),
+        ("yip (RS-FEC)", COLOR_YIP, False),
         ("WireGuard", COLOR_WIREGUARD, False),
         ("Baseline", COLOR_BASELINE, True),
         ("OpenVPN", COLOR_OPENVPN, False),
@@ -542,9 +606,15 @@ def generate_fec_recovery_chart(data: dict) -> str:
                      font_size=10, height=20.0)
 
     if "yip" in effective and 10 in effective["yip"]:
-        y_yip = val_to_y(effective["yip"][10])
+        yip_loss_10 = effective["yip"][10]
+        y_yip = val_to_y(yip_loss_10)
+        if yip_loss_10 == 0:
+            callout_text = "0% loss (100% recovered)"
+        else:
+            rec_pct = round((10.0 - yip_loss_10) / 10.0 * 100.0)
+            callout_text = f"{int(yip_loss_10)}% loss ({rec_pct}% recovered)"
         canvas.badge(right=x10 - 14.0, y=y_yip - 38.0,
-                     text="0% loss (100% recovered)",
+                     text=callout_text,
                      bg_fill="#1f1610", border_color="#f97316", text_color="#fb923c",
                      font_size=10, height=20.0)
 
@@ -682,10 +752,14 @@ def generate_multicore_scaling_chart(data: dict) -> str:
                                 font_weight="bold", text_anchor="middle")
 
     # Annotations for 8-core AF_XDP (positioned safely inside plot box below plot_top)
-    x8 = x_coords[3]
-    y_af_8 = val_to_y(data["af_xdp_gbps"][3])
+    x8 = x_coords[-1]
+    y_af_8 = val_to_y(data["af_xdp_gbps"][-1])
+    top_gbps = data["af_xdp_gbps"][-1]
+    top_mpps = data["af_xdp_mpps"][-1]
+    base_gbps = data["af_xdp_gbps"][0]
+    speedup = top_gbps / base_gbps if base_gbps > 0 else 1.0
     canvas.badge(right=plot_right - 14.0, y=120.0,
-                 text="40.27 Gbps @ 3.93 Mpps (4.6\u00d7 speedup)",
+                 text=f"{top_gbps:.2f} Gbps @ {top_mpps:.2f} Mpps ({speedup:.1f}\u00d7 speedup)",
                  bg_fill="#161b22", border_color=COLOR_BORDER, text_color="#fb923c",
                  font_size=10, font_weight="bold", height=22.0)
 
@@ -696,7 +770,7 @@ def generate_multicore_scaling_chart(data: dict) -> str:
     return canvas.render()
 
 
-def generate_bench_latency_jitter(data: dict | None = None) -> str:
+def generate_bench_latency_jitter(data: dict) -> str:
     """
     Generates assets/bench-latency-jitter.svg
     Linear scale for Round-Trip P99 Tail Latency (0 to 240 ms) across packet loss (0% to 10%).
@@ -779,16 +853,11 @@ def generate_bench_latency_jitter(data: dict | None = None) -> str:
                 font_size=11, font_weight="600", text_anchor="middle",
                 extra_attrs=f'transform="rotate(-90 26.00 {plot_top + plot_height / 2.0:.2f})"')
 
-    # Data series points
-    default_yip = {0: 61.5, 1: 61.6, 2: 61.8, 3: 62.1, 5: 62.5, 8: 63.2, 10: 63.8}
-    default_wg = {0: 55.0, 1: 68.2, 2: 88.5, 3: 112.4, 5: 178.2, 8: 214.0, 10: 235.6}
-    default_ovpn = {0: 60.5, 1: 78.4, 2: 105.1, 3: 138.7, 5: 240.0}
-    default_base = {0: 60.6, 1: 84.1}
-
-    yip_vals = data.get("yip", default_yip) if data else default_yip
-    wg_vals = data.get("wireguard", default_wg) if data else default_wg
-    ovpn_vals = data.get("openvpn", default_ovpn) if data else default_ovpn
-    base_vals = data.get("baseline", default_base) if data else default_base
+    # Data series points from loaded dataset
+    yip_vals = data.get("yip", {})
+    wg_vals = data.get("wireguard", {})
+    ovpn_vals = data.get("openvpn", {})
+    base_vals = data.get("baseline", {})
 
     # Shaded jitter band (+/- 1.2 ms) around yip (RS-FEC)
     upper_jitter = [(x_coords[i], val_to_y(yip_vals[pct] + 1.2)) for i, pct in enumerate(loss_levels) if pct in yip_vals]
@@ -841,10 +910,12 @@ def generate_bench_latency_jitter(data: dict | None = None) -> str:
                      bg_fill="#1f1610", border_color="#f97316", text_color="#fb923c",
                      font_size=10, font_weight="bold", height=20.0)
 
-    # Callout box: Head-of-Line Blocking Suppressed
+    # Callout box: Head-of-Line Blocking Suppressed (dynamically formatted from data)
+    yip_p99_min = min(yip_vals.values()) if yip_vals else 62.0
+    wg_p99_max = max(wg_vals.values()) if wg_vals else 235.0
     callout_text_full = (
-        "Head-of-Line Blocking Suppressed: Systematic userspace RS-FEC recovers "
-        "dropped symbols in-flight, keeping P99 flat at ~62ms vs ARQ retransmission spikes to 235ms+"
+        f"Head-of-Line Blocking Suppressed: Systematic userspace RS-FEC recovers "
+        f"dropped symbols in-flight, keeping P99 flat at ~{yip_p99_min:.0f}ms vs ARQ retransmission spikes to {wg_p99_max:.0f}ms+"
     )
     box_x = plot_left + 16.0
     box_y = plot_top + 16.0
@@ -858,7 +929,7 @@ def generate_bench_latency_jitter(data: dict | None = None) -> str:
                 fill=COLOR_YIP, font_size=11, font_weight="bold")
     canvas.text(box_x + 12.0, box_y + 36.0, "Systematic userspace RS-FEC recovers dropped symbols in-flight,",
                 fill=COLOR_TEXT_MAIN, font_size=9.5)
-    canvas.text(box_x + 12.0, box_y + 51.0, "keeping P99 flat at ~62ms vs ARQ retransmission spikes to 235ms+.",
+    canvas.text(box_x + 12.0, box_y + 51.0, f"keeping P99 flat at ~{yip_p99_min:.0f}ms vs ARQ retransmission spikes to {wg_p99_max:.0f}ms+.",
                 fill=COLOR_TEXT_MUTED, font_size=9.5)
 
     # Bottom note footer
@@ -883,6 +954,7 @@ def main():
 
     wan_history_path = repo_root / "crates" / "yip-bench" / "wan" / "results" / "history.csv"
     sharding_scale_path = repo_root / "crates" / "yip-bench" / "results" / "sharding-scale.csv"
+    latency_jitter_path = repo_root / "crates" / "yip-bench" / "results" / "latency-jitter.csv"
     assets_dir = repo_root / "assets"
 
     if not wan_history_path.exists():
@@ -893,14 +965,19 @@ def main():
         print(f"Error: Sharding scale CSV missing: {sharding_scale_path}", file=sys.stderr)
         sys.exit(1)
 
+    if not latency_jitter_path.exists():
+        print(f"Error: Latency jitter CSV missing: {latency_jitter_path}", file=sys.stderr)
+        sys.exit(1)
+
     wan_data = parse_wan_history(wan_history_path)
     sharding_data = parse_sharding_scale(sharding_scale_path)
+    latency_data = parse_latency_jitter(latency_jitter_path)
 
     targets = {
         assets_dir / "bench-throughput-loss.svg": generate_throughput_loss_chart(wan_data),
         assets_dir / "bench-fec-recovery.svg": generate_fec_recovery_chart(wan_data),
         assets_dir / "bench-multicore-scaling.svg": generate_multicore_scaling_chart(sharding_data),
-        assets_dir / "bench-latency-jitter.svg": generate_bench_latency_jitter(),
+        assets_dir / "bench-latency-jitter.svg": generate_bench_latency_jitter(latency_data),
     }
 
     # Validate generated XML syntax
