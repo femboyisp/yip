@@ -35,6 +35,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 TMPDIR_TEST="$(mktemp -d /tmp/yip-iperf-compare.XXXXXX)"
+chmod 755 "$TMPDIR_TEST"
 
 # ── yip ───────────────────────────────────────────────────────────────────────
 NS_YA="ipfYA"; NS_YB="ipfYB"; VYA="ipfvYA"; VYB="ipfvYB"
@@ -284,20 +285,28 @@ setup_wg() {
     fi
     echo "[wg] generating keypairs"
     local privA pubA privB pubB
-    privA="$(wg genkey)"; pubA="$(echo "$privA" | wg pubkey)"
-    privB="$(wg genkey)"; pubB="$(echo "$privB" | wg pubkey)"
+    privA="$(wg genkey 2>/dev/null || true)"; pubA="$(echo "$privA" | wg pubkey 2>/dev/null || true)"
+    privB="$(wg genkey 2>/dev/null || true)"; pubB="$(echo "$privB" | wg pubkey 2>/dev/null || true)"
+    if [ -z "$privA" ] || [ -z "$privB" ]; then
+        echo "[wg] SKIP: key generation failed"; WG_AVAILABLE=false; return
+    fi
     echo "[wg] creating namespaces and veth pair"
     make_pair "$NS_WA" "$NS_WB" "$VWA" "$VWB" "$VWA_IP" "$VWB_IP"
-    ip netns exec "$NS_WA" ip link add wg0 type wireguard
-    ip netns exec "$NS_WB" ip link add wg0 type wireguard
+    if ! ip netns exec "$NS_WA" ip link add wg0 type wireguard 2>/dev/null || \
+       ! ip netns exec "$NS_WB" ip link add wg0 type wireguard 2>/dev/null; then
+        echo "[wg] SKIP: wireguard interface creation failed"; WG_AVAILABLE=false; return
+    fi
+    printf '%s' "$privA" > "$TMPDIR_TEST/wg_a"
+    printf '%s' "$privB" > "$TMPDIR_TEST/wg_b"
+    chmod 600 "$TMPDIR_TEST/wg_a" "$TMPDIR_TEST/wg_b"
+    if ! ip netns exec "$NS_WA" wg set wg0 private-key "$TMPDIR_TEST/wg_a" listen-port "$WPORT_A" \
+            peer "$pubB" endpoint "${VWB_IP}:${WPORT_B}" allowed-ips "${TUN_WB_IP}/32" 2>/dev/null || \
+       ! ip netns exec "$NS_WB" wg set wg0 private-key "$TMPDIR_TEST/wg_b" listen-port "$WPORT_B" \
+            peer "$pubA" endpoint "${VWA_IP}:${WPORT_A}" allowed-ips "${TUN_WA_IP}/32" 2>/dev/null; then
+        echo "[wg] SKIP: wg set configuration failed"; WG_AVAILABLE=false; return
+    fi
     ip netns exec "$NS_WA" ip addr add "${TUN_WA_IP}/24" dev wg0
     ip netns exec "$NS_WB" ip addr add "${TUN_WB_IP}/24" dev wg0
-    echo "$privA" > "$TMPDIR_TEST/wgA.key"
-    echo "$privB" > "$TMPDIR_TEST/wgB.key"
-    ip netns exec "$NS_WA" wg set wg0 listen-port "$WPORT_A" private-key "$TMPDIR_TEST/wgA.key" \
-        peer "$pubB" endpoint "${VWB_IP}:${WPORT_B}" allowed-ips "${TUN_WB_IP}/32"
-    ip netns exec "$NS_WB" wg set wg0 listen-port "$WPORT_B" private-key "$TMPDIR_TEST/wgB.key" \
-        peer "$pubA" endpoint "${VWA_IP}:${WPORT_A}" allowed-ips "${TUN_WA_IP}/32"
     ip netns exec "$NS_WA" ip link set wg0 up
     ip netns exec "$NS_WB" ip link set wg0 up
     sleep 0.5
@@ -326,8 +335,11 @@ setup_awg() {
     fi
     echo "[awg] generating keypairs"
     local privA pubA privB pubB
-    privA="$(awg genkey)"; pubA="$(echo "$privA" | awg pubkey)"
-    privB="$(awg genkey)"; pubB="$(echo "$privB" | awg pubkey)"
+    privA="$(awg genkey 2>/dev/null || true)"; pubA="$(echo "$privA" | awg pubkey 2>/dev/null || true)"
+    privB="$(awg genkey 2>/dev/null || true)"; pubB="$(echo "$privB" | awg pubkey 2>/dev/null || true)"
+    if [ -z "$privA" ] || [ -z "$privB" ]; then
+        echo "[awg] SKIP: key generation failed"; AWG_AVAILABLE=false; return
+    fi
     echo "[awg] creating namespaces and veth pair"
     make_pair "$NS_AA" "$NS_AB" "$VAA" "$VAB" "$VAA_IP" "$VAB_IP"
     if [ "$use_go" = true ]; then
@@ -335,8 +347,10 @@ setup_awg() {
         ip netns exec "$NS_AB" amneziawg-go awg0 >"$TMPDIR_TEST/awg-go-b.log" 2>&1 &
         sleep 0.5
     else
-        ip netns exec "$NS_AA" ip link add awg0 type amneziawg
-        ip netns exec "$NS_AB" ip link add awg0 type amneziawg
+        if ! ip netns exec "$NS_AA" ip link add awg0 type amneziawg 2>/dev/null || \
+           ! ip netns exec "$NS_AB" ip link add awg0 type amneziawg 2>/dev/null; then
+            echo "[awg] SKIP: amneziawg link add failed"; AWG_AVAILABLE=false; return
+        fi
     fi
     ip netns exec "$NS_AA" ip addr add "${TUN_AA_IP}/24" dev awg0
     ip netns exec "$NS_AB" ip addr add "${TUN_AB_IP}/24" dev awg0
@@ -381,9 +395,12 @@ PublicKey = $pubA
 Endpoint = ${VAA_IP}:${APORT_A}
 AllowedIPs = ${TUN_AA_IP}/32
 EOF
+    chmod 600 "$CFG_AA" "$CFG_AB"
 
-    ip netns exec "$NS_AA" awg setconf awg0 "$CFG_AA"
-    ip netns exec "$NS_AB" awg setconf awg0 "$CFG_AB"
+    if ! ip netns exec "$NS_AA" awg setconf awg0 "$CFG_AA" 2>/dev/null || \
+       ! ip netns exec "$NS_AB" awg setconf awg0 "$CFG_AB" 2>/dev/null; then
+        echo "[awg] SKIP: awg setconf failed"; AWG_AVAILABLE=false; return
+    fi
     ip netns exec "$NS_AA" ip link set awg0 up
     ip netns exec "$NS_AB" ip link set awg0 up
     sleep 0.5
@@ -408,6 +425,7 @@ setup_ovpn() {
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -keyout "$TMPDIR_TEST/ovpn-b.key" -out "$TMPDIR_TEST/ovpn-b.crt" \
         -days 1 -nodes -subj "/CN=ovpn-b" >/dev/null 2>&1
+    chmod 600 "$TMPDIR_TEST/ovpn-a.key" "$TMPDIR_TEST/ovpn-b.key"
     local FA FB
     FA="$(openssl x509 -in "$TMPDIR_TEST/ovpn-a.crt" -noout -fingerprint -sha256 \
         | cut -d= -f2)"
