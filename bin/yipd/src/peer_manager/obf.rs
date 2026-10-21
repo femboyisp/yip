@@ -211,6 +211,20 @@ impl PeerManager {
             }
         });
     }
+
+    /// Wrap a single datagram under the obfuscation envelope (matching `obf_egress`),
+    /// used in tests to verify datagram wire sizes under obfuscation.
+    #[cfg(test)]
+    pub(super) fn obf_envelope(&self, pkt: Vec<u8>, _now: u64) -> Vec<u8> {
+        let dst = self
+            .peers
+            .first()
+            .and_then(|p| p.endpoint)
+            .unwrap_or_else(|| "127.0.0.1:0".parse().unwrap());
+        let mut dgs = vec![EgressDatagram { fate: 0, dst, bytes: pkt }];
+        self.obf_egress(&mut dgs);
+        dgs.pop().map(|d| d.bytes).unwrap_or_default()
+    }
 }
 
 #[cfg(test)]

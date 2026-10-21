@@ -46,18 +46,19 @@
 //!
 //! # What this tool checks instead — sound, and still on-wire
 //!
-//! Noise_IK's very first token of *both* messages is `e`: the sender's
-//! ephemeral public key, written to the message IN CLEARTEXT (Noise mixes
-//! it into the running hash but never encrypts it — there is no cipher key
-//! yet when writing the first token of message 1, and message 2's leading
-//! `e` is likewise unencrypted per the Noise spec). So the first 32 bytes
-//! after the 1-byte `PacketType` prefix of every `[HandshakeInit]` /
-//! `[HandshakeResp]` datagram (`bin/yipd/src/handshake.rs`'s wire format)
-//! are a raw, unencrypted, freshly-random 32-byte key — visible to any
-//! passive observer, no key material needed at all. Counting *distinct*
+//! In Noise-IKpsk2, the sender's ephemeral public key `e` is written to the
+//! message IN CLEARTEXT (Noise mixes it into the running hash but never
+//! encrypts it — there is no cipher key yet when writing the first token of
+//! message 1, and message 2's leading `e` is likewise unencrypted per the
+//! Noise spec). For `[HandshakeInit]`, the first 32 bytes after the 1-byte
+//! `PacketType` prefix (`init_pkt[1..33]`) are the raw, unencrypted 32-byte
+//! ephemeral key. For `[HandshakeResp]`, the datagram carries a 768-byte
+//! ML-KEM ciphertext before the 32-byte Noise ephemeral, so the ephemeral is
+//! located at `resp_pkt[769..801]`. In both cases, the ephemeral is visible
+//! to any passive observer, no key material needed at all. Counting *distinct*
 //! cleartext ephemeral keys across the run's `[HandshakeInit]`/
 //! `[HandshakeResp]` datagrams is therefore direct, unambiguous, on-wire
-//! evidence of N independently-completed Noise-IK handshake rounds (a
+//! evidence of N independently-completed Noise-IKpsk2 handshake rounds (a
 //! replay/retransmit of the SAME round reuses the SAME ephemeral, since
 //! `handshake.rs`'s retry logic resends the same message rather than
 //! restarting the handshake — see `PeerManager`'s

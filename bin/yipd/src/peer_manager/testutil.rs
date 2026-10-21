@@ -276,6 +276,15 @@ pub(super) fn established_pm_pair(
     pm_a.rekey_interval_ms = interval_ms;
     pm_b.rekey_interval_ms = interval_ms;
 
+    peer_test_key_registry()
+        .lock()
+        .unwrap()
+        .insert(kp_b.public, (kp_b.private, [0xBB; 32]));
+    peer_test_key_registry()
+        .lock()
+        .unwrap()
+        .insert(kp_a.public, (kp_a.private, [0xAA; 32]));
+
     let init = pm_a.on_tun(&dummy_tun_pkt(), 0)[0].bytes.clone();
     let resp = resp_bytes(&pm_b.on_udp(ep_a, &init, 0));
     assert_eq!(resp.len(), 1, "cold-start init must produce one resp");
@@ -331,6 +340,15 @@ pub(super) fn established_pm_pair_with_obf(
     pm_b.rekey_interval_ms = interval_ms;
     pm_a.set_obf_psk(Some(psk));
     pm_b.set_obf_psk(Some(psk));
+
+    peer_test_key_registry()
+        .lock()
+        .unwrap()
+        .insert(kp_b.public, (kp_b.private, [0xBB; 32]));
+    peer_test_key_registry()
+        .lock()
+        .unwrap()
+        .insert(kp_a.public, (kp_a.private, [0xAA; 32]));
 
     let dgs = pm_a.on_tun(&dummy_tun_pkt(), 0);
     // When obf is on, begin_handshake emits junk bursts followed by the HandshakeInit
