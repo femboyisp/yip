@@ -37,19 +37,22 @@ maintainer.
   under `OBF_MTU_BUDGET = 1200` bytes with deadlock-free outer framing, FIPS 203 Section 7.2 modulus
   validation, IND-CCA2 implicit rejection, zero allocations in the data plane, and ~120s ephemeral
   rotation.
+- **Phase 3 rigor, benchmarks & wire format ceremony (#148)** — deterministic P99 tail latency
+  and jitter chart (`assets/bench-latency-jitter.svg`) visualizing flat ~62ms latency under loss,
+  deterministic wire format and cryptographic ceremony diagram generator (`crates/yip-bench/generate-wire-format.py` ->
+  `assets/wire-format.svg`) with CI gating, 100.0% mutation test score across 1,020 mutants (0 missed
+  across `yip-wire`, `yip-crypto`, `yip-transport`, `yip-obf`, `yip-membership`, `yip-rendezvous`),
+  and academic literature review synthesized in `README.md`.
 
 ## Now
-
-- **Mutation test hardening** — kill remaining surviving mutants across `yip-obf`, `yip-membership`,
-  `yip-rendezvous`, `yip-crypto`, `yip-wire`, and `yip-transport` to reach zero missed mutants
-  across the core logic crates.
-
-## Next
 
 - **Throughput 4c: MTU-aware packetization (#59)** — dynamic MSS clamping and adaptive path
   MTU discovery.
 - **SipHash header-auth optimization (#58)** — streaming and SIMD acceleration for wire header
   authentication.
+
+## Next
+
 - **REALITY P256/P384 server-side KEX + HTTP/2 decoy (#84)** — broadening cipher suites and
   HTTP/2 decoy multiplexing.
 - **Traffic-analysis defense** — jittered cover traffic cadence and packet size shaping.
