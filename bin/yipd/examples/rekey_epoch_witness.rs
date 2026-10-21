@@ -214,8 +214,8 @@ fn parse_eth_ipv4_udp(pkt: &[u8]) -> Option<UdpPkt> {
 const TYPE_HANDSHAKE_INIT: u8 = 0;
 const TYPE_HANDSHAKE_RESP: u8 = 1;
 const TYPE_DATA: u8 = 2;
-/// 1-byte PacketType prefix + 32-byte cleartext Noise ephemeral pubkey.
-const MIN_HANDSHAKE_LEN: usize = 33;
+const MIN_INIT_LEN: usize = 33;
+const MIN_RESP_LEN: usize = 801;
 
 /// `yip_rendezvous::proto::Tag::RelaySend` / `Tag::RelayDeliver` (see
 /// `crates/yip-rendezvous/src/proto.rs`). Only meaningful when the
@@ -271,24 +271,31 @@ fn main() {
         } else {
             &p.payload
         };
-        if inner.len() < MIN_HANDSHAKE_LEN {
+        if inner.is_empty() {
             continue;
         }
-        let ephemeral: [u8; 32] = inner[1..33].try_into().expect("32 bytes");
         match inner[0] {
             TYPE_HANDSHAKE_INIT => {
+                if inner.len() < MIN_INIT_LEN {
+                    continue;
+                }
+                let ephemeral: [u8; 32] = inner[1..33].try_into().expect("32 bytes");
                 init_pkt_count += 1;
                 if !init_ephemerals.contains(&ephemeral) {
                     init_ephemerals.push(ephemeral);
                 }
             }
             TYPE_HANDSHAKE_RESP => {
+                if inner.len() < MIN_RESP_LEN {
+                    continue;
+                }
+                let ephemeral: [u8; 32] = inner[769..801].try_into().expect("32 bytes");
                 resp_pkt_count += 1;
                 if !resp_ephemerals.contains(&ephemeral) {
                     resp_ephemerals.push(ephemeral);
                 }
             }
-            _ => {}
+            _ => continue,
         }
     }
 
