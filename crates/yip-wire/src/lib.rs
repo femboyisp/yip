@@ -3,7 +3,7 @@
 //! milestone establishes the public surface later crates depend on.
 #![forbid(unsafe_code)]
 
-use siphasher::sip::SipHasher24;
+use siphasher::sip::SipHasher13;
 use std::hash::Hasher;
 use subtle::ConstantTimeEq;
 
@@ -48,26 +48,37 @@ fn read_header(bytes: &[u8; HEADER_LEN]) -> (u64, u16, [u8; 4], u8) {
     (conn_tag, object_id, payload_id, flags)
 }
 
-/// Compute the 8-byte coverage-auth tag over `covered` under `auth_key`.
-fn auth_tag(auth_key: &[u8; 16], covered: &[u8]) -> [u8; TAG_LEN] {
-    let mut hasher = SipHasher24::new_with_key(auth_key);
-    hasher.write(covered);
+/// Compute the 8-byte coverage-auth tag over `header` and `payload` under `auth_key`.
+///
+/// Feeds the slices sequentially into `SipHasher13` without allocating intermediate buffers.
+#[inline]
+fn auth_tag(auth_key: &[u8; 16], header: &[u8; HEADER_LEN], payload: &[u8]) -> [u8; TAG_LEN] {
+    let mut hasher = SipHasher13::new_with_key(auth_key);
+    hasher.write(header);
+    hasher.write(payload);
     hasher.finish().to_be_bytes()
 }
 
-/// Generate `n` mask bytes as a SipHash-CTR keystream under `hp_key`,
-/// seeded by `sample`. Block i = SipHash24(hp_key, sample ‖ i_be_u32).
-fn keystream(hp_key: &[u8; 16], sample: &[u8], n: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(n);
-    let mut counter: u32 = 0;
-    while out.len() < n {
-        let mut hasher = SipHasher24::new_with_key(hp_key);
-        hasher.write(sample);
-        hasher.write(&counter.to_be_bytes());
-        out.extend_from_slice(&hasher.finish().to_be_bytes());
-        counter += 1;
-    }
-    out.truncate(n);
+/// Generate the 15-byte header protection mask as a SipHash-1-3 CTR keystream under `hp_key`,
+/// seeded by `sample` (the 8-byte auth tag).
+///
+/// Computed entirely on the stack into a fixed `[u8; HEADER_LEN]` buffer (zero heap allocation).
+#[inline]
+fn header_mask(hp_key: &[u8; 16], sample: &[u8]) -> [u8; HEADER_LEN] {
+    let mut out = [0u8; HEADER_LEN];
+
+    // Block 0: SipHash13(hp_key, sample ‖ 0_u32) -> 8 bytes
+    let mut h0 = SipHasher13::new_with_key(hp_key);
+    h0.write(sample);
+    h0.write(&0u32.to_be_bytes());
+    out[0..8].copy_from_slice(&h0.finish().to_be_bytes());
+
+    // Block 1: SipHash13(hp_key, sample ‖ 1_u32) -> 8 bytes (truncate to 7 bytes to fill 15)
+    let mut h1 = SipHasher13::new_with_key(hp_key);
+    h1.write(sample);
+    h1.write(&1u32.to_be_bytes());
+    out[8..15].copy_from_slice(&h1.finish().to_be_bytes()[..7]);
+
     out
 }
 
@@ -114,15 +125,14 @@ pub trait WireCodec {
 impl WireCodec for Codec {
     fn frame(&self, frame: &Frame) -> Vec<u8> {
         let header = write_header(frame);
+        let tag = auth_tag(&self.auth_key, &header, &frame.payload);
+        let mask = header_mask(&self.hp_key, &tag);
+
         let mut out = Vec::with_capacity(HEADER_LEN + frame.payload.len() + TAG_LEN);
         out.extend_from_slice(&header);
-        out.extend_from_slice(&frame.payload);
-        // Authenticate header‖payload, then append the tag.
-        let tag = auth_tag(&self.auth_key, &out);
-        out.extend_from_slice(&tag);
-        // Header-protect: XOR a keyed mask (seeded by the tag) over the header.
-        let mask = keystream(&self.hp_key, &tag, HEADER_LEN);
         xor_in_place(&mut out[..HEADER_LEN], &mask);
+        out.extend_from_slice(&frame.payload);
+        out.extend_from_slice(&tag);
         out
     }
 
@@ -131,17 +141,15 @@ impl WireCodec for Codec {
             return Err(WireError::Malformed);
         }
         let tag = &datagram[datagram.len() - TAG_LEN..];
-        // Recover the header by removing the keyed mask (seeded by the tag).
-        let mask = keystream(&self.hp_key, tag, HEADER_LEN);
+        // Recover the header by removing the keyed mask (seeded by the tag) entirely on the stack.
+        let mask = header_mask(&self.hp_key, tag);
         let mut header = [0u8; HEADER_LEN];
         header.copy_from_slice(&datagram[..HEADER_LEN]);
         xor_in_place(&mut header, &mask);
         let payload = &datagram[HEADER_LEN..datagram.len() - TAG_LEN];
-        // Recompute the tag over recovered-header‖payload and compare in constant time.
-        let mut authed = Vec::with_capacity(HEADER_LEN + payload.len());
-        authed.extend_from_slice(&header);
-        authed.extend_from_slice(payload);
-        let expected = auth_tag(&self.auth_key, &authed);
+
+        // Recompute the tag over recovered-header‖payload using streaming multi-slice (zero alloc).
+        let expected = auth_tag(&self.auth_key, &header, payload);
         if expected.ct_eq(tag).unwrap_u8() != 1 {
             return Err(WireError::AuthFailed);
         }
@@ -164,13 +172,37 @@ mod tests {
     fn auth_tag_is_keyed_and_covers_input() {
         let k1 = [1u8; 16];
         let k2 = [2u8; 16];
-        let a = auth_tag(&k1, b"hello");
-        let b = auth_tag(&k1, b"hello");
-        let c = auth_tag(&k1, b"hellp"); // one byte different
-        let d = auth_tag(&k2, b"hello"); // different key
+        let h1 = [0x11u8; HEADER_LEN];
+        let h2 = [0x22u8; HEADER_LEN];
+        let a = auth_tag(&k1, &h1, b"hello");
+        let b = auth_tag(&k1, &h1, b"hello");
+        let c = auth_tag(&k1, &h1, b"hellp"); // one payload byte different
+        let d = auth_tag(&k2, &h1, b"hello"); // different key
+        let e = auth_tag(&k1, &h2, b"hello"); // different header
         assert_eq!(a, b, "deterministic for same key+input");
-        assert_ne!(a, c, "changes when covered bytes change");
+        assert_ne!(a, c, "changes when payload bytes change");
         assert_ne!(a, d, "changes when key changes");
+        assert_ne!(a, e, "changes when header bytes change");
+    }
+
+    #[test]
+    fn auth_tag_multi_slice_matches_contiguous() {
+        let key = [0x42u8; 16];
+        let header = [0x33u8; HEADER_LEN];
+        let payload = vec![0x77u8; 1200];
+        let tag = auth_tag(&key, &header, &payload);
+
+        let mut ref_hasher = SipHasher13::new_with_key(&key);
+        let mut contiguous = Vec::with_capacity(HEADER_LEN + payload.len());
+        contiguous.extend_from_slice(&header);
+        contiguous.extend_from_slice(&payload);
+        ref_hasher.write(&contiguous);
+        let expected = ref_hasher.finish().to_be_bytes();
+
+        assert_eq!(
+            tag, expected,
+            "streaming multi-slice matches contiguous hash"
+        );
     }
 
     #[test]
@@ -186,11 +218,11 @@ mod tests {
     }
 
     #[test]
-    fn keystream_masks_reversibly_and_hides_constants() {
+    fn header_mask_masks_reversibly_and_hides_constants() {
         let hp = [3u8; 16];
         let sample = [0xAAu8; TAG_LEN];
         let mut header = [0u8; HEADER_LEN]; // all-zero "constant" header
-        let mask = keystream(&hp, &sample, HEADER_LEN);
+        let mask = header_mask(&hp, &sample);
         assert_eq!(mask.len(), HEADER_LEN);
         xor_in_place(&mut header, &mask);
         assert_ne!(
@@ -201,24 +233,21 @@ mod tests {
         xor_in_place(&mut header, &mask);
         assert_eq!(header, [0u8; HEADER_LEN], "masking is reversible");
         // a different sample yields a different stream
-        let mask2 = keystream(&hp, &[0xBBu8; TAG_LEN], HEADER_LEN);
+        let mask2 = header_mask(&hp, &[0xBBu8; TAG_LEN]);
         assert_ne!(mask, mask2);
     }
 
-    /// `keystream` must advance its internal counter so successive 8-byte
-    /// blocks are distinct.  Kills the `counter += 1` → `counter *= 1` mutant
-    /// (line 68): with `*= 1` the counter stays at 0 forever, every block is
-    /// the same hash output, so the two halves of a 16-byte stream are equal.
+    /// `header_mask` must advance its internal block counter so successive blocks
+    /// (Block 0 = bytes 0..8, Block 1 = bytes 8..15) are distinct.
     #[test]
-    fn keystream_consecutive_blocks_are_distinct() {
+    fn header_mask_consecutive_blocks_are_distinct() {
         let hp = [7u8; 16];
         let sample = [0x55u8; TAG_LEN];
-        // Request exactly two SipHash-CTR blocks (16 bytes = 2 × 8).
-        let stream = keystream(&hp, &sample, 16);
-        assert_eq!(stream.len(), 16);
+        let mask = header_mask(&hp, &sample);
+        assert_eq!(mask.len(), HEADER_LEN);
         assert_ne!(
-            stream[..8],
-            stream[8..],
+            &mask[..7],
+            &mask[8..15],
             "block-0 (counter=0) and block-1 (counter=1) must differ"
         );
     }
