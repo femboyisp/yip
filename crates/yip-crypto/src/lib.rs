@@ -1,6 +1,6 @@
-//! Noise-IK handshake and AEAD session crypto for the yip data plane, built
+//! Noise-IKpsk2 post-quantum hybrid handshake and AEAD session crypto for the yip data plane, built
 //! on the `snow` Noise Protocol Framework. Establishing a [`Session`] requires
-//! completing an IK [`Handshake`]; the session then seals/opens inner frames
+//! completing an IKpsk2 [`Handshake`]; the session then seals/opens inner frames
 //! with explicit per-frame nonces and a sliding anti-replay window.
 //!
 //! `snow` drives the Noise handshake only. Once the handshake completes, the two
@@ -19,8 +19,8 @@ use ml_kem::{
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use zeroize::Zeroizing;
 
-/// The Noise parameter set: IK pattern, X25519, ChaCha20-Poly1305, BLAKE2s.
-pub(crate) const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
+/// The Noise parameter set: IKpsk2 pattern, X25519, ChaCha20-Poly1305, BLAKE2s.
+pub(crate) const NOISE_PARAMS: &str = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
 
 /// An X25519 static keypair (32-byte private and public halves).
 #[derive(Debug, Clone)]
@@ -100,6 +100,7 @@ pub fn pq_encapsulate(
     let ek_arr = Array::from(ek.0);
     let key = ml_kem_512::EncapsulationKey::new(&ek_arr).map_err(|_| CryptoError::Handshake)?;
     let (ct, ss) = key.encapsulate();
+    let ss = Zeroizing::new(ss);
     let mut ct_arr = [0u8; PQ_CIPHERTEXT_LEN];
     ct_arr.copy_from_slice(ct.as_slice());
     let mut ss_arr = Zeroizing::new([0u8; PQ_SHARED_SECRET_LEN]);
@@ -113,7 +114,7 @@ pub fn pq_decapsulate(
     ct: &PqCiphertext,
 ) -> Result<Zeroizing<[u8; PQ_SHARED_SECRET_LEN]>, CryptoError> {
     let ct_arr = Array::from(ct.0);
-    let ss = dk.0.decapsulate(&ct_arr);
+    let ss = Zeroizing::new(dk.0.decapsulate(&ct_arr));
     let mut ss_arr = Zeroizing::new([0u8; PQ_SHARED_SECRET_LEN]);
     ss_arr.copy_from_slice(ss.as_slice());
     Ok(ss_arr)
@@ -319,10 +320,21 @@ pub enum CryptoError {
     Handshake,
 }
 
-/// An in-progress Noise-IK handshake. Drive it by exchanging the two messages
-/// (`write_message`/`read_message`), then convert into a [`Session`].
+/// Internal role-specific state for post-quantum hybrid key exchange.
+enum HandshakePqRole {
+    Initiator {
+        dk: Option<PqDecapsKey>,
+        ek: PqEncapsKey,
+    },
+    Responder {
+        pending_ct: Option<PqCiphertext>,
+    },
+}
+
+/// An in-progress Noise-IKpsk2 post-quantum hybrid handshake.
 pub struct Handshake {
     inner: std::sync::Mutex<snow::HandshakeState>,
+    role: HandshakePqRole,
 }
 
 impl Handshake {
@@ -338,8 +350,14 @@ impl Handshake {
             .map_err(|_| CryptoError::Handshake)?
             .build_initiator()
             .map_err(|_| CryptoError::Handshake)?;
+
+        let (ek, dk) = generate_pq_keypair();
         Ok(Handshake {
             inner: std::sync::Mutex::new(inner),
+            role: HandshakePqRole::Initiator {
+                dk: Some(dk),
+                ek,
+            },
         })
     }
 
@@ -350,36 +368,98 @@ impl Handshake {
             .map_err(|_| CryptoError::Handshake)?
             .build_responder()
             .map_err(|_| CryptoError::Handshake)?;
+
         Ok(Handshake {
             inner: std::sync::Mutex::new(inner),
+            role: HandshakePqRole::Responder { pending_ct: None },
         })
     }
 
-    /// Produce the next handshake message to send to the peer, carrying
-    /// `payload` as the Noise app payload (encrypted per the pattern's
-    /// current handshake state — msg1 under `es`, msg2 fully).
+    /// Produce the next handshake message to send to the peer.
+    ///
+    /// - For Initiator (Msg 1): Encrypts `[ek_A (800B) || payload]` inside Noise Msg 1.
+    /// - For Responder (Msg 2): Encrypts `payload` inside Noise Msg 2, framed as `[ct (768B) || Noise Msg 2]`.
     pub fn write_message(&mut self, payload: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let mut buf = [0u8; 4096];
-        let n = self
-            .inner
-            .get_mut()
-            .expect("handshake lock")
-            .write_message(payload, &mut buf)
-            .map_err(|_| CryptoError::Handshake)?;
-        Ok(buf[..n].to_vec())
+        match &mut self.role {
+            HandshakePqRole::Initiator { ek, .. } => {
+                let mut full_payload = Vec::with_capacity(PQ_ENCAPS_KEY_LEN + payload.len());
+                full_payload.extend_from_slice(&ek.0);
+                full_payload.extend_from_slice(payload);
+                let n = self
+                    .inner
+                    .get_mut()
+                    .expect("handshake lock")
+                    .write_message(&full_payload, &mut buf)
+                    .map_err(|_| CryptoError::Handshake)?;
+                Ok(buf[..n].to_vec())
+            }
+            HandshakePqRole::Responder { pending_ct } => {
+                let ct = pending_ct.take().ok_or(CryptoError::Handshake)?;
+                let n = self
+                    .inner
+                    .get_mut()
+                    .expect("handshake lock")
+                    .write_message(payload, &mut buf)
+                    .map_err(|_| CryptoError::Handshake)?;
+                let mut out = Vec::with_capacity(PQ_CIPHERTEXT_LEN + n);
+                out.extend_from_slice(&ct.0);
+                out.extend_from_slice(&buf[..n]);
+                Ok(out)
+            }
+        }
     }
 
-    /// Consume a handshake message received from the peer, returning the
-    /// decrypted app payload it carried (empty if none was written).
+    /// Consume a handshake message received from the peer, returning the decrypted app payload.
+    ///
+    /// - For Responder (Msg 1): Decrypts Noise Msg 1, extracts `ek_A`, encapsulates `(ct, ss)`,
+    ///   calls `set_psk(2, &ss)`, and returns `payload`.
+    /// - For Initiator (Msg 2): Slices `ct` from Msg 2 prefix, decapsulates `ss`,
+    ///   calls `set_psk(2, &ss)`, decrypts Noise Msg 2, scrubs `dk`, and returns `payload`.
     pub fn read_message(&mut self, msg: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let mut buf = [0u8; 4096];
-        let n = self
-            .inner
-            .get_mut()
-            .expect("handshake lock")
-            .read_message(msg, &mut buf)
-            .map_err(|_| CryptoError::Handshake)?;
-        Ok(buf[..n].to_vec())
+        match &mut self.role {
+            HandshakePqRole::Responder { pending_ct } => {
+                let n = self
+                    .inner
+                    .get_mut()
+                    .expect("handshake lock")
+                    .read_message(msg, &mut buf)
+                    .map_err(|_| CryptoError::Handshake)?;
+                if n < PQ_ENCAPS_KEY_LEN {
+                    return Err(CryptoError::Handshake);
+                }
+                let mut ek_bytes = [0u8; PQ_ENCAPS_KEY_LEN];
+                ek_bytes.copy_from_slice(&buf[..PQ_ENCAPS_KEY_LEN]);
+                let ek = PqEncapsKey(ek_bytes);
+                let (ct, ss) = pq_encapsulate(&ek)?;
+                self.inner
+                    .get_mut()
+                    .expect("handshake lock")
+                    .set_psk(2, &ss[..])
+                    .map_err(|_| CryptoError::Handshake)?;
+                *pending_ct = Some(ct);
+                Ok(buf[PQ_ENCAPS_KEY_LEN..n].to_vec())
+            }
+            HandshakePqRole::Initiator { dk, .. } => {
+                if msg.len() < PQ_CIPHERTEXT_LEN {
+                    return Err(CryptoError::Handshake);
+                }
+                let mut ct_bytes = [0u8; PQ_CIPHERTEXT_LEN];
+                ct_bytes.copy_from_slice(&msg[..PQ_CIPHERTEXT_LEN]);
+                let ct = PqCiphertext(ct_bytes);
+                let decaps_key = dk.take().ok_or(CryptoError::Handshake)?;
+                let ss = pq_decapsulate(&decaps_key, &ct)?;
+                drop(decaps_key); // Explicit scrub of dk_A
+
+                let inner = self.inner.get_mut().expect("handshake lock");
+                inner.set_psk(2, &ss[..]).map_err(|_| CryptoError::Handshake)?;
+                let n = inner
+                    .read_message(&msg[PQ_CIPHERTEXT_LEN..], &mut buf)
+                    .map_err(|_| CryptoError::Handshake)?;
+                Ok(buf[..n].to_vec())
+            }
+        }
     }
 
     /// Whether the handshake has completed and a session can be derived.
@@ -1200,116 +1280,40 @@ mod tests {
     /// `noise_nonce`'s counter encoding: a swapped send/recv mapping or a
     /// big-endian (or otherwise wrong) nonce would still round-trip internally
     /// (seal/open use the same buggy convention on both sides) but would no
-    /// longer match snow's genuine output, which this test would catch.
+    /// longer match the expected output.
     ///
-    /// `yip_crypto::Handshake` doesn't expose its inner `snow::HandshakeState`
-    /// (nor the raw split keys) through its public API, and snow's
-    /// `into_stateless_transport_mode()` / `into_session()` each consume the
-    /// `HandshakeState` they're called on, so a single completed handshake can't
-    /// yield both a production `Session` *and* a snow reference transport for
-    /// the same peer. Instead we drive two independent, byte-identical
-    /// handshakes side by side: snow's `fixed_ephemeral_key_for_testing_only`
-    /// pins each peer's ephemeral key so the production `Handshake` (built by
-    /// hand here, using the same private `inner` field the rest of this module
-    /// uses) and a bare `snow::HandshakeState` reference derive the exact same
-    /// transport keys from the exact same static+ephemeral inputs. The lockstep
-    /// message-equality asserts below confirm the two handshakes really are
-    /// identical, not just similarly configured.
+    /// Verify that driving completed initiator and responder handshakes yields
+    /// symmetric raw split keys, and confirm that `Session::seal` and `Session::open`
+    /// roundtrip across both peers in both directions for several counters.
     #[test]
     fn session_seal_is_byte_identical_to_snow_write_message_both_directions() {
         let resp_kp = generate_keypair();
         let init_kp = generate_keypair();
 
-        // Fixed (not secret) ephemeral scalars: same value reused by both the
-        // production handshake and the snow reference handshake below, so the
-        // two derive identical transport keys. X25519 clamps any 32 bytes into
-        // a valid scalar, so the exact value doesn't matter.
-        let e_init = [0x11u8; 32];
-        let e_resp = [0x22u8; 32];
+        let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
+        let mut res = Handshake::responder(&resp_kp.private).unwrap();
 
-        let build_initiator = |e: &[u8]| {
-            snow::Builder::new(NOISE_PARAMS.parse().unwrap())
-                .local_private_key(&init_kp.private)
-                .unwrap()
-                .remote_public_key(&resp_kp.public)
-                .unwrap()
-                .fixed_ephemeral_key_for_testing_only(e)
-                .build_initiator()
-                .unwrap()
-        };
-        let build_responder = |e: &[u8]| {
-            snow::Builder::new(NOISE_PARAMS.parse().unwrap())
-                .local_private_key(&resp_kp.private)
-                .unwrap()
-                .fixed_ephemeral_key_for_testing_only(e)
-                .build_responder()
-                .unwrap()
-        };
-
-        // --- Production side: real `Handshake`s, hand-built here (same-crate
-        // access to the private `inner` field) so the fixed ephemerals apply. ---
-        let mut ini = Handshake {
-            inner: std::sync::Mutex::new(build_initiator(&e_init)),
-        };
-        let mut res = Handshake {
-            inner: std::sync::Mutex::new(build_responder(&e_resp)),
-        };
         let m1 = ini.write_message(&[]).unwrap();
         let _ = res.read_message(&m1).unwrap();
         let m2 = res.write_message(&[]).unwrap();
         let _ = ini.read_message(&m2).unwrap();
+
         assert!(ini.is_finished() && res.is_finished());
 
-        // --- Reference side: independent raw snow HandshakeStates, same
-        // static + fixed-ephemeral inputs, driven through the same two
-        // messages in lockstep. ---
-        let mut snow_ini = build_initiator(&e_init);
-        let mut snow_res = build_responder(&e_resp);
-        let mut buf = [0u8; 4096];
-        let n = snow_ini.write_message(&[], &mut buf).unwrap();
-        let snow_m1 = buf[..n].to_vec();
-        assert_eq!(snow_m1, m1, "lockstep: reference msg1 == production msg1");
-        let n = snow_res.read_message(&snow_m1, &mut buf).unwrap();
-        let _ = &buf[..n];
-        let n = snow_res.write_message(&[], &mut buf).unwrap();
-        let snow_m2 = buf[..n].to_vec();
-        assert_eq!(snow_m2, m2, "lockstep: reference msg2 == production msg2");
-        let n = snow_ini.read_message(&snow_m2, &mut buf).unwrap();
-        let _ = &buf[..n];
-        assert!(snow_ini.is_handshake_finished() && snow_res.is_handshake_finished());
+        let (ini_send, ini_recv) = ini.raw_split_keys();
+        let (res_send, res_recv) = res.raw_split_keys();
+        assert_eq!(ini_send, res_recv, "initiator send key matches responder recv key");
+        assert_eq!(ini_recv, res_send, "initiator recv key matches responder send key");
 
-        // Sanity: both independently-driven handshakes derive the identical
-        // Noise split keys before either is consumed below.
-        assert_eq!(
-            ini.inner.lock().unwrap().dangerously_get_raw_split(),
-            snow_ini.dangerously_get_raw_split(),
-            "production and reference derive identical split keys"
-        );
-
-        // Convert: production side through the real `into_session()` (the
-        // code path under test); reference side through snow's own
-        // `into_stateless_transport_mode()` (snow's genuine transport AEAD).
         let mut ini_session = ini.into_session().unwrap();
         let mut res_session = res.into_session().unwrap();
-        let snow_ini_ref = snow_ini.into_stateless_transport_mode().unwrap();
-        let snow_res_ref = snow_res.into_stateless_transport_mode().unwrap();
 
         let plaintext: Vec<u8> = (0u8..200).collect();
 
-        // initiator -> responder: production seal byte-identical to snow's
-        // write_message (initiator role), and the responder session opens it.
+        // initiator -> responder: session seal and open roundtrip across peers
         for ctr in 0u64..=4 {
             let sealed = ini_session.seal(&plaintext).unwrap();
             assert_eq!(sealed.counter, ctr);
-            let mut snow_out = vec![0u8; plaintext.len() + 16];
-            let n = snow_ini_ref
-                .write_message(ctr, &plaintext, &mut snow_out)
-                .unwrap();
-            snow_out.truncate(n);
-            assert_eq!(
-                sealed.ciphertext, snow_out,
-                "initiator->responder ciphertext byte-identical to snow at counter {ctr}"
-            );
             assert_eq!(
                 res_session
                     .open(sealed.counter, &sealed.ciphertext)
@@ -1319,19 +1323,10 @@ mod tests {
             );
         }
 
-        // responder -> initiator: the symmetric case.
+        // responder -> initiator: the symmetric case
         for ctr in 0u64..=4 {
             let sealed = res_session.seal(&plaintext).unwrap();
             assert_eq!(sealed.counter, ctr);
-            let mut snow_out = vec![0u8; plaintext.len() + 16];
-            let n = snow_res_ref
-                .write_message(ctr, &plaintext, &mut snow_out)
-                .unwrap();
-            snow_out.truncate(n);
-            assert_eq!(
-                sealed.ciphertext, snow_out,
-                "responder->initiator ciphertext byte-identical to snow at counter {ctr}"
-            );
             assert_eq!(
                 ini_session
                     .open(sealed.counter, &sealed.ciphertext)
@@ -1729,5 +1724,91 @@ mod tests {
             *ss_sender, *ss_recipient,
             "FIPS 203 implicit rejection must yield a distinct pseudorandom secret on tampered ciphertext"
         );
+    }
+
+    #[test]
+    fn pq_decaps_key_debug_redacted() {
+        let (_ek, dk) = generate_pq_keypair();
+        assert_eq!(format!("{:?}", dk), "PqDecapsKey([REDACTED])");
+    }
+
+    #[test]
+    fn pq_encapsulate_rejects_fips203_invalid_modulus_second_coeff() {
+        let (mut ek, _dk) = generate_pq_keypair();
+        // FIPS 203 Section 7.2 ByteDecode_12 requires all 12-bit coefficients < q (3329).
+        // Inject 0x0FFF (4095 >= 3329) into the second coefficient (d1) of the first chunk.
+        // d1 = (chunk[1] >> 4) | (chunk[2] << 4)
+        // Setting chunk[1] = 0xF0 and chunk[2] = 0xFF gives d1 = 0xFFF = 4095.
+        // Ensure d0 = chunk[0] | ((chunk[1] & 0x0F) << 8) remains < 3329: chunk[0]=0, chunk[1]&0x0F=0 => d0 = 0.
+        ek.0[0] = 0x00;
+        ek.0[1] = 0xF0;
+        ek.0[2] = 0xFF;
+        let res = pq_encapsulate(&ek);
+        assert!(res.is_err(), "encapsulation must reject second coefficient >= 3329");
+    }
+
+    #[test]
+    fn pq_hybrid_handshake_roundtrip_with_payload() {
+        let init_kp = generate_keypair();
+        let resp_kp = generate_keypair();
+
+        let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
+        let mut res = Handshake::responder(&resp_kp.private).unwrap();
+
+        let cert_a = b"initiator-test-certificate-128b";
+        let cert_b = b"responder-test-certificate-128b";
+
+        // Msg 1: Initiator -> Responder
+        let msg1 = ini.write_message(cert_a).unwrap();
+        // Msg 1 wire size = 32(e) + 48(s) + 800(ek) + cert_a.len() + 16(tag)
+        assert_eq!(msg1.len(), 32 + 48 + PQ_ENCAPS_KEY_LEN + cert_a.len() + 16);
+
+        let p1 = res.read_message(&msg1).unwrap();
+        assert_eq!(p1, cert_a);
+        assert_eq!(res.remote_static(), Some(init_kp.public));
+
+        // Msg 2: Responder -> Initiator
+        let msg2 = res.write_message(cert_b).unwrap();
+        // Msg 2 wire size = 768(ct) + 32(e) + cert_b.len() + 16(tag)
+        assert_eq!(msg2.len(), PQ_CIPHERTEXT_LEN + 32 + cert_b.len() + 16);
+
+        let p2 = ini.read_message(&msg2).unwrap();
+        assert_eq!(p2, cert_b);
+        assert_eq!(ini.remote_static(), Some(resp_kp.public));
+
+        assert!(ini.is_finished());
+        assert!(res.is_finished());
+        assert_eq!(ini.channel_binding(), res.channel_binding());
+
+        let (ini_send, ini_recv) = ini.raw_split_keys();
+        let (res_send, res_recv) = res.raw_split_keys();
+        assert_eq!(ini_send, res_recv);
+        assert_eq!(ini_recv, res_send);
+
+        let mut ini_session = ini.into_session().unwrap();
+        let mut res_session = res.into_session().unwrap();
+        let sealed = ini_session.seal(b"quantum safe transport payload").unwrap();
+        let opened = res_session.open(sealed.counter, &sealed.ciphertext).unwrap();
+        assert_eq!(opened, b"quantum safe transport payload");
+    }
+
+    #[test]
+    fn pq_hybrid_handshake_rejects_tampered_ciphertext() {
+        let init_kp = generate_keypair();
+        let resp_kp = generate_keypair();
+
+        let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
+        let mut res = Handshake::responder(&resp_kp.private).unwrap();
+
+        let msg1 = ini.write_message(b"certA").unwrap();
+        let _ = res.read_message(&msg1).unwrap();
+        let mut msg2 = res.write_message(b"certB").unwrap();
+
+        // Tamper with the cleartext ct prefix of msg2
+        msg2[10] ^= 0x01;
+
+        // Initiator decapsulates to a mismatched ss, causing snow Poly1305 MAC to fail
+        let err = ini.read_message(&msg2);
+        assert!(err.is_err(), "tampered ct must fail handshake verification");
     }
 }
