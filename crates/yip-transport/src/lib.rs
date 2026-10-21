@@ -166,14 +166,20 @@ impl Transport {
     }
 
     /// Feed a received symbol for `class`; returns the frame when its object decodes.
-    pub fn decode(&mut self, symbol: &Symbol, class: FlowClass, now_ms: u64) -> Option<Vec<u8>> {
+    pub fn decode(
+        &mut self,
+        object_key: u64,
+        symbol: &Symbol,
+        class: FlowClass,
+        now_ms: u64,
+    ) -> Option<Vec<u8>> {
         let params = self.params_for(class);
         let idx = u8::try_from(class_index(class)).expect("3 classes");
         let deadline_ms = params.deadline.as_millis() as u64;
         self.reassemblers
             .entry(idx)
             .or_insert_with(|| FecReassembler::new(params.symbol_size, 256))
-            .push(symbol, now_ms, deadline_ms)
+            .push(object_key, symbol, now_ms, deadline_ms)
     }
 
     /// Generate fresh FEC repair symbols for a previously-sent object,
@@ -244,7 +250,7 @@ mod tests {
             if i % 6 == 0 {
                 continue;
             }
-            if let Some(frame) = rx.decode(&s, class, 0) {
+            if let Some(frame) = rx.decode(u64::from(s.object_id), &s, class, 0) {
                 out = Some(frame);
                 break;
             }
@@ -307,14 +313,14 @@ mod tests {
         // Decode to completion
         let mut decoded = false;
         for s in &syms {
-            if rx.decode(s, class, 0).is_some() {
+            if rx.decode(u64::from(s.object_id), s, class, 0).is_some() {
                 decoded = true;
                 break;
             }
         }
         assert!(decoded, "object decoded successfully");
         // Push a late/duplicate symbol after decode: should return None
-        let late = rx.decode(&syms[0], class, 0);
+        let late = rx.decode(u64::from(syms[0].object_id), &syms[0], class, 0);
         assert!(late.is_none(), "late symbol returns None after completion");
     }
 
@@ -331,7 +337,7 @@ mod tests {
         let mut rx = Transport::new(vec![], 1200);
         let mut out = None;
         for s in syms.iter().take(1) {
-            out = out.or(rx.decode(s, cls, 0));
+            out = out.or(rx.decode(u64::from(s.object_id), s, cls, 0));
         }
         assert!(out.is_none(), "one symbol short -> not yet decoded");
         // Retransmit: fresh repair symbols carrying the SAME object_id top up the decoder.
@@ -341,7 +347,7 @@ mod tests {
             "repair reuses object identity"
         );
         for s in &repair {
-            out = out.or(rx.decode(s, cls, 0));
+            out = out.or(rx.decode(u64::from(s.object_id), s, cls, 0));
         }
         assert_eq!(out.as_deref(), Some(ct.as_slice()));
     }
