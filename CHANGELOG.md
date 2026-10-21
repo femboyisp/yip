@@ -27,6 +27,8 @@ until 0.1.0.
   Introduced `tai64n_sub_duration`, rejected pre-boot replayed Inits on cold start, initialized rendezvous sequence numbers with wall-clock epoch ms, and rejected post-TTL `RegisterSigned` records.
 
 ### Added
+- **Bidirectional flow accounting in traffic classifier (`crates/yip-transport`, `bin/yipd`, #11).**
+  Added canonical symmetric 5-tuple canonicalization to `FlowKey` and wired decrypted ingress packet observation in `DataPlane::on_udp_datagram` via `Transport::observe_ingress`. Both forward transmission and return traffic (such as return TCP ACKs and reverse RTP media bursts) now update the shared EWMA packet size and packet rate estimator, accelerating `MIN_PACKETS` convergence and enabling symmetric traffic classification across interactive, default, and bulk traffic flows.
 - **Deadline-based FEC reassembly eviction & late symbol tombstoning (`crates/yip-transport`, `bin/yipd`, #11).**
   Added per-object deadline tracking (`expires_at_ms = first_seen_ms + deadline_ms`) to `FecReassembler` in `crates/yip-transport`. Eagerly evicts expired FEC reassembly state on incoming symbols and during FIFO queue maintenance, tombstoning expired objects to free symbol shard buffers immediately while preventing late trailing parity bursts from resurrecting expired `object_id`s or causing head-of-line blocking across traffic classes (`Realtime`, `Default`, `Bulk`).
 - **Zero-allocation egress buffer scavenging under obfuscation (`crates/yip-obf`, `bin/yipd`, #11).**
