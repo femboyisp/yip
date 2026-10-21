@@ -289,14 +289,16 @@ cheap on a clean fast path where every tunnel is fast enough.
 
 The benchmark harness evaluates and compares yip against contemporary VPN, mesh, and FEC network transports. Below is an architectural breakdown of each contender, how they operate in the benchmark environment, and how their design maps to yip:
 
-| Contender | Execution Context | Encapsulation & Protocol | Cryptography | Loss Recovery (FEC) | Role & Benchmark Status |
-|-----------|-------------------|--------------------------|--------------|---------------------|--------------------------|
-| **yip** | Userspace (`yipd`) | UDP tunnel (TUN, MTU 1184), custom framed wire format | ChaCha20-Poly1305 + SipHash-2-4 | Proactive Reed–Solomon over GF(256) + Reactive ARQ | Primary project under test |
-| **WireGuard** | In-kernel module (`wireguard`) | UDP (L3 TUN, MTU 1420), Noise IKpsk2 | ChaCha20-Poly1305, Curve25519, BLAKE2s | None | In-tree kernel baseline |
-| **OpenVPN** | Userspace (`openvpn`) | UDP (L3 TUN), TLS control + data channel | AES-256-GCM (peer-fingerprint EC certs) | None | Full-featured legacy / enterprise tunnel |
-| **n2n** | Userspace (`edge` + `supernode`) | UDP (L2 TAP), centralized discovery + P2P | Twofish / AES-CBC | None | P2P edge mesh with supernode directory |
-| **ZeroTier** | System daemon (`zerotier-one`) | Encrypted UDP (L2 TAP virtual switch) | Curve25519, Salsa20/12, Poly1305 | None | Global planetary SDN mesh (architectural contender) |
-| **AmneziaWG** | DKMS kernel / userspace Go | UDP (L3 TUN), obfuscated WireGuard headers | ChaCha20-Poly1305 (obfuscated) | None | DPI-resistant WireGuard fork (architectural contender) |
+| Contender | Execution Context | Encapsulation & Protocol | Cryptography | Loss Recovery (FEC) | NAT Traversal / Control Plane |
+|-----------|-------------------|--------------------------|--------------|---------------------|-------------------------------|
+| **yip** | Userspace (`yipd`) | UDP tunnel (TUN, MTU 1184), custom framed wire format | ChaCha20-Poly1305 + SipHash-1-3 | Proactive Reed–Solomon over GF(256) + Reactive ARQ | Rendezvous + gossip discovery + blind relay |
+| **WireGuard** | In-kernel module (`wireguard`) | UDP (L3 TUN, MTU 1420), Noise IKpsk2 | ChaCha20-Poly1305, Curve25519, BLAKE2s | None | Static cryptokey routing |
+| **AmneziaWG** | Userspace / DKMS (`amneziawg-go`, `awg`) | UDP (L3 TUN, MTU 1420), obfuscated WireGuard headers | ChaCha20-Poly1305 (obfuscated) | None | Static cryptokey routing |
+| **OpenVPN** | Userspace (`openvpn`) | UDP (L3 TUN), TLS control + data channel | AES-256-GCM (peer-fingerprint EC certs) | None | Client-server |
+| **n2n** | Userspace (`edge` + `supernode`) | UDP (L2 TAP), centralized discovery + P2P | Twofish / AES-CBC | None | Supernode directory + P2P hole punching |
+| **ZeroTier** | System daemon (`zerotier-one`) | Encrypted UDP (L2 TAP virtual switch) | Curve25519, Salsa20/12, Poly1305 | None | Local netns controller / planetary roots |
+| **Tailscale** | System daemon (`tailscaled`) | WireGuard-in-userspace (`wireguard-go`) | ChaCha20-Poly1305, Curve25519 | None | Local Headscale coordinator / DERP relays |
+| **NetBird** | System daemon (`netbird`) | WireGuard-in-userspace (`wireguard-go`) | ChaCha20-Poly1305, Curve25519 | None | WebRTC ICE / STUN / TURN + Management API |
 
 ### Detailed Architectural Analysis
 
@@ -321,18 +323,59 @@ The benchmark harness evaluates and compares yip against contemporary VPN, mesh,
 
 #### 4. ZeroTier (Planetary Virtual SDN)
 - **Architecture:** ZeroTier implements a network virtualization engine (VL2 / VL1) presenting a virtual Ethernet switch (L2 TAP) across physical networks. Nodes run a persistent `zerotier-one` system daemon that communicates with planetary root servers ("planets") and custom federated relays ("moons").
-- **Why External & Not Bundled in Standalone Netns Benchmarks:**
-  - *System Daemon Requirement:* ZeroTier requires running a system-level background daemon (`zerotier-one` managed via systemd) with persistent machine identity keys stored in `/var/lib/zerotier-one`.
-  - *External Orchestration & State:* Joining a ZeroTier network requires a 16-digit network ID issued by a central ZeroTier network controller (either ZeroTier Central cloud or a self-hosted controller daemon) and explicit authorization per node.
-  - *Namespace Isolation Challenges:* Because `zerotier-one` expects to manage host networking or requires custom multi-instance configuration flags (`-D<dir>`), provisioning isolated, ephemeral, zero-leak network pairs in short-lived Linux network namespaces requires extensive external controller automation.
+- **Harness Integration:** Automated in `crates/yip-bench/tests/run-iperf-compare.sh` using an offline, netns-local controller via `zerotier-one` and its local control HTTP API (`http://127.0.0.1:9993/controller/network/<id>`), enabling completely air-gapped testing without external planetary server access.
 - **Design Mapping to yip:** ZeroTier prioritizes global SDN management, access control lists (flow rules), and multi-tenant Layer 2 virtual switching. In contrast, yip focuses on high-performance point-to-point and edge mesh transport survivability. yip operates as a self-contained, configuration-file-driven daemon with zero external controller dependencies, zero cloud phone-home, and integrated Reed–Solomon FEC designed to withstand severe packet loss that degrades ZeroTier's underlying UDP streams.
 
 #### 5. AmneziaWG (Censorship-Resistant WireGuard)
 - **Architecture:** A specialized fork of WireGuard designed to evade Deep Packet Inspection (DPI) and protocol classification firewalls. Standard WireGuard handshakes have rigid 4-byte message types (`0x01` Init, `0x02` Response, `0x03` Cookie) and predictable packet lengths (148 bytes for initiation, 92 bytes for response), making them easily fingerprinted and blocked by stateful DPI systems. AmneziaWG injects random-length junk padding (`InitJunkSize`, `ResponseJunkSize`) and custom random message type headers (`Undercover` mode).
-- **Why External & Not Bundled in Standalone Netns Benchmarks:**
-  - *Custom Kernel Module (DKMS):* The primary high-performance implementation requires compiling and inserting an out-of-tree DKMS kernel module (`amneziawg-dkms`), which requires kernel headers matching the exact running kernel and is not distributed in standard distribution package repositories.
-  - *Out-of-Tree Userspace Fallback:* The userspace implementation (`amneziawg-go`) requires external Go build dependencies and third-party binaries rather than native distribution packages.
-- **Design Mapping to yip:** AmneziaWG addresses **censorship and DPI fingerprinting**, whereas yip addresses **physical and wireless link degradation (loss, jitter, reordering)**. AmneziaWG modifies WireGuard's header layout but retains WireGuard's underlying transport semantics—meaning it inherits WireGuard's vulnerability to packet loss and throughput collapse under lossy conditions. Furthermore, yip inherently protects its packet headers against fingerprinting and tampering using keyed SipHash-2-4 authentication and XOR masking over the wire frame.
+- **Harness Integration:** Supported via `awg` CLI and `amneziawg-go` userspace daemon or DKMS kernel module with custom obfuscation headers (`Jc`, `Jmin`, `Jmax`, `S1`, `S2`, `H1..H4`).
+- **Design Mapping to yip:** AmneziaWG addresses **censorship and DPI fingerprinting**, whereas yip addresses **both physical link degradation (loss, jitter, reordering) and DPI evasion**. AmneziaWG modifies WireGuard's header layout but retains WireGuard's underlying transport semantics—inheriting WireGuard's severe throughput collapse under packet loss. Furthermore, yip inherently protects its packet headers against fingerprinting and tampering using keyed SipHash-1-3 authentication and XOR masking over the wire frame.
+
+#### 6. Tailscale (WireGuard-in-Userspace + Headscale Coordinator)
+- **Architecture:** Tailscale builds upon WireGuard using an in-userspace Go implementation (`wireguard-go`) integrated into the `tailscaled` daemon. Control plane coordination is typically cloud-managed via DERP relay servers, STUN NAT discovery, and node authorization.
+- **Harness Integration:** Benchmarked in isolated `netns` using a local, air-gapped [Headscale](https://github.com/juanfont/headscale) coordination server and ephemeral pre-authenticated registration keys, bypassing public DERP and cloud infrastructure.
+- **Behavior Under Loss:** Because Tailscale encapsulates packets using unmodified WireGuard protocols in userspace, it suffers from the same loss-induced throughput degradation as WireGuard, exacerbated slightly by userspace context switches.
+- **Design Mapping to yip:** Tailscale solves enterprise identity and zero-trust mesh peering, but delegates transport reliability entirely to underlying UDP/TCP. yip provides transport-native forward error correction, ensuring uninterrupted flow delivery across degraded wireless and WAN paths.
+
+#### 7. NetBird (WireGuard-in-Userspace + WebRTC Management)
+- **Architecture:** NetBird combines WireGuard in userspace with WebRTC ICE / STUN / TURN signaling for direct peer-to-peer traversal and an open-source management server architecture.
+- **Harness Integration:** Detected and isolated in dedicated namespaces with graceful skip when local management is not provisioned.
+- **Design Mapping to yip:** Similar to Tailscale, NetBird provides centralized overlay orchestration over WireGuard tunnels. yip distinguishes itself by integrating proactive erasure coding (Reed–Solomon over GF(256)) and reactive hybrid ARQ directly into the data plane.
+
+---
+
+### Installing Optional Contenders
+
+To install or build any of the external contenders for local benchmarking:
+
+```sh
+# Check which contender binaries are currently installed on the host:
+./crates/yip-bench/setup-contenders.sh --check
+
+# Build and install missing contenders (requires Go and build tools):
+sudo ./crates/yip-bench/setup-contenders.sh --amneziawg
+sudo ./crates/yip-bench/setup-contenders.sh --tailscale
+sudo ./crates/yip-bench/setup-contenders.sh --zerotier
+sudo ./crates/yip-bench/setup-contenders.sh --netbird
+
+# Or build all available contenders:
+sudo ./crates/yip-bench/setup-contenders.sh --all
+```
+
+When running `crates/yip-bench/tests/run-iperf-compare.sh`, any contender whose binaries are absent will log `[contender] SKIP: binary not found` and continue testing without failure.
+
+---
+
+### Dual TCP and UDP-Under-Loss Evaluation
+
+The benchmark runner executes both TCP stream goodput and UDP loss recovery evaluation:
+```sh
+# Standard sweep: ping (50 samples), TCP goodput (iperf3 -t 8), and UDP throughput/loss (50 Mbit/s offered):
+sudo bash crates/yip-bench/tests/run-iperf-compare.sh
+
+# High-precision sweep with custom UDP offered rate:
+sudo PING_COUNT=1000 UDP_RATE=100M bash crates/yip-bench/tests/run-iperf-compare.sh
+```
 
 ---
 
