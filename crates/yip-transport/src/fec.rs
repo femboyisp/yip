@@ -194,11 +194,11 @@ struct ObjState {
 }
 
 /// Reassembles RS symbols into objects, keeping multiple objects in flight
-/// (keyed by `object_id`), tolerating loss/reordering, evicting oldest at cap.
+/// (keyed by `object_key: u64`), tolerating loss/reordering, evicting oldest at cap.
 pub struct FecReassembler {
     symbol_size: u16,
-    objects: HashMap<u16, ObjState>,
-    order: VecDeque<u16>,
+    objects: HashMap<u64, ObjState>,
+    order: VecDeque<u64>,
     max_objects: usize,
     recovered_count: u64,
 }
@@ -228,7 +228,13 @@ impl FecReassembler {
 
     /// Feed one received symbol. Returns the decoded object when it completes.
     /// Returns `None` (never panics) for any malformed/attacker field.
-    pub fn push(&mut self, symbol: &Symbol, now_ms: u64, deadline_ms: u64) -> Option<Vec<u8>> {
+    pub fn push(
+        &mut self,
+        object_key: u64,
+        symbol: &Symbol,
+        now_ms: u64,
+        deadline_ms: u64,
+    ) -> Option<Vec<u8>> {
         // --- Guards: object_size, codec tag, symbol_index, K bounds ---
         if symbol.object_size == 0 || symbol.object_size > MAX_OBJECT_SIZE {
             return None;
@@ -250,9 +256,9 @@ impl FecReassembler {
         }
 
         // FIFO sweep: sweep expired or completed objects from the head of order,
-        // stopping if the head is the incoming symbol's object_id (handled below).
+        // stopping if the head is the incoming symbol's object_key (handled below).
         while let Some(&oldest_id) = self.order.front() {
-            if oldest_id == symbol.object_id {
+            if oldest_id == object_key {
                 break;
             }
             if let Some(state) = self.objects.get(&oldest_id) {
@@ -268,14 +274,14 @@ impl FecReassembler {
             break;
         }
 
-        if !self.objects.contains_key(&symbol.object_id) {
+        if !self.objects.contains_key(&object_key) {
             if self.objects.len() >= self.max_objects {
                 if let Some(oldest) = self.order.pop_front() {
                     self.objects.remove(&oldest);
                 }
             }
             self.objects.insert(
-                symbol.object_id,
+                object_key,
                 ObjState {
                     shards: HashMap::new(),
                     k,
@@ -284,9 +290,9 @@ impl FecReassembler {
                     expires_at_ms: now_ms.saturating_add(deadline_ms),
                 },
             );
-            self.order.push_back(symbol.object_id);
+            self.order.push_back(object_key);
         }
-        let state = self.objects.get_mut(&symbol.object_id)?;
+        let state = self.objects.get_mut(&object_key)?;
         if now_ms > state.expires_at_ms {
             state.done = true;
             state.shards.clear();
@@ -386,7 +392,7 @@ mod tests {
             if i % 4 == 0 {
                 continue; // drop every 4th
             }
-            if let Some(frame) = re.push(s, 0, 1000) {
+            if let Some(frame) = re.push(u64::from(s.object_id), s, 0, 1000) {
                 out = Some(frame);
                 break;
             }
@@ -406,7 +412,7 @@ mod tests {
         let mut out = None;
         for s in syms.iter().take(3) {
             // only the 3 source symbols
-            out = out.or(re.push(s, 0, 1000));
+            out = out.or(re.push(u64::from(s.object_id), s, 0, 1000));
         }
         assert_eq!(out.as_deref(), Some(ct.as_slice()));
     }
@@ -425,7 +431,7 @@ mod tests {
         let mut re = FecReassembler::new(params.symbol_size, 64);
         let mut out = None;
         for s in &batch {
-            out = out.or(re.push(s, 0, 1000));
+            out = out.or(re.push(u64::from(s.object_id), s, 0, 1000));
         }
         assert_eq!(
             out.as_deref(),
@@ -454,7 +460,10 @@ mod tests {
         let oid = original[0].object_id;
         // Receiver gets only ONE shard of the original — not enough to decode.
         let mut re = FecReassembler::new(params.symbol_size, 64);
-        assert_eq!(re.push(&original[0], 0, 1000), None);
+        assert_eq!(
+            re.push(u64::from(original[0].object_id), &original[0], 0, 1000),
+            None
+        );
         // ARQ retransmit with the production constant (4). Must be Cauchy and accepted.
         let retx = enc.repair_with_id(&ct, params, oid, 4);
         assert!(
@@ -464,7 +473,7 @@ mod tests {
         );
         let mut out = None;
         for s in &retx {
-            out = out.or(re.push(s, 0, 1000));
+            out = out.or(re.push(u64::from(s.object_id), s, 0, 1000));
         }
         assert_eq!(
             out.as_deref(),
@@ -487,8 +496,11 @@ mod tests {
     #[test]
     fn rejects_zero_and_oversized_object_size() {
         let mut re = FecReassembler::new(1200, 64);
-        assert_eq!(re.push(&sym(0, 0, 1200), 0, 1000), None);
-        assert_eq!(re.push(&sym(MAX_OBJECT_SIZE + 1, 0, 1200), 0, 1000), None);
+        assert_eq!(re.push(0, &sym(0, 0, 1200), 0, 1000), None);
+        assert_eq!(
+            re.push(0, &sym(MAX_OBJECT_SIZE + 1, 0, 1200), 0, 1000),
+            None
+        );
     }
 
     /// K >= 255 (no GF(256) codeword room) must be rejected by `build`'s guard,
@@ -536,20 +548,20 @@ mod tests {
         let mut re = FecReassembler::new(1200, 64);
         let mut s = sym(1200, 0, 1200);
         s.payload_id[0] = 0x02; // not RS-v1
-        assert_eq!(re.push(&s, 0, 1000), None);
+        assert_eq!(re.push(u64::from(s.object_id), &s, 0, 1000), None);
     }
 
     #[test]
     fn rejects_out_of_range_symbol_index() {
         let mut re = FecReassembler::new(1200, 64);
-        assert_eq!(re.push(&sym(1200, 255, 1200), 0, 1000), None);
-        assert_eq!(re.push(&sym(1200, 60000, 1200), 0, 1000), None);
+        assert_eq!(re.push(0, &sym(1200, 255, 1200), 0, 1000), None);
+        assert_eq!(re.push(0, &sym(1200, 60000, 1200), 0, 1000), None);
     }
 
     #[test]
     fn rejects_wrong_symbol_length() {
         let mut re = FecReassembler::new(1200, 64);
-        assert_eq!(re.push(&sym(1200, 0, 999), 0, 1000), None); // not symbol_size
+        assert_eq!(re.push(0, &sym(1200, 0, 999), 0, 1000), None); // not symbol_size
     }
 
     #[test]
@@ -560,11 +572,23 @@ mod tests {
         let syms = enc.encode(&ct, params, 2);
         let mut re = FecReassembler::new(params.symbol_size, 64);
         // Push symbol 0 three times, then 1, 2 → only 3 distinct → decodes exactly once.
-        assert_eq!(re.push(&syms[0], 0, 1000), None);
-        assert_eq!(re.push(&syms[0], 0, 1000), None);
-        assert_eq!(re.push(&syms[0], 0, 1000), None);
-        assert_eq!(re.push(&syms[1], 0, 1000), None);
-        let out = re.push(&syms[2], 0, 1000);
+        assert_eq!(
+            re.push(u64::from(syms[0].object_id), &syms[0], 0, 1000),
+            None
+        );
+        assert_eq!(
+            re.push(u64::from(syms[0].object_id), &syms[0], 0, 1000),
+            None
+        );
+        assert_eq!(
+            re.push(u64::from(syms[0].object_id), &syms[0], 0, 1000),
+            None
+        );
+        assert_eq!(
+            re.push(u64::from(syms[1].object_id), &syms[1], 0, 1000),
+            None
+        );
+        let out = re.push(u64::from(syms[2].object_id), &syms[2], 0, 1000);
         assert_eq!(out.as_deref(), Some(ct.as_slice()));
     }
 
@@ -577,13 +601,16 @@ mod tests {
         let mut re = FecReassembler::new(params.symbol_size, 64);
         let mut decoded = false;
         for s in &syms {
-            if re.push(s, 0, 1000).is_some() {
+            if re.push(u64::from(s.object_id), s, 0, 1000).is_some() {
                 decoded = true;
                 break;
             }
         }
         assert!(decoded);
-        assert_eq!(re.push(&syms[0], 0, 1000), None); // late/dup after completion
+        assert_eq!(
+            re.push(u64::from(syms[0].object_id), &syms[0], 0, 1000),
+            None
+        ); // late/dup after completion
     }
 
     #[test]
@@ -593,11 +620,11 @@ mod tests {
         let a = enc.encode(b"first object payload contents here!!", params, 4);
         let b = enc.encode(b"second object payload contents here!", params, 4);
         let mut re = FecReassembler::new(params.symbol_size, 1); // cap 1
-        re.push(&a[0], 0, 1000); // partial a
+        re.push(u64::from(a[0].object_id), &a[0], 0, 1000); // partial a
         assert_eq!(re.in_flight(), 1);
         let mut got_b = None;
         for s in &b {
-            got_b = got_b.or(re.push(s, 0, 1000));
+            got_b = got_b.or(re.push(u64::from(s.object_id), s, 0, 1000));
         }
         assert_eq!(
             got_b.as_deref(),
@@ -641,7 +668,7 @@ mod tests {
             if i == 1 {
                 continue;
             }
-            out = out.or(re.push(s, 0, 1000));
+            out = out.or(re.push(u64::from(s.object_id), s, 0, 1000));
         }
         assert_eq!(out.as_deref(), Some(ct.as_slice()));
     }
@@ -660,7 +687,7 @@ mod tests {
             if i == 0 || i == 2 {
                 continue; // drop two sources
             }
-            out = out.or(re.push(s, 0, 1000));
+            out = out.or(re.push(u64::from(s.object_id), s, 0, 1000));
         }
         assert_eq!(out.as_deref(), Some(ct.as_slice()));
     }
@@ -675,7 +702,7 @@ mod tests {
         // Craft a PQ symbol at index K+2 (=4) — an invalid P/Q row — must be rejected.
         let mut bad = syms[0].clone();
         bad.payload_id = pack_payload_id(4, crate::rs::SCHEME_PQ);
-        assert_eq!(re.push(&bad, 0, 1000), None);
+        assert_eq!(re.push(u64::from(bad.object_id), &bad, 0, 1000), None);
     }
 
     #[test]
@@ -683,7 +710,7 @@ mod tests {
         let mut re = FecReassembler::new(1200, 64);
         let mut s = sym(2400, 0, 1200);
         s.payload_id[3] = 9; // unknown scheme id
-        assert_eq!(re.push(&s, 0, 1000), None);
+        assert_eq!(re.push(u64::from(s.object_id), &s, 0, 1000), None);
     }
 
     /// `in_flight` must report the exact number of in-progress objects, not a
@@ -701,8 +728,8 @@ mod tests {
         );
         let a = enc.encode(&vec![0xAAu8; 2400], params, 0);
         let b = enc.encode(&vec![0xBBu8; 2400], params, 0);
-        re.push(&a[0], 0, 1000);
-        re.push(&b[0], 0, 1000);
+        re.push(u64::from(a[0].object_id), &a[0], 0, 1000);
+        re.push(u64::from(b[0].object_id), &b[0], 0, 1000);
         assert_eq!(
             re.in_flight(),
             2,
@@ -733,7 +760,7 @@ mod tests {
                 payload_id: pack_payload_id(u16::try_from(i).unwrap(), crate::rs::SCHEME_CAUCHY),
                 data: vec![0u8; usize::from(symbol_size)],
             };
-            out = out.or(re.push(&s, 0, 1000));
+            out = out.or(re.push(u64::from(s.object_id), &s, 0, 1000));
         }
         assert!(
             out.is_none(),
@@ -760,7 +787,7 @@ mod tests {
                 payload_id: pack_payload_id(u16::try_from(i).unwrap(), crate::rs::SCHEME_CAUCHY),
                 data: vec![0u8; usize::from(symbol_size)],
             };
-            out = out.or(re.push(&s, 0, 1000));
+            out = out.or(re.push(u64::from(s.object_id), &s, 0, 1000));
         }
         assert!(
             out.is_some(),
@@ -782,13 +809,13 @@ mod tests {
             payload_id: pack_payload_id(0, crate::rs::SCHEME_CAUCHY),
             data: vec![0u8; 1],
         };
-        let out = re.push(&s, 0, 1000);
+        let out = re.push(u64::from(s.object_id), &s, 0, 1000);
         assert!(out.is_none(), "K >= 255 must be rejected");
         assert_eq!(
             re.in_flight(),
             0,
             "a symbol implying K >= 255 must be rejected before any object \
-             state is allocated"
+            state is allocated"
         );
     }
 
@@ -815,7 +842,7 @@ mod tests {
         // both are >= K+2, exercising the guard for a Cauchy (not Pq) scheme,
         // where it must NOT reject.
         for s in syms.iter().skip(4) {
-            out = out.or(re.push(s, 0, 1000));
+            out = out.or(re.push(u64::from(s.object_id), s, 0, 1000));
         }
         assert_eq!(
             out.as_deref(),
@@ -838,7 +865,7 @@ mod tests {
         assert!(syms.iter().all(|s| s.payload_id[3] == crate::rs::SCHEME_PQ));
         let mut re = FecReassembler::new(params.symbol_size, 64);
         // Feed ONLY the Q row (index 2 = K+1); it's the sole shard needed (K=1).
-        let out = re.push(&syms[2], 0, 1000);
+        let out = re.push(u64::from(syms[2].object_id), &syms[2], 0, 1000);
         assert_eq!(
             out.as_deref(),
             Some(ct.as_slice()),
@@ -860,7 +887,7 @@ mod tests {
         for i in 0u8..5 {
             let ct = vec![i; 2400]; // K=2 each; push only syms[0] so objects stay in flight
             let syms = enc.encode(&ct, params, 0);
-            re.push(&syms[0], 0, 1000);
+            re.push(u64::from(syms[0].object_id), &syms[0], 0, 1000);
         }
         assert_eq!(
             re.in_flight(),
@@ -879,14 +906,20 @@ mod tests {
 
         // Case A: receives before deadline -> decodes successfully
         let mut re = FecReassembler::new(params.symbol_size, 64);
-        assert_eq!(re.push(&syms[0], 100, 50), None); // expires_at = 150
-        let res = re.push(&syms[1], 140, 50); // 140 <= 150 -> ok
+        assert_eq!(
+            re.push(u64::from(syms[0].object_id), &syms[0], 100, 50),
+            None
+        ); // expires_at = 150
+        let res = re.push(u64::from(syms[1].object_id), &syms[1], 140, 50); // 140 <= 150 -> ok
         assert_eq!(res.as_deref(), Some(ct.as_slice()));
 
         // Case B: receives after deadline -> fails (None) and tombstones
         let mut re2 = FecReassembler::new(params.symbol_size, 64);
-        assert_eq!(re2.push(&syms[0], 100, 50), None); // expires_at = 150
-        let res2 = re2.push(&syms[1], 151, 50); // 151 > 150 -> expired!
+        assert_eq!(
+            re2.push(u64::from(syms[0].object_id), &syms[0], 100, 50),
+            None
+        ); // expires_at = 150
+        let res2 = re2.push(u64::from(syms[1].object_id), &syms[1], 151, 50); // 151 > 150 -> expired!
         assert_eq!(res2, None);
     }
 
@@ -900,24 +933,36 @@ mod tests {
 
         let mut re = FecReassembler::new(params.symbol_size, 64);
         // Push first symbol at t=100 with deadline 50ms (expires at 150ms)
-        assert_eq!(re.push(&syms[0], 100, 50), None);
+        assert_eq!(
+            re.push(u64::from(syms[0].object_id), &syms[0], 100, 50),
+            None
+        );
         assert_eq!(re.in_flight(), 1);
 
         // Arrive at t=160 (past deadline): symbol 1 triggers tombstoning
-        assert_eq!(re.push(&syms[1], 160, 50), None);
-        let state = re.objects.get(&syms[0].object_id).unwrap();
+        assert_eq!(
+            re.push(u64::from(syms[1].object_id), &syms[1], 160, 50),
+            None
+        );
+        let state = re.objects.get(&u64::from(syms[0].object_id)).unwrap();
         assert!(state.done, "object must be marked done");
         assert!(state.shards.is_empty(), "shards must be freed");
 
         // Trailing parity symbol 2 arrives at t=165: hits tombstone, does not resurrect
-        assert_eq!(re.push(&syms[2], 165, 50), None);
-        let state = re.objects.get(&syms[0].object_id).unwrap();
+        assert_eq!(
+            re.push(u64::from(syms[2].object_id), &syms[2], 165, 50),
+            None
+        );
+        let state = re.objects.get(&u64::from(syms[0].object_id)).unwrap();
         assert!(state.done, "must remain done");
         assert!(state.shards.is_empty(), "must not store shard");
 
         // Trailing parity symbol 3 arrives at t=170: hits tombstone
-        assert_eq!(re.push(&syms[3], 170, 50), None);
-        let state = re.objects.get(&syms[0].object_id).unwrap();
+        assert_eq!(
+            re.push(u64::from(syms[3].object_id), &syms[3], 170, 50),
+            None
+        );
+        let state = re.objects.get(&u64::from(syms[0].object_id)).unwrap();
         assert!(state.done, "must remain done");
         assert!(state.shards.is_empty(), "must not store shard");
     }
@@ -937,31 +982,37 @@ mod tests {
         let mut re = FecReassembler::new(1200, 64);
 
         // t=100: Bulk object arrives first (deadline 500ms, expires at 600ms)
-        assert_eq!(re.push(&bulk_syms[0], 100, 500), None);
+        assert_eq!(
+            re.push(u64::from(bulk_syms[0].object_id), &bulk_syms[0], 100, 500),
+            None
+        );
 
         // t=105: Realtime object arrives second (deadline 20ms, expires at 125ms)
-        assert_eq!(re.push(&rt_syms[0], 105, 20), None);
+        assert_eq!(
+            re.push(u64::from(rt_syms[0].object_id), &rt_syms[0], 105, 20),
+            None
+        );
 
         // Order head is Bulk object
-        assert_eq!(re.order.front(), Some(&bulk_syms[0].object_id));
+        assert_eq!(re.order.front(), Some(&u64::from(bulk_syms[0].object_id)));
 
         // At t=130:
         // Realtime object has expired (130 > 125).
         // Bulk object has NOT expired (130 <= 600).
         // Bulk at head of queue must NOT block Realtime object from expiring.
-        let rt_res = re.push(&rt_syms[1], 130, 20);
+        let rt_res = re.push(u64::from(rt_syms[1].object_id), &rt_syms[1], 130, 20);
         assert_eq!(
             rt_res, None,
             "Realtime object must expire despite Bulk at queue head"
         );
 
         // Realtime object should be tombstoned
-        let rt_state = re.objects.get(&rt_syms[0].object_id).unwrap();
+        let rt_state = re.objects.get(&u64::from(rt_syms[0].object_id)).unwrap();
         assert!(rt_state.done);
         assert!(rt_state.shards.is_empty());
 
         // Bulk object at head was NOT prematurely evicted and can still decode within its deadline
-        let bulk_res = re.push(&bulk_syms[1], 200, 500); // 200 <= 600
+        let bulk_res = re.push(u64::from(bulk_syms[1].object_id), &bulk_syms[1], 200, 500); // 200 <= 600
         assert_eq!(
             bulk_res.as_deref(),
             Some(ct_bulk.as_slice()),
@@ -971,15 +1022,44 @@ mod tests {
         // Both objects are now done. When a new object arrives, both get swept from order/objects.
         let ct_new = vec![0x33u8; 1200];
         let new_syms = enc.encode(&ct_new, rt_params, 0);
-        let _ = re.push(&new_syms[0], 250, 20);
+        let _ = re.push(u64::from(new_syms[0].object_id), &new_syms[0], 250, 20);
         assert!(
-            !re.objects.contains_key(&bulk_syms[0].object_id),
+            !re.objects.contains_key(&u64::from(bulk_syms[0].object_id)),
             "Bulk object must be swept"
         );
         assert!(
-            !re.objects.contains_key(&rt_syms[0].object_id),
+            !re.objects.contains_key(&u64::from(rt_syms[0].object_id)),
             "Realtime object must be swept"
         );
+    }
+
+    #[test]
+    fn reassembler_keys_by_u64_preventing_u16_wraparound_collision() {
+        let mut re = FecReassembler::new(1200, 64);
+        let key1 = 42u64;
+        let key2 = 42u64 + 65536;
+
+        let mut sym1 = sym(2400, 0, 1200); // K=2
+        sym1.object_id = 42;
+        let mut sym2 = sym(2400, 0, 1200); // K=2
+        sym2.object_id = 42;
+
+        let res1 = re.push(key1, &sym1, 0, 1000);
+        assert!(res1.is_none());
+        assert!(re.objects.contains_key(&key1));
+
+        let res2 = re.push(key2, &sym2, 0, 1000);
+        assert!(res2.is_none());
+        assert!(re.objects.contains_key(&key2));
+
+        assert_eq!(re.in_flight(), 2);
+
+        let mut sym1_shard1 = sym(2400, 1, 1200);
+        sym1_shard1.object_id = 42;
+        let res1_done = re.push(key1, &sym1_shard1, 0, 1000);
+        assert!(res1_done.is_some());
+        assert!(re.objects[&key1].done);
+        assert!(!re.objects[&key2].done);
     }
 
     #[test]

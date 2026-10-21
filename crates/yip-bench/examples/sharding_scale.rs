@@ -239,7 +239,7 @@ impl Worker {
     fn receive(&mut self, dg: &[u8]) -> Option<(usize, bool)> {
         let frame = self.codec.deframe(dg).ok()?;
         let (sym, counter, class) = frame_to_symbol(&frame)?;
-        let ciphertext = self.rx.decode(&sym, class, 0)?;
+        let ciphertext = self.rx.decode(u64::from(sym.object_id), &sym, class, 0)?;
         match self.receiver.open(counter, &ciphertext) {
             Ok(inner_bytes) => Some((inner_bytes.len(), true)),
             Err(_) => Some((ciphertext.len(), false)),

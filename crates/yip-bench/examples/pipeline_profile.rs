@@ -26,7 +26,7 @@ fn main() {
     for _ in 0..iters {
         let (cls, syms) = tx.encode(&ciphertext, &inner, false, 0);
         for s in &syms {
-            if rx.decode(s, cls, 0).is_some() {
+            if rx.decode(u64::from(s.object_id), s, cls, 0).is_some() {
                 decoded += 1;
                 break;
             }

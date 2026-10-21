@@ -10,7 +10,8 @@ maintainer.
   UDP transport, streaming rateless RLNC (fountain coding), poly-vector SIMD Galois Field engine
   (GFNI, AVX-512BW, AVX2, SSSE3, ARM NEON, Wasm SIMD128), batched `sendmmsg`/`recvmmsg`,
   `UDP_SEGMENT` GSO, 64 KB TUN GSO/GRO superpacket offload, deadline-based FEC reassembly eviction
-  with trailing symbol tombstoning, and zero-allocation egress buffer scavenging under obfuscation (#11).
+  with trailing symbol tombstoning, zero-allocation egress buffer scavenging under obfuscation, and
+  wire-auth 64-bit counter-bound FEC reassembly with pre-AEAD anti-replay gating (#11).
 - **Multi-core throughput & kernel-bypass** — multi-queue TUN worker sharding (`IFF_MULTI_QUEUE`),
   core-pinned flow hashing, lock-free chunked nonce dispensers, circular replay windows, and
   AF_XDP zero-copy driver (over 40 Gbps aggregate throughput, 5.3x higher goodput than kernel

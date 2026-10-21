@@ -411,11 +411,15 @@ impl DataPlane {
                     }
                 };
 
+                if !self.session.check_replay(counter) {
+                    return Outcome::None;
+                }
+
                 // Notify the loss detector that we saw this counter.
                 self.detector.on_seen(counter, now_ms);
 
                 // Feed the symbol to the FEC reassembler; continue until an object decodes.
-                let ciphertext = match self.transport.decode(&sym, class, now_ms) {
+                let ciphertext = match self.transport.decode(counter, &sym, class, now_ms) {
                     Some(ct) => ct,
                     None => return Outcome::None,
                 };
@@ -1043,5 +1047,31 @@ mod tests {
             1200,
         );
         assert_eq!(dp_plain.obf_key(), None);
+    }
+
+    #[test]
+    fn replayed_counter_dropped_before_reassembly_allocation() {
+        let (mut a, mut b) = dataplane_pair(TunnelMode::L3Tun, false);
+        let inner = vec![0x11u8; 100];
+        let dgrams = a.on_tun_packet(&inner, 0).to_vec();
+        assert!(
+            !dgrams.is_empty(),
+            "on_tun_packet must produce at least one datagram"
+        );
+        let dg = &dgrams[0].bytes;
+
+        // First call succeeds and returns Outcome::TunWrite with inner bytes.
+        let outcome1 = b.on_udp_datagram(dg, 100);
+        match outcome1 {
+            Outcome::TunWrite(payload) => assert_eq!(payload, &inner[..]),
+            _ => panic!("expected Outcome::TunWrite, got other outcome"),
+        }
+
+        // Replaying the exact same datagram is dropped before reassembly allocation.
+        let outcome2 = b.on_udp_datagram(dg, 101);
+        assert!(
+            matches!(outcome2, Outcome::None),
+            "replayed counter must produce Outcome::None"
+        );
     }
 }
