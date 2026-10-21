@@ -8,6 +8,12 @@ name: wan-benchmark
       - 'bin/yipd/**'
       - 'crates/yip-transport/**'
       - 'crates/yip-wire/**'
+    paths-ignore:
+      - 'crates/yip-bench/RESULTS.md'
+      - 'crates/yip-bench/wan/results/**'
+      - 'assets/**'
+      - '**.md'
+      - 'docs/**'
   push:
     branches: [main]
     paths:
@@ -15,6 +21,12 @@ name: wan-benchmark
       - 'bin/yipd/**'
       - 'crates/yip-transport/**'
       - 'crates/yip-wire/**'
+    paths-ignore:
+      - 'crates/yip-bench/RESULTS.md'
+      - 'crates/yip-bench/wan/results/**'
+      - 'assets/**'
+      - '**.md'
+      - 'docs/**'
   workflow_dispatch:
     inputs:
       mode:

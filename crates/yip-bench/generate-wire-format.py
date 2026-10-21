@@ -7,7 +7,7 @@ Generates:
   assets/wire-format.svg
 
 Visualizes four key architectural pillars of yip:
-  1. Panel A: Data-Plane Datagram Framing (Anti-DPI Keyed Header Protection & SipHash-2-4 MAC)
+  1. Panel A: Data-Plane Datagram Framing (Anti-DPI Keyed Header Protection & SipHash-1-3 MAC)
   2. Panel B: Post-Quantum Hybrid Handshake Framing (Noise-IKpsk2 + ML-KEM-512 Kyber)
   3. Panel C: 120-Second Epoch Ratchet Overlap (Zero-Loss Rekey Rotation)
   4. Panel D: Cryptographic Self-Certifying Node Addressing (fd00::/8 ULA via BLAKE2s)
@@ -269,7 +269,7 @@ def generate_wire_format_svg() -> str:
 
     canvas.rect(154.0, 130.0, 114.0, 46.0, rx=4.0, fill="#1c1917", stroke=COLOR_OBF, stroke_width=1.0)
     canvas.text(211.0, 144.0, "Bytes 4..12 (8B)", fill=COLOR_OBF_LIGHT, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
-    canvas.text(211.0, 158.0, "SipHash-2-4 MAC", fill=COLOR_TEXT_MAIN, font_size=10.5, font_weight="700", text_anchor="middle")
+    canvas.text(211.0, 158.0, "SipHash-1-3 MAC", fill=COLOR_TEXT_MAIN, font_size=10.5, font_weight="700", text_anchor="middle")
     canvas.text(211.0, 170.0, "Header Auth Tag", fill=COLOR_TEXT_MUTED, font_size=8.5, text_anchor="middle")
 
     canvas.rect(272.0, 130.0, 222.0, 46.0, rx=4.0, fill=COLOR_DATA_BG, stroke=COLOR_DATA, stroke_width=1.0)

@@ -46,13 +46,17 @@ maintainer.
   `assets/wire-format.svg`) with CI gating, 100.0% mutation test score across 1,020 mutants (0 missed
   across `yip-wire`, `yip-crypto`, `yip-transport`, `yip-obf`, `yip-membership`, `yip-rendezvous`),
   and academic literature review synthesized in `README.md`.
+- **MTU-aware packetization & in-band PLPMTUD (#59)** — effective shard length wire-trimming ($L_{\text{eff}} = \min(\text{object\_size}, \text{symbol\_size})$)
+  collapsing 1400–1500B packets into $k = 1$ single-symbol objects, TUN device `SIOCSIFMTU` configuration (`--mtu 1400`),
+  and RFC 8899 PLPMTUD 4-tier probe ladder (`1120`, `1320`, `1400`, `1530`) with roaming and blackhole floor fallback.
+- **SipHash-1-3 & zero-alloc wire header auth (#58)** — streaming multi-slice SipHash-1-3 coverage authentication
+  and stack-allocated keystream generation (`header_mask`), slashing scalar MAC CPU by ~45% and eliminating
+  intermediate heap allocations on data-plane framing.
 
 ## Now
 
-- **Throughput 4c: MTU-aware packetization (#59)** — dynamic MSS clamping and adaptive path
-  MTU discovery.
-- **SipHash header-auth optimization (#58)** — streaming and SIMD acceleration for wire header
-  authentication.
+- **REALITY P256/P384 server-side KEX + HTTP/2 decoy (#84)** — broadening cipher suites and
+  HTTP/2 decoy multiplexing.
 
 ## Next
 
