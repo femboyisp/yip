@@ -77,8 +77,8 @@ class TestWireFormatGenerator(unittest.TestCase):
         self.assertIn("Epoch (6b)", svg_str)
         self.assertIn("Payload Length (16b)", svg_str)
         self.assertIn("Reserved (8b)", svg_str)
-        self.assertIn("Keyed Header Protection eliminates wire signatures; packets appear as pure high-entropy", svg_str)
-        self.assertIn("random bytes to DPI engines (nDPI, Zeek, Suricata).", svg_str)
+        self.assertIn("Keyed Header Protection eliminates static signatures; datagrams appear", svg_str)
+        self.assertIn("as uniform random bytes to DPI engines (nDPI, Zeek, Suricata, Wireshark).", svg_str)
 
     def test_panel_b_post_quantum_handshake(self):
         svg_str = generate_wire_format_module.generate_wire_format_svg()
@@ -103,11 +103,14 @@ class TestWireFormatGenerator(unittest.TestCase):
         self.assertIn("PANEL C", svg_str)
         self.assertIn("120s Epoch Ratchet Overlap", svg_str)
         self.assertIn("20s Overlap Window", svg_str)
-        self.assertIn("Epoch N Active (TX + RX Session Keys)", svg_str)
+        self.assertIn("Epoch N Active (TX + RX)", svg_str)
         self.assertIn("Epoch N+1 Active (TX + RX)", svg_str)
-        self.assertIn("t = 110s (Rekey)", svg_str)
-        self.assertIn("t = 120s (Expiry)", svg_str)
-        self.assertIn("t = 130s (Zeroize)", svg_str)
+        self.assertIn("t = 110s", svg_str)
+        self.assertIn("Rekey HS", svg_str)
+        self.assertIn("t = 120s", svg_str)
+        self.assertIn("Epoch End", svg_str)
+        self.assertIn("t = 130s", svg_str)
+        self.assertIn("Zeroize", svg_str)
         self.assertIn("Zeroize on Retire", svg_str)
         self.assertIn("0% Dropped Packets During Continuous Key Refresh", svg_str)
 
@@ -122,7 +125,7 @@ class TestWireFormatGenerator(unittest.TestCase):
         self.assertIn("0xfd (8 bits)", svg_str)
         self.assertIn("Digest[0..7] (56 bits)", svg_str)
         self.assertIn("Digest[7..15] (64 bits)", svg_str)
-        self.assertIn("Self-Certifying Identity", svg_str)
+        self.assertIn("Self-Certifying", svg_str)
         self.assertIn("Zero Central Infrastructure", svg_str)
 
     def test_cli_check_success(self):
