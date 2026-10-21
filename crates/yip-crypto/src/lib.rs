@@ -650,6 +650,13 @@ impl Session {
         Ok(plain.to_vec())
     }
 
+    /// Check whether `counter` is valid within the anti-replay window without committing it.
+    /// Used for pre-decoding packet validation and DoS rejection.
+    #[inline]
+    pub fn check_replay(&self, counter: u64) -> bool {
+        self.replay.check(counter)
+    }
+
     /// Seal into a caller-owned reusable buffer (no per-call allocation).
     pub fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> Result<u64, CryptoError> {
         let counter = self.send_counter;
@@ -1865,5 +1872,18 @@ mod tests {
         // Initiator decapsulates to a mismatched ss, causing snow Poly1305 MAC to fail
         let err = ini.read_message(&msg2);
         assert!(err.is_err(), "tampered ct must fail handshake verification");
+    }
+
+    #[test]
+    fn session_check_replay_is_non_committing() {
+        let (a, mut b) = crate::test_session_pair();
+        assert!(b.check_replay(1));
+        assert!(b.check_replay(1));
+
+        let sealed = a.seal_with_counter(1, b"hello").unwrap();
+        let opened = b.open(sealed.counter, &sealed.ciphertext).unwrap();
+        assert_eq!(opened, b"hello");
+
+        assert!(!b.check_replay(1));
     }
 }
