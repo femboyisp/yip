@@ -3,7 +3,7 @@
 **Author:** Zoa Hickenlooper  
 **Date:** 2026-10-20  
 **Target Milestone:** Issue #9 (Part 9b)  
-**Status:** Approved  
+**Status:** Approved with Audit Resolutions  
 
 ---
 
@@ -13,9 +13,10 @@
 
 This specification details the transition of `yip`'s cryptographic handshake to a **Post-Quantum Hybrid Key Exchange** utilizing **`Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s`** paired with **ML-KEM-512** (FIPS 203 / Kyber).
 
-The design satisfies two non-negotiable operational requirements:
-1. **Single-Datagram Fit**: Both handshake messages fit comfortably inside `OBF_MTU_BUDGET = 1200` bytes (Msg1 = 1,028 bytes, Msg2 = 980 bytes), completely avoiding IP fragmentation, chunking overhead, and packet loss amplification on lossy WAN links.
-2. **Dual-Layer Defense**: Session keys are derived via HKDF over *both* classical X25519 Diffie-Hellman secrets and ML-KEM-512 post-quantum shared secrets. Breaking the session requires breaking *both* discrete logarithms and the Module Learning with Errors (MLWE) lattice problem simultaneously.
+The design satisfies three non-negotiable operational requirements:
+1. **Single-Datagram Fit**: Both handshake messages fit comfortably inside `OBF_MTU_BUDGET = 1200` bytes (Msg 1 = 1,028 bytes, Msg 2 = 948 bytes), completely avoiding IP fragmentation, chunking overhead, and packet loss amplification on lossy WAN links.
+2. **Deadlock-Free Noise-IKpsk2 Protocol Execution**: Message 2 places the public ML-KEM-512 ciphertext ($ct$, 768B) in the outer framing envelope before the `snow` token sequence (`e, ee, se, psk`), allowing the Initiator to decapsulate $ss$ and invoke `handshake_state.set_psk(2, &ss)` *before* `read_message` executes the `psk` mix.
+3. **Dual-Layer Defense**: Session keys are derived via HKDF over *both* classical X25519 Diffie-Hellman secrets and ML-KEM-512 post-quantum shared secrets. Breaking the session requires breaking *both* discrete logarithms and the Module Learning with Errors (MLWE) lattice problem simultaneously.
 
 ---
 
@@ -27,7 +28,7 @@ The Noise Protocol Framework parameter string is:
 Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s
 ```
 * **Pattern**: `IK` (Initiator knows Responder static public key upfront; authenticates both sides in 1 round trip).
-* **Modifier**: `psk2` (Pre-Shared Key mixed into the chaining key at the end of Message 2).
+* **Modifier**: `psk2` (Pre-Shared Key mixed into chaining key and transcript hash at the end of Message 2).
 * **DH Function**: `25519` (X25519 scalar multiplication, 32-byte public keys / shared secrets).
 * **Cipher**: `ChaChaPoly` (ChaCha20 stream cipher with Poly1305 MAC).
 * **Hash Function**: `BLAKE2s` (256-bit cryptographic hash function).
@@ -46,16 +47,16 @@ Total Wire Size: 1,028 bytes (172 bytes headroom under 1,200 MTU budget)
 
 Message 2 (Responder -> Initiator):
 +------------------------------------------------------------------------+
-| Header (4B) | Ephemeral e (32B)                                        |
-| Encrypted Payload: ML-KEM-512 Ciphertext ct (768B)                    |
-|                    Member Certificate (128B)                          |
-|                    Poly1305 Auth Tag (16B)                            |
+| Header (4B) | ML-KEM-512 Ciphertext ct (768B)                         |
+| Noise Msg 2: Ephemeral e (32B)                                         |
+|              Encrypted Member Certificate (128B)                       |
+|              Poly1305 Auth Tag (16B)                                   |
 +------------------------------------------------------------------------+
-Total Wire Size: 980 bytes (220 bytes headroom under 1,200 MTU budget)
+Total Wire Size: 948 bytes (252 bytes headroom under 1,200 MTU budget)
 ```
 
 ### 2.3 Post-Quantum Key Encapsulation (ML-KEM-512)
-* Standard: **FIPS 203 (ML-KEM)** / Kyber-512.
+* Standard: **FIPS 203 (ML-KEM)** / Kyber-512 via RustCrypto `ml-kem = { version = "0.3", features = ["zeroize"] }`.
 * Encapsulation Key ($ek$): 800 bytes.
 * Decapsulation Key ($dk$): 1,632 bytes (stored in volatile zeroized memory).
 * Ciphertext ($ct$): 768 bytes.
@@ -75,39 +76,40 @@ sequenceDiagram
     Note over I: 1. Generate Ephemeral X25519 (e_A)<br/>2. Generate Ephemeral ML-KEM-512 (ek_A, dk_A)<br/>3. Format Msg1: payload = ek_A (800B) || Cert_A (128B)
     I->>R: Handshake Message 1 (1,028 bytes)
 
-    Note over R: 4. Noise decrypts Msg1 payload<br/>5. Verify Cert_A against Root Ed25519 CA<br/>6. Generate Ephemeral X25519 (e_B)<br/>7. ML-KEM Encapsulate: (ct, ss) = Encaps(ek_A)<br/>8. MixKey(psk = ss) into Noise state<br/>9. Format Msg2: payload = ct (768B) || Cert_B (128B)
-    R->>I: Handshake Message 2 (980 bytes)
+    Note over R: 4. Noise decrypts Msg1 payload<br/>5. Verify Cert_A against Root Ed25519 CA<br/>6. Extract ek_A and Encapsulate: (ct, ss) = Encaps(ek_A)<br/>7. Noise set_psk(2, &ss)<br/>8. Write Noise Msg2: payload = Cert_B (128B)<br/>9. Prepend ct (768B) to wire frame
+    R->>I: Handshake Message 2 (948 bytes)
 
-    Note over I: 10. Noise decrypts Msg2 payload<br/>11. Verify Cert_B against Root Ed25519 CA<br/>12. ML-KEM Decapsulate: ss = Decaps(dk_A, ct)<br/>13. MixKey(psk = ss) into Noise state<br/>14. Zeroize memory of dk_A
+    Note over I: 10. Extract ct from Msg2 frame envelope<br/>11. ML-KEM Decapsulate: ss = Decaps(dk_A, ct)<br/>12. Noise set_psk(2, &ss)<br/>13. Noise read_message validates psk and decrypts Cert_B<br/>14. Verify Cert_B against Root Ed25519 CA<br/>15. Drop Initiator state (ZeroizeOnDrop scrubs dk_A)
 
-    Note over I,R: Session Established: Split into Send & Recv Transport Keys<br/>Transport: ChaCha20-Poly1305 AEAD + Reed-Solomon RS(8,12) FEC
+    Note over I,R: Symmetrical Post-Quantum Transport Epoch Installed<br/>Data Plane: ChaCha20-Poly1305 AEAD + Reed-Solomon RS(8,12) FEC
 ```
 
 ### 3.1 Step-by-Step Operations
 
-1. **Initiator Setup**:
-   * Initiator generates classical ephemeral keypair $e_A$ via `snow`.
-   * Initiator generates ML-KEM-512 keypair $(ek_A, dk_A)$ via `ml_kem::MlKem512::generate(&mut rng)`.
-   * Initiator builds Msg1 payload: `[ek_A (800B) || Cert_A (128B)]`.
-   * `snow` encrypts payload under ephemeral Diffie-Hellman intermediate key.
+1. **Initiator Setup (Msg 1)**:
+   * Initiator initializes `snow::Builder::new("Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s")`.
+   * Initiator generates ML-KEM-512 keypair $(ek_A, dk_A)$ via `ml_kem::MlKem512::generate(&mut rng)`. $dk_A$ is wrapped in `Box<zeroize::Zeroizing<DecapsulationKey<MlKem512Params>>>`.
+   * Initiator builds Msg 1 payload: `[ek_A (800B) || Cert_A (128B)]`.
+   * `snow` executes `-> e, es, s, ss`, encrypting the payload. Total datagram: 1,028 bytes.
 
-2. **Responder Processing & Response**:
-   * Responder decrypts Msg1 payload.
+2. **Responder Processing & Response (Msg 2)**:
+   * Responder decrypts Msg 1 payload via `read_message`.
    * Responder extracts and verifies `Cert_A` using Root CA public key. If invalid or expired, abort.
-   * Responder extracts `ek_A`.
+   * Responder extracts `ek_A` (800 bytes).
    * Responder calls `ml_kem::MlKem512::encapsulate(&ek_A, &mut rng)` yielding $(ct, ss)$.
-   * Responder feeds $ss$ into `snow` state machine via `handshake_state.set_psk(ss)`.
-   * Responder builds Msg2 payload: `[ct (768B) || Cert_B (128B)]`.
-   * `snow` completes Msg2 Diffie-Hellman and mixes `psk` into chaining key (`ck`).
+   * Responder calls `handshake_state.set_psk(2, &ss)`.
+   * Responder writes Noise Msg 2 with payload `Cert_B (128B)`.
+   * Responder frames outbound packet as: `[Header (4B) || ct (768B) || Noise Msg 2 (176B)]`. Total datagram: 948 bytes.
 
-3. **Initiator Finalization**:
-   * Initiator receives Msg2, decrypts payload via `snow`.
-   * Initiator extracts and verifies `Cert_B`.
-   * Initiator extracts $ct$ (768 bytes).
-   * Initiator calls `ml_kem::MlKem512::decapsulate(&dk_A, &ct)` recovering $ss$.
-   * Initiator feeds $ss$ into `snow` state machine via `handshake_state.set_psk(ss)`.
-   * Initiator zeroes `dk_A` in memory immediately.
-   * Both sides call `snow::HandshakeState::split()` deriving identical send and receive AEAD transport keys.
+3. **Initiator Processing & Finalization**:
+   * Initiator receives Msg 2 datagram (948 bytes).
+   * Initiator parses outer framing: slices `msg2[4..772]` to extract $ct$ (768 bytes).
+   * Initiator decapsulates $ss = \text{Decaps}(dk_A, ct)$.
+   * Initiator calls `handshake_state.set_psk(2, &ss)`.
+   * Initiator passes `msg2[772..]` to `handshake_state.read_message(...)`.
+   * `snow` evaluates `<- e, ee, se, psk`, mixing $ss$ into the chaining key and validating the Poly1305 MAC over `Cert_B`.
+   * Initiator verifies `Cert_B`.
+   * Both sides call `into_transport_mode()` / `split()`. $dk_A$ is automatically zeroized when `Handshake::Initiator` drops.
 
 ---
 
@@ -116,6 +118,7 @@ sequenceDiagram
 The post-quantum hybrid handshake is directly bound to `yipd`'s 120-second session rekey rotation mechanism:
 * **Fresh Ephemerals**: Every rekey cycle generates a brand-new classical X25519 ephemeral *and* a brand-new ML-KEM-512 ephemeral keypair.
 * **Forward Secrecy**: Even if a physical node's memory is dumped hours later, past session traffic cannot be decrypted because all ephemeral $dk$ instances were zeroized upon epoch installation.
+* **Transient Memory Footprint**: In-flight `dk_A` instances add only 1,632 bytes per active rekeying peer. `Box<Zeroizing<...>>` ensures the `PeerState` enum remains small on the stack.
 * **Zero-Downtime Epoch Overlap**: Outgoing traffic transitions immediately to the new epoch; incoming traffic continues to accept the old epoch for 15 seconds to drain network inflight packets.
 
 ---
@@ -128,7 +131,7 @@ The post-quantum hybrid handshake is directly bound to `yipd`'s 120-second sessi
    * Derivation of transport keys remains computationally infeasible ($\ge 2^{140}$ quantum operations).
 2. **Adversary Manipulating Ciphertext ($ct$)**:
    * Under ML-KEM-512's Fujisaki-Okamoto transform (FIPS 203 implicit rejection), modified ciphertext produces a deterministic pseudorandom $ss$ that does not match the responder's secret.
-   * The resulting Noise MAC fails instantly. No timing leak is exposed.
+   * `MixKeyAndHash(ss)` produces a mismatched AEAD key, causing Noise Msg 2's Poly1305 tag over `Cert_B` to fail verification immediately. No timing leak is exposed.
 3. **Replay Attacks**:
    * Handshake messages reuse `yip`'s monotonic timestamp window and anti-replay epoch cache. Replays are dropped at the border.
 
@@ -138,19 +141,21 @@ The post-quantum hybrid handshake is directly bound to `yipd`'s 120-second sessi
 
 ### 6.1 Affected Crates
 * `crates/yip-crypto`:
-  * Add `ml-kem = "0.3"` dependency.
+  * Ensure `ml-kem = { version = "0.3", features = ["zeroize"] }` is configured.
   * Update `NOISE_PARAMS` to `"Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"`.
   * Update `Handshake::initiator`, `Handshake::responder`, and `Handshake::finalize_initiator`.
 * `bin/yipd`:
-  * Update handshake buffer sizing constants to accommodate 1,028-byte Msg1 and 980-byte Msg2.
+  * Update handshake buffer sizing constants to accommodate 1,028-byte Msg 1 and 948-byte Msg 2.
+  * Verify `OBF_MTU_BUDGET = 1200` headroom and relay forwarding buffers.
   * Wire PQ rekey state machine into `peer_manager`.
 
 ### 6.2 Testing Requirements
 * **Unit Tests**:
   * Round-trip PQ handshake producing working transport sessions.
-  * Bit-tampered encapsulation key rejection.
+  * FIPS 203 Modulus Rejection: verify `EncapsKey` parsing rejects coefficients $\ge 3329$ (`0xFFF` in `ek_A[0..3]`).
   * Bit-tampered ciphertext implicit rejection and subsequent MAC failure.
-  * Memory hygiene test confirming $dk$ zeroization.
+  * Memory hygiene test confirming $dk$ zeroization via `ZeroizeOnDrop`.
+  * Mutants verification: assert that skipping `set_psk` or zeroing $ss$ causes handshake divergence.
 * **Integration Tests**:
   * Privileged network namespace tunnel test under 5% packet loss with active PQ encryption.
   * 10 consecutive fast-cadence rekey rotations over `poll` and `io_uring` drivers.
