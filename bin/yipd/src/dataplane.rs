@@ -415,7 +415,7 @@ impl DataPlane {
                 self.detector.on_seen(counter, now_ms);
 
                 // Feed the symbol to the FEC reassembler; continue until an object decodes.
-                let ciphertext = match self.transport.decode(&sym, class) {
+                let ciphertext = match self.transport.decode(&sym, class, now_ms) {
                     Some(ct) => ct,
                     None => return Outcome::None,
                 };
