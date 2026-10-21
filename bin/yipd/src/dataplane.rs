@@ -4,7 +4,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 
-use yip_transport::{FlowClass, LossDetector, LossReport, RetxBuffer, Transport};
+use yip_transport::{
+    ControlFrame, FlowClass, LossDetector, PlpmtuController, RetxBuffer, Transport,
+};
 use yip_wire::{Codec, WireCodec as _};
 
 use crate::handshake::{Established, PacketType};
@@ -146,6 +148,8 @@ pub struct DataPlane {
     feedback_interval_ms: u64,
     /// Count of ARQ retransmits emitted (for observability / periodic log).
     arq_retx_count: u64,
+    /// In-band PLPMTUD state machine.
+    pub plpmtu: PlpmtuController,
 
     // ── reused per-call scratch buffers ──────────────────────────────────────
     /// Reused per-call scratch: each element holds one framed egress datagram
@@ -255,6 +259,7 @@ impl DataPlane {
             },
             feedback_interval_ms: FEEDBACK_INTERVAL_MS,
             arq_retx_count: 0,
+            plpmtu: PlpmtuController::new(),
             egress_scratch: Vec::new(),
             inner_scratch: Vec::new(),
             retx_scratch: Vec::new(),
@@ -278,6 +283,10 @@ impl DataPlane {
     /// authenticated, non-replayed inbound packet, so it cannot be steered by a
     /// spoofed source.
     pub fn set_peer_addr(&mut self, addr: SocketAddr) {
+        if self.peer_addr != addr {
+            let floor = self.plpmtu.reset_to_floor();
+            self.transport.set_symbol_size(floor);
+        }
         self.peer_addr = addr;
     }
 
@@ -484,99 +493,156 @@ impl DataPlane {
                 self.detector.on_seen(counter, now_ms);
                 self.detector.on_delivered(counter);
 
-                // Decode the LossReport.
-                let report = match LossReport::decode(&plaintext) {
-                    Some(r) => r,
+                // Decode the ControlFrame.
+                let frame = match ControlFrame::decode(&plaintext) {
+                    Some(f) => f,
                     None => {
-                        eprintln!("dataplane ingress: malformed LossReport");
+                        eprintln!("dataplane ingress: malformed ControlFrame");
                         return Outcome::None;
                     }
                 };
 
-                // Attribute missing counters to flow classes via the sent-log.
-                //
-                // Per-class fraction estimate:
-                //   fraction = class_missing / max(1, class_sent_in_log)
-                let mut missing_rt: u32 = 0;
-                let mut missing_bulk: u32 = 0;
-                let mut missing_default: u32 = 0;
+                match frame {
+                    ControlFrame::Feedback(report) => {
+                        // Attribute missing counters to flow classes via the sent-log.
+                        //
+                        // Per-class fraction estimate:
+                        //   fraction = class_missing / max(1, class_sent_in_log)
+                        let mut missing_rt: u32 = 0;
+                        let mut missing_bulk: u32 = 0;
+                        let mut missing_default: u32 = 0;
 
-                for &c in &report.missing {
-                    match self.sent_log.get(c) {
-                        Some(FlowClass::Realtime) => {
-                            missing_rt = missing_rt.saturating_add(1);
+                        for &c in &report.missing {
+                            match self.sent_log.get(c) {
+                                Some(FlowClass::Realtime) => {
+                                    missing_rt = missing_rt.saturating_add(1);
+                                }
+                                Some(FlowClass::Bulk) => {
+                                    missing_bulk = missing_bulk.saturating_add(1);
+                                }
+                                Some(FlowClass::Default) => {
+                                    missing_default = missing_default.saturating_add(1);
+                                }
+                                None => {
+                                    // Counter not in log (too old or was a control packet) — ignore.
+                                }
+                            }
                         }
-                        Some(FlowClass::Bulk) => {
-                            missing_bulk = missing_bulk.saturating_add(1);
-                        }
-                        Some(FlowClass::Default) => {
-                            missing_default = missing_default.saturating_add(1);
-                        }
-                        None => {
-                            // Counter not in log (too old or was a control packet) — ignore.
-                        }
-                    }
-                }
 
-                let sent_rt = self.sent_log.count_class(FlowClass::Realtime).max(1);
-                let sent_bulk = self.sent_log.count_class(FlowClass::Bulk).max(1);
-                let sent_default = self.sent_log.count_class(FlowClass::Default).max(1);
+                        let sent_rt = self.sent_log.count_class(FlowClass::Realtime).max(1);
+                        let sent_bulk = self.sent_log.count_class(FlowClass::Bulk).max(1);
+                        let sent_default = self.sent_log.count_class(FlowClass::Default).max(1);
 
-                let frac_rt = fraction_f32(missing_rt, sent_rt);
-                let frac_bulk = fraction_f32(missing_bulk, sent_bulk);
-                let frac_default = fraction_f32(missing_default, sent_default);
+                        let frac_rt = fraction_f32(missing_rt, sent_rt);
+                        let frac_bulk = fraction_f32(missing_bulk, sent_bulk);
+                        let frac_default = fraction_f32(missing_default, sent_default);
 
-                self.transport.observe_loss(FlowClass::Realtime, frac_rt);
-                self.transport.observe_loss(FlowClass::Bulk, frac_bulk);
-                self.transport
-                    .observe_loss(FlowClass::Default, frac_default);
-
-                // ARQ: for each missing counter reported by the peer,
-                // generate fresh repair symbols if the entry is still in the
-                // retransmit buffer and the class has ARQ enabled.
-                self.retx_scratch.clear();
-
-                for &missing_counter in &report.missing {
-                    let retx_entry = self
-                        .retx
-                        .get(missing_counter, now_ms)
-                        .map(|(ct, cls, oid)| (ct.to_vec(), cls, oid));
-
-                    let Some((ct, cls, oid)) = retx_entry else {
-                        continue;
-                    };
-                    if !cls.params().arq {
-                        continue;
-                    }
-
-                    // Count this retransmit for observability.
-                    self.arq_retx_count = self.arq_retx_count.saturating_add(1);
-
-                    // Generate fresh repair symbols with the original object_id.
-                    let repair_syms =
+                        self.transport.observe_loss(FlowClass::Realtime, frac_rt);
+                        self.transport.observe_loss(FlowClass::Bulk, frac_bulk);
                         self.transport
-                            .repair_object(&ct, cls, oid, RETX_EXTRA_REPAIR);
+                            .observe_loss(FlowClass::Default, frac_default);
 
-                    // Frame and collect all repair datagrams.
-                    for sym in &repair_syms {
-                        let frame =
-                            wire_glue::symbol_to_frame(self.conn_tag, sym, missing_counter, cls);
-                        let dg_bytes = self.codec.frame(&frame);
-                        let mut pkt = Vec::with_capacity(1 + dg_bytes.len());
-                        pkt.push(PacketType::Data as u8);
-                        pkt.extend_from_slice(&dg_bytes);
+                        // Blackhole loss detection: severe loss across default or bulk triggers fast fallback.
+                        if (frac_default >= 0.8 || frac_bulk >= 0.8)
+                            && (sent_default >= 3 || sent_bulk >= 3)
+                        {
+                            if let Some(floor) = self.plpmtu.on_blackhole() {
+                                self.transport.set_symbol_size(floor);
+                            }
+                        }
+
+                        // ARQ: for each missing counter reported by the peer,
+                        // generate fresh repair symbols if the entry is still in the
+                        // retransmit buffer and the class has ARQ enabled.
+                        self.retx_scratch.clear();
+
+                        for &missing_counter in &report.missing {
+                            let retx_entry = self
+                                .retx
+                                .get(missing_counter, now_ms)
+                                .map(|(ct, cls, oid)| (ct.to_vec(), cls, oid));
+
+                            let Some((ct, cls, oid)) = retx_entry else {
+                                continue;
+                            };
+                            if !cls.params().arq {
+                                continue;
+                            }
+
+                            // Count this retransmit for observability.
+                            self.arq_retx_count = self.arq_retx_count.saturating_add(1);
+
+                            // Generate fresh repair symbols with the original object_id.
+                            let repair_syms =
+                                self.transport
+                                    .repair_object(&ct, cls, oid, RETX_EXTRA_REPAIR);
+
+                            // Frame and collect all repair datagrams.
+                            for sym in &repair_syms {
+                                let frame = wire_glue::symbol_to_frame(
+                                    self.conn_tag,
+                                    sym,
+                                    missing_counter,
+                                    cls,
+                                );
+                                let dg_bytes = self.codec.frame(&frame);
+                                let mut pkt = Vec::with_capacity(1 + dg_bytes.len());
+                                pkt.push(PacketType::Data as u8);
+                                pkt.extend_from_slice(&dg_bytes);
+                                self.retx_scratch.push(yip_io::poll::EgressDatagram {
+                                    fate: oid,
+                                    dst: self.peer_addr,
+                                    bytes: pkt,
+                                });
+                            }
+                        }
+
+                        if self.retx_scratch.is_empty() {
+                            Outcome::None
+                        } else {
+                            Outcome::Send(&self.retx_scratch)
+                        }
+                    }
+
+                    ControlFrame::MtuProbe {
+                        probe_id,
+                        target_symbol_size,
+                        ..
+                    } => {
+                        let ack = ControlFrame::MtuProbeAck {
+                            probe_id,
+                            accepted_symbol_size: target_symbol_size,
+                        };
+                        let ack_bytes = ack.encode();
+                        let sealed = match self.session.seal(&ack_bytes) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("dataplane ingress: seal error on MtuProbeAck: {e}");
+                                return Outcome::None;
+                            }
+                        };
+                        self.retx_scratch.clear();
+                        let mut pkt = Vec::with_capacity(1 + 8 + sealed.ciphertext.len());
+                        pkt.push(PacketType::Control as u8);
+                        pkt.extend_from_slice(&sealed.counter.to_be_bytes());
+                        pkt.extend_from_slice(&sealed.ciphertext);
                         self.retx_scratch.push(yip_io::poll::EgressDatagram {
-                            fate: oid,
+                            fate: 0,
                             dst: self.peer_addr,
                             bytes: pkt,
                         });
+                        Outcome::Send(&self.retx_scratch)
                     }
-                }
 
-                if self.retx_scratch.is_empty() {
-                    Outcome::None
-                } else {
-                    Outcome::Send(&self.retx_scratch)
+                    ControlFrame::MtuProbeAck {
+                        probe_id,
+                        accepted_symbol_size,
+                    } => {
+                        if let Some(new_sym) = self.plpmtu.on_ack(probe_id, accepted_symbol_size) {
+                            self.transport.set_symbol_size(new_sym);
+                        }
+                        Outcome::None
+                    }
                 }
             }
 
@@ -616,6 +682,36 @@ impl DataPlane {
 
         // ── periodic feedback emission ─────────────────────────────────────────
         if now_ms.saturating_sub(self.last_feedback_ms) < self.feedback_interval_ms {
+            // Check if PLPMTUD has an in-band probe to emit between feedback ticks
+            if let Some((probe_id, target_symbol_size, pad_len)) = self.plpmtu.on_tick(now_ms) {
+                let probe = ControlFrame::MtuProbe {
+                    probe_id,
+                    target_symbol_size,
+                    padding: vec![0u8; pad_len],
+                };
+                let probe_bytes = probe.encode();
+                let sealed = match self.session.seal(&probe_bytes) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("dataplane tick: seal error on MtuProbe: {e}");
+                        return None;
+                    }
+                };
+                if self.tick_scratch.is_empty() {
+                    self.tick_scratch.push(yip_io::poll::EgressDatagram {
+                        fate: 0,
+                        dst: self.peer_addr,
+                        bytes: Vec::new(),
+                    });
+                }
+                let dg = &mut self.tick_scratch[0];
+                dg.dst = self.peer_addr;
+                dg.bytes.clear();
+                dg.bytes.push(PacketType::Control as u8);
+                dg.bytes.extend_from_slice(&sealed.counter.to_be_bytes());
+                dg.bytes.extend_from_slice(&sealed.ciphertext);
+                return Some(&self.tick_scratch);
+            }
             return None;
         }
         self.last_feedback_ms = now_ms;
@@ -631,7 +727,8 @@ impl DataPlane {
 
         // Build the report from the current detector state.
         let report = self.detector.report(now_ms);
-        let report_bytes = report.encode();
+        let frame = ControlFrame::Feedback(report);
+        let report_bytes = frame.encode();
 
         // Seal the report. The counter comes from the unified session sequence;
         // the peer's detector will call on_seen for it.
@@ -1119,5 +1216,24 @@ mod tests {
             Some(FlowClass::Realtime),
             "ingress packets must be observed in B's transport classifier"
         );
+    }
+
+    #[test]
+    fn plpmtu_roaming_resets_symbol_size_to_floor() {
+        let (mut a, _b) = dataplane_pair(TunnelMode::L3Tun, false);
+        // Advance PLPMTU tier to 1320
+        let ack_sym = a.plpmtu.on_ack(1, 1320);
+        if let Some(sz) = ack_sym {
+            a.transport.set_symbol_size(sz);
+        }
+        assert_eq!(a.transport.symbol_size(), 1320);
+        assert_eq!(a.plpmtu.current_symbol_size(), 1320);
+
+        // Roaming to new address resets to floor 1120
+        let new_addr: SocketAddr = "203.0.113.99:51820".parse().unwrap();
+        a.set_peer_addr(new_addr);
+        assert_eq!(a.peer_addr, new_addr);
+        assert_eq!(a.transport.symbol_size(), 1120);
+        assert_eq!(a.plpmtu.current_symbol_size(), 1120);
     }
 }

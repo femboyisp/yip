@@ -53,6 +53,7 @@ fn print_daemon_usage() {
     println!();
     println!("Options:");
     println!("  -c, --control <SOCKET>  UNIX domain control socket path");
+    println!("      --mtu <BYTES>       TUN device MTU (576-65535, default: 1400)");
     println!("      --genkey            Generate a fresh X25519 keypair");
     println!("      --addr <HEX-KEY>    Derive self-certifying mesh IPv6 address");
     println!("  -V, --version           Print version");
@@ -363,6 +364,7 @@ fn main() -> std::io::Result<()> {
         }
         Some(path) => {
             let mut control_override = None;
+            let mut mtu_override = None;
             while let Some(arg) = args.next() {
                 if arg == "--control" || arg == "-c" {
                     let cpath = args.next().ok_or_else(|| {
@@ -372,6 +374,26 @@ fn main() -> std::io::Result<()> {
                         )
                     })?;
                     control_override = Some(std::path::PathBuf::from(cpath));
+                } else if arg == "--mtu" {
+                    let mstr = args.next().ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "--mtu requires a byte count argument",
+                        )
+                    })?;
+                    let m: u32 = mstr.parse().map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("invalid mtu '{mstr}': must be an integer"),
+                        )
+                    })?;
+                    if !(576..=65535).contains(&m) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("invalid mtu '{m}': must be between 576 and 65535"),
+                        ));
+                    }
+                    mtu_override = Some(m);
                 }
             }
 
@@ -379,6 +401,9 @@ fn main() -> std::io::Result<()> {
             let mut config = Config::parse(&text)?;
             if let Some(sock_path) = control_override {
                 config.control_socket = Some(sock_path);
+            }
+            if let Some(mtu) = mtu_override {
+                config.mtu = Some(mtu);
             }
             tunnel::run(config)
         }

@@ -27,6 +27,8 @@ until 0.1.0.
   Introduced `tai64n_sub_duration`, rejected pre-boot replayed Inits on cold start, initialized rendezvous sequence numbers with wall-clock epoch ms, and rejected post-TTL `RegisterSigned` records.
 
 ### Added
+- **MTU-aware packetization & in-band PLPMTUD (`crates/yip-transport`, `crates/yip-device`, `bin/yipd`, #59).**
+  Implemented effective shard length ($L_{\text{eff}} = \min(\text{object\_size}, \text{symbol\_size})$) wire-trimming and last-symbol trimming in `FecEncoder` and `FecReassembler`, eliminating wire padding bloat and SIMD matrix work on sub-symbol packets while collapsing standard 1400–1500B packets into a single $k = 1$ source symbol. Added `SIOCSIFMTU` configuration to `TunTap` and daemon `--mtu` options with safe WAN defaults (1400B). Built in-band PLPMTUD (RFC 8899) control frames (`MtuProbe`, `MtuProbeAck`) with a 4-tier discrete search ladder (`1120`, `1320`, `1400`, `1530`) and instant fallback to floor on path roaming and blackhole loss.
 - **Zero-copy datapath egress in `io_uring` driver (`crates/yip-io`, #11).**
   Eliminated redundant `pkts.to_vec()` heap vector allocations in `handle_dispatch_udp` for both `DispatchOut::Udp` and `DispatchOut::Both` paths in `crates/yip-io/src/uring.rs`. Passes the existing borrowed datagram slice directly to `queue_udp_batch_tagged`, achieving zero-allocation datagram forwarding on the `io_uring` hot path.
 - **Bidirectional flow accounting in traffic classifier (`crates/yip-transport`, `bin/yipd`, #11).**

@@ -21,6 +21,12 @@ pub use flow::FlowTable;
 pub mod control;
 pub use control::AdaptiveController;
 
+pub mod plpmtu;
+pub use plpmtu::{
+    ControlFrame, PlpmtuController, MAGIC_MTU_PROBE, MAGIC_MTU_PROBE_ACK, MAX_PROBE_ATTEMPTS,
+    PLPMTU_LADDER, PROBE_INTERVAL_MS,
+};
+
 pub mod fec;
 pub use fec::{shard_for_fec_symbol, FecEncoder, FecReassembler, Symbol};
 
@@ -135,6 +141,19 @@ impl Transport {
     /// Reconfigure shard start object id and stride increment for multi-core scaling.
     pub fn set_shard(&mut self, shard_id: usize, num_shards: usize) {
         self.encoder.set_shard(shard_id as u16, num_shards as u16);
+    }
+
+    /// Dynamically update the active symbol size for future encodes and reassembly.
+    pub fn set_symbol_size(&mut self, symbol_size: u16) {
+        self.symbol_size = symbol_size;
+        for re in self.reassemblers.values_mut() {
+            re.set_symbol_size(symbol_size);
+        }
+    }
+
+    /// Return the active symbol size.
+    pub fn symbol_size(&self) -> u16 {
+        self.symbol_size
     }
 
     /// `class`'s default [`FlowParams`], with `symbol_size` overridden by the

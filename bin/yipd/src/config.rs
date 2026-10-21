@@ -168,6 +168,8 @@ pub struct Config {
     pub shards: usize,
     /// Optional path to UNIX domain control socket (`control_socket=<path>` or `--control <path>`).
     pub control_socket: Option<std::path::PathBuf>,
+    /// Configured TUN device MTU (`mtu=<576..=65535>`).
+    pub mtu: Option<u32>,
 }
 
 // ── hex decode helper ─────────────────────────────────────────────────────────
@@ -512,6 +514,7 @@ impl Config {
         let mut tls_sni: Option<String> = None;
         let mut shards: Option<usize> = None;
         let mut control_socket: Option<std::path::PathBuf> = None;
+        let mut mtu: Option<u32> = None;
 
         for line in text.lines() {
             let line = line.trim();
@@ -643,6 +646,18 @@ impl Config {
                 }
                 "control_socket" | "control" => {
                     control_socket = Some(std::path::PathBuf::from(val));
+                }
+                "mtu" => {
+                    let m = val
+                        .parse::<u32>()
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    if !(576..=65535).contains(&m) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("mtu must be between 576 and 65535, got {m}"),
+                        ));
+                    }
+                    mtu = Some(m);
                 }
                 // Silently ignore unknown keys for forward-compatibility. The
                 // netns config files still contain `initiate=true|false` from
@@ -782,6 +797,7 @@ impl Config {
             tls_sni: tls_sni.unwrap_or_else(|| DEFAULT_TLS_SNI.to_owned()),
             shards: shards.unwrap_or(1),
             control_socket,
+            mtu,
         })
     }
 }
@@ -824,6 +840,39 @@ mod tests {
 
         let text_zero = format!("{base}shards=0\n");
         assert!(Config::parse(&text_zero).is_err());
+    }
+
+    #[test]
+    fn parse_config_valid_mtu() {
+        let base = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
+                    local_public=00000000000000000000000000000000000000000000000000000000000000aa\n\
+                    peer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:51820\n";
+
+        for m in [1400, 9000, 576] {
+            let text = format!("{base}mtu={m}\n");
+            let c = Config::parse(&text).unwrap();
+            assert_eq!(c.mtu, Some(m));
+        }
+
+        let c_default = Config::parse(base).unwrap();
+        assert_eq!(c_default.mtu, None);
+    }
+
+    #[test]
+    fn parse_config_rejects_out_of_range_mtu() {
+        let base = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
+                    local_public=00000000000000000000000000000000000000000000000000000000000000aa\n\
+                    peer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:51820\n";
+
+        for bad in ["575", "70000"] {
+            let text = format!("{base}mtu={bad}\n");
+            let err = Config::parse(&text).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
     }
 
     #[test]

@@ -226,6 +226,15 @@ pub fn run(config: Config) -> io::Result<()> {
     let tun =
         TunTap::create(&config.device, device_kind, want_vnet_hdr).map_err(io::Error::other)?;
 
+    let mtu = config.mtu.unwrap_or(1400);
+    if let Err(e) = tun.set_mtu(mtu) {
+        eprintln!("warning: failed to set mtu {mtu} on {}: {e}", config.device);
+    }
+    let derived_symbol_size = u16::try_from(mtu.saturating_add(30)).unwrap_or(u16::MAX);
+    if config.transport != crate::config::TransportMode::Quic {
+        manager.set_data_symbol_size(derived_symbol_size);
+    }
+
     // Assign this node's self-certifying mesh address and route the mesh
     // prefix over the device. Best-effort: shelling out to `ip` (no unsafe,
     // no netlink code in this `forbid(unsafe_code)` binary) keeps this

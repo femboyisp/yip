@@ -24,7 +24,7 @@ pub struct Symbol {
     pub object_size: u32,
     /// `[codec_tag, symbol_index_hi, symbol_index_lo, scheme]`.
     pub payload_id: [u8; 4],
-    /// The symbol bytes (exactly `symbol_size`).
+    /// The symbol bytes (up to `symbol_size`, wire-trimmed on last source shard or when K=1).
     pub data: Vec<u8>,
 }
 
@@ -57,7 +57,11 @@ fn parse_payload_id(payload_id: &[u8; 4]) -> Option<(u16, rs::Scheme)> {
 /// Number of source symbols for an object of `object_size` at `symbol_size`.
 fn source_count(object_size: u32, symbol_size: u16) -> usize {
     let size = usize::try_from(object_size).expect("object_size fits usize");
-    size.div_ceil(usize::from(symbol_size))
+    let sym = usize::from(symbol_size);
+    if sym == 0 {
+        return 0;
+    }
+    size.div_ceil(sym)
 }
 
 /// Split `ciphertext` into `k` source shards of `sym` bytes each (last zero-padded).
@@ -140,6 +144,9 @@ impl FecEncoder {
     ) -> Vec<Symbol> {
         let object_size = u32::try_from(ciphertext.len()).expect("frame fits u32");
         let sym = usize::from(params.symbol_size);
+        if sym == 0 {
+            return Vec::new();
+        }
         let k = source_count(object_size, params.symbol_size);
         // Guard: K==0 (empty frame) or K>=255 (no GF(256) codeword room) → no symbols.
         if k == 0 || k >= 255 {
@@ -150,7 +157,6 @@ impl FecEncoder {
             .unwrap_or(max_repair)
             .min(max_repair);
 
-        let source = split_source(ciphertext, k, sym);
         let scheme = if !params.arq && (r == 1 || r == 2) {
             rs::Scheme::Pq
         } else {
@@ -158,26 +164,59 @@ impl FecEncoder {
         };
         let scheme_u8 = scheme.to_u8();
         let mut out = Vec::with_capacity(k + r);
-        for (i, shard) in source.iter().enumerate() {
+
+        if k == 1 {
+            let source = vec![ciphertext.to_vec()];
             out.push(Symbol {
                 object_id,
                 object_size,
-                payload_id: pack_payload_id(u16::try_from(i).expect("i < 255"), scheme_u8),
-                data: shard.clone(),
+                payload_id: pack_payload_id(0, scheme_u8),
+                data: ciphertext.to_vec(),
             });
-        }
-        if r > 0 {
-            for (m, rep) in rs::encode_repair(&source, r, scheme)
-                .into_iter()
-                .enumerate()
-            {
-                let idx = u16::try_from(k + m).expect("k+m < 255");
+            if r > 0 {
+                for (m, rep) in rs::encode_repair(&source, r, scheme)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let idx = u16::try_from(1 + m).expect("1+m < 255");
+                    out.push(Symbol {
+                        object_id,
+                        object_size,
+                        payload_id: pack_payload_id(idx, scheme_u8),
+                        data: rep,
+                    });
+                }
+            }
+        } else {
+            let source = split_source(ciphertext, k, sym);
+            let obj_len = usize::try_from(object_size).expect("fits usize");
+            let last_source_len = obj_len - (k - 1) * sym;
+            for (i, shard) in source.iter().enumerate() {
+                let data = if i == k - 1 {
+                    shard[..last_source_len].to_vec()
+                } else {
+                    shard.clone()
+                };
                 out.push(Symbol {
                     object_id,
                     object_size,
-                    payload_id: pack_payload_id(idx, scheme_u8),
-                    data: rep,
+                    payload_id: pack_payload_id(u16::try_from(i).expect("i < 255"), scheme_u8),
+                    data,
                 });
+            }
+            if r > 0 {
+                for (m, rep) in rs::encode_repair(&source, r, scheme)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let idx = u16::try_from(k + m).expect("k+m < 255");
+                    out.push(Symbol {
+                        object_id,
+                        object_size,
+                        payload_id: pack_payload_id(idx, scheme_u8),
+                        data: rep,
+                    });
+                }
             }
         }
         out
@@ -188,6 +227,8 @@ struct ObjState {
     /// Received shards keyed by symbol_index (deduped).
     shards: HashMap<u16, Vec<u8>>,
     k: usize,
+    shard_len: usize,
+    object_size: u32,
     scheme: rs::Scheme,
     done: bool,
     expires_at_ms: u64,
@@ -226,6 +267,11 @@ impl FecReassembler {
         self.objects.len()
     }
 
+    /// Dynamically update the baseline symbol size for newly arriving objects.
+    pub fn set_symbol_size(&mut self, s: u16) {
+        self.symbol_size = s;
+    }
+
     /// Feed one received symbol. Returns the decoded object when it completes.
     /// Returns `None` (never panics) for any malformed/attacker field.
     pub fn push(
@@ -236,18 +282,36 @@ impl FecReassembler {
         deadline_ms: u64,
     ) -> Option<Vec<u8>> {
         // --- Guards: object_size, codec tag, symbol_index, K bounds ---
-        if symbol.object_size == 0 || symbol.object_size > MAX_OBJECT_SIZE {
+        if symbol.object_size == 0 || symbol.object_size > MAX_OBJECT_SIZE || self.symbol_size == 0
+        {
             return None;
         }
         let (symbol_index, scheme) = parse_payload_id(&symbol.payload_id)?; // bad tag/scheme → None
         if usize::from(symbol_index) >= 255 {
             return None;
         }
-        if symbol.data.len() != usize::from(self.symbol_size) {
+        // If object is already in flight, preserve its original k, shard_len, and object_size;
+        // otherwise compute from self.symbol_size.
+        let (k, sym_size) = if let Some(existing) = self.objects.get(&object_key) {
+            if existing.object_size != symbol.object_size {
+                return None;
+            }
+            (existing.k, existing.shard_len)
+        } else {
+            let k = source_count(symbol.object_size, self.symbol_size);
+            (k, usize::from(self.symbol_size))
+        };
+        if k == 0 || k >= 255 {
             return None;
         }
-        let k = source_count(symbol.object_size, self.symbol_size);
-        if k == 0 || k >= 255 {
+        let obj_size = usize::try_from(symbol.object_size).ok()?;
+        let expected_wire_len = if usize::from(symbol_index) == k - 1 {
+            let prefix = (k - 1).checked_mul(sym_size)?;
+            obj_size.checked_sub(prefix)?
+        } else {
+            obj_size.min(sym_size)
+        };
+        if symbol.data.len() != expected_wire_len {
             return None;
         }
         // Ingest guard: a P+Q repair row m>=2 (index >= K+2) is invalid.
@@ -285,6 +349,8 @@ impl FecReassembler {
                 ObjState {
                     shards: HashMap::new(),
                     k,
+                    shard_len: obj_size.min(sym_size),
+                    object_size: symbol.object_size,
                     scheme,
                     done: false,
                     expires_at_ms: now_ms.saturating_add(deadline_ms),
@@ -306,10 +372,16 @@ impl FecReassembler {
             return None;
         }
         // Dedupe by index; only store what we don't have.
-        state
-            .shards
-            .entry(symbol_index)
-            .or_insert_with(|| symbol.data.clone());
+        if usize::from(symbol_index) == k - 1 && k >= 2 {
+            let mut padded = symbol.data.clone();
+            padded.resize(state.shard_len, 0);
+            state.shards.entry(symbol_index).or_insert(padded);
+        } else {
+            state
+                .shards
+                .entry(symbol_index)
+                .or_insert_with(|| symbol.data.clone());
+        }
 
         if state.shards.len() < state.k {
             return None;
@@ -321,12 +393,7 @@ impl FecReassembler {
             .iter()
             .map(|(&idx, d)| (idx, d.as_slice()))
             .collect();
-        let sources = rs::decode_source(
-            state.k,
-            usize::from(self.symbol_size),
-            &received,
-            state.scheme,
-        )?;
+        let sources = rs::decode_source(state.k, state.shard_len, &received, state.scheme)?;
         state.done = true;
 
         if state.shards.keys().any(|&idx| usize::from(idx) >= state.k) {
@@ -334,8 +401,8 @@ impl FecReassembler {
         }
 
         // Concatenate source shards and trim to the original object_size.
-        let size = usize::try_from(symbol.object_size).expect("size fits usize");
-        let mut object = Vec::with_capacity(state.k * usize::from(self.symbol_size));
+        let size = usize::try_from(symbol.object_size).unwrap();
+        let mut object = Vec::with_capacity(state.k * state.shard_len);
         for shard in &sources {
             object.extend_from_slice(shard);
         }
@@ -781,11 +848,16 @@ mod tests {
         let k = 5usize; // ceil(262_144 / 65_535) = 5
         let mut out = None;
         for i in 0..k {
+            let len = if i == k - 1 {
+                usize::try_from(object_size).unwrap() - (k - 1) * usize::from(symbol_size)
+            } else {
+                usize::from(symbol_size)
+            };
             let s = Symbol {
                 object_id: 0,
                 object_size,
                 payload_id: pack_payload_id(u16::try_from(i).unwrap(), crate::rs::SCHEME_CAUCHY),
-                data: vec![0u8; usize::from(symbol_size)],
+                data: vec![0u8; len],
             };
             out = out.or(re.push(u64::from(s.object_id), &s, 0, 1000));
         }
@@ -1081,5 +1153,196 @@ mod tests {
         // Zero shards falls back to stride 1
         enc.set_shard(5, 0);
         assert_eq!(enc.stride, 1);
+    }
+
+    #[test]
+    fn k1_wire_trimming_source_and_repair_shards() {
+        let params = FlowClass::Default.params();
+        assert_eq!(params.symbol_size, 1200);
+
+        // Test varying small object sizes: 64, 128, 576, 1199 bytes
+        for size in [64usize, 128, 576, 1199] {
+            let ct: Vec<u8> = (0..size).map(|i| (i as u8).wrapping_mul(7)).collect();
+            let mut enc = FecEncoder::new();
+            let syms = enc.encode(&ct, params, 2); // K=1, R=2 (P+Q)
+            assert_eq!(syms.len(), 3);
+
+            // Shard 0 (source) and Shards 1, 2 (P, Q) must ALL have wire length == size (L_eff)
+            for s in &syms {
+                assert_eq!(s.data.len(), size, "wire length must match L_eff={size}");
+            }
+
+            // Direct decode with only source symbol
+            let mut re = FecReassembler::new(params.symbol_size, 64);
+            let out0 = re.push(u64::from(syms[0].object_id), &syms[0], 0, 1000);
+            assert_eq!(out0.as_deref(), Some(ct.as_slice()));
+
+            // Decode from P repair shard only (erasure of source)
+            let mut re_p = FecReassembler::new(params.symbol_size, 64);
+            let out_p = re_p.push(u64::from(syms[1].object_id), &syms[1], 0, 1000);
+            assert_eq!(out_p.as_deref(), Some(ct.as_slice()), "P shard decodes K=1");
+
+            // Decode from Q repair shard only (erasure of source and P)
+            let mut re_q = FecReassembler::new(params.symbol_size, 64);
+            let out_q = re_q.push(u64::from(syms[2].object_id), &syms[2], 0, 1000);
+            assert_eq!(out_q.as_deref(), Some(ct.as_slice()), "Q shard decodes K=1");
+
+            // Wire length mismatch rejection: padded to 1200 instead of trimmed wire len
+            let mut bad_s0 = syms[0].clone();
+            bad_s0.data.resize(usize::from(params.symbol_size), 0);
+            let mut re_bad0 = FecReassembler::new(params.symbol_size, 64);
+            assert_eq!(re_bad0.push(0, &bad_s0, 0, 1000), None);
+
+            let mut bad_s1 = syms[1].clone();
+            bad_s1.data.resize(usize::from(params.symbol_size), 0);
+            let mut re_bad1 = FecReassembler::new(params.symbol_size, 64);
+            assert_eq!(re_bad1.push(0, &bad_s1, 0, 1000), None);
+        }
+    }
+
+    #[test]
+    fn k1_boundary_symbol_size_matches() {
+        let params = FlowClass::Default.params();
+        let ct = vec![0xEEu8; usize::from(params.symbol_size)]; // exactly 1200B
+        let mut enc = FecEncoder::new();
+        let syms = enc.encode(&ct, params, 1);
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].data.len(), 1200);
+        assert_eq!(syms[1].data.len(), 1200);
+        let mut re = FecReassembler::new(params.symbol_size, 64);
+        let out = re.push(u64::from(syms[0].object_id), &syms[0], 0, 1000);
+        assert_eq!(out.as_deref(), Some(ct.as_slice()));
+    }
+
+    #[test]
+    fn k_ge_2_wire_trimming_and_repadding_roundtrip() {
+        let params = FlowClass::Bulk.params(); // Cauchy
+        let _sym_size = usize::from(params.symbol_size); // 1200
+
+        // 1400B packet: K=2 (Shard 0: 1200B, Shard 1: 200B, Repair: 1200B each)
+        let ct_1400: Vec<u8> = (0..1400usize).map(|i| (i % 251) as u8).collect();
+        let mut enc = FecEncoder::new();
+        let syms_1400 = enc.encode(&ct_1400, params, 2);
+        assert_eq!(syms_1400.len(), 4); // 2 source + 2 repair
+
+        assert_eq!(syms_1400[0].data.len(), 1200);
+        assert_eq!(syms_1400[1].data.len(), 200); // trimmed to 1400 - 1200
+        assert_eq!(syms_1400[2].data.len(), 1200); // repair full length
+        assert_eq!(syms_1400[3].data.len(), 1200);
+
+        // Recovery with source symbols only [0, 1]
+        let mut re = FecReassembler::new(params.symbol_size, 64);
+        assert_eq!(re.push(0, &syms_1400[0], 0, 1000), None);
+        let res = re.push(0, &syms_1400[1], 0, 1000);
+        assert_eq!(res.as_deref(), Some(ct_1400.as_slice()));
+
+        // Recovery with [0, 2] (shard 1 missing)
+        let mut re_drop1 = FecReassembler::new(params.symbol_size, 64);
+        assert_eq!(re_drop1.push(0, &syms_1400[0], 0, 1000), None);
+        let res_drop1 = re_drop1.push(0, &syms_1400[2], 0, 1000);
+        assert_eq!(res_drop1.as_deref(), Some(ct_1400.as_slice()));
+
+        // Recovery with [1, 2] (shard 0 missing; shard 1 trimmed + repair shard)
+        let mut re_drop0 = FecReassembler::new(params.symbol_size, 64);
+        assert_eq!(re_drop0.push(0, &syms_1400[1], 0, 1000), None);
+        let res_drop0 = re_drop0.push(0, &syms_1400[2], 0, 1000);
+        assert_eq!(res_drop0.as_deref(), Some(ct_1400.as_slice()));
+
+        // Wire length validation:
+        // shard 0 with 200B -> rejected
+        let mut bad_s0 = syms_1400[0].clone();
+        bad_s0.data.truncate(200);
+        let mut re_bad0 = FecReassembler::new(params.symbol_size, 64);
+        assert_eq!(re_bad0.push(0, &bad_s0, 0, 1000), None);
+
+        // shard 1 with 1200B (untrimmed) -> rejected
+        let mut bad_s1 = syms_1400[1].clone();
+        bad_s1.data.resize(1200, 0);
+        let mut re_bad1 = FecReassembler::new(params.symbol_size, 64);
+        assert_eq!(re_bad1.push(0, &bad_s1, 0, 1000), None);
+
+        // repair shard with 200B -> rejected
+        let mut bad_r = syms_1400[2].clone();
+        bad_r.data.truncate(200);
+        let mut re_badr = FecReassembler::new(params.symbol_size, 64);
+        assert_eq!(re_badr.push(0, &bad_r, 0, 1000), None);
+
+        // 2500B packet: K=3 (Shard 0: 1200B, Shard 1: 1200B, Shard 2: 100B, Repair: 1200B)
+        let ct_2500: Vec<u8> = (0..2500usize).map(|i| (i % 251) as u8).collect();
+        let syms_2500 = enc.encode(&ct_2500, params, 3);
+        assert_eq!(syms_2500.len(), 6); // 3 source + 3 repair
+        assert_eq!(syms_2500[0].data.len(), 1200);
+        assert_eq!(syms_2500[1].data.len(), 1200);
+        assert_eq!(syms_2500[2].data.len(), 100); // 2500 - 2400
+        assert_eq!(syms_2500[3].data.len(), 1200);
+        assert_eq!(syms_2500[4].data.len(), 1200);
+        assert_eq!(syms_2500[5].data.len(), 1200);
+
+        // Recover with [1, 3, 5] (missing 0, 2, 4)
+        let mut re_cauchy = FecReassembler::new(params.symbol_size, 64);
+        assert_eq!(re_cauchy.push(0, &syms_2500[1], 0, 1000), None);
+        assert_eq!(re_cauchy.push(0, &syms_2500[3], 0, 1000), None);
+        let res_cauchy = re_cauchy.push(0, &syms_2500[5], 0, 1000);
+        assert_eq!(res_cauchy.as_deref(), Some(ct_2500.as_slice()));
+    }
+
+    #[test]
+    fn repair_with_id_produces_identical_wire_trimming() {
+        let params = FlowClass::Bulk.params();
+        let ct: Vec<u8> = (0..1400usize).map(|i| (i % 251) as u8).collect();
+        let mut enc = FecEncoder::new();
+        let regular = enc.encode(&ct, params, 2);
+        let retx = enc.repair_with_id(&ct, params, regular[0].object_id, 2);
+
+        assert_eq!(regular.len(), retx.len());
+        for (a, b) in regular.iter().zip(retx.iter()) {
+            assert_eq!(a.data.len(), b.data.len());
+            assert_eq!(a.data, b.data);
+            assert_eq!(a.payload_id, b.payload_id);
+            assert_eq!(a.object_size, b.object_size);
+        }
+    }
+
+    #[test]
+    fn dynamic_symbol_size_transition_preserves_inflight_objects() {
+        let mut re = FecReassembler::new(1200, 64);
+        let mut enc = FecEncoder::new();
+
+        // Object 1: 2400B at symbol_size 1200 (K=2, Shard 0: 1200B, Shard 1: 1200B)
+        let ct1 = vec![0x41u8; 2400];
+        let mut params1 = FlowClass::Bulk.params();
+        params1.symbol_size = 1200;
+        let syms1 = enc.encode(&ct1, params1, 1);
+        assert_eq!(syms1[0].data.len(), 1200);
+
+        // Receive shard 0 of Object 1 at t=10
+        assert_eq!(re.push(101, &syms1[0], 10, 1000), None);
+        assert_eq!(re.in_flight(), 1);
+
+        // Dynamic MTU upgrade: receiver's symbol_size transitions to 1500
+        re.set_symbol_size(1500);
+
+        // Object 2 arrives: encoded with new symbol_size 1500 (1400B -> K=1, Shard 0: 1400B)
+        let ct2 = vec![0x42u8; 1400];
+        let mut params2 = FlowClass::Default.params();
+        params2.symbol_size = 1500;
+        let syms2 = enc.encode(&ct2, params2, 1);
+        assert_eq!(syms2[0].data.len(), 1400);
+
+        let res2 = re.push(102, &syms2[0], 20, 1000);
+        assert_eq!(
+            res2.as_deref(),
+            Some(ct2.as_slice()),
+            "Object 2 decodes with new symbol_size"
+        );
+
+        // Now shard 1 of Object 1 arrives (still using 1200B encoding)
+        // Reassembler must NOT reject or corrupt Object 1 because its in-flight state is preserved
+        let res1 = re.push(101, &syms1[1], 30, 1000);
+        assert_eq!(
+            res1.as_deref(),
+            Some(ct1.as_slice()),
+            "Object 1 completes using preserved in-flight parameters"
+        );
     }
 }
