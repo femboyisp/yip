@@ -170,6 +170,43 @@ fn bring_up(ifname: &[u8; libc::IFNAMSIZ]) -> Result<(), DeviceError> {
     }
 }
 
+/// Set the MTU of a network interface via `SIOCSIFMTU`.
+fn set_device_mtu(ifname: &[u8; libc::IFNAMSIZ], mtu: u32) -> Result<(), DeviceError> {
+    #[repr(C)]
+    struct IfReqMtu {
+        name: [u8; libc::IFNAMSIZ],
+        mtu: libc::c_int,
+        _pad: [u8; 20],
+    }
+    let req = IfReqMtu {
+        name: *ifname,
+        mtu: mtu as libc::c_int,
+        _pad: [0; 20],
+    };
+
+    // SAFETY: `sock_fd` is a valid AF_INET socket returned by `socket(2)`; `req` is a
+    // correctly-laid-out `ifreq` for SIOCSIFMTU, exclusively owned here. We check both
+    // socket creation and ioctl return values, and close `sock_fd` before returning.
+    let err = unsafe {
+        let sock_fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if sock_fd < 0 {
+            return Err(DeviceError::Io(io::Error::last_os_error()));
+        }
+        let rc = libc::ioctl(sock_fd, libc::SIOCSIFMTU, &req);
+        let e = if rc != 0 {
+            Some(io::Error::last_os_error())
+        } else {
+            None
+        };
+        libc::close(sock_fd);
+        e
+    };
+    match err {
+        Some(e) => Err(DeviceError::Io(e)),
+        None => Ok(()),
+    }
+}
+
 // struct ifreq: name[IFNAMSIZ] then a union; we only set ifr_flags.
 #[repr(C)]
 struct IfReq {
@@ -546,6 +583,12 @@ impl TunTap {
             Ok(())
         }
     }
+
+    /// Set the MTU of this device. Requires `CAP_NET_ADMIN`.
+    pub fn set_mtu(&self, mtu: u32) -> Result<(), DeviceError> {
+        let ifname = encode_ifname(&self.name)?;
+        set_device_mtu(&ifname, mtu)
+    }
 }
 
 /// The read half of a split [`TunTap`].
@@ -723,5 +766,47 @@ mod tests {
             None,
             "want_vnet_hdr=false must never activate vnet_hdr framing"
         );
+    }
+
+    #[test]
+    fn set_mtu_fails_on_too_long_name() {
+        let dummy_file = std::fs::File::open("/dev/null").unwrap();
+        let dev = TunTap {
+            file: dummy_file,
+            kind: DeviceKind::Tun,
+            name: "x".repeat(libc::IFNAMSIZ),
+            vnet_hdr_len: None,
+        };
+        assert!(matches!(dev.set_mtu(1500), Err(DeviceError::NameTooLong)));
+    }
+
+    #[test]
+    fn set_device_mtu_nonexistent_interface() {
+        let enc = encode_ifname("nonexistent0").unwrap();
+        let res = set_device_mtu(&enc, 1500);
+        assert!(matches!(res, Err(DeviceError::Io(_))));
+    }
+
+    #[test]
+    fn set_mtu_nonexistent_interface() {
+        let dummy_file = std::fs::File::open("/dev/null").unwrap();
+        let dev = TunTap {
+            file: dummy_file,
+            kind: DeviceKind::Tun,
+            name: "nonexistent0".to_owned(),
+            vnet_hdr_len: None,
+        };
+        assert!(matches!(dev.set_mtu(1500), Err(DeviceError::Io(_))));
+    }
+
+    #[test]
+    fn tun_set_mtu_succeeds_when_privileged() {
+        if !can_create_devices() {
+            eprintln!("SKIP tun_set_mtu_succeeds_when_privileged: needs CAP_NET_ADMIN");
+            return;
+        }
+        let dev = TunTap::create("yipmtu0", DeviceKind::Tun, false).unwrap();
+        assert!(dev.set_mtu(1400).is_ok());
+        assert!(dev.set_mtu(1500).is_ok());
     }
 }

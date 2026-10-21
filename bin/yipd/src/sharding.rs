@@ -600,6 +600,13 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
     )
     .map_err(io::Error::other)?;
 
+    let mtu = config.mtu.unwrap_or(1400);
+    if let Some(first_queue) = tun_queues.first() {
+        if let Err(e) = first_queue.set_mtu(mtu) {
+            eprintln!("warning: failed to set mtu {mtu} on {}: {e}", config.device);
+        }
+    }
+
     let local_addr = crate::addr::node_addr(&config.local_public);
     crate::tunnel::assign_mesh_address(&config.device, local_addr);
 
@@ -659,6 +666,8 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                 let mut manager = create_peer_manager(&cfg, &peers)?;
                 manager.set_num_shards(num_shards);
                 manager.set_shard_id(shard_id);
+                let derived_symbol_size = u16::try_from(mtu.saturating_add(30)).unwrap_or(u16::MAX);
+                manager.set_data_symbol_size(derived_symbol_size);
                 let tun_fd = tun_dev.as_raw_fd();
 
                 // Probe opportunistic AF_XDP socket with 3-tier fallback
