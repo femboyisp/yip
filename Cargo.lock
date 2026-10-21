@@ -1124,6 +1124,7 @@ dependencies = [
  "rand_core",
  "sha3",
  "shake",
+ "zeroize",
 ]
 
 [[package]]
@@ -1135,6 +1136,7 @@ dependencies = [
  "ctutils",
  "hybrid-array",
  "num-traits",
+ "zeroize",
 ]
 
 [[package]]
@@ -2314,9 +2316,11 @@ dependencies = [
 name = "yip-crypto"
 version = "0.0.0"
 dependencies = [
+ "ml-kem",
  "ring",
  "snow",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]

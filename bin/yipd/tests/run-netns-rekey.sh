@@ -66,8 +66,11 @@
 # argument.
 set -euo pipefail
 
-YIPD="${1:?Usage: $0 <yipd-binary>}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+YIPD="${1:-$WORKSPACE_ROOT/target/release/yipd}"
 WITNESS_BIN="$(dirname "$YIPD")/examples/rekey_epoch_witness"
+[ ! -x "$WITNESS_BIN" ] && WITNESS_BIN="$WORKSPACE_ROOT/target/release/examples/rekey_epoch_witness"
 
 # ── 0. root + tool preflight (this script is invoked directly by CI, not
 # through the tunnel_netns.rs Rust harness, so it does its own SKIP-gating

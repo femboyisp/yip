@@ -261,6 +261,28 @@ pub fn init_ephemeral(init_pkt: &[u8]) -> Option<[u8; 32]> {
     init_pkt.get(1..33)?.try_into().ok()
 }
 
+/// The responder's Noise ephemeral public key: the raw, unencrypted 32 bytes
+/// that lead Noise Msg 2 (`<- e, ee, se, psk`), located immediately after the
+/// 1-byte [`PacketType::HandshakeResp`] prefix and the 768-byte ML-KEM ciphertext.
+///
+/// Offset: `1 + 768 .. 1 + 768 + 32` = `769..801`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "exported for wire witnesses and tests")
+)]
+pub const RESP_EPHEMERAL_OFFSET: usize = 1 + yip_crypto::PQ_CIPHERTEXT_LEN;
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "exported for wire witnesses and tests")
+)]
+pub fn resp_ephemeral(resp_pkt: &[u8]) -> Option<[u8; 32]> {
+    resp_pkt
+        .get(RESP_EPHEMERAL_OFFSET..RESP_EPHEMERAL_OFFSET + 32)?
+        .try_into()
+        .ok()
+}
+
 /// TAI64N label length: 8-byte seconds + 4-byte nanoseconds.
 pub const TAI64N_LEN: usize = 12;
 
@@ -534,6 +556,29 @@ mod tests {
 
         // Too-short input: no panic, just `None`.
         assert_eq!(init_ephemeral(&[0u8; 10]), None);
+    }
+
+    #[test]
+    fn resp_ephemeral_matches_across_identical_retransmits_and_differs_for_new_attempts() {
+        let local_kp = yip_crypto::generate_keypair();
+        let peer_kp = yip_crypto::generate_keypair();
+
+        let (_hs, init_pkt) =
+            HandshakeState::start_initiator(&local_kp.private, &peer_kp.public, &[]).unwrap();
+        let (_, resp_pkt1, _, _) =
+            HandshakeState::start_responder(&peer_kp.private, &init_pkt, &[]).unwrap();
+        let (_, resp_pkt2, _, _) =
+            HandshakeState::start_responder(&peer_kp.private, &init_pkt, &[]).unwrap();
+
+        let eph1 = resp_ephemeral(&resp_pkt1).expect("valid resp has ephemeral");
+        let eph2 = resp_ephemeral(&resp_pkt2).expect("valid resp has ephemeral");
+        assert_ne!(eph1, [0u8; 32]);
+        assert_ne!(eph2, [0u8; 32]);
+        assert_ne!(
+            eph1, eph2,
+            "distinct responder attempts draw distinct ephemerals"
+        );
+        assert_eq!(resp_ephemeral(&[0u8; 10]), None);
     }
 
     #[test]

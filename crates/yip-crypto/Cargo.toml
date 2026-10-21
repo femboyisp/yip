@@ -9,6 +9,8 @@ repository.workspace = true
 thiserror = { workspace = true }
 snow = { version = "0.10.0", features = ["risky-raw-split"] }
 ring = "0.17"
+ml-kem = { version = "0.3", features = ["zeroize", "getrandom"] }
+zeroize = "1.8"
 
 [lints]
 workspace = true

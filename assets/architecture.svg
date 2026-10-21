@@ -49,12 +49,12 @@
     <text x="73.00" y="36.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" font-weight="700" fill="#fb923c" text-anchor="middle">YIP</text>
     <text x="110.00" y="37.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="17" font-weight="700" fill="#f0f6fc">DUAL-PATH SYSTEM ARCHITECTURE</text>
     <text x="110.00" y="55.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="11.5" fill="#8b949e">Zero-Lock Data Plane • eBPF AF_XDP 40 Gbps &amp; Anti-DPI Subsystems</text>
-    <rect x="898.50" y="24.00" width="117.50" height="22.00" rx="11.00" fill="#1e1b4b" stroke="#6366f1" stroke-width="1.00" />
-    <text x="957.25" y="39.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="600" fill="#818cf8" text-anchor="middle">Noise-IK AEAD</text>
-    <rect x="763.50" y="24.00" width="125.00" height="22.00" rx="11.00" fill="#431407" stroke="#f97316" stroke-width="1.00" />
-    <text x="826.00" y="39.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="600" fill="#fb923c" text-anchor="middle">GF(256) RS-FEC</text>
-    <rect x="636.00" y="24.00" width="117.50" height="22.00" rx="11.00" fill="#064e3b" stroke="#10b981" stroke-width="1.00" />
-    <text x="694.75" y="39.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="600" fill="#34d399" text-anchor="middle">40+ Gbps eBPF</text>
+    <rect x="808.50" y="24.00" width="207.50" height="22.00" rx="11.00" fill="#1e1b4b" stroke="#6366f1" stroke-width="1.00" />
+    <text x="912.25" y="39.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="600" fill="#818cf8" text-anchor="middle">Noise-IKpsk2 + ML-KEM-512</text>
+    <rect x="673.50" y="24.00" width="125.00" height="22.00" rx="11.00" fill="#431407" stroke="#f97316" stroke-width="1.00" />
+    <text x="736.00" y="39.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="600" fill="#fb923c" text-anchor="middle">GF(256) RS-FEC</text>
+    <rect x="546.00" y="24.00" width="117.50" height="22.00" rx="11.00" fill="#064e3b" stroke="#10b981" stroke-width="1.00" />
+    <text x="604.75" y="39.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="600" fill="#34d399" text-anchor="middle">40+ Gbps eBPF</text>
   </g>
   <!-- ========================================================= -->
   <!-- SECTION 1: CONTROL PLANE                                 -->
@@ -65,10 +65,10 @@
     <text x="98.00" y="97.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="700" fill="#818cf8" text-anchor="middle">CONTROL PLANE</text>
     <text x="172.00" y="97.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="11" fill="#8b949e">Out-of-band orchestration, cryptographic session management &amp; topology mesh discovery</text>
     <rect x="36.00" y="106.00" width="312.00" height="76.00" rx="6.00" fill="#0d1117" stroke="#30363d" stroke-width="1.00" />
-    <text x="48.00" y="123.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">BLAKE2s Key-Derivation</text>
-    <text x="48.00" y="139.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Static &amp; Ephemeral 256-bit Keypairs</text>
-    <text x="48.00" y="155.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Noise-IK Handshake Token Generation</text>
-    <text x="48.00" y="171.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#818cf8">• Ephemeral Rekeying State (120s Ratchet)</text>
+    <text x="48.00" y="123.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">PQ Hybrid Handshake &amp; KDF</text>
+    <text x="48.00" y="139.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• ML-KEM-512 (FIPS 203) + X25519</text>
+    <text x="48.00" y="155.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Noise-IKpsk2 Token Sequencing</text>
+    <text x="48.00" y="171.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#818cf8">• Ephemeral Rekeying (120s Ratchet)</text>
     <rect x="364.00" y="106.00" width="312.00" height="76.00" rx="6.00" fill="#0d1117" stroke="#30363d" stroke-width="1.00" />
     <text x="376.00" y="123.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">CA-Gated Mesh Discovery <tspan fill="#818cf8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">(yip-ca)</tspan></text>
     <text x="376.00" y="139.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• mTLS Node Identity &amp; Role Claims</text>
@@ -84,7 +84,7 @@
   <g id="connectors-control-to-data">
     <path d="M 192.00 182.00 L 192.00 206.00 L 644.00 206.00 L 644.00 232.00" fill="none" stroke="#6366f1" stroke-width="1.40" stroke-dasharray="3,3" marker-end="url(#arrow-ctrl)" />
     <rect x="250.00" y="198.00" width="168.00" height="16.00" rx="3.00" fill="#0d1117" stroke="#6366f1" stroke-width="0.80" />
-    <text x="334.00" y="210.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="9" font-weight="600" fill="#818cf8" text-anchor="middle">Noise Keys &amp; Ratchet State</text>
+    <text x="334.00" y="210.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="9" font-weight="600" fill="#818cf8" text-anchor="middle">Hybrid Keys &amp; Ratchet State</text>
     <path d="M 520.00 182.00 L 520.00 218.00 L 396.00 218.00 L 396.00 232.00" fill="none" stroke="#6366f1" stroke-width="1.40" stroke-dasharray="3,3" marker-end="url(#arrow-ctrl)" />
     <rect x="428.00" y="210.00" width="144.00" height="16.00" rx="3.00" fill="#0d1117" stroke="#6366f1" stroke-width="0.80" />
     <text x="500.00" y="222.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="9" font-weight="600" fill="#818cf8" text-anchor="middle">Peer Routing &amp; Endpoints</text>
@@ -116,7 +116,7 @@
     <rect x="532.00" y="278.00" width="224.00" height="114.00" rx="6.00" fill="#0d1117" stroke="#30363d" stroke-width="1.00" />
     <text x="542.00" y="294.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="9" font-weight="700" fill="#22d3ee">STAGE 03 • CRYPTO</text>
     <text x="542.00" y="310.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">ChaCha20-Poly1305 AEAD</text>
-    <text x="542.00" y="326.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="600" fill="#06b6d4">Noise-IK • 120s Ratchet</text>
+    <text x="542.00" y="326.00" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" font-weight="600" fill="#06b6d4">Noise-IKpsk2 • 120s Ratchet</text>
     <text x="542.00" y="346.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• AVX2 / NEON SIMD acceleration</text>
     <text x="542.00" y="362.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Bitmap sliding replay window</text>
     <text x="542.00" y="378.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• WireGuard-compatible framing</text>

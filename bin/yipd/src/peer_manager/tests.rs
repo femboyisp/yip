@@ -2334,3 +2334,70 @@ fn is_peer_established_reports_correct_state() {
     assert!(pm.is_peer_established(&[1u8; 32]));
     assert!(!pm.is_peer_established(&[2u8; 32]));
 }
+
+#[test]
+fn test_peer_manager_pq_hybrid_handshake_datagrams_fit_mtu_budget() {
+    let (mut pm_a, pm_b, ..) = established_pm_pair(100);
+
+    // Verify existing established pair operates across cold start and rekey
+    let now = 10_000u64;
+    let b_addr = peer_src(&pm_a, 0);
+
+    // Attach membership so responder can include its own certificate
+    let ca = test_ca();
+    pm_a.membership = Some(membership_for(&ca, pm_a.local_pub));
+
+    // Verify rekey payload construction (HandshakeInit with cert)
+    let rekey_pkt = rekey_init_with_payload(&pm_a, 0, &valid_cert_bytes(&pm_a, 0));
+    assert!(
+        rekey_pkt.len() <= OBF_MTU_BUDGET,
+        "rekey Init with cert must stay within OBF_MTU_BUDGET, got {}",
+        rekey_pkt.len()
+    );
+    assert_eq!(rekey_pkt[0], PacketType::HandshakeInit as u8);
+    // Msg 1 contains: 1 ptype + 32 Noise ephemeral + 48 encrypted static + 12 TAI64N + 800 ML-KEM ek + cert + 16 Poly1305 MAC tag
+    assert!(
+        rekey_pkt.len() >= 1025 && rekey_pkt.len() <= 1080,
+        "rekey Init with cert should be around 1,025-1,080 bytes, got {}",
+        rekey_pkt.len()
+    );
+
+    // Verify responder processes Init and builds HandshakeResp with cert
+    let out = pm_a.on_udp(b_addr, &rekey_pkt, now);
+    let resp = resp_bytes(&out);
+    assert_eq!(resp.len(), 1, "rekey init must produce one resp");
+    let resp_pkt = &resp[0];
+    assert_eq!(resp_pkt[0], PacketType::HandshakeResp as u8);
+    assert!(
+        resp_pkt.len() <= OBF_MTU_BUDGET,
+        "rekey Resp with cert must stay within OBF_MTU_BUDGET, got {}",
+        resp_pkt.len()
+    );
+    // Msg 2 contains: 1 ptype + 768 ML-KEM ct + 32 Noise ephemeral + cert (~128) + 16 Poly1305 MAC tag
+    assert!(
+        resp_pkt.len() >= 900 && resp_pkt.len() <= 1000,
+        "rekey Resp with cert should be around 945 bytes, got {}",
+        resp_pkt.len()
+    );
+
+    // Verify with obfuscation
+    let (pm_obf_a, ..) = established_pm_pair_with_obf(100, [0x42u8; 32]);
+    let rekey_obf = rekey_init_with_payload(&pm_obf_a, 0, &valid_cert_bytes(&pm_obf_a, 0));
+    let wrapped = pm_obf_a.obf_envelope(rekey_obf, now);
+    assert!(
+        wrapped.len() <= OBF_MTU_BUDGET,
+        "obfuscated rekey datagram must stay within OBF_MTU_BUDGET, got {}",
+        wrapped.len()
+    );
+
+    // Verify obfuscated response fits within OBF_MTU_BUDGET
+    let wrapped_resp = pm_obf_a.obf_envelope(resp_pkt.clone(), now);
+    assert!(
+        wrapped_resp.len() <= OBF_MTU_BUDGET,
+        "obfuscated rekey Resp datagram must stay within OBF_MTU_BUDGET, got {}",
+        wrapped_resp.len()
+    );
+
+    // Peer B is established
+    assert!(pm_b.is_peer_established(&pm_a.local_pub));
+}
