@@ -70,7 +70,7 @@
 //! before any side effect, so trying the wrong peer just yields
 //! `Outcome::None`, never corrupted state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv6Addr, SocketAddr};
 
 use yip_io::poll::{Dispatch, DispatchOut, EgressDatagram};
@@ -78,13 +78,21 @@ use yip_membership::{Cert, GossipMsg};
 use yip_rendezvous::{node_id, NodeId};
 
 use crate::addr::node_addr;
-use crate::config::PeerConfig;
+use crate::config::{PeerConfig, TrafficDefenseConfig};
 use crate::dataplane::{conn_tag_from_keys, DataPlane};
 use crate::handshake::{Established, HandshakeState, PacketType};
 use crate::membership::Membership;
 use crate::mode::TunnelMode;
 use crate::path::{PathAction, PathKind, PathStage, PathState};
 use crate::rendezvous::{RdvEvent, Rendezvous};
+
+pub const MAX_JITTER_QUEUE: usize = 1024;
+
+#[derive(Debug, Clone)]
+pub struct ScheduledDatagram {
+    pub deliver_after_ms: u64,
+    pub datagram: EgressDatagram,
+}
 
 mod gossip;
 mod handshake;
@@ -325,6 +333,9 @@ struct Peer {
     /// to this peer (3b Task 4). Defaults to `0`. Bounds cover emission to at
     /// most one datagram per peer per `cover_traffic_ms` interval.
     last_cover_ms: u64,
+    /// Stochastic cover traffic interval (jittered ms) to apply the next time
+    /// cover traffic is checked for this peer (DAITA).
+    next_cover_interval_ms: Option<u64>,
     tx_bytes: u64,
     rx_bytes: u64,
     tx_packets: u64,
@@ -432,13 +443,17 @@ pub struct PeerManager {
     /// [`PeerManager::build_junk`]. Seeded once from the OS RNG; never used
     /// for any security decision (junk bytes are keystream-masked by
     /// `yip_obf::obfuscate`, so their content is irrelevant).
-    junk_rng: yip_obf::XorShift64,
+    pub(super) junk_rng: yip_obf::XorShift64,
     /// Opt-in idle cover-traffic interval (3b Task 4), or `None` to disable.
     /// Only consulted when `obf_key.is_some()` — with obfuscation off, cover
     /// traffic never fires regardless of this value (there is no wrapper to
     /// hide it, and junk-in-the-clear would be worse than silence). Set once,
     /// before the event loop starts, via [`PeerManager::set_cover_traffic_ms`].
     cover_traffic_ms: Option<u64>,
+    /// Traffic defense configuration (DAITA packet length quantization and cover bursts).
+    pub traffic_defense: TrafficDefenseConfig,
+    /// Bounded queue for micro-jitter delayed egress datagrams (traffic defense).
+    pub scheduled_egress: VecDeque<ScheduledDatagram>,
     /// RaptorQ symbol size passed to `DataPlane::new` at every establish site
     /// (3c.1 Task 2). Defaults to `1200` — the pre-3c.1 hardcode, byte-identical
     /// for raw/obf mode. QUIC mode (3c.1 Tasks 4/5) overrides it via
@@ -561,6 +576,7 @@ impl PeerManager {
                 session_obf_key: None,
                 last_activity_ms: 0,
                 last_cover_ms: 0,
+                next_cover_interval_ms: None,
                 tx_bytes: 0,
                 rx_bytes: 0,
                 tx_packets: 0,
@@ -591,6 +607,8 @@ impl PeerManager {
             obf_key: None,
             junk_rng: yip_obf::XorShift64::from_getrandom(),
             cover_traffic_ms: None,
+            traffic_defense: TrafficDefenseConfig::default(),
+            scheduled_egress: VecDeque::new(),
             data_symbol_size: DEFAULT_DATA_SYMBOL_SIZE,
             relay_only,
             rekey_interval_ms: std::env::var("YIP_REKEY_INTERVAL_MS")
@@ -670,6 +688,7 @@ impl PeerManager {
             session_obf_key: None,
             last_activity_ms: 0,
             last_cover_ms: 0,
+            next_cover_interval_ms: None,
             tx_bytes: 0,
             rx_bytes: 0,
             tx_packets: 0,
@@ -705,6 +724,82 @@ impl PeerManager {
     /// keeps the existing `PeerManager::new` call sites untouched.
     pub fn set_cover_traffic_ms(&mut self, cover_traffic_ms: Option<u64>) {
         self.cover_traffic_ms = cover_traffic_ms;
+    }
+
+    /// Store traffic defense (DAITA packet length quantization and decoy bursts) configuration.
+    pub fn set_traffic_defense(&mut self, cfg: TrafficDefenseConfig) {
+        self.traffic_defense = cfg;
+    }
+
+    /// Query the milliseconds remaining until the earliest scheduled micro-jitter datagram is due.
+    /// Returns `Some(0)` if a datagram is already due, `Some(delay_ms)` if scheduled in the future,
+    /// or `None` if the queue is empty.
+    pub fn next_scheduled_egress_delay_ms(&self, now_ms: u64) -> Option<u64> {
+        let earliest = self
+            .scheduled_egress
+            .iter()
+            .map(|s| s.deliver_after_ms)
+            .min()?;
+        Some(earliest.saturating_sub(now_ms))
+    }
+
+    /// Drain all scheduled datagrams whose scheduled delivery timestamp `deliver_after_ms <= now_ms`.
+    pub fn drain_scheduled_egress(&mut self, now_ms: u64, out: &mut Vec<EgressDatagram>) {
+        while let Some(front) = self.scheduled_egress.front() {
+            if front.deliver_after_ms <= now_ms {
+                if let Some(item) = self.scheduled_egress.pop_front() {
+                    out.push(item.datagram);
+                }
+            } else {
+                break;
+            }
+        }
+        if self
+            .scheduled_egress
+            .iter()
+            .any(|s| s.deliver_after_ms <= now_ms)
+        {
+            let mut i = 0;
+            while i < self.scheduled_egress.len() {
+                if self.scheduled_egress[i].deliver_after_ms <= now_ms {
+                    if let Some(item) = self.scheduled_egress.remove(i) {
+                        out.push(item.datagram);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    /// Insert a micro-jitter delayed datagram in sorted `deliver_after_ms` order,
+    /// popping and immediately dispatching the oldest item on overrun (`len >= MAX_JITTER_QUEUE`).
+    pub(super) fn queue_scheduled_egress(
+        &mut self,
+        dg: EgressDatagram,
+        deliver_after_ms: u64,
+        out: &mut Vec<EgressDatagram>,
+    ) {
+        if self.scheduled_egress.len() >= MAX_JITTER_QUEUE {
+            if let Some(oldest) = self.scheduled_egress.pop_front() {
+                out.push(oldest.datagram);
+            }
+        }
+        let idx = match self
+            .scheduled_egress
+            .iter()
+            .rposition(|s| s.deliver_after_ms <= deliver_after_ms)
+        {
+            Some(pos) => pos + 1,
+            None => 0,
+        };
+        self.scheduled_egress.insert(
+            idx,
+            ScheduledDatagram {
+                deliver_after_ms,
+                datagram: dg,
+            },
+        );
     }
 
     /// Attach a UNIX domain control socket handle and device metadata.
@@ -909,6 +1004,7 @@ impl PeerManager {
             session_obf_key: None,
             last_activity_ms: 0,
             last_cover_ms: 0,
+            next_cover_interval_ms: None,
             tx_bytes: 0,
             rx_bytes: 0,
             tx_packets: 0,
@@ -1055,8 +1151,12 @@ impl PeerManager {
         &mut self,
         tun: Option<Vec<u8>>,
         mut udp: Vec<EgressDatagram>,
+        now_ms: u64,
     ) -> DispatchOut<'_> {
         self.obf_egress(&mut udp);
+        if !self.scheduled_egress.is_empty() {
+            self.drain_scheduled_egress(now_ms, &mut udp);
+        }
         self.egress = udp;
         match (tun, self.egress.is_empty()) {
             (Some(t), true) => {
@@ -1081,7 +1181,24 @@ impl Dispatch for PeerManager {
     /// egress it produces.
     fn on_udp(&mut self, src: SocketAddr, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
         if self.obf_key.is_none() {
-            return self.on_udp_dispatch(src, dg, now_ms);
+            if self.scheduled_egress.is_empty() {
+                return self.on_udp_dispatch(src, dg, now_ms);
+            }
+            let (tun, mut udp) = own_dispatch(self.on_udp_dispatch(src, dg, now_ms));
+            self.drain_scheduled_egress(now_ms, &mut udp);
+            self.egress = udp;
+            return match (tun, self.egress.is_empty()) {
+                (Some(t), true) => {
+                    self.tun_scratch = t;
+                    DispatchOut::Tun(&self.tun_scratch)
+                }
+                (Some(t), false) => {
+                    self.tun_scratch = t;
+                    DispatchOut::Both(&self.tun_scratch, &self.egress)
+                }
+                (None, false) => DispatchOut::Udp(&self.egress),
+                (None, true) => DispatchOut::None,
+            };
         }
         if dg.is_empty() {
             return DispatchOut::None;
@@ -1103,40 +1220,67 @@ impl Dispatch for PeerManager {
                 return DispatchOut::None;
             }
             let (tun, udp) = own_dispatch(self.on_rdv(&body, now_ms));
-            return self.finish_wrapped(tun, udp);
+            return self.finish_wrapped(tun, udp, now_ms);
         }
         let Some(plain) = self.deobf_ingress(src, dg) else {
             return DispatchOut::None;
         };
         let (tun, udp) = own_dispatch(self.on_udp_dispatch(src, &plain, now_ms));
-        self.finish_wrapped(tun, udp)
+        self.finish_wrapped(tun, udp, now_ms)
     }
 
     fn on_tun(&mut self, inner: &[u8], now_ms: u64) -> &[EgressDatagram] {
-        if self.obf_key.is_none() {
-            return self.on_tun_dispatch(inner, now_ms);
+        if self.traffic_defense.jitter_max_ms == 0 && self.scheduled_egress.is_empty() {
+            if self.obf_key.is_none() {
+                return self.on_tun_dispatch(inner, now_ms);
+            }
+            let mut scratch = std::mem::take(&mut self.egress);
+            {
+                let dispatched = self.on_tun_dispatch(inner, now_ms);
+                copy_into_reusable_egress(&mut scratch, dispatched);
+            }
+            self.obf_egress(&mut scratch);
+            self.egress = scratch;
+            return &self.egress;
         }
+
         let mut scratch = std::mem::take(&mut self.egress);
         {
             let dispatched = self.on_tun_dispatch(inner, now_ms);
             copy_into_reusable_egress(&mut scratch, dispatched);
         }
-        self.obf_egress(&mut scratch);
+        if self.obf_key.is_some() {
+            self.obf_egress_with_jitter(&mut scratch, now_ms);
+        } else {
+            self.jitter_unobfuscated_egress(&mut scratch, now_ms);
+        }
         self.egress = scratch;
         &self.egress
     }
 
     fn tick(&mut self, now_ms: u64) -> Option<&[EgressDatagram]> {
-        let has_egress = self.tick_dispatch(now_ms).is_some();
-        if !has_egress {
-            return None;
-        }
+        let _ = self.tick_dispatch(now_ms);
         if self.obf_key.is_some() {
             let mut tick_egress = std::mem::take(&mut self.tick_egress);
             self.obf_egress(&mut tick_egress);
+            if !self.scheduled_egress.is_empty() {
+                self.drain_scheduled_egress(now_ms, &mut tick_egress);
+            }
+            self.tick_egress = tick_egress;
+        } else if !self.scheduled_egress.is_empty() {
+            let mut tick_egress = std::mem::take(&mut self.tick_egress);
+            self.drain_scheduled_egress(now_ms, &mut tick_egress);
             self.tick_egress = tick_egress;
         }
-        Some(&self.tick_egress)
+        if self.tick_egress.is_empty() {
+            None
+        } else {
+            Some(&self.tick_egress)
+        }
+    }
+
+    fn next_timeout_ms(&self, now_ms: u64) -> Option<u64> {
+        self.next_scheduled_egress_delay_ms(now_ms)
     }
 }
 
@@ -1501,25 +1645,24 @@ impl PeerManager {
             self.tick_gossip(now_ms);
         }
 
-        // ── idle cover traffic (3b Task 4) ──────────────────────────────────
-        // Opt-in decoy traffic: only when obfuscation is on AND a
-        // `cover_traffic_ms` interval is configured. For each direct
-        // (non-relay) `Established` peer with a known endpoint that has been
-        // idle (no real Data sent or received) for at least the interval,
-        // AND hasn't had a cover datagram emitted in at least the interval,
-        // push exactly one session-keyed junk datagram (`build_junk` is
-        // plaintext; `tick`/`obf_egress` wraps it once with that peer's
-        // session key, since `dst` is an `Established` peer's endpoint).
-        // Gated on `last_activity_ms` so this never races or delays real
-        // data — latency-free, idle-only, bounded to one datagram per peer
-        // per tick. A relay-reached peer (`relay == true`) is skipped: its
-        // `endpoint` is a stale/candidate direct address left over from
-        // before the passive `relayed_handshake_*` path took over (see the
-        // real-Data egress arm above, which likewise checks `!relay`) —
-        // firing cover at it would leak junk to an unrelated address and
-        // miss the peer entirely. Relay-path cover is out of scope for 3b
-        // (mirrors Task 3's handshake junk, which is direct-path-only).
-        if let (true, Some(iv)) = (self.obf_key.is_some(), self.cover_traffic_ms) {
+        // ── idle cover traffic (3b Task 4 / DAITA) ──────────────────────────
+        // Opt-in decoy traffic: only when obfuscation is on AND either
+        // `traffic_defense.cover_interval_ms` or `cover_traffic_ms` is configured.
+        let base_iv_opt = self
+            .traffic_defense
+            .cover_interval_ms
+            .or(self.cover_traffic_ms);
+        if let (true, Some(base_iv)) = (self.obf_key.is_some(), base_iv_opt) {
+            let max_budget = 1420.max(OBF_MTU_BUDGET);
+            let mut valid_buckets = [0usize; 8];
+            let mut valid_count = 0usize;
+            for &b in &self.traffic_defense.buckets {
+                if b <= max_budget && valid_count < valid_buckets.len() {
+                    valid_buckets[valid_count] = b;
+                    valid_count += 1;
+                }
+            }
+
             for i in 0..self.peers.len() {
                 if !matches!(self.peers[i].state, PeerState::Established(_)) || self.peers[i].relay
                 {
@@ -1528,18 +1671,45 @@ impl PeerManager {
                 let Some(endpoint) = self.peers[i].endpoint else {
                     continue;
                 };
-                if now_ms.saturating_sub(self.peers[i].last_activity_ms) < iv
-                    || now_ms.saturating_sub(self.peers[i].last_cover_ms) < iv
+                let current_iv = self.peers[i].next_cover_interval_ms.unwrap_or(base_iv);
+                if now_ms.saturating_sub(self.peers[i].last_activity_ms) < current_iv
+                    || now_ms.saturating_sub(self.peers[i].last_cover_ms) < current_iv
                 {
                     continue;
                 }
-                let bytes = self.build_junk();
-                self.tick_egress.push(EgressDatagram {
-                    fate: 0,
-                    dst: endpoint,
-                    bytes,
-                });
+                let burst_count = if self.traffic_defense.cover_burst_max <= 1 {
+                    1
+                } else {
+                    usize::try_from(
+                        self.junk_rng
+                            .gen_range(1, self.traffic_defense.cover_burst_max),
+                    )
+                    .unwrap_or(1)
+                };
+
+                for _ in 0..burst_count {
+                    if valid_count == 0 {
+                        let bytes = self.build_junk();
+                        self.tick_egress.push(EgressDatagram {
+                            fate: 0,
+                            dst: endpoint,
+                            bytes,
+                        });
+                    } else {
+                        let b_idx =
+                            usize::try_from(self.junk_rng.gen_range(0, (valid_count - 1) as u64))
+                                .unwrap_or(0);
+                        let b = valid_buckets[b_idx];
+                        let fate = u16::try_from(b).unwrap_or(0);
+                        self.tick_egress.push(EgressDatagram {
+                            fate,
+                            dst: endpoint,
+                            bytes: vec![yip_obf::JUNK_TYPE],
+                        });
+                    }
+                }
                 self.peers[i].last_cover_ms = now_ms;
+                self.peers[i].next_cover_interval_ms = Some(jitter_ms(base_iv));
             }
         }
 

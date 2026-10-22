@@ -195,6 +195,77 @@ pub fn deobfuscate(key: &[u8; 16], dg: &[u8]) -> Option<(u8, Vec<u8>)> {
     Some((ptype, body))
 }
 
+/// Presets configuring packet length quantization (DAITA) and cover traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrafficDefensePreset {
+    #[default]
+    Off,
+    Balanced,
+    Paranoid,
+}
+
+impl TrafficDefensePreset {
+    pub const fn default_buckets(&self) -> &'static [usize] {
+        match self {
+            Self::Off => &[],
+            Self::Balanced => &[256, 512, 1024, 1420],
+            Self::Paranoid => &[512, 1420],
+        }
+    }
+
+    pub const fn default_cover_interval_ms(&self) -> Option<u64> {
+        match self {
+            Self::Off => None,
+            Self::Balanced => Some(500),
+            Self::Paranoid => Some(150),
+        }
+    }
+
+    pub const fn default_cover_burst_max(&self) -> u64 {
+        match self {
+            Self::Off => 1,
+            Self::Balanced => 2,
+            Self::Paranoid => 4,
+        }
+    }
+
+    pub const fn default_jitter_max_ms(&self) -> u64 {
+        match self {
+            Self::Off => 0,
+            Self::Balanced => 2,
+            Self::Paranoid => 4,
+        }
+    }
+}
+
+/// Round a raw datagram wire length up to the nearest configured bucket size,
+/// bounded by `max_budget`.
+///
+/// - If `buckets.is_empty()`, returns `raw_wire_len`.
+/// - Scans ascending `buckets`: for the first `b >= raw_wire_len`, if `b <= max_budget` returns `b`;
+///   if `b > max_budget`, returns `max_budget.max(raw_wire_len)`.
+/// - If `raw_wire_len > max(buckets)`, if `raw_wire_len < max_budget` returns `max_budget`;
+///   else returns `raw_wire_len`.
+pub fn round_to_bucket(raw_wire_len: usize, buckets: &[usize], max_budget: usize) -> usize {
+    if buckets.is_empty() {
+        return raw_wire_len;
+    }
+    for &b in buckets {
+        if b >= raw_wire_len {
+            if b <= max_budget {
+                return b;
+            } else {
+                return max_budget.max(raw_wire_len);
+            }
+        }
+    }
+    if raw_wire_len < max_budget {
+        max_budget
+    } else {
+        raw_wire_len
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +498,66 @@ mod tests {
             assert_eq!(ptype, 1);
             assert_eq!(body, payload.as_bytes());
         }
+    }
+
+    #[test]
+    fn test_traffic_defense_preset_defaults() {
+        assert_eq!(TrafficDefensePreset::default(), TrafficDefensePreset::Off);
+
+        let off = TrafficDefensePreset::Off;
+        assert_eq!(off.default_buckets(), &[] as &[usize]);
+        assert_eq!(off.default_cover_interval_ms(), None);
+        assert_eq!(off.default_cover_burst_max(), 1);
+        assert_eq!(off.default_jitter_max_ms(), 0);
+
+        let balanced = TrafficDefensePreset::Balanced;
+        assert_eq!(balanced.default_buckets(), &[256, 512, 1024, 1420]);
+        assert_eq!(balanced.default_cover_interval_ms(), Some(500));
+        assert_eq!(balanced.default_cover_burst_max(), 2);
+        assert_eq!(balanced.default_jitter_max_ms(), 2);
+
+        let paranoid = TrafficDefensePreset::Paranoid;
+        assert_eq!(paranoid.default_buckets(), &[512, 1420]);
+        assert_eq!(paranoid.default_cover_interval_ms(), Some(150));
+        assert_eq!(paranoid.default_cover_burst_max(), 4);
+        assert_eq!(paranoid.default_jitter_max_ms(), 4);
+    }
+
+    #[test]
+    fn test_round_to_bucket_empty_buckets() {
+        assert_eq!(round_to_bucket(100, &[], 1420), 100);
+        assert_eq!(round_to_bucket(0, &[], 1420), 0);
+        assert_eq!(round_to_bucket(2000, &[], 1420), 2000);
+    }
+
+    #[test]
+    fn test_round_to_bucket_exact_and_intermediate() {
+        let buckets = [256, 512, 1024, 1420];
+        assert_eq!(round_to_bucket(100, &buckets, 1420), 256);
+        assert_eq!(round_to_bucket(256, &buckets, 1420), 256);
+        assert_eq!(round_to_bucket(257, &buckets, 1420), 512);
+        assert_eq!(round_to_bucket(512, &buckets, 1420), 512);
+        assert_eq!(round_to_bucket(700, &buckets, 1420), 1024);
+        assert_eq!(round_to_bucket(1024, &buckets, 1420), 1024);
+        assert_eq!(round_to_bucket(1400, &buckets, 1420), 1420);
+        assert_eq!(round_to_bucket(1420, &buckets, 1420), 1420);
+    }
+
+    #[test]
+    fn test_round_to_bucket_budget_clamping() {
+        let buckets = [256, 512, 1024, 1420];
+        // b = 512 > max_budget (500), raw_wire_len (300) <= max_budget -> returns max_budget (500)
+        assert_eq!(round_to_bucket(300, &buckets, 500), 500);
+        // b = 1024 > max_budget (500), raw_wire_len (600) > max_budget -> returns raw_wire_len (600)
+        assert_eq!(round_to_bucket(600, &buckets, 500), 600);
+    }
+
+    #[test]
+    fn test_round_to_bucket_exceeding_max_bucket() {
+        let buckets = [256, 512];
+        // raw_wire_len (600) > max bucket (512), raw_wire_len < max_budget (1000) -> returns max_budget (1000)
+        assert_eq!(round_to_bucket(600, &buckets, 1000), 1000);
+        // raw_wire_len (1200) > max bucket (512), raw_wire_len >= max_budget (1000) -> returns raw_wire_len (1200)
+        assert_eq!(round_to_bucket(1200, &buckets, 1000), 1200);
     }
 }

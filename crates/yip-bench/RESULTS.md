@@ -740,8 +740,8 @@ Regime F delivers:
 ### Conditions
 
 - **Hosts:** `EC2 us-east-1 (t3.small)` ↔ `EC2 us-west-2 (t3.small)` (two 1-vCPU / ~1 GB Debian 13 VPSes, kernel 6.1.0-54-cloud-amd64)
-- **Baseline path:** ~54.411 ms RTT, single Gbit links
-- **Date / commit:** 2026-10-22T00:21:40Z / `efc91e4`
+- **Baseline path:** ~54.790 ms RTT, single Gbit links
+- **Date / commit:** 2026-10-22T02:20:18Z / `d6c18dc`
 - **Host tuning (applied equally, all tunnels):** `net.core.rmem_max=net.core.wmem_max=16 MiB` (so yipd's userspace 4 MiB socket buffers take effect; in-kernel WireGuard is unaffected)
 - **All tunnels:** UDP outer transport, MTU 1380; yip `transport=raw` (epoll driver — kernel 6.12 has no io_uring multishot recv, #25); WireGuard kernel module; OpenVPN static-key AES-256-GCM
 
@@ -751,10 +751,10 @@ Regime F delivers:
 
 | tunnel | TCP 1-stream | TCP 4-stream | UDP goodput | UDP loss | idle RTT | RTT under load | CPU (A, 1 vCPU) |
 |---|--:|--:|--:|--:|--:|--:|--:|
-| baseline (no tunnel) | 372.3 Mbit/s | 1006.0 Mbit/s | 200.0 Mbit/s | 0.02% | 54.448 ms | 54.435 ms | 3.7% |
-| yip | 258.5 Mbit/s | 368.3 Mbit/s | 200.0 Mbit/s | 0.00% | 55.175 ms | 58.223 ms | 14.1% |
-| WireGuard | 394.2 Mbit/s | 1314.1 Mbit/s | 200.0 Mbit/s | 2.55% | 58.936 ms | 58.996 ms | 10.9% |
-| OpenVPN | 26.2 Mbit/s | 32.3 Mbit/s | 200.0 Mbit/s | 0.00% | 55.264 ms | 55.578 ms | 3.7% |
+| baseline (no tunnel) | 387.8 Mbit/s | 1001.6 Mbit/s | 200.0 Mbit/s | 0.00% | 54.778 ms | 54.774 ms | 4.7% |
+| yip | 220.8 Mbit/s | 333.0 Mbit/s | 200.0 Mbit/s | 0.00% | 61.054 ms | 64.463 ms | 23.3% |
+| WireGuard | 421.9 Mbit/s | 1110.1 Mbit/s | 200.0 Mbit/s | 0.00% | 55.031 ms | 55.048 ms | 11.0% |
+| OpenVPN | 25.8 Mbit/s | 34.8 Mbit/s | 200.0 Mbit/s | 0.15% | 55.090 ms | 55.093 ms | 5.5% |
 
 ### Loss resilience (netem injected on the A→B outer path)
 
@@ -763,20 +763,20 @@ Effective end-to-end loss (ping) — lower is better; yip's FEC recovers what th
 | injected loss | baseline (no tunnel) | yip | WireGuard | OpenVPN |
 |---|--:|--:|--:|--:|
 | 0% | 0% | 0% | 0% | 0% |
-| 1% | 1% | 0% | 0% | 0% |
-| 3% | 4% | 0% | 4% | 2% |
-| 5% | 7% | 0% | 3% | 4% |
-| 10% | 13% | 0% | 8% | 16% |
+| 1% | 0% | 0% | 2% | 1% |
+| 3% | 3% | 0% | 1% | 1% |
+| 5% | 4% | 0% | 5% | 5% |
+| 10% | 7% | 0% | 14% | 7% |
 
 TCP goodput under the same injected loss (Mbit/s):
 
 | injected loss | baseline (no tunnel) | yip | WireGuard | OpenVPN |
 |---|--:|--:|--:|--:|
-| 0% | 401.5 | 108.1 | 395.0 | 23.2 |
-| 1% | 4.0 | 248.6 | 2.7 | 3.8 |
-| 3% | 1.8 | 113.8 | 1.1 | 1.5 |
-| 5% | 1.0 | 136.1 | 0.7 | 0.8 |
-| 10% | 0.8 | 35.0 | 0.5 | 0.5 |
+| 0% | 388.7 | 228.1 | 422.3 | 23.9 |
+| 1% | 8.7 | 12.0 | 2.2 | 2.5 |
+| 3% | 1.7 | 89.5 | 1.2 | 1.6 |
+| 5% | 1.3 | 51.7 | 0.9 | 0.8 |
+| 10% | 0.7 | 60.5 | 0.5 | 0.5 |
 
 ### Reproduce
 ```sh

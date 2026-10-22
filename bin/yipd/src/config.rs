@@ -97,6 +97,28 @@ pub struct PeerConfig {
     pub endpoint: Option<SocketAddr>,
 }
 
+/// Configuration for packet length quantization (DAITA) and cover traffic defenses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrafficDefenseConfig {
+    pub preset: yip_obf::TrafficDefensePreset,
+    pub buckets: Vec<usize>,
+    pub cover_interval_ms: Option<u64>,
+    pub cover_burst_max: u64,
+    pub jitter_max_ms: u64,
+}
+
+impl Default for TrafficDefenseConfig {
+    fn default() -> Self {
+        Self {
+            preset: yip_obf::TrafficDefensePreset::Off,
+            buckets: vec![],
+            cover_interval_ms: None,
+            cover_burst_max: 1,
+            jitter_max_ms: 0,
+        }
+    }
+}
+
 /// Static configuration for one yip tunnel endpoint.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -154,6 +176,8 @@ pub struct Config {
     /// of `0` is rejected as invalid (there is no such thing as a zero-length
     /// idle interval).
     pub cover_traffic_ms: Option<u64>,
+    /// Traffic analysis defense (DAITA) packet length quantization and cover traffic configuration.
+    pub traffic_defense: TrafficDefenseConfig,
     /// Wire transport (`transport=quic|tls|raw|udp`, absent ⇒ `RawUdp`).
     /// Mutually exclusive with `obf_psk`/`cover_traffic_ms` — QUIC and TLS
     /// mimicry each provide their own wire obfuscation. Nothing consumes
@@ -510,6 +534,11 @@ impl Config {
         let mut network_id: Option<[u8; 16]> = None;
         let mut obf_psk: Option<[u8; 32]> = None;
         let mut cover_traffic_ms: Option<u64> = None;
+        let mut raw_defense_preset: Option<yip_obf::TrafficDefensePreset> = None;
+        let mut raw_defense_buckets: Option<Vec<usize>> = None;
+        let mut raw_defense_cover_interval_ms: Option<u64> = None;
+        let mut raw_defense_cover_burst_max: Option<u64> = None;
+        let mut raw_defense_jitter_max_ms: Option<u64> = None;
         let mut transport = TransportMode::default();
         let mut tls_sni: Option<String> = None;
         let mut shards: Option<usize> = None;
@@ -614,6 +643,64 @@ impl Config {
                         ));
                     }
                     cover_traffic_ms = Some(ms);
+                }
+                "traffic_defense" => {
+                    let p = match val {
+                        "off" => yip_obf::TrafficDefensePreset::Off,
+                        "balanced" => yip_obf::TrafficDefensePreset::Balanced,
+                        "paranoid" => yip_obf::TrafficDefensePreset::Paranoid,
+                        other => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("unknown traffic_defense preset: {other}"),
+                            ));
+                        }
+                    };
+                    raw_defense_preset = Some(p);
+                }
+                "defense_buckets" => {
+                    let mut buckets = Vec::new();
+                    for part in val.split(',') {
+                        let part = part.trim();
+                        if part.is_empty() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "empty bucket in defense_buckets",
+                            ));
+                        }
+                        let b = part.parse::<usize>().map_err(|e| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("invalid defense_buckets value: {e}"),
+                            )
+                        })?;
+                        buckets.push(b);
+                    }
+                    raw_defense_buckets = Some(buckets);
+                }
+                "defense_cover_interval_ms" => {
+                    let ms = val
+                        .parse::<u64>()
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    if ms == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "defense_cover_interval_ms must be non-zero",
+                        ));
+                    }
+                    raw_defense_cover_interval_ms = Some(ms);
+                }
+                "defense_cover_burst_max" => {
+                    let burst = val
+                        .parse::<u64>()
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    raw_defense_cover_burst_max = Some(burst);
+                }
+                "defense_jitter_max_ms" => {
+                    let jitter = val
+                        .parse::<u64>()
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    raw_defense_jitter_max_ms = Some(jitter);
                 }
                 "transport" => {
                     transport = match val {
@@ -733,6 +820,96 @@ impl Config {
             }
         }
 
+        // Traffic defense (DAITA) preset expansion and granular overrides
+        let defense_enabled = raw_defense_preset
+            .is_some_and(|p| p != yip_obf::TrafficDefensePreset::Off)
+            || raw_defense_buckets.is_some()
+            || raw_defense_cover_interval_ms.is_some()
+            || raw_defense_cover_burst_max.is_some()
+            || raw_defense_jitter_max_ms.is_some();
+
+        let preset = raw_defense_preset.unwrap_or(yip_obf::TrafficDefensePreset::Off);
+        let buckets = raw_defense_buckets.unwrap_or_else(|| preset.default_buckets().to_vec());
+        let cover_interval_ms = raw_defense_cover_interval_ms
+            .or(cover_traffic_ms)
+            .or_else(|| preset.default_cover_interval_ms());
+        let cover_burst_max =
+            raw_defense_cover_burst_max.unwrap_or_else(|| preset.default_cover_burst_max());
+        let jitter_max_ms =
+            raw_defense_jitter_max_ms.unwrap_or_else(|| preset.default_jitter_max_ms());
+
+        let traffic_defense = TrafficDefenseConfig {
+            preset,
+            buckets,
+            cover_interval_ms,
+            cover_burst_max,
+            jitter_max_ms,
+        };
+
+        if defense_enabled {
+            if transport == TransportMode::Quic || transport == TransportMode::Tls {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "traffic_defense is mutually exclusive with transport=quic and transport=tls",
+                ));
+            }
+            if obf_psk.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "traffic_defense requires obf_psk",
+                ));
+            }
+            if traffic_defense.buckets.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "defense_buckets must be non-empty when traffic_defense is enabled",
+                ));
+            }
+            let mut prev = 0usize;
+            for &b in &traffic_defense.buckets {
+                if !(64..=1500).contains(&b) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("defense_buckets values must be between 64 and 1500, got {b}"),
+                    ));
+                }
+                if b <= prev {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "defense_buckets must be strictly ascending, got {:?}",
+                            traffic_defense.buckets
+                        ),
+                    ));
+                }
+                prev = b;
+            }
+        }
+
+        if traffic_defense.jitter_max_ms > 10 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "defense_jitter_max_ms cannot exceed 10",
+            ));
+        }
+
+        if !(1..=8).contains(&traffic_defense.cover_burst_max) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "defense_cover_burst_max must be between 1 and 8, got {}",
+                    traffic_defense.cover_burst_max
+                ),
+            ));
+        }
+
+        if let Some(0) = traffic_defense.cover_interval_ms {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "defense_cover_interval_ms must be non-zero",
+            ));
+        }
+
         // `transport=quic`/`transport=tls` each provide their own wire
         // obfuscation, so the obf/cover-traffic knobs (which assume the
         // raw-UDP path) don't apply — reject the combination rather than
@@ -793,6 +970,7 @@ impl Config {
             network_id,
             obf_psk,
             cover_traffic_ms,
+            traffic_defense,
             transport,
             tls_sni: tls_sni.unwrap_or_else(|| DEFAULT_TLS_SNI.to_owned()),
             shards: shards.unwrap_or(1),
@@ -2131,5 +2309,184 @@ local_public=0000000000000000000000000000000000000000000000000000000000000002
             cfg.control_socket,
             Some(std::path::PathBuf::from("/run/yipd/control.sock"))
         );
+    }
+
+    // ── traffic_defense (DAITA) tests ────────────────────────────────────
+
+    #[test]
+    fn parses_traffic_defense_balanced_with_defaults() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    obf_psk=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+                    traffic_defense=balanced\n";
+        let cfg = Config::parse(text).unwrap();
+        assert_eq!(
+            cfg.traffic_defense.preset,
+            yip_obf::TrafficDefensePreset::Balanced
+        );
+        assert_eq!(cfg.traffic_defense.buckets, vec![256, 512, 1024, 1420]);
+        assert_eq!(cfg.traffic_defense.cover_interval_ms, Some(500));
+        assert_eq!(cfg.traffic_defense.cover_burst_max, 2);
+        assert_eq!(cfg.traffic_defense.jitter_max_ms, 2);
+    }
+
+    #[test]
+    fn parses_traffic_defense_granular_overrides() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    obf_psk=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+                    traffic_defense=balanced\n\
+                    defense_buckets=512,1024,1420\n\
+                    defense_cover_interval_ms=250\n\
+                    defense_cover_burst_max=4\n\
+                    defense_jitter_max_ms=5\n";
+        let cfg = Config::parse(text).unwrap();
+        assert_eq!(
+            cfg.traffic_defense.preset,
+            yip_obf::TrafficDefensePreset::Balanced
+        );
+        assert_eq!(cfg.traffic_defense.buckets, vec![512, 1024, 1420]);
+        assert_eq!(cfg.traffic_defense.cover_interval_ms, Some(250));
+        assert_eq!(cfg.traffic_defense.cover_burst_max, 4);
+        assert_eq!(cfg.traffic_defense.jitter_max_ms, 5);
+    }
+
+    #[test]
+    fn rejects_traffic_defense_without_obf_psk() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    traffic_defense=balanced\n";
+        let err = Config::parse(text).unwrap_err();
+        assert!(
+            err.to_string().contains("traffic_defense requires obf_psk"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_non_ascending_defense_buckets() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    obf_psk=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+                    traffic_defense=balanced\n\
+                    defense_buckets=1024,512,1420\n";
+        let err = Config::parse(text).unwrap_err();
+        assert!(
+            err.to_string().contains("strictly ascending"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_excessive_jitter_max() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    obf_psk=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+                    traffic_defense=balanced\n\
+                    defense_jitter_max_ms=11\n";
+        let err = Config::parse(text).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("defense_jitter_max_ms cannot exceed 10"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_traffic_defense_with_quic_or_tls() {
+        let quic_text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                         local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                         local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                         peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                         transport=quic\n\
+                         traffic_defense=balanced\n";
+        let err_quic = Config::parse(quic_text).unwrap_err();
+        assert!(
+            err_quic.to_string().contains(
+                "traffic_defense is mutually exclusive with transport=quic and transport=tls"
+            ),
+            "unexpected error: {err_quic}"
+        );
+
+        let tls_text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                        local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                        local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                        peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                        transport=tls\n\
+                        traffic_defense=balanced\n";
+        let err_tls = Config::parse(tls_text).unwrap_err();
+        assert!(
+            err_tls.to_string().contains(
+                "traffic_defense is mutually exclusive with transport=quic and transport=tls"
+            ),
+            "unexpected error: {err_tls}"
+        );
+    }
+
+    #[test]
+    fn legacy_cover_traffic_ms_maps_to_defense_cover_interval() {
+        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    cover_traffic_ms=250\n";
+        let cfg = Config::parse(text).unwrap();
+        assert_eq!(cfg.cover_traffic_ms, Some(250));
+        assert_eq!(cfg.traffic_defense.cover_interval_ms, Some(250));
+        assert_eq!(
+            cfg.traffic_defense.preset,
+            yip_obf::TrafficDefensePreset::Off
+        );
+        assert_eq!(cfg.traffic_defense.buckets, Vec::<usize>::new());
+    }
+
+    #[test]
+    fn traffic_defense_config_default() {
+        let def = TrafficDefenseConfig::default();
+        assert_eq!(def.preset, yip_obf::TrafficDefensePreset::Off);
+        assert_eq!(def.buckets, Vec::<usize>::new());
+        assert_eq!(def.cover_interval_ms, None);
+        assert_eq!(def.cover_burst_max, 1);
+        assert_eq!(def.jitter_max_ms, 0);
+    }
+
+    #[test]
+    fn rejects_invalid_burst_or_interval_or_bucket_range() {
+        let base = "device=yip0\nlisten=0.0.0.0:51820\n\
+                    local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+                    local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    obf_psk=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+                    traffic_defense=balanced\n";
+
+        // burst max 0
+        let text_burst0 = format!("{base}defense_cover_burst_max=0\n");
+        assert!(Config::parse(&text_burst0).is_err());
+
+        // burst max 9 (>8)
+        let text_burst9 = format!("{base}defense_cover_burst_max=9\n");
+        assert!(Config::parse(&text_burst9).is_err());
+
+        // interval 0
+        let text_interval0 = format!("{base}defense_cover_interval_ms=0\n");
+        assert!(Config::parse(&text_interval0).is_err());
+
+        // bucket < 64
+        let text_bucket_small = format!("{base}defense_buckets=32,512\n");
+        assert!(Config::parse(&text_bucket_small).is_err());
+
+        // bucket > 1500
+        let text_bucket_large = format!("{base}defense_buckets=512,1600\n");
+        assert!(Config::parse(&text_bucket_large).is_err());
     }
 }

@@ -197,6 +197,7 @@ pub fn run(config: Config) -> io::Result<()> {
     // Opt-in idle cover traffic (3b Task 4): a no-op unless obf is also on
     // (`PeerManager::tick_dispatch` gates cover emission on both).
     manager.set_cover_traffic_ms(config.cover_traffic_ms);
+    manager.set_traffic_defense(config.traffic_defense.clone());
     let control_handle = if let Some(ref path) = config.control_socket {
         Some(crate::control::ControlHandle::bind(path)?)
     } else {
@@ -393,6 +394,22 @@ pub fn run(config: Config) -> io::Result<()> {
         yip_io::uring::run_uring(udp_fd, tun_fd, &mut manager)
     } else {
         yip_io::poll::run_poll(udp_fd, tun_fd, tun.vnet_hdr_len().is_some(), &mut manager)
+    }
+}
+
+/// Clamps the reactor poll timeout (in milliseconds) to the soonest scheduled micro-jitter
+/// delivery time across all peers, ensuring the event loop wakes promptly (<= 2-4ms)
+/// rather than waiting for coarse cadence ticks (20-50ms).
+pub fn clamp_reactor_timeout_ms(
+    default_timeout_ms: i32,
+    next_scheduled_delay_ms: Option<u64>,
+) -> i32 {
+    match next_scheduled_delay_ms {
+        Some(delay_ms) => {
+            let clamped = i32::try_from(delay_ms).unwrap_or(default_timeout_ms);
+            default_timeout_ms.min(clamped)
+        }
+        None => default_timeout_ms,
     }
 }
 

@@ -562,6 +562,7 @@ fn create_peer_manager(
     );
     manager.set_obf_psk(config.obf_psk);
     manager.set_cover_traffic_ms(config.cover_traffic_ms);
+    manager.set_traffic_defense(config.traffic_defense.clone());
     Ok(manager)
 }
 
@@ -759,11 +760,29 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                         std::hint::spin_loop();
                         poller.wait(0)?
                     } else {
-                        poller.wait(10)?
+                        let timeout_ms = crate::tunnel::clamp_reactor_timeout_ms(
+                            10,
+                            manager.next_scheduled_egress_delay_ms(cached_now_ms),
+                        );
+                        poller.wait(timeout_ms)?
                     };
 
                     if SHUTDOWN.load(Ordering::Relaxed) {
                         break;
+                    }
+
+                    // Refresh cached_now_ms upon reactor wakeup
+                    let wakeup_now = std::time::Instant::now();
+                    cached_now_ms = u64::try_from(wakeup_now.duration_since(start).as_millis())
+                        .unwrap_or(u64::MAX);
+
+                    // Drain scheduled micro-jitter datagrams due on wakeup and transmit to socket
+                    let mut drained_jitter = Vec::new();
+                    manager.drain_scheduled_egress(cached_now_ms, &mut drained_jitter);
+                    if !drained_jitter.is_empty() {
+                        let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
+                            drained_jitter.iter().map(|d| (&d.bytes[..], d.dst)).collect();
+                        let _ = batch_sock.sendmmsg_batch(&egress_batch);
                     }
 
                     let xsk_rx_ready = xsk_sock.mode() != XskBindMode::FallbackRecvmmsg

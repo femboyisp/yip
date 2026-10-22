@@ -47,6 +47,13 @@ pub trait Dispatch {
     /// Called at least every 10 ms.  Returns addressed feedback/keepalive
     /// datagrams (usually 0 or 1) that should be sent on the UDP socket.
     fn tick(&mut self, now_ms: u64) -> Option<&[EgressDatagram]>;
+
+    /// Optional next timeout hint in milliseconds from `now_ms`.
+    /// When provided, [`run_poll`] clamps its epoll wait timeout to
+    /// `min(10, delay)`.
+    fn next_timeout_ms(&self, _now_ms: u64) -> Option<u64> {
+        None
+    }
 }
 
 /// One egress datagram: its destination, plus the FEC "fate group" it
@@ -716,15 +723,25 @@ pub fn run_poll<D: Dispatch>(
     ];
 
     loop {
+        let now_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let timeout_ms = match d.next_timeout_ms(now_ms) {
+            Some(delay_ms) => {
+                let clamped = i32::try_from(delay_ms).unwrap_or(10);
+                10.min(clamped)
+            }
+            None => 10,
+        };
+
         // SAFETY: `epoll_fd` is a valid epoll fd.  `events` is a valid
         // stack-allocated array; we pass its length as `maxevents`.
-        // A timeout of 10 ms ensures `tick` fires on cadence.
+        // A timeout of 10 ms (or clamped to soonest scheduled micro-jitter delay)
+        // ensures `tick` fires on cadence and jittered egress drains promptly.
         let nfds = unsafe {
             libc::epoll_wait(
                 epoll_fd,
                 events.as_mut_ptr(),
                 libc::c_int::try_from(events.len()).expect("event array len fits c_int"),
-                10, // 10 ms timeout
+                timeout_ms,
             )
         };
 

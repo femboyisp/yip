@@ -2471,3 +2471,381 @@ fn repeated_on_tun_under_obfuscation_retains_egress_and_scratch_capacity() {
         );
     }
 }
+
+// ── Traffic Defense (DAITA) Unit Tests ──────────────────────────────────────
+
+#[test]
+fn obf_egress_quantizes_to_discrete_buckets() {
+    let peer = peer_cfg(1, "10.0.0.1:1000");
+    let mut pm = PeerManager::new(
+        [1u8; 32],
+        [2u8; 32],
+        &[peer],
+        TunnelMode::L3Tun,
+        None,
+        None,
+        false,
+    );
+    pm.set_obf_psk(Some([0xAAu8; 32]));
+    pm.set_traffic_defense(crate::config::TrafficDefenseConfig {
+        preset: yip_obf::TrafficDefensePreset::Balanced,
+        buckets: vec![256, 512, 1024, 1420],
+        cover_interval_ms: Some(500),
+        cover_burst_max: 2,
+        jitter_max_ms: 2,
+    });
+
+    let allowed_buckets = [256, 512, 1024, 1420];
+    let payload_lens = [50, 100, 300, 600, 1100];
+    let expected_buckets = [256, 256, 512, 1024, 1420];
+
+    for (&len, &expected) in payload_lens.iter().zip(expected_buckets.iter()) {
+        let pkt = vec![PacketType::Data as u8; len];
+        let wire = pm.obf_envelope(pkt, 0);
+        assert!(
+            allowed_buckets.contains(&wire.len()),
+            "payload len {} resulted in wire len {}, not in {:?}",
+            len,
+            wire.len(),
+            allowed_buckets
+        );
+        assert_eq!(wire.len(), expected);
+    }
+}
+
+#[test]
+fn handshake_quantizes_to_bucket() {
+    let peer = peer_cfg(1, "10.0.0.1:1000");
+    let mut pm = PeerManager::new(
+        [1u8; 32],
+        [2u8; 32],
+        &[peer],
+        TunnelMode::L3Tun,
+        None,
+        None,
+        false,
+    );
+    pm.set_obf_psk(Some([0xAAu8; 32]));
+    pm.set_traffic_defense(crate::config::TrafficDefenseConfig {
+        preset: yip_obf::TrafficDefensePreset::Balanced,
+        buckets: vec![256, 512, 1024, 1420],
+        cover_interval_ms: Some(500),
+        cover_burst_max: 2,
+        jitter_max_ms: 2,
+    });
+
+    // HandshakeInit (1025B) -> quantizes to 1420B
+    let mut init = vec![0u8; 1025];
+    init[0] = PacketType::HandshakeInit as u8;
+    let wire_init = pm.obf_envelope(init, 0);
+    assert_eq!(wire_init.len(), 1420);
+
+    // HandshakeResp (945B) -> quantizes to 1024B
+    let mut resp = vec![0u8; 945];
+    resp[0] = PacketType::HandshakeResp as u8;
+    let wire_resp = pm.obf_envelope(resp, 0);
+    assert_eq!(wire_resp.len(), 1024);
+}
+
+#[test]
+fn decoy_burst_emits_multiple_bucket_sized_packets() {
+    const TAG: u64 = 0x1122_3344_5566_7788;
+    let peer_ep: SocketAddr = "10.0.0.50:5050".parse().unwrap();
+    let peer = peer_cfg(50, "10.0.0.50:5050");
+    let mut pm = PeerManager::new(
+        [1u8; 32],
+        [2u8; 32],
+        &[peer],
+        TunnelMode::L3Tun,
+        None,
+        None,
+        false,
+    );
+    pm.set_obf_psk(Some([0xAAu8; 32]));
+    pm.set_traffic_defense(crate::config::TrafficDefenseConfig {
+        preset: yip_obf::TrafficDefensePreset::Paranoid,
+        buckets: vec![512, 1420],
+        cover_interval_ms: Some(20),
+        cover_burst_max: 3,
+        jitter_max_ms: 4,
+    });
+    let dp = fake_established_dataplane(TAG, peer_ep);
+    let sess = [0xBBu8; 16];
+    pm.peers[0].state =
+        PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+    pm.peers[0].session_obf_key = Some(sess);
+    pm.by_tag.insert(TAG, 0);
+
+    // Peer is idle from t=0. Keep now_ms under FEEDBACK_INTERVAL_MS (30ms)
+    // so tick_egress contains only the decoy burst.
+    let out = pm.tick(20).expect("idle peer should emit cover burst");
+    assert!(
+        (1..=3).contains(&out.len()),
+        "burst count {} not in 1..=3",
+        out.len()
+    );
+
+    let allowed_buckets = [512, 1420];
+    for dgram in out {
+        assert_eq!(dgram.dst, peer_ep);
+        assert!(
+            allowed_buckets.contains(&dgram.bytes.len()),
+            "packet len {} not in {:?}",
+            dgram.bytes.len(),
+            allowed_buckets
+        );
+        let (ptype, _) = yip_obf::deobfuscate(&sess, &dgram.bytes)
+            .expect("decoy packet deobfuscates under session key");
+        assert_eq!(ptype, yip_obf::JUNK_TYPE);
+    }
+}
+
+#[test]
+fn stochastic_cover_cadence_jitters_interval() {
+    const TAG: u64 = 0x2233_4455_6677_8899;
+    let peer_ep: SocketAddr = "10.0.0.60:6060".parse().unwrap();
+    let peer = peer_cfg(60, "10.0.0.60:6060");
+    let mut pm = PeerManager::new(
+        [1u8; 32],
+        [2u8; 32],
+        &[peer],
+        TunnelMode::L3Tun,
+        None,
+        None,
+        false,
+    );
+    pm.set_obf_psk(Some([0xAAu8; 32]));
+    let base_iv = 1000u64;
+    pm.set_traffic_defense(crate::config::TrafficDefenseConfig {
+        preset: yip_obf::TrafficDefensePreset::Balanced,
+        buckets: vec![256, 512, 1024, 1420],
+        cover_interval_ms: Some(base_iv),
+        cover_burst_max: 2,
+        jitter_max_ms: 2,
+    });
+    let dp = fake_established_dataplane(TAG, peer_ep);
+    let sess = [0xCCu8; 16];
+    pm.peers[0].state =
+        PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+    pm.peers[0].session_obf_key = Some(sess);
+    pm.by_tag.insert(TAG, 0);
+
+    let spread = base_iv / 4; // 250 ms (±25%)
+    let min_iv = base_iv - spread;
+    let max_iv = base_iv + spread;
+
+    let mut intervals = std::collections::HashSet::new();
+    let mut cur_time = 0u64;
+
+    for _ in 0..20 {
+        cur_time += 2000;
+        let _ = pm.tick(cur_time);
+        let next_iv = pm.peers[0]
+            .next_cover_interval_ms
+            .expect("next_cover_interval_ms should be set");
+        assert!(
+            next_iv >= min_iv && next_iv <= max_iv,
+            "next_iv {} outside ±25% range [{}, {}]",
+            next_iv,
+            min_iv,
+            max_iv
+        );
+        intervals.insert(next_iv);
+    }
+    // Over 20 jitter draws with spread 250, we should see multiple distinct intervals
+    assert!(
+        intervals.len() > 1,
+        "intervals should vary across ticks, got {:?}",
+        intervals
+    );
+}
+
+#[test]
+fn obf_off_retains_legacy_padding_behavior() {
+    let peer = peer_cfg(1, "10.0.0.1:1000");
+    let mut pm = PeerManager::new(
+        [1u8; 32],
+        [2u8; 32],
+        &[peer],
+        TunnelMode::L3Tun,
+        None,
+        None,
+        false,
+    );
+    pm.set_obf_psk(Some([0xAAu8; 32]));
+    // preset Off
+    pm.set_traffic_defense(crate::config::TrafficDefenseConfig {
+        preset: yip_obf::TrafficDefensePreset::Off,
+        buckets: vec![],
+        cover_interval_ms: None,
+        cover_burst_max: 1,
+        jitter_max_ms: 0,
+    });
+
+    let payload = vec![PacketType::Data as u8; 50];
+    let wire = pm.obf_envelope(payload, 0);
+    // Legacy data padding max is 64, raw_wire = 11 + 49 = 60.
+    // Wire length must be in 60..=(60 + 64).
+    assert!(
+        (60..=124).contains(&wire.len()),
+        "wire len {} should be in legacy range 60..=124",
+        wire.len()
+    );
+}
+
+#[test]
+fn micro_jitter_delays_packet_until_scheduled_time() {
+    let (mut pm, _tag, _ep) = pm_with_established_peer([1u8; 32], [2u8; 32], 100);
+    pm.set_obf_psk(Some([0xAAu8; 32]));
+    pm.set_traffic_defense(crate::config::TrafficDefenseConfig {
+        preset: yip_obf::TrafficDefensePreset::Balanced,
+        buckets: vec![256, 512, 1024, 1420],
+        cover_interval_ms: Some(500),
+        cover_burst_max: 2,
+        jitter_max_ms: 4,
+    });
+
+    let now_ms = 100u64;
+    let mut queued = false;
+    for _ in 0..50 {
+        let _ = pm.on_tun(&dummy_tun_pkt(), now_ms);
+        if !pm.scheduled_egress.is_empty() {
+            queued = true;
+            break;
+        }
+    }
+    assert!(queued, "expected packet(s) to be queued when delta > 0");
+    let queued_count = pm.scheduled_egress.len();
+    assert!(queued_count >= 1);
+
+    let earliest_deliver = pm
+        .scheduled_egress
+        .iter()
+        .map(|s| s.deliver_after_ms)
+        .min()
+        .unwrap();
+    assert!(earliest_deliver > now_ms);
+    let expected_delta = earliest_deliver - now_ms;
+
+    // Test next_scheduled_egress_delay_ms reports exact delay
+    let delay = pm.next_scheduled_egress_delay_ms(now_ms);
+    assert_eq!(delay, Some(expected_delta));
+
+    // Test intermediate time reporting
+    if expected_delta > 1 {
+        let partial_delay = pm.next_scheduled_egress_delay_ms(now_ms + 1);
+        assert_eq!(partial_delay, Some(expected_delta - 1));
+    }
+
+    // Advance time before earliest delivery - no packets should be drained
+    let mut drained_early = Vec::new();
+    pm.drain_scheduled_egress(earliest_deliver - 1, &mut drained_early);
+    assert!(drained_early.is_empty());
+    assert_eq!(pm.scheduled_egress.len(), queued_count);
+
+    // Advance time past all scheduled packets
+    let latest_deliver = pm
+        .scheduled_egress
+        .iter()
+        .map(|s| s.deliver_after_ms)
+        .max()
+        .unwrap();
+    assert_eq!(pm.next_scheduled_egress_delay_ms(latest_deliver), Some(0));
+    let mut drained = Vec::new();
+    pm.drain_scheduled_egress(latest_deliver, &mut drained);
+    assert_eq!(drained.len(), queued_count);
+    assert!(pm.scheduled_egress.is_empty());
+    assert_eq!(pm.next_scheduled_egress_delay_ms(latest_deliver), None);
+}
+
+#[test]
+fn reactor_timeout_clamping_matches_spec() {
+    // Default 10ms with no scheduled packets -> 10ms
+    assert_eq!(crate::tunnel::clamp_reactor_timeout_ms(10, None), 10);
+    // Scheduled packet due in 2ms -> clamps to 2ms
+    assert_eq!(crate::tunnel::clamp_reactor_timeout_ms(10, Some(2)), 2);
+    // Scheduled packet already due (0ms) -> clamps to 0ms (wake immediately)
+    assert_eq!(crate::tunnel::clamp_reactor_timeout_ms(10, Some(0)), 0);
+    // Scheduled packet far in future (50ms) -> remains at default 10ms
+    assert_eq!(crate::tunnel::clamp_reactor_timeout_ms(10, Some(50)), 10);
+}
+
+#[test]
+fn micro_jitter_queue_overrun_flushes_oldest_without_loss() {
+    let (mut pm, _tag, ep) = pm_with_established_peer([1u8; 32], [2u8; 32], 100);
+    pm.set_obf_psk(Some([0xAAu8; 32]));
+    pm.set_traffic_defense(crate::config::TrafficDefenseConfig {
+        preset: yip_obf::TrafficDefensePreset::Balanced,
+        buckets: vec![256, 512, 1024, 1420],
+        cover_interval_ms: Some(500),
+        cover_burst_max: 2,
+        jitter_max_ms: 10,
+    });
+
+    let total_packets = super::MAX_JITTER_QUEUE + 50;
+    let mut flushed_immediately = Vec::new();
+    let now_ms = 1000u64;
+
+    for i in 0..total_packets {
+        let dg = EgressDatagram {
+            fate: 0,
+            dst: ep,
+            bytes: vec![i as u8, (i >> 8) as u8],
+        };
+        let deliver_after_ms = now_ms + 10;
+        if pm.scheduled_egress.len() >= super::MAX_JITTER_QUEUE {
+            if let Some(oldest) = pm.scheduled_egress.pop_front() {
+                flushed_immediately.push(oldest.datagram);
+            }
+        }
+        pm.scheduled_egress.push_back(super::ScheduledDatagram {
+            deliver_after_ms,
+            datagram: dg,
+        });
+        assert!(pm.scheduled_egress.len() <= super::MAX_JITTER_QUEUE);
+    }
+
+    assert_eq!(pm.scheduled_egress.len(), super::MAX_JITTER_QUEUE);
+    assert_eq!(flushed_immediately.len(), 50);
+
+    for (i, dg) in flushed_immediately.iter().enumerate() {
+        assert_eq!(dg.bytes[0], i as u8);
+        assert_eq!(dg.bytes[1], (i >> 8) as u8);
+    }
+
+    let mut remaining = Vec::new();
+    pm.drain_scheduled_egress(now_ms + 10, &mut remaining);
+    assert_eq!(remaining.len(), super::MAX_JITTER_QUEUE);
+    assert!(pm.scheduled_egress.is_empty());
+
+    for (i, dg) in remaining.iter().enumerate() {
+        let expected_idx = 50 + i;
+        assert_eq!(dg.bytes[0], expected_idx as u8);
+        assert_eq!(dg.bytes[1], (expected_idx >> 8) as u8);
+    }
+
+    assert_eq!(flushed_immediately.len() + remaining.len(), total_packets);
+}
+
+#[test]
+fn zero_jitter_bypasses_queue() {
+    let (mut pm, _tag, _ep) = pm_with_established_peer([1u8; 32], [2u8; 32], 100);
+    pm.set_obf_psk(Some([0xAAu8; 32]));
+    pm.set_traffic_defense(crate::config::TrafficDefenseConfig {
+        preset: yip_obf::TrafficDefensePreset::Balanced,
+        buckets: vec![256, 512, 1024, 1420],
+        cover_interval_ms: Some(500),
+        cover_burst_max: 2,
+        jitter_max_ms: 0,
+    });
+
+    for _ in 0..10 {
+        let out = pm.on_tun(&dummy_tun_pkt(), 500);
+        assert!(!out.is_empty(), "packet must be dispatched immediately");
+        assert!(
+            pm.scheduled_egress.is_empty(),
+            "scheduled_egress must remain empty when jitter_max_ms == 0"
+        );
+        assert_eq!(pm.next_scheduled_egress_delay_ms(500), None);
+    }
+}
