@@ -1,0 +1,183 @@
+---
+name: Release
+
+'on':
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  build-release:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            musl_cross_url: https://musl.cc/x86_64-linux-musl-cross.tgz
+            musl_cross_dir: x86_64-linux-musl-cross
+            linker: x86_64-linux-musl-gcc
+            cc: x86_64-linux-musl-gcc
+            cxx: x86_64-linux-musl-g++
+            ar: x86_64-linux-musl-ar
+          - target: aarch64-unknown-linux-musl
+            musl_cross_url: https://musl.cc/aarch64-linux-musl-cross.tgz
+            musl_cross_dir: aarch64-linux-musl-cross
+            linker: aarch64-linux-musl-gcc
+            cc: aarch64-linux-musl-gcc
+            cxx: aarch64-linux-musl-g++
+            ar: aarch64-linux-musl-ar
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install build prerequisites (BoringSSL cmake + bindgen clang)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config binutils file
+
+      - name: Set up musl cross-compilation toolchain
+        run: |
+          echo "Fetching ${{ matrix.target }} musl toolchain..."
+          curl -fsSL --retry 3 --retry-connrefused "${{ matrix.musl_cross_url }}" | sudo tar -xz -C /opt
+          echo "/opt/${{ matrix.musl_cross_dir }}/bin" >> $GITHUB_PATH
+          UPPER_TARGET="$(echo "${{ matrix.target }}" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
+          echo "CARGO_TARGET_${UPPER_TARGET}_LINKER=/opt/${{ matrix.musl_cross_dir }}/bin/${{ matrix.linker }}" >> $GITHUB_ENV
+          echo "CC_${{ matrix.target }}=/opt/${{ matrix.musl_cross_dir }}/bin/${{ matrix.cc }}" >> $GITHUB_ENV
+          echo "CXX_${{ matrix.target }}=/opt/${{ matrix.musl_cross_dir }}/bin/${{ matrix.cxx }}" >> $GITHUB_ENV
+          echo "AR_${{ matrix.target }}=/opt/${{ matrix.musl_cross_dir }}/bin/${{ matrix.ar }}" >> $GITHUB_ENV
+          SYSROOT_DIR="$(echo "${{ matrix.target }}" | sed 's/-unknown-/-/')"
+          echo "BINDGEN_EXTRA_CLANG_ARGS_${{ matrix.target }}=--sysroot=/opt/${{ matrix.musl_cross_dir }}/${SYSROOT_DIR}" >> $GITHUB_ENV
+
+      - name: Resolve release tag
+        id: vars
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+              TAG="${{ github.ref_name }}"
+            else
+              TAG="v0.0.0-${GITHUB_SHA::8}"
+            fi
+          fi
+          case "$TAG" in
+            v*) ;;
+            *) TAG="v$TAG" ;;
+          esac
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Build release binaries
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            -p yipd -p yip-ca -p yip-rendezvous-bin
+
+      - name: Verify static linkage
+        run: |
+          TARGET_DIR="target/${{ matrix.target }}/release"
+          for bin in yipd yip-ca yip-rendezvous; do
+            file "${TARGET_DIR}/${bin}"
+            if command -v readelf >/dev/null 2>&1; then
+              if readelf -l "${TARGET_DIR}/${bin}" | grep -q INTERP; then
+                echo "Error: ${bin} contains dynamic INTERP header!" >&2
+                exit 1
+              fi
+            fi
+          done
+
+      - name: Package release archive
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          TARGET="${{ matrix.target }}"
+          PKG_NAME="yip-${TAG}-${TARGET}"
+          STAGE_DIR="${RUNNER_TEMP:-/tmp}/${PKG_NAME}"
+          rm -rf "${STAGE_DIR}"
+          mkdir -p "${STAGE_DIR}"
+
+          TARGET_DIR="target/${TARGET}/release"
+          cp "${TARGET_DIR}/yipd" "${STAGE_DIR}/"
+          cp "${TARGET_DIR}/yip-ca" "${STAGE_DIR}/"
+          cp "${TARGET_DIR}/yip-rendezvous" "${STAGE_DIR}/"
+          cp example.config "${STAGE_DIR}/"
+          cp LICENSE "${STAGE_DIR}/"
+          cp README.md "${STAGE_DIR}/"
+          cp -r contrib "${STAGE_DIR}/"
+
+          tar -czvf "${PKG_NAME}.tar.gz" -C "${RUNNER_TEMP:-/tmp}" "${PKG_NAME}"
+          sha256sum "${PKG_NAME}.tar.gz" > "${PKG_NAME}.tar.gz.sha256"
+
+          mkdir -p dist
+          mv "${PKG_NAME}.tar.gz" dist/
+          mv "${PKG_NAME}.tar.gz.sha256" dist/
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/yip-*.tar.gz
+            dist/yip-*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish-release:
+    name: publish
+    needs: build-release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Collate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum yip-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Resolve release tag
+        id: vars
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${{ github.ref_name }}"
+          fi
+          case "$TAG" in
+            v*) ;;
+            *) TAG="v$TAG" ;;
+          esac
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          files: |
+            dist/yip-*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true

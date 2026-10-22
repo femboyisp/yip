@@ -392,18 +392,7 @@ fn send_mmsg(udp_fd: RawFd, datagrams: &[EgressDatagram]) -> io::Result<usize> {
         iov_base: std::ptr::null_mut(),
         iov_len: 0,
     }; MAX_DATAGRAM_BATCH];
-    let mut msgs = [libc::mmsghdr {
-        msg_hdr: libc::msghdr {
-            msg_name: std::ptr::null_mut(),
-            msg_namelen: 0,
-            msg_iov: std::ptr::null_mut(),
-            msg_iovlen: 0,
-            msg_control: std::ptr::null_mut(),
-            msg_controllen: 0,
-            msg_flags: 0,
-        },
-        msg_len: 0,
-    }; MAX_DATAGRAM_BATCH];
+    let mut msgs = [crate::empty_mmsghdr(); MAX_DATAGRAM_BATCH];
 
     for (i, dg) in datagrams[..count].iter().enumerate() {
         let (storage, addr_len) = std_to_sockaddr(dg.dst);
@@ -428,7 +417,7 @@ fn send_mmsg(udp_fd: RawFd, datagrams: &[EgressDatagram]) -> io::Result<usize> {
             udp_fd,
             msgs.as_mut_ptr(),
             u32::try_from(count).expect("count ≤ 64 fits u32"),
-            libc::MSG_NOSIGNAL,
+            libc::MSG_NOSIGNAL as crate::MsgFlags,
         )
     };
     if ret < 0 {
@@ -476,7 +465,7 @@ fn send_gso_payload(
     if cmsg_space > control.len() {
         return Err(io::Error::other("GSO control buffer too small"));
     }
-    msg.msg_controllen = cmsg_space;
+    msg.msg_controllen = cmsg_space as crate::CmsgLen;
 
     // SAFETY: `msg` points to valid in-frame iovec/control storage; we write
     // exactly one SOL_UDP/UDP_SEGMENT cmsg (a u16 segment size) into `control`.
@@ -487,8 +476,8 @@ fn send_gso_payload(
         }
         (*cmsg).cmsg_level = libc::SOL_UDP;
         (*cmsg).cmsg_type = libc::UDP_SEGMENT;
-        (*cmsg).cmsg_len =
-            usize::try_from(libc::CMSG_LEN(GSO_CONTROL_PAYLOAD_LEN)).expect("cmsg len fits usize");
+        (*cmsg).cmsg_len = usize::try_from(libc::CMSG_LEN(GSO_CONTROL_PAYLOAD_LEN))
+            .expect("cmsg len fits usize") as crate::CmsgLen;
         let seg_ptr = libc::CMSG_DATA(cmsg).cast::<u16>();
         *seg_ptr = segment_size;
     }
@@ -577,18 +566,7 @@ fn recv_mmsg(
         iov_base: std::ptr::null_mut(),
         iov_len: 0,
     }; MAX_DATAGRAM_BATCH];
-    let mut msgs = [libc::mmsghdr {
-        msg_hdr: libc::msghdr {
-            msg_name: std::ptr::null_mut(),
-            msg_namelen: 0,
-            msg_iov: std::ptr::null_mut(),
-            msg_iovlen: 0,
-            msg_control: std::ptr::null_mut(),
-            msg_controllen: 0,
-            msg_flags: 0,
-        },
-        msg_len: 0,
-    }; MAX_DATAGRAM_BATCH];
+    let mut msgs = [crate::empty_mmsghdr(); MAX_DATAGRAM_BATCH];
 
     for i in 0..count {
         // SAFETY: each iov_base/msg_name points to a distinct element of
@@ -609,7 +587,7 @@ fn recv_mmsg(
             udp_fd,
             msgs.as_mut_ptr(),
             u32::try_from(count).expect("count ≤ 64 fits u32"),
-            libc::MSG_DONTWAIT,
+            libc::MSG_DONTWAIT as crate::MsgFlags,
             std::ptr::null_mut(),
         )
     };

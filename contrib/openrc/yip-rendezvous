@@ -1,0 +1,19 @@
+#!/sbin/openrc-run
+# OpenRC service script for yip-rendezvous
+
+name="yip-rendezvous"
+description="yip rendezvous & relay server"
+
+command="/usr/local/bin/yip-rendezvous"
+command_args="${YIP_RENDEZVOUS_ARGS:---listen-udp 0.0.0.0:51820}"
+supervisor="supervise-daemon"
+capabilities="^cap_net_bind_service"
+
+depend() {
+	need net
+	use dns
+}
+
+start_pre() {
+	checkpath -d -m 0755 /run/yip-rendezvous
+}
