@@ -238,7 +238,7 @@ Install the latest pre-compiled static musl binary (`x86_64` or `aarch64`) with 
 curl -fsSL https://raw.githubusercontent.com/femboyisp/yip/main/install.sh | sh
 ```
 
-The POSIX installer places `yipd`, `yipctl`, and `yip-rendezvous` into `/usr/local/bin`, creates `/etc/yip`, and configures your init manager (`systemd`, `OpenRC`, or `runit`).
+The POSIX installer places `yipd`, `yip-ca`, and `yip-rendezvous` into `/usr/local/bin`, creates `/etc/yip`, and configures your init manager (`systemd`, `OpenRC`, or `runit`).
 
 #### Alternative Installation Methods
 
@@ -276,8 +276,8 @@ Every release includes detached `SHA256SUMS` for integrity verification.
 <summary><b>Production Init Services (contrib/)</b></summary>
 
 Hardened init service definitions with privilege separation are available in [`contrib/`](contrib/):
-- **systemd**: [`contrib/systemd/yipd.service`](contrib/systemd/yipd.service), multi-instance [`contrib/systemd/yipd@.service`](contrib/systemd/yipd@.service), and [`contrib/systemd/yip-rendezvous.service`](contrib/systemd/yip-rendezvous.service) with `DynamicUser=`, `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE`, `ProtectSystem=strict`, and seccomp filters.
-- **OpenRC**: [`contrib/openrc/yipd.initd`](contrib/openrc/yipd.initd) and [`contrib/openrc/yip-rendezvous.initd`](contrib/openrc/yip-rendezvous.initd) for Alpine Linux and Gentoo.
+- **systemd**: [`contrib/systemd/yipd.service`](contrib/systemd/yipd.service) and [`contrib/systemd/yip-rendezvous.service`](contrib/systemd/yip-rendezvous.service) with `LimitMEMLOCK=infinity`, `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_IPC_LOCK`, `DeviceAllow=/dev/net/tun rw`, and `ProtectSystem=strict`.
+- **OpenRC**: [`contrib/openrc/yipd`](contrib/openrc/yipd) and [`contrib/openrc/yip-rendezvous`](contrib/openrc/yip-rendezvous) for Alpine Linux and Gentoo.
 - **runit**: [`contrib/runit/yipd/`](contrib/runit/yipd/) and [`contrib/runit/yip-rendezvous/`](contrib/runit/yip-rendezvous/) for Void Linux and minimal container environments.
 </details>
 
