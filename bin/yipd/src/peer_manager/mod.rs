@@ -1278,6 +1278,10 @@ impl Dispatch for PeerManager {
             Some(&self.tick_egress)
         }
     }
+
+    fn next_timeout_ms(&self, now_ms: u64) -> Option<u64> {
+        self.next_scheduled_egress_delay_ms(now_ms)
+    }
 }
 
 impl PeerManager {

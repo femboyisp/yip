@@ -111,8 +111,8 @@ five** of these keys puts the node in *mesh mode*, where it may carry no
 `traffic_defense` implements Defending Against Intrusion with Traffic Analysis (DAITA) primitives to defeat statistical packet-size and timing fingerprinting attacks:
 
 - **Packet size quantization (`round_to_bucket`)**: Pads outbound datagrams to discrete byte sizes, eliminating packet size histograms that reveal protocol handshakes, page loads, or flow characteristics.
-- **Stochastic cover traffic & zero-allocation decoy bursts**: When no user datagrams are queued within the configured interval, `yipd` emits multi-packet bursts of authenticated decoy datagrams (`ptype == PTYPE_DECOY`) generated via zero-allocation scratch buffer reuse (`obf_scratch`). Receivers authenticate and silently discard decoy datagrams in constant time before reaching TUN or FEC reassembly queues.
-- **Micro-jitter delay queue**: Buffers egress datagrams for a bounded random interval (up to `defense_jitter_max_ms`), disrupting inter-arrival time regularity. Enforces a 256-packet capacity limit with a strict flush-oldest guarantee under buffer overrun, and clamps the event-loop poll timeout (`next_jitter_deadline_ms`) to ensure punctual queue draining.
+- **Stochastic cover traffic & zero-allocation decoy bursts**: When no user datagrams are queued within the configured interval, `yipd` emits multi-packet bursts of authenticated decoy datagrams (`ptype == JUNK_TYPE`) generated via zero-allocation scratch buffer reuse (`obf_scratch`). Receivers authenticate and silently discard decoy datagrams in constant time before reaching TUN or FEC reassembly queues.
+- **Micro-jitter delay queue**: Buffers egress datagrams for a bounded random interval (up to `defense_jitter_max_ms`), disrupting inter-arrival time regularity. Enforces a 1,024-packet capacity limit (`MAX_JITTER_QUEUE = 1024`) with a strict flush-oldest guarantee under buffer overrun, and clamps the event-loop poll timeout (`next_scheduled_egress_delay_ms`) to ensure punctual queue draining.
 
 **Preset reference:**
 
