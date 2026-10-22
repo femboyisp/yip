@@ -1,0 +1,11 @@
+#!/bin/sh
+exec 2>&1
+
+ulimit -l unlimited 2>/dev/null || true
+
+mkdir -p /run/yipd
+chmod 0755 /run/yipd
+
+CONF="${YIPD_CONF:-/etc/yip/yipd.conf}"
+
+exec /usr/local/bin/yipd "$CONF"

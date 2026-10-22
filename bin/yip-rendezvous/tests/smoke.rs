@@ -276,6 +276,19 @@ fn register_lookup_relay_over_udp_with_obf_psk() {
     let _ = server.wait();
 }
 
+#[test]
+fn server_accepts_listen_udp_flag() {
+    let listen = format!("127.0.0.1:{}", free_udp_port());
+    let mut server = Command::new(env!("CARGO_BIN_EXE_yip-rendezvous"))
+        .arg("--listen-udp")
+        .arg(&listen)
+        .spawn()
+        .expect("spawn server with --listen-udp");
+    wait_until_listening(&listen, None);
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
 /// Local hex decode mirroring the binary's own (unexported) `hex_to_32`, just
 /// enough for this test to derive the same key it passes on the command line.
 fn hex_decode(hex: &str) -> [u8; 32] {

@@ -340,11 +340,11 @@ pub fn dispatch_cmd(
     }
 }
 
-pub const DEFAULT_CONTROL_SOCKET: &str = "/run/yipd.sock";
+pub const DEFAULT_CONTROL_SOCKET: &str = "/run/yipd/yip.sock";
 pub const FALLBACK_CONTROL_SOCKET: &str = "/tmp/yipd.sock";
 
 /// Resolve the control socket path from an optional override, falling back to
-/// `/run/yipd.sock` if present, or `/tmp/yipd.sock`.
+/// `/run/yipd/yip.sock` if present, or `/tmp/yipd.sock`.
 pub fn resolve_control_socket(override_path: Option<&Path>) -> PathBuf {
     if let Some(p) = override_path {
         return p.to_path_buf();
@@ -1014,7 +1014,7 @@ mod tests {
         let custom = Path::new("/tmp/custom_yipd.sock");
         assert_eq!(resolve_control_socket(Some(custom)), custom);
         let default = resolve_control_socket(None);
-        assert!(default.to_str().unwrap().contains("yipd.sock"));
+        assert!(default.to_str().unwrap().contains("yip.sock"));
     }
 
     #[test]

@@ -1,0 +1,39 @@
+[Unit]
+Description=yip high-performance obfuscated mesh VPN daemon
+After=network.target network-online.target
+Wants=network-online.target
+Documentation=https://github.com/femboy/yip
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/yipd /etc/yip/yipd.conf
+Restart=always
+RestartSec=3s
+
+# Privileges and capabilities
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_IPC_LOCK
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_IPC_LOCK
+LimitMEMLOCK=infinity
+
+# Device permissions
+DeviceAllow=/dev/net/tun rw
+
+# Sandboxing and filesystem protection
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictNamespaces=false
+
+# Runtime and configuration directories
+RuntimeDirectory=yipd
+ConfigurationDirectory=yip
+
+[Install]
+WantedBy=multi-user.target
