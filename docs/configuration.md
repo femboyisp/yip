@@ -100,6 +100,29 @@ five** of these keys puts the node in *mesh mode*, where it may carry no
 | Key | Value | Notes |
 |---|---|---|
 | `obf_psk` | 64 hex chars (32 bytes) | Network-wide obfuscation shared secret. When set, every datagram is wrapped so the wire is indistinguishable from random UDP. **All nodes and the rendezvous server must share the same value.** Absent ⇒ byte-identical to the non-obfuscated wire format. |
+| `traffic_defense` | `off` \| `balanced` \| `paranoid` | Traffic-analysis defense preset (DAITA). Quantizes packet lengths into discrete buckets, sends stochastic cover traffic bursts during idle periods, and introduces egress micro-jitter. Default `off`. Mutually exclusive with `transport=quic` and `transport=tls`. |
+| `defense_buckets` | comma-separated bytes (64..1500) | Granular override: discrete packet byte size buckets (e.g. `256,512,1024,1420`). |
+| `defense_cover_interval_ms` | non-zero integer (ms) | Granular override: idle interval cadence between cover traffic bursts (e.g. `500`). Legacy `cover_traffic_ms` maps here. |
+| `defense_cover_burst_max` | integer (1..8) | Granular override: maximum decoy datagrams emitted in a single cover burst. |
+| `defense_jitter_max_ms` | integer (0..10) | Granular override: maximum bounded egress micro-jitter delay in milliseconds (capped at 10ms to prevent buffer bloat). |
+
+#### Traffic-analysis defense (DAITA) presets & parameters
+
+`traffic_defense` implements Defending Against Intrusion with Traffic Analysis (DAITA) primitives to defeat statistical packet-size and timing fingerprinting attacks:
+
+- **Packet size quantization (`round_to_bucket`)**: Pads outbound datagrams to discrete byte sizes, eliminating packet size histograms that reveal protocol handshakes, page loads, or flow characteristics.
+- **Stochastic cover traffic & zero-allocation decoy bursts**: When no user datagrams are queued within the configured interval, `yipd` emits multi-packet bursts of authenticated decoy datagrams (`ptype == PTYPE_DECOY`) generated via zero-allocation scratch buffer reuse (`obf_scratch`). Receivers authenticate and silently discard decoy datagrams in constant time before reaching TUN or FEC reassembly queues.
+- **Micro-jitter delay queue**: Buffers egress datagrams for a bounded random interval (up to `defense_jitter_max_ms`), disrupting inter-arrival time regularity. Enforces a 256-packet capacity limit with a strict flush-oldest guarantee under buffer overrun, and clamps the event-loop poll timeout (`next_jitter_deadline_ms`) to ensure punctual queue draining.
+
+**Preset reference:**
+
+| Preset | Default Buckets | Cover Interval | Burst Max | Max Jitter |
+|---|---|---|---|---|
+| `off` | *(none / raw size)* | *None* | 1 | 0 ms |
+| `balanced` | `256, 512, 1024, 1420` | 500 ms | 2 | 2 ms |
+| `paranoid` | `512, 1420` | 150 ms | 4 | 4 ms |
+
+Any granular key (`defense_buckets`, `defense_cover_interval_ms`, `defense_cover_burst_max`, `defense_jitter_max_ms`) explicitly defined in the config overrides the preset's default for that parameter.
 
 See the [user guide](user-guide.md#anti-dpi-obfuscation) for the security model.
 

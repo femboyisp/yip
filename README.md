@@ -167,7 +167,7 @@ Full reproduction instructions, test scripts, and historical logs are in [`crate
 | `yip-transport` | Systematic Reed–Solomon FEC (GF(256)), FEC object demuxing, per-flow classifier, thin ARQ. |
 | `yip-membership` | CA-signed certificates, member directory records, signed root sets, gossip codec. |
 | `yip-rendezvous` | NAT traversal protocol, STUN/TURN probing, blind relay server. |
-| `yip-obf` | Obfuscation envelope (SipHash-CTR keystream over a random nonce). |
+| `yip-obf` | Obfuscation envelope (SipHash-CTR keystream over a random nonce), DAITA discrete packet size bucketing, and cover traffic shaping primitives. |
 | `yip-utls` | Xray-REALITY TLS 1.3 mimicry primitives, Chrome JA3/JA4 fingerprint emulation. |
 | `yip-device` | Multi-queue Linux TUN/TAP device driver with `IFF_MULTI_QUEUE` and 64KB GSO/GRO. |
 | `yipd` | The daemon combining all subsystems into a unified mesh node. |
@@ -251,7 +251,7 @@ cp example.config my-node.config
 sudo target/release/yipd my-node.config
 ```
 
-For two-node tunnels, mesh setups, and NAT configuration, consult the [User Guide](docs/user-guide.md) and [Configuration Reference](docs/configuration.md).
+For two-node tunnels, mesh setups, NAT configuration, and DAITA traffic analysis defense (`traffic_defense = balanced`), consult the [User Guide](docs/user-guide.md) and [Configuration Reference](docs/configuration.md).
 
 ---
 
@@ -259,8 +259,8 @@ For two-node tunnels, mesh setups, and NAT configuration, consult the [User Guid
 
 - **Data Plane & Handshake**: Single-RTT post-quantum hybrid key exchange (`Noise_IKpsk2` + ML-KEM-512 / FIPS 203) with ChaCha20-Poly1305 AEAD data plane, per-direction keys, a WireGuard-style replay window, and ~120s ephemeral rekey with epoch overlap. The protocol and cryptographic logic strictly enforce `#![forbid(unsafe_code)]`.
 - **Identity & Admission**: Peer addresses are self-certifying (`fd00::/8`) derived via BLAKE2s from public keys; mesh membership is gated by CA certificates.
-- **Anti-DPI Verification**: Verified in CI against four independent DPI engines (**nDPI**, **Zeek**, **Suricata**, and **Wireshark**).
-- **What is *not* defended yet**: Traffic-analysis (timing/padding shape) defense is in development. Statistical packet-burst size classifiers can observe flow patterns without deep packet content inspection.
+- **Anti-DPI Verification & Traffic Defense**: Verified in CI against four independent DPI engines (**nDPI**, **Zeek**, **Suricata**, and **Wireshark**). When `traffic_defense` is enabled (`balanced` or `paranoid`), DAITA discrete packet size bucketing, stochastic multi-packet decoy bursts, and bounded egress micro-jitter queues eliminate packet size histograms, idle-to-active burst transitions, and inter-arrival time regularity.
+- **What is *not* defended yet**: Multi-hop anonymity / onion routing. `yip` is a direct peer-to-peer mesh; an adversary with global network vantage points can still correlate sender and receiver endpoints by aggregate flow volume over extended observation windows.
 
 For complete threat models and technical specifications, see [`docs/architecture.md`](docs/architecture.md).
 
