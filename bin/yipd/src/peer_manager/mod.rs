@@ -78,7 +78,7 @@ use yip_membership::{Cert, GossipMsg};
 use yip_rendezvous::{node_id, NodeId};
 
 use crate::addr::node_addr;
-use crate::config::PeerConfig;
+use crate::config::{PeerConfig, TrafficDefenseConfig};
 use crate::dataplane::{conn_tag_from_keys, DataPlane};
 use crate::handshake::{Established, HandshakeState, PacketType};
 use crate::membership::Membership;
@@ -325,6 +325,9 @@ struct Peer {
     /// to this peer (3b Task 4). Defaults to `0`. Bounds cover emission to at
     /// most one datagram per peer per `cover_traffic_ms` interval.
     last_cover_ms: u64,
+    /// Stochastic cover traffic interval (jittered ms) to apply the next time
+    /// cover traffic is checked for this peer (DAITA).
+    next_cover_interval_ms: Option<u64>,
     tx_bytes: u64,
     rx_bytes: u64,
     tx_packets: u64,
@@ -439,6 +442,8 @@ pub struct PeerManager {
     /// hide it, and junk-in-the-clear would be worse than silence). Set once,
     /// before the event loop starts, via [`PeerManager::set_cover_traffic_ms`].
     cover_traffic_ms: Option<u64>,
+    /// Traffic defense configuration (DAITA packet length quantization and cover bursts).
+    pub traffic_defense: TrafficDefenseConfig,
     /// RaptorQ symbol size passed to `DataPlane::new` at every establish site
     /// (3c.1 Task 2). Defaults to `1200` — the pre-3c.1 hardcode, byte-identical
     /// for raw/obf mode. QUIC mode (3c.1 Tasks 4/5) overrides it via
@@ -561,6 +566,7 @@ impl PeerManager {
                 session_obf_key: None,
                 last_activity_ms: 0,
                 last_cover_ms: 0,
+                next_cover_interval_ms: None,
                 tx_bytes: 0,
                 rx_bytes: 0,
                 tx_packets: 0,
@@ -591,6 +597,7 @@ impl PeerManager {
             obf_key: None,
             junk_rng: yip_obf::XorShift64::from_getrandom(),
             cover_traffic_ms: None,
+            traffic_defense: TrafficDefenseConfig::default(),
             data_symbol_size: DEFAULT_DATA_SYMBOL_SIZE,
             relay_only,
             rekey_interval_ms: std::env::var("YIP_REKEY_INTERVAL_MS")
@@ -670,6 +677,7 @@ impl PeerManager {
             session_obf_key: None,
             last_activity_ms: 0,
             last_cover_ms: 0,
+            next_cover_interval_ms: None,
             tx_bytes: 0,
             rx_bytes: 0,
             tx_packets: 0,
@@ -705,6 +713,11 @@ impl PeerManager {
     /// keeps the existing `PeerManager::new` call sites untouched.
     pub fn set_cover_traffic_ms(&mut self, cover_traffic_ms: Option<u64>) {
         self.cover_traffic_ms = cover_traffic_ms;
+    }
+
+    /// Store traffic defense (DAITA packet length quantization and decoy bursts) configuration.
+    pub fn set_traffic_defense(&mut self, cfg: TrafficDefenseConfig) {
+        self.traffic_defense = cfg;
     }
 
     /// Attach a UNIX domain control socket handle and device metadata.
@@ -909,6 +922,7 @@ impl PeerManager {
             session_obf_key: None,
             last_activity_ms: 0,
             last_cover_ms: 0,
+            next_cover_interval_ms: None,
             tx_bytes: 0,
             rx_bytes: 0,
             tx_packets: 0,
@@ -1501,25 +1515,24 @@ impl PeerManager {
             self.tick_gossip(now_ms);
         }
 
-        // ── idle cover traffic (3b Task 4) ──────────────────────────────────
-        // Opt-in decoy traffic: only when obfuscation is on AND a
-        // `cover_traffic_ms` interval is configured. For each direct
-        // (non-relay) `Established` peer with a known endpoint that has been
-        // idle (no real Data sent or received) for at least the interval,
-        // AND hasn't had a cover datagram emitted in at least the interval,
-        // push exactly one session-keyed junk datagram (`build_junk` is
-        // plaintext; `tick`/`obf_egress` wraps it once with that peer's
-        // session key, since `dst` is an `Established` peer's endpoint).
-        // Gated on `last_activity_ms` so this never races or delays real
-        // data — latency-free, idle-only, bounded to one datagram per peer
-        // per tick. A relay-reached peer (`relay == true`) is skipped: its
-        // `endpoint` is a stale/candidate direct address left over from
-        // before the passive `relayed_handshake_*` path took over (see the
-        // real-Data egress arm above, which likewise checks `!relay`) —
-        // firing cover at it would leak junk to an unrelated address and
-        // miss the peer entirely. Relay-path cover is out of scope for 3b
-        // (mirrors Task 3's handshake junk, which is direct-path-only).
-        if let (true, Some(iv)) = (self.obf_key.is_some(), self.cover_traffic_ms) {
+        // ── idle cover traffic (3b Task 4 / DAITA) ──────────────────────────
+        // Opt-in decoy traffic: only when obfuscation is on AND either
+        // `traffic_defense.cover_interval_ms` or `cover_traffic_ms` is configured.
+        let base_iv_opt = self
+            .traffic_defense
+            .cover_interval_ms
+            .or(self.cover_traffic_ms);
+        if let (true, Some(base_iv)) = (self.obf_key.is_some(), base_iv_opt) {
+            let max_budget = 1420.max(OBF_MTU_BUDGET);
+            let mut valid_buckets = [0usize; 8];
+            let mut valid_count = 0usize;
+            for &b in &self.traffic_defense.buckets {
+                if b <= max_budget && valid_count < valid_buckets.len() {
+                    valid_buckets[valid_count] = b;
+                    valid_count += 1;
+                }
+            }
+
             for i in 0..self.peers.len() {
                 if !matches!(self.peers[i].state, PeerState::Established(_)) || self.peers[i].relay
                 {
@@ -1528,18 +1541,45 @@ impl PeerManager {
                 let Some(endpoint) = self.peers[i].endpoint else {
                     continue;
                 };
-                if now_ms.saturating_sub(self.peers[i].last_activity_ms) < iv
-                    || now_ms.saturating_sub(self.peers[i].last_cover_ms) < iv
+                let current_iv = self.peers[i].next_cover_interval_ms.unwrap_or(base_iv);
+                if now_ms.saturating_sub(self.peers[i].last_activity_ms) < current_iv
+                    || now_ms.saturating_sub(self.peers[i].last_cover_ms) < current_iv
                 {
                     continue;
                 }
-                let bytes = self.build_junk();
-                self.tick_egress.push(EgressDatagram {
-                    fate: 0,
-                    dst: endpoint,
-                    bytes,
-                });
+                let burst_count = if self.traffic_defense.cover_burst_max <= 1 {
+                    1
+                } else {
+                    usize::try_from(
+                        self.junk_rng
+                            .gen_range(1, self.traffic_defense.cover_burst_max),
+                    )
+                    .unwrap_or(1)
+                };
+
+                for _ in 0..burst_count {
+                    if valid_count == 0 {
+                        let bytes = self.build_junk();
+                        self.tick_egress.push(EgressDatagram {
+                            fate: 0,
+                            dst: endpoint,
+                            bytes,
+                        });
+                    } else {
+                        let b_idx =
+                            usize::try_from(self.junk_rng.gen_range(0, (valid_count - 1) as u64))
+                                .unwrap_or(0);
+                        let b = valid_buckets[b_idx];
+                        let fate = u16::try_from(b).unwrap_or(0);
+                        self.tick_egress.push(EgressDatagram {
+                            fate,
+                            dst: endpoint,
+                            bytes: vec![yip_obf::JUNK_TYPE],
+                        });
+                    }
+                }
                 self.peers[i].last_cover_ms = now_ms;
+                self.peers[i].next_cover_interval_ms = Some(jitter_ms(base_iv));
             }
         }
 

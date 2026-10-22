@@ -180,6 +180,10 @@ impl PeerManager {
     /// practice this is defense-in-depth, not the expected path.
     pub(super) fn obf_egress(&mut self, dgs: &mut Vec<EgressDatagram>) {
         let server = self.rendezvous.as_ref().map(|r| r.server_addr());
+        let defense_active = self.traffic_defense.preset != yip_obf::TrafficDefensePreset::Off
+            && !self.traffic_defense.buckets.is_empty();
+        let max_budget = 1420.max(OBF_MTU_BUDGET);
+
         dgs.retain_mut(|d| {
             if d.bytes.is_empty() {
                 return true;
@@ -188,7 +192,17 @@ impl PeerManager {
                 let Some(key) = self.obf_key else {
                     return true;
                 };
-                let pad = random_pad(obf_pad_max(yip_obf::RDV_TYPE, d.bytes.len() + 1));
+                let pad = if defense_active {
+                    let raw_wire = yip_obf::MIN_ENVELOPE + d.bytes.len();
+                    let target_wire = yip_obf::round_to_bucket(
+                        raw_wire,
+                        &self.traffic_defense.buckets,
+                        max_budget,
+                    );
+                    target_wire.saturating_sub(raw_wire)
+                } else {
+                    random_pad(obf_pad_max(yip_obf::RDV_TYPE, d.bytes.len() + 1))
+                };
                 if yip_obf::obfuscate_into(
                     &key,
                     yip_obf::RDV_TYPE,
@@ -206,7 +220,45 @@ impl PeerManager {
                 let Some(key) = self.obf_key_for_egress(d.dst, ptype) else {
                     return true;
                 };
-                let pad = random_pad(obf_pad_max(ptype, d.bytes.len()));
+                let pad = if defense_active {
+                    let body_len = d.bytes.len().saturating_sub(1);
+                    let raw_wire = yip_obf::MIN_ENVELOPE + body_len;
+                    let target_wire = if ptype == yip_obf::JUNK_TYPE
+                        && d.fate > 0
+                        && self.traffic_defense.buckets.contains(&(d.fate as usize))
+                    {
+                        let tw = d.fate as usize;
+                        d.fate = 0;
+                        tw
+                    } else if ptype == yip_obf::JUNK_TYPE && body_len == 0 {
+                        let mut valid_buckets = [0usize; 8];
+                        let mut valid_count = 0usize;
+                        for &b in &self.traffic_defense.buckets {
+                            if b <= max_budget && valid_count < valid_buckets.len() {
+                                valid_buckets[valid_count] = b;
+                                valid_count += 1;
+                            }
+                        }
+                        if valid_count == 0 {
+                            max_budget
+                        } else {
+                            let idx = usize::try_from(
+                                self.junk_rng.gen_range(0, (valid_count - 1) as u64),
+                            )
+                            .unwrap_or(0);
+                            valid_buckets[idx]
+                        }
+                    } else {
+                        yip_obf::round_to_bucket(
+                            raw_wire,
+                            &self.traffic_defense.buckets,
+                            max_budget,
+                        )
+                    };
+                    target_wire.saturating_sub(raw_wire)
+                } else {
+                    random_pad(obf_pad_max(ptype, d.bytes.len()))
+                };
                 if yip_obf::obfuscate_into(&key, ptype, &d.bytes[1..], pad, &mut self.obf_scratch) {
                     std::mem::swap(&mut d.bytes, &mut self.obf_scratch);
                     true

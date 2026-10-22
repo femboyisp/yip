@@ -562,6 +562,7 @@ fn create_peer_manager(
     );
     manager.set_obf_psk(config.obf_psk);
     manager.set_cover_traffic_ms(config.cover_traffic_ms);
+    manager.set_traffic_defense(config.traffic_defense.clone());
     Ok(manager)
 }
 
