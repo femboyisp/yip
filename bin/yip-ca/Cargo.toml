@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[package.metadata.cargo-binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/yip-v{ version }-{ target }.tar.gz"
+bin-dir = "yip-v{ version }-{ target }/{ bin }"
+pkg-fmt = "tgz"
+
 [dependencies]
 yip-membership = { path = "../../crates/yip-membership" }
 ed25519-dalek = { version = "3", features = ["rand_core"] }
