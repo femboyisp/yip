@@ -19,4 +19,8 @@ depend() {
 
 start_pre() {
 	checkpath -d -m 0755 /run/yipd
+	if [ ! -f "${command_args}" ]; then
+		eerror "Config file ${command_args} not found!"
+		return 1
+	fi
 }

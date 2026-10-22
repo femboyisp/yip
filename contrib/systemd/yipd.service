@@ -2,7 +2,7 @@
 Description=yip high-performance obfuscated mesh VPN daemon
 After=network.target network-online.target
 Wants=network-online.target
-Documentation=https://github.com/femboy/yip
+Documentation=https://github.com/femboyisp/yip
 
 [Service]
 Type=simple

@@ -30,8 +30,10 @@ jobs:
           - target: x86_64-unknown-linux-musl
             musl_cross_url: https://musl.cc/x86_64-linux-musl-cross.tgz
             musl_cross_dir: x86_64-linux-musl-cross
-            linker: musl-gcc
-            cc: musl-gcc
+            linker: x86_64-linux-musl-gcc
+            cc: x86_64-linux-musl-gcc
+            cxx: x86_64-linux-musl-g++
+            ar: x86_64-linux-musl-ar
           - target: aarch64-unknown-linux-musl
             musl_cross_url: https://musl.cc/aarch64-linux-musl-cross.tgz
             musl_cross_dir: aarch64-linux-musl-cross
@@ -53,27 +55,21 @@ jobs:
         run: |
           SUDO="$(command -v sudo 2>/dev/null || true)"
           $SUDO apt-get update
-          $SUDO apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config musl-tools binutils file jq curl
+          $SUDO apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config binutils file jq curl
 
       - name: Set up musl cross-compilation toolchain
         run: |
           SUDO="$(command -v sudo 2>/dev/null || true)"
-          TARGET="${{ matrix.target }}"
-          if [ "$TARGET" = "aarch64-unknown-linux-musl" ]; then
-            echo "Fetching aarch64 musl toolchain..."
-            curl -fsSL --retry 3 --retry-connrefused "${{ matrix.musl_cross_url }}" | $SUDO tar -xz -C /opt
-            echo "/opt/${{ matrix.musl_cross_dir }}/bin" >> $GITHUB_PATH
-            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=/opt/${{ matrix.musl_cross_dir }}/bin/${{ matrix.linker }}" >> $GITHUB_ENV
-            echo "CC_aarch64_unknown_linux_musl=/opt/${{ matrix.musl_cross_dir }}/bin/${{ matrix.cc }}" >> $GITHUB_ENV
-            echo "CXX_aarch64_unknown_linux_musl=/opt/${{ matrix.musl_cross_dir }}/bin/${{ matrix.cxx }}" >> $GITHUB_ENV
-            echo "AR_aarch64_unknown_linux_musl=/opt/${{ matrix.musl_cross_dir }}/bin/${{ matrix.ar }}" >> $GITHUB_ENV
-            echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_musl=--sysroot=/opt/${{ matrix.musl_cross_dir }}/aarch64-linux-musl" >> $GITHUB_ENV
-          else
-            if command -v musl-gcc >/dev/null 2>&1; then
-              echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> $GITHUB_ENV
-              echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> $GITHUB_ENV
-            fi
-          fi
+          echo "Fetching ${{ matrix.target }} musl toolchain..."
+          curl -fsSL --retry 3 --retry-connrefused "${{ matrix.musl_cross_url }}" | $SUDO tar -xz -C /opt
+          echo "/opt/${{ matrix.musl_cross_dir }}/bin" >> $GITHUB_PATH
+          UPPER_TARGET="$(echo "${{ matrix.target }}" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
+          echo "CARGO_TARGET_${UPPER_TARGET}_LINKER=/opt/${{ matrix.musl_cross_dir }}/bin/${{ matrix.linker }}" >> $GITHUB_ENV
+          echo "CC_${{ matrix.target }}=/opt/${{ matrix.musl_cross_dir }}/bin/${{ matrix.cc }}" >> $GITHUB_ENV
+          echo "CXX_${{ matrix.target }}=/opt/${{ matrix.musl_cross_dir }}/bin/${{ matrix.cxx }}" >> $GITHUB_ENV
+          echo "AR_${{ matrix.target }}=/opt/${{ matrix.musl_cross_dir }}/bin/${{ matrix.ar }}" >> $GITHUB_ENV
+          SYSROOT_DIR="$(echo "${{ matrix.target }}" | sed 's/-unknown-/-/')"
+          echo "BINDGEN_EXTRA_CLANG_ARGS_${{ matrix.target }}=--sysroot=/opt/${{ matrix.musl_cross_dir }}/${SYSROOT_DIR}" >> $GITHUB_ENV
 
       - name: Resolve release tag
         id: vars
@@ -204,7 +200,7 @@ jobs:
             [ -f "$f" ] || continue
             fname=$(basename "$f")
             echo "Uploading ${fname}..."
-            curl -fsSL -X POST -H "Authorization: token ${TOKEN}" -H "Content-Type: application/octet-stream" \
-              --data-binary @"$f" "${API_URL}/releases/${RELEASE_ID}/assets?name=${fname}" || echo "Warning: Failed to upload ${fname}"
+            curl -fsSL -X POST -H "Authorization: token ${TOKEN}" \
+              -F "attachment=@$f" "${API_URL}/releases/${RELEASE_ID}/assets?name=${fname}" || echo "Warning: Failed to upload ${fname}"
           done
           echo "Forgejo release publication finished."

@@ -43,12 +43,19 @@ if [ -z "${SUDO+x}" ]; then
     fi
 fi
 
-BINDIR="${BINDIR:-/usr/local/bin}"
-CONFDIR="${CONFDIR:-/etc/yip}"
+if [ "$(id -u)" -ne 0 ] && [ -z "$SUDO" ]; then
+    # Unprivileged user execution without sudo/doas: default to user-local XDG paths
+    BINDIR="${BINDIR:-${HOME}/.local/bin}"
+    CONFDIR="${CONFDIR:-${XDG_CONFIG_HOME:-$HOME/.config}/yip}"
+    INIT_SYSTEM="${INIT_SYSTEM:-none}"
+else
+    BINDIR="${BINDIR:-/usr/local/bin}"
+    CONFDIR="${CONFDIR:-/etc/yip}"
+    INIT_SYSTEM="${INIT_SYSTEM:-auto}"
+fi
 SYSD_DIR="${SYSD_DIR:-/etc/systemd/system}"
 OPENRC_DIR="${OPENRC_DIR:-/etc/init.d}"
 RUNIT_DIR="${RUNIT_DIR:-/etc/sv}"
-INIT_SYSTEM="${INIT_SYSTEM:-auto}"
 REPO="${REPO:-femboyisp/yip}"
 
 # --- 2. OS & Architecture Check ---
@@ -261,10 +268,13 @@ done
 
 # --- 6. Configuration Seeding ---
 echo "Seeding configuration into ${CONFDIR}..."
-$SUDO mkdir -p "$CONFDIR"
-if [ -f "$ROOT_DIR/example.config" ]; then
-    $SUDO cp "$ROOT_DIR/example.config" "$CONFDIR/yipd.conf.example"
-    $SUDO chmod 0644 "$CONFDIR/yipd.conf.example"
+if $SUDO mkdir -p "$CONFDIR" 2>/dev/null; then
+    if [ -f "$ROOT_DIR/example.config" ]; then
+        $SUDO cp "$ROOT_DIR/example.config" "$CONFDIR/yipd.conf.example"
+        $SUDO chmod 0644 "$CONFDIR/yipd.conf.example"
+    fi
+else
+    echo "Warning: Could not create ${CONFDIR}; skipping configuration seeding." >&2
 fi
 
 # --- 7. Init System Detection & Installation ---

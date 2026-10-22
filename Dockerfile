@@ -7,6 +7,9 @@ FROM rust:alpine AS builder
 RUN apk add --no-cache musl-dev gcc g++ make linux-headers git cmake perl clang-dev
 
 ENV LIBCLANG_PATH=/usr/lib
+# Note on crt-static: On Alpine Linux, bindgen links dynamically against libclang.so,
+# and BoringSSL compiles C++ components. We compile with -crt-static and package
+# into a minimal (~20MB) Alpine runtime layer with ca-certificates and libstdc++.
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 
 WORKDIR /usr/src/yip

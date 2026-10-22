@@ -331,6 +331,30 @@ esac
 
 pass "Test Case 5 passed: Incomplete archive with missing binaries detected and rejected"
 
+# -----------------------------------------------------------------------------
+# Test Case 6: Unprivileged user installation with only BINDIR override
+# -----------------------------------------------------------------------------
+echo "=== Test Case 6: Unprivileged installation with only BINDIR specified ==="
+SB6="$TEST_ROOT/sandbox_6"
+mkdir -p "$SB6/bin" "$SB6/home"
+
+export HOME="$SB6/home"
+export XDG_CONFIG_HOME="$SB6/home/.config"
+
+set +e
+OUTPUT_6=$(BINDIR="$SB6/bin" \
+LOCAL_TARBALL="$MOCK_TARBALL" \
+LOCAL_SHA256SUMS="$MOCK_SHA256SUMS" \
+sh "$INSTALL_SH" 2>&1)
+EXIT_CODE_6=$?
+set -e
+
+[ "$EXIT_CODE_6" -eq 0 ] || fail "install.sh failed with only BINDIR set: $OUTPUT_6"
+[ -x "$SB6/bin/yipd" ] || fail "yipd not installed in user BINDIR"
+[ -f "$SB6/home/.config/yip/yipd.conf.example" ] || fail "Config not seeded in user config directory: $OUTPUT_6"
+
+pass "Test Case 6 passed: Unprivileged user install gracefully defaults to user XDG config path"
+
 echo ""
 echo "=========================================="
 printf "%bALL INSTALLER INTEGRATION TESTS PASSED!%b\n" "${GREEN}" "${NC}"
