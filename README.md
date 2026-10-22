@@ -230,7 +230,60 @@ To guarantee that test suites verify rigorous behavioral semantics rather than s
 
 ## Quick Start
 
-### 1. Build from Source
+### 1. 1-Line Quick Start (Recommended)
+
+Install the latest pre-compiled static musl binary (`x86_64` or `aarch64`) with automated SHA-256 verification and init service registration:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/femboyisp/yip/main/install.sh | sh
+```
+
+The POSIX installer places `yipd`, `yipctl`, and `yip-rendezvous` into `/usr/local/bin`, creates `/etc/yip`, and configures your init manager (`systemd`, `OpenRC`, or `runit`).
+
+#### Alternative Installation Methods
+
+<details open>
+<summary><b>cargo-binstall</b></summary>
+
+Fetch pre-compiled static binaries directly via cargo without compiling from source:
+
+```bash
+cargo binstall yipd
+```
+</details>
+
+<details>
+<summary><b>Docker Container</b></summary>
+
+Run the official lightweight musl container image:
+
+```bash
+docker run -d --restart=always --privileged --net=host -v /etc/yip:/etc/yip -v /run/yipd:/run/yipd ghcr.io/femboyisp/yipd:latest
+```
+</details>
+
+<details>
+<summary><b>Pre-built Static Binaries (GitHub Releases)</b></summary>
+
+Download standalone statically linked musl binaries with zero runtime dependencies directly from [GitHub Releases](https://github.com/femboyisp/yip/releases):
+- `yip-v0.1.0-x86_64-unknown-linux-musl.tar.gz`
+- `yip-v0.1.0-aarch64-unknown-linux-musl.tar.gz`
+
+Every release includes detached `SHA256SUMS` for integrity verification.
+</details>
+
+<details>
+<summary><b>Production Init Services (contrib/)</b></summary>
+
+Hardened init service definitions with privilege separation are available in [`contrib/`](contrib/):
+- **systemd**: [`contrib/systemd/yipd.service`](contrib/systemd/yipd.service), multi-instance [`contrib/systemd/yipd@.service`](contrib/systemd/yipd@.service), and [`contrib/systemd/yip-rendezvous.service`](contrib/systemd/yip-rendezvous.service) with `DynamicUser=`, `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE`, `ProtectSystem=strict`, and seccomp filters.
+- **OpenRC**: [`contrib/openrc/yipd.initd`](contrib/openrc/yipd.initd) and [`contrib/openrc/yip-rendezvous.initd`](contrib/openrc/yip-rendezvous.initd) for Alpine Linux and Gentoo.
+- **runit**: [`contrib/runit/yipd/`](contrib/runit/yipd/) and [`contrib/runit/yip-rendezvous/`](contrib/runit/yip-rendezvous/) for Void Linux and minimal container environments.
+</details>
+
+---
+
+### 2. Build from Source
 
 Requires a stable Rust toolchain (`1.85+`), `cmake`, and a C toolchain (for BoringSSL linking):
 
@@ -240,15 +293,18 @@ cd yip
 cargo build --release --workspace
 ```
 
-### 2. Generate Keypair & Start Node
+---
+
+### 3. Generate Keypair & Start Node
 
 ```sh
 # Generate identity keypair
-cargo run --release -p yipd -- --genkey > node.key
+yipd --genkey > node.key
+# (Or if building from source: cargo run --release -p yipd -- --genkey > node.key)
 
 # Copy example config and run
 cp example.config my-node.config
-sudo target/release/yipd my-node.config
+sudo yipd my-node.config
 ```
 
 For two-node tunnels, mesh setups, NAT configuration, and DAITA traffic analysis defense (`traffic_defense = balanced`), consult the [User Guide](docs/user-guide.md) and [Configuration Reference](docs/configuration.md).
