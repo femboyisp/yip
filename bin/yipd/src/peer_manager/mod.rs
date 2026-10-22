@@ -70,7 +70,7 @@
 //! before any side effect, so trying the wrong peer just yields
 //! `Outcome::None`, never corrupted state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv6Addr, SocketAddr};
 
 use yip_io::poll::{Dispatch, DispatchOut, EgressDatagram};
@@ -85,6 +85,14 @@ use crate::membership::Membership;
 use crate::mode::TunnelMode;
 use crate::path::{PathAction, PathKind, PathStage, PathState};
 use crate::rendezvous::{RdvEvent, Rendezvous};
+
+pub const MAX_JITTER_QUEUE: usize = 1024;
+
+#[derive(Debug, Clone)]
+pub struct ScheduledDatagram {
+    pub deliver_after_ms: u64,
+    pub datagram: EgressDatagram,
+}
 
 mod gossip;
 mod handshake;
@@ -435,7 +443,7 @@ pub struct PeerManager {
     /// [`PeerManager::build_junk`]. Seeded once from the OS RNG; never used
     /// for any security decision (junk bytes are keystream-masked by
     /// `yip_obf::obfuscate`, so their content is irrelevant).
-    junk_rng: yip_obf::XorShift64,
+    pub(super) junk_rng: yip_obf::XorShift64,
     /// Opt-in idle cover-traffic interval (3b Task 4), or `None` to disable.
     /// Only consulted when `obf_key.is_some()` — with obfuscation off, cover
     /// traffic never fires regardless of this value (there is no wrapper to
@@ -444,6 +452,8 @@ pub struct PeerManager {
     cover_traffic_ms: Option<u64>,
     /// Traffic defense configuration (DAITA packet length quantization and cover bursts).
     pub traffic_defense: TrafficDefenseConfig,
+    /// Bounded queue for micro-jitter delayed egress datagrams (traffic defense).
+    pub scheduled_egress: VecDeque<ScheduledDatagram>,
     /// RaptorQ symbol size passed to `DataPlane::new` at every establish site
     /// (3c.1 Task 2). Defaults to `1200` — the pre-3c.1 hardcode, byte-identical
     /// for raw/obf mode. QUIC mode (3c.1 Tasks 4/5) overrides it via
@@ -598,6 +608,7 @@ impl PeerManager {
             junk_rng: yip_obf::XorShift64::from_getrandom(),
             cover_traffic_ms: None,
             traffic_defense: TrafficDefenseConfig::default(),
+            scheduled_egress: VecDeque::new(),
             data_symbol_size: DEFAULT_DATA_SYMBOL_SIZE,
             relay_only,
             rekey_interval_ms: std::env::var("YIP_REKEY_INTERVAL_MS")
@@ -718,6 +729,77 @@ impl PeerManager {
     /// Store traffic defense (DAITA packet length quantization and decoy bursts) configuration.
     pub fn set_traffic_defense(&mut self, cfg: TrafficDefenseConfig) {
         self.traffic_defense = cfg;
+    }
+
+    /// Query the milliseconds remaining until the earliest scheduled micro-jitter datagram is due.
+    /// Returns `Some(0)` if a datagram is already due, `Some(delay_ms)` if scheduled in the future,
+    /// or `None` if the queue is empty.
+    pub fn next_scheduled_egress_delay_ms(&self, now_ms: u64) -> Option<u64> {
+        let earliest = self
+            .scheduled_egress
+            .iter()
+            .map(|s| s.deliver_after_ms)
+            .min()?;
+        Some(earliest.saturating_sub(now_ms))
+    }
+
+    /// Drain all scheduled datagrams whose scheduled delivery timestamp `deliver_after_ms <= now_ms`.
+    pub fn drain_scheduled_egress(&mut self, now_ms: u64, out: &mut Vec<EgressDatagram>) {
+        while let Some(front) = self.scheduled_egress.front() {
+            if front.deliver_after_ms <= now_ms {
+                if let Some(item) = self.scheduled_egress.pop_front() {
+                    out.push(item.datagram);
+                }
+            } else {
+                break;
+            }
+        }
+        if self
+            .scheduled_egress
+            .iter()
+            .any(|s| s.deliver_after_ms <= now_ms)
+        {
+            let mut i = 0;
+            while i < self.scheduled_egress.len() {
+                if self.scheduled_egress[i].deliver_after_ms <= now_ms {
+                    if let Some(item) = self.scheduled_egress.remove(i) {
+                        out.push(item.datagram);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    /// Insert a micro-jitter delayed datagram in sorted `deliver_after_ms` order,
+    /// popping and immediately dispatching the oldest item on overrun (`len >= MAX_JITTER_QUEUE`).
+    pub(super) fn queue_scheduled_egress(
+        &mut self,
+        dg: EgressDatagram,
+        deliver_after_ms: u64,
+        out: &mut Vec<EgressDatagram>,
+    ) {
+        if self.scheduled_egress.len() >= MAX_JITTER_QUEUE {
+            if let Some(oldest) = self.scheduled_egress.pop_front() {
+                out.push(oldest.datagram);
+            }
+        }
+        let idx = match self
+            .scheduled_egress
+            .iter()
+            .rposition(|s| s.deliver_after_ms <= deliver_after_ms)
+        {
+            Some(pos) => pos + 1,
+            None => 0,
+        };
+        self.scheduled_egress.insert(
+            idx,
+            ScheduledDatagram {
+                deliver_after_ms,
+                datagram: dg,
+            },
+        );
     }
 
     /// Attach a UNIX domain control socket handle and device metadata.
@@ -1069,8 +1151,12 @@ impl PeerManager {
         &mut self,
         tun: Option<Vec<u8>>,
         mut udp: Vec<EgressDatagram>,
+        now_ms: u64,
     ) -> DispatchOut<'_> {
         self.obf_egress(&mut udp);
+        if !self.scheduled_egress.is_empty() {
+            self.drain_scheduled_egress(now_ms, &mut udp);
+        }
         self.egress = udp;
         match (tun, self.egress.is_empty()) {
             (Some(t), true) => {
@@ -1095,7 +1181,24 @@ impl Dispatch for PeerManager {
     /// egress it produces.
     fn on_udp(&mut self, src: SocketAddr, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
         if self.obf_key.is_none() {
-            return self.on_udp_dispatch(src, dg, now_ms);
+            if self.scheduled_egress.is_empty() {
+                return self.on_udp_dispatch(src, dg, now_ms);
+            }
+            let (tun, mut udp) = own_dispatch(self.on_udp_dispatch(src, dg, now_ms));
+            self.drain_scheduled_egress(now_ms, &mut udp);
+            self.egress = udp;
+            return match (tun, self.egress.is_empty()) {
+                (Some(t), true) => {
+                    self.tun_scratch = t;
+                    DispatchOut::Tun(&self.tun_scratch)
+                }
+                (Some(t), false) => {
+                    self.tun_scratch = t;
+                    DispatchOut::Both(&self.tun_scratch, &self.egress)
+                }
+                (None, false) => DispatchOut::Udp(&self.egress),
+                (None, true) => DispatchOut::None,
+            };
         }
         if dg.is_empty() {
             return DispatchOut::None;
@@ -1117,40 +1220,63 @@ impl Dispatch for PeerManager {
                 return DispatchOut::None;
             }
             let (tun, udp) = own_dispatch(self.on_rdv(&body, now_ms));
-            return self.finish_wrapped(tun, udp);
+            return self.finish_wrapped(tun, udp, now_ms);
         }
         let Some(plain) = self.deobf_ingress(src, dg) else {
             return DispatchOut::None;
         };
         let (tun, udp) = own_dispatch(self.on_udp_dispatch(src, &plain, now_ms));
-        self.finish_wrapped(tun, udp)
+        self.finish_wrapped(tun, udp, now_ms)
     }
 
     fn on_tun(&mut self, inner: &[u8], now_ms: u64) -> &[EgressDatagram] {
-        if self.obf_key.is_none() {
-            return self.on_tun_dispatch(inner, now_ms);
+        if self.traffic_defense.jitter_max_ms == 0 && self.scheduled_egress.is_empty() {
+            if self.obf_key.is_none() {
+                return self.on_tun_dispatch(inner, now_ms);
+            }
+            let mut scratch = std::mem::take(&mut self.egress);
+            {
+                let dispatched = self.on_tun_dispatch(inner, now_ms);
+                copy_into_reusable_egress(&mut scratch, dispatched);
+            }
+            self.obf_egress(&mut scratch);
+            self.egress = scratch;
+            return &self.egress;
         }
+
         let mut scratch = std::mem::take(&mut self.egress);
         {
             let dispatched = self.on_tun_dispatch(inner, now_ms);
             copy_into_reusable_egress(&mut scratch, dispatched);
         }
-        self.obf_egress(&mut scratch);
+        if self.obf_key.is_some() {
+            self.obf_egress_with_jitter(&mut scratch, now_ms);
+        } else {
+            self.jitter_unobfuscated_egress(&mut scratch, now_ms);
+        }
         self.egress = scratch;
         &self.egress
     }
 
     fn tick(&mut self, now_ms: u64) -> Option<&[EgressDatagram]> {
-        let has_egress = self.tick_dispatch(now_ms).is_some();
-        if !has_egress {
-            return None;
-        }
+        let _ = self.tick_dispatch(now_ms);
         if self.obf_key.is_some() {
             let mut tick_egress = std::mem::take(&mut self.tick_egress);
             self.obf_egress(&mut tick_egress);
+            if !self.scheduled_egress.is_empty() {
+                self.drain_scheduled_egress(now_ms, &mut tick_egress);
+            }
+            self.tick_egress = tick_egress;
+        } else if !self.scheduled_egress.is_empty() {
+            let mut tick_egress = std::mem::take(&mut self.tick_egress);
+            self.drain_scheduled_egress(now_ms, &mut tick_egress);
             self.tick_egress = tick_egress;
         }
-        Some(&self.tick_egress)
+        if self.tick_egress.is_empty() {
+            None
+        } else {
+            Some(&self.tick_egress)
+        }
     }
 }
 

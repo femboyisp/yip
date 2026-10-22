@@ -269,6 +269,62 @@ impl PeerManager {
         });
     }
 
+    /// Obfuscate egress datagrams and apply micro-jitter scheduling to outbound data datagrams.
+    pub(super) fn obf_egress_with_jitter(&mut self, dgs: &mut Vec<EgressDatagram>, now_ms: u64) {
+        let mut are_data = Vec::with_capacity(dgs.len());
+        for d in dgs.iter() {
+            are_data.push(d.bytes.first() == Some(&(crate::handshake::PacketType::Data as u8)));
+        }
+        self.obf_egress(dgs);
+        self.apply_egress_jitter(dgs, &are_data, now_ms);
+    }
+
+    /// Apply micro-jitter scheduling to unobfuscated outbound datagrams.
+    pub(super) fn jitter_unobfuscated_egress(
+        &mut self,
+        dgs: &mut Vec<EgressDatagram>,
+        now_ms: u64,
+    ) {
+        let mut are_data = Vec::with_capacity(dgs.len());
+        for d in dgs.iter() {
+            are_data.push(d.bytes.first() == Some(&(crate::handshake::PacketType::Data as u8)));
+        }
+        self.apply_egress_jitter(dgs, &are_data, now_ms);
+    }
+
+    /// Schedule or immediately dispatch outbound datagrams according to `traffic_defense.jitter_max_ms`.
+    pub(super) fn apply_egress_jitter(
+        &mut self,
+        dgs: &mut Vec<EgressDatagram>,
+        are_data: &[bool],
+        now_ms: u64,
+    ) {
+        let jitter_max = self.traffic_defense.jitter_max_ms;
+        if jitter_max == 0 {
+            if !self.scheduled_egress.is_empty() {
+                self.drain_scheduled_egress(now_ms, dgs);
+            }
+            return;
+        }
+
+        let mut immediate = Vec::with_capacity(dgs.len());
+        for (dg, &is_data) in dgs.drain(..).zip(are_data.iter()) {
+            if !is_data {
+                immediate.push(dg);
+                continue;
+            }
+            let delta = self.junk_rng.gen_range(0, jitter_max);
+            if delta == 0 {
+                immediate.push(dg);
+            } else {
+                let deliver_after_ms = now_ms.saturating_add(delta);
+                self.queue_scheduled_egress(dg, deliver_after_ms, &mut immediate);
+            }
+        }
+        self.drain_scheduled_egress(now_ms, &mut immediate);
+        *dgs = immediate;
+    }
+
     /// Wrap a single datagram under the obfuscation envelope (matching `obf_egress`),
     /// used in tests to verify datagram wire sizes under obfuscation.
     #[cfg(test)]

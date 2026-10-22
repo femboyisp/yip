@@ -2692,3 +2692,160 @@ fn obf_off_retains_legacy_padding_behavior() {
         wire.len()
     );
 }
+
+#[test]
+fn micro_jitter_delays_packet_until_scheduled_time() {
+    let (mut pm, _tag, _ep) = pm_with_established_peer([1u8; 32], [2u8; 32], 100);
+    pm.set_obf_psk(Some([0xAAu8; 32]));
+    pm.set_traffic_defense(crate::config::TrafficDefenseConfig {
+        preset: yip_obf::TrafficDefensePreset::Balanced,
+        buckets: vec![256, 512, 1024, 1420],
+        cover_interval_ms: Some(500),
+        cover_burst_max: 2,
+        jitter_max_ms: 4,
+    });
+
+    let now_ms = 100u64;
+    let mut queued = false;
+    for _ in 0..50 {
+        let _ = pm.on_tun(&dummy_tun_pkt(), now_ms);
+        if !pm.scheduled_egress.is_empty() {
+            queued = true;
+            break;
+        }
+    }
+    assert!(queued, "expected packet(s) to be queued when delta > 0");
+    let queued_count = pm.scheduled_egress.len();
+    assert!(queued_count >= 1);
+
+    let earliest_deliver = pm
+        .scheduled_egress
+        .iter()
+        .map(|s| s.deliver_after_ms)
+        .min()
+        .unwrap();
+    assert!(earliest_deliver > now_ms);
+    let expected_delta = earliest_deliver - now_ms;
+
+    // Test next_scheduled_egress_delay_ms reports exact delay
+    let delay = pm.next_scheduled_egress_delay_ms(now_ms);
+    assert_eq!(delay, Some(expected_delta));
+
+    // Test intermediate time reporting
+    if expected_delta > 1 {
+        let partial_delay = pm.next_scheduled_egress_delay_ms(now_ms + 1);
+        assert_eq!(partial_delay, Some(expected_delta - 1));
+    }
+
+    // Advance time before earliest delivery - no packets should be drained
+    let mut drained_early = Vec::new();
+    pm.drain_scheduled_egress(earliest_deliver - 1, &mut drained_early);
+    assert!(drained_early.is_empty());
+    assert_eq!(pm.scheduled_egress.len(), queued_count);
+
+    // Advance time past all scheduled packets
+    let latest_deliver = pm
+        .scheduled_egress
+        .iter()
+        .map(|s| s.deliver_after_ms)
+        .max()
+        .unwrap();
+    assert_eq!(pm.next_scheduled_egress_delay_ms(latest_deliver), Some(0));
+    let mut drained = Vec::new();
+    pm.drain_scheduled_egress(latest_deliver, &mut drained);
+    assert_eq!(drained.len(), queued_count);
+    assert!(pm.scheduled_egress.is_empty());
+    assert_eq!(pm.next_scheduled_egress_delay_ms(latest_deliver), None);
+}
+
+#[test]
+fn reactor_timeout_clamping_matches_spec() {
+    // Default 10ms with no scheduled packets -> 10ms
+    assert_eq!(crate::tunnel::clamp_reactor_timeout_ms(10, None), 10);
+    // Scheduled packet due in 2ms -> clamps to 2ms
+    assert_eq!(crate::tunnel::clamp_reactor_timeout_ms(10, Some(2)), 2);
+    // Scheduled packet already due (0ms) -> clamps to 0ms (wake immediately)
+    assert_eq!(crate::tunnel::clamp_reactor_timeout_ms(10, Some(0)), 0);
+    // Scheduled packet far in future (50ms) -> remains at default 10ms
+    assert_eq!(crate::tunnel::clamp_reactor_timeout_ms(10, Some(50)), 10);
+}
+
+#[test]
+fn micro_jitter_queue_overrun_flushes_oldest_without_loss() {
+    let (mut pm, _tag, ep) = pm_with_established_peer([1u8; 32], [2u8; 32], 100);
+    pm.set_obf_psk(Some([0xAAu8; 32]));
+    pm.set_traffic_defense(crate::config::TrafficDefenseConfig {
+        preset: yip_obf::TrafficDefensePreset::Balanced,
+        buckets: vec![256, 512, 1024, 1420],
+        cover_interval_ms: Some(500),
+        cover_burst_max: 2,
+        jitter_max_ms: 10,
+    });
+
+    let total_packets = super::MAX_JITTER_QUEUE + 50;
+    let mut flushed_immediately = Vec::new();
+    let now_ms = 1000u64;
+
+    for i in 0..total_packets {
+        let dg = EgressDatagram {
+            fate: 0,
+            dst: ep,
+            bytes: vec![i as u8, (i >> 8) as u8],
+        };
+        let deliver_after_ms = now_ms + 10;
+        if pm.scheduled_egress.len() >= super::MAX_JITTER_QUEUE {
+            if let Some(oldest) = pm.scheduled_egress.pop_front() {
+                flushed_immediately.push(oldest.datagram);
+            }
+        }
+        pm.scheduled_egress.push_back(super::ScheduledDatagram {
+            deliver_after_ms,
+            datagram: dg,
+        });
+        assert!(pm.scheduled_egress.len() <= super::MAX_JITTER_QUEUE);
+    }
+
+    assert_eq!(pm.scheduled_egress.len(), super::MAX_JITTER_QUEUE);
+    assert_eq!(flushed_immediately.len(), 50);
+
+    for (i, dg) in flushed_immediately.iter().enumerate() {
+        assert_eq!(dg.bytes[0], i as u8);
+        assert_eq!(dg.bytes[1], (i >> 8) as u8);
+    }
+
+    let mut remaining = Vec::new();
+    pm.drain_scheduled_egress(now_ms + 10, &mut remaining);
+    assert_eq!(remaining.len(), super::MAX_JITTER_QUEUE);
+    assert!(pm.scheduled_egress.is_empty());
+
+    for (i, dg) in remaining.iter().enumerate() {
+        let expected_idx = 50 + i;
+        assert_eq!(dg.bytes[0], expected_idx as u8);
+        assert_eq!(dg.bytes[1], (expected_idx >> 8) as u8);
+    }
+
+    assert_eq!(flushed_immediately.len() + remaining.len(), total_packets);
+}
+
+#[test]
+fn zero_jitter_bypasses_queue() {
+    let (mut pm, _tag, _ep) = pm_with_established_peer([1u8; 32], [2u8; 32], 100);
+    pm.set_obf_psk(Some([0xAAu8; 32]));
+    pm.set_traffic_defense(crate::config::TrafficDefenseConfig {
+        preset: yip_obf::TrafficDefensePreset::Balanced,
+        buckets: vec![256, 512, 1024, 1420],
+        cover_interval_ms: Some(500),
+        cover_burst_max: 2,
+        jitter_max_ms: 0,
+    });
+
+    for _ in 0..10 {
+        let out = pm.on_tun(&dummy_tun_pkt(), 500);
+        assert!(!out.is_empty(), "packet must be dispatched immediately");
+        assert!(
+            pm.scheduled_egress.is_empty(),
+            "scheduled_egress must remain empty when jitter_max_ms == 0"
+        );
+        assert_eq!(pm.next_scheduled_egress_delay_ms(500), None);
+    }
+}

@@ -397,6 +397,22 @@ pub fn run(config: Config) -> io::Result<()> {
     }
 }
 
+/// Clamps the reactor poll timeout (in milliseconds) to the soonest scheduled micro-jitter
+/// delivery time across all peers, ensuring the event loop wakes promptly (<= 2-4ms)
+/// rather than waiting for coarse cadence ticks (20-50ms).
+pub fn clamp_reactor_timeout_ms(
+    default_timeout_ms: i32,
+    next_scheduled_delay_ms: Option<u64>,
+) -> i32 {
+    match next_scheduled_delay_ms {
+        Some(delay_ms) => {
+            let clamped = i32::try_from(delay_ms).unwrap_or(default_timeout_ms);
+            default_timeout_ms.min(clamped)
+        }
+        None => default_timeout_ms,
+    }
+}
+
 /// Bind the data-plane UDP socket — used only by the raw and QUIC transports —
 /// on the plausible port with the 3d 443→8443 fallback, raise its kernel
 /// buffers to 4 MiB, and set it non-blocking. The TLS costume (`transport=tls`)
