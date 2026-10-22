@@ -120,15 +120,7 @@ impl GsoSendContext {
                 iov_base: std::ptr::null_mut(),
                 iov_len: 0,
             },
-            msg: libc::msghdr {
-                msg_name: std::ptr::null_mut(),
-                msg_namelen: 0,
-                msg_iov: std::ptr::null_mut(),
-                msg_iovlen: 0,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
-                msg_flags: 0,
-            },
+            msg: crate::empty_msghdr(),
             control: [0_u8; GSO_CONTROL_SPACE],
             // SAFETY: `sockaddr_storage` is plain-old-data (integers/byte
             // arrays); the all-zero bit pattern is a valid value for it.
@@ -177,7 +169,7 @@ impl GsoSendContext {
         if cmsg_space > self.control.len() {
             return Err(io::Error::other("GSO control buffer too small"));
         }
-        self.msg.msg_controllen = cmsg_space;
+        self.msg.msg_controllen = cmsg_space as crate::CmsgLen;
         self.msg.msg_flags = 0;
         self.set_destination(dst);
 
@@ -191,8 +183,9 @@ impl GsoSendContext {
             }
             (*cmsg).cmsg_level = libc::SOL_UDP;
             (*cmsg).cmsg_type = libc::UDP_SEGMENT;
-            (*cmsg).cmsg_len = usize::try_from(libc::CMSG_LEN(GSO_CONTROL_PAYLOAD_LEN_U32))
+            let cmsg_len: usize = usize::try_from(libc::CMSG_LEN(GSO_CONTROL_PAYLOAD_LEN_U32))
                 .map_err(|_| io::Error::other("cmsg len does not fit usize"))?;
+            (*cmsg).cmsg_len = cmsg_len as crate::CmsgLen;
             let segment_ptr = libc::CMSG_DATA(cmsg).cast::<u16>();
             *segment_ptr = segment_size;
         }
@@ -298,15 +291,11 @@ impl UringDriver {
                 iov_base: slot.buf.as_mut_ptr().cast::<libc::c_void>(),
                 iov_len: slot.buf.len(),
             };
-            slot.msg = libc::msghdr {
-                msg_name: std::ptr::addr_of_mut!(slot.name).cast::<libc::c_void>(),
-                msg_namelen: namelen,
-                msg_iov: std::ptr::addr_of_mut!(slot.iov),
-                msg_iovlen: 1,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
-                msg_flags: 0,
-            };
+            slot.msg = crate::empty_msghdr();
+            slot.msg.msg_name = std::ptr::addr_of_mut!(slot.name).cast::<libc::c_void>();
+            slot.msg.msg_namelen = namelen;
+            slot.msg.msg_iov = std::ptr::addr_of_mut!(slot.iov);
+            slot.msg.msg_iovlen = 1;
         }
 
         let mut in_flight = Vec::with_capacity(SEND_SLOTS);
