@@ -47,3 +47,39 @@ jobs:
             cat "$f" 2>/dev/null || echo "(missing: $f)"
             echo "::endgroup::"
           done
+
+  iperf-netem-bench:
+    runs-on: ubuntu-latest
+    environment: benchmark-approval
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.22'
+      - name: Install BoringSSL build deps & networking tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config iproute2 iputils-ping iperf3 wireguard-tools openvpn jq
+      - name: Load wireguard kernel module
+        run: sudo modprobe wireguard 2>/dev/null || echo "[note] wireguard module unavailable"
+      - name: Build yipd release
+        run: cargo build --release -p yipd
+      - name: Set up contenders
+        run: |
+          sudo env "PATH=$PATH" ./crates/yip-bench/setup-contenders.sh --check
+          sudo env "PATH=$PATH" ./crates/yip-bench/setup-contenders.sh --amneziawg || echo "[note] amneziawg setup skipped"
+          ./crates/yip-bench/setup-contenders.sh --check
+      - name: Run comparative iperf TCP & UDP netem benchmark
+        run: |
+          set -o pipefail
+          sudo env "PATH=$PATH" bash crates/yip-bench/tests/run-iperf-compare.sh ./target/release/yipd | tee iperf-results.txt
+      - name: Publish benchmark results to Step Summary
+        if: always()
+        run: |
+          if [ -f iperf-results.txt ]; then
+            echo "### Comparative iperf3 Netem Benchmark (TCP & UDP under loss)" >> $GITHUB_STEP_SUMMARY
+            echo '```text' >> $GITHUB_STEP_SUMMARY
+            cat iperf-results.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi

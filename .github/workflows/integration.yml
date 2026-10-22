@@ -67,9 +67,14 @@ jobs:
         # list iproute2/iputils-ping as Recommends. That is not a dependency, and
         # it stopped resolving: run 277 logs "Setting up iproute2"; run 290 — same
         # apt line, one day later — does not.
-        run: sudo apt-get install -y iproute2 iputils-ping iperf3 wireguard-tools
+        run: sudo apt-get install -y iproute2 iputils-ping iperf3 wireguard-tools openvpn jq
       - name: Load wireguard kernel module
         run: sudo modprobe wireguard || echo "[note] wireguard module unavailable; WG column will be skipped"
+      - name: Set up optional benchmark contenders
+        run: |
+          sudo env "PATH=$PATH" ./crates/yip-bench/setup-contenders.sh --check
+          sudo env "PATH=$PATH" ./crates/yip-bench/setup-contenders.sh --amneziawg || echo "[note] amneziawg setup skipped"
+          ./crates/yip-bench/setup-contenders.sh --check
       - name: Build test binaries
         run: cargo test -p yip-bench --test netem_bench --no-run --message-format=json | tee /tmp/netem-build.json
       - name: Run netem harness tests under sudo

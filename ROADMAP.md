@@ -52,17 +52,16 @@ maintainer.
 - **SipHash-1-3 & zero-alloc wire header auth (#58)** — streaming multi-slice SipHash-1-3 coverage authentication
   and stack-allocated keystream generation (`header_mask`), slashing scalar MAC CPU by ~45% and eliminating
   intermediate heap allocations on data-plane framing.
+- **Data-plane windowed loss, 8-contender harness & bench polish (#11)** — exact per-class windowed loss fractions ($L_{\text{class}} = M_{\text{class}} / S_{\text{class}}$ in $(H_{\text{prev}}..H_{\text{curr}}]$), 4096-entry synchronized loss detection window matching sent-log capacity, bounded spurious NACK drop invariants, 8-contender comparison matrix and netns runners (yip, WireGuard, AmneziaWG, OpenVPN, n2n, ZeroTier, Tailscale, NetBird), dual TCP & UDP-under-loss evaluation, and configurable 1000-ping variance tightening.
 
 ## Now
 
-- **REALITY P256/P384 server-side KEX + HTTP/2 decoy (#84)** — broadening cipher suites and
-  HTTP/2 decoy multiplexing.
+- **Traffic-analysis defense (#11 / Sub-project #4)** — jittered cover traffic cadence, packet size shaping, and AmneziaWG junk/padding recipes.
 
 ## Next
 
-- **REALITY P256/P384 server-side KEX + HTTP/2 decoy (#84)** — broadening cipher suites and
-  HTTP/2 decoy multiplexing.
-- **Traffic-analysis defense** — jittered cover traffic cadence and packet size shaping.
+- **Multi-platform native drivers** — macOS (NetworkExtension / utun) and Windows (Wintun).
+- **Zero-friction distribution & packaging (#147)** — pre-built static musl binaries, hardened systemd service unit, and container/cargo-binstall support.
 
 ## Later
 
