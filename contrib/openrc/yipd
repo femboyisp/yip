@@ -1,0 +1,26 @@
+#!/sbin/openrc-run
+# OpenRC service script for yipd
+
+name="yipd"
+description="yip high-performance obfuscated mesh VPN daemon"
+
+command="/usr/local/bin/yipd"
+command_args="${YIPD_CONF:-/etc/yip/yipd.conf}"
+supervisor="supervise-daemon"
+capabilities="^cap_net_admin,^cap_net_raw,^cap_bpf,^cap_ipc_lock"
+
+rc_ulimit="-l unlimited"
+
+depend() {
+	need net
+	after firewall
+	use dns
+}
+
+start_pre() {
+	checkpath -d -m 0755 /run/yipd
+	if [ ! -f "${command_args}" ]; then
+		eerror "Config file ${command_args} not found!"
+		return 1
+	fi
+}

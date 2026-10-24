@@ -1,0 +1,9 @@
+#!/bin/sh
+exec 2>&1
+
+ulimit -l unlimited 2>/dev/null || true
+
+mkdir -p /run/yip-rendezvous
+chmod 0755 /run/yip-rendezvous
+
+exec /usr/local/bin/yip-rendezvous --listen-udp 0.0.0.0:51820

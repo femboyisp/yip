@@ -229,7 +229,7 @@ fn vpn_port_warning(port: u16) -> Option<String> {
 
 fn usage_exit() -> ! {
     eprintln!(
-        "usage: yip-rendezvous <listen-addr> [--obf-psk <hex64>] \
+        "usage: yip-rendezvous [--listen-udp] <listen-addr> [--obf-psk <hex64>] \
          [--listen-tcp <addr> [--tls-cert <path> --tls-key <path>] [--decoy <addr>] \
          [--reality-dest <host:port> --reality-private-key <hex64> \
          [--reality-short-id <hex16>]... [--reality-server-name <name>]... \
@@ -283,9 +283,33 @@ async fn main() -> std::io::Result<()> {
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--help" | "-h" => {
+                println!(
+                    "usage: yip-rendezvous [--listen-udp] <listen-addr> [--obf-psk <hex64>] \
+                     [--listen-tcp <addr> [--tls-cert <path> --tls-key <path>] [--decoy <addr>] \
+                     [--reality-dest <host:port> --reality-private-key <hex64> \
+                     [--reality-short-id <hex16>]... [--reality-server-name <name>]... \
+                     [--reality-cert-refresh-secs <secs>] [--reality-cert-max-stale-secs <secs>] \
+                     [--reality-replay-max-bucket <n>] [--reality-max-inflight <n>]]] \
+                     [--roots <path> --network-id <hex32>]\n\
+                     (--reality-dest supersedes --decoy when both are set; --tls-cert/--tls-key are \
+                     optional when --reality-dest is set — REALITY forges its own per-SNI cert; \
+                     --roots/--network-id are both-or-neither and switch the server into mesh mode, \
+                     requiring every registration to carry a verified signed record)\n\
+                     e.g. 0.0.0.0:51821"
+                );
+                return Ok(());
+            }
             "--version" | "-V" => {
                 println!("yip-rendezvous {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
+            }
+            "--listen-udp" => {
+                let Some(v) = args.next() else {
+                    eprintln!("--listen-udp requires an address argument");
+                    std::process::exit(2);
+                };
+                listen = Some(v);
             }
             "--obf-psk" => {
                 let Some(hex) = args.next() else {

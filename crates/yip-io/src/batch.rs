@@ -96,18 +96,7 @@ impl BatchUdpSocket {
             iov_base: std::ptr::null_mut(),
             iov_len: 0,
         }; BATCH_SIZE];
-        let mut msgs = [libc::mmsghdr {
-            msg_hdr: libc::msghdr {
-                msg_name: std::ptr::null_mut(),
-                msg_namelen: 0,
-                msg_iov: std::ptr::null_mut(),
-                msg_iovlen: 0,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
-                msg_flags: 0,
-            },
-            msg_len: 0,
-        }; BATCH_SIZE];
+        let mut msgs = [crate::empty_mmsghdr(); BATCH_SIZE];
 
         for i in 0..BATCH_SIZE {
             iovecs[i].iov_base = buffers[i].as_mut_ptr().cast::<libc::c_void>();
@@ -130,7 +119,7 @@ impl BatchUdpSocket {
                     self.fd,
                     msgs.as_mut_ptr(),
                     u32::try_from(BATCH_SIZE).expect("BATCH_SIZE fits u32"),
-                    libc::MSG_DONTWAIT,
+                    libc::MSG_DONTWAIT as crate::MsgFlags,
                     std::ptr::null_mut(),
                 )
             };
@@ -190,18 +179,7 @@ impl BatchUdpSocket {
             iov_base: std::ptr::null_mut(),
             iov_len: 0,
         }; BATCH_SIZE];
-        let mut msgs = [libc::mmsghdr {
-            msg_hdr: libc::msghdr {
-                msg_name: std::ptr::null_mut(),
-                msg_namelen: 0,
-                msg_iov: std::ptr::null_mut(),
-                msg_iovlen: 0,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
-                msg_flags: 0,
-            },
-            msg_len: 0,
-        }; BATCH_SIZE];
+        let mut msgs = [crate::empty_mmsghdr(); BATCH_SIZE];
 
         for (i, &(payload, dst)) in packets[..count].iter().enumerate() {
             let (storage, addr_len) = crate::addr::std_to_sockaddr(dst);
@@ -225,7 +203,7 @@ impl BatchUdpSocket {
                     self.fd,
                     msgs.as_mut_ptr(),
                     u32::try_from(count).expect("count fits u32"),
-                    libc::MSG_NOSIGNAL,
+                    libc::MSG_NOSIGNAL as crate::MsgFlags,
                 )
             };
 
@@ -304,7 +282,7 @@ pub fn send_gso_superpacket(
     let cmsg_space =
         usize::try_from(unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) })
             .unwrap_or(control.len());
-    msg.msg_controllen = cmsg_space;
+    msg.msg_controllen = cmsg_space as crate::CmsgLen;
 
     // SAFETY: msg points to valid control storage; write SOL_UDP / UDP_SEGMENT cmsg.
     unsafe {
@@ -312,8 +290,8 @@ pub fn send_gso_superpacket(
         if !cmsg.is_null() {
             (*cmsg).cmsg_level = libc::SOL_UDP;
             (*cmsg).cmsg_type = libc::UDP_SEGMENT;
-            (*cmsg).cmsg_len =
-                usize::try_from(libc::CMSG_LEN(std::mem::size_of::<u16>() as u32)).unwrap_or(0);
+            (*cmsg).cmsg_len = usize::try_from(libc::CMSG_LEN(std::mem::size_of::<u16>() as u32))
+                .unwrap_or(0) as crate::CmsgLen;
             let seg_ptr = libc::CMSG_DATA(cmsg).cast::<u16>();
             *seg_ptr = segment_size;
         }

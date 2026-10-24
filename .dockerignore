@@ -1,0 +1,34 @@
+# Version control
+.git
+.github
+.forgejo
+.claude
+CLAUDE.md
+
+# Build artifacts
+target
+**/target
+mutants.out*
+.bench-tools
+
+# Documentation, internal specs, and superpowers
+.superpowers
+docs/superpowers
+docs/research
+docs/2026-*.md
+docs/*-plan.md
+docs/*-design.md
+docs/*-implementation.md
+docs/nlnet-application.md
+refrences
+projectref.md
+
+# Python artifacts
+__pycache__
+*.pyc
+.pytest_cache
+
+# OS and editor files
+.DS_Store
+*.swp
+*~

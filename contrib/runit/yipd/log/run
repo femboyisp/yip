@@ -1,0 +1,8 @@
+#!/bin/sh
+exec 2>&1
+
+LOGDIR="/var/log/yipd"
+mkdir -p "$LOGDIR"
+chmod 0750 "$LOGDIR"
+
+exec svlogd -tt "$LOGDIR"

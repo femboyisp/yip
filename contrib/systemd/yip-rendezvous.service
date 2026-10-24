@@ -1,0 +1,27 @@
+[Unit]
+Description=yip rendezvous & relay server
+After=network.target network-online.target
+Wants=network-online.target
+Documentation=https://github.com/femboyisp/yip
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/yip-rendezvous --listen-udp 0.0.0.0:51820
+Restart=always
+RestartSec=3s
+
+# Privileges and capabilities
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# Sandboxing and filesystem protection
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Runtime directory
+RuntimeDirectory=yip-rendezvous
+
+[Install]
+WantedBy=multi-user.target

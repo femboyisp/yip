@@ -2,6 +2,11 @@
 //! I/O lands in M4; this milestone fixes the public surface.
 #![deny(unsafe_op_in_unsafe_fn)]
 
+#[cfg(target_env = "musl")]
+type IoctlReq = libc::c_int;
+#[cfg(not(target_env = "musl"))]
+type IoctlReq = libc::c_ulong;
+
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -72,7 +77,7 @@ fn negotiate_offload(fd: std::os::fd::RawFd) -> Option<OffloadMode> {
     let full = unsafe {
         libc::ioctl(
             fd,
-            TUNSETOFFLOAD,
+            TUNSETOFFLOAD as IoctlReq,
             libc::c_ulong::from(TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6),
         )
     };
@@ -81,7 +86,13 @@ fn negotiate_offload(fd: std::os::fd::RawFd) -> Option<OffloadMode> {
     }
 
     // SAFETY: same rationale as the previous TUNSETOFFLOAD call.
-    let csum_only = unsafe { libc::ioctl(fd, TUNSETOFFLOAD, libc::c_ulong::from(TUN_F_CSUM)) };
+    let csum_only = unsafe {
+        libc::ioctl(
+            fd,
+            TUNSETOFFLOAD as IoctlReq,
+            libc::c_ulong::from(TUN_F_CSUM),
+        )
+    };
     if csum_only == 0 {
         return Some(OffloadMode::CsumOnly);
     }
@@ -95,7 +106,7 @@ fn apply_offload(fd: std::os::fd::RawFd, mode: OffloadMode) -> Result<(), Device
         OffloadMode::CsumOnly => libc::c_ulong::from(TUN_F_CSUM),
     };
     // SAFETY: `fd` is a valid open /dev/net/tun fd. TUNSETOFFLOAD takes its flags as an integer passed by value.
-    let rc = unsafe { libc::ioctl(fd, TUNSETOFFLOAD, flags) };
+    let rc = unsafe { libc::ioctl(fd, TUNSETOFFLOAD as IoctlReq, flags) };
     if rc != 0 {
         return Err(DeviceError::Io(io::Error::last_os_error()));
     }
@@ -146,12 +157,12 @@ fn bring_up(ifname: &[u8; libc::IFNAMSIZ]) -> Result<(), DeviceError> {
         if sock_fd < 0 {
             return Err(DeviceError::Io(io::Error::last_os_error()));
         }
-        let rc_get = libc::ioctl(sock_fd, libc::SIOCGIFFLAGS, &raw mut req);
+        let rc_get = libc::ioctl(sock_fd, libc::SIOCGIFFLAGS as IoctlReq, &raw mut req);
         if rc_get == 0 {
             // FFI: libc exposes IFF_UP/IFF_RUNNING as c_int, but `ifreq.ifr_flags`
             // is c_short; the combined value (0x41) fits trivially.
             req.flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
-            let rc_set = libc::ioctl(sock_fd, libc::SIOCSIFFLAGS, &raw mut req);
+            let rc_set = libc::ioctl(sock_fd, libc::SIOCSIFFLAGS as IoctlReq, &raw mut req);
             libc::close(sock_fd);
             if rc_set != 0 {
                 Some(io::Error::last_os_error())
@@ -192,7 +203,7 @@ fn set_device_mtu(ifname: &[u8; libc::IFNAMSIZ], mtu: u32) -> Result<(), DeviceE
         if sock_fd < 0 {
             return Err(DeviceError::Io(io::Error::last_os_error()));
         }
-        let rc = libc::ioctl(sock_fd, libc::SIOCSIFMTU, &req);
+        let rc = libc::ioctl(sock_fd, libc::SIOCSIFMTU as IoctlReq, &req);
         let e = if rc != 0 {
             Some(io::Error::last_os_error())
         } else {
@@ -321,7 +332,7 @@ impl TunTap {
         // TUNSETIFF; the fd is a freshly-opened /dev/net/tun. The kernel reads
         // `req` and writes back the resolved name into the same buffer, which
         // we own exclusively here.
-        let rc = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETIFF, &raw mut req) };
+        let rc = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETIFF as IoctlReq, &raw mut req) };
         if rc != 0 {
             // Driver rejected IFF_VNET_HDR (or the type/name flags altogether).
             // `file` drops here, closing the fd; caller reopens plain.
@@ -332,7 +343,13 @@ impl TunTap {
         let mut hdr_sz: libc::c_int = VNET_HDR_LEN as libc::c_int;
         // SAFETY: `file` is a valid open /dev/net/tun fd. TUNSETVNETHDRSZ takes an int pointer
         // specifying the virtio_net_hdr byte size.
-        let _ = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETVNETHDRSZ, &raw mut hdr_sz) };
+        let _ = unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                TUNSETVNETHDRSZ as IoctlReq,
+                &raw mut hdr_sz,
+            )
+        };
 
         if let Some(_mode) = negotiate_offload(file.as_raw_fd()) {
             bring_up(&req.name)?;
@@ -371,7 +388,7 @@ impl TunTap {
         // SAFETY: `req` is a correctly-sized, properly-initialized `ifreq` for TUNSETIFF;
         // the fd is a freshly-opened /dev/net/tun. The kernel reads `req` and writes back
         // the resolved name into the same buffer, which we own exclusively here.
-        let rc = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETIFF, &raw mut req) };
+        let rc = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETIFF as IoctlReq, &raw mut req) };
         if rc != 0 {
             return Err(DeviceError::Io(io::Error::last_os_error()));
         }
@@ -409,14 +426,20 @@ impl TunTap {
         };
 
         // SAFETY: req0 is a correctly-sized ifreq for TUNSETIFF; file0 is a freshly-opened /dev/net/tun.
-        let rc = unsafe { libc::ioctl(file0.as_raw_fd(), TUNSETIFF, &raw mut req0) };
+        let rc = unsafe { libc::ioctl(file0.as_raw_fd(), TUNSETIFF as IoctlReq, &raw mut req0) };
         if rc != 0 {
             return Ok(None);
         }
 
         let mut hdr_sz0: libc::c_int = VNET_HDR_LEN as libc::c_int;
         // SAFETY: file0 is a valid open /dev/net/tun fd. TUNSETVNETHDRSZ takes an int pointer.
-        let _ = unsafe { libc::ioctl(file0.as_raw_fd(), TUNSETVNETHDRSZ, &raw mut hdr_sz0) };
+        let _ = unsafe {
+            libc::ioctl(
+                file0.as_raw_fd(),
+                TUNSETVNETHDRSZ as IoctlReq,
+                &raw mut hdr_sz0,
+            )
+        };
 
         let offload_mode = match negotiate_offload(file0.as_raw_fd()) {
             Some(mode) => mode,
@@ -450,14 +473,20 @@ impl TunTap {
             };
 
             // SAFETY: req is a correctly-sized ifreq for TUNSETIFF; file is a freshly-opened /dev/net/tun.
-            let rc = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETIFF, &raw mut req) };
+            let rc = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETIFF as IoctlReq, &raw mut req) };
             if rc != 0 {
                 return Err(DeviceError::Io(io::Error::last_os_error()));
             }
 
             let mut hdr_sz: libc::c_int = VNET_HDR_LEN as libc::c_int;
             // SAFETY: file is a valid open /dev/net/tun fd. TUNSETVNETHDRSZ takes an int pointer.
-            let _ = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETVNETHDRSZ, &raw mut hdr_sz) };
+            let _ = unsafe {
+                libc::ioctl(
+                    file.as_raw_fd(),
+                    TUNSETVNETHDRSZ as IoctlReq,
+                    &raw mut hdr_sz,
+                )
+            };
 
             apply_offload(file.as_raw_fd(), offload_mode)?;
 
@@ -495,7 +524,7 @@ impl TunTap {
         };
 
         // SAFETY: req0 is a correctly-sized ifreq for TUNSETIFF; file0 is a freshly-opened /dev/net/tun.
-        let rc = unsafe { libc::ioctl(file0.as_raw_fd(), TUNSETIFF, &raw mut req0) };
+        let rc = unsafe { libc::ioctl(file0.as_raw_fd(), TUNSETIFF as IoctlReq, &raw mut req0) };
         if rc != 0 {
             return Err(DeviceError::Io(io::Error::last_os_error()));
         }
@@ -527,7 +556,7 @@ impl TunTap {
             };
 
             // SAFETY: req is a correctly-sized ifreq for TUNSETIFF; file is a freshly-opened /dev/net/tun.
-            let rc = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETIFF, &raw mut req) };
+            let rc = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETIFF as IoctlReq, &raw mut req) };
             if rc != 0 {
                 return Err(DeviceError::Io(io::Error::last_os_error()));
             }

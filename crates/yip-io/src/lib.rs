@@ -14,8 +14,31 @@ pub mod spsc;
 pub mod tun_offload;
 pub mod uring;
 
+#[cfg(target_env = "musl")]
+pub(crate) type MsgFlags = libc::c_uint;
+#[cfg(not(target_env = "musl"))]
+pub(crate) type MsgFlags = libc::c_int;
+
+#[cfg(target_env = "musl")]
+pub(crate) type CmsgLen = libc::socklen_t;
+#[cfg(not(target_env = "musl"))]
+pub(crate) type CmsgLen = usize;
+
 pub use addr::{sockaddr_to_std, std_to_sockaddr};
 pub use bpf::{BpfFilterStatus, XdpRedirectFilter};
+
+#[inline]
+pub(crate) fn empty_msghdr() -> libc::msghdr {
+    // SAFETY: msghdr contains only pointers, lengths, and integer flags, which
+    // are valid when all bytes are zeroed.
+    unsafe { std::mem::zeroed() }
+}
+
+#[inline]
+pub(crate) fn empty_mmsghdr() -> libc::mmsghdr {
+    // SAFETY: mmsghdr contains msghdr and msg_len, which are valid when zeroed.
+    unsafe { std::mem::zeroed() }
+}
 
 /// Maximum number of datagrams in a single batched send/recv call.
 pub const MAX_DATAGRAM_BATCH: usize = 64;
@@ -189,18 +212,7 @@ impl DataPlaneIo for PlainIo {
             iov_base: std::ptr::null_mut(),
             iov_len: 0,
         }; MAX_DATAGRAM_BATCH];
-        let mut msgs = [libc::mmsghdr {
-            msg_hdr: libc::msghdr {
-                msg_name: std::ptr::null_mut(),
-                msg_namelen: 0,
-                msg_iov: std::ptr::null_mut(),
-                msg_iovlen: 0,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
-                msg_flags: 0,
-            },
-            msg_len: 0,
-        }; MAX_DATAGRAM_BATCH];
+        let mut msgs = [empty_mmsghdr(); MAX_DATAGRAM_BATCH];
 
         for (i, dg) in datagrams[..count].iter().enumerate() {
             // SAFETY: We cast a shared slice to a *mut c_void as required by the
@@ -224,7 +236,7 @@ impl DataPlaneIo for PlainIo {
                 self.socket.as_raw_fd(),
                 msgs.as_mut_ptr(),
                 u32::try_from(count).expect("count ≤ MAX_DATAGRAM_BATCH ≤ 64 fits u32"),
-                libc::MSG_NOSIGNAL,
+                libc::MSG_NOSIGNAL as MsgFlags,
             )
         };
 
@@ -253,18 +265,7 @@ impl DataPlaneIo for PlainIo {
             iov_base: std::ptr::null_mut(),
             iov_len: 0,
         }; MAX_DATAGRAM_BATCH];
-        let mut msgs = [libc::mmsghdr {
-            msg_hdr: libc::msghdr {
-                msg_name: std::ptr::null_mut(),
-                msg_namelen: 0,
-                msg_iov: std::ptr::null_mut(),
-                msg_iovlen: 0,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
-                msg_flags: 0,
-            },
-            msg_len: 0,
-        }; MAX_DATAGRAM_BATCH];
+        let mut msgs = [empty_mmsghdr(); MAX_DATAGRAM_BATCH];
 
         for i in 0..count {
             // SAFETY: bufs[i] is a mutable slice owned by the caller and lives
@@ -289,7 +290,7 @@ impl DataPlaneIo for PlainIo {
                 self.socket.as_raw_fd(),
                 msgs.as_mut_ptr(),
                 u32::try_from(count).expect("count ≤ MAX_DATAGRAM_BATCH ≤ 64 fits u32"),
-                libc::MSG_WAITFORONE,
+                libc::MSG_WAITFORONE as MsgFlags,
                 std::ptr::null_mut(),
             )
         };
