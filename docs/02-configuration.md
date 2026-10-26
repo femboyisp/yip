@@ -218,43 +218,43 @@ On a publicly accessible cloud instance (e.g. `198.51.100.5`):
 ```sh
 # Run unprivileged standalone rendezvous with shared obfuscation PSK
 yip-rendezvous 0.0.0.0:51821 \
-  --obf-psk 4444444444444444444444444444444444444444444444444444444444444444
+  --obf-psk c058438031ac60191a28852334d20f33ef7ad15ac39ede42150bd23d66f5b024
 ```
 
 #### Node A Configuration (`/etc/yip/yipd.conf`)
 
 ```ini
-local_private=1111111111111111111111111111111111111111111111111111111111111111
-local_public=2222222222222222222222222222222222222222222222222222222222222222
+local_private=dd152fc311a115549005da852d101a7d3a14594c728f71ff87aa0872da6c0fa9
+local_public=bf923deeaddb66dde39e99987abdfd789c54eb882a570c340cd338071727ceeb
 listen=0.0.0.0
 device=yip0
 device_kind=tun
 
 # Intermediate rendezvous coordinator
 rendezvous=198.51.100.5:51821
-obf_psk=4444444444444444444444444444444444444444444444444444444444444444
+obf_psk=c058438031ac60191a28852334d20f33ef7ad15ac39ede42150bd23d66f5b024
 
 # Remote peer: endpoint is omitted because Node B is behind NAT
 [peer]
-public_key=3333333333333333333333333333333333333333333333333333333333333333
+public_key=1f5b6b76d9723a79221777a7450522c32faa7300efd59b0a5efa42665cac0a0a
 ```
 
 #### Node B Configuration (`/etc/yip/yipd.conf`)
 
 ```ini
-local_private=6666666666666666666666666666666666666666666666666666666666666666
-local_public=3333333333333333333333333333333333333333333333333333333333333333
+local_private=b7f496a24be70c3a856e53a21456963c784aaf0d4f21dce9eca620120974eada
+local_public=1f5b6b76d9723a79221777a7450522c32faa7300efd59b0a5efa42665cac0a0a
 listen=0.0.0.0
 device=yip0
 device_kind=tun
 
 # Intermediate rendezvous coordinator
 rendezvous=198.51.100.5:51821
-obf_psk=4444444444444444444444444444444444444444444444444444444444444444
+obf_psk=c058438031ac60191a28852334d20f33ef7ad15ac39ede42150bd23d66f5b024
 
 # Remote peer: endpoint is omitted because Node A is behind NAT
 [peer]
-public_key=2222222222222222222222222222222222222222222222222222222222222222
+public_key=bf923deeaddb66dde39e99987abdfd789c54eb882a570c340cd338071727ceeb
 ```
 
 > [!TIP]
@@ -288,29 +288,29 @@ On a public VPS outside censorship boundaries:
 
 ```sh
 yip-rendezvous 0.0.0.0:51821 \
-  --obf-psk 7777777777777777777777777777777777777777777777777777777777777777 \
+  --obf-psk 6d752f062201ce61222b06e28317c4568f0f3501d0eb4a5e28c0ac0b541f8f18 \
   --listen-tcp 0.0.0.0:443 \
   --reality-dest www.microsoft.com:443 \
   --reality-server-name www.microsoft.com \
-  --reality-private-key aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --reality-private-key a588ac85b395f7403c042e72fa4891ade68dda1779e7356a9823116bb098f527 \
   --reality-short-id 0123456789abcdef
 ```
 
-*Note: The corresponding public key for private key `aaaa...aaaa` is derived via `yipd --genkey` or `yip-rendezvous` key utility (e.g. `bbbb...bbbb`).*
+*Note: The corresponding public key for private key `a588ac85...f527` is derived via `yipd --genkey` or `yip-rendezvous` key utility (e.g. `9246fe11...9366`).*
 
 #### Client Node Configuration (`/etc/yip/yipd.conf`)
 
 ```ini
-local_private=8888888888888888888888888888888888888888888888888888888888888888
-local_public=9999999999999999999999999999999999999999999999999999999999999999
+local_private=d8e1d3269e750a802a3a64c9f07c2691ebbbc830a00d7a2f98aac554708822ab
+local_public=5bc3510da3fb0d32c493aab3a1eac641f81a7f87cc7d3977af594174e4d3c946
 listen=0.0.0.0
 device=yip0
 device_kind=tun
 
 # REALITY Relay Dial
 # Syntax: reality://<relay-host>:<port>?pbk=<pubkey>&sid=<short-id>&sni=<decoy-sni>&verify=on
-rendezvous=reality://relay.example.org:443?pbk=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&sid=0123456789abcdef&sni=www.microsoft.com&verify=on
-obf_psk=7777777777777777777777777777777777777777777777777777777777777777
+rendezvous=reality://relay.example.org:443?pbk=9246fe11d923f5cc24424c1833fba7aec0f80868987b2c3fa77e6543dec69366&sid=0123456789abcdef&sni=www.microsoft.com&verify=on
+obf_psk=6d752f062201ce61222b06e28317c4568f0f3501d0eb4a5e28c0ac0b541f8f18
 
 # Traffic Analysis Defense (DAITA)
 traffic_defense=paranoid
@@ -321,7 +321,7 @@ defense_jitter_max_ms=4
 
 # Far-end peer terminating through the same REALITY relay
 [peer]
-public_key=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+public_key=93dedf18e5942c787403576ab4fc80e8969a760912613957781c930ae0ddbb61
 ```
 
 > [!IMPORTANT]
@@ -366,8 +366,8 @@ flowchart TD
 
 ```ini
 # Core Node
-local_private=0101010101010101010101010101010101010101010101010101010101010101
-local_public=0202020202020202020202020202020202020202020202020202020202020202
+local_private=38e55e4bf5b7d903f5ad6f406ab2d3e0984a95610ecae251783515436c7a8fe8
+local_public=47d25e016147610fa65d93e157291a13481e18d6e326b48fbba2637651a5d2eb
 listen=198.51.100.10:443
 device=yip0
 device_kind=tun
@@ -380,12 +380,12 @@ transport=raw
 
 # Remote Datacenter Peer
 [peer]
-public_key=0303030303030303030303030303030303030303030303030303030303030303
+public_key=7a9b3c4d5e6f0123456789abcdef0123456789abcdef0123456789abcdef0123
 endpoint=203.0.113.50:443
 
 # Remote Branch Office Peer
 [peer]
-public_key=0404040404040404040404040404040404040404040404040404040404040404
+public_key=8b0c1d2e3f4a5b6c7d8e9f0123456789abcdef0123456789abcdef0123456789
 endpoint=198.51.100.200:443
 ```
 

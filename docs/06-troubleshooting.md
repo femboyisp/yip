@@ -211,7 +211,7 @@ yipd /etc/yip/node.toml
 - `yipctl peers` reports peer state `Handshaking` or `Idle`:
   ```text
   PEER                                    ENDPOINT               RTT      STATE         TRANSPORT
-  a3f89b...e2                             198.51.100.10:51820    -        Handshaking   raw-obf
+  a3f89b...e2                             198.51.100.10:443      -        Handshaking   raw-obf
   ```
 - Overlay ping fails completely:
   ```text
@@ -229,7 +229,7 @@ yipd /etc/yip/node.toml
 #### Root Causes
 1. **Public Key / Node Address Mismatch:** Host A's configuration specifies a `public_key` that does not correspond to Host B's active private key.
 2. **Clock Skew Exceeding Replay Window (> 60 Seconds):** The Noise-IK handshake encapsulates a TAI64N high-resolution timestamp. If either host has system clock drift exceeding the anti-replay window, the responder refuses the initial handshake message (`stale/replayed Init refused`).
-3. **Firewall Blocking Underlay UDP Port:** The underlay transit port (default `51820/udp`) is dropped by cloud security groups (AWS VPC Security Groups, GCP Firewall Rules), `iptables`, or `nftables`.
+3. **Firewall Blocking Underlay UDP Port:** The underlay transit port (default `443/udp`) is dropped by cloud security groups (AWS VPC Security Groups, GCP Firewall Rules), `iptables`, or `nftables`. Note that `yipd` natively selects port 443 to blend with HTTPS traffic and evade blocks on standard VPN ports.
 4. **Zero-Trust CA Admission Failure:** If `[ca]` is enforced, a peer presenting an expired or untrusted Ed25519 node certificate is rejected immediately (`peer_manager: responder cert rejected`).
 
 #### Step-by-Step Remediation
@@ -244,7 +244,7 @@ Verify that Host B's hex public key matches the entry in Host A's `/etc/yip/node
 ```toml
 [[peer]]
 public_key = "<HOST_B_HEX_PUBLIC_KEY>"
-endpoint = "198.51.100.10:51820"
+endpoint = "198.51.100.10:443"
 ```
 Verify the self-certifying IPv6 address derived from the public key:
 ```bash
@@ -275,23 +275,23 @@ journalctl -u systemd-timesyncd -e --no-pager
 ##### Step 2.3: Verify Underlay Transit Reachability with Packet Captures
 On the listening host (Host B), inspect incoming UDP traffic on the listening port:
 ```bash
-sudo tcpdump -nn -i any udp port 51820
+sudo tcpdump -nn -i any udp port 443
 ```
 On the initiator host (Host A), send a manual probe or trigger a re-handshake:
 ```bash
 # Test raw UDP reachability
-nc -u -z -v -w 3 198.51.100.10 51820
+nc -u -z -v -w 3 198.51.100.10 443
 ```
 If no packets arrive in `tcpdump` on Host B:
 - Check host firewall:
   ```bash
   sudo ufw status
-  sudo iptables -L -n -v | grep 51820
-  sudo nft list ruleset | grep 51820
+  sudo iptables -L -n -v | grep 443
+  sudo nft list ruleset | grep 443
   ```
 - Allow incoming UDP port:
   ```bash
-  sudo iptables -A INPUT -p udp --dport 51820 -j ACCEPT
+  sudo iptables -A INPUT -p udp --dport 443 -j ACCEPT
   ```
 
 ##### Step 2.4: Check Zero-Trust Certificate Admission
@@ -352,7 +352,7 @@ Check whether the rendezvous server resolves and responds to UDP/TCP probes:
 getent hosts rdv.example.com
 
 # Test UDP reachability to rendezvous coordinator
-nc -u -z -v -w 3 rdv.example.com 51820
+nc -u -z -v -w 3 rdv.example.com 443
 ```
 
 ##### Step 3.3: Configure Persistent Keepalives
@@ -370,7 +370,7 @@ When direct UDP hole-punching fails due to symmetric NAT on both sides, configur
 
 ```toml
 [rendezvous]
-server = "rdv.example.com:51820"
+server = "rdv.example.com:443"
 relay_fallback = true
 
 [transport]
@@ -487,7 +487,7 @@ Examine `FEC PARITY` and `RECOVERED` counters. If `RECOVERED` is incrementing ra
 - DPI engines (e.g., nDPI, Suricata, Zeek) classify wire traffic as `Unknown / Suspicious Protocol` or detect protocol entropy anomalies.
 
 #### Root Causes
-1. **Fixed UDP Port Blocking:** Censors (such as state-level firewalls or university networks) filter UDP port `51820` or block non-standard UDP protocols entirely.
+1. **Fixed UDP Port Blocking or Protocol Inspection:** While `yipd` natively binds port `443` to blend with HTTPS/QUIC traffic and evade standard VPN port blocks (like `51820`), restrictive censors or deep packet inspection middleboxes may drop raw UDP on port 443 unless it conforms to standard QUIC handshakes, or filter non-standard UDP protocols entirely.
 2. **Decoy Domain SNI Mismatch or Target Blocked:** When using TLS / REALITY mimicry (`[transport] kind = "tls"`), the configured `reality_sni` domain is blocked, does not support TLS 1.3, or negotiates an unexpected ALPN.
 3. **Active Prober Detection:** Censors replay captured handshakes or probe open ports with random payloads. Without REALITY authorization, unauthorized probes reveal the daemon.
 4. **Traffic Analysis & Flow Shaping Heuristics:** Advanced DPI middleboxes detect packet size distributions, burst entropy, and inter-arrival timing patterns consistent with encrypted tunnels.
@@ -588,9 +588,9 @@ The `yipctl` command-line utility communicates directly with the running `yipd` 
 #### Example: `yipctl peers` Output
 ```text
 PEER                                    ENDPOINT               RTT      STATE         TRANSPORT        CERT        TX / RX                  FEC PARITY   RECOVERED
-5a712c94...123456                      198.51.100.22:51820    18ms     Established   raw-obf          CA Valid    1.42 GB / 3.81 GB        20%          1,482
+5a712c94...123456                      198.51.100.22:443      18ms     Established   raw-obf          CA Valid    1.42 GB / 3.81 GB        20%          1,482
 e4b1029c...890123                      203.0.113.50:443       32ms     Established   tls (reality)    CA Valid    412 MB / 890 MB          15%          319
-90fa3128...456789                      192.0.2.80:51820       -        Handshaking   relay            CA Valid    12 KB / 0 B              0%           0
+90fa3128...456789                      192.0.2.80:443         -        Handshaking   relay            CA Valid    12 KB / 0 B              0%           0
 ```
 
 ---

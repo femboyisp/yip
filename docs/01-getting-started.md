@@ -302,7 +302,7 @@ This walkthrough sets up a direct, point-to-point encrypted tunnel between two d
 | Public IP:  198.51.100.1          |              | Public IP:  203.0.113.2           |
 | Overlay IP: fd00:1::1/64          | <==========> | Overlay IP: fd00:1::2/64          |
 | Tunnel Dev: yip0 (L3 TUN)         |  Encrypted   | Tunnel Dev: yip0 (L3 TUN)         |
-| Listen:     0.0.0.0:51820         |     UDP      | Listen:     0.0.0.0:51820         |
+| Listen:     0.0.0.0:443           |     UDP      | Listen:     0.0.0.0:443           |
 +-----------------------------------+              +-----------------------------------+
 ```
 
@@ -370,7 +370,7 @@ local_private=e81d76326087b220d3f237ef39aa4d91361ff55b7661005a7657d23d8c117d4a
 local_public=7df4d68205f03a2cae7e1713444fcda80ff43a29de7e9b0b4b2c159286d9a11a
 
 # Socket binding & network device
-listen=0.0.0.0:51820
+listen=0.0.0.0:443
 device=yip0
 device_kind=tun
 
@@ -380,7 +380,7 @@ control_socket=/run/yipd/yipd.sock
 # Remote peer: Host B
 [peer]
 public_key=9b49ffeb4566b53a0f78cae08920bc9e30a6e0c60f252cfdf4740e74f8c92b21
-endpoint=203.0.113.2:51820
+endpoint=203.0.113.2:443
 ```
 
 Secure the permissions:
@@ -402,7 +402,7 @@ local_private=50b522bb0b57e7eb133e9b11b5275ea011cf8c3f4e24eb37452d192131b0e01c
 local_public=9b49ffeb4566b53a0f78cae08920bc9e30a6e0c60f252cfdf4740e74f8c92b21
 
 # Socket binding & network device
-listen=0.0.0.0:51820
+listen=0.0.0.0:443
 device=yip0
 device_kind=tun
 
@@ -412,7 +412,7 @@ control_socket=/run/yipd/yipd.sock
 # Remote peer: Host A
 [peer]
 public_key=7df4d68205f03a2cae7e1713444fcda80ff43a29de7e9b0b4b2c159286d9a11a
-endpoint=198.51.100.1:51820
+endpoint=198.51.100.1:443
 ```
 
 Secure the permissions:
@@ -472,7 +472,7 @@ sudo yipctl status
 ```text
 Daemon Status: RUNNING
 Interface:     yip0 (tun)
-Listen:        0.0.0.0:51820
+Listen:        0.0.0.0:443
 Active Peers:  1
 Worker Shards: 1
 ```
@@ -486,7 +486,7 @@ sudo yipctl peers
 *Output:*
 ```text
 PEER: 9b49ffeb4566b53a...
-  Endpoint:       203.0.113.2:51820 (Direct)
+  Endpoint:       203.0.113.2:443 (Direct)
   Handshake:      Completed (authenticated via Noise_IKpsk2)
   Rekey:          In 114s (epoch 1)
   Tx Packets:     42 (6.2 KiB)
@@ -534,12 +534,12 @@ sudo yipctl top
 - **Remedy**: Set `LimitMEMLOCK=infinity` in the systemd service or execute `ulimit -l unlimited` prior to starting `yipd`.
 
 ### Handshake Timeout / No Packets Exchanged
-- **Firewall Filtering**: Ensure UDP port `51820` (or your configured `listen` port) is open in host firewalls (`ufw allow 51820/udp` or `nftables` / `iptables`).
+- **Firewall Filtering**: Ensure UDP port `443` (or your configured `listen` port) is open in host firewalls (`ufw allow 443/udp` or `nftables` / `iptables`).
 - **Endpoint Mismatch**: Verify that `endpoint` on Host A points to Host B's public reachable IP and vice versa.
 - **Key Mismatch**: Double-check that Host A's `[peer] public_key` matches Host B's `local_public`.
 
-### DPI Port Blocking
-If standard VPN ports (e.g. `51820`, `1194`) are fingerprinted or throttled by network firewalls, change `listen=0.0.0.0:443` or use the built-in TLS/QUIC mimicry transports documented in [02-configuration.md](02-configuration.md#anti-dpi-obfuscation--traffic-defense-obfuscation).
+### DPI Port Blocking & Protocol Mimicry
+`yipd` natively uses port `443` as its default listen port to blend directly into HTTPS/QUIC web traffic and bypass restrictive middleboxes or firewalls that block standard VPN ports (such as `51820` or `1194`). If network firewalls perform stateful deep packet inspection beyond port filtering, enable the built-in TLS/QUIC mimicry transports documented in [02-configuration.md](02-configuration.md#anti-dpi-obfuscation--traffic-defense-obfuscation).
 
 ---
 
