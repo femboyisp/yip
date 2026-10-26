@@ -336,6 +336,8 @@ mod tests {
         };
 
         assert_eq!(fwd.canonical(), rev.canonical());
+        assert_eq!(fwd.canonical().src, src);
+        assert_eq!(fwd.canonical().src_port, 1234);
     }
 
     #[test]

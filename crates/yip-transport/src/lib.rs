@@ -438,4 +438,53 @@ mod tests {
             "object_id must match configured shard"
         );
     }
+
+    #[test]
+    fn test_transport_symbol_size_and_set_symbol_size() {
+        let mut t = Transport::new(vec![], 1200);
+        assert_eq!(t.symbol_size(), 1200);
+        t.set_symbol_size(1050);
+        assert_eq!(t.symbol_size(), 1050);
+        assert_eq!(t.params_for(FlowClass::Realtime).symbol_size, 1050);
+    }
+
+    #[test]
+    fn test_transport_observe_ingress_and_fec_recovered_count() {
+        let mut t = Transport::new(vec![], 1200);
+        assert_eq!(t.fec_recovered_count(), 0);
+
+        let make_udp = |src_ip: [u8; 4], dst_ip: [u8; 4], sport: u16, dport: u16| {
+            let mut p = vec![0u8; 100];
+            p[0] = 0x45;
+            p[9] = 17;
+            p[12..16].copy_from_slice(&src_ip);
+            p[16..20].copy_from_slice(&dst_ip);
+            p[20..22].copy_from_slice(&sport.to_be_bytes());
+            p[22..24].copy_from_slice(&dport.to_be_bytes());
+            p
+        };
+
+        let fwd = make_udp([192, 168, 1, 10], [192, 168, 1, 20], 10000, 20000);
+        let rev = make_udp([192, 168, 1, 20], [192, 168, 1, 10], 20000, 10000);
+
+        let (c0, _) = t.encode(&fwd, &fwd, false, 0);
+        assert_eq!(c0, FlowClass::Default);
+
+        t.observe_ingress(&rev, false, 10);
+        t.observe_ingress(&rev, false, 20);
+
+        let (c1, syms) = t.encode(&fwd, &fwd, false, 30);
+        assert_eq!(c1, FlowClass::Realtime);
+        assert!(syms.len() >= 2);
+
+        // Receive only the repair symbol (index 1), dropping source symbol 0
+        let decoded = t.decode(
+            u64::from(syms[1].object_id),
+            &syms[1],
+            FlowClass::Realtime,
+            30,
+        );
+        assert_eq!(decoded.as_deref(), Some(fwd.as_slice()));
+        assert_eq!(t.fec_recovered_count(), 1);
+    }
 }
