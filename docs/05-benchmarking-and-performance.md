@@ -1,6 +1,6 @@
 # yip Benchmarking, Testbed Methodology & Performance Guide
 
-This document is the authoritative performance engineering specification, testbed methodology reference, and benchmark reproduction guide for `yip` and `yipd`. It provides an in-depth analysis of the proactive Reed–Solomon Forward Error Correction (RS-FEC) trade-off, multi-core scaling characteristics across three distinct hardware testbeds, empirical comparisons against Linux kernel WireGuard and OpenVPN, and step-by-step instructions for deterministic reproduction.
+This document is the authoritative performance engineering specification, testbed methodology reference, and benchmark reproduction guide for `yip` and `yipd`. It provides an in-depth analysis of the proactive Reed-Solomon Forward Error Correction (RS-FEC) trade-off, multi-core scaling characteristics across three distinct hardware testbeds, empirical comparisons against Linux kernel WireGuard and OpenVPN, and step-by-step instructions for deterministic reproduction.
 
 For quick-start deployment tutorials, see [01-getting-started.md](01-getting-started.md).
 For runtime configuration directives and driver flags, see [02-configuration.md](02-configuration.md).
@@ -12,7 +12,7 @@ For cryptographic threat modeling and anti-DPI verification, see [04-security-an
 ## Table of Contents
 
 - [1. Benchmark Reading Guide & Mental Model](#1-benchmark-reading-guide--mental-model)
-  - [Proactive Reed–Solomon FEC vs. Reactive ARQ Retransmission](#proactive-reedsolomon-fec-vs-reactive-arq-retransmission)
+  - [Proactive Reed-Solomon FEC vs. Reactive ARQ Retransmission](#proactive-reed-solomon-fec-vs-reactive-arq-retransmission)
   - [The Dynamics of TCP Congestion Collapse on Lossy Links](#the-dynamics-of-tcp-congestion-collapse-on-lossy-links)
   - [The Clean-Link vs. Degraded-Link Trade-Off](#the-clean-link-vs-degraded-link-trade-off)
   - [Metrics That Matter: Goodput, P99 Tail Latency, and Recovery Ratios](#metrics-that-matter-goodput-p99-tail-latency-and-recovery-ratios)
@@ -71,7 +71,7 @@ Evaluating a transport-layer overlay tunnel like `yip` requires a fundamentally 
 +-----------------------------------------------------------------------------------------+
 ```
 
-### Proactive Reed–Solomon FEC vs. Reactive ARQ Retransmission
+### Proactive Reed-Solomon FEC vs. Reactive ARQ Retransmission
 
 Standard tunnels and IP fabrics rely on **Automatic Repeat reQuest (ARQ)**:
 1. A packet is dropped by an intermediate router due to queue buffer exhaustion, policed rate limiting, or wireless fading.
@@ -81,7 +81,7 @@ Standard tunnels and IP fabrics rely on **Automatic Repeat reQuest (ARQ)**:
 
 On a high-latency WAN link (e.g. cross-continental transit with a base Round-Trip Time of $\text{RTT} \approx 60\text{ ms}$), reactive ARQ imposes a minimum penalty of **$60\text{ ms}$ to $200+\text{ ms}$** before a single dropped byte can be recovered.
 
-In contrast, `yip` utilizes **Proactive Systematic Cauchy Reed–Solomon Erasure Coding** ($GF(2^8)$) with an adaptive ratio ($\sim 10\text{--}15\%$). For every block of $K$ source packets, the encoder emits $R$ parity packets interleaved directly into the egress stream. When a drop occurs on the transit network:
+In contrast, `yip` utilizes **Proactive Systematic Cauchy Reed-Solomon Erasure Coding** ($GF(2^8)$) with an adaptive ratio ($\sim 10\text{--}15\%$). For every block of $K$ source packets, the encoder emits $R$ parity packets interleaved directly into the egress stream. When a drop occurs on the transit network:
 - The missing packet is algebraically reconstructed **in-place at the receiver** the microsecond the parity symbol arrives.
 - **Zero Round-Trip Penalty:** The recovery latency is $0\text{ ms}$ of network traversal, bounded purely by the sub-microsecond Galois Field matrix multiplication.
 - Upper-layer TCP congestion control never observes an IP packet drop, preventing congestion window collapse.
@@ -108,7 +108,7 @@ On a perfectly lossless channel ($0.0\%$ loss) running on single-vCPU cloud inst
 - Linux kernel WireGuard achieves **$\sim 716\text{ Mbit/s}$** (or up to $\sim 927\text{ Mbit/s}$ across 4 parallel streams). It operates entirely within ring-0 kernel space, leveraging direct sk_buff steering without userspace context switches.
 - `yip` achieves **$\sim 612.8\text{ Mbit/s}$** on comparable workloads (or $\sim 282\text{--}375\text{ Mbit/s}$ on budget single-core VPS nodes).
 
-This difference ($\sim 14\text{--}20\%$) is the intentional, mathematically necessary trade-off for userspace cryptographic encapsulation and proactive Reed–Solomon parity generation:
+This difference ($\sim 14\text{--}20\%$) is the intentional, mathematically necessary trade-off for userspace cryptographic encapsulation and proactive Reed-Solomon parity generation:
 1. **Userspace Context Switches:** TUN/socket buffer transfers across the kernel boundary (`read`/`write` or `recvmmsg`/`sendmmsg`).
 2. **Proactive Parity Overhead:** Allocating $10\%$ of outbound bandwidth to systematic FEC symbols.
 3. **Double Cryptographic Protection:** Noise-IK transport encryption alongside ChaCha20-Poly1305 header protection and SipHash-1-3 filtering.
@@ -121,6 +121,9 @@ This difference ($\sim 14\text{--}20\%$) is the intentional, mathematically nece
 
 On clean fiber, both tunnels provide more than enough bandwidth for typical interactive usage. But on real-world mobile networks, congested satellite links (Starlink), inter-continental transit, and adversarial middleboxes injecting drops, `yip` keeps connections alive and fast when standard tunnels fail completely.
 
+> [!TIP] Clever Fox Tip: The Clean-Path Trade-Off
+> If you have a zero-loss gigabit fiber LAN, kernel WireGuard is king: it runs directly in ring-0. But yip was engineered for real-world hostility rather than laboratory perfection. Like a clever fox navigating thorny brush and rough terrain, yip is built for lossy WANs where packets get dropped. That 10% parity insurance policy keeps your SSH sessions responsive and transfers flying when traditional tunnels collapse into exponential backoff.
+
 ### Metrics That Matter: Goodput, P99 Tail Latency, and Recovery Ratios
 
 Standard benchmarking tools often report raw wire rate or packet counters. When assessing tunnel resilience, four specific metrics must be examined:
@@ -128,7 +131,7 @@ Standard benchmarking tools often report raw wire rate or packet counters. When 
 1. **Application Goodput:** Measured exclusively by completed layer-7 application transfers (e.g. `iperf3` TCP payload delivered without duplicate sequence accounting). Wire throughput is misleading if the wire is saturated with retransmissions.
 2. **P99 Tail Latency:** The 99th percentile round-trip latency. While median latency ($P_{50}$) may look acceptable on lossy links, unrecovered packet drops create massive $P_{99}$ latency spikes (hundreds of milliseconds) due to TCP head-of-line blocking.
 3. **Retransmit Storms & Retransmission Multiplier:** The ratio of transmitted packets to useful payloads. Under $5\%$ loss, standard tunnels trigger cascading retransmissions where the sender repeatedly blasts unacknowledged frames, causing queue bufferbloat.
-4. **FEC Recovery Ratio:** The percentage of missing packets successfully reconstructed by the Reed–Solomon decoder before the thin reactive ARQ timeout expires. In `yip`, this exceeds $99.3\%$ under continuous $10\%$ channel loss.
+4. **FEC Recovery Ratio:** The percentage of missing packets successfully reconstructed by the Reed-Solomon decoder before the thin reactive ARQ timeout expires. In `yip`, this exceeds $99.3\%$ under continuous $10\%$ channel loss.
 
 ---
 
@@ -153,7 +156,7 @@ Notice the logarithmic cliff experienced by both Linux kernel WireGuard and Open
 
 Figure 2 demonstrates the effective packet loss experienced by application traffic traversing the tunnel versus the actual physical channel loss injected by `tc-netem`:
 - For unencapsulated IP baseline, WireGuard, and OpenVPN, effective loss tracks or exceeds the injected loss (escalating to $12\text{--}17\%$ at the $10\%$ injection mark due to queue drop amplification).
-- For `yip`, the systematic Cauchy Reed–Solomon encoder completely suppresses packet loss: application-level effective loss remains **$0.0\%$** up to $5\%$ injected loss, and only registers $1\text{--}2\%$ at extreme $10\%$ channel degradation where burst drops briefly exceed the repair budget.
+- For `yip`, the systematic Cauchy Reed-Solomon encoder completely suppresses packet loss: application-level effective loss remains **$0.0\%$** up to $5\%$ injected loss, and only registers $1\text{--}2\%$ at extreme $10\%$ channel degradation where burst drops briefly exceed the repair budget.
 
 ### Figure 3: Multi-Core Datapath Scaling Across Driver Tiers
 
@@ -246,7 +249,7 @@ The Cloud WAN testbed measures real-world performance over commodity cloud infra
   sysctl -w net.core.wmem_max=16777216
   ```
 - **Tunnel Configurations:**
-  - `yip`: Default UDP outer transport, MTU 1380, `transport = "raw"`, vectorized epoll engine with adaptive Reed–Solomon FEC.
+  - `yip`: Default UDP outer transport, MTU 1380, `transport = "raw"`, vectorized epoll engine with adaptive Reed-Solomon FEC.
   - `wireguard`: Linux in-tree kernel module (`wg0`), MTU 1380, default cryptographic parameters.
   - `openvpn`: Static-key tunnel, AES-256-GCM cipher, UDP transport, MTU 1380.
 - **Traffic Generation:** `iperf3` version 3.12 (TCP single-stream, TCP 4-stream, UDP 200M saturation) and sub-millisecond interval ICMP `ping` (`-c 50 -i 0.05`).
@@ -338,11 +341,11 @@ Galois Field multiplication cannot be executed with standard integer multiply in
 | **AVX-512BW** | 2.00 µs | 59.85 Gbps | 41.73× | 142.9 ns / packet |
 | **Hardware GFNI** | **1.71 µs** | **70.21 Gbps** | **48.95×** | **122.1 ns / packet** |
 
-Under AVX2 and GFNI, the per-packet compute cost of Reed–Solomon parity generation drops to **$\sim 122\text{--}134\text{ ns}$**. Parity encoding requires less than $2\%$ of a single CPU core at $10\text{ Gbps}$ line rates.
+Under AVX2 and GFNI, the per-packet compute cost of Reed-Solomon parity generation drops to **$\sim 122\text{--}134\text{ ns}$**. Parity encoding requires less than $2\%$ of a single CPU core at $10\text{ Gbps}$ line rates.
 
 ### Systematic Cauchy RS-FEC vs. Rateless RLNC Benchmark
 
-In addition to Cauchy Reed–Solomon coding, `yip` incorporates a streaming **Rateless Random Linear Network Coding (RLNC)** engine ([`crates/yip-transport/src/rlnc.rs`](../crates/yip-transport/src/rlnc.rs)) featuring incremental Gaussian elimination and back-substitution:
+In addition to Cauchy Reed-Solomon coding, `yip` incorporates a streaming **Rateless Random Linear Network Coding (RLNC)** engine ([`crates/yip-transport/src/rlnc.rs`](../crates/yip-transport/src/rlnc.rs)) featuring incremental Gaussian elimination and back-substitution:
 
 | Coding Scheme | Configuration | Symbol Latency | Packet Rate | Effective Throughput |
 |:---|:---:|:---:|:---:|:---:|

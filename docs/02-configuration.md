@@ -29,7 +29,7 @@ A baseline commented configuration file is maintained at [`example.config`](../e
   - [Rendezvous, Relays & Mesh Discovery (`[rendezvous]`)](#rendezvous-relays--mesh-discovery-rendezvous)
   - [Peer Declarations (`[peer]`)](#peer-declarations-peer)
 - [4. Configuration Validation & Hot-Reloading](#4-configuration-validation--hot-reloading)
-  - [Syntax Verification (`yipd --check`)](#syntax-verification-yipd---check)
+  - [Configuration Validation & Safety Checks](#configuration-validation--safety-checks)
   - [Mutual Exclusivity & Conflict Matrix](#mutual-exclusivity--conflict-matrix)
   - [Dynamic Reloading via SIGHUP](#dynamic-reloading-via-sighup)
   - [Runtime Socket Management (`yipctl`)](#runtime-socket-management-yipctl)
@@ -89,7 +89,7 @@ sudo chmod 0600 /etc/yip/yipd.conf
 
 ### Scenario A: Static Direct Point-to-Point (VPS-to-VPS)
 
-This scenario connects two publicly addressable Linux cloud instances over a direct UDP tunnel with symmetric Cauchy Reed–Solomon Forward Error Correction (RS-FEC). Both endpoints have static public IPv4/IPv6 addresses.
+This scenario connects two publicly addressable Linux cloud instances over a direct UDP tunnel with symmetric Cauchy Reed-Solomon Forward Error Correction (RS-FEC). Both endpoints have static public IPv4/IPv6 addresses.
 
 ```mermaid
 flowchart LR
@@ -468,10 +468,13 @@ Parameters governing the external wire encapsulation and mimicry costume.
 
 ### Forward Error Correction (`[fec]`)
 
-Parameters governing userspace Galois Field $GF(2^8)$ Cauchy Reed–Solomon erasure coding and loss recovery.
+Parameters governing userspace Galois Field $GF(2^8)$ Cauchy Reed-Solomon erasure coding and loss recovery.
+
+> [!TIP] Clever Fox Tip: Dynamic Loss Adaptation
+> yip doesn't just blast redundant packets blindly. Its Cauchy Reed-Solomon engine continuously gauges link turbulence: on clean links, repair overhead stays at a feather-light 10%, but when packets start disappearing into the void, yip automatically boosts parity output up to 50% to reconstruct your packets without breaking stride.
 
 > [!NOTE]
-> The Cauchy Reed–Solomon FEC engine (`crates/yip-transport/src/fec.rs`) is built into the `yip` transport layer and automatically generates proactive repair symbols adaptively based on real-time link loss. The parameters below document default internal values and planned configuration overrides.
+> The Cauchy Reed-Solomon FEC engine (`crates/yip-transport/src/fec.rs`) is built into the `yip` transport layer and automatically generates proactive repair symbols adaptively based on real-time link loss. The parameters below document default internal values and planned configuration overrides.
 
 | Configuration Directive | Type | Default Value | Valid Range / Format | Operational Impact |
 | :--- | :--- | :--- | :--- | :--- |
@@ -654,7 +657,7 @@ yipctl top
 
 ## Related Documentation
 
-- [01-getting-started.md](01-getting-started.md) — Comprehensive installation and first tunnel guide.
-- [architecture.md](architecture.md) — Internal datapath design, cryptographic state machines, and FEC mathematics.
-- [user-guide.md](user-guide.md) — End-user operational guide and command recipes.
-- [testing-and-benchmarking.md](testing-and-benchmarking.md) — Latency and loss recovery validation.
+- [01-getting-started.md](01-getting-started.md): Comprehensive installation and first tunnel guide.
+- [architecture.md](architecture.md): Internal datapath design, cryptographic state machines, and FEC mathematics.
+- [user-guide.md](user-guide.md): End-user operational guide and command recipes.
+- [testing-and-benchmarking.md](testing-and-benchmarking.md): Latency and loss recovery validation.

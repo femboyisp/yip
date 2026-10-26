@@ -3,11 +3,11 @@
 This guide is the authoritative operational runbook, diagnostic workflow reference, and triage guide for `yip` and `yipd`. It covers end-to-end failure isolation across Linux networking primitives, kernel privileges, cryptographic handshakes, NAT traversal, path MTU discovery (PMTUD), and deep packet inspection (DPI) censorship filters.
 
 For deployment and initial configuration, refer to:
-- [01-getting-started.md](01-getting-started.md) — System requirements, installation, and init service setups.
-- [02-configuration.md](02-configuration.md) — Comprehensive configuration reference (`yip.toml`).
-- [03-architecture.md](03-architecture.md) — Datapath pipeline, kernel bypass, and crypto engine.
-- [04-security-and-threat-model.md](04-security-and-threat-model.md) — Threat model, zero-trust admission, and censorship resistance.
-- [05-benchmarking-and-performance.md](05-benchmarking-and-performance.md) — Hardware tuning, microbenchmarks, and line-rate scaling.
+- [01-getting-started.md](01-getting-started.md): System requirements, installation, and init service setups.
+- [02-configuration.md](02-configuration.md): Comprehensive configuration reference (`yip.toml`).
+- [03-architecture.md](03-architecture.md): Datapath pipeline, kernel bypass, and crypto engine.
+- [04-security-and-threat-model.md](04-security-and-threat-model.md): Threat model, zero-trust admission, and censorship resistance.
+- [05-benchmarking-and-performance.md](05-benchmarking-and-performance.md): Hardware tuning, microbenchmarks, and line-rate scaling.
 
 ---
 
@@ -365,6 +365,9 @@ persistent_keepalive = 25  # Sends periodic keepalive every 25 seconds
 ##### Step 3.4: Enable Blind Relay Fallback
 When direct UDP hole-punching fails due to symmetric NAT on both sides, configure blind relay transport fallback. `yip` automatically proxies encrypted ciphertext through the rendezvous node without revealing keys or payload:
 
+> [!TIP] Clever Fox Tip: Nimble Tunneling Around Symmetric NATs
+> Symmetric NATs try to trap you by randomizing outbound ports for every new destination. When direct hole-punching cannot find an open path, yip doesn't give up: it burrows through via blind relaying. The relay forwards your packets without ever possessing your session keys, keeping the data completely private while punching through otherwise impassable carrier networks.
+
 ```toml
 [rendezvous]
 server = "rdv.example.com:51820"
@@ -463,7 +466,7 @@ table inet filter {
 ```
 
 ##### Step 4.4: Verify Forward Error Correction Recovery
-Check if Reed–Solomon FEC is actively recovering loss caused by marginal MTU fragmentation:
+Check if Reed-Solomon FEC is actively recovering loss caused by marginal MTU fragmentation:
 ```bash
 yipctl peers
 ```
@@ -577,7 +580,7 @@ The `yipctl` command-line utility communicates directly with the running `yipd` 
 ● yipd v0.0.0
   Device:     yip0
   Mesh IPv6:  fd00:yip:5a71:2c94:83bb:67ff:fe12:3456
-  CA Gating:  Enforced (Root Ed25519) — Zero-Trust Admission
+  CA Gating:  Enforced (Root Ed25519): Zero-Trust Admission
   Uptime:     18h 42m 15s
   Peers:      3 active
 ```

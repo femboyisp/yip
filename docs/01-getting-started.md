@@ -3,9 +3,9 @@
 This guide walks through system requirements, installation workflows, production init service integration, and a complete end-to-end tutorial to establish your first encrypted, forward-error-corrected `yip` tunnel between two Linux hosts.
 
 For comprehensive configuration directives and wire protocol internals, refer to:
-- [configuration.md](configuration.md) — Exhaustive configuration syntax and option reference.
-- [architecture.md](architecture.md) — System architecture, packet pipeline, and crypto engine.
-- [user-guide.md](user-guide.md) — Advanced topologies, NAT traversal, and mesh operation.
+- [configuration.md](configuration.md): Exhaustive configuration syntax and option reference.
+- [architecture.md](architecture.md): System architecture, packet pipeline, and crypto engine.
+- [user-guide.md](user-guide.md): Advanced topologies, NAT traversal, and mesh operation.
 
 ---
 
@@ -46,7 +46,7 @@ For comprehensive configuration directives and wire protocol internals, refer to
 
 - **Target OS**: Linux (glibc 2.31+ or musl 1.2+)
 - **Architectures**:
-  - `x86_64` (AMD64 / Intel 64) with AVX2 support recommended for hardware-accelerated Reed–Solomon FEC
+  - `x86_64` (AMD64 / Intel 64) with AVX2 support recommended for hardware-accelerated Reed-Solomon FEC
   - `aarch64` (ARM64 / ARMv8-A+) with NEON vector instructions
   - `armv7` (ARM 32-bit with VFPv4/NEON)
 
@@ -134,8 +134,8 @@ sudo mkdir -p /etc/yip
 sudo cp example.config /etc/yip/yipd.conf.example
 ```
 
-> [!TIP]
-> Always compile with `--release`. Unoptimized debug builds run the Galois field GF(256) Reed–Solomon matrix routines in software without SIMD autovectorization, resulting in substantially higher CPU latency.
+> [!TIP] Clever Fox Tip: Always Build in Release Mode
+> Always compile with `--release`. Unoptimized debug builds run the Galois field GF(256) Reed-Solomon matrix routines in software without SIMD autovectorization, resulting in substantially higher CPU latency.
 
 ### Option D: Container / Docker Deployment
 
@@ -353,6 +353,9 @@ yipd --addr 9b49ffeb4566b53a0f78cae08920bc9e30a6e0c60f252cfdf4740e74f8c92b21
 
 You can choose either standard custom ULA prefixes (such as `fd00:1::1/64`) or these self-certifying key addresses for your overlay. For this tutorial, we will assign `fd00:1::1/64` to Host A and `fd00:1::2/64` to Host B.
 
+> [!TIP] Clever Fox Tip: Self-Certifying Addressing
+> Because your overlay IPv6 is cryptographically bound to your public key, peers can verify your identity without consulting a centralized directory or authority. If an incoming packet doesn't match its cryptographic origin, yip quietly drops it in its tracks.
+
 ---
 
 ### Step 3: Configure Host A
@@ -475,7 +478,7 @@ Worker Shards: 1
 ```
 
 #### 2. Inspect Connected Peers & FEC Telemetry
-Inspect handshake status, session counters, and Reed–Solomon recovery metrics:
+Inspect handshake status, session counters, and Reed-Solomon recovery metrics:
 
 ```sh
 sudo yipctl peers
@@ -536,12 +539,12 @@ sudo yipctl top
 - **Key Mismatch**: Double-check that Host A's `[peer] public_key` matches Host B's `local_public`.
 
 ### DPI Port Blocking
-If standard VPN ports (e.g. `51820`, `1194`) are fingerprinted or throttled by network firewalls, change `listen=0.0.0.0:443` or use the built-in TLS/QUIC mimicry transports documented in [configuration.md](configuration.md#anti-dpi--obfuscation).
+If standard VPN ports (e.g. `51820`, `1194`) are fingerprinted or throttled by network firewalls, change `listen=0.0.0.0:443` or use the built-in TLS/QUIC mimicry transports documented in [02-configuration.md](02-configuration.md#anti-dpi-obfuscation--traffic-defense-obfuscation).
 
 ---
 
 ## Next Steps
 
-- Explore [configuration.md](configuration.md) to enable **multi-core CPU sharding**, **anti-DPI TLS/REALITY mimicry**, and **DAITA traffic padding**.
-- Learn about NAT-traversal, STUN hole-punching, and relay fallback in [user-guide.md](user-guide.md#rendezvous--nat-traversal).
-- Review performance tuning and automated benchmarking scripts in [testing-and-benchmarking.md](testing-and-benchmarking.md).
+- Explore [02-configuration.md](02-configuration.md) to enable **multi-core CPU sharding**, **anti-DPI TLS/REALITY mimicry**, and **DAITA traffic padding**.
+- Learn about NAT-traversal, STUN hole-punching, and relay fallback in [02-configuration.md](02-configuration.md#rendezvous-relays--mesh-discovery-rendezvous).
+- Review performance tuning and automated benchmarking scripts in [05-benchmarking-and-performance.md](05-benchmarking-and-performance.md).

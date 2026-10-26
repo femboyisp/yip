@@ -163,7 +163,7 @@ Standard integrations of post-quantum KEMs into Noise often introduce a protocol
 
 To prevent Path MTU (PMTU) blackholing and avoid IP fragmentation across restrictive internet paths (such as cellular networks, nested tunnels, PPPoE, and international transit links), both handshake flights strictly adhere to `OBF_MTU_BUDGET = 1200` bytes:
 
-#### Message 1 (Initiator $\to$ Responder) — Total: 1,028 Bytes
+#### Message 1 (Initiator $\to$ Responder): 1,028 Bytes Total
 
 ```
  0                   1                   2                   3
@@ -184,7 +184,7 @@ To prevent Path MTU (PMTU) blackholing and avoid IP fragmentation across restric
 Total: 4 + 800 + 32 + 144 = 1,028 Bytes (<= 1,200 B OBF_MTU_BUDGET)
 ```
 
-#### Message 2 (Responder $\to$ Initiator) — Total: 948 Bytes
+#### Message 2 (Responder $\to$ Initiator): 948 Bytes Total
 
 ```
  0                   1                   2                   3
@@ -432,6 +432,9 @@ flowchart TD
    - If the seal is **invalid, missing, or malformed** (the signature of an active DPI probe or port scanner), the relay connects via raw TCP to the authentic destination server (`dest`, e.g. Apple or Microsoft CDN) and transparently splices the connection.
    - The relay replays the exact buffered `ClientHello` bytes to the destination server and pipes bidirectional traffic between the prober and the authentic web server.
    - The active prober observes a genuine, valid X.509 certificate signed by a public CA, complete with authentic HTTP/2 responses. The prober cannot distinguish the `yip` node from the real web service.
+
+> [!TIP] Clever Fox Tip: Burrowing Past Active Probers
+> When a suspicious firewall probes your endpoint, yip doesn't drop the connection or serve a fishy self-signed certificate. Instead, like a clever fox diving into a familiar burrow, yip transparently splices the prober into an authentic web server (such as Apple or Microsoft CDN). The prober sees genuine CA certs and valid HTTP/2 responses, completely unaware that an encrypted mesh was ever there.
 
 ---
 

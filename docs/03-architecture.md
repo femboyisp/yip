@@ -111,7 +111,7 @@ The `yip` codebase is organized into modular Rust crates with strict interface b
 | :--- | :--- | :--- |
 | [`crates/yip-crypto`](../crates/yip-crypto) | Noise-IKpsk2 state machine, ML-KEM-512 post-quantum KDF, ChaCha20-Poly1305 AEAD, sliding replay window. | `#![forbid(unsafe_code)]` |
 | [`crates/yip-wire`](../crates/yip-wire) | Frame serialization, SipHash-1-3 coverage authentication, keyed header obfuscation. | `#![forbid(unsafe_code)]` |
-| [`crates/yip-transport`](../crates/yip-transport) | Flow classification, GF(256) Cauchy Reed–Solomon FEC, RLNC codec, thin ARQ, PLPMTU discovery. | `#![forbid(unsafe_code)]` |
+| [`crates/yip-transport`](../crates/yip-transport) | Flow classification, GF(256) Cauchy Reed-Solomon FEC, RLNC codec, thin ARQ, PLPMTU discovery. | `#![forbid(unsafe_code)]` |
 | [`crates/yip-device`](../crates/yip-device) | Multi-queue Linux TUN/TAP device provisioning, ioctl allocation, MTU negotiation. | Encapsulated |
 | [`crates/yip-io`](../crates/yip-io) | Vectorized `recvmmsg`/`sendmmsg`, GSO batching, `io_uring` multishot driver, AF_XDP/eBPF kernel bypass, lock-free SPSC rings. | Quarantined / Audited |
 | [`crates/yip-rendezvous`](../crates/yip-rendezvous) | NAT discovery, reflexive candidate harvesting, symmetric NAT port prediction, DERP relay fallback. | `#![forbid(unsafe_code)]` |
@@ -169,7 +169,7 @@ The Initiator extracts `ct` prior to decrypting Message 2's AEAD envelope, execu
 
 Handshake packets are designed to fit strictly within the MTU budget (`OBF_MTU_BUDGET = 1,200` bytes) to prevent IP fragmentation on paths with restricted MTUs:
 
-#### Message 1 (Initiator $\to$ Responder) — Total: 1,028 Bytes
+#### Message 1 (Initiator $\to$ Responder): 1,028 Bytes Total
 
 ```
  0                   1                   2                   3
@@ -189,7 +189,7 @@ Handshake packets are designed to fit strictly within the MTU budget (`OBF_MTU_B
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-#### Message 2 (Responder $\to$ Initiator) — Total: 948 Bytes
+#### Message 2 (Responder $\to$ Initiator): 948 Bytes Total
 
 ```
  0                   1                   2                   3
@@ -574,7 +574,7 @@ Deep Packet Inspection (DPI) appliances (such as nDPI, Zeek, Suricata, and state
 4. The mask is XORed into the header bytes in-place:
    $$\text{Header}_{\text{wire}} = \text{Header}_{\text{plain}} \oplus \text{Mask}[0..4]$$
 
-Every byte on the wire—including the header, type bits, and length fields—exhibits uniform pseudo-random entropy. There are no magic numbers, no static offsets, and no unencrypted protocol identifiers.
+Every byte on the wire (including the header, type bits, and length fields) exhibits uniform pseudo-random entropy. There are no magic numbers, no static offsets, and no unencrypted protocol identifiers.
 
 ---
 
@@ -595,6 +595,9 @@ Combined with optional traffic-analysis defense plugins ([`crates/yip-obf`](../c
 - **Chi-Square Goodness-of-Fit**: Conforms to an ideal uniform distribution ($p > 0.95$).
 - **Bitwise Entropy**: Evaluates to $> 7.999$ bits per byte.
 - **Oracle Verification**: Validated against automated oracle test suites running nDPI, Zeek, Suricata, and Wireshark analyzers without triggering protocol detection signatures.
+
+> [!TIP] Clever Fox Tip: Blending Into the Shadows
+> By eliminating fixed protocol signatures and masking headers with per-packet keystreams, yip leaves no tracks for deep packet inspection engines. To a network monitor, your mesh traffic looks indistinguishable from benign, uniform random noise.
 
 ---
 
@@ -632,7 +635,7 @@ The egress path moves an IP packet originating from the host operating system to
 1. **Host Read**: The worker thread reads up to 32 frames from its exclusive TUN queue descriptor.
 2. **Classification**: `FlowTuple::extract` identifies IP protocol, source/destination IPs, and ports, computing the symmetric shard affinity.
 3. **AEAD Sealing**: The inner packet is sealed with ChaCha20-Poly1305 using SIMD instructions (AVX2 on x86_64, NEON on ARM64).
-4. **RS-FEC Encoding**: Ciphertext blocks are passed to the Systematic Cauchy Reed–Solomon encoder. For every $K$ source symbols, $R$ parity symbols are generated.
+4. **RS-FEC Encoding**: Ciphertext blocks are passed to the Systematic Cauchy Reed-Solomon encoder. For every $K$ source symbols, $R$ parity symbols are generated.
 5. **Wire Framing**: The logical header is assembled, protected with the XOR keystream mask, and tagged with the 64-bit SipHash MAC.
 6. **Transmission**: Datagrams are submitted to the NIC via the selected driver engine (AF_XDP Tx Ring, `io_uring` SQE, or `sendmmsg` with `UDP_SEGMENT`).
 
@@ -684,7 +687,7 @@ The ingress path reverses the processing stages with early verification gates:
 
 ### Systematic Cauchy RS-FEC Erasure Coding
 
-`yip-transport` implements Systematic Cauchy Reed–Solomon Forward Error Correction over the Galois Field $\text{GF}(2^{8})$ ([`crates/yip-transport/src/fec.rs`](../crates/yip-transport/src/fec.rs)):
+`yip-transport` implements Systematic Cauchy Reed-Solomon Forward Error Correction over the Galois Field $\text{GF}(2^{8})$ ([`crates/yip-transport/src/fec.rs`](../crates/yip-transport/src/fec.rs)):
 
 - **Systematic Structure**: The first $K$ symbols emitted on the wire are identical to the unencoded source packets. In loss-free conditions, decode cost is exactly **zero** (no matrix multiplication).
 - **Cauchy Generator Matrix**: Employs Cauchy matrices rather than traditional Vandermonde matrices:
