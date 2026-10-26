@@ -171,6 +171,29 @@ pub fn decode_source(
     received: &[(u16, &[u8])],
     scheme: Scheme,
 ) -> Option<Vec<Vec<u8>>> {
+    let mut flat = vec![0u8; k.checked_mul(shard_len)?];
+    decode_source_into(k, shard_len, received, scheme, &mut flat)?;
+    let mut out = Vec::with_capacity(k);
+    for i in 0..k {
+        let offset = i * shard_len;
+        out.push(flat[offset..offset + shard_len].to_vec());
+    }
+    Some(out)
+}
+
+/// Recover the K source shards directly into `out_payload` (which must be at least `k * shard_len` bytes).
+/// Returns `None` if fewer than K distinct usable shards, or if P+Q row index is out of bounds,
+/// or if matrix inversion fails.
+pub fn decode_source_into(
+    k: usize,
+    shard_len: usize,
+    received: &[(u16, &[u8])],
+    scheme: Scheme,
+    out_payload: &mut [u8],
+) -> Option<()> {
+    if out_payload.len() < k.checked_mul(shard_len)? {
+        return None;
+    }
     // Deduplicate by index, keep the first K distinct.
     let mut seen = [false; 256];
     let mut rows: Vec<(usize, &[u8])> = Vec::with_capacity(k);
@@ -191,17 +214,15 @@ pub fn decode_source(
 
     // Fast path: all K source shards present (indices 0..k) → systematic copy.
     if rows.iter().all(|&(idx, _)| idx < k) {
-        let mut out = vec![vec![0u8; shard_len]; k];
         for &(idx, bytes) in &rows {
-            out[idx].copy_from_slice(bytes);
+            let offset = idx * shard_len;
+            out_payload[offset..offset + shard_len].copy_from_slice(bytes);
         }
-        return Some(out);
+        return Some(());
     }
 
     // General path: build the K×K generator submatrix M for the received rows,
     // invert it (Gauss–Jordan over GF(256)), and apply to the received shards.
-    // Row for source index i (< k): unit vector e_i. Row for repair index j (>= k):
-    // Cauchy row (j - k), i.e. M[row][i] = cauchy_coef(k, j-k, i).
     let mut m = vec![vec![0u8; k]; k];
     for (row, &(idx, _)) in rows.iter().enumerate() {
         if idx < k {
@@ -217,13 +238,110 @@ pub fn decode_source(
     let minv = invert(&mut m)?;
 
     // source_i = Σ_row minv[i][row] * received_shard[row]
-    let mut out = vec![vec![0u8; shard_len]; k];
-    for i in 0..k {
+    for (i, minv_row) in minv.iter().enumerate().take(k) {
+        let offset = i * shard_len;
+        let dst = &mut out_payload[offset..offset + shard_len];
+        dst.fill(0);
         for (row, &(_, bytes)) in rows.iter().enumerate() {
-            mul_add_row(minv[i][row], bytes, &mut out[i]);
+            let coef = minv_row[row];
+            if coef != 0 {
+                mul_add_row(coef, bytes, dst);
+            }
         }
     }
-    Some(out)
+    Some(())
+}
+
+/// Reconstructs ONLY missing source shards into `payload` using the received repair shards
+/// and already-copied source shards in `payload`.
+///
+/// Preconditions:
+/// - `payload.len() >= k * shard_len`
+/// - For every `idx < k` where `seen_mask` has bit `idx` set, `payload[idx * shard_len .. (idx + 1) * shard_len]`
+///   already holds the valid source shard.
+/// - `repair_shards` provides the parity shards to make up the missing shards (at least K total shards).
+pub fn reconstruct_missing_sources(
+    k: usize,
+    shard_len: usize,
+    payload: &mut [u8],
+    seen_mask: &[u64; 4],
+    repair_shards: &[(u16, &[u8])],
+    scheme: Scheme,
+) -> Option<()> {
+    if payload.len() < k.checked_mul(shard_len)? {
+        return None;
+    }
+
+    enum ShardRef<'a> {
+        Source(usize),
+        Repair(&'a [u8]),
+    }
+
+    let mut rows: Vec<(usize, ShardRef<'_>)> = Vec::with_capacity(k);
+    for idx in 0..k {
+        let u = idx;
+        if (seen_mask[u / 64] & (1u64 << (u % 64))) != 0 {
+            rows.push((idx, ShardRef::Source(idx)));
+        }
+    }
+
+    for &(idx, bytes) in repair_shards {
+        if rows.len() == k {
+            break;
+        }
+        if bytes.len() != shard_len {
+            continue;
+        }
+        rows.push((usize::from(idx), ShardRef::Repair(bytes)));
+    }
+
+    if rows.len() < k {
+        return None;
+    }
+
+    // Build the K×K generator submatrix M.
+    let mut m = vec![vec![0u8; k]; k];
+    for (row, (idx, _)) in rows.iter().enumerate() {
+        if *idx < k {
+            m[row][*idx] = 1;
+        } else {
+            let rm = idx - k;
+            if scheme == Scheme::Pq && rm >= 2 {
+                return None;
+            }
+            m[row].copy_from_slice(&repair_row(scheme, k, rm));
+        }
+    }
+    let minv = invert(&mut m)?;
+
+    // Only reconstruct missing source shards!
+    let mut scratch = vec![0u8; shard_len];
+    for (i, minv_row) in minv.iter().enumerate().take(k) {
+        let u = i;
+        let is_present = (seen_mask[u / 64] & (1u64 << (u % 64))) != 0;
+        if is_present {
+            continue; // Already in place in payload!
+        }
+        scratch.fill(0);
+        for (row_idx, (_, shard_ref)) in rows.iter().enumerate() {
+            let coef = minv_row[row_idx];
+            if coef == 0 {
+                continue;
+            }
+            let bytes = match shard_ref {
+                ShardRef::Source(src_idx) => {
+                    let offset = src_idx * shard_len;
+                    &payload[offset..offset + shard_len]
+                }
+                ShardRef::Repair(rep_bytes) => rep_bytes,
+            };
+            mul_add_row(coef, bytes, &mut scratch);
+        }
+        let dst_offset = i * shard_len;
+        payload[dst_offset..dst_offset + shard_len].copy_from_slice(&scratch);
+    }
+
+    Some(())
 }
 
 /// Gauss–Jordan inverse of a K×K GF(256) matrix; `None` if singular.
@@ -470,5 +588,61 @@ mod tests {
 
         let mut singular = vec![vec![0u8; 2], vec![0u8; 2]];
         assert_eq!(invert(&mut singular), None);
+    }
+
+    #[test]
+    fn test_decode_source_into_matches_decode_source() {
+        let len = 32usize;
+        let k = 3usize;
+        let source: Vec<Vec<u8>> = (0..k)
+            .map(|s| shard(u8::try_from(s).unwrap() * 5 + 3, len))
+            .collect();
+        let repair = encode_repair(&source, 2, Scheme::Pq);
+
+        // Receive source 0, source 2, repair 3
+        let recv: Vec<(u16, &[u8])> = vec![
+            (0, source[0].as_slice()),
+            (2, source[2].as_slice()),
+            (3, repair[0].as_slice()),
+        ];
+
+        let expected = decode_source(k, len, &recv, Scheme::Pq).unwrap();
+
+        let mut payload = vec![0u8; k * len];
+        decode_source_into(k, len, &recv, Scheme::Pq, &mut payload).unwrap();
+
+        for (i, exp) in expected.iter().enumerate().take(k) {
+            let offset = i * len;
+            assert_eq!(&payload[offset..offset + len], exp.as_slice());
+        }
+    }
+
+    #[test]
+    fn test_reconstruct_missing_sources() {
+        let len = 64usize;
+        let k = 4usize;
+        let source: Vec<Vec<u8>> = (0..k)
+            .map(|s| shard(u8::try_from(s).unwrap() * 9 + 7, len))
+            .collect();
+        let repair = encode_repair(&source, 2, Scheme::Pq);
+
+        // Sources 0 and 2 present in payload. 1 and 3 missing.
+        let mut payload = vec![0u8; k * len];
+        payload[0..len].copy_from_slice(&source[0]);
+        payload[2 * len..3 * len].copy_from_slice(&source[2]);
+
+        let mut seen_mask = [0u64; 4];
+        seen_mask[0] = (1 << 0) | (1 << 2);
+
+        let repair_shards: Vec<(u16, &[u8])> =
+            vec![(4, repair[0].as_slice()), (5, repair[1].as_slice())];
+
+        reconstruct_missing_sources(k, len, &mut payload, &seen_mask, &repair_shards, Scheme::Pq)
+            .unwrap();
+
+        for (i, src) in source.iter().enumerate().take(k) {
+            let offset = i * len;
+            assert_eq!(&payload[offset..offset + len], src.as_slice());
+        }
     }
 }

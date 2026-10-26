@@ -446,28 +446,22 @@ impl FecReassembler {
         // Loss path: at least one repair shard is required.
         self.recovered_count += 1;
 
-        // Collect K shards for decode:
-        let mut received: Vec<(u16, &[u8])> = Vec::with_capacity(state.k);
-        for idx in 0..state.k {
-            if is_seen(&state.seen_mask, idx as u16) {
-                let offset = idx * state.shard_len;
-                received.push((idx as u16, &state.payload[offset..offset + state.shard_len]));
-            }
-        }
-        for (idx, shard_bytes) in &state.repair_shards {
-            if received.len() == state.k {
-                break;
-            }
-            received.push((*idx, shard_bytes.as_slice()));
-        }
+        let repair_refs: Vec<(u16, &[u8])> = state
+            .repair_shards
+            .iter()
+            .map(|(idx, d)| (*idx, d.as_slice()))
+            .collect();
 
-        let sources = rs::decode_source(state.k, state.shard_len, &received, state.scheme)?;
-        let mut object = Vec::with_capacity(state.k * state.shard_len);
-        for shard in &sources {
-            object.extend_from_slice(shard);
-        }
-        state.payload.clear();
-        state.payload.shrink_to_fit();
+        rs::reconstruct_missing_sources(
+            state.k,
+            state.shard_len,
+            &mut state.payload,
+            &state.seen_mask,
+            &repair_refs,
+            state.scheme,
+        )?;
+
+        let mut object = std::mem::take(&mut state.payload);
         state.repair_shards.clear();
         state.repair_shards.shrink_to_fit();
         object.truncate(size);
