@@ -372,16 +372,11 @@ impl FecReassembler {
             return None;
         }
         // Dedupe by index; only store what we don't have.
-        if usize::from(symbol_index) == k - 1 && k >= 2 {
-            let mut padded = symbol.data.clone();
-            padded.resize(state.shard_len, 0);
-            state.shards.entry(symbol_index).or_insert(padded);
-        } else {
-            state
-                .shards
-                .entry(symbol_index)
-                .or_insert_with(|| symbol.data.clone());
+        let mut shard_data = symbol.data.clone();
+        if shard_data.len() < state.shard_len {
+            shard_data.resize(state.shard_len, 0);
         }
+        state.shards.entry(symbol_index).or_insert(shard_data);
 
         if state.shards.len() < state.k {
             return None;
@@ -821,11 +816,16 @@ mod tests {
         let k = 5usize; // ceil(262_145 / 65_535) = 5
         let mut out = None;
         for i in 0..k {
+            let data_len = if i == k - 1 {
+                usize::try_from(object_size).unwrap() - (k - 1) * usize::from(symbol_size)
+            } else {
+                usize::from(symbol_size)
+            };
             let s = Symbol {
                 object_id: 0,
                 object_size,
                 payload_id: pack_payload_id(u16::try_from(i).unwrap(), crate::rs::SCHEME_CAUCHY),
-                data: vec![0u8; usize::from(symbol_size)],
+                data: vec![0u8; data_len],
             };
             out = out.or(re.push(u64::from(s.object_id), &s, 0, 1000));
         }
@@ -976,13 +976,13 @@ mod tests {
         let syms = enc.encode(&ct, params, 1);
         assert!(syms.len() >= 2);
 
-        // Case A: receives before deadline -> decodes successfully
+        // Case A: receives at exact deadline (inclusive) -> decodes successfully
         let mut re = FecReassembler::new(params.symbol_size, 64);
         assert_eq!(
             re.push(u64::from(syms[0].object_id), &syms[0], 100, 50),
             None
         ); // expires_at = 150
-        let res = re.push(u64::from(syms[1].object_id), &syms[1], 140, 50); // 140 <= 150 -> ok
+        let res = re.push(u64::from(syms[1].object_id), &syms[1], 150, 50); // 150 <= 150 -> ok
         assert_eq!(res.as_deref(), Some(ct.as_slice()));
 
         // Case B: receives after deadline -> fails (None) and tombstones
@@ -1037,6 +1037,33 @@ mod tests {
         let state = re.objects.get(&u64::from(syms[0].object_id)).unwrap();
         assert!(state.done, "must remain done");
         assert!(state.shards.is_empty(), "must not store shard");
+    }
+
+    #[test]
+    fn reassembler_fifo_sweep_exact_boundary() {
+        let params = FlowClass::Default.params();
+        let ct_a = vec![0x11u8; 2400]; // K=2
+        let ct_b = vec![0x22u8; 2400]; // K=2
+        let mut enc = FecEncoder::new();
+        let syms_a = enc.encode(&ct_a, params, 0);
+        let syms_b = enc.encode(&ct_b, params, 0);
+
+        let mut re = FecReassembler::new(params.symbol_size, 64);
+        // Push A shard 0 at t=100, deadline 50 -> expires at 150
+        assert_eq!(re.push(1, &syms_a[0], 100, 50), None);
+        assert_eq!(re.in_flight(), 1);
+
+        // At t=150 (exact deadline), push B shard 0: A must NOT be swept yet (now_ms > expires_at_ms is false)
+        assert_eq!(re.push(2, &syms_b[0], 150, 50), None);
+        assert_eq!(re.in_flight(), 2);
+        assert!(re.objects.contains_key(&1));
+
+        // At t=151 (past deadline), push another shard for B: A MUST now be swept
+        assert_eq!(
+            re.push(2, &syms_b[1], 151, 50).as_deref(),
+            Some(ct_b.as_slice())
+        );
+        assert!(!re.objects.contains_key(&1));
     }
 
     #[test]
@@ -1166,6 +1193,8 @@ mod tests {
             let mut enc = FecEncoder::new();
             let syms = enc.encode(&ct, params, 2); // K=1, R=2 (P+Q)
             assert_eq!(syms.len(), 3);
+            assert_eq!(parse_payload_id(&syms[1].payload_id).unwrap().0, 1);
+            assert_eq!(parse_payload_id(&syms[2].payload_id).unwrap().0, 2);
 
             // Shard 0 (source) and Shards 1, 2 (P, Q) must ALL have wire length == size (L_eff)
             for s in &syms {
@@ -1176,16 +1205,19 @@ mod tests {
             let mut re = FecReassembler::new(params.symbol_size, 64);
             let out0 = re.push(u64::from(syms[0].object_id), &syms[0], 0, 1000);
             assert_eq!(out0.as_deref(), Some(ct.as_slice()));
+            assert_eq!(re.recovered_count(), 0);
 
             // Decode from P repair shard only (erasure of source)
             let mut re_p = FecReassembler::new(params.symbol_size, 64);
             let out_p = re_p.push(u64::from(syms[1].object_id), &syms[1], 0, 1000);
             assert_eq!(out_p.as_deref(), Some(ct.as_slice()), "P shard decodes K=1");
+            assert_eq!(re_p.recovered_count(), 1);
 
             // Decode from Q repair shard only (erasure of source and P)
             let mut re_q = FecReassembler::new(params.symbol_size, 64);
             let out_q = re_q.push(u64::from(syms[2].object_id), &syms[2], 0, 1000);
             assert_eq!(out_q.as_deref(), Some(ct.as_slice()), "Q shard decodes K=1");
+            assert_eq!(re_q.recovered_count(), 1);
 
             // Wire length mismatch rejection: padded to 1200 instead of trimmed wire len
             let mut bad_s0 = syms[0].clone();

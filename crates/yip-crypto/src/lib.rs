@@ -437,12 +437,9 @@ impl Handshake {
                 Ok(buf[PQ_ENCAPS_KEY_LEN..n].to_vec())
             }
             HandshakePqRole::Initiator { dk, .. } => {
-                if msg.len() < PQ_CIPHERTEXT_LEN {
-                    return Err(CryptoError::Handshake);
-                }
-                let ct_bytes: [u8; PQ_CIPHERTEXT_LEN] = msg[..PQ_CIPHERTEXT_LEN]
-                    .try_into()
-                    .map_err(|_| CryptoError::Handshake)?;
+                let ct_slice = msg.get(..PQ_CIPHERTEXT_LEN).ok_or(CryptoError::Handshake)?;
+                let ct_bytes: [u8; PQ_CIPHERTEXT_LEN] =
+                    ct_slice.try_into().map_err(|_| CryptoError::Handshake)?;
                 let ct = PqCiphertext(ct_bytes);
                 let decaps_key = dk.take().ok_or(CryptoError::Handshake)?;
                 let ss = pq_decapsulate(&decaps_key, &ct)?;
@@ -1872,6 +1869,28 @@ mod tests {
         // Initiator decapsulates to a mismatched ss, causing snow Poly1305 MAC to fail
         let err = ini.read_message(&msg2);
         assert!(err.is_err(), "tampered ct must fail handshake verification");
+    }
+
+    #[test]
+    fn pq_handshake_read_message_rejects_truncated_message() {
+        let init_kp = generate_keypair();
+        let resp_kp = generate_keypair();
+
+        let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
+        let mut res = Handshake::responder(&resp_kp.private).unwrap();
+
+        // Initiator sends valid msg1 to responder
+        let msg1 = ini.write_message(b"certA").unwrap();
+        // Responder rejects truncated msg1
+        assert!(res.read_message(&msg1[..10]).is_err());
+
+        let _ = res.read_message(&msg1).unwrap();
+        let msg2 = res.write_message(b"certB").unwrap();
+
+        // Initiator rejects msg2 shorter than PQ_CIPHERTEXT_LEN
+        let truncated = vec![0u8; PQ_CIPHERTEXT_LEN - 1];
+        assert!(ini.read_message(&truncated).is_err());
+        assert!(ini.read_message(&msg2[..PQ_CIPHERTEXT_LEN]).is_err());
     }
 
     #[test]

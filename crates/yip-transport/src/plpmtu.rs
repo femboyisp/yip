@@ -496,4 +496,30 @@ mod tests {
         assert_eq!(ctrl.probe_interval_ms(), 1000);
         assert!(!ctrl.is_converged());
     }
+
+    #[test]
+    fn active_probe_id_tracks_probing_and_converged_states() {
+        let mut ctrl = PlpmtuController::new();
+        // Initially in Probing state with active_probe_id = 1
+        assert_eq!(ctrl.active_probe_id(), Some(1));
+
+        let (id1, _, _) = ctrl.on_tick(1000).expect("first probe");
+        assert_eq!(id1, 1);
+        assert_eq!(ctrl.active_probe_id(), Some(1));
+
+        // Acking 1 transitions to next probe (id 2)
+        assert_eq!(ctrl.on_ack(id1, 1320), Some(1320));
+        assert_eq!(ctrl.active_probe_id(), Some(2));
+
+        let (id2, _, _) = ctrl.on_tick(2000).expect("second probe");
+        assert_eq!(id2, 2);
+        assert_eq!(ctrl.on_ack(id2, 1400), Some(1400));
+        assert_eq!(ctrl.active_probe_id(), Some(3));
+
+        let (id3, _, _) = ctrl.on_tick(3000).expect("third probe");
+        assert_eq!(id3, 3);
+        assert_eq!(ctrl.on_ack(id3, 1530), Some(1530));
+        assert!(ctrl.is_converged());
+        assert_eq!(ctrl.active_probe_id(), None);
+    }
 }

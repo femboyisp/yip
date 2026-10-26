@@ -134,8 +134,7 @@ pub fn obfuscate_into(
         Some(l) => l,
         None => return false,
     };
-    let total_len = NONCE_LEN + 3 + body.len() + pad_len;
-    out.reserve(total_len);
+    out.reserve(NONCE_LEN + 3 + body.len() + pad_len);
     let nonce = random_nonce();
     out.extend_from_slice(&nonce);
     let plaintext_start = out.len();
@@ -145,18 +144,15 @@ pub fn obfuscate_into(
     out.resize(out.len() + pad_len, 0);
 
     let mut counter: u64 = 0;
-    let mut offset = plaintext_start;
-    while offset < out.len() {
+    for chunk in out[plaintext_start..].chunks_mut(8) {
         let mut h = SipHasher24::new_with_key(key);
         h.write(&nonce);
         h.write(&counter.to_be_bytes());
         let ks = h.finish().to_be_bytes();
         counter = counter.wrapping_add(1);
-        let chunk_len = (out.len() - offset).min(8);
-        for i in 0..chunk_len {
-            out[offset + i] ^= ks[i];
+        for (byte, k) in chunk.iter_mut().zip(ks) {
+            *byte ^= k;
         }
-        offset += chunk_len;
     }
     true
 }
@@ -259,11 +255,7 @@ pub fn round_to_bucket(raw_wire_len: usize, buckets: &[usize], max_budget: usize
             }
         }
     }
-    if raw_wire_len < max_budget {
-        max_budget
-    } else {
-        raw_wire_len
-    }
+    max_budget.max(raw_wire_len)
 }
 
 #[cfg(test)]

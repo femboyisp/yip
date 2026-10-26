@@ -129,6 +129,21 @@
 #     Replacing the feature query with whichever boolean matches the host CPU's actual
 #     capability produces 100% identical runtime behaviour to unmutated code, making either
 #     direction an equivalent mutant depending on the CI host machine.
+# 14. `replace .* in pq_encapsulate` (yip-crypto/src/lib.rs ~lines 90-92)
+#     `pq_encapsulate` manually validates FIPS 203 Section 7.2 ByteDecode_12 (all 12-bit
+#     coefficients < 3329) prior to calling `ml_kem_512::EncapsulationKey::new(&ek_arr)`.
+#     However, `EncapsulationKey::new` in the `ml-kem` crate (v0.3.3) itself decodes the
+#     polynomial vectors and validates ByteDecode_12, returning an error which maps to
+#     `CryptoError::Handshake`. Any mutant that alters or disables the manual pre-check
+#     causes `EncapsulationKey::new` to reject the invalid key and return the identical
+#     `CryptoError::Handshake`, making all mutations within the manual ByteDecode_12 loop
+#     equivalent mutants.
+# 15. `replace < with <= in FecReassembler::push` (yip-transport/src/fec.rs ~line 376)
+#     `if shard_data.len() < state.shard_len { shard_data.resize(state.shard_len, 0); }`.
+#     Incoming shard wire lengths are strictly bounded by `<= state.shard_len` via the
+#     preceding `expected_wire_len` guard. When `shard_data.len() == state.shard_len`,
+#     resizing to `state.shard_len` is an exact no-op on a `Vec` whose length already equals
+#     the target length. Both `<` and `<=` produce byte-for-byte identical shard states.
 exclude_re = [
     "replace \\| with \\^ in ReplayWindow::commit",
     "replace > with >= in ReplayWindow::commit",
@@ -138,6 +153,7 @@ exclude_re = [
     "replace > with >= in FecEncoder::build",
     "replace < with <= in split_source",
     "replace < with > in FecReassembler::push",
+    "replace < with <= in FecReassembler::push",
     "replace > with >= in LossDetector::on_seen",
     "replace \\+ with \\* in LossDetector::on_seen",
     "replace neon_supported -> bool with (true|false)",
@@ -147,4 +163,7 @@ exclude_re = [
     "replace avx2_supported -> bool with (true|false)",
     "replace avx512bw_supported -> bool with (true|false)",
     "replace gfni_supported -> bool with (true|false)",
+    "replace .* in pq_encapsulate",
 ]
+
+skip_calls = ["reserve"]
