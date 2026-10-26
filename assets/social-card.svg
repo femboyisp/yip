@@ -45,7 +45,7 @@
   <g id="mini-graph" transform="translate(80, 345)">
     <rect width="1120" height="225" rx="12" fill="#0d1117" stroke="#30363d" stroke-width="1.2" />
     <text x="24" y="32" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="14" font-weight="700" fill="#f0f6fc">Throughput Under Network Packet Loss (AWS us-east-1 ↔ us-west-2, 60ms RTT)</text>
-    <text x="1096" y="32" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" font-weight="700" fill="#fb923c" text-anchor="end">33× to 98× Higher Goodput at 3%–10% Loss</text>
+    <text x="1096" y="32" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" font-weight="700" fill="#fb923c" text-anchor="end">23× to 138× Higher Goodput at 3%–10% Loss</text>
     <line x1="80" y1="190" x2="900" y2="190" stroke="#21262d" stroke-width="1" />
     <text x="60" y="194" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#6e7681" text-anchor="end">0</text>
     <line x1="80" y1="60" x2="900" y2="60" stroke="#21262d" stroke-width="1" stroke-dasharray="3,3" />
@@ -53,8 +53,8 @@
     <polygon points="80,190 80,65 280,75 490,85 700,105 900,140 900,190" fill="url(#plot-fill)" />
     <polyline points="80,55 280,120 490,180 700,186 900,190" fill="none" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
     <polyline points="80,65 280,75 490,85 700,105 900,140" fill="none" stroke="#f97316" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" />
-    <text x="918" y="144" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" font-weight="700" fill="#f97316">yip (16.6 Mbit/s)</text>
-    <text x="918" y="194" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" font-weight="600" fill="#38bdf8">WireGuard (0.5 Mbit/s)</text>
+    <text x="918" y="144" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" font-weight="700" fill="#f97316">yip (14.0 Mbit/s)</text>
+    <text x="918" y="194" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" font-weight="600" fill="#38bdf8">WireGuard (0.6 Mbit/s)</text>
     <text x="80" y="208" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#8b949e" text-anchor="middle">0% Loss</text>
     <text x="280" y="208" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#8b949e" text-anchor="middle">1%</text>
     <text x="490" y="208" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#8b949e" text-anchor="middle">3%</text>

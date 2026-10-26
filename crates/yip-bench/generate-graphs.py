@@ -38,6 +38,10 @@ COLOR_OPENVPN = "#a855f7"      # Purple
 COLOR_IO_URING = "#34d399"     # Emerald Green
 COLOR_BASELINE = "#64748b"     # Slate Gray
 
+DEFAULT_WAN_HISTORY = Path(__file__).resolve().parent / "wan" / "results" / "history.csv"
+DEFAULT_SHARDING_SCALE = Path(__file__).resolve().parent / "results" / "sharding-scale.csv"
+DEFAULT_LATENCY_JITTER = Path(__file__).resolve().parent / "results" / "latency-jitter.csv"
+
 
 class SvgCanvas:
     def __init__(self, width: int = 840, height: int = 480):
@@ -295,11 +299,13 @@ def parse_latency_jitter(path: Path):
     }
 
 
-def generate_throughput_loss_chart(data: dict) -> str:
+def generate_throughput_loss_chart(data: dict | None = None) -> str:
     """
     Generates assets/bench-throughput-loss.svg
     Logarithmic scale for TCP Goodput (Mbit/s).
     """
+    if data is None:
+        data = parse_wan_history(DEFAULT_WAN_HISTORY)
     canvas = SvgCanvas(width=840, height=480)
 
     # Header
@@ -481,11 +487,13 @@ def generate_throughput_loss_chart(data: dict) -> str:
     return canvas.render()
 
 
-def generate_fec_recovery_chart(data: dict) -> str:
+def generate_fec_recovery_chart(data: dict | None = None) -> str:
     """
     Generates assets/bench-fec-recovery.svg
     Linear scale for Effective Packet Loss % (0% to 15%).
     """
+    if data is None:
+        data = parse_wan_history(DEFAULT_WAN_HISTORY)
     canvas = SvgCanvas(width=840, height=480)
 
     # Header
@@ -631,11 +639,13 @@ def generate_fec_recovery_chart(data: dict) -> str:
     return canvas.render()
 
 
-def generate_multicore_scaling_chart(data: dict) -> str:
+def generate_multicore_scaling_chart(data: dict | None = None) -> str:
     """
     Generates assets/bench-multicore-scaling.svg
     Linear scale for Multi-Stream TCP Throughput (Gbps).
     """
+    if data is None:
+        data = parse_sharding_scale(DEFAULT_SHARDING_SCALE)
     canvas = SvgCanvas(width=840, height=480)
 
     # Header
@@ -770,12 +780,14 @@ def generate_multicore_scaling_chart(data: dict) -> str:
     return canvas.render()
 
 
-def generate_bench_latency_jitter(data: dict) -> str:
+def generate_bench_latency_jitter(data: dict | None = None) -> str:
     """
     Generates assets/bench-latency-jitter.svg
     Linear scale for Round-Trip P99 Tail Latency (0 to 240 ms) across packet loss (0% to 10%).
     Visualizes RS-FEC head-of-line blocking elimination vs ARQ retransmission timeouts.
     """
+    if data is None:
+        data = parse_latency_jitter(DEFAULT_LATENCY_JITTER)
     canvas = SvgCanvas(width=840, height=480)
 
     # Header
