@@ -5,7 +5,7 @@
 # 🦊 yip
 
 **Low-latency P2P mesh VPN in Rust.**<br/>
-*Reed-Solomon FEC loss immunity • 40 Gbps AF_XDP multi-core scaling • NAT traversal • Self-certifying routing • Anti-DPI TLS mimicry*
+*Reed-Solomon FEC loss immunity • 40 Gbps AF_XDP multi-core scaling • NAT traversal • Zero-trust CA mesh • Anti-DPI TLS mimicry*
 
 <p align="center">
   <a href="https://github.com/femboyisp/yip/actions/workflows/ci.yml"><img src="https://github.com/femboyisp/yip/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
@@ -13,6 +13,10 @@
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.85%2B-orange.svg" alt="Rust 1.85+" /></a>
   <a href="docs/01-getting-started.md"><img src="https://img.shields.io/badge/platform-linux-lightgrey.svg" alt="Platform: Linux" /></a>
   <a href="bin/yipd/tests/run-multi-dpi-oracle.sh"><img src="https://img.shields.io/badge/dpi%20oracle-4%20engines%20clean-brightgreen.svg" alt="DPI Oracle" /></a>
+</p>
+
+<p align="center">
+  <img src="assets/terminal-telemetry.gif" width="100%" alt="yipctl top: live multi-transport mesh telemetry dashboard" />
 </p>
 
 </div>
@@ -29,6 +33,63 @@ Under the hood, yip pairs proactive loss recovery with 40 Gbps AF_XDP zero-copy 
 
 > [!NOTE]
 > yip builds an encrypted peer-to-peer overlay, not an anonymizing mix-net like Tor. Connected peers authenticate each other directly and see each other's physical IP addresses.
+
+---
+
+<a id="why-yip"></a>
+## Why yip Exists: The Problem with Traditional VPNs
+
+Every modern tunnel protocol (WireGuard, OpenVPN, IPsec) operates on a fatal assumption: the underlying transport network delivers packets reliably. On clean local fiber or controlled datacenter cross-connects, that assumption holds. WireGuard achieves stellar throughput with minimal CPU overhead.
+
+The open internet is not a clean datacenter cross-connect. When you transmit across long-haul continental WANs, congested public Wi-Fi, cellular networks, or international boundaries, packet loss is an inescapable reality.
+
+When an underlying network drops packets, standard VPNs pass that loss straight up the protocol stack. For TCP connections, this triggers catastrophic congestion control backoff. Mathis' formula models this throughput limit:
+
+$$T \le \frac{MSS}{RTT} \times \frac{C}{\sqrt{p}}$$
+
+Because throughput is inversely proportional to the square root of packet loss probability ($p$), even a modest 1% to 3% packet loss rate forces TCP into severe window throttling, slashing effective throughput by 90% to 99%. On a 100 Mbit/s link with 60ms round-trip time, injecting just 3% packet loss can plummet transfer speeds from 95 Mbit/s down to under 10 Mbit/s. At 10% packet loss, connections stall completely.
+
+**yip's answer is proactive in-flight repair.** Instead of waiting for timeout expirations and reactive retransmissions, yip computes Cauchy Reed-Solomon erasure coding over Galois Field $GF(2^8)$ directly in the datapath. For every block of data packets, yip generates dynamic mathematical parity packets in-flight. When transit networks drop intermediate packets, yip reconstructs the missing symbols on the fly before kernel TCP stacks or user applications ever detect a gap. The result is sustained throughput and predictable latency across lossy links.
+
+---
+
+## Comprehensive 6-Pillar Feature Showcase
+
+### 1. Galois Field Proactive FEC
+- **Systematic Cauchy RS + RLNC Streaming**: In-flight erasure coding over $GF(2^8)$ pairs Cauchy Reed-Solomon block codes with Random Linear Network Coding (RLNC) streaming fountain codes.
+- **Poly-Vector SIMD Acceleration**: Hardware-accelerated matrix multiplication across AVX-512BW, Intel GFNI, AVX2, SSSE3, ARM NEON, and WebAssembly SIMD128.
+- **Adaptive Repair Scaling**: Real-time sliding window telemetry dynamically adjusts repair symbol overhead based on observed channel loss, eliminating goodput waste on clean links.
+
+### 2. Zero-Trust PKI & Decentralized Mesh Membership
+- **Cryptographic Authority (`yip-ca`)**: Offline or operator-governed root-of-trust issuing signed node membership certificates (`Cert`).
+- **Signed RootSets & Epidemic Gossip**: Node identity, authorized endpoints, and routing capabilities propagate across nodes using anti-entropy gossip protocol records (`Record`) with cryptographic signature validation.
+- **TAI64N Anti-Replay Freshness Gating**: Sub-nanosecond monotonic timestamps enforce strict certificate freshness and reject stale or replayed topology announcements.
+
+### 3. Kernel-Bypass Performance
+- **Zero-Copy AF_XDP (XSK)**: Direct UMEM memory ring driver bypasses the Linux network stack, sustaining 40.27 Gbps and 3.93 Mpps across 8 CPU cores.
+- **Asynchronous `io_uring`**: High-performance multishot ring polling drives high packet rates without thread contention or syscall overhead.
+- **Multi-Queue TUN Sharding**: `IFF_MULTI_QUEUE` worker isolation maps packet flows to dedicated CPU cores via lock-free SPSC ring buffers.
+- **Vectorized Socket I/O**: Batched `recvmmsg` and `sendmmsg` with `UDP_SEGMENT` Generic Segmentation Offload (GSO) optimize standard POSIX network paths.
+
+### 4. Post-Quantum Cryptography & Identity
+- **Single-RTT Hybrid Handshake**: Blends Noise_IKpsk2 (Curve25519) with NIST FIPS 203 ML-KEM-512 (Kyber) within compact datagrams strictly under the 1200-byte internet MTU floor.
+- **120-Second Epoch Ratcheting**: Automated forward-secrecy key rotation with a 20-second dual-receive grace window prevents dropped packets during rekey transitions.
+- **Rigorous Memory Hygiene**: Cryptographic secrets implement explicit `Zeroize` traits to purge private key material from memory buffers immediately upon drop.
+- **Self-Certifying IPv6 Addressing**: Cryptographic BLAKE2s-120 hashing derives immutable, anti-spoofing overlay addresses in the `fd00::/8` ULA space directly from node public keys.
+
+### 5. 4-Mode Anti-DPI Armor
+- **`raw-obf`**: SipHash-CTR keystream masking with a 64-bit SipHash-1-3 coverage authentication tag strips all fixed wire headers, leaving uniform high-entropy payload noise.
+- **`quic` Masquerade**: Encapsulates tunnel traffic inside standard RFC 9221 HTTP/3 datagrams indistinguishable from ordinary web media traffic.
+- **`tls` Emulation**: Authentic TLS 1.3 framing paired with uTLS Google Chrome ClientHello fingerprints evades SNI inspection and protocol whitelisting.
+- **`relay` (REALITY)**: Advanced certificate borrowing and transparent TCP splicing forward unauthorized probes to authentic upstream target servers.
+- **DAITA Cover Defense**: Discrete packet-length bucketing and randomized decoy traffic defeat statistical packet-size analysis and website fingerprinting.
+- **4-Engine DPI Oracle Verified**: Continuously tested and verified clean against nDPI, Zeek, Suricata, and Wireshark inspection rules.
+
+### 6. NAT Traversal & Blind Relays
+- **STUN UDP Hole-Punching**: Embedded STUN resolver discovers public reflexive mappings and classifies symmetric, full-cone, and port-restricted NAT topologies.
+- **Zero-Knowledge Blind Relays**: Untrusted rendezvous nodes (`yip-rendezvous`) relay encrypted envelopes without possessing decryption keys or inspecting packet contents.
+- **Seamless Roaming**: Cryptographic session binding automatically maintains connection state when roaming between Wi-Fi, Ethernet, and cellular interfaces.
+- **Headless Daemon Control**: Full management and real-time observability over a protected UNIX domain control socket using the `yipctl` command-line utility.
 
 ---
 
@@ -73,14 +134,14 @@ Direct UDP tunnel between two publicly addressable nodes with Cauchy RS-FEC:
 
 ```toml
 # /etc/yip/yipd.conf (Host A: 198.51.100.1)
-local_private = e81d76326087b220d3f237ef39aa4d91361ff55b7661005a7657d23d8c117d4a
-local_public  = 7df4d68205f03a2cae7e1713444fcda80ff43a29de7e9b0b4b2c159286d9a11a
+local_private = dd152fc311a115549005da852d101a7d3a14594c728f71ff87aa0872da6c0fa9
+local_public  = bf923deeaddb66dde39e99987abdfd789c54eb882a570c340cd338071727ceeb
 listen        = 0.0.0.0:443
 device        = yip0
 
 # Remote peer: Host B (203.0.113.2)
 [peer]
-public_key    = 9b49ffeb4566b53a0f78cae08920bc9e30a6e0c60f252cfdf4740e74f8c92b21
+public_key    = 1f5b6b76d9723a79221777a7450522c32faa7300efd59b0a5efa42665cac0a0a
 endpoint      = 203.0.113.2:443
 ```
 
@@ -90,15 +151,15 @@ Node behind NAT discovering and coordinating through an intermediate rendezvous 
 
 ```toml
 # /etc/yip/yipd.conf (Node A behind CGNAT)
-local_private = 1111111111111111111111111111111111111111111111111111111111111111
-local_public  = 2222222222222222222222222222222222222222222222222222222222222222
+local_private = 2f2b5880cc15f29f826e876f5396c6f418e2366b73b415c5441f152b23c0334d
+local_public  = 4cbc48cf095389d829abf3c7d78747ca35c96483375bd73860b2ebba94c99d50
 listen        = 0.0.0.0:443
 device        = yip0
-rendezvous    = 198.51.100.5:51821
+rendezvous    = 198.51.100.5:443
 
 # Remote peer: Node B (endpoint resolved dynamically via rendezvous)
 [peer]
-public_key    = 3333333333333333333333333333333333333333333333333333333333333333
+public_key    = 6ed3f82ba6450cd14ec52509deb42a87c6a8d2fa91a5a145f2ddcfdb0d675d12
 ```
 
 ---
@@ -149,6 +210,7 @@ Full methodology and reproducible test harnesses are documented in [`crates/yip-
 | [`04. Security & Threat Model`](docs/04-security-and-threat-model.md) | Post-quantum hybrid handshake, zero-fixed-signature wire format, and anti-DPI test oracle defenses |
 | [`05. Benchmarks & Performance`](docs/05-benchmarking-and-performance.md) | Real-world WAN test data, multi-core scaling charts, loss-recovery mathematical proofs, and kernel tuning |
 | [`06. Troubleshooting Runbook`](docs/06-troubleshooting.md) | Step-by-step diagnostic workflows, MTU discovery issues, NAT traversal debugging, and telemetry inspection |
+| [`Motivation & Philosophy`](docs/motivation.md) | Design philosophy, anti-censorship regulatory context, and the problem with traditional VPNs |
 
 ---
 
