@@ -865,6 +865,10 @@ mod tests {
             re.push(u64::from(syms[1].object_id), &syms[1], 0, 1000),
             None
         );
+        assert_eq!(
+            re.push(u64::from(syms[1].object_id), &syms[1], 0, 1000),
+            None
+        );
         let out = re.push(u64::from(syms[2].object_id), &syms[2], 0, 1000);
         assert_eq!(out.as_deref(), Some(ct.as_slice()));
     }
@@ -1627,6 +1631,7 @@ mod tests {
             table.insert(k, dummy());
         }
         assert_eq!(table.len(), 64);
+        assert!(!table.is_empty());
 
         // Remove even keys: 100, 102, ...
         for k in (100..164u64).step_by(2) {
@@ -1653,5 +1658,25 @@ mod tests {
             table.insert(k, dummy());
         }
         assert_eq!(table.len(), 64);
+    }
+
+    #[test]
+    fn test_is_seen_and_mark_seen_bounds() {
+        let mut mask = [0u64; 4];
+        assert!(!is_seen(&mask, 0));
+        assert!(!is_seen(&mask, 1));
+        assert!(!is_seen(&mask, 255));
+        assert!(!is_seen(&mask, 256));
+
+        mark_seen(&mut mask, 1);
+        assert!(!is_seen(&mask, 0));
+        assert!(is_seen(&mask, 1));
+
+        mark_seen(&mut mask, 255);
+        assert!(is_seen(&mask, 255));
+
+        // 256 must be ignored safely without panic or out of bounds
+        mark_seen(&mut mask, 256);
+        assert!(!is_seen(&mask, 256));
     }
 }
