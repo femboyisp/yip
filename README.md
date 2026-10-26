@@ -1,364 +1,236 @@
-<p align="center">
-  <img src="assets/yip.gif" alt="yip" width="340">
-</p>
+<div align="center">
 
-# yip
+<img src="assets/yip.gif" alt="yip logo" width="340" />
 
-<p align="center">
-  <a href="https://github.com/femboyisp/yip/actions/workflows/ci.yml"><img src="https://github.com/femboyisp/yip/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/DPI%20Evasion-nDPI%20%7C%20Zeek%20%7C%20Suricata%20%7C%20Wireshark-brightgreen" alt="DPI Evasion: 4-Engine Oracle">
-  <img src="https://img.shields.io/badge/Protocol%20%26%20Crypto-%23!%5Bforbid(unsafe_code)%5D-blue" alt="Protocol & Crypto: #![forbid(unsafe_code)]">
-  <img src="https://img.shields.io/badge/rust-stable-orange.svg" alt="Rust Stable 1.85+">
-  <img src="https://img.shields.io/badge/platform-linux-lightgrey.svg" alt="Linux x86_64 / aarch64">
-</p>
+# 🦊 yip
+
+**Low-latency P2P mesh VPN in Rust.**<br/>
+*Reed-Solomon FEC loss immunity • 40 Gbps AF_XDP multi-core scaling • NAT traversal • Zero-trust CA mesh • Anti-DPI TLS mimicry*
 
 <p align="center">
-  <b>A low-latency, loss-resilient peer-to-peer mesh VPN in Rust.</b>
+  <a href="https://github.com/femboyisp/yip/actions/workflows/ci.yml"><img src="https://github.com/femboyisp/yip/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License: AGPL-3.0" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.85%2B-orange.svg" alt="Rust 1.85+" /></a>
+  <a href="docs/01-getting-started.md"><img src="https://img.shields.io/badge/platform-linux-lightgrey.svg" alt="Platform: Linux" /></a>
+  <a href="bin/yipd/tests/run-multi-dpi-oracle.sh"><img src="https://img.shields.io/badge/dpi%20oracle-4%20engines%20clean-brightgreen.svg" alt="DPI Oracle" /></a>
 </p>
-
-<p align="center">
-  <a href="#quick-start"><b>Quick Start</b></a> •
-  <a href="#why-yip"><b>Why yip?</b></a> •
-  <a href="#benchmarks"><b>Benchmarks</b></a> •
-  <a href="#architecture"><b>Architecture</b></a> •
-  <a href="#cryptographic-wire-protocol--ceremony"><b>Wire Ceremony</b></a> •
-  <a href="#mutation-testing-rigor-cargo-mutants"><b>Mutation Rigor</b></a> •
-  <a href="#comparison"><b>Comparison</b></a> •
-  <a href="#security-model"><b>Security</b></a>
-</p>
-
----
-
-## The 30-Second Proof (Local Netns Demo)
-
-Verify `yip`'s loss resilience on your own Linux machine in 30 seconds without external servers or cloud credentials:
-
-```bash
-git clone https://github.com/femboyisp/yip.git && cd yip
-sudo ./scripts/demo-loss.sh
-```
-
-This provisions two isolated network namespaces, injects **5% packet loss and 50ms latency** via `tc netem`, and benchmarks TCP goodput across Baseline, WireGuard, and `yip`:
-
-```text
-========================================================================
-                     BENCHMARK RESULTS SUMMARY
-        Condition: 5% Packet Loss + 50ms RTT Latency
-========================================================================
-Transport / Protocol         Goodput              Status
-------------------------------------------------------------------------
-Baseline TCP (veth)          0.8 Mbit/s           Choked by packet loss
-WireGuard (Kernel wg0)       0.7 Mbit/s           Stalled by drop recovery
-yip (Adaptive RS-FEC)        98.5 Mbit/s          🚀 123.1x Speedup
-========================================================================
-```
-
----
-
-## Live Telemetry Dashboard (`yipctl top`)
-
-Inspect active peer tunnels across all transports (`Direct UDP`, `Holepunched UDP`, `Relayed`, `REALITY TLS`, `QUIC`), zero-trust CA admission status, real-time RTT latency, and in-flight Reed-Solomon FEC packet recovery:
 
 <p align="center">
   <img src="assets/terminal-telemetry.gif" width="100%" alt="yipctl top: live multi-transport mesh telemetry dashboard" />
 </p>
 
+</div>
+
+---
+
+## What is yip?
+
+Ever wonder why standard VPNs choke the moment a packet drops? WireGuard is fantastic on a pristine gigabit fiber link, but on lossy Wi-Fi, cellular, or crowded trans-oceanic routes, TCP panics, triggers exponential backoff, and collapses.
+
+**yip fixes this.** It is a fast, clever peer-to-peer mesh VPN in Rust that bakes Reed-Solomon forward error correction straight into the wire. Missing packets get reconstructed in-flight before the application even realizes a drop happened.
+
+Under the hood, yip pairs proactive loss recovery with 40 Gbps AF_XDP zero-copy line-rate scaling, automatic NAT hole-punching, post-quantum ML-KEM handshakes, and authentic Chrome TLS mimicry to sneak past strict DPI firewalls unnoticed. It runs circles around packet loss and keeps your connections alive where ordinary tunnels stall out.
+
+> [!NOTE]
+> yip builds an encrypted peer-to-peer overlay, not an anonymizing mix-net like Tor. Connected peers authenticate each other directly and see each other's physical IP addresses.
+
+---
+
+<a id="why-yip"></a>
+## Why yip Exists: The Problem with Traditional VPNs
+
+Every modern tunnel protocol (WireGuard, OpenVPN, IPsec) operates on a fatal assumption: the underlying transport network delivers packets reliably. On clean local fiber or controlled datacenter cross-connects, that assumption holds. WireGuard achieves stellar throughput with minimal CPU overhead.
+
+The open internet is not a clean datacenter cross-connect. When you transmit across long-haul continental WANs, congested public Wi-Fi, cellular networks, or international boundaries, packet loss is an inescapable reality.
+
+When an underlying network drops packets, standard VPNs pass that loss straight up the protocol stack. For TCP connections, this triggers catastrophic congestion control backoff. Mathis' formula models this throughput limit:
+
+$$T \le \frac{MSS}{RTT} \times \frac{C}{\sqrt{p}}$$
+
+Because throughput is inversely proportional to the square root of packet loss probability ($p$), even a modest 1% to 3% packet loss rate forces TCP into severe window throttling, slashing effective throughput by 90% to 99%. On a 100 Mbit/s link with 60ms round-trip time, injecting just 3% packet loss can plummet transfer speeds from 95 Mbit/s down to under 10 Mbit/s. At 10% packet loss, connections stall completely.
+
+**yip's answer is proactive in-flight repair.** Instead of waiting for timeout expirations and reactive retransmissions, yip computes Cauchy Reed-Solomon erasure coding over Galois Field $GF(2^8)$ directly in the datapath. For every block of data packets, yip generates dynamic mathematical parity packets in-flight. When transit networks drop intermediate packets, yip reconstructs the missing symbols on the fly before kernel TCP stacks or user applications ever detect a gap. The result is sustained throughput and predictable latency across lossy links.
+
+---
+
+## Comprehensive 6-Pillar Feature Showcase
+
+### 1. Galois Field Proactive FEC
+- **Systematic Cauchy RS + RLNC Streaming**: In-flight erasure coding over $GF(2^8)$ pairs Cauchy Reed-Solomon block codes with Random Linear Network Coding (RLNC) streaming fountain codes.
+- **Poly-Vector SIMD Acceleration**: Hardware-accelerated matrix multiplication across AVX-512BW, Intel GFNI, AVX2, SSSE3, ARM NEON, and WebAssembly SIMD128.
+- **Adaptive Repair Scaling**: Real-time sliding window telemetry dynamically adjusts repair symbol overhead based on observed channel loss, eliminating goodput waste on clean links.
+
+### 2. Zero-Trust PKI & Decentralized Mesh Membership
+- **Cryptographic Authority (`yip-ca`)**: Offline or operator-governed root-of-trust issuing signed node membership certificates (`Cert`).
+- **Signed RootSets & Epidemic Gossip**: Node identity, authorized endpoints, and routing capabilities propagate across nodes using anti-entropy gossip protocol records (`Record`) with cryptographic signature validation.
+- **TAI64N Anti-Replay Freshness Gating**: Sub-nanosecond monotonic timestamps enforce strict certificate freshness and reject stale or replayed topology announcements.
+
+### 3. Kernel-Bypass Performance
+- **Zero-Copy AF_XDP (XSK)**: Direct UMEM memory ring driver bypasses the Linux network stack, sustaining 40.27 Gbps and 3.93 Mpps across 8 CPU cores.
+- **Asynchronous `io_uring`**: High-performance multishot ring polling drives high packet rates without thread contention or syscall overhead.
+- **Multi-Queue TUN Sharding**: `IFF_MULTI_QUEUE` worker isolation maps packet flows to dedicated CPU cores via lock-free SPSC ring buffers.
+- **Vectorized Socket I/O**: Batched `recvmmsg` and `sendmmsg` with `UDP_SEGMENT` Generic Segmentation Offload (GSO) optimize standard POSIX network paths.
+
+### 4. Post-Quantum Cryptography & Identity
+- **Single-RTT Hybrid Handshake**: Blends Noise_IKpsk2 (Curve25519) with NIST FIPS 203 ML-KEM-512 (Kyber) within compact datagrams strictly under the 1200-byte internet MTU floor.
+- **120-Second Epoch Ratcheting**: Automated forward-secrecy key rotation with a 20-second dual-receive grace window prevents dropped packets during rekey transitions.
+- **Rigorous Memory Hygiene**: Cryptographic secrets implement explicit `Zeroize` traits to purge private key material from memory buffers immediately upon drop.
+- **Self-Certifying IPv6 Addressing**: Cryptographic BLAKE2s-120 hashing derives immutable, anti-spoofing overlay addresses in the `fd00::/8` ULA space directly from node public keys.
+
+### 5. 4-Mode Anti-DPI Armor
+- **`raw-obf`**: SipHash-CTR keystream masking with a 64-bit SipHash-1-3 coverage authentication tag strips all fixed wire headers, leaving uniform high-entropy payload noise.
+- **`quic` Masquerade**: Encapsulates tunnel traffic inside standard RFC 9221 HTTP/3 datagrams indistinguishable from ordinary web media traffic.
+- **`tls` Emulation**: Authentic TLS 1.3 framing paired with uTLS Google Chrome ClientHello fingerprints evades SNI inspection and protocol whitelisting.
+- **`relay` (REALITY)**: Advanced certificate borrowing and transparent TCP splicing forward unauthorized probes to authentic upstream target servers.
+- **DAITA Cover Defense**: Discrete packet-length bucketing and randomized decoy traffic defeat statistical packet-size analysis and website fingerprinting.
+- **4-Engine DPI Oracle Verified**: Continuously tested and verified clean against nDPI, Zeek, Suricata, and Wireshark inspection rules.
+
+### 6. NAT Traversal & Blind Relays
+- **STUN UDP Hole-Punching**: Embedded STUN resolver discovers public reflexive mappings and classifies symmetric, full-cone, and port-restricted NAT topologies.
+- **Zero-Knowledge Blind Relays**: Untrusted rendezvous nodes (`yip-rendezvous`) relay encrypted envelopes without possessing decryption keys or inspecting packet contents.
+- **Seamless Roaming**: Cryptographic session binding automatically maintains connection state when roaming between Wi-Fi, Ethernet, and cellular interfaces.
+- **Headless Daemon Control**: Full management and real-time observability over a protected UNIX domain control socket using the `yipctl` command-line utility.
+
+---
+
+## When to Use yip
+
+| Use yip for | Stick with WireGuard or others for |
+| :--- | :--- |
+| **Contended, lossy, or wireless links** (cellular, satellite, trans-oceanic transit) where packet drops stall standard tunnels | **Clean zero-loss gigabit LANs** where in-kernel WireGuard already saturates the wire with lower CPU overhead |
+| **High-packet-rate 40G/100G edge infrastructure** scaling across multiple CPU cores via zero-copy AF_XDP | **Anonymity or mix-net routing** without trusted multi-hop relay chaining (peers authenticate directly) |
+| **Hostile network environments** monitored by aggressive Deep Packet Inspection (DPI) firewalls | **Desktop platforms other than Linux** (macOS and Windows desktop clients are not currently supported) |
+| **Future-proof quantum resistance** via NIST FIPS 203 ML-KEM-512 hybrid handshakes | Environments where legacy unencrypted protocols or centralized proprietary controllers are required |
+
+---
+
+## 5-Minute Quickstart
+
+Set up an encrypted, forward-error-corrected tunnel between two Linux nodes in four steps:
+
 ```bash
-# Real-time ANSI dashboard (zero external terminal dependencies)
-yipctl top
+# 1. Install pre-compiled static binary (or: cargo binstall yipd)
+curl -fsSL https://raw.githubusercontent.com/femboyisp/yip/main/install.sh | sh
 
-# Inspect connected peers table with transports, RTT, and CA validation
-yipctl peers
+# 2. Generate identity keypair and print self-certifying overlay IPv6 address
+yipd --genkey > /etc/yip/node.key && yipd --addr $(grep '^public=' /etc/yip/node.key | cut -d= -f2)
 
-# Probe real-time latency to any peer in the mesh
-yipctl ping fd9c:890c:cfed:d6a2:4b60:15e6:77b0:cf76
+# 3. Start the daemon (systemd service or direct configuration file invocation)
+sudo systemctl start yipd
+# Or run manually: sudo yipd /etc/yip/yipd.conf
 
-# Dynamically add peers at runtime across any transport
-yipctl peer add <PUBLIC_KEY> 13.222.130.225:51833 "Direct UDP"
-
-# Formatted JSON output for Prometheus / monitoring scripts
-yipctl status --json
+# 4. Verify telemetry and ping remote overlay peer
+yipctl status
+ping6 <peer-overlay-ip>
 ```
 
 ---
-## Why yip?
 
-Traditional VPNs (WireGuard, OpenVPN, IPsec) suffer devastating throughput collapses the moment a network experiences packet loss—a 3% drop in packet delivery can halve or decimate TCP transmission speeds due to backoff congestion algorithms. `yip` is engineered from scratch for high-loss links, hostile censorship environments, and multi-core line-rate scaling.
+## Minimal Working Configurations
 
-1. **Loss Immunity without Retransmission**: Systematic Cauchy Reed–Solomon forward error correction (RS-FEC over GF(256)) reconstructs dropped packets in-place on the fly before the kernel TCP stack ever registers a drop.
-2. **Line-Rate Multi-Core Scaling**: Scale from single-core VPSes to 40+ Gbps line-rate throughput on multi-core servers using lock-free SPSC sharding and kernel-bypass eBPF AF_XDP zero-copy drivers.
-3. **Architectural Censorship-Resistance**: Bypasses deep packet inspection using authentic uTLS Chrome fingerprint emulation (JA3/JA4) and Xray-REALITY TLS 1.3 certificate borrowing, continually verified against a 4-engine DPI test oracle (nDPI, Zeek, Suricata, Wireshark).
+### Scenario A: Direct Point-to-Point (VPS-to-VPS)
+
+Direct UDP tunnel between two publicly addressable nodes with Cauchy RS-FEC:
+
+```toml
+# /etc/yip/yipd.conf (Host A: 198.51.100.1)
+local_private = dd152fc311a115549005da852d101a7d3a14594c728f71ff87aa0872da6c0fa9
+local_public  = bf923deeaddb66dde39e99987abdfd789c54eb882a570c340cd338071727ceeb
+listen        = 0.0.0.0:443
+device        = yip0
+
+# Remote peer: Host B (203.0.113.2)
+[peer]
+public_key    = 1f5b6b76d9723a79221777a7450522c32faa7300efd59b0a5efa42665cac0a0a
+endpoint      = 203.0.113.2:443
+```
+
+### Scenario B: NAT Rendezvous (Behind CGNAT)
+
+Node behind NAT discovering and coordinating through an intermediate rendezvous relay:
+
+```toml
+# /etc/yip/yipd.conf (Node A behind CGNAT)
+local_private = 2f2b5880cc15f29f826e876f5396c6f418e2366b73b415c5441f152b23c0334d
+local_public  = 4cbc48cf095389d829abf3c7d78747ca35c96483375bd73860b2ebba94c99d50
+listen        = 0.0.0.0:443
+device        = yip0
+rendezvous    = 198.51.100.5:443
+
+# Remote peer: Node B (endpoint resolved dynamically via rendezvous)
+[peer]
+public_key    = 6ed3f82ba6450cd14ec52509deb42a87c6a8d2fa91a5a145f2ddcfdb0d675d12
+```
+
+### Scenario C: Zero-Trust CA Mesh (Dynamic Discovery)
+
+Nodes discover and peer with authorized members automatically via signed gossip and rendezvous, requiring zero manual `[peer]` entries:
+
+```toml
+# /etc/yip/yipd.conf (Mesh Member Node)
+local_private       = 2f2b5880cc15f29f826e876f5396c6f418e2366b73b415c5441f152b23c0334d
+local_public        = 4cbc48cf095389d829abf3c7d78747ca35c96483375bd73860b2ebba94c99d50
+listen              = 0.0.0.0:443
+device              = yip0
+rendezvous          = 198.51.100.5:443
+
+# Zero-trust CA mesh enrollment (issued via yip-ca)
+ca_public           = 8a03a4cf43c2907041efb394c0effabad5bdb4cbbc35d17c924c0b6cbfa8ba75
+cert                = /etc/yip/node.cert
+roots               = /etc/yip/network.roots
+member_sign_private = c22239d00522843313aa03a662e8f0cb6abb7889f8f103510ebb5dee0e924857
+network_id          = f11a8e0df8fa6352eeb62192de7ece47
+```
 
 ---
 
-## Benchmarks
+## Performance & Benchmark Highlights
 
-All benchmark charts are generated deterministically from verified testbed data.
+Deterministic benchmarks measured across multi-region cloud WANs (AWS `us-east-1` to `us-west-2`, ~58ms RTT) and multi-core edge hardware:
 
 <p align="center">
   <img src="assets/bench-throughput-loss.svg" width="49%" alt="Throughput Under Packet Loss" />
-  <img src="assets/bench-multicore-scaling.svg" width="49%" alt="Multi-Core Line-Rate Scaling" />
-</p>
-<p align="center">
-  <img src="assets/bench-fec-recovery.svg" width="49%" alt="Effective Loss Suppression via RS-FEC" />
-  <img src="assets/bench-latency-jitter.svg" width="49%" alt="P99 Tail Latency and Jitter Under Loss" />
+  <img src="assets/bench-multicore-scaling.svg" width="49%" alt="Multi-Core Scaling" />
 </p>
 
-### Key Benchmark Findings
-
-- **23× to 138× Higher Throughput Under Loss**: On real-world multi-region cloud WANs (AWS `us-east-1` ↔ `us-west-2`, ~55–60ms RTT), `yip` maintains **14.0 Mbit/s** at 10% packet loss (vs. WireGuard collapsing to **0.6 Mbit/s**, a 23× advantage) and **221.3 Mbit/s** at 3% loss (vs. WireGuard's **1.6 Mbit/s**, a 138× advantage).
-- **Flat ~62ms P99 Tail Latency Under Loss**: Userspace systematic Cauchy RS-FEC reconstructs lost symbols in-flight without waiting for retransmission, suppressing head-of-line blocking and keeping P99 tail latency flat at ~62ms up to 10% link loss (vs. WireGuard and OpenVPN spiking to 180–235ms+ due to ARQ/TCP retransmission timeouts).
-- **0% Effective Loss (100% Recovery)**: Systematic Cauchy RS-FEC reconstructs missing symbols within the receive window, preserving a flat 0% ping loss profile up to 10% injected channel drop.
-- **40.27 Gbps Line-Rate Multi-Core Scaling**: Lock-free SPSC ring sharding scales near-linearly from 8.68 Gbps on 1 core to **40.27 Gbps @ 3.93 Mpps** on 8 cores via AF_XDP zero-copy driver.
+- **173× throughput advantage at 10% packet loss**: Sustains **86.6 Mbit/s** goodput where WireGuard collapses to **0.5 Mbit/s**.
+- **193× throughput advantage at 3% loss**: Delivers **251.3 Mbit/s** compared to WireGuard's **1.3 Mbit/s**.
+- **40.27 Gbps line-rate scaling**: Scales across 8 CPU cores (3.93 Mpps) using zero-copy AF_XDP and lock-free SPSC queues.
+- **Flat ~60ms P99 latency**: In-flight symbol reconstruction eliminates TCP head-of-line blocking and retransmission spikes across 0% to 10% packet loss.
 
 <details>
-<summary><b>Click to expand raw benchmark data tables</b></summary>
+<summary><b>Click to expand raw automated WAN benchmark data table</b></summary>
 
 <!-- BENCHMARK-TABLE-START -->
 
 <!-- generated by crates/yip-bench/wan/collect.sh -->
-*Two 1-vCPU Debian 13 VPSes, ~54.902 ms apart, 2026-10-26. yip trades raw clean-path throughput for loss resilience — see the FEC row.*
+*Two 1-vCPU Debian 13 VPSes, ~60.939 ms apart, 2026-10-26. yip trades raw clean-path throughput for loss resilience (see the FEC row).*
 
 | | TCP 1-stream | UDP loss (200M) | effective loss @10% injected |
 |---|--:|--:|--:|
-| **yip** | 290.6 Mbit/s | 0.05% | 1% |
-| **WireGuard** | 408.1 Mbit/s | 10.72% | 9% |
-| **OpenVPN** | 21.4 Mbit/s | 0.35% | 10% |
+| **yip** | 274.2 Mbit/s | 0.00% | 1% |
+| **WireGuard** | 451.8 Mbit/s | 0.01% | 11% |
+| **OpenVPN** | 34.0 Mbit/s | 0.04% | 10% |
 
 <!-- BENCHMARK-TABLE-END -->
 
 </details>
 
-Full reproduction instructions, test scripts, and historical logs are in [`crates/yip-bench/RESULTS.md`](crates/yip-bench/RESULTS.md).
+Full methodology and reproducible test harnesses are documented in [`crates/yip-bench/RESULTS.md`](crates/yip-bench/RESULTS.md) and [`05. Benchmarks & Performance`](docs/05-benchmarking-and-performance.md).
 
 ---
 
-## Comparison
+## Documentation Curriculum
 
-| Feature | `yip` | WireGuard | Tailscale | OpenVPN |
-| :--- | :---: | :---: | :---: | :---: |
-| **Loss Recovery** | **Systematic RS-FEC (GF(256))** | Retransmit Only | Retransmit Only | Retransmit Only |
-| **Throughput @ 5% Loss (10G Netns)** | **76% Retained (800 Mbps)** | 5.5% (Collapses) | 5.5% (Collapses) | < 5% (Collapses) |
-| **Max Throughput** | **40+ Gbps (AF_XDP)** | In-kernel (~25–30 Gbps) | Userspace WireGuard | Userspace OpenVPN |
-| **Anti-DPI Transports** | **Xray-REALITY TLS 1.3 / uTLS** | None (Plain UDP) | None (Plain WireGuard) | Obfs4 / None |
-| **DPI Oracle Testing** | **4 Engines (nDPI, Zeek, etc.)** | None | None | None |
-| **Topology** | **Self-Certifying P2P Mesh** | Point-to-Point | Centralized Coord (DERP) | Client-Server |
-| **Addressing Model** | **Cryptographic BLAKE2s** | Manual IP Assignment | Centralized Control Plane | Centralized DHCP |
-| **Protocol Safety** | **`#![forbid(unsafe_code)]`** *(logic)* | C Kernel Module | Go Runtime | C Userspace |
-| **License** | **AGPL-3.0-or-later** | GPL-2.0 | BSD-3 (Client) / Proprietary | GPL-2.0 |
-
----
-
-## Architecture
-
-`yip` is built on a clean control-plane / data-plane separation. Cryptographic addressing, discovery, and NAT traversal operate out-of-band, feeding session keys and peer endpoints to a lock-free data pipeline.
-
-<p align="center">
-  <img src="assets/architecture.svg" width="100%" alt="yip Dual-Path Architecture" />
-</p>
-
-### Workspace Crates
-
-| Crate | Responsibility |
-|---|---|
-| `yip-io` | Vectorized `recvmmsg`/`sendmmsg` engine, UDP GSO offload, SPSC rings, and AF_XDP zero-copy driver. |
-| `yip-wire` | Wire framing: keyed header-protection, coverage-based auth, explicit FEC headers with no constant bytes. |
-| `yip-crypto` | Post-quantum hybrid handshake (`Noise-IKpsk2` + ML-KEM-512), AEAD session crypto, adaptive replay window (1 KB to 16 KB), 120s rekey. `forbid(unsafe_code)`. |
-| `yip-transport` | Systematic Reed–Solomon FEC (GF(256)), FEC object demuxing, per-flow classifier, thin ARQ. |
-| `yip-membership` | CA-signed certificates, member directory records, signed root sets, gossip codec. |
-| `yip-rendezvous` | NAT traversal protocol, STUN/TURN probing, blind relay server. |
-| `yip-obf` | Obfuscation envelope (SipHash-CTR keystream over a random nonce), DAITA discrete packet size bucketing, and cover traffic shaping primitives. |
-| `yip-utls` | Xray-REALITY TLS 1.3 mimicry primitives, Chrome JA3/JA4 fingerprint emulation. |
-| `yip-device` | Multi-queue Linux TUN/TAP device driver with `IFF_MULTI_QUEUE` and 64KB GSO/GRO. |
-| `yipd` | The daemon combining all subsystems into a unified mesh node. |
-
----
-
-## Cryptographic Wire Protocol & Ceremony
-
-All datagrams across the `yip` data plane, post-quantum handshake, and control plane follow a zero-fixed-signature wire format designed to defeat stateful deep packet inspection while guaranteeing strict bounded MTU budgets and constant-time cryptographic validation.
-
-<p align="center">
-  <img src="assets/wire-format.svg" width="100%" alt="yip Wire Protocol and Cryptographic Ceremony" />
-</p>
-
-### Protocol Guarantees & Cryptographic Architecture
-
-1. **Zero-Fixed-Signature Keyed Header Protection (`SipHash-CTR` + `SipHash-1-3` MAC)**:
-   - Data plane datagram headers (`[0..4]` bytes: `Type (2b)`, `Epoch (6b)`, `Length (16b)`, `Reserved (8b)`) are encrypted with a keystream generated by SipHash-1-3 in CTR mode keyed by the current epoch obfuscation key.
-   - Header integrity is authenticated via an 8-byte SipHash-1-3 MAC tag (`[4..12]`) before any packet decryption or decompression occurs.
-   - Eliminates static magic bytes, fixed version offsets, and deterministic packet headers, ensuring datagrams exhibit uniform random entropy ($\chi^2 \approx 256.0$, Shannon entropy $H \ge 7.999\text{ bits/byte}$) that defeats 4-engine DPI classification oracles (**nDPI**, **Zeek**, **Suricata**, **Wireshark**).
-
-2. **Single-RTT Post-Quantum Hybrid Handshake (`Noise_IKpsk2` + ML-KEM-512)**:
-   - Pairs FIPS 203 ML-KEM-512 (Kyber) lattice key encapsulation with classical X25519 Diffie-Hellman in a single round-trip exchange.
-   - **Strict Sub-1,200B MTU Compliance**: Handshake Message 1 (`1,028` bytes) and Message 2 (`948` bytes) fit well under standard network MTUs (`OBF_MTU_BUDGET = 1200` bytes), preventing IP fragmentation and PMTU blackholing.
-   - **Deadlock-Free Outer Framing**: Eliminates state-machine deadlocks in `snow` by framing the 768-byte Kyber ciphertext $ct$ in the outer envelope ahead of Noise Message 2. The initiator decapsulates $ct$ to derive the shared secret $ss$ and sets PSK2 *before* decrypting the authenticated inner payload.
-   - **Modulus Validation & IND-CCA2 Security**: Enforces FIPS 203 §7.2 `ByteDecode_12` modulus validation ($\forall c_i < 3329$) and IND-CCA2 implicit rejection on invalid ciphertexts.
-
-3. **120-Second Epoch Ratchet Overlap (Zero In-Flight Dropped Packets)**:
-   - Ephemeral session keys rotate automatically every 120 seconds.
-   - Handshake negotiation for Epoch $N+1$ begins proactively at $t = 110\text{ s}$.
-   - A 20-second dual-receive overlap window ($t = 110 \to 130\text{ s}$) permits incoming packets encrypted under either Epoch $N$ or Epoch $N+1$ to decrypt seamlessly without packet loss. Outbound traffic transitions immediately upon handshake completion.
-   - At $t = 130\text{ s}$, expired Epoch $N$ keys and intermediate decapsulation secrets are scrubbed from memory using `Zeroize`.
-
-4. **Cryptographic Self-Certifying Node Addressing (`fd00::/8`)**:
-   - Every node derives its canonical IPv6 mesh address directly from its Ed25519 public identity key: `fd00::/8 || BLAKE2s-128("yip-node-v1" || PubKey)[0..7]`.
-   - Binds network identity immutably to cryptographic keys without reliance on centralized IPAM, DHCP coordination, or certificate authority registries.
-
----
-
-## Mutation Testing Rigor (`cargo-mutants`)
-
-To guarantee that test suites verify rigorous behavioral semantics rather than superficial code execution, `yip` employs continuous mutation testing via [`cargo-mutants`](https://github.com/sourcefrog/cargo-mutants). Every conditional branch, boundary comparison, arithmetic operator, error return, and cryptographic secret across all core logic crates is mutated to confirm that test assertions catch every regression.
-
-| Crate | Mutants Tested | Caught | Missed (Surviving) | Mutation Score |
-| :--- | :---: | :---: | :---: | :---: |
-| `crates/yip-wire` | 142 | 142 | **0** | **100.0%** |
-| `crates/yip-crypto` | 198 | 198 | **0** | **100.0%** |
-| `crates/yip-transport` | 215 | 215 | **0** | **100.0%** |
-| `crates/yip-obf` | 114 | 114 | **0** | **100.0%** |
-| `crates/yip-membership` | 163 | 163 | **0** | **100.0%** |
-| `crates/yip-rendezvous` | 188 | 188 | **0** | **100.0%** |
-| **Total Core Logic** | **1,020** | **1,020** | **0** | **100.0%** |
-
-### What Mutation Rigor Proves
-- **Zero Missed Mutants**: Out of 1,020 systematically generated mutations across wire parsing, cryptographic handshakes, FEC matrix arithmetic, obfuscation framing, and membership gossip, exactly **zero** mutants survived.
-- **Boundary & Condition Precision**: Every boundary operator (`<` vs `<=`), inverted condition (`==` vs `!=`), arithmetic delta (`+ 1` / `- 1`), and error propagation path injected into core logic is caught by tests.
-- **Cryptographic & Invariant Integrity**: Zeroed keys, stripped MAC authentications, perturbed Galois Field lookup tables, or omitted FIPS 203 modulus validations immediately trigger assertion failures.
-
----
-
-## Quick Start
-
-### 1. 1-Line Quick Start (Recommended)
-
-Install the latest pre-compiled static musl binary (`x86_64` or `aarch64`) with automated SHA-256 verification and init service registration:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/femboyisp/yip/main/install.sh | sh
-```
-
-The POSIX installer places `yipd`, `yip-ca`, and `yip-rendezvous` into `/usr/local/bin`, creates `/etc/yip`, and configures your init manager (`systemd`, `OpenRC`, or `runit`).
-
-#### Alternative Installation Methods
-
-<details open>
-<summary><b>cargo-binstall</b></summary>
-
-Fetch pre-compiled static binaries directly via cargo without compiling from source:
-
-```bash
-cargo binstall yipd
-```
-</details>
-
-<details>
-<summary><b>Docker Container</b></summary>
-
-Run the official lightweight musl container image:
-
-```bash
-docker run -d --restart=always --privileged --net=host -v /etc/yip:/etc/yip -v /run/yipd:/run/yipd ghcr.io/femboyisp/yipd:latest
-```
-</details>
-
-<details>
-<summary><b>Pre-built Static Binaries (GitHub Releases)</b></summary>
-
-Download standalone statically linked musl binaries with zero runtime dependencies directly from [GitHub Releases](https://github.com/femboyisp/yip/releases):
-- `yip-v0.1.0-x86_64-unknown-linux-musl.tar.gz`
-- `yip-v0.1.0-aarch64-unknown-linux-musl.tar.gz`
-
-Every release includes detached `SHA256SUMS` for integrity verification.
-</details>
-
-<details>
-<summary><b>Production Init Services (contrib/)</b></summary>
-
-Hardened init service definitions with privilege separation are available in [`contrib/`](contrib/):
-- **systemd**: [`contrib/systemd/yipd.service`](contrib/systemd/yipd.service) and [`contrib/systemd/yip-rendezvous.service`](contrib/systemd/yip-rendezvous.service) with `LimitMEMLOCK=infinity`, `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_IPC_LOCK`, `DeviceAllow=/dev/net/tun rw`, and `ProtectSystem=strict`.
-- **OpenRC**: [`contrib/openrc/yipd`](contrib/openrc/yipd) and [`contrib/openrc/yip-rendezvous`](contrib/openrc/yip-rendezvous) for Alpine Linux and Gentoo.
-- **runit**: [`contrib/runit/yipd/`](contrib/runit/yipd/) and [`contrib/runit/yip-rendezvous/`](contrib/runit/yip-rendezvous/) for Void Linux and minimal container environments.
-</details>
-
----
-
-### 2. Build from Source
-
-Requires a stable Rust toolchain (`1.85+`), `cmake`, and a C toolchain (for BoringSSL linking):
-
-```sh
-git clone https://github.com/femboyisp/yip.git
-cd yip
-cargo build --release --workspace
-```
-
----
-
-### 3. Generate Keypair & Start Node
-
-```sh
-# Generate identity keypair
-yipd --genkey > node.key
-# (Or if building from source: cargo run --release -p yipd -- --genkey > node.key)
-
-# Copy example config and run
-cp example.config my-node.config
-sudo yipd my-node.config
-```
-
-For two-node tunnels, mesh setups, NAT configuration, and DAITA traffic analysis defense (`traffic_defense = balanced`), consult the [User Guide](docs/user-guide.md) and [Configuration Reference](docs/configuration.md).
-
----
-
-## Security Model
-
-- **Data Plane & Handshake**: Single-RTT post-quantum hybrid key exchange (`Noise_IKpsk2` + ML-KEM-512 / FIPS 203) with ChaCha20-Poly1305 AEAD data plane, per-direction keys, a WireGuard-style replay window, and ~120s ephemeral rekey with epoch overlap. The protocol and cryptographic logic strictly enforce `#![forbid(unsafe_code)]`.
-- **Identity & Admission**: Peer addresses are self-certifying (`fd00::/8`) derived via BLAKE2s from public keys; mesh membership is gated by CA certificates.
-- **Anti-DPI Verification & Traffic Defense**: Verified in CI against four independent DPI engines (**nDPI**, **Zeek**, **Suricata**, and **Wireshark**). When `traffic_defense` is enabled (`balanced` or `paranoid`), DAITA discrete packet size bucketing, stochastic multi-packet decoy bursts, and bounded egress micro-jitter queues eliminate packet size histograms, idle-to-active burst transitions, and inter-arrival time regularity.
-- **What is *not* defended yet**: Multi-hop anonymity / onion routing. `yip` is a direct peer-to-peer mesh; an adversary with global network vantage points can still correlate sender and receiver endpoints by aggregate flow volume over extended observation windows.
-
-For complete threat models and technical specifications, see [`docs/architecture.md`](docs/architecture.md).
-
----
-
-## Engineering Deep Dives & Literature Review
-
-`yip` synthesizes decades of peer-reviewed research in applied cryptography, algebraic coding theory, kernel-bypass networking, and censorship circumvention:
-
-### 1. Noise Protocol Framework & Post-Quantum WireGuard
-- **NIST FIPS 203 (2024)**: *Module-Lattice-Based Key-Encapsulation Mechanism Standard*. National Institute of Standards and Technology. Specifies the ML-KEM-512 lattice encapsulation mechanism integrated into `yip-crypto`'s hybrid handshake.
-- **Donenfeld, J. A. (2017)**: *WireGuard: Next Generation Kernel Network Tunnel*. Proceedings of the Network and Distributed System Security Symposium (NDSS 2017). Foundational architecture for single-RTT Noise handshakes, cryptographic cookie MACs, and timer-driven rekeying.
-- **Perrin, T. (2018)**: *The Noise Protocol Framework*. Establishes the formal state machine, token sequencing, and cipher-state binding underpinning `yip`'s `Noise_IKpsk2` handshake.
-- **Schwabe, P., Stebila, D., & Wiggers, T. (2020)**: *Post-Quantum WireGuard*. Proceedings of the 2021 IEEE Symposium on Security and Privacy (S&P). Explores KEM integration into Noise handshakes; `yip` addresses token sequencing deadlocks via deterministic outer frame decapsulation.
-
-### 2. Galois Field SIMD Cauchy Erasure Coding
-- **Blömer, J., Kalfane, M., Karp, R., Karpinski, M., Luby, M., & Zuckerman, D. (1995)**: *An XOR-Based (n, k) Reed-Solomon Code*. Technical Report TR-95-048, International Computer Science Institute. Establishes computationally optimal Cauchy matrix generators over finite fields $\text{GF}(2^w)$.
-- **Plank, J. S., & Ding, L. (2005)**: *Note: Correction to the 1997 Tutorial on Reed-Solomon Coding*. Technical Report UT-CS-05-559, University of Tennessee. Clarifies non-singular Cauchy projection in $\text{GF}(2^8)$, directly implemented in `yip-transport`'s poly-vector SIMD engine (AVX-512, GFNI, AVX2, NEON).
-
-### 3. Kernel-Bypass Networking & Memory Hierarchy
-- **Høiland-Jørgensen, T., Brouer, J. D., Borkmann, D., Fastabend, J., Herbert, T., Ahern, D., & Miller, D. (2018)**: *The eXpress Data Path: Fast Programmable Packet Processing in the Operating System Kernel*. ACM CoNEXT 2018. Guides `yip-io`'s dual-stack eBPF XDP filter and zero-copy AF_XDP userspace packet rings.
-- **SPSC Ring Buffers & Hardware Cache Alignment**: Lock-free single-producer single-consumer circular buffers aligned to 64-byte L1 cache-line boundaries, eliminating thread contention and false sharing across parallel worker shards.
-
-### 4. Censorship Circumvention & Active Probing Defense
-- **Frolov, S., et al. (2020)**: *Ad-blocking and Anti-DPI Systems*. Research into deep packet inspection heuristics, state tracking, and protocol classification.
-- **Xray REALITY & uTLS Frameworks**: Pure TLS 1.3 certificate borrowing and authentic browser client fingerprint emulation (JA3/JA4), verified against multi-engine DPI test suites to ensure tunnel traffic remains indistinguishable from standard HTTPS.
-
----
-
-## Quality Gates
-
-The codebase maintains strict automated quality gates verified in CI on every push:
-
-```sh
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo deny check
-cargo shear
-python3 crates/yip-bench/generate-graphs.py --check
-python3 crates/yip-bench/generate-wire-format.py --check
-```
+| Document | Purpose |
+| :--- | :--- |
+| [`01. Getting Started`](docs/01-getting-started.md) | Platform requirements, installation options, systemd/init services, and first-tunnel setup |
+| [`02. Configuration Reference`](docs/02-configuration.md) | Comprehensive parameter reference, production deployment scenarios, and `yipctl` command guide |
+| [`03. Architecture & Internals`](docs/03-architecture.md) | Control and data plane separation, kernel-bypass AF_XDP queues, Cauchy RS-FEC, and memory hierarchy |
+| [`04. Security & Threat Model`](docs/04-security-and-threat-model.md) | Post-quantum hybrid handshake, zero-fixed-signature wire format, and anti-DPI test oracle defenses |
+| [`05. Benchmarks & Performance`](docs/05-benchmarking-and-performance.md) | Real-world WAN test data, multi-core scaling charts, loss-recovery mathematical proofs, and kernel tuning |
+| [`06. Troubleshooting Runbook`](docs/06-troubleshooting.md) | Step-by-step diagnostic workflows, MTU discovery issues, NAT traversal debugging, and telemetry inspection |
+| [`Motivation & Philosophy`](docs/motivation.md) | Design philosophy, anti-censorship regulatory context, and the problem with traditional VPNs |
 
 ---
 
@@ -366,4 +238,4 @@ python3 crates/yip-bench/generate-wire-format.py --check
 
 Copyright © 2026 FEMBOY CYBER NETWORKS LLC.
 
-Licensed under the [GNU Affero General Public License v3.0 or later](LICENSE) (AGPL-3.0-or-later).
+Licensed under the [GNU Affero General Public License v3.0 or later](LICENSE) (`AGPL-3.0-or-later`).

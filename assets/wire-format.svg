@@ -49,13 +49,13 @@
   <rect x="372.00" y="204.00" width="122.00" height="36.00" fill="#161b22" rx="3.00" stroke="#6e7681" stroke-width="1.00" />
   <text x="433.00" y="218.00" fill="#8b949e" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Reserved (8b)</text>
   <text x="433.00" y="232.00" fill="#6e7681" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Flags / Zero Padding</text>
-  <text x="40.00" y="253.00" fill="#fb923c" font-size="8.8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="start">⊕ XOR keystream mask: zero magic bytes or fixed wire discriminators.</text>
-  <rect x="40.00" y="264.00" width="454.00" height="72.00" fill="#1c1917" rx="6.00" stroke="#f97316" stroke-width="1.00" />
-  <path d="M 54.00,282.00 L 60.00,279.00 L 66.00,282.00 L 66.00,289.00 C 66.00,296.00 60.00,300.00 60.00,300.00 C 60.00,300.00 54.00,296.00 54.00,289.00 Z" fill="#fb923c" />
-  <text x="74.00" y="284.00" fill="#f0f6fc" font-size="10.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="start">Anti-DPI Guarantee: Pure High-Entropy Random Bytes</text>
-  <text x="74.00" y="299.00" fill="#8b949e" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">Keyed Header Protection eliminates static signatures; datagrams appear</text>
-  <text x="74.00" y="312.00" fill="#8b949e" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">as uniform random bytes to DPI engines (nDPI, Zeek, Suricata, Wireshark).</text>
-  <text x="74.00" y="326.00" fill="#6e7681" font-size="8.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">Constant-time SipHash MAC tag check rejects forged headers in &lt;12ns prior to decode.</text>
+  <text x="40.00" y="251.00" fill="#fb923c" font-size="8.8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="start">⊕ XOR keystream mask: zero magic bytes or fixed wire discriminators.</text>
+  <rect x="40.00" y="265.00" width="454.00" height="72.00" fill="#1c1917" rx="6.00" stroke="#f97316" stroke-width="1.00" />
+  <path d="M 54.00,283.00 L 60.00,280.00 L 66.00,283.00 L 66.00,290.00 C 66.00,297.00 60.00,301.00 60.00,301.00 C 60.00,301.00 54.00,297.00 54.00,290.00 Z" fill="#fb923c" />
+  <text x="74.00" y="285.00" fill="#f0f6fc" font-size="10.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="start">Anti-DPI Guarantee: Pure High-Entropy Random Bytes</text>
+  <text x="74.00" y="300.00" fill="#8b949e" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">Keyed Header Protection eliminates static signatures; datagrams appear</text>
+  <text x="74.00" y="313.00" fill="#8b949e" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">as uniform random bytes to DPI engines (nDPI, Zeek, Suricata, Wireshark).</text>
+  <text x="74.00" y="327.00" fill="#6e7681" font-size="8.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">Constant-time SipHash MAC tag check rejects forged headers in &lt;12ns prior to decode.</text>
   <rect x="40.00" y="344.00" width="454.00" height="24.00" fill="#0d1117" rx="4.00" stroke="#30363d" stroke-width="1.00" />
   <text x="267.00" y="360.00" fill="#34d399" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">DPI Resistance: Pass (0 signatures detected across 4-Engine Oracle)</text>
   <rect x="530.00" y="68.00" width="486.00" height="344.00" fill="url(#grad-panel-b)" rx="8.00" stroke="#30363d" stroke-width="1.00" />
@@ -112,26 +112,26 @@
   <text x="276.00" y="547.00" fill="#fb923c" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">HS</text>
   <rect x="296.00" y="532.00" width="174.00" height="24.00" fill="#064e3b" rx="4.00" stroke="#10b981" stroke-width="1.20" />
   <text x="383.00" y="547.00" fill="#34d399" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="middle">Epoch N+1 Active (TX + RX)</text>
-  <line x1="60.00" y1="566.00" x2="470.00" y2="566.00" stroke="#30363d" stroke-width="1.00" />
-  <line x1="60.00" y1="563.00" x2="60.00" y2="569.00" stroke="#6e7681" stroke-width="1.00" />
-  <text x="60.00" y="578.00" fill="#8b949e" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">t = 0s</text>
-  <line x1="160.00" y1="563.00" x2="160.00" y2="569.00" stroke="#6e7681" stroke-width="1.00" />
-  <text x="160.00" y="578.00" fill="#6e7681" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">t = 60s</text>
-  <line x1="260.00" y1="563.00" x2="260.00" y2="569.00" stroke="#6e7681" stroke-width="1.00" />
-  <text x="260.00" y="578.00" fill="#fb923c" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">t = 110s</text>
-  <text x="260.00" y="588.00" fill="#fb923c" font-size="7.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">Rekey HS</text>
-  <line x1="350.00" y1="563.00" x2="350.00" y2="569.00" stroke="#6e7681" stroke-width="1.00" />
-  <text x="350.00" y="578.00" fill="#8b949e" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">t = 120s</text>
-  <text x="350.00" y="588.00" fill="#8b949e" font-size="7.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">Epoch End</text>
-  <line x1="440.00" y1="563.00" x2="440.00" y2="569.00" stroke="#6e7681" stroke-width="1.00" />
-  <text x="440.00" y="578.00" fill="#ef4444" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">t = 130s</text>
-  <text x="440.00" y="588.00" fill="#ef4444" font-size="7.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">Zeroize</text>
-  <rect x="40.00" y="594.00" width="454.00" height="102.00" fill="#0d1117" rx="6.00" stroke="#30363d" stroke-width="1.00" />
-  <text x="54.00" y="612.00" fill="#8b949e" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">• Seamless Egress Switch: Outbound frames jump to Epoch N+1 immediately.</text>
-  <text x="54.00" y="629.00" fill="#8b949e" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">• Dual-Receive Window (110s..130s): Accepts packets encrypted under both</text>
-  <text x="54.00" y="643.00" fill="#8b949e" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">  Epoch N and Epoch N+1 without drops or decryption errors.</text>
-  <text x="54.00" y="662.00" fill="#c084fc" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="start">• Zeroize on Retire: At t = 130s, Epoch N secrets scrubbed from RAM.</text>
-  <text x="54.00" y="680.00" fill="#34d399" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="start">• 0% Packet Loss: Eliminates rekey stalls and head-of-line blocking.</text>
+  <line x1="60.00" y1="563.00" x2="470.00" y2="563.00" stroke="#30363d" stroke-width="1.00" />
+  <line x1="60.00" y1="560.00" x2="60.00" y2="566.00" stroke="#6e7681" stroke-width="1.00" />
+  <text x="60.00" y="575.00" fill="#8b949e" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">t = 0s</text>
+  <line x1="160.00" y1="560.00" x2="160.00" y2="566.00" stroke="#6e7681" stroke-width="1.00" />
+  <text x="160.00" y="575.00" fill="#6e7681" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">t = 60s</text>
+  <line x1="260.00" y1="560.00" x2="260.00" y2="566.00" stroke="#6e7681" stroke-width="1.00" />
+  <text x="260.00" y="575.00" fill="#fb923c" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">t = 110s</text>
+  <text x="260.00" y="585.00" fill="#fb923c" font-size="7.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">Rekey HS</text>
+  <line x1="350.00" y1="560.00" x2="350.00" y2="566.00" stroke="#6e7681" stroke-width="1.00" />
+  <text x="350.00" y="575.00" fill="#8b949e" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">t = 120s</text>
+  <text x="350.00" y="585.00" fill="#8b949e" font-size="7.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">Epoch End</text>
+  <line x1="440.00" y1="560.00" x2="440.00" y2="566.00" stroke="#6e7681" stroke-width="1.00" />
+  <text x="440.00" y="575.00" fill="#ef4444" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">t = 130s</text>
+  <text x="440.00" y="585.00" fill="#ef4444" font-size="7.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">Zeroize</text>
+  <rect x="40.00" y="596.00" width="454.00" height="102.00" fill="#0d1117" rx="6.00" stroke="#30363d" stroke-width="1.00" />
+  <text x="54.00" y="614.00" fill="#8b949e" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">• Seamless Egress Switch: Outbound frames jump to Epoch N+1 immediately.</text>
+  <text x="54.00" y="631.00" fill="#8b949e" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">• Dual-Receive Window (110s..130s): Accepts packets encrypted under both</text>
+  <text x="54.00" y="645.00" fill="#8b949e" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">  Epoch N and Epoch N+1 without drops or decryption errors.</text>
+  <text x="54.00" y="664.00" fill="#c084fc" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="start">• Zeroize on Retire: At t = 130s, Epoch N secrets scrubbed from RAM.</text>
+  <text x="54.00" y="682.00" fill="#34d399" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="start">• 0% Packet Loss: Eliminates rekey stalls and head-of-line blocking.</text>
   <rect x="40.00" y="704.00" width="454.00" height="24.00" fill="#2e1065" rx="4.00" stroke="#a855f7" stroke-width="1.00" />
   <text x="267.00" y="720.00" fill="#c084fc" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Rotation Guarantee: 0% Dropped Packets During Continuous Key Refresh</text>
   <rect x="530.00" y="424.00" width="486.00" height="344.00" fill="url(#grad-panel-d)" rx="8.00" stroke="#30363d" stroke-width="1.00" />

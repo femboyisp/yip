@@ -5,18 +5,18 @@ This is a navigational summary. The authoritative design lives in the specs and 
 
 ## Map of the docs
 
-- **`docs/research/00-overview.md`** — synthesis of ~35 reference projects and the cross-cutting
+- **`docs/research/00-overview.md`**: synthesis of ~35 reference projects and the cross-cutting
   design conclusions that drive yip. Start here for *why* the design is what it is.
-- **`docs/research/01–07`** — per-cluster deep analysis (WireGuard family, mesh overlays, anonymity
+- **`docs/research/01-07`**: per-cluster deep analysis (WireGuard family, mesh overlays, anonymity
   networks, mixnet/proxies, transport/FEC, crypto/PQ, DPI engines).
-- **`docs/superpowers/specs/`** — approved design specs, one per sub-project.
-- **`docs/superpowers/plans/`** — bite-sized implementation plans, one per milestone.
+- **`docs/superpowers/specs/`**: approved design specs, one per sub-project.
+- **`docs/superpowers/plans/`**: bite-sized implementation plans, one per milestone.
 
 ## Project shape
 
 yip is decomposed into five sub-projects, built in order. Each is independently testable and ships
-on its own; later sub-projects layer onto the data plane through stable trait interfaces. #1–#3 are
-merged (#3 partially — obfuscation and REALITY TLS-mimicry are in, DAITA-style padding is not); #4
+on its own; later sub-projects layer onto the data plane through stable trait interfaces. #1-#3 are
+merged (#3 partially: obfuscation and REALITY TLS-mimicry are in, DAITA-style padding is not); #4
 and #5 have not started. See the sub-project table in `README.md` for the authoritative status.
 
 ```
@@ -60,13 +60,13 @@ write`.
 
 ### Why this is low-latency
 
-Crypto is latency-irrelevant (~0.5–2 µs/packet after the `ring` ChaCha20-Poly1305 swap; see
+Crypto is latency-irrelevant (~0.5-2 µs/packet after the `ring` ChaCha20-Poly1305 swap; see
 `crates/yip-bench/RESULTS.md`). The real cost in a userspace tunnel is syscalls, kernel/user
 copies, and scheduling jitter. yip attacks that with a single-threaded `epoll`-driven event loop
 (the default `PollDriver`) that batches sends with `sendmmsg`/`UDP_SEGMENT` (GSO) and reads bursts
 with `recvmmsg`; an opt-in `io_uring` driver (`YIP_USE_URING=1`) trades a core for lower RTT on
 bare metal with adaptive busy-polling. AF_XDP zero-copy is sub-project #5 and has not started. The
-Reed–Solomon FEC recovers loss *proactively* (no retransmit round-trip needed for the common case),
+Reed-Solomon FEC recovers loss *proactively* (no retransmit round-trip needed for the common case),
 so p99 latency stays flat under loss; a thin reactive ARQ backstops residual loss on ARQ-eligible
 flows.
 
