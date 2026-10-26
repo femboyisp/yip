@@ -416,22 +416,22 @@ Under network impairment (simulated with `tc netem` on the WAN egress), yip's pr
 | injected loss | baseline (no tunnel) | yip | WireGuard | OpenVPN |
 |---|--:|--:|--:|--:|
 | 0% | 0% | 0% | 0% | 0% |
-| 1% | 0% | 0% | 0% | 0% |
-| 3% | 5% | 1% | 3% | 3% |
-| 5% | 7% | 1% | 4% | 5% |
-| 10% | 12% | 0% | 11% | 6% |
+| 1% | 1% | 0% | 1% | 1% |
+| 3% | 5% | 0% | 2% | 3% |
+| 5% | 4% | 0% | 4% | 5% |
+| 10% | 11% | 0% | 14% | 10% |
 
 **TCP Goodput Under Loss (Mbit/s):**
 
 | injected loss | baseline (no tunnel) | yip | WireGuard | OpenVPN |
 |---|--:|--:|--:|--:|
-| 0% | 420.5 | 156.8 | 420.8 | 18.0 |
-| 1% | 3.0 | 11.3 | 3.2 | 2.7 |
-| 3% | 1.7 | 117.6 | 1.2 | 1.6 |
-| 5% | 1.6 | 81.5 | 1.0 | 0.9 |
-| 10% | 0.6 | 16.6 | 0.5 | 0.5 |
+| 0% | 370.4 | 149.7 | 407.7 | 23.7 |
+| 1% | 3.7 | 245.7 | 1.9 | 2.4 |
+| 3% | 2.1 | 221.3 | 1.6 | 1.2 |
+| 5% | 1.5 | 67.0 | 0.8 | 0.7 |
+| 10% | 0.8 | 14.0 | 0.6 | 0.7 |
 
-At 10% packet loss, WireGuard and OpenVPN collapse to ~0.5 Mbit/s due to TCP window backoff, while yip sustains **16.6 Mbit/s** (~33× WireGuard) with effective end-to-end loss held to 0%.
+At 10% packet loss, WireGuard and OpenVPN collapse to ~0.6 Mbit/s due to TCP window backoff, while yip sustains **14.0 Mbit/s** (~23× WireGuard) with effective end-to-end loss held to 0%. Across 1% to 10% loss, yip delivers **23× to 138× higher throughput** than WireGuard.
 
 ### Reproducing WAN benchmarks
 

@@ -102,7 +102,7 @@ def build_social_card_svg() -> str:
 
     # Graph title
     lines.append(f'    <text x="24" y="32" font-family="{FONT_SANS}" font-size="14" font-weight="700" fill="#f0f6fc">Throughput Under Network Packet Loss (AWS us-east-1 ↔ us-west-2, 60ms RTT)</text>')
-    lines.append(f'    <text x="{gw - 24}" y="32" font-family="{FONT_MONO}" font-size="12" font-weight="700" fill="#fb923c" text-anchor="end">33× to 98× Higher Goodput at 3%–10% Loss</text>')
+    lines.append(f'    <text x="{gw - 24}" y="32" font-family="{FONT_MONO}" font-size="12" font-weight="700" fill="#fb923c" text-anchor="end">23× to 138× Higher Goodput at 3%–10% Loss</text>')
 
     # Simple stylised curves - ending at x=900 so labels at x=925 fit inside 1120 card
     # x: 0% (x=80), 1% (x=280), 3% (x=490), 5% (x=700), 10% (x=900)
@@ -129,8 +129,8 @@ def build_social_card_svg() -> str:
     lines.append(f'    <polyline points="{yip_str}" fill="none" stroke="#f97316" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" />')
 
     # Labels at end of curves (comfortably inside card)
-    lines.append(f'    <text x="918" y="144" font-family="{FONT_MONO}" font-size="11.5" font-weight="700" fill="#f97316">yip (16.6 Mbit/s)</text>')
-    lines.append(f'    <text x="918" y="194" font-family="{FONT_MONO}" font-size="11" font-weight="600" fill="#38bdf8">WireGuard (0.5 Mbit/s)</text>')
+    lines.append(f'    <text x="918" y="144" font-family="{FONT_MONO}" font-size="11.5" font-weight="700" fill="#f97316">yip (14.0 Mbit/s)</text>')
+    lines.append(f'    <text x="918" y="194" font-family="{FONT_MONO}" font-size="11" font-weight="600" fill="#38bdf8">WireGuard (0.6 Mbit/s)</text>')
 
     # X-axis markers
     for x_pos, loss_lbl in [(80, "0% Loss"), (280, "1%"), (490, "3%"), (700, "5%"), (900, "10% Loss")]:

@@ -52,7 +52,7 @@ class TestGraphGenerators(unittest.TestCase):
         # Callout
         self.assertIn("Head-of-Line Blocking Suppressed", svg_str)
         self.assertIn("Systematic userspace RS-FEC recovers dropped symbols in-flight", svg_str)
-        self.assertIn("keeping P99 flat at ~62ms vs ARQ retransmission spikes to 235ms+", svg_str)
+        self.assertIn("keeping P99 flat at ~62ms vs ARQ retransmission spikes", svg_str)
 
         # Legend entries
         self.assertIn("yip (RS-FEC)", svg_str)
@@ -66,6 +66,24 @@ class TestGraphGenerators(unittest.TestCase):
 
         for pct in ["0%", "1%", "2%", "3%", "5%", "8%", "10%"]:
             self.assertIn(f">{pct}<", svg_str)
+
+    def test_throughput_loss_chart_valid_xml(self):
+        svg_str = generate_graphs_module.generate_throughput_loss_chart()
+        root = ET.fromstring(svg_str)
+        self.assertEqual(root.tag, "{http://www.w3.org/2000/svg}svg")
+        self.assertIn("WAN TCP Goodput vs Packet Loss", svg_str)
+
+    def test_fec_recovery_chart_valid_xml(self):
+        svg_str = generate_graphs_module.generate_fec_recovery_chart()
+        root = ET.fromstring(svg_str)
+        self.assertEqual(root.tag, "{http://www.w3.org/2000/svg}svg")
+        self.assertIn("FEC Recovery: Effective Loss Suppression", svg_str)
+
+    def test_multicore_scaling_chart_valid_xml(self):
+        svg_str = generate_graphs_module.generate_multicore_scaling_chart()
+        root = ET.fromstring(svg_str)
+        self.assertEqual(root.tag, "{http://www.w3.org/2000/svg}svg")
+        self.assertIn("Multi-Core Throughput Scaling", svg_str)
 
 
 if __name__ == "__main__":

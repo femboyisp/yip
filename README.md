@@ -106,7 +106,7 @@ All benchmark charts are generated deterministically from verified testbed data.
 
 ### Key Benchmark Findings
 
-- **33× to 98× Higher Throughput Under Loss**: On real-world multi-region cloud WANs (AWS `us-east-1` ↔ `us-west-2`, ~60.6ms RTT), `yip` maintains **16.6 Mbit/s** at 10% packet loss, whereas WireGuard and OpenVPN collapse to **0.5 Mbit/s**.
+- **23× to 138× Higher Throughput Under Loss**: On real-world multi-region cloud WANs (AWS `us-east-1` ↔ `us-west-2`, ~55–60ms RTT), `yip` maintains **14.0 Mbit/s** at 10% packet loss (vs. WireGuard collapsing to **0.6 Mbit/s**, a 23× advantage) and **221.3 Mbit/s** at 3% loss (vs. WireGuard's **1.6 Mbit/s**, a 138× advantage).
 - **Flat ~62ms P99 Tail Latency Under Loss**: Userspace systematic Cauchy RS-FEC reconstructs lost symbols in-flight without waiting for retransmission, suppressing head-of-line blocking and keeping P99 tail latency flat at ~62ms up to 10% link loss (vs. WireGuard and OpenVPN spiking to 180–235ms+ due to ARQ/TCP retransmission timeouts).
 - **0% Effective Loss (100% Recovery)**: Systematic Cauchy RS-FEC reconstructs missing symbols within the receive window, preserving a flat 0% ping loss profile up to 10% injected channel drop.
 - **40.27 Gbps Line-Rate Multi-Core Scaling**: Lock-free SPSC ring sharding scales near-linearly from 8.68 Gbps on 1 core to **40.27 Gbps @ 3.93 Mpps** on 8 cores via AF_XDP zero-copy driver.
@@ -138,7 +138,7 @@ Full reproduction instructions, test scripts, and historical logs are in [`crate
 | Feature | `yip` | WireGuard | Tailscale | OpenVPN |
 | :--- | :---: | :---: | :---: | :---: |
 | **Loss Recovery** | **Systematic RS-FEC (GF(256))** | Retransmit Only | Retransmit Only | Retransmit Only |
-| **Throughput @ 5% Loss** | **76% Retained (800 Mbps)** | 5.5% (Collapses) | 5.5% (Collapses) | < 5% (Collapses) |
+| **Throughput @ 5% Loss (10G Netns)** | **76% Retained (800 Mbps)** | 5.5% (Collapses) | 5.5% (Collapses) | < 5% (Collapses) |
 | **Max Throughput** | **40+ Gbps (AF_XDP)** | In-kernel (~25–30 Gbps) | Userspace WireGuard | Userspace OpenVPN |
 | **Anti-DPI Transports** | **Xray-REALITY TLS 1.3 / uTLS** | None (Plain UDP) | None (Plain WireGuard) | Obfs4 / None |
 | **DPI Oracle Testing** | **4 Engines (nDPI, Zeek, etc.)** | None | None | None |

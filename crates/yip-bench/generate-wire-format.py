@@ -297,7 +297,7 @@ def generate_wire_format_svg() -> str:
     canvas.text(433.0, bf_y + 14.0, "Reserved (8b)", fill=COLOR_TEXT_MUTED, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
     canvas.text(433.0, bf_y + 28.0, "Flags / Zero Padding", fill=COLOR_TEXT_DIM, font_size=8.0, text_anchor="middle")
 
-    canvas.text(40.0, 253.0, "⊕ XOR keystream mask eliminates wire signatures: zero magic bytes or fixed discriminators.", fill=COLOR_OBF_LIGHT, font_size=9.0, font_family=FONT_MONO)
+    canvas.text(40.0, 253.0, "⊕ XOR keystream mask: zero magic bytes or fixed wire discriminators.", fill=COLOR_OBF_LIGHT, font_size=8.8, font_family=FONT_MONO)
 
     # Explanatory callout box
     cb_y = 264.0
@@ -431,11 +431,11 @@ def generate_wire_format_svg() -> str:
     # Explanatory subcard
     ratchet_info_y = 594.0
     canvas.rect(40.0, ratchet_info_y, 454.0, 102.0, rx=6.0, fill=COLOR_SUB_CARD_BG, stroke=COLOR_CANVAS_BORDER, stroke_width=1.0)
-    canvas.text(54.0, ratchet_info_y + 18.0, "• Seamless Egress Switch: Outbound frames jump to Epoch N+1 immediately on response.", fill=COLOR_TEXT_MUTED, font_size=9.5)
-    canvas.text(54.0, ratchet_info_y + 36.0, "• Dual-Receive Grace Window (110s..130s): Receiver accepts datagrams encrypted under", fill=COLOR_TEXT_MUTED, font_size=9.5)
-    canvas.text(54.0, ratchet_info_y + 50.0, "  both Epoch N and Epoch N+1 without packet drops or decryption errors.", fill=COLOR_TEXT_MUTED, font_size=9.5)
-    canvas.text(54.0, ratchet_info_y + 68.0, "• Zeroize on Retire: At t = 130s, Epoch N secrets scrubbed from RAM with Zeroize.", fill=COLOR_EPOCH_LIGHT, font_size=9.5, font_weight="700")
-    canvas.text(54.0, ratchet_info_y + 86.0, "• 0% Packet Loss: Eliminates rekey stalls, head-of-line blocking, and burst drops.", fill=COLOR_PQ_LIGHT, font_size=9.5, font_weight="700")
+    canvas.text(54.0, ratchet_info_y + 18.0, "• Seamless Egress Switch: Outbound frames jump to Epoch N+1 immediately.", fill=COLOR_TEXT_MUTED, font_size=9.0)
+    canvas.text(54.0, ratchet_info_y + 35.0, "• Dual-Receive Window (110s..130s): Accepts packets encrypted under both", fill=COLOR_TEXT_MUTED, font_size=9.0)
+    canvas.text(54.0, ratchet_info_y + 49.0, "  Epoch N and Epoch N+1 without drops or decryption errors.", fill=COLOR_TEXT_MUTED, font_size=9.0)
+    canvas.text(54.0, ratchet_info_y + 68.0, "• Zeroize on Retire: At t = 130s, Epoch N secrets scrubbed from RAM.", fill=COLOR_EPOCH_LIGHT, font_size=9.0, font_weight="700")
+    canvas.text(54.0, ratchet_info_y + 86.0, "• 0% Packet Loss: Eliminates rekey stalls and head-of-line blocking.", fill=COLOR_PQ_LIGHT, font_size=9.0, font_weight="700")
 
     # Outcome banner
     ob3_y = 704.0
