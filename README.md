@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/banner.svg" alt="yip logo" width="400" />
+<img src="assets/yip.gif" alt="yip logo" width="340" />
 
 # 🦊 yip
 
