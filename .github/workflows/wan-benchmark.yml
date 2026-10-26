@@ -2,18 +2,6 @@
 name: wan-benchmark
 
 'on':
-  push:
-    branches: [main]
-    paths:
-      - 'crates/yip-bench/**'
-      - 'bin/yipd/**'
-      - 'crates/yip-transport/**'
-      - 'crates/yip-wire/**'
-      - '!crates/yip-bench/RESULTS.md'
-      - '!crates/yip-bench/wan/results/**'
-      - '!assets/**'
-      - '!**.md'
-      - '!docs/**'
   workflow_dispatch:
     inputs:
       mode:
