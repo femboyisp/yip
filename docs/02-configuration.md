@@ -470,6 +470,9 @@ Parameters governing the external wire encapsulation and mimicry costume.
 
 Parameters governing userspace Galois Field $GF(2^8)$ Cauchy Reed–Solomon erasure coding and loss recovery.
 
+> [!NOTE]
+> The Cauchy Reed–Solomon FEC engine (`crates/yip-transport/src/fec.rs`) is built into the `yip` transport layer and automatically generates proactive repair symbols adaptively based on real-time link loss. The parameters below document default internal values and planned configuration overrides.
+
 | Configuration Directive | Type | Default Value | Valid Range / Format | Operational Impact |
 | :--- | :--- | :--- | :--- | :--- |
 | `enabled` | Boolean | `true` | `true`, `false` | Toggles userspace FEC erasure coding. When disabled, packets rely exclusively on link-layer retransmissions. |
@@ -534,28 +537,30 @@ Parameters defined within repeatable `[peer]` blocks to establish connections to
 | :--- | :--- | :--- | :--- | :--- |
 | `public_key` | String (Hex) | *None* (Required) | 64 hex characters (32 bytes) | Remote peer's public X25519 key. Authenticates the peer during Noise-IK key exchange. |
 | `endpoint` | String | *None* (Optional) | `IP:port` (IPv4 or `[IPv6]:port`) | Direct UDP endpoint. If omitted, the peer is reached via rendezvous STUN hole punching or blind relaying. |
-| `allowed_ips` | String (CIDR) | `::/0, 0.0.0.0/0` | Comma-separated CIDR list | IP prefix routing table for packets directed to or accepted from this peer. |
-| `fec_ratio_override` | Float | *Inherited* | `0.0` to `2.0` | Overrides the global initial FEC repair ratio for this specific peer link. |
-| `keepalive_secs` | Integer | `25` | `0` to `3600` seconds | Cadence of authenticated keepalive probes to preserve stateful NAT and firewall port bindings. |
+
+> [!IMPORTANT]
+> **Cryptographic Addressing vs. WireGuard `allowed_ips`**:
+> Unlike WireGuard, `yip` does **not** parse or rely on `allowed_ips` prefix filtering for access control. In `yip`, peer overlay addresses in `fd00::/8` are **cryptographically derived** from the peer's public key (via `BLAKE2s-120`). Inbound packets are authenticated against the sender's authenticated cryptographic session key; address spoofing and squatting are mathematically prevented at the crypto layer. Direct route configuration is handled via the operating system network stack (`ip -6 route`). Advanced per-peer overrides (`fec_ratio_override`, custom `keepalive_secs`) are planned extensions; link maintenance and adaptive FEC recovery are handled automatically by `yip`'s transport engine.
 
 ---
 
 ## 4. Configuration Validation & Hot-Reloading
 
-### Syntax Verification (`yipd --check`)
+### Configuration Validation & Safety Checks
 
-To validate a configuration file's grammar, key lengths, and semantic integrity without binding network interfaces or starting threads:
+`yipd` validates configuration grammar, key lengths, MTU boundaries, and semantic invariants immediately upon load via `Config::parse()`:
 
 ```sh
-yipd --check -c /etc/yip/yipd.conf
+# Start daemon with configuration file (validates semantics before bringing up interfaces)
+sudo yipd /etc/yip/yipd.conf
 ```
 
-The validation suite executes the following checks:
+`yipd` executes the following fail-fast validations on startup before creating virtual interfaces or allocating worker threads:
 1. **Hex character length tests**: Confirms all keys are exact-length hex (64 chars for 32-byte keys, 32 chars for 16-byte network IDs, 16 chars for 8-byte short IDs).
 2. **MTU boundaries**: Verifies `mtu` falls within `576..=65535`.
 3. **Bucket monotonic ordering**: Ensures `defense_buckets` contains strictly ascending values between 64 and 1500 bytes.
 4. **Root signature verification**: In mesh mode, verifies that `roots` is cryptographically signed by an anchor present in `ca_public`.
-5. **Port conflict checking**: Emits warnings if a listen address collides with fingerprinted VPN ports (51820, 1194, 500, etc.).
+5. **Port conflict & plausibility**: Emits warnings if a listen address collides with fingerprinted VPN ports (51820, 1194, 500, etc.), falling back to 8443 if unprivileged.
 
 ### Mutual Exclusivity & Conflict Matrix
 

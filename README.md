@@ -44,7 +44,7 @@ Set up an encrypted, forward-error-corrected tunnel between two Linux nodes in f
 curl -fsSL https://raw.githubusercontent.com/femboyisp/yip/main/install.sh | sh
 
 # 2. Generate identity keypair and print self-certifying overlay IPv6 address
-yipd --genkey > /etc/yip/node.key && yipd --addr $(cat /etc/yip/node.key)
+yipd --genkey > /etc/yip/node.key && yipd --addr $(grep '^public=' /etc/yip/node.key | cut -d= -f2)
 
 # 3. Start the daemon (systemd service or direct configuration file invocation)
 sudo systemctl start yipd

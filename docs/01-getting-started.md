@@ -294,6 +294,8 @@ sudo ln -s /etc/sv/yipd /var/service/
 
 This walkthrough sets up a direct, point-to-point encrypted tunnel between two distinct servers across the public internet.
 
+### Topology Overview
+
 ```
 +-----------------------------------+              +-----------------------------------+
 |              HOST A               |              |              HOST B               |
