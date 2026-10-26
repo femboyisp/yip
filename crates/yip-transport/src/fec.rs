@@ -224,14 +224,39 @@ impl FecEncoder {
 }
 
 struct ObjState {
-    /// Received shards keyed by symbol_index (deduped).
-    shards: HashMap<u16, Vec<u8>>,
+    /// Pre-allocated buffer for the assembled object.
+    payload: Vec<u8>,
+    /// Bitset of received symbol indices (0..255).
+    seen_mask: [u64; 4],
+    /// Count of received source shards (symbol_index < k).
+    source_count: usize,
+    /// Total count of distinct shards received (source + repair).
+    total_count: usize,
     k: usize,
     shard_len: usize,
     object_size: u32,
     scheme: rs::Scheme,
     done: bool,
     expires_at_ms: u64,
+    /// Repair shards (symbol_index >= k), stored only when packet loss occurs.
+    repair_shards: Vec<(u16, Vec<u8>)>,
+}
+
+#[inline]
+fn is_seen(seen_mask: &[u64; 4], idx: u16) -> bool {
+    let u = idx as usize;
+    if u >= 256 {
+        return false;
+    }
+    (seen_mask[u / 64] & (1u64 << (u % 64))) != 0
+}
+
+#[inline]
+fn mark_seen(seen_mask: &mut [u64; 4], idx: u16) {
+    let u = idx as usize;
+    if u < 256 {
+        seen_mask[u / 64] |= 1u64 << (u % 64);
+    }
 }
 
 /// Reassembles RS symbols into objects, keeping multiple objects in flight
@@ -344,16 +369,22 @@ impl FecReassembler {
                     self.objects.remove(&oldest);
                 }
             }
+            let shard_len = obj_size.min(sym_size);
+            let payload_len = k.checked_mul(shard_len).unwrap_or(0);
             self.objects.insert(
                 object_key,
                 ObjState {
-                    shards: HashMap::new(),
+                    payload: vec![0u8; payload_len],
+                    seen_mask: [0; 4],
+                    source_count: 0,
+                    total_count: 0,
                     k,
-                    shard_len: obj_size.min(sym_size),
+                    shard_len,
                     object_size: symbol.object_size,
                     scheme,
                     done: false,
                     expires_at_ms: now_ms.saturating_add(deadline_ms),
+                    repair_shards: Vec::new(),
                 },
             );
             self.order.push_back(object_key);
@@ -361,7 +392,10 @@ impl FecReassembler {
         let state = self.objects.get_mut(&object_key)?;
         if now_ms > state.expires_at_ms {
             state.done = true;
-            state.shards.clear();
+            state.payload.clear();
+            state.payload.shrink_to_fit();
+            state.repair_shards.clear();
+            state.repair_shards.shrink_to_fit();
             return None;
         }
         if state.done {
@@ -372,35 +406,70 @@ impl FecReassembler {
             return None;
         }
         // Dedupe by index; only store what we don't have.
-        let mut shard_data = symbol.data.clone();
-        if shard_data.len() < state.shard_len {
-            shard_data.resize(state.shard_len, 0);
+        if is_seen(&state.seen_mask, symbol_index) {
+            return None;
         }
-        state.shards.entry(symbol_index).or_insert(shard_data);
+        mark_seen(&mut state.seen_mask, symbol_index);
+        state.total_count += 1;
 
-        if state.shards.len() < state.k {
+        let sym_idx = usize::from(symbol_index);
+        if sym_idx < state.k {
+            state.source_count += 1;
+            let offset = sym_idx * state.shard_len;
+            let copy_len = symbol.data.len().min(state.shard_len);
+            state.payload[offset..offset + copy_len].copy_from_slice(&symbol.data[..copy_len]);
+        } else {
+            let mut shard_data = symbol.data.clone();
+            if shard_data.len() < state.shard_len {
+                shard_data.resize(state.shard_len, 0);
+            }
+            state.repair_shards.push((symbol_index, shard_data));
+        }
+
+        if state.total_count < state.k {
             return None;
         }
 
-        // Decode once we hold K distinct shards.
-        let received: Vec<(u16, &[u8])> = state
-            .shards
-            .iter()
-            .map(|(&idx, d)| (idx, d.as_slice()))
-            .collect();
-        let sources = rs::decode_source(state.k, state.shard_len, &received, state.scheme)?;
+        // We hold at least K distinct shards: complete object reassembly.
         state.done = true;
+        let size = usize::try_from(symbol.object_size).ok()?;
 
-        if state.shards.keys().any(|&idx| usize::from(idx) >= state.k) {
-            self.recovered_count += 1;
+        if state.source_count == state.k {
+            // All K source shards arrived: fast systematic path with no RS decode!
+            let mut object = std::mem::take(&mut state.payload);
+            state.repair_shards.clear();
+            state.repair_shards.shrink_to_fit();
+            object.truncate(size);
+            return Some(object);
         }
 
-        // Concatenate source shards and trim to the original object_size.
-        let size = usize::try_from(symbol.object_size).unwrap();
+        // Loss path: at least one repair shard is required.
+        self.recovered_count += 1;
+
+        // Collect K shards for decode:
+        let mut received: Vec<(u16, &[u8])> = Vec::with_capacity(state.k);
+        for idx in 0..state.k {
+            if is_seen(&state.seen_mask, idx as u16) {
+                let offset = idx * state.shard_len;
+                received.push((idx as u16, &state.payload[offset..offset + state.shard_len]));
+            }
+        }
+        for (idx, shard_bytes) in &state.repair_shards {
+            if received.len() == state.k {
+                break;
+            }
+            received.push((*idx, shard_bytes.as_slice()));
+        }
+
+        let sources = rs::decode_source(state.k, state.shard_len, &received, state.scheme)?;
         let mut object = Vec::with_capacity(state.k * state.shard_len);
         for shard in &sources {
             object.extend_from_slice(shard);
         }
+        state.payload.clear();
+        state.payload.shrink_to_fit();
+        state.repair_shards.clear();
+        state.repair_shards.shrink_to_fit();
         object.truncate(size);
         Some(object)
     }
@@ -477,6 +546,34 @@ mod tests {
             out = out.or(re.push(u64::from(s.object_id), s, 0, 1000));
         }
         assert_eq!(out.as_deref(), Some(ct.as_slice()));
+    }
+
+    #[test]
+    fn out_of_order_source_shards_assemble_in_place() {
+        let params = FlowClass::Default.params();
+        let ct: Vec<u8> = (0..3600u32)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect(); // K=3
+        let mut enc = FecEncoder::new();
+        let syms = enc.encode(&ct, params, 0); // K=3, R=0
+        assert_eq!(syms.len(), 3);
+
+        let mut re = FecReassembler::new(params.symbol_size, 64);
+        let obj_key = u64::from(syms[0].object_id);
+
+        // Feed shard 2 first
+        assert_eq!(re.push(obj_key, &syms[2], 100, 500), None);
+        assert_eq!(re.recovered_count(), 0);
+
+        // Feed shard 0 next
+        assert_eq!(re.push(obj_key, &syms[0], 101, 500), None);
+        assert_eq!(re.recovered_count(), 0);
+
+        // Feed shard 1 last -> complete assembly
+        let out = re.push(obj_key, &syms[1], 102, 500);
+        assert_eq!(out.as_deref(), Some(ct.as_slice()));
+        // Must NOT increment recovered_count because all shards were source shards
+        assert_eq!(re.recovered_count(), 0);
     }
 
     #[test]
@@ -1018,7 +1115,10 @@ mod tests {
         );
         let state = re.objects.get(&u64::from(syms[0].object_id)).unwrap();
         assert!(state.done, "object must be marked done");
-        assert!(state.shards.is_empty(), "shards must be freed");
+        assert!(
+            state.payload.is_empty() && state.repair_shards.is_empty(),
+            "shards must be freed"
+        );
 
         // Trailing parity symbol 2 arrives at t=165: hits tombstone, does not resurrect
         assert_eq!(
@@ -1027,7 +1127,10 @@ mod tests {
         );
         let state = re.objects.get(&u64::from(syms[0].object_id)).unwrap();
         assert!(state.done, "must remain done");
-        assert!(state.shards.is_empty(), "must not store shard");
+        assert!(
+            state.payload.is_empty() && state.repair_shards.is_empty(),
+            "must not store shard"
+        );
 
         // Trailing parity symbol 3 arrives at t=170: hits tombstone
         assert_eq!(
@@ -1036,7 +1139,10 @@ mod tests {
         );
         let state = re.objects.get(&u64::from(syms[0].object_id)).unwrap();
         assert!(state.done, "must remain done");
-        assert!(state.shards.is_empty(), "must not store shard");
+        assert!(
+            state.payload.is_empty() && state.repair_shards.is_empty(),
+            "must not store shard"
+        );
     }
 
     #[test]
@@ -1108,7 +1214,7 @@ mod tests {
         // Realtime object should be tombstoned
         let rt_state = re.objects.get(&u64::from(rt_syms[0].object_id)).unwrap();
         assert!(rt_state.done);
-        assert!(rt_state.shards.is_empty());
+        assert!(rt_state.payload.is_empty() && rt_state.repair_shards.is_empty());
 
         // Bulk object at head was NOT prematurely evicted and can still decode within its deadline
         let bulk_res = re.push(u64::from(bulk_syms[1].object_id), &bulk_syms[1], 200, 500); // 200 <= 600
