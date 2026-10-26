@@ -1,30 +1,24 @@
-# Why yip exists
+# Documentation Has Moved: Motivation & Why yip Exists
 
-yip is built by [FEMBOY CYBER NETWORKS LLC](../README.md#license), an independent entity
-registered in Utah.
+> [!IMPORTANT]
+> The architectural motivation and regulatory background from `docs/motivation.md` have been integrated into our primary documentation and landing materials. This document is maintained for link compatibility.
 
-On May 6, 2026, Utah enacted **Senate Bill 73 — the Online Age Verification Amendments**. As
-covered by the [Electronic Frontier Foundation](https://www.eff.org/deeplinks/2026/04/utahs-new-law-regulating-vpns-goes-effect-next-week),
-it made Utah the first state to explicitly target the use of VPNs to circumvent geofenced,
-government-mandated identity checks — holding a website operator liable when a user reaches
-their platform from inside Utah even if that user is masking their location.
+## Canonical Guides
 
-The EFF describes the liability trap this creates: a site that cannot reliably guess the
-physical origin of a privacy-protected IP faces a choice between banning *every* known
-commercial VPN range or forcing intrusive ID/biometric checks on *every* visitor to screen
-out hidden Utah users. The law also reaches toward a First Amendment problem by targeting the
-act of *providing instructions* for routing around local geofences.
+Please refer to the following documents for the design philosophy, regulatory context, and architectural motivation behind yip:
 
-> "Blocking all known VPN and proxy IP addresses is a technical whack-a-mole that likely no
-> company can win… The internet is built to, and will always, route around censorship." — EFF
+- **[`01-getting-started.md`](01-getting-started.md)**: Project background, core motivation, design principles, and operational quickstart.
+- **[`03-architecture.md`](03-architecture.md)**: Architectural motivation, anti-censorship design, zero-data-center decentralization, self-certifying addressing, and systematic Reed–Solomon FEC resilience.
 
-Attacks on VPNs are attacks on the tools that enable digital privacy. The state's approach —
-enumerate and block commercial VPN IP ranges — only works against centralized providers with
-bannable data-center address blocks. yip's answer is architectural: a decentralized, CA-gated
-P2P mesh over opt-in NAT hole-punching and zero-signature obfuscation, with **no
-data-center IP blocks to enumerate**. We don't publish instructions for breaking local laws;
-we build open systems so that secure, low-latency, private networking stays available
-wherever you live.
+You can also read the project overview and mission statement directly in the [main README](../README.md#why-yip).
 
-This is the *why*. The [README](../README.md) is the *what* and *how*, and is honest about
-what yip does and does not yet defend.
+---
+
+### Full Documentation Curriculum
+
+- **[01 — Getting Started & Quickstart](01-getting-started.md)**: Operational onboarding and quickstarts.
+- **[02 — Configuration Reference](02-configuration.md)**: Complete parameter, flag, and deployment reference.
+- **[03 — Architecture & Internals](03-architecture.md)**: Wire format, FEC pipeline, engine state machines, and data-plane design.
+- **[04 — Security & Threat Model](04-security-and-threat-model.md)**: Cryptographic guarantees, session state, key ratchets, and threat mitigations.
+- **[05 — Benchmarking & Performance](05-benchmarking-and-performance.md)**: Benchmarks, methodology, comparative evaluations, and netem loss recovery.
+- **[06 — Troubleshooting Runbook](06-troubleshooting.md)**: Diagnostic flowcharts, error resolutions, and operational mitigation procedures.
