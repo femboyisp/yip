@@ -380,12 +380,12 @@ transport=raw
 
 # Remote Datacenter Peer
 [peer]
-public_key=7a9b3c4d5e6f0123456789abcdef0123456789abcdef0123456789abcdef0123
+public_key=4138e653ea9d05e0455dbca11bda603b54d6fa7c588523ae1c5eec7d121c272f
 endpoint=203.0.113.50:443
 
 # Remote Branch Office Peer
 [peer]
-public_key=8b0c1d2e3f4a5b6c7d8e9f0123456789abcdef0123456789abcdef0123456789
+public_key=19b48f95c0c920f3c8340d99ef871ef3b55a8e0cb2049e6f3dfaa6221f00b991
 endpoint=198.51.100.200:443
 ```
 
@@ -413,6 +413,95 @@ sudo -E yipd /etc/yip/yipd.conf
 
 > [!NOTE]
 > Setting `shards=8` enables multi-threaded core pinning. `yipd` allocates an `IFF_MULTI_QUEUE` TUN interface with 8 file descriptors and creates 8 `SO_REUSEPORT` UDP listening sockets, ensuring that packet processing never suffers cross-core mutex contention.
+
+---
+
+### Scenario E: Decentralized Zero-Trust Mesh (`yip-ca` + Gossip Discovery)
+
+This scenario deploys an enterprise or community zero-trust mesh where nodes authenticate through an offline Certificate Authority (`yip-ca`), gossip peer reachability dynamically, and require **zero manual `[peer]` blocks**.
+
+```mermaid
+flowchart TD
+    subgraph Offline Management
+        CA[Offline Authority: yip-ca<br/>Issues Member Certs & Signs RootSet]
+    end
+
+    subgraph Mesh Network
+        Seed[Seed Root Node<br/>Reachable at public IP<br/>Anchor in network.roots]
+        NodeA[Member Node A<br/>Valid Cert & Gossip Engine]
+        NodeB[Member Node B<br/>Valid Cert & Gossip Engine]
+    end
+
+    CA -.->|Distribute node.cert & network.roots| Seed
+    CA -.->|Distribute node.cert & network.roots| NodeA
+    CA -.->|Distribute node.cert & network.roots| NodeB
+
+    NodeA <-->|1. Bootstrap Handshake & Gossip| Seed
+    NodeB <-->|1. Bootstrap Handshake & Gossip| Seed
+    NodeA <-.->|2. Epidemic Gossip Convergence| NodeB
+    NodeA <===>|3. Direct Encrypted Tunnel on Demand| NodeB
+```
+
+#### 1. Issue Member Certificates via `yip-ca`
+
+On your offline administrative workstation:
+
+```sh
+# Mint the root CA
+yip-ca genkey > ca.key
+
+# Issue cert for Member Node A (using Node A's identity and signing public keys)
+yip-ca sign-cert \
+  --member 4cbc48cf095389d829abf3c7d78747ca35c96483375bd73860b2ebba94c99d50 \
+  --member-sign c0b221a5986e7d279d9c39040a1db1721ee57f5febb2f6be4a661aa1076e9e8a \
+  --network f11a8e0df8fa6352eeb62192de7ece47 \
+  --days 365 \
+  --ca-private $(grep '^ca_private=' ca.key | cut -d= -f2) > nodeA.cert
+
+# Assemble and sign the seed root set (listing Seed Node)
+echo "bf923deeaddb66dde39e99987abdfd789c54eb882a570c340cd338071727ceeb 198.51.100.1:443" > roots.in
+yip-ca sign-roots \
+  --roots roots.in \
+  --version 1 \
+  --ca-private $(grep '^ca_private=' ca.key | cut -d= -f2) > network.roots
+```
+
+#### 2. Seed Node Configuration (`/etc/yip/yipd.conf` on 198.51.100.1)
+
+```ini
+local_private=dd152fc311a115549005da852d101a7d3a14594c728f71ff87aa0872da6c0fa9
+local_public=bf923deeaddb66dde39e99987abdfd789c54eb882a570c340cd338071727ceeb
+listen=0.0.0.0:443
+device=yip0
+device_kind=tun
+
+# All 5 Mesh Directives
+ca_public=8a03a4cf43c2907041efb394c0effabad5bdb4cbbc35d17c924c0b6cbfa8ba75
+cert=/etc/yip/seed.cert
+roots=/etc/yip/network.roots
+member_sign_private=986590d0751560e38dff71028e032c0182c6de4c327b06eda5e0a476efd13eba
+network_id=f11a8e0df8fa6352eeb62192de7ece47
+```
+
+#### 3. Member Node Configuration (`/etc/yip/yipd.conf` on Node A)
+
+```ini
+local_private=2f2b5880cc15f29f826e876f5396c6f418e2366b73b415c5441f152b23c0334d
+local_public=4cbc48cf095389d829abf3c7d78747ca35c96483375bd73860b2ebba94c99d50
+listen=0.0.0.0:443
+device=yip0
+device_kind=tun
+
+# All 5 Mesh Directives
+ca_public=8a03a4cf43c2907041efb394c0effabad5bdb4cbbc35d17c924c0b6cbfa8ba75
+cert=/etc/yip/nodeA.cert
+roots=/etc/yip/network.roots
+member_sign_private=c22239d00522843313aa03a662e8f0cb6abb7889f8f103510ebb5dee0e924857
+network_id=f11a8e0df8fa6352eeb62192de7ece47
+
+# Optional: Set rendezvous relay for members behind NAT
+rendezvous=198.51.100.1:443
+```
 
 ---
 

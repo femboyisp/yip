@@ -297,10 +297,10 @@ def generate_wire_format_svg() -> str:
     canvas.text(433.0, bf_y + 14.0, "Reserved (8b)", fill=COLOR_TEXT_MUTED, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
     canvas.text(433.0, bf_y + 28.0, "Flags / Zero Padding", fill=COLOR_TEXT_DIM, font_size=8.0, text_anchor="middle")
 
-    canvas.text(40.0, 253.0, "⊕ XOR keystream mask: zero magic bytes or fixed wire discriminators.", fill=COLOR_OBF_LIGHT, font_size=8.8, font_family=FONT_MONO)
+    canvas.text(40.0, 251.0, "⊕ XOR keystream mask: zero magic bytes or fixed wire discriminators.", fill=COLOR_OBF_LIGHT, font_size=8.8, font_family=FONT_MONO)
 
     # Explanatory callout box
-    cb_y = 264.0
+    cb_y = 265.0
     canvas.rect(40.0, cb_y, 454.0, 72.0, rx=6.0, fill="#1c1917", stroke=COLOR_OBF, stroke_width=1.0)
     # Shield icon path
     canvas.path(f"M 54.00,{cb_y + 18.0:.2f} L 60.00,{cb_y + 15.0:.2f} L 66.00,{cb_y + 18.0:.2f} L 66.00,{cb_y + 25.0:.2f} C 66.00,{cb_y + 32.0:.2f} 60.00,{cb_y + 36.0:.2f} 60.00,{cb_y + 36.0:.2f} C 60.00,{cb_y + 36.0:.2f} 54.00,{cb_y + 32.0:.2f} 54.00,{cb_y + 25.0:.2f} Z", fill=COLOR_OBF_LIGHT)
@@ -412,8 +412,8 @@ def generate_wire_format_svg() -> str:
     canvas.rect(296.0, 532.0, 174.0, 24.0, rx=4.0, fill=COLOR_PQ_BG, stroke=COLOR_PQ, stroke_width=1.2)
     canvas.text(383.0, 547.0, "Epoch N+1 Active (TX + RX)", fill=COLOR_PQ_LIGHT, font_size=9.0, font_weight="700", text_anchor="middle")
 
-    # Timeline axis line & ticks at y = 566.0
-    canvas.line(60.0, 566.0, 470.0, 566.0, stroke=COLOR_CANVAS_BORDER, stroke_width=1.0)
+    # Timeline axis line & ticks at y = 563.0
+    canvas.line(60.0, 563.0, 470.0, 563.0, stroke=COLOR_CANVAS_BORDER, stroke_width=1.0)
     # Ticks with non-colliding labels (time on top line, event on bottom line)
     ticks = [
         (60.0, "t = 0s", None, COLOR_TEXT_MUTED),
@@ -423,13 +423,13 @@ def generate_wire_format_svg() -> str:
         (440.0, "t = 130s", "Zeroize", COLOR_RED),
     ]
     for tx, tlabel, sublabel, tcol in ticks:
-        canvas.line(tx, 563.0, tx, 569.0, stroke=COLOR_TEXT_DIM, stroke_width=1.0)
-        canvas.text(tx, 578.0, tlabel, fill=tcol, font_size=8.5, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
+        canvas.line(tx, 560.0, tx, 566.0, stroke=COLOR_TEXT_DIM, stroke_width=1.0)
+        canvas.text(tx, 575.0, tlabel, fill=tcol, font_size=8.5, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
         if sublabel:
-            canvas.text(tx, 588.0, sublabel, fill=tcol, font_size=7.5, font_family=FONT_MONO, text_anchor="middle")
+            canvas.text(tx, 585.0, sublabel, fill=tcol, font_size=7.5, font_family=FONT_MONO, text_anchor="middle")
 
     # Explanatory subcard
-    ratchet_info_y = 594.0
+    ratchet_info_y = 596.0
     canvas.rect(40.0, ratchet_info_y, 454.0, 102.0, rx=6.0, fill=COLOR_SUB_CARD_BG, stroke=COLOR_CANVAS_BORDER, stroke_width=1.0)
     canvas.text(54.0, ratchet_info_y + 18.0, "• Seamless Egress Switch: Outbound frames jump to Epoch N+1 immediately.", fill=COLOR_TEXT_MUTED, font_size=9.0)
     canvas.text(54.0, ratchet_info_y + 35.0, "• Dual-Receive Window (110s..130s): Accepts packets encrypted under both", fill=COLOR_TEXT_MUTED, font_size=9.0)

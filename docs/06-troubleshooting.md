@@ -295,13 +295,18 @@ If no packets arrive in `tcpdump` on Host B:
   ```
 
 ##### Step 2.4: Check Zero-Trust Certificate Admission
-If using PKI node certificates, inspect certificate validity using `yip-ca`:
+If using PKI node certificates in mesh mode, inspect daemon logs for signature verification failures or expiry:
 ```bash
-journalctl -u yipd -e --no-pager | grep "cert rejected"
+journalctl -u yipd -e --no-pager | grep -E "cert rejected|bad cert|expired"
 ```
-Reissue or verify the node certificate against the root CA public key:
+If the certificate is expired or rejected, re-issue the certificate with `yip-ca sign-cert`:
 ```bash
-yip-ca verify --root-pub <ROOT_CA_KEY> --cert /etc/yip/node.crt
+yip-ca sign-cert \
+  --member <MEMBER_PUBLIC_KEY> \
+  --member-sign <MEMBER_SIGN_PUBLIC_KEY> \
+  --network <NETWORK_ID_16HEX> \
+  --days 365 \
+  --ca-private <CA_PRIVATE_KEY> > /etc/yip/node.cert
 ```
 
 ---

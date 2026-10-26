@@ -34,7 +34,14 @@ For comprehensive configuration directives and wire protocol internals, refer to
   - [Step 5: Start the Daemon](#step-5-start-the-daemon)
   - [Step 6: Configure Network Interfaces & Addressing](#step-6-configure-network-interfaces--addressing)
   - [Step 7: Verify Connectivity & Telemetry](#step-7-verify-connectivity--telemetry)
-- [5. Troubleshooting & Common Pitfalls](#5-troubleshooting--common-pitfalls)
+- [5. Zero-Trust Mesh with yip-ca](#5-zero-trust-mesh-with-yip-ca)
+  - [Step 1: Initialize the Offline Root CA](#step-1-initialize-the-offline-root-ca)
+  - [Step 2: Generate Node Keys](#step-2-generate-node-keys)
+  - [Step 3: Issue Member Certificates](#step-3-issue-member-certificates)
+  - [Step 4: Create and Sign the Bootstrap Root Set](#step-4-create-and-sign-the-bootstrap-root-set)
+  - [Step 5: Configure Mesh Node](#step-5-configure-mesh-node)
+  - [Step 6: Start and Verify Dynamic Mesh Convergence](#step-6-start-and-verify-dynamic-mesh-convergence)
+- [6. Troubleshooting & Common Pitfalls](#6-troubleshooting--common-pitfalls)
 
 ---
 
@@ -523,7 +530,151 @@ sudo yipctl top
 
 ---
 
-## 5. Troubleshooting & Common Pitfalls
+## 5. Zero-Trust Mesh with yip-ca
+
+In the point-to-point setup in Section 4, each node required an explicit `[peer]` block defining the remote public key and endpoint. While simple for two nodes, configuring and distributing static peer blocks across dozens or hundreds of nodes becomes an operational headache.
+
+**Mesh mode solves this with zero-trust cryptographic admission.** Instead of maintaining static peer lists, nodes dynamically discover authorized members and establish point-to-point tunnels on demand:
+
+1. An **offline Certificate Authority (`yip-ca`)** issues cryptographic membership certificates (`Cert`) binding a node's Noise identity and Ed25519 gossip signing key.
+2. A **signed root set (`RootSet`)** seeds the network with authoritative bootstrap nodes.
+3. Nodes gossip membership records with sub-nanosecond TAI64N anti-replay protection.
+4. When traffic is routed to a peer's self-certifying IPv6 address (`fd00::/8`), `yipd` dynamically resolves the peer endpoint from the gossip directory and brings up the encrypted Noise-IK session.
+
+```mermaid
+flowchart TD
+    CA["Offline CA (yip-ca)<br/>Holds ca_private"] -- "1. Issue Cert" --> NodeA["Node A<br/>Holds node.cert"]
+    CA -- "1. Issue Cert" --> NodeB["Node B<br/>Holds node.cert"]
+    CA -- "2. Sign RootSet" --> Roots["network.roots<br/>Lists Bootstrap Seed Nodes"]
+
+    NodeA -- "3. Boot & Load roots" --> Roots
+    NodeB -- "3. Boot & Load roots" --> Roots
+
+    NodeA <-->|"4. Authenticated Gossip<br/>(TAI64N Timestamped)"| NodeB
+    NodeA <===>|"5. Dynamic Encrypted Tunnel<br/>(Noise-IK + RS-FEC)"| NodeB
+```
+
+### Step 1: Initialize the Offline Root CA
+
+Run `yip-ca genkey` on a secure management machine (or offline workstation) to generate the root CA keypair:
+
+```sh
+yip-ca genkey > /etc/yip/ca.key
+```
+
+*Example Output:*
+```text
+ca_private=2b4a919864d4a8e2eefb4081cb96e95c1d70e8f3956960cfdfca00ec063bc97a
+ca_public=8a03a4cf43c2907041efb394c0effabad5bdb4cbbc35d17c924c0b6cbfa8ba75
+```
+
+> [!CAUTION]
+> The `ca_private` key never needs to live on any running mesh node. Keep it securely stored on an administrative machine or encrypted backup volume. Only the `ca_public` key is placed on mesh nodes.
+
+### Step 2: Generate Node Keys
+
+Each mesh node requires two cryptographic keypairs:
+1. **Noise Identity Keypair** (X25519) for tunnel encryption:
+   ```sh
+   yipd --genkey > /etc/yip/node.key
+   ```
+2. **Gossip Record Signing Keypair** (Ed25519) for authenticated membership announcements:
+   ```sh
+   yip-ca genkey > /etc/yip/member-sign.key
+   ```
+
+Extract the public keys for registration:
+```sh
+NODE_PUB=$(grep '^public=' /etc/yip/node.key | cut -d= -f2)
+SIGN_PUB=$(grep '^ca_public=' /etc/yip/member-sign.key | cut -d= -f2)
+```
+
+### Step 3: Issue Member Certificates
+
+Using the offline CA, issue a signed membership certificate for the node. Define a unique 16-byte (32 hex characters) `network_id` for your private mesh (e.g. `f11a8e0df8fa6352eeb62192de7ece47`):
+
+```sh
+yip-ca sign-cert \
+  --member "$NODE_PUB" \
+  --member-sign "$SIGN_PUB" \
+  --network f11a8e0df8fa6352eeb62192de7ece47 \
+  --days 365 \
+  --ca-private 2b4a919864d4a8e2eefb4081cb96e95c1d70e8f3956960cfdfca00ec063bc97a > /etc/yip/node.cert
+```
+
+Place the generated `/etc/yip/node.cert` on the member node with permissions `0644`.
+
+### Step 4: Create and Sign the Bootstrap Root Set
+
+Mesh nodes need at least one stable bootstrap peer to join the gossip network. Create a seed file (e.g. `roots.in`) listing the public keys and reachable endpoints of your seed nodes:
+
+```text
+# Format: <node_public_key_hex> <ip:port>
+bf923deeaddb66dde39e99987abdfd789c54eb882a570c340cd338071727ceeb 198.51.100.1:443
+```
+
+Sign the root set with `yip-ca sign-roots`:
+
+```sh
+yip-ca sign-roots \
+  --roots roots.in \
+  --version 1 \
+  --ca-private 2b4a919864d4a8e2eefb4081cb96e95c1d70e8f3956960cfdfca00ec063bc97a > /etc/yip/network.roots
+```
+
+Distribute `/etc/yip/network.roots` to all member nodes.
+
+### Step 5: Configure Mesh Node
+
+Create `/etc/yip/yipd.conf` on the member node. Note the complete absence of any `[peer]` blocks:
+
+```ini
+# /etc/yip/yipd.conf (Mesh Member Node)
+local_private=50b522bb0b57e7eb133e9b11b5275ea011cf8c3f4e24eb37452d192131b0e01c
+local_public=9b49ffeb4566b53a0f78cae08920bc9e30a6e0c60f252cfdf4740e74f8c92b21
+listen=0.0.0.0:443
+device=yip0
+device_kind=tun
+
+# Zero-Trust Mesh Directives (All 5 Required)
+ca_public=8a03a4cf43c2907041efb394c0effabad5bdb4cbbc35d17c924c0b6cbfa8ba75
+cert=/etc/yip/node.cert
+roots=/etc/yip/network.roots
+member_sign_private=c22239d00522843313aa03a662e8f0cb6abb7889f8f103510ebb5dee0e924857
+network_id=f11a8e0df8fa6352eeb62192de7ece47
+
+# Optional: Add rendezvous for members located behind NAT
+rendezvous=198.51.100.5:443
+```
+
+### Step 6: Start and Verify Dynamic Mesh Convergence
+
+Start the daemon:
+```sh
+sudo systemctl restart yipd
+```
+
+Check the log to confirm certificate and root set verification:
+```sh
+journalctl -u yipd -e --no-pager | grep membership
+```
+*Expected log:*
+```text
+membership: loaded node certificate for member 9b49ffeb4566b53a...
+membership: loaded root set version 1 with 1 anchor(s)
+membership: gossip session established with seed root
+```
+
+Query `yipctl peers` to observe peers joining the network via gossip:
+```sh
+sudo yipctl peers
+```
+
+When you send traffic to any member's self-certifying IPv6 address (e.g. `ping6 <peer-mesh-ip>`), `yipd` resolves the destination through its internal directory and establishes the tunnel automatically.
+
+---
+
+## 6. Troubleshooting & Common Pitfalls
 
 ### `Operation not permitted` / `TUNSETIFF` failure
 - **Cause**: Lack of `CAP_NET_ADMIN` capability or running without sufficient permissions.
