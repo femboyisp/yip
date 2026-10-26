@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 
 use crate::rs;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 /// Maximum permitted object size for a single FEC-coded frame (256 KiB): bounds
 /// the memory a forged symbol can cause the decoder to allocate.
@@ -223,7 +223,7 @@ impl FecEncoder {
     }
 }
 
-struct ObjState {
+pub(crate) struct ObjState {
     /// Pre-allocated buffer for the assembled object.
     payload: Vec<u8>,
     /// Bitset of received symbol indices (0..255).
@@ -259,12 +259,130 @@ fn mark_seen(seen_mask: &mut [u64; 4], idx: u16) {
     }
 }
 
+#[inline]
+fn hash_key(key: u64, mask: usize) -> usize {
+    let mut x = key;
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^= x >> 31;
+    (x as usize) & mask
+}
+
+pub(crate) struct ObjectTable {
+    slots: Vec<Option<(u64, ObjState)>>,
+    len: usize,
+}
+
+impl ObjectTable {
+    pub fn new(capacity: usize) -> Self {
+        let cap = (capacity.max(1) * 2).next_power_of_two().max(16);
+        let mut slots = Vec::with_capacity(cap);
+        for _ in 0..cap {
+            slots.push(None);
+        }
+        Self { slots, len: 0 }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    pub fn contains_key(&self, key: &u64) -> bool {
+        self.get(key).is_some()
+    }
+
+    pub fn find_index(&self, key: &u64) -> Option<usize> {
+        let mask = self.slots.len() - 1;
+        let mut idx = hash_key(*key, mask);
+        loop {
+            match &self.slots[idx] {
+                Some((k, _)) if *k == *key => return Some(idx),
+                Some(_) => idx = (idx + 1) & mask,
+                None => return None,
+            }
+        }
+    }
+
+    pub fn get(&self, key: &u64) -> Option<&ObjState> {
+        let idx = self.find_index(key)?;
+        self.slots[idx].as_ref().map(|(_, s)| s)
+    }
+
+    pub fn get_mut(&mut self, key: &u64) -> Option<&mut ObjState> {
+        let idx = self.find_index(key)?;
+        self.slots[idx].as_mut().map(|(_, s)| s)
+    }
+
+    pub fn insert(&mut self, key: u64, state: ObjState) -> Option<ObjState> {
+        let mask = self.slots.len() - 1;
+        let mut idx = hash_key(key, mask);
+        loop {
+            match &mut self.slots[idx] {
+                Some((k, s)) if *k == key => {
+                    return Some(std::mem::replace(s, state));
+                }
+                Some(_) => idx = (idx + 1) & mask,
+                None => {
+                    self.slots[idx] = Some((key, state));
+                    self.len += 1;
+                    return None;
+                }
+            }
+        }
+    }
+
+    pub fn remove(&mut self, key: &u64) -> Option<ObjState> {
+        let mask = self.slots.len() - 1;
+        let mut idx = hash_key(*key, mask);
+        loop {
+            match &self.slots[idx] {
+                Some((k, _)) if *k == *key => break,
+                Some(_) => idx = (idx + 1) & mask,
+                None => return None,
+            }
+        }
+        let removed = self.slots[idx].take().map(|(_, s)| s);
+        self.len -= 1;
+
+        // Backward-shift deletion to preserve linear probing invariants without tombstones.
+        let mut next_idx = (idx + 1) & mask;
+        while let Some((k, _)) = self.slots[next_idx] {
+            let natural_idx = hash_key(k, mask);
+            let should_move = if next_idx >= idx {
+                natural_idx <= idx || natural_idx > next_idx
+            } else {
+                natural_idx <= idx && natural_idx > next_idx
+            };
+            if should_move {
+                self.slots[idx] = self.slots[next_idx].take();
+                idx = next_idx;
+            }
+            next_idx = (next_idx + 1) & mask;
+        }
+        removed
+    }
+}
+
+impl std::ops::Index<&u64> for ObjectTable {
+    type Output = ObjState;
+    fn index(&self, key: &u64) -> &Self::Output {
+        self.get(key).expect("key not found in ObjectTable")
+    }
+}
+
 /// Reassembles RS symbols into objects, keeping multiple objects in flight
 /// (keyed by `object_key: u64`), tolerating loss/reordering, evicting oldest at cap.
 pub struct FecReassembler {
     symbol_size: u16,
-    objects: HashMap<u64, ObjState>,
-    order: VecDeque<u64>,
+    pub(crate) objects: ObjectTable,
+    pub(crate) order: VecDeque<u64>,
     max_objects: usize,
     recovered_count: u64,
 }
@@ -273,11 +391,12 @@ impl FecReassembler {
     /// Create a reassembler for a class's `symbol_size`, keeping at most
     /// `max_objects` partially-received objects.
     pub fn new(symbol_size: u16, max_objects: usize) -> Self {
+        let max_obj = max_objects.max(1);
         Self {
             symbol_size,
-            objects: HashMap::new(),
-            order: VecDeque::new(),
-            max_objects: max_objects.max(1),
+            objects: ObjectTable::new(max_obj),
+            order: VecDeque::with_capacity(max_obj + 1),
+            max_objects: max_obj,
             recovered_count: 0,
         }
     }
@@ -290,6 +409,11 @@ impl FecReassembler {
     /// Number of objects currently being reassembled.
     pub fn in_flight(&self) -> usize {
         self.objects.len()
+    }
+
+    /// Whether any objects are currently in flight.
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty()
     }
 
     /// Dynamically update the baseline symbol size for newly arriving objects.
@@ -1476,5 +1600,58 @@ mod tests {
             Some(ct1.as_slice()),
             "Object 1 completes using preserved in-flight parameters"
         );
+    }
+
+    #[test]
+    fn test_object_table_churn_and_backward_shift() {
+        let mut table = ObjectTable::new(64);
+        assert!(table.is_empty());
+        assert_eq!(table.len(), 0);
+
+        let dummy = || ObjState {
+            payload: Vec::new(),
+            seen_mask: [0; 4],
+            source_count: 0,
+            total_count: 0,
+            k: 1,
+            shard_len: 100,
+            object_size: 100,
+            scheme: rs::Scheme::Pq,
+            done: false,
+            expires_at_ms: 1000,
+            repair_shards: Vec::new(),
+        };
+
+        // Insert 64 objects (keys 100..164)
+        for k in 100..164u64 {
+            table.insert(k, dummy());
+        }
+        assert_eq!(table.len(), 64);
+
+        // Remove even keys: 100, 102, ...
+        for k in (100..164u64).step_by(2) {
+            let removed = table.remove(&k);
+            assert!(removed.is_some());
+        }
+        assert_eq!(table.len(), 32);
+
+        // Verify odd keys are still present and accessible via get and index
+        for k in (101..164u64).step_by(2) {
+            assert!(table.contains_key(&k));
+            assert_eq!(table.get(&k).unwrap().shard_len, 100);
+            assert_eq!(table[&k].shard_len, 100);
+        }
+
+        // Verify even keys are gone
+        for k in (100..164u64).step_by(2) {
+            assert!(!table.contains_key(&k));
+            assert!(table.get(&k).is_none());
+        }
+
+        // Re-insert 32 new keys
+        for k in 200..232u64 {
+            table.insert(k, dummy());
+        }
+        assert_eq!(table.len(), 64);
     }
 }
