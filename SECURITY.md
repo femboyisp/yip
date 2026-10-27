@@ -17,33 +17,25 @@ rather stay anonymous. There is no bounty program.
 
 ## Supported versions
 
-There are no releases yet; `main` is the only supported branch. Fixes land there.
+| Version | Supported |
+| :--- | :--- |
+| 0.1.x | :white_check_mark: |
+| < 0.1.0 | :x: |
+
+Fixes land on `main` and are tagged for release.
 
 ## What yip protects
 
-- **Confidentiality + integrity** of tunneled traffic: ChaCha20-Poly1305 AEAD over a Noise-IK
-  session, per-direction keys, a replay window, and ~120 s rekey. Keys are classical today.
-- **Identity**: mesh membership requires a CA-signed certificate; handshake admission checks
-  the peer's static key; a TAI64N timestamp closes an endpoint-hijack-via-replay vector;
-  endpoint roaming follows only authenticated packets; rendezvous registration is signed on
-  the UDP path.
-- **Content-DPI resistance**: no fixed bytes or constant offsets (property-tested); nDPI
-  classifies obfuscated traffic as `Unknown`; an Xray-REALITY transport parrots real TLS for
-  hostile networks.
+- **Confidentiality + integrity**: ChaCha20-Poly1305 AEAD over a Noise-IK session, per-direction keys, a sliding replay window, and ~120 s forward-secret rekeys.
+- **Post-Quantum Security Margin**: Single-RTT hybrid key exchange pairing NIST FIPS 203 ML-KEM-512 (Kyber) with classical X25519 Diffie-Hellman to defeat Harvest-Now, Decrypt-Later (HNDL) attacks.
+- **Decentralized Root Authority**: Optional RFC 9591 FROST(Ed25519, SHA-512) threshold CA with ROAST asynchronous coordination, preprocessed 1-RTT nonces, and memory-locked (`mlock`) rollback-immune nonce vaults to eliminate single-point-of-compromise root key theft.
+- **Identity & Admission**: Mesh membership requires CA-signed certificates; handshake admission checks static keys; TAI64N monotonic timestamps prevent replay and endpoint-hijacking; endpoint roaming follows only authenticated packets; and rendezvous registration is cryptographically authenticated.
+- **Traffic Analysis Defense (DAITA)**: Discrete packet-length bucketing, stochastic multi-packet cover traffic bursts during idle periods, and bounded egress micro-jitter delay queues prevent statistical flow analysis.
+- **Content-DPI Resistance**: No fixed wire bytes or constant offsets; verified clean against a 4-engine DPI oracle panel (nDPI, tshark, Suricata, Zeek); an Xray-REALITY transport mimics real Chrome TLS 1.3 for hostile networks and splices unauthorized probers to authentic decoy servers.
 
-## What yip does *not* (yet) protect — read this
+## What yip does *not* protect — read this
 
-- **Traffic analysis.** There is no timing/padding (DAITA-style) defense yet. The FEC burst
-  shape, packet-size distribution, and constant-interval idle cover traffic are observable to
-  a statistical/flow classifier, and the high-entropy-UDP anomaly is not gated. Use the
-  REALITY/TLS transport, not plain `obf_psk`, where the network is actively hostile.
-- **The control plane has known hardening gaps** — the TLS relay-front registration is not yet
-  signed, the resolver can be steered by an unauthenticated address, and a couple of
-  registration/handshake replay windows exist. These are tracked openly in the
-  [issue tracker](https://github.com/femboyisp/yip/issues) (search `security`).
-- **No independent audit.** The crypto reuses audited primitives (`snow`, `ring`), but the
-  protocol composition and the control plane have not been externally reviewed.
+- **Physical Peer IP Concealment**: yip is a peer-to-peer overlay network, not an anonymizing mix-net like Tor. Connected nodes authenticate directly and see each other's physical IP addresses.
+- **No independent commercial audit**: The implementation uses audited cryptographic primitives (`ring`, `snow`, `frost-ed25519`), but the full protocol composition and daemon have not yet undergone an external third-party commercial audit.
 
-If a documented limitation above matters to your threat model, that's a reason to wait, not a
-vulnerability to report — but a *new* way to break the stated guarantees is exactly what we
-want to hear about privately.
+If a documented limitation above matters to your threat model, that's a reason to plan accordingly — but a *new* way to break the stated guarantees is exactly what we want to hear about privately.

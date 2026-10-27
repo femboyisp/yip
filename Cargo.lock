@@ -2560,22 +2560,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "yip"
-version = "0.1.0"
-dependencies = [
- "yip-ca",
- "yip-crypto",
- "yip-device",
- "yip-io",
- "yip-membership",
- "yip-obf",
- "yip-rendezvous",
- "yip-transport",
- "yip-utls",
- "yip-wire",
-]
-
-[[package]]
 name = "yip-bench"
 version = "0.1.0"
 dependencies = [
@@ -2644,6 +2628,22 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.4.3",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "yip-mesh"
+version = "0.1.0"
+dependencies = [
+ "yip-ca",
+ "yip-crypto",
+ "yip-device",
+ "yip-io",
+ "yip-membership",
+ "yip-obf",
+ "yip-rendezvous",
+ "yip-transport",
+ "yip-utls",
+ "yip-wire",
 ]
 
 [[package]]

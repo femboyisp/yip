@@ -8,8 +8,8 @@
 *Reed-Solomon FEC loss immunity • 40 Gbps AF_XDP multi-core scaling • Decentralized threshold PKI • Anti-DPI TLS mimicry*
 
 <p align="center">
-  <a href="https://crates.io/crates/yip"><img src="https://img.shields.io/crates/v/yip.svg?logo=rust" alt="Crates.io" /></a>
-  <a href="https://docs.rs/yip"><img src="https://img.shields.io/docsrs/yip?logo=docsdotrs" alt="docs.rs" /></a>
+  <a href="https://crates.io/crates/yip-mesh"><img src="https://img.shields.io/crates/v/yip-mesh.svg?logo=rust" alt="Crates.io" /></a>
+  <a href="https://docs.rs/yip-mesh"><img src="https://img.shields.io/docsrs/yip-mesh?logo=docsdotrs" alt="docs.rs" /></a>
   <a href="https://github.com/femboyisp/yip/actions/workflows/ci.yml"><img src="https://github.com/femboyisp/yip/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="https://github.com/femboyisp/yip/actions/workflows/mutants.yml"><img src="https://img.shields.io/badge/cargo--mutants-tested-blueviolet.svg" alt="cargo-mutants" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License: AGPL-3.0" /></a>
@@ -52,7 +52,7 @@ Find the fastest path to what you need:
 | 🟢 **New User** | Install binary → Generate keypair → Connect two nodes → Ping overlay | [5-Minute Quickstart](#5-minute-quickstart) • [`01. Getting Started`](docs/01-getting-started.md) |
 | 🌐 **Mesh Operator** | Choose deployment topology → Set up root CA / Threshold Quorum → Configure seeds | [Deployment Modes](#primary-deployment-modes) • [`Threshold CA Guide`](examples/threshold-ca/README.md) • [`02. Configuration`](docs/02-configuration.md) |
 | 🛠️ **Developer** | Inspect lock-free ring buffers → Zero-alloc FEC pipeline → Run test suites | [`03. Architecture`](docs/03-architecture.md) • [`crates/yip-bench`](crates/yip-bench/RESULTS.md) |
-| 🦀 **Rust Developer** | Import `yip` facade crate → Embed Cauchy RS-FEC or Noise-IK into custom apps | [Rust Library & SDK](#rust-library--sdk) • [`crates/yip`](crates/yip/README.md) • [docs.rs](https://docs.rs/yip) |
+| 🦀 **Rust Developer** | Import `yip-mesh` facade crate → Embed Cauchy RS-FEC or Noise-IK into custom apps | [Rust Library & SDK](#rust-library--sdk) • [`crates/yip-mesh`](crates/yip-mesh/README.md) • [docs.rs](https://docs.rs/yip-mesh) |
 | 🛡️ **Security Reviewer** | Verify post-quantum hybrid KEM → ROAST threshold quorum → Anti-DPI test oracle | [Trust Model](#crisp-trust-model--security-invariants) • [`04. Security & Threat Model`](docs/04-security-and-threat-model.md) |
 
 ---
@@ -346,11 +346,11 @@ Explore the full documentation curriculum organized by role and interest:
 
 ## Rust Library & SDK
 
-The `yip` workspace publishes a unified facade crate [`yip`](crates/yip) for embedding yip's primitives directly into your Rust applications:
+The `yip` workspace publishes a unified facade crate [`yip-mesh`](crates/yip-mesh) for embedding yip's primitives directly into your Rust applications:
 
 ```toml
 [dependencies]
-yip = { version = "0.1", features = ["full"] }
+yip-mesh = { version = "0.1", features = ["full"] }
 ```
 
 ### Modular Feature Flags

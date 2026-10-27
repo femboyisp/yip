@@ -1,14 +1,14 @@
-# yip
+# yip-mesh
 
-[![Crates.io](https://img.shields.io/crates/v/yip.svg)](https://crates.io/crates/yip)
-[![Documentation](https://docs.rs/yip/badge.svg)](https://docs.rs/yip)
+[![Crates.io](https://img.shields.io/crates/v/yip-mesh.svg)](https://crates.io/crates/yip-mesh)
+[![Documentation](https://docs.rs/yip-mesh/badge.svg)](https://docs.rs/yip-mesh)
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/License-AGPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/agpl-3.0.html)
 
 The unified Rust library and SDK for the **yip** high-performance overlay network protocol.
 
 ## Features
 
-The `yip` crate provides modular facade access to all underlying protocol components:
+The `yip-mesh` crate provides modular facade access to all underlying protocol components:
 
 - **`crypto`** (default): AEAD ciphers (ChaCha20-Poly1305, AES-256-GCM, AES-128-GCM), Noise-IK handshakes, BLAKE2s hashing, and key derivations.
 - **`wire`** (default): Zero-allocation framing, wire codec parsing, header obfuscation, and control frame encoding.
@@ -24,16 +24,16 @@ The `yip` crate provides modular facade access to all underlying protocol compon
 
 ## Quickstart
 
-Add `yip` to your `Cargo.toml`:
+Add `yip-mesh` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-yip = { version = "0.1", features = ["full"] }
+yip-mesh = { version = "0.1", features = ["full"] }
 ```
 
 ### Self-Certifying Mesh Address Generation
 
 ```rust
-use yip::membership::cert::Cert;
-use yip::membership::addr::MeshAddr;
+use yip_mesh::membership::cert::Cert;
+use yip_mesh::membership::addr::MeshAddr;
 ```

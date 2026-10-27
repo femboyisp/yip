@@ -117,14 +117,19 @@ The `yip` codebase is organized into modular Rust crates with strict interface b
 
 | Crate | Responsibility | Unsafe Code |
 | :--- | :--- | :--- |
+| [`crates/yip-mesh`](../crates/yip-mesh) | Primary unified SDK facade crate exposing modular feature flags (`crypto`, `wire`, `transport`, `membership`, `device`, `io`, etc.). | `#![forbid(unsafe_code)]` |
 | [`crates/yip-crypto`](../crates/yip-crypto) | Noise-IKpsk2 state machine, ML-KEM-512 post-quantum KDF, ChaCha20-Poly1305 AEAD, sliding replay window. | `#![forbid(unsafe_code)]` |
 | [`crates/yip-wire`](../crates/yip-wire) | Frame serialization, SipHash-1-3 coverage authentication, keyed header obfuscation. | `#![forbid(unsafe_code)]` |
 | [`crates/yip-transport`](../crates/yip-transport) | Flow classification, GF(256) Cauchy Reed-Solomon FEC, RLNC codec, thin ARQ, PLPMTU discovery. | `#![forbid(unsafe_code)]` |
+| [`crates/yip-membership`](../crates/yip-membership) | Cryptographic identity certificates, RootSets, epidemic anti-entropy gossip, and TAI64N replay freshness. | `#![forbid(unsafe_code)]` |
 | [`crates/yip-device`](../crates/yip-device) | Multi-queue Linux TUN/TAP device provisioning, ioctl allocation, MTU negotiation. | Encapsulated |
 | [`crates/yip-io`](../crates/yip-io) | Vectorized `recvmmsg`/`sendmmsg`, GSO batching, `io_uring` multishot driver, AF_XDP/eBPF kernel bypass, lock-free SPSC rings. | Quarantined / Audited |
 | [`crates/yip-rendezvous`](../crates/yip-rendezvous) | NAT discovery, reflexive candidate harvesting, symmetric NAT port prediction, DERP relay fallback. | `#![forbid(unsafe_code)]` |
+| [`crates/yip-obf`](../crates/yip-obf) | Steganographic framing, SipHash-CTR masking, DAITA length quantization, and stochastic cover bursts. | `#![forbid(unsafe_code)]` |
+| [`crates/yip-utls`](../crates/yip-utls) | TLS 1.3 Chrome ClientHello mimicry, ML-KEM-768 hybrid KEX, and REALITY active-probe camouflage. | `#![forbid(unsafe_code)]` |
 | [`bin/yipd`](../bin/yipd) | Core routing daemon, CLI management, configuration parsing, multi-core worker thread sharding. | Application |
-| [`bin/yip-ca`](../bin/yip-ca) | Cryptographic identity authority, Ed25519 root certificates, node enrollment certificates. | Application |
+| [`bin/yip-ca`](../bin/yip-ca) | Threshold (RFC 9591 FROST) & offline root CA daemon, ROAST consensus engine, and client enrollment CLI. | Application |
+| [`bin/yip-rendezvous`](../bin/yip-rendezvous) | Blind relay rendezvous daemon, authenticated relay Trojan front, and REALITY TCP splicing proxy. | Application |
 
 ---
 

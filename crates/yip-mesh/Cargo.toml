@@ -1,5 +1,5 @@
 [package]
-name = "yip"
+name = "yip-mesh"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

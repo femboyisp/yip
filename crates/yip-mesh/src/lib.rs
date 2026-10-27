@@ -1,8 +1,8 @@
-//! # yip
+//! # yip-mesh
 //!
 //! High-performance userspace WireGuard-alternative overlay network protocol and Rust SDK.
 //!
-//! `yip` unifies the sub-crates of the yip project into a modular, cohesive library.
+//! `yip-mesh` unifies the sub-crates of the yip project into a modular, cohesive library.
 //! Whether you are integrating yip's slotted Reed-Solomon FEC into custom network protocols,
 //! verifying self-certifying mesh certificates, or orchestrating FROST threshold signers,
 //! `yip` provides typed, memory-safe primitives.

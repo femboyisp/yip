@@ -5,8 +5,7 @@ All notable changes to this project are documented here, following
 
 ## [Unreleased]
 
-No release has been cut yet — everything below is tracked under `[Unreleased]`
-until 0.1.0.
+## [0.1.0] - 2026-10-27
 
 ### Security
 - **Decentralized Threshold CA Quorum via RFC 9591 FROST Ed25519 & ROAST Asynchronous Coordination (`bin/yip-ca`, `crates/yip-membership`, `bin/yipd`, #39, PR #180).**
@@ -520,3 +519,6 @@ until 0.1.0.
 - `yip-bench`: hot-path micro-benchmarks (AEAD, wire framing, RaptorQ FEC encode)
   via Criterion, and a `tc netem` latency/loss harness comparing the yip tunnel
   against kernel WireGuard (results in `crates/yip-bench/README.md`).
+
+[Unreleased]: https://github.com/femboyisp/yip/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/femboyisp/yip/releases/tag/v0.1.0

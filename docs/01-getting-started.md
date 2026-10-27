@@ -168,14 +168,14 @@ docker run -d \
 To integrate `yip` directly into your Rust services or network daemons, add the facade crate:
 
 ```sh
-cargo add yip --features full
+cargo add yip-mesh --features full
 ```
 
 Or cherry-pick specific components in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-yip = { version = "0.1", default-features = false, features = ["crypto", "transport", "wire"] }
+yip-mesh = { version = "0.1", default-features = false, features = ["crypto", "transport", "wire"] }
 ```
 
 ### Control Utility Symlink (`yipctl`)

@@ -10,7 +10,7 @@ license = "AGPL-3.0-or-later"
 authors = ["FEMBOY CYBER NETWORKS LLC <security@femboy.is>"]
 repository = "https://github.com/femboyisp/yip"
 homepage = "https://github.com/femboyisp/yip"
-documentation = "https://docs.rs/yip"
+documentation = "https://docs.rs/yip-mesh"
 keywords = ["vpn", "mesh", "fec", "cryptography", "peer-to-peer"]
 categories = ["network-programming", "cryptography"]
 
