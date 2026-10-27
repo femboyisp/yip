@@ -499,6 +499,9 @@ roots=/etc/yip/network.roots
 member_sign_private=c22239d00522843313aa03a662e8f0cb6abb7889f8f103510ebb5dee0e924857
 network_id=f11a8e0df8fa6352eeb62192de7ece47
 
+# Optional: Online Threshold CA Coordinator for zero-touch 70% TTL auto-renewal
+threshold_ca_server=198.51.100.10:4443
+
 # Optional: Set rendezvous relay for members behind NAT
 rendezvous=198.51.100.1:443
 ```
@@ -608,11 +611,12 @@ Parameters governing NAT traversal, blind relays, and decentralized cryptographi
 | Configuration Directive | Type | Default Value | Valid Range / Format | Operational Impact |
 | :--- | :--- | :--- | :--- | :--- |
 | `rendezvous`<br/>*(TOML: `server`)* | String | *None* (Optional) | `IP:port`, `tls://...`, `reality://...` | Coordinator address. Supports plain UDP (`IP:port`), TLS relay (`tls://host:port`), and REALITY relay dial (`reality://...`). |
-| `ca_public` | String (Hex) | *None* (Repeatable) | 64 hex characters (32 bytes) | Trusted root CA Ed25519 public key(s). Used to verify membership certificates and the network root set. |
+| `ca_public` | String (Hex) | *None* (Repeatable) | 64 hex characters (32 bytes) | Trusted root CA Ed25519 public key(s). Used to verify membership certificates and the network root set. For a threshold CA, set to group verifying key from `dealer-gen`. |
 | `cert` | String (Path) | *None* | Filesystem path | Path to file containing this node's CA-signed membership certificate blob. |
 | `roots` | String (Path) | *None* | Filesystem path | Path to file containing the CA-signed root set. Verified against `ca_public` at boot. |
 | `member_sign_private` | String (Hex) | *None* | 64 hex characters (32 bytes) | Node Ed25519 signing key used to sign gossip membership records. Kept strictly secret. |
 | `network_id` | String (Hex) | *None* | 32 hex characters (16 bytes) | Unique 16-byte identifier for the private mesh network. |
+| `threshold_ca_server`<br/>*(Alias: `ca_server`)* | String | *None* (Optional) | `IP:port` (IPv4 or `[IPv6]:port`) | Address of online threshold CA coordinator. Enables automatic background renewal at $\ge 70\%$ of certificate TTL. |
 
 #### Rendezvous Dial Scheme Formats
 - **Plain UDP**: `rendezvous=198.51.100.5:51821`
@@ -711,13 +715,77 @@ yipctl peer add <PUBLIC_KEY_HEX> 203.0.113.25:443 raw
 # Dynamically remove a peer
 yipctl peer rm <PUBLIC_KEY_HEX>
 
+# Query node certificate status, remaining TTL, and threshold renewal threshold
+yipctl cert status
+
+# Trigger an immediate certificate renewal against the threshold CA coordinator
+yipctl cert renew
+
 # Launch the real-time terminal throughput dashboard
 yipctl top
 ```
 
 ---
 
-## 5. Troubleshooting Common Failures
+## 5. `yip-ca` Command-Line Reference
+
+`yip-ca` manages both offline and online Certificate Authority operations:
+
+### Offline CA Commands
+```sh
+# Generate single-signer CA Ed25519 keypair
+yip-ca genkey
+
+# Issue signed membership certificate
+yip-ca sign-cert \
+  --member <32-byte-hex> \
+  --member-sign <32-byte-hex> \
+  --network <16-byte-hex> \
+  (--days <N> | --secs <N>) \
+  [--ca-private <64-byte-hex>]
+
+# Sign bootstrap network root set
+yip-ca sign-roots \
+  --roots <path-to-roots.in> \
+  --version <N> \
+  [--ca-private <64-byte-hex>]
+```
+
+### Decentralized Threshold CA Commands (RFC 9591 FROST)
+```sh
+# Generate t-of-n Shamir key packages and group public key
+yip-ca dealer-gen \
+  --threshold <T> \
+  --signers <N> \
+  --out-dir <output-directory>
+
+# Run online coordinator daemon (enrollment gateway + ROAST aggregation)
+yip-ca serve \
+  --role coordinator \
+  --bind <IP:port> \
+  --threshold <T> \
+  --pubkey <path-to-pubkey_package.json>
+
+# Run isolated signer daemon (nonce vault + local policy engine)
+yip-ca serve \
+  --role signer \
+  --coordinator <IP:port> \
+  --key <path-to-signer_N.json> \
+  --pubkey <path-to-pubkey_package.json> \
+  [--max-ttl <secs>]
+
+# Enroll client node directly over online RPC (1-RTT preprocessed nonces)
+yip-ca enroll \
+  --server <IP:port> \
+  --member <32-byte-hex> \
+  --member-sign <32-byte-hex> \
+  --network <16-byte-hex> \
+  [--out <output-cert-path>]
+```
+
+---
+
+## 6. Troubleshooting Common Failures
 
 ### 1. `PermissionDenied` when binding port 443
 - **Cause**: Unprivileged process attempting to bind a network port below 1024.

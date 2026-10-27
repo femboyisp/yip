@@ -534,27 +534,36 @@ sudo yipctl top
 
 In the point-to-point setup in Section 4, each node required an explicit `[peer]` block defining the remote public key and endpoint. While simple for two nodes, configuring and distributing static peer blocks across dozens or hundreds of nodes becomes an operational headache.
 
-**Mesh mode solves this with zero-trust cryptographic admission.** Instead of maintaining static peer lists, nodes dynamically discover authorized members and establish point-to-point tunnels on demand:
-
-1. An **offline Certificate Authority (`yip-ca`)** issues cryptographic membership certificates (`Cert`) binding a node's Noise identity and Ed25519 gossip signing key.
-2. A **signed root set (`RootSet`)** seeds the network with authoritative bootstrap nodes.
-3. Nodes gossip membership records with sub-nanosecond TAI64N anti-replay protection.
-4. When traffic is routed to a peer's self-certifying IPv6 address (`fd00::/8`), `yipd` dynamically resolves the peer endpoint from the gossip directory and brings up the encrypted Noise-IK session.
+**Mesh mode solves this with zero-trust cryptographic admission.** Instead of maintaining static peer lists, nodes dynamically discover authorized members and establish point-to-point tunnels on demand. `yip` provides two CA models:
+- **Model A: Offline Single-Key Root CA**: For air-gapped root-of-trust deployments where certificates and root sets are minted manually.
+- **Model B: Decentralized Threshold CA ($t$-of-$n$ FROST)**: For online, automated environments where signing authority is distributed across a quorum of independent signer daemons, with 1-RTT enrollment and automated background renewal in `yipd`.
 
 ```mermaid
 flowchart TD
-    CA["Offline CA (yip-ca)<br/>Holds ca_private"] -- "1. Issue Cert" --> NodeA["Node A<br/>Holds node.cert"]
-    CA -- "1. Issue Cert" --> NodeB["Node B<br/>Holds node.cert"]
-    CA -- "2. Sign RootSet" --> Roots["network.roots<br/>Lists Bootstrap Seed Nodes"]
+    subgraph Quorum ["Certificate Authority Options"]
+        OfflineCA["Model A: Offline Single CA<br/>Air-gapped Master Key"]
+        ThresholdCA["Model B: t-of-n Threshold CA<br/>RFC 9591 FROST Quorum"]
+    end
 
-    NodeA -- "3. Boot & Load roots" --> Roots
-    NodeB -- "3. Boot & Load roots" --> Roots
+    NodeA["Node A<br/>Holds node.cert"]
+    NodeB["Node B<br/>Holds node.cert"]
+    Roots["network.roots<br/>Lists Bootstrap Seed Nodes"]
 
-    NodeA <-->|"4. Authenticated Gossip<br/>(TAI64N Timestamped)"| NodeB
-    NodeA <===>|"5. Dynamic Encrypted Tunnel<br/>(Noise-IK + RS-FEC)"| NodeB
+    OfflineCA -.->|Issue Cert / Sign Roots| NodeA & NodeB & Roots
+    ThresholdCA -.->|Online 1-RTT Enroll / Renew| NodeA & NodeB
+
+    NodeA -- "Boot & Load roots" --> Roots
+    NodeB -- "Boot & Load roots" --> Roots
+
+    NodeA <-->|"Authenticated Gossip<br/>(TAI64N Timestamped)"| NodeB
+    NodeA <===>|"Dynamic Encrypted Tunnel<br/>(Noise-IK + RS-FEC)"| NodeB
 ```
 
-### Step 1: Initialize the Offline Root CA
+---
+
+### Model A: Offline Root CA Workflow
+
+#### Step 1: Initialize the Offline Root CA
 
 Run `yip-ca genkey` on a secure management machine (or offline workstation) to generate the root CA keypair:
 
@@ -624,6 +633,58 @@ yip-ca sign-roots \
 
 Distribute `/etc/yip/network.roots` to all member nodes.
 
+---
+
+### Model B: Decentralized Threshold CA Workflow (FROST Ed25519)
+
+In this model, no single machine holds the root private key. Instead, authority is partitioned across a $t$-of-$n$ quorum of signer daemons.
+
+#### Step 1: Generate Threshold Key Packages
+
+Generate a 2-of-3 threshold quorum:
+```sh
+mkdir -p /etc/yip/ca-shares
+yip-ca dealer-gen --threshold 2 --signers 3 --out-dir /etc/yip/ca-shares
+```
+*Output:*
+- `pubkey_package.json`: Contains the group verifying key (`threshold_ca_public`). Distribute this to the coordinator and signers.
+- `signer_1.json`, `signer_2.json`, `signer_3.json`: Private `KeyPackage` shares. Distribute exactly one file to each respective signer host (`chmod 0600`).
+
+#### Step 2: Start Coordinator and Signer Daemons
+
+On the coordinator host (e.g. `198.51.100.10:4443`):
+```sh
+yip-ca serve \
+  --role coordinator \
+  --bind 0.0.0.0:4443 \
+  --threshold 2 \
+  --pubkey /etc/yip/ca-shares/pubkey_package.json
+```
+
+On each of the three signer hosts (initiates an outbound persistent connection with preprocessed nonces):
+```sh
+yip-ca serve \
+  --role signer \
+  --coordinator 198.51.100.10:4443 \
+  --key /etc/yip/ca-shares/signer_1.json \
+  --pubkey /etc/yip/ca-shares/pubkey_package.json \
+  --max-ttl 2592000
+```
+
+#### Step 3: Enroll Member Node Online (1-RTT)
+
+Request a signed certificate from the online coordinator in a single round-trip:
+```sh
+yip-ca enroll \
+  --server 198.51.100.10:4443 \
+  --member "$NODE_PUB" \
+  --member-sign "$SIGN_PUB" \
+  --network f11a8e0df8fa6352eeb62192de7ece47 \
+  --out /etc/yip/node.cert
+```
+
+---
+
 ### Step 5: Configure Mesh Node
 
 Create `/etc/yip/yipd.conf` on the member node. Note the complete absence of any `[peer]` blocks:
@@ -642,6 +703,9 @@ cert=/etc/yip/node.cert
 roots=/etc/yip/network.roots
 member_sign_private=c22239d00522843313aa03a662e8f0cb6abb7889f8f103510ebb5dee0e924857
 network_id=f11a8e0df8fa6352eeb62192de7ece47
+
+# Optional: Threshold CA coordinator for automated 70% TTL background rotation
+# threshold_ca_server=198.51.100.10:4443
 
 # Optional: Add rendezvous for members located behind NAT
 rendezvous=198.51.100.5:443
@@ -671,6 +735,12 @@ sudo yipctl peers
 ```
 
 When you send traffic to any member's self-certifying IPv6 address (e.g. `ping6 <peer-mesh-ip>`), `yipd` resolves the destination through its internal directory and establishes the tunnel automatically.
+
+If running with `threshold_ca_server`, check certificate renewal status or trigger immediate rotation via the control socket:
+```sh
+sudo yipd cert status
+sudo yipd cert renew
+```
 
 ---
 

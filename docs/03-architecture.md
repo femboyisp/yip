@@ -57,6 +57,14 @@ For automated benchmarks, performance analysis, and tuning, see [testing-and-ben
   - [Sliding Bitmap Replay Protection](#sliding-bitmap-replay-protection)
   - [Side-Channel Mitigation & Memory Zeroization](#side-channel-mitigation--memory-zeroization)
   - [Blind Packet Injection & DoS Defense](#blind-packet-injection--dos-defense)
+- [9. Decentralized Threshold PKI & FROST Consensus Quorum](#9-decentralized-threshold-pki--frost-consensus-quorum)
+  - [Dual PKI Topology & Wire Compatibility Invariant](#dual-pki-topology--wire-compatibility-invariant)
+  - [RFC 9591 FROST(Ed25519, SHA-512) Ciphersuite](#rfc-9591-frosted25519-sha-512-ciphersuite)
+  - [Single-Round (1-RTT) Preprocessed Nonce Pools](#single-round-1-rtt-preprocessed-nonce-pools)
+  - [ROAST Asynchronous Coordinator State Machine](#roast-asynchronous-coordinator-state-machine)
+  - [Rollback-Immune Ephemeral Nonce Vault](#rollback-immune-ephemeral-nonce-vault)
+  - [Proactive Polynomial Refresh & Lost-Share Repair](#proactive-polynomial-refresh--lost-share-repair)
+  - [Zero-Touch Background Renewal in yipd (70% TTL)](#zero-touch-background-renewal-in-yipd-70-ttl)
 
 ---
 
@@ -744,4 +752,141 @@ To defeat packet replay attacks across high-speed connections, `crates/yip-crypt
 
 ---
 
-*For further implementation details, inspect the source implementations in [`crates/yip-io`](../crates/yip-io), [`crates/yip-crypto`](../crates/yip-crypto), [`crates/yip-transport`](../crates/yip-transport), and [`crates/yip-wire`](../crates/yip-wire).*
+## 9. Decentralized Threshold PKI & FROST Consensus Quorum
+
+To eliminate operational friction and single-point-of-compromise vulnerabilities inherent in centralized or offline root authorities, `yip` implements a decentralized **Threshold Certificate Authority** ($t$-of-$n$) grounded in **RFC 9591 Flexible Round-Optimized Schnorr Threshold (FROST)** signatures.
+
+```mermaid
+flowchart TD
+    subgraph ThresholdCA ["Decentralized Threshold CA Quorum (t-of-n)"]
+        Coord["ROAST Coordinator Gateway<br/>(yip-ca serve --role coordinator)<br/>Maintains Nonce Pools & Aggregation"]
+        S1["Signer 1<br/>KeyPackage 1<br/>EphemeralNonceVault"]
+        S2["Signer 2<br/>KeyPackage 2<br/>EphemeralNonceVault"]
+        Sn["Signer n<br/>KeyPackage n<br/>EphemeralNonceVault"]
+
+        S1 -- "Preprocessed Nonces" --> Coord
+        S2 -- "Preprocessed Nonces" --> Coord
+        Sn -- "Preprocessed Nonces" --> Coord
+    end
+
+    Client["Mesh Node (yipd)<br/>Self-Certifying Identity"]
+
+    Client -->|"1. EnrollRequest (CSR + PoP)"| Coord
+    Coord -->|"2. Round2SignRequest (Single RTT)"| S1 & S2
+    S1 & S2 -->|"3. Round2SignResponse (Shares)"| Coord
+    Coord -->|"4. Aggregate 64-byte Ed25519 Sig"| Coord
+    Coord -->|"5. Standard Wire-Identical Cert"| Client
+```
+
+### Dual PKI Topology & Wire Compatibility Invariant
+
+`yip` supports two distinct operational modes for Certificate Authorities:
+1. **Offline Single-Signer CA**: Master private scalar $sk$ stored air-gapped on an administrative host (`yip-ca sign-cert`).
+2. **Decentralized Threshold CA**: Secret scalar is partitioned into $n$ Shamir secret shares across independent daemons (`yip-ca serve --role signer`).
+
+**The Wire Compatibility Invariant**:
+Under Schnorr threshold signatures (RFC 9591 §5.2), partial signature shares $z_i = d_i + (e_i \cdot \rho_i) + \lambda_i s_i c$ aggregate linearly:
+
+$$z = \sum_{i \in S} z_i \pmod \ell$$
+
+The resulting signature pair $(R, z)$ is a standard 64-byte Ed25519 signature verifying under group public key $Y = s \cdot B$.
+
+> [!IMPORTANT]
+> **Byte-for-Byte Wire Compatibility**: Certificates emitted by a threshold quorum are bit-for-bit indistinguishable from certificates issued by a single-signer CA. The verifier in `crates/yip-membership/src/cert.rs::verify_cert`, the data-plane handshake in `bin/yipd/src/handshake.rs`, and rendezvous relay registration require zero modifications or protocol forks.
+
+### RFC 9591 FROST(Ed25519, SHA-512) Ciphersuite
+
+The threshold engine uses `frost-ed25519 v3.0.0` over Edwards25519 with SHA-512 transcript hashing:
+- **Group Elements**: Compressed 32-byte Edwards points.
+- **Scalars**: 32-byte integers modulo $\ell = 2^{252} + 27742317777372353535851937790883648493$.
+- **Hardened Dependencies**: Pinned against CVE-2025-58359 threshold-drift vulnerabilities.
+
+### Single-Round (1-RTT) Preprocessed Nonce Pools
+
+Standard FROST requires two interactive rounds: Round 1 (commitment exchange) and Round 2 (partial signature emission). Across WAN networks, 2-RTT signing doubles latency and increases susceptibility to packet loss.
+
+`yip-ca` collapses online enrollment into **1-RTT single-round signing** via preprocessed nonce pools:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as Signer Daemons (P_1..P_n)
+    participant C as Coordinator Gateway
+    participant N as Enrolling Node (yipd)
+
+    Note over S,C: Offline / Continuous Background Preprocessing
+    S->>S: Generate Nonces (d_i, e_i) & Commitments (D_i, E_i)
+    S->>C: RegisterCommitments(batch of 16 nonces)
+    Note over C: Coordinator caches pool of valid SigningCommitments
+
+    Note over N,C: Single-Round Online Certificate Enrollment
+    N->>C: EnrollRequest(Node Identity, MemberSign, NetworkID, CSR PoP)
+    Note over C: Validate CSR PoP & Assemble SigningPackage
+    C->>S: Round2SignRequest(session_id, SigningPackage, nonces)
+    Note over S: Atomic take_once() from EphemeralNonceVault & Policy Check
+    S->>C: Round2SignResponse(session_id, SignatureShare)
+    Note over C: Verify shares & Linear Aggregation
+    C->>N: EnrollResponse(Standard 64-byte Ed25519 Cert)
+```
+
+### ROAST Asynchronous Coordinator State Machine
+
+To prevent slow or malicious signers from stalling certificate issuance, the coordinator wraps FROST signing sessions in the **ROAST (Robust Asynchronous Schnorr Threshold)** algorithm:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle: Coordinator Listening
+    Idle --> Inspecting: Incoming EnrollRequest
+    Inspecting --> SelectQuorum: CSR Proof-of-Possession Valid
+    Inspecting --> Idle: Malformed / Invalid PoP
+
+    SelectQuorum --> AwaitingShares: Dispatch Round2SignRequest to t Signers
+
+    AwaitingShares --> Aggregate: Received t Valid SignatureShares
+    AwaitingShares --> ReassignQuorum: Signer Timeout / Malformed Share (Identifiable Abort)
+
+    ReassignQuorum --> AwaitingShares: Mark Culprit Byzantine, Select Alternate Signer
+
+    Aggregate --> Delivered: Compute Combined (R, z) & Emit Cert
+    Delivered --> Idle: Refresh Nonce Stock
+```
+
+- **Identifiable Aborts**: If a signer returns an invalid partial signature, `frost_ed25519::verify_signature_share` pinpoint-identifies the dishonest participant (`Error::culprit()`), allowing the coordinator to log the fault, mark the signer Byzantine, and substitute an alternate responsive signer without restarting the enrollment session.
+- **$n - t$ Fault Tolerance**: The system guarantees liveness as long as any $t$ honest signers are reachable.
+
+### Rollback-Immune Ephemeral Nonce Vault
+
+In virtualized or cloud environments, VM snapshots, live migrations, and container crash-restarts present a catastrophic threat to threshold Schnorr signatures: if a signer rolls back its state and signs a distinct message with an identical nonce pair $(d_i, e_i)$, an attacker can solve for the signer's long-term private share $s_i$.
+
+`yip-ca` mitigates this via `EphemeralNonceVault`:
+1. **Physical Memory Locking (`mlock`)**: Nonce allocations are locked into non-swappable physical RAM to prevent core dumps or swap partition leakage.
+2. **Monotonic Boot Epoch Watermark**: At startup, the vault initializes a 128-bit CSPRNG `boot_epoch_id`. Any attempt to present nonces from a mismatched epoch is rejected.
+3. **Atomic Single-Use Extraction (`take_once`)**: Nonces are moved out of the vault atomically and zeroized (`ZeroizeOnDrop`) upon consumption. A nonce can never be reused.
+
+### Proactive Polynomial Refresh & Lost-Share Repair
+
+To protect long-lived quorums against mobile adversaries who compromise signers sequentially over time, `yip-ca` supports zero-knowledge proactive share refreshing:
+- **Zero-Knowledge Refresh Polynomials**: Signers exchange zero-constant polynomials $f_i(0) = 0$. Each signer updates its secret share $s_i' = s_i + \sum \delta_{j \to i}$, completely invalidating all historical shares while leaving the group verifying key $Y$ strictly invariant.
+- **Lost-Share Repair**: If a signer suffers hardware failure or data corruption, an online repair ceremony allows $t$ active signers to construct a replacement share for the restored node without reconstructing the root secret.
+
+### Zero-Touch Background Renewal in yipd (70% TTL)
+
+Nodes running `yipd` with `threshold_ca_server` configured eliminate manual certificate renewal overhead:
+
+```mermaid
+flowchart LR
+    subgraph yipd ["yipd Background Monitor"]
+        Check["Periodic Tick<br/>Measure Cert Lifetime"]
+        Check -->|< 70% TTL| Sleep["No Action<br/>Continue Fast Datapath"]
+        Check -->|>= 70% TTL| Renew["Non-Blocking Online Renewal<br/>RPC to threshold_ca_server"]
+        Renew --> Success["Atomically Update Memory Cert<br/>& Overwrite Disk File"]
+    end
+```
+
+- **Non-Blocking Background Renewal**: Initiated during event loop ticks without interrupting active data-plane packet forwarding or kernel-bypass queues.
+- **Fail-Safe Grace Window**: If the coordinator or threshold quorum is transiently unreachable at 70% TTL, `yipd` logs a warning and retries smoothly across the remaining 30% validity window.
+- **Operator Observability**: Real-time status and manual rotation are exposed via `yipd cert status` and `yipd cert renew` over the UNIX domain control socket.
+
+---
+
+*For further implementation details, inspect the source implementations in [`crates/yip-io`](../crates/yip-io), [`crates/yip-crypto`](../crates/yip-crypto), [`crates/yip-transport`](../crates/yip-transport), [`crates/yip-membership`](../crates/yip-membership), and [`bin/yip-ca`](../bin/yip-ca).*

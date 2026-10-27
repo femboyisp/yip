@@ -62,9 +62,36 @@ Because throughput is inversely proportional to the square root of packet loss p
 - **Zero-Allocation Hot-Path Reassembly**: Pre-allocated contiguous object buffers and in-place Cauchy RS repair (`reconstruct_missing_sources`) deliver clean packets in **117 ns** with zero heap allocations.
 
 ### 2. Zero-Trust PKI & Decentralized Mesh Membership
-- **Cryptographic Authority (`yip-ca`)**: Offline or operator-governed root-of-trust issuing signed node membership certificates (`Cert`).
+- **Dual Cryptographic CA Architecture**: Supports both an air-gapped, offline master key root CA (`yip-ca sign-cert`) and an online, decentralized **$t$-of-$n$ Threshold CA** (`yip-ca serve --role coordinator|signer`).
+- **RFC 9591 FROST Ed25519 Quorum**: Threshold signers collaborate using the FROST(Ed25519, SHA-512) ciphersuite. Because Schnorr threshold signatures aggregate linearly into a standard 64-byte Ed25519 signature, threshold credentials are 100% byte-for-byte indistinguishable from single-signer certificates, requiring zero changes to existing node verifiers.
+- **Single-Round (1-RTT) Online Enrollment**: Pre-generated nonce pools (`frost_ed25519::round1::preprocess`) pre-cached at the coordinator collapse online certificate enrollment from two network round-trips to a single RPC round-trip.
+- **Asynchronous Robustness (ROAST)**: Coordinator signing loop is wrapped in a ROAST state machine, guaranteeing progress and unforgeable issuance even if up to $n - t$ signers are unresponsive, delayed, or Byzantine.
+- **Rollback-Immune Nonce Vault**: Memory-locked (`mlock`), zeroized-on-drop ephemeral nonce pools bound to 128-bit CSPRNG boot-epoch IDs eliminate nonce-reuse private key extraction under VM snapshots.
+- **Automated Lifecycle & Background Renewal**: Proactive zero-knowledge polynomial share refreshing (CVE-2025-58359 hardened), lost-share repair, and automated zero-touch renewal inside `bin/yipd` at $\ge 70\%$ of certificate TTL.
 - **Signed RootSets & Epidemic Gossip**: Node identity, authorized endpoints, and routing capabilities propagate across nodes using anti-entropy gossip protocol records (`Record`) with cryptographic signature validation.
 - **TAI64N Anti-Replay Freshness Gating**: Sub-nanosecond monotonic timestamps enforce strict certificate freshness and reject stale or replayed topology announcements.
+
+```mermaid
+flowchart TD
+    subgraph ThresholdCA ["Decentralized Threshold CA Quorum (t-of-n FROST)"]
+        Coord["Coordinator Gateway<br/>(yip-ca serve --role coordinator)<br/>ROAST State Machine"]
+        S1["Signer 1<br/>KeyShare 1<br/>Nonce Vault"]
+        S2["Signer 2<br/>KeyShare 2<br/>Nonce Vault"]
+        Sn["Signer n<br/>KeyShare n<br/>Nonce Vault"]
+
+        S1 -.->|1. Preprocessed Nonce Commitments| Coord
+        S2 -.->|1. Preprocessed Nonce Commitments| Coord
+        Sn -.->|1. Preprocessed Nonce Commitments| Coord
+    end
+
+    Node["Mesh Member Node (yipd)<br/>Automatic 70% TTL Rotation"]
+
+    Node -->|2. Enroll Request (CSR + PoP)| Coord
+    Coord -->|3. SigningPackage (Single RTT)| S1 & S2
+    S1 & S2 -->|4. Signature Shares| Coord
+    Coord -->|5. Linear Aggregation (RFC 9591)| Coord
+    Coord -->|6. Standard 64-byte Ed25519 Cert| Node
+```
 
 ### 3. Kernel-Bypass Performance
 - **Zero-Copy AF_XDP (XSK)**: Direct UMEM memory ring driver with per-core slab partitioning and lock-free ring recycling bypasses the Linux network stack, sustaining 40.27 Gbps and 3.93 Mpps across 8 CPU cores.
@@ -176,12 +203,21 @@ listen              = 0.0.0.0:443
 device              = yip0
 rendezvous          = 198.51.100.5:443
 
-# Zero-trust CA mesh enrollment (issued via yip-ca)
+# Zero-trust CA mesh enrollment (issued via yip-ca offline or online threshold CA)
 ca_public           = 8a03a4cf43c2907041efb394c0effabad5bdb4cbbc35d17c924c0b6cbfa8ba75
 cert                = /etc/yip/node.cert
 roots               = /etc/yip/network.roots
 member_sign_private = c22239d00522843313aa03a662e8f0cb6abb7889f8f103510ebb5dee0e924857
 network_id          = f11a8e0df8fa6352eeb62192de7ece47
+
+# Optional: Online threshold CA coordinator for zero-touch background renewal at >= 70% TTL
+threshold_ca_server = 198.51.100.10:4443
+```
+
+Check certificate validity or trigger immediate renewal via the daemon control socket:
+```bash
+sudo yipd cert status
+sudo yipd cert renew
 ```
 
 ---
