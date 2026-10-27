@@ -197,6 +197,40 @@ impl Membership {
         self.own_node_id
     }
 
+    /// Returns a reference to this node's own membership certificate.
+    pub fn own_cert(&self) -> &Cert {
+        &self.own_cert
+    }
+
+    /// Returns this node's record-signing private key.
+    pub fn own_sign_priv(&self) -> &[u8; 32] {
+        &self.sign_priv
+    }
+
+    /// Returns the mesh network ID.
+    pub fn network_id(&self) -> [u8; 16] {
+        self.network_id
+    }
+
+    /// Updates this node's own certificate, generates a new signed `Record` with incremented `seq`,
+    /// and inserts it into the local directory.
+    pub fn update_own_cert(&mut self, new_cert: Cert) -> Record {
+        self.own_cert = new_cert.clone();
+        let next_seq = self
+            .directory
+            .get(&self.own_node_id)
+            .map(|r| r.seq.saturating_add(1))
+            .unwrap_or(INITIAL_SEQ);
+        let rec = build_signed_record(
+            new_cert,
+            self.own_endpoints.clone(),
+            next_seq,
+            &self.sign_priv,
+        );
+        self.insert_record(rec.clone());
+        rec
+    }
+
     /// Mint a fresh, self-signed registration `Record` at `seq` (the
     /// rendezvous freshness counter). Reuses the gossip record machinery —
     /// same cert, same endpoints, monotonic `seq` — so the registration and

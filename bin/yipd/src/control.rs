@@ -37,6 +37,10 @@ pub enum ControlCmd {
         public_key: String,
         transport: String,
     },
+    #[serde(rename = "cert_status")]
+    CertStatus,
+    #[serde(rename = "cert_renew")]
+    CertRenew,
 }
 
 /// Outbound control command responses returned to clients.
@@ -56,6 +60,20 @@ pub enum ControlResponse {
     ListPeers {
         ok: bool,
         peers: Vec<PeerStats>,
+    },
+    CertStatus {
+        ok: bool,
+        not_before: u64,
+        not_after: u64,
+        ttl_remaining_secs: u64,
+        renewal_threshold_secs: u64,
+        is_threshold_ca: bool,
+    },
+    CertRenew {
+        ok: bool,
+        renewed: bool,
+        message: String,
+        new_not_after: Option<u64>,
     },
     Ack {
         ok: bool,
@@ -337,6 +355,42 @@ pub fn dispatch_cmd(
                 message: "peer transport updated".into(),
             }
         }
+        ControlCmd::CertStatus => {
+            let Some(m) = pm.membership() else {
+                return ControlResponse::Err {
+                    ok: false,
+                    error: "membership directory is not enabled".into(),
+                };
+            };
+            let cert = m.own_cert();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let ttl_remaining = cert.not_after.saturating_sub(now);
+            let total_ttl = cert.not_after.saturating_sub(cert.not_before);
+            let renewal_threshold = (total_ttl * 7) / 10;
+            ControlResponse::CertStatus {
+                ok: true,
+                not_before: cert.not_before,
+                not_after: cert.not_after,
+                ttl_remaining_secs: ttl_remaining,
+                renewal_threshold_secs: renewal_threshold,
+                is_threshold_ca: pm.threshold_ca_server.is_some(),
+            }
+        }
+        ControlCmd::CertRenew => match pm.renew_cert() {
+            Ok(new_cert) => ControlResponse::CertRenew {
+                ok: true,
+                renewed: true,
+                message: "certificate renewed successfully".into(),
+                new_not_after: Some(new_cert.not_after),
+            },
+            Err(e) => ControlResponse::Err {
+                ok: false,
+                error: format!("certificate renewal failed: {e}"),
+            },
+        },
     }
 }
 

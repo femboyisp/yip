@@ -164,6 +164,8 @@ pub struct Config {
     /// The mesh network id (`network_id=<hex32>`), embedded in and checked
     /// against every cert/record.
     pub network_id: Option<[u8; 16]>,
+    /// Optional online Threshold CA coordinator address for automated 70% TTL rotation and control commands.
+    pub threshold_ca_server: Option<SocketAddr>,
     /// Network-wide anti-DPI obfuscation shared secret (`obf_psk=<hex64>`).
     /// Absent (`None`) means obfuscation is disabled for this node. Feeds
     /// `yip_obf::derive_key` once Tasks 3/4 wire obfuscation into the wire
@@ -532,6 +534,7 @@ impl Config {
         let mut roots: Option<RootSet> = None;
         let mut member_sign_private: Option<[u8; 32]> = None;
         let mut network_id: Option<[u8; 16]> = None;
+        let mut threshold_ca_server: Option<SocketAddr> = None;
         let mut obf_psk: Option<[u8; 32]> = None;
         let mut cover_traffic_ms: Option<u64> = None;
         let mut raw_defense_preset: Option<yip_obf::TrafficDefensePreset> = None;
@@ -631,6 +634,12 @@ impl Config {
                 "roots" => roots = Some(load_roots_file(val)?),
                 "member_sign_private" => member_sign_private = Some(hex_to_32(val)?),
                 "network_id" => network_id = Some(hex_to_16(val)?),
+                "ca_server" | "threshold_ca_server" => {
+                    let addr = val
+                        .parse::<SocketAddr>()
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    threshold_ca_server = Some(addr);
+                }
                 "obf_psk" => obf_psk = Some(hex_to_32(val)?),
                 "cover_traffic_ms" => {
                     let ms = val
@@ -968,6 +977,7 @@ impl Config {
             roots,
             member_sign_private,
             network_id,
+            threshold_ca_server,
             obf_psk,
             cover_traffic_ms,
             traffic_defense,

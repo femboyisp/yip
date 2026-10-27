@@ -10,7 +10,7 @@ mod epoch;
 pub mod flow;
 pub mod handshake;
 mod mac_table;
-mod membership;
+pub mod membership;
 pub mod mode;
 mod path;
 pub mod peer_manager;

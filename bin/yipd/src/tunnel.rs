@@ -198,6 +198,7 @@ pub fn run(config: Config) -> io::Result<()> {
     // (`PeerManager::tick_dispatch` gates cover emission on both).
     manager.set_cover_traffic_ms(config.cover_traffic_ms);
     manager.set_traffic_defense(config.traffic_defense.clone());
+    manager.set_threshold_ca_server(config.threshold_ca_server);
     let control_handle = if let Some(ref path) = config.control_socket {
         Some(crate::control::ControlHandle::bind(path)?)
     } else {

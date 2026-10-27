@@ -2723,6 +2723,7 @@ dependencies = [
  "serde_json",
  "socket2 0.5.10",
  "tokio",
+ "yip-ca",
  "yip-crypto",
  "yip-device",
  "yip-io",
