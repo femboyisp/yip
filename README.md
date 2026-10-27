@@ -70,7 +70,7 @@ Because throughput is inversely proportional to the square root of packet loss p
 - **Zero-Copy AF_XDP (XSK)**: Direct UMEM memory ring driver with per-core slab partitioning and lock-free ring recycling bypasses the Linux network stack, sustaining 40.27 Gbps and 3.93 Mpps across 8 CPU cores.
 - **Asynchronous `io_uring`**: High-performance multishot ring polling drives high packet rates without thread contention or syscall overhead.
 - **Multi-Queue TUN Sharding**: `IFF_MULTI_QUEUE` worker isolation maps packet flows to dedicated CPU cores via lock-free SPSC ring buffers.
-- **Vectorized Socket I/O**: Batched `recvmmsg` and `sendmmsg` with `UDP_SEGMENT` Generic Segmentation Offload (GSO) optimize standard POSIX network paths.
+- **Vectorized Socket I/O**: Batched `recvmmsg` and `sendmmsg` (tunable 32/64/128-packet bursts) with `UDP_SEGMENT` Generic Segmentation Offload (GSO) optimize standard POSIX network paths.
 - **Flat Open-Addressing Tables**: Replaces dynamic pointer maps with bounded flat slot tables using SplitMix64 fast hashing and backward-shift deletion with zero tombstones.
 
 ### 4. Post-Quantum Cryptography & Identity

@@ -17,6 +17,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::net::UdpSocket;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Instant;
@@ -24,6 +25,7 @@ use std::time::Instant;
 use yip_bench::established_raw_keys;
 use yip_crypto::{ChaCha20Poly1305Cipher, ReplayWindow, Session};
 use yip_io::af_xdp::{CompletionRing, FillRing, RxRing, TxRing, UmemPool, XskDesc};
+use yip_io::batch::{BatchUdpSocket, BATCH_SIZE, BATCH_SIZE_128, BATCH_SIZE_64};
 
 /// Inner 5-tuple extracted from plaintext IP packets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -218,6 +220,36 @@ fn run_component_microbenchmarks() {
         );
     }
 
+    // 1c. UMEM Startup Latency: Pre-Fault (MAP_POPULATE) vs Lazy (On-Demand)
+    {
+        let iters = 1_000;
+        let start_prefault = Instant::now();
+        for _ in 0..iters {
+            let pool = UmemPool::new(1024, CHUNK_SIZE).expect("prefault pool");
+            std::hint::black_box(pool);
+        }
+        let elapsed_prefault = start_prefault.elapsed().as_secs_f64();
+        let us_prefault = (elapsed_prefault / iters as f64) * 1e6;
+
+        let start_lazy = Instant::now();
+        for _ in 0..iters {
+            let pool = UmemPool::new_lazy(1024, CHUNK_SIZE).expect("lazy pool");
+            std::hint::black_box(pool);
+        }
+        let elapsed_lazy = start_lazy.elapsed().as_secs_f64();
+        let us_lazy = (elapsed_lazy / iters as f64) * 1e6;
+
+        println!(
+            "  UMEM Init (MAP_POPULATE):       {:6.2} µs/pool (full physical page commit)",
+            us_prefault
+        );
+        println!(
+            "  UMEM Init (Lazy On-Demand):     {:6.2} µs/pool ({:.1}x faster startup)",
+            us_lazy,
+            us_prefault / us_lazy.max(0.001)
+        );
+    }
+
     // 2. Circular Ring Batch Enqueue / Dequeue Throughput
     {
         let batch_size = 32;
@@ -286,6 +318,80 @@ fn run_component_microbenchmarks() {
             "  Ring-to-Ring Recycling (B32):   {:6.2} Mops/s ({:.2} ns/op)",
             mops,
             (elapsed / total_recycled as f64) * 1e9
+        );
+    }
+
+    // 2c. Vectorized Syscall Burst Scaling: Batch 32 vs 64 vs 128
+    {
+        let s1 = UdpSocket::bind("127.0.0.1:0").expect("bind s1");
+        let s2 = UdpSocket::bind("127.0.0.1:0").expect("bind s2");
+        s1.set_nonblocking(true).unwrap();
+        s2.set_nonblocking(true).unwrap();
+        let addr2 = s2.local_addr().unwrap();
+        let mut b1 = BatchUdpSocket::new(&s1);
+        let mut b2 = BatchUdpSocket::new(&s2);
+
+        let iters = 2_000;
+        let payload = [0x5au8; 1280];
+
+        // Batch 32
+        let pkts_32: Vec<(&[u8], std::net::SocketAddr)> =
+            (0..BATCH_SIZE).map(|_| (&payload[..], addr2)).collect();
+        let mut rx_buf_32 = [[0u8; yip_io::MAX_WIRE_DATAGRAM]; BATCH_SIZE];
+        let mut rx_out_32 = [const { yip_io::batch::ReceivedDatagram::empty() }; BATCH_SIZE];
+
+        let start_32 = Instant::now();
+        for _ in 0..iters {
+            let _ = b1.sendmmsg_burst::<BATCH_SIZE>(&pkts_32);
+            let _ = b2.recvmmsg_batch::<BATCH_SIZE>(&mut rx_buf_32, &mut rx_out_32);
+        }
+        let elapsed_32 = start_32.elapsed().as_secs_f64();
+        let mpps_32 = (iters * BATCH_SIZE) as f64 / (elapsed_32 * 1e6);
+
+        // Batch 64
+        let pkts_64: Vec<(&[u8], std::net::SocketAddr)> =
+            (0..BATCH_SIZE_64).map(|_| (&payload[..], addr2)).collect();
+        let mut rx_buf_64 = [[0u8; yip_io::MAX_WIRE_DATAGRAM]; BATCH_SIZE_64];
+        let mut rx_out_64 = [const { yip_io::batch::ReceivedDatagram::empty() }; BATCH_SIZE_64];
+
+        let start_64 = Instant::now();
+        for _ in 0..iters {
+            let _ = b1.sendmmsg_burst::<BATCH_SIZE_64>(&pkts_64);
+            let _ = b2.recvmmsg_batch::<BATCH_SIZE_64>(&mut rx_buf_64, &mut rx_out_64);
+        }
+        let elapsed_64 = start_64.elapsed().as_secs_f64();
+        let mpps_64 = (iters * BATCH_SIZE_64) as f64 / (elapsed_64 * 1e6);
+
+        // Batch 128
+        let pkts_128: Vec<(&[u8], std::net::SocketAddr)> =
+            (0..BATCH_SIZE_128).map(|_| (&payload[..], addr2)).collect();
+        let mut rx_buf_128 = [[0u8; yip_io::MAX_WIRE_DATAGRAM]; BATCH_SIZE_128];
+        let mut rx_out_128 = [const { yip_io::batch::ReceivedDatagram::empty() }; BATCH_SIZE_128];
+
+        let start_128 = Instant::now();
+        for _ in 0..iters {
+            let _ = b1.sendmmsg_burst::<BATCH_SIZE_128>(&pkts_128);
+            let _ = b2.recvmmsg_batch::<BATCH_SIZE_128>(&mut rx_buf_128, &mut rx_out_128);
+        }
+        let elapsed_128 = start_128.elapsed().as_secs_f64();
+        let mpps_128 = (iters * BATCH_SIZE_128) as f64 / (elapsed_128 * 1e6);
+
+        println!(
+            "  Syscall Burst Batch 32:         {:6.3} Mpps   ({:.2} ns/packet)",
+            mpps_32,
+            (elapsed_32 / (iters * BATCH_SIZE) as f64) * 1e9
+        );
+        println!(
+            "  Syscall Burst Batch 64:         {:6.3} Mpps   ({:.2} ns/packet, {:.1}x throughput)",
+            mpps_64,
+            (elapsed_64 / (iters * BATCH_SIZE_64) as f64) * 1e9,
+            mpps_64 / mpps_32.max(0.001)
+        );
+        println!(
+            "  Syscall Burst Batch 128:        {:6.3} Mpps   ({:.2} ns/packet, {:.1}x throughput)",
+            mpps_128,
+            (elapsed_128 / (iters * BATCH_SIZE_128) as f64) * 1e9,
+            mpps_128 / mpps_32.max(0.001)
         );
     }
 

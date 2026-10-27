@@ -10,8 +10,14 @@ use std::os::fd::{AsRawFd, RawFd};
 
 use crate::MAX_WIRE_DATAGRAM;
 
-/// Maximum number of datagrams transferred in a single batched syscall.
+/// Maximum number of datagrams transferred in a single default batched syscall.
 pub const BATCH_SIZE: usize = 32;
+
+/// Expanded 64-datagram burst size for high-packet-rate 10G/25G interfaces.
+pub const BATCH_SIZE_64: usize = 64;
+
+/// Ultra-high 128-datagram burst size for maximum syscall amortization at 40G+ line rate.
+pub const BATCH_SIZE_128: usize = 128;
 
 /// Metadata for a single datagram received via [`BatchUdpSocket::recvmmsg_batch`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +73,7 @@ impl BatchUdpSocket {
         self.fd
     }
 
-    /// Receive a burst of up to [`BATCH_SIZE`] datagrams into `buffers` via `libc::recvmmsg`.
+    /// Receive a burst of up to `N` datagrams into `buffers` via `libc::recvmmsg`.
     ///
     /// For each received datagram:
     /// - The datagram payload bytes are written into `buffers[i]`.
@@ -79,26 +85,30 @@ impl BatchUdpSocket {
     ///
     /// Returns an [`io::Error`] if the underlying `recvmmsg` syscall fails with any error
     /// other than `EAGAIN` or `EWOULDBLOCK`.
-    pub fn recvmmsg_batch(
+    pub fn recvmmsg_batch<const N: usize>(
         &mut self,
-        buffers: &mut [[u8; MAX_WIRE_DATAGRAM]; BATCH_SIZE],
-        out: &mut [ReceivedDatagram; BATCH_SIZE],
+        buffers: &mut [[u8; MAX_WIRE_DATAGRAM]; N],
+        out: &mut [ReceivedDatagram; N],
     ) -> io::Result<usize> {
-        let mut storages: [libc::sockaddr_storage; BATCH_SIZE] = unsafe {
+        if N == 0 {
+            return Ok(0);
+        }
+
+        let mut storages: [libc::sockaddr_storage; N] = unsafe {
             // SAFETY: `sockaddr_storage` is a plain-old-data struct consisting of integer
             // and byte array fields. The all-zero bit pattern is a valid initial state that
             // `libc::recvmmsg` overwrites upon receipt.
             std::mem::zeroed()
         };
         let addrlens = [libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>())
-            .expect("sockaddr_storage size fits socklen_t"); BATCH_SIZE];
+            .expect("sockaddr_storage size fits socklen_t"); N];
         let mut iovecs = [libc::iovec {
             iov_base: std::ptr::null_mut(),
             iov_len: 0,
-        }; BATCH_SIZE];
-        let mut msgs = [crate::empty_mmsghdr(); BATCH_SIZE];
+        }; N];
+        let mut msgs = [crate::empty_mmsghdr(); N];
 
-        for i in 0..BATCH_SIZE {
+        for i in 0..N {
             iovecs[i].iov_base = buffers[i].as_mut_ptr().cast::<libc::c_void>();
             iovecs[i].iov_len = MAX_WIRE_DATAGRAM;
             msgs[i].msg_hdr.msg_iov = &raw mut iovecs[i];
@@ -118,7 +128,7 @@ impl BatchUdpSocket {
                 libc::recvmmsg(
                     self.fd,
                     msgs.as_mut_ptr(),
-                    u32::try_from(BATCH_SIZE).expect("BATCH_SIZE fits u32"),
+                    u32::try_from(N).expect("N fits u32"),
                     libc::MSG_DONTWAIT as crate::MsgFlags,
                     std::ptr::null_mut(),
                 )
@@ -137,10 +147,7 @@ impl BatchUdpSocket {
             }
 
             let received = usize::try_from(ret).expect("recvmmsg return fits usize");
-            assert!(
-                received <= BATCH_SIZE,
-                "recvmmsg returned count exceeding BATCH_SIZE"
-            );
+            assert!(received <= N, "recvmmsg returned count exceeding N");
 
             for i in 0..received {
                 let len = usize::try_from(msgs[i].msg_len).expect("msg_len fits usize");
@@ -155,7 +162,7 @@ impl BatchUdpSocket {
         }
     }
 
-    /// Send a burst of up to [`BATCH_SIZE`] datagrams in a single `libc::sendmmsg` syscall.
+    /// Send a burst of up to [`BATCH_SIZE`] (32) datagrams in a single `libc::sendmmsg` syscall.
     ///
     /// If `packets.len() > BATCH_SIZE`, only the first [`BATCH_SIZE`] packets are submitted.
     /// Returns the number of datagrams accepted by the kernel (0 if the socket would block).
@@ -164,22 +171,37 @@ impl BatchUdpSocket {
     ///
     /// Returns an [`io::Error`] if the underlying `sendmmsg` syscall fails with an unrecoverable error.
     pub fn sendmmsg_batch(&mut self, packets: &[(&[u8], SocketAddr)]) -> io::Result<usize> {
-        let count = packets.len().min(BATCH_SIZE);
+        self.sendmmsg_burst::<BATCH_SIZE>(packets)
+    }
+
+    /// Send a burst of up to `N` datagrams in a single `libc::sendmmsg` syscall.
+    ///
+    /// If `packets.len() > N`, only the first `N` packets are submitted.
+    /// Returns the number of datagrams accepted by the kernel (0 if the socket would block).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`io::Error`] if the underlying `sendmmsg` syscall fails with an unrecoverable error.
+    pub fn sendmmsg_burst<const N: usize>(
+        &mut self,
+        packets: &[(&[u8], SocketAddr)],
+    ) -> io::Result<usize> {
+        let count = packets.len().min(N);
         if count == 0 {
             return Ok(0);
         }
 
-        let mut storages: [libc::sockaddr_storage; BATCH_SIZE] = unsafe {
+        let mut storages: [libc::sockaddr_storage; N] = unsafe {
             // SAFETY: `sockaddr_storage` is plain-old-data. An all-zero value is a valid
             // initial state that is overwritten for the first `count` items below.
             std::mem::zeroed()
         };
-        let mut addrlens = [0 as libc::socklen_t; BATCH_SIZE];
+        let mut addrlens = [0 as libc::socklen_t; N];
         let mut iovecs = [libc::iovec {
             iov_base: std::ptr::null_mut(),
             iov_len: 0,
-        }; BATCH_SIZE];
-        let mut msgs = [crate::empty_mmsghdr(); BATCH_SIZE];
+        }; N];
+        let mut msgs = [crate::empty_mmsghdr(); N];
 
         for (i, &(payload, dst)) in packets[..count].iter().enumerate() {
             let (storage, addr_len) = crate::addr::std_to_sockaddr(dst);

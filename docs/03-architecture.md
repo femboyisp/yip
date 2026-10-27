@@ -421,7 +421,7 @@ On multi-socket NUMA hardware (e.g., dual AMD EPYC or Intel Xeon systems), cross
 
 The standard vectorized engine ([`crates/yip-io/src/batch.rs`](../crates/yip-io/src/batch.rs)) runs on any generic Linux distribution without hardware-specific requirements:
 
-1. **Syscall Amortization**: Collects bursts of up to `BATCH_SIZE = 32` datagrams and transfers them in a single `recvmmsg(2)` or `sendmmsg(2)` invocation, amortizing CPU privilege boundary transitions.
+1. **Syscall Amortization**: Collects bursts of datagrams (default `BATCH_SIZE = 32`, expandable to `BATCH_SIZE_64 = 64` and `BATCH_SIZE_128 = 128` via const-generic `sendmmsg_burst` and `recvmmsg_batch`) and transfers them in a single `recvmmsg(2)` or `sendmmsg(2)` invocation, amortizing CPU privilege boundary transitions.
 2. **Fate-Safe Generic Segmentation Offload (GSO)**: Uses the Linux `UDP_SEGMENT` socket control message to hand the kernel aggregated super-buffers up to 64 KB. The kernel or NIC hardware splits the buffer into physical MTU-sized segments.
 
 #### Fate-Safety Rule
@@ -463,8 +463,9 @@ The AF_XDP engine ([`crates/yip-io/src/af_xdp.rs`](../crates/yip-io/src/af_xdp.r
 #### Shared Memory UMEM Pool Architecture
 
 Packet memory is managed in a pre-allocated, page-aligned shared memory pool (`UmemPool`):
-- Allocated via `libc::mmap` with `MAP_ANONYMOUS | MAP_SHARED | MAP_POPULATE`.
+- Allocated via `libc::mmap` with `MAP_ANONYMOUS | MAP_SHARED`.
 - Chunk size is 2,048 bytes (`UMEM_CHUNK_SIZE`), aligning with standard MTU envelopes and cache lines.
+- **Configurable Page Faulting (`UmemPoolConfig`)**: Supports both zero-tail-latency physical page pre-faulting (`pre_fault: true` with `MAP_POPULATE`) and instant on-demand lazy paging (`pre_fault: false` via `UmemPool::new_lazy`, cutting pool initialization time from ~1,590 µs to ~7 µs, a 219x reduction). Optional `lock_memory: true` calls `libc::mlock` to pin pages in physical RAM and prevent paging under memory pressure.
 - **Per-Core `UmemSlab` Partitioning**: To eliminate centralized free-list serialization and cross-core cache invalidation under multi-worker scaling, `UmemPool` partitions chunks into disjoint per-core `UmemSlab`s (`UmemPool::new_slabs`). Each worker thread allocates and frees chunks locally from its dedicated slab without atomic locks or cross-core coordination.
 - **Lock-Free Batch Ring Recycling**: Completed TX chunk descriptors are recycled directly from the `CompletionRing` into the `FillRing` via `slab.recycle_from_rings`, spilling surplus chunks to the thread-local slab without heap allocations.
 - **Vectorized Ring Operations**: Circular descriptor rings (`FillRing`, `CompletionRing`, `RxRing`, `TxRing`) execute batch produce and consume using power-of-two masking and contiguous slice copies, sustaining over 4,000 Mops/s.
