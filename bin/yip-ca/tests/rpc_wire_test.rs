@@ -7,21 +7,17 @@ use yip_ca::rpc::{
 fn test_cert_tbs_canonical_bytes() {
     let tbs = CertTbs {
         version: 1,
-        serial_number: [0x01; 16],
-        node_id: [0x02; 32],
-        subject_ed25519_pubkey: [0x03; 32],
-        subject_x25519_pubkey: [0x04; 32],
-        assigned_ipv4: 0x0a000001,
-        assigned_ipv6: [0x20; 16],
-        issued_at_unix: 1_700_000_000,
-        expires_at_unix: 1_700_086_400,
-        flags: 7,
+        member_pubkey: [0x02; 32],
+        member_sign_pubkey: [0x03; 32],
+        network_id: [0x01; 16],
+        not_before: 1_700_000_000,
+        not_after: 1_700_086_400,
+        tags: vec![(1, b"tag".to_vec())],
     };
 
     let bytes = tbs.to_canonical_bytes();
-    assert_eq!(bytes.len(), 1 + 16 + 32 + 32 + 32 + 4 + 16 + 8 + 8 + 4);
     assert_eq!(bytes[0], 1);
-    assert_eq!(&bytes[1..17], &[0x01; 16]);
+    assert_eq!(&bytes[1..33], &[0x02; 32]);
 }
 
 #[test]

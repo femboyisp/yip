@@ -32,31 +32,32 @@ pub const ENROLL_POP_CONTEXT: &[u8] = b"YIP-CA-ENROLL-POP-V1";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CertTbs {
     pub version: u8,
-    pub serial_number: [u8; 16],
-    pub node_id: [u8; 32],
-    pub subject_ed25519_pubkey: [u8; 32],
-    pub subject_x25519_pubkey: [u8; 32],
-    pub assigned_ipv4: u32,
-    pub assigned_ipv6: [u8; 16],
-    pub issued_at_unix: u64,
-    pub expires_at_unix: u64,
-    pub flags: u32,
+    pub member_pubkey: [u8; 32],
+    pub member_sign_pubkey: [u8; 32],
+    pub network_id: [u8; 16],
+    pub not_before: u64,
+    pub not_after: u64,
+    pub tags: Vec<(u8, Vec<u8>)>,
 }
 
 impl CertTbs {
     pub fn to_canonical_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(145);
-        buf.push(self.version);
-        buf.extend_from_slice(&self.serial_number);
-        buf.extend_from_slice(&self.node_id);
-        buf.extend_from_slice(&self.subject_ed25519_pubkey);
-        buf.extend_from_slice(&self.subject_x25519_pubkey);
-        buf.extend_from_slice(&self.assigned_ipv4.to_le_bytes());
-        buf.extend_from_slice(&self.assigned_ipv6);
-        buf.extend_from_slice(&self.issued_at_unix.to_le_bytes());
-        buf.extend_from_slice(&self.expires_at_unix.to_le_bytes());
-        buf.extend_from_slice(&self.flags.to_le_bytes());
-        buf
+        let mut out = Vec::new();
+        out.push(self.version);
+        out.extend_from_slice(&self.member_pubkey);
+        out.extend_from_slice(&self.member_sign_pubkey);
+        out.extend_from_slice(&self.network_id);
+        out.extend_from_slice(&self.not_before.to_be_bytes());
+        out.extend_from_slice(&self.not_after.to_be_bytes());
+        let tag_count = u16::try_from(self.tags.len()).expect("tags fit in u16");
+        out.extend_from_slice(&tag_count.to_be_bytes());
+        for (tag, bytes) in &self.tags {
+            out.push(*tag);
+            let len = u16::try_from(bytes.len()).expect("tag value fits in u16");
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(bytes);
+        }
+        out
     }
 }
 
@@ -165,4 +166,31 @@ pub enum QuorumRpcMessage {
         signer_id: frost::Identifier,
         reason: String,
     },
+}
+
+/// Unified wire message envelope for all yip-ca TCP connections.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum CaWireMessage {
+    Quorum(QuorumRpcMessage),
+    ClientReq(ClientRpcRequest),
+    ClientResp(ClientRpcResponse),
+}
+
+/// Verifies client Proof-of-Possession signature against the challenge and candidate certificate TBS bytes.
+pub fn verify_enrollment_pop(
+    pop_sig_bytes: &[u8; 64],
+    signer_pubkey_bytes: &[u8; 32],
+    challenge_nonce: &[u8; 32],
+    csr_tbs: &CertTbs,
+) -> Result<(), &'static str> {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    let vk =
+        VerifyingKey::from_bytes(signer_pubkey_bytes).map_err(|_| "invalid signer public key")?;
+    let sig = Signature::from_bytes(pop_sig_bytes);
+    let mut pop_msg = Vec::new();
+    pop_msg.extend_from_slice(ENROLL_POP_CONTEXT);
+    pop_msg.extend_from_slice(challenge_nonce);
+    pop_msg.extend_from_slice(&csr_tbs.to_canonical_bytes());
+    vk.verify_strict(&pop_msg, &sig)
+        .map_err(|_| "invalid Proof-of-Possession signature")
 }

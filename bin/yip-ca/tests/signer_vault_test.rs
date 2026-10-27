@@ -67,15 +67,12 @@ fn test_signer_state_handle_sign_request() {
 
     let cert_tbs = CertTbs {
         version: 1,
-        serial_number: [0x10; 16],
-        node_id: [0x20; 32],
-        subject_ed25519_pubkey: [0x30; 32],
-        subject_x25519_pubkey: [0x40; 32],
-        assigned_ipv4: 0x0a000005,
-        assigned_ipv6: [0x20; 16],
-        issued_at_unix: 1_700_000_000,
-        expires_at_unix: 1_700_086_400,
-        flags: 0,
+        member_pubkey: [0x30; 32],
+        member_sign_pubkey: [0x40; 32],
+        network_id: [0x10; 16],
+        not_before: 1_700_000_000,
+        not_after: 1_700_086_400,
+        tags: Vec::new(),
     };
 
     let msg = cert_tbs.to_canonical_bytes();

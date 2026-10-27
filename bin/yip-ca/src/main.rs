@@ -28,6 +28,9 @@ fn main() -> ExitCode {
         Some("genkey") => cmd_genkey(),
         Some("sign-cert") => cmd_sign_cert(&rest),
         Some("sign-roots") => cmd_sign_roots(&rest),
+        Some("dealer-gen") => cmd_dealer_gen(&rest),
+        Some("serve") => cmd_serve(&rest),
+        Some("enroll") => cmd_enroll(&rest),
         _ => Err(usage()),
     };
 
@@ -41,11 +44,14 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> String {
-    "usage: yip-ca <genkey|sign-cert|sign-roots> [args]\n\
+    "usage: yip-ca <genkey|sign-cert|sign-roots|dealer-gen|serve|enroll> [args]\n\
      \n\
      yip-ca genkey\n\
      yip-ca sign-cert --member <hex32> --member-sign <hex32> --network <hex16> (--days <N> | --secs <N>) [--ca-private <hex>]\n\
      yip-ca sign-roots --roots <file> --version <N> [--ca-private <hex>]\n\
+     yip-ca dealer-gen --threshold <T> --signers <N> --out-dir <DIR>\n\
+     yip-ca serve --role <coordinator|signer> ...\n\
+     yip-ca enroll --server <ADDR> --member <hex32> --member-sign <hex32> --network <hex16> [--out <FILE>]\n\
      \n\
      Exactly one of --days/--secs sets the cert's validity window: --days N\n\
      is N*86400 seconds, --secs N is exactly N seconds (overrides --days if\n\
@@ -54,6 +60,162 @@ fn usage() -> String {
      \n\
      If --ca-private is omitted, the CA private key hex is read from stdin."
         .to_string()
+}
+
+// --- dealer-gen -------------------------------------------------------
+
+fn cmd_dealer_gen(args: &[String]) -> Result<(), String> {
+    let flags = parse_flags(args)?;
+    let threshold: u16 = require(&flags, "threshold")?
+        .parse()
+        .map_err(|e| format!("bad threshold: {e}"))?;
+    let signers: u16 = require(&flags, "signers")?
+        .parse()
+        .map_err(|e| format!("bad signers: {e}"))?;
+    let out_dir = require(&flags, "out-dir")?;
+
+    let (pubkey_package, key_packages) =
+        yip_ca::threshold::dealer_generate(threshold, signers).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("failed to create dir {out_dir}: {e}"))?;
+
+    let pk_json = serde_json::to_string_pretty(&pubkey_package).map_err(|e| e.to_string())?;
+    std::fs::write(format!("{out_dir}/pubkey_package.json"), pk_json).map_err(|e| e.to_string())?;
+
+    for (i, (_id, kp)) in key_packages.iter().enumerate() {
+        let kp_json = serde_json::to_string_pretty(kp).map_err(|e| e.to_string())?;
+        std::fs::write(format!("{out_dir}/signer_{}.json", i + 1), kp_json)
+            .map_err(|e| e.to_string())?;
+    }
+
+    let root_vk = pubkey_package
+        .verifying_key()
+        .serialize()
+        .map_err(|e| e.to_string())?;
+    println!("threshold_ca_public={}", hex_encode(&root_vk));
+    println!("generated {threshold}-of-{signers} keys in {out_dir}");
+    Ok(())
+}
+
+// --- serve ------------------------------------------------------------
+
+fn cmd_serve(args: &[String]) -> Result<(), String> {
+    let flags = parse_flags(args)?;
+    let role = require(&flags, "role")?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+
+    match role {
+        "coordinator" => {
+            let bind_addr: SocketAddr = require(&flags, "bind")?
+                .parse()
+                .map_err(|e| format!("bad --bind: {e}"))?;
+            let threshold: usize = require(&flags, "threshold")?
+                .parse()
+                .map_err(|e| format!("bad --threshold: {e}"))?;
+            let pubkey_path = require(&flags, "pubkey")?;
+            let pubkey_str = std::fs::read_to_string(pubkey_path)
+                .map_err(|e| format!("failed to read {pubkey_path}: {e}"))?;
+            let pubkey_package: frost_ed25519::keys::PublicKeyPackage =
+                serde_json::from_str(&pubkey_str)
+                    .map_err(|e| format!("failed to parse {pubkey_path}: {e}"))?;
+
+            rt.block_on(async {
+                let listener = tokio::net::TcpListener::bind(bind_addr)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                println!("coordinator listening on {bind_addr} (threshold={threshold})");
+                yip_ca::serve::run_coordinator(listener, threshold, pubkey_package)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+        }
+        "signer" => {
+            let coord_addr: SocketAddr = require(&flags, "coordinator")?
+                .parse()
+                .map_err(|e| format!("bad --coordinator: {e}"))?;
+            let key_path = require(&flags, "key")?;
+            let pubkey_path = require(&flags, "pubkey")?;
+            let key_str = std::fs::read_to_string(key_path)
+                .map_err(|e| format!("failed to read {key_path}: {e}"))?;
+            let pubkey_str = std::fs::read_to_string(pubkey_path)
+                .map_err(|e| format!("failed to read {pubkey_path}: {e}"))?;
+
+            let key_package: frost_ed25519::keys::KeyPackage = serde_json::from_str(&key_str)
+                .map_err(|e| format!("failed to parse {key_path}: {e}"))?;
+            let pubkey_package: frost_ed25519::keys::PublicKeyPackage =
+                serde_json::from_str(&pubkey_str)
+                    .map_err(|e| format!("failed to parse {pubkey_path}: {e}"))?;
+
+            let max_ttl_secs = flags
+                .get("max-ttl")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(86_400 * 30);
+            let policy = yip_ca::signer_daemon::SignerPolicy {
+                max_ttl_secs,
+                ..Default::default()
+            };
+
+            rt.block_on(async {
+                println!("signer connecting to coordinator at {coord_addr}...");
+                yip_ca::serve::run_signer(coord_addr, key_package, pubkey_package, policy)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+        }
+        _ => Err(format!(
+            "unknown role {role:?}, expected 'coordinator' or 'signer'"
+        )),
+    }
+}
+
+// --- enroll -----------------------------------------------------------
+
+fn cmd_enroll(args: &[String]) -> Result<(), String> {
+    let flags = parse_flags(args)?;
+    let server_addr: SocketAddr = require(&flags, "server")?
+        .parse()
+        .map_err(|e| format!("bad --server: {e}"))?;
+    let member_pubkey = fixed32(&hex_decode(require(&flags, "member")?)?, "member")?;
+    let member_sign_pubkey = fixed32(&hex_decode(require(&flags, "member-sign")?)?, "member-sign")?;
+    let network_id = fixed16(&hex_decode(require(&flags, "network")?)?, "network")?;
+
+    let client_key = match flags.get("client-key") {
+        Some(hex) => {
+            let b = fixed32(&hex_decode(hex)?, "client-key")?;
+            SigningKey::from_bytes(&b)
+        }
+        None => SigningKey::generate(&mut UnwrapErr(SysRng)),
+    };
+
+    let credential = yip_ca::rpc::EnrollmentCredential::RenewalCert {
+        existing_cert_bytes: Vec::new(),
+        renewal_signature: [0u8; 64],
+    };
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let cert = rt.block_on(async {
+        yip_ca::enroll::enroll_node(
+            server_addr,
+            &client_key,
+            member_pubkey,
+            member_sign_pubkey,
+            network_id,
+            credential,
+        )
+        .await
+    })?;
+
+    let mut cert_bytes = Vec::new();
+    cert.encode(&mut cert_bytes);
+
+    if let Some(out_path) = flags.get("out") {
+        std::fs::write(out_path, &cert_bytes)
+            .map_err(|e| format!("failed to write cert to {out_path}: {e}"))?;
+        println!("wrote certificate to {out_path}");
+    } else {
+        println!("cert_hex={}", hex_encode(&cert_bytes));
+    }
+
+    Ok(())
 }
 
 // --- genkey -----------------------------------------------------------

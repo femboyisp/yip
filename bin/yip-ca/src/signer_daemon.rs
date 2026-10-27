@@ -140,9 +140,8 @@ impl SignerState {
         }
 
         // 2. Policy bounds checks
-        if req.cert_tbs.expires_at_unix <= req.cert_tbs.issued_at_unix
-            || (req.cert_tbs.expires_at_unix - req.cert_tbs.issued_at_unix)
-                > self.policy.max_ttl_secs
+        if req.cert_tbs.not_after <= req.cert_tbs.not_before
+            || (req.cert_tbs.not_after - req.cert_tbs.not_before) > self.policy.max_ttl_secs
         {
             return QuorumRpcMessage::SignCertReject {
                 session_id,
