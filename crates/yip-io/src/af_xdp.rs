@@ -9,6 +9,7 @@
 use std::ffi::CString;
 use std::io;
 use std::os::fd::RawFd;
+use std::sync::Arc;
 
 /// Default UMEM chunk size in bytes (2 KiB aligns with MTU 1500 + wire overhead).
 pub const UMEM_CHUNK_SIZE: usize = 2048;
@@ -162,6 +163,304 @@ impl UmemPool {
     pub fn free_chunk_count(&self) -> usize {
         self.free_chunks.len()
     }
+
+    /// Returns `true` if `addr` is an aligned chunk address within this pool's bounds.
+    #[inline]
+    pub fn is_valid_chunk_addr(&self, addr: u64) -> bool {
+        (addr as usize) < self.size && addr.is_multiple_of(self.chunk_size as u64)
+    }
+
+    /// Unsafe direct access to a mutable raw pointer for a chunk.
+    ///
+    /// # Safety
+    /// Caller must ensure that no other thread or reference is concurrently accessing
+    /// the memory range `[addr, addr + len)`.
+    pub(crate) unsafe fn chunk_ptr_mut(&self, addr: u64, len: usize) -> *mut u8 {
+        assert!(
+            (addr as usize)
+                .checked_add(len)
+                .is_some_and(|end| end <= self.size),
+            "UMEM slice out of bounds: addr={addr}, len={len}, total size={}",
+            self.size
+        );
+        let offset = (addr as usize) % self.chunk_size;
+        assert!(
+            offset
+                .checked_add(len)
+                .is_some_and(|end| end <= self.chunk_size),
+            "UMEM slice len={len} with intra-chunk offset={offset} exceeds chunk_size={}",
+            self.chunk_size
+        );
+
+        // SAFETY: The caller guarantees exclusive access to this slice. `self.area` is valid
+        // mapped memory of `self.size` bytes, and we verified that `addr + len <= self.size`.
+        unsafe { (self.area as *mut u8).add(addr as usize) }
+    }
+
+    /// Partitions an `Arc<UmemPool>` into `num_slabs` disjoint, per-core chunk slabs.
+    ///
+    /// Each slab receives an equal partition of chunks (`total_chunks / num_slabs`).
+    /// Slabs operate completely independently without shared locks or cross-core
+    /// cache line contention.
+    pub fn create_slabs(self: &Arc<Self>, num_slabs: usize) -> io::Result<Vec<UmemSlab>> {
+        if num_slabs == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "num_slabs must be positive",
+            ));
+        }
+
+        let total_chunks = self.size / self.chunk_size;
+        let chunks_per_slab = total_chunks / num_slabs;
+        if chunks_per_slab == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("not enough chunks ({total_chunks}) for requested slabs ({num_slabs})"),
+            ));
+        }
+
+        let mut slabs = Vec::with_capacity(num_slabs);
+        for slab_id in 0..num_slabs {
+            let base_addr = (slab_id * chunks_per_slab * self.chunk_size) as u64;
+            // Pre-allocate free chunks so popping yields base_addr, base_addr + chunk_size, ...
+            let free_chunks: Vec<u64> = (0..chunks_per_slab)
+                .rev()
+                .map(|i| base_addr + (i * self.chunk_size) as u64)
+                .collect();
+
+            slabs.push(UmemSlab {
+                pool: Arc::clone(self),
+                slab_id,
+                base_addr,
+                num_chunks: chunks_per_slab,
+                chunk_size: self.chunk_size,
+                free_chunks,
+            });
+        }
+
+        Ok(slabs)
+    }
+
+    /// Allocates a new `UmemPool` and partitions it into `num_slabs` disjoint slabs.
+    pub fn new_slabs(
+        num_chunks: usize,
+        chunk_size: usize,
+        num_slabs: usize,
+    ) -> io::Result<(Arc<Self>, Vec<UmemSlab>)> {
+        let pool = Arc::new(Self::new(num_chunks, chunk_size)?);
+        let slabs = pool.create_slabs(num_slabs)?;
+        Ok((pool, slabs))
+    }
+}
+
+/// Dedicated per-core / per-queue UMEM chunk slab for lock-free AF_XDP multi-worker scaling.
+///
+/// Each `UmemSlab` manages an isolated, non-overlapping range of UMEM chunk addresses
+/// allocated from a parent `UmemPool`. Worker threads allocate and recycle chunks
+/// locally from their dedicated slab without cross-core coordination, atomic locks,
+/// or MESI cache-line invalidation.
+pub struct UmemSlab {
+    pool: Arc<UmemPool>,
+    slab_id: usize,
+    base_addr: u64,
+    num_chunks: usize,
+    chunk_size: usize,
+    free_chunks: Vec<u64>,
+}
+
+impl UmemSlab {
+    /// Slab identifier (e.g. core ID or queue ID).
+    #[inline]
+    pub fn slab_id(&self) -> usize {
+        self.slab_id
+    }
+
+    /// Base memory address offset of this slab within the parent UMEM area.
+    #[inline]
+    pub fn base_addr(&self) -> u64 {
+        self.base_addr
+    }
+
+    /// Upper non-inclusive address boundary of this slab within the parent UMEM area.
+    #[inline]
+    pub fn end_addr(&self) -> u64 {
+        self.base_addr + (self.num_chunks * self.chunk_size) as u64
+    }
+
+    /// Total number of chunks assigned to this slab.
+    #[inline]
+    pub fn num_chunks(&self) -> usize {
+        self.num_chunks
+    }
+
+    /// Total number of chunks assigned to this slab (alias for `num_chunks`).
+    #[inline]
+    pub fn total_chunks(&self) -> usize {
+        self.num_chunks
+    }
+
+    /// Number of free chunks currently available in this slab.
+    #[inline]
+    pub fn free_chunk_count(&self) -> usize {
+        self.free_chunks.len()
+    }
+
+    /// Chunk size in bytes.
+    #[inline]
+    pub fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
+    /// Reference to the parent `UmemPool`.
+    #[inline]
+    pub fn pool(&self) -> &Arc<UmemPool> {
+        &self.pool
+    }
+
+    /// Returns `true` if `addr` is an aligned chunk address belonging to this slab.
+    #[inline]
+    pub fn contains_addr(&self, addr: u64) -> bool {
+        addr >= self.base_addr
+            && addr < self.end_addr()
+            && (addr - self.base_addr).is_multiple_of(self.chunk_size as u64)
+    }
+
+    /// Returns `true` if `addr..addr+len` lies completely within this slab's memory range.
+    #[inline]
+    pub fn contains_addr_range(&self, addr: u64, len: usize) -> bool {
+        addr >= self.base_addr
+            && (addr as usize)
+                .checked_add(len)
+                .is_some_and(|end| end as u64 <= self.end_addr())
+    }
+
+    /// Allocates a chunk address from this slab, returning `None` if exhausted.
+    #[inline]
+    pub fn alloc_chunk(&mut self) -> Option<u64> {
+        self.free_chunks.pop()
+    }
+
+    /// Returns a chunk address to this slab's free pool.
+    #[inline]
+    pub fn free_chunk(&mut self, addr: u64) {
+        debug_assert!(
+            self.contains_addr(addr),
+            "corrupt chunk address returned to slab {}: addr={addr}, base={}, end={}, chunk_size={}",
+            self.slab_id,
+            self.base_addr,
+            self.end_addr(),
+            self.chunk_size
+        );
+        self.free_chunks.push(addr);
+    }
+
+    /// Allocates up to `out.len()` chunk addresses into `out`. Returns count allocated.
+    pub fn alloc_batch(&mut self, out: &mut [u64]) -> usize {
+        let count = out.len().min(self.free_chunks.len());
+        if count == 0 {
+            return 0;
+        }
+        let start = self.free_chunks.len() - count;
+        for (i, slot) in out.iter_mut().take(count).enumerate() {
+            *slot = self.free_chunks[start + count - 1 - i];
+        }
+        self.free_chunks.truncate(start);
+        count
+    }
+
+    /// Frees a slice of chunk addresses back to this slab.
+    pub fn free_batch(&mut self, addrs: &[u64]) {
+        for &addr in addrs {
+            debug_assert!(
+                self.contains_addr(addr),
+                "corrupt chunk address in batch for slab {}: addr={addr}",
+                self.slab_id
+            );
+        }
+        self.free_chunks.extend_from_slice(addrs);
+    }
+
+    /// Pre-populates a `FillRing` with chunks from this slab up to `max_count`.
+    ///
+    /// Allocates in batches of 64 chunks to maximize memory pipeline throughput.
+    /// Returns the total number of chunks enqueued into the fill ring.
+    pub fn populate_fill_ring(&mut self, fill_ring: &mut FillRing, max_count: usize) -> usize {
+        let mut total = 0;
+        let mut buf = [0u64; 64];
+        while total < max_count && !self.free_chunks.is_empty() && !fill_ring.is_full() {
+            let to_alloc = (max_count - total).min(buf.len());
+            let allocated = self.alloc_batch(&mut buf[..to_alloc]);
+            if allocated == 0 {
+                break;
+            }
+            let produced = fill_ring.produce_batch(&buf[..allocated]);
+            total += produced;
+            if produced < allocated {
+                self.free_batch(&buf[produced..allocated]);
+                break;
+            }
+        }
+        total
+    }
+
+    /// Recycles completed chunk descriptors from `CompletionRing` directly back into `FillRing`.
+    ///
+    /// Consumes up to `max_batch` descriptors from `comp_ring` and attempts to produce them
+    /// directly into `fill_ring`. Any surplus chunks that do not fit into `fill_ring` are
+    /// returned to this slab's free pool without heap allocations.
+    ///
+    /// Returns the total number of completed descriptors consumed from `comp_ring`.
+    pub fn recycle_from_rings(
+        &mut self,
+        comp_ring: &mut CompletionRing,
+        fill_ring: &mut FillRing,
+        max_batch: usize,
+    ) -> usize {
+        let mut buf = [0u64; 64];
+        let batch_size = max_batch.min(buf.len());
+        let consumed = comp_ring.consume_batch(&mut buf[..batch_size]);
+        if consumed == 0 {
+            return 0;
+        }
+
+        let produced = fill_ring.produce_batch(&buf[..consumed]);
+        if produced < consumed {
+            self.free_batch(&buf[produced..consumed]);
+        }
+
+        consumed
+    }
+
+    /// Returns a bounds-checked immutable slice into the chunk starting at `addr`.
+    pub fn chunk_slice(&self, addr: u64, len: usize) -> &[u8] {
+        assert!(
+            self.contains_addr_range(addr, len),
+            "UMEM slab {}: addr={addr}, len={len} out of slab bounds [{}..{})",
+            self.slab_id,
+            self.base_addr,
+            self.end_addr()
+        );
+        self.pool.chunk_slice(addr, len)
+    }
+
+    /// Returns a bounds-checked mutable slice into the chunk starting at `addr`.
+    pub fn chunk_slice_mut(&mut self, addr: u64, len: usize) -> &mut [u8] {
+        assert!(
+            self.contains_addr_range(addr, len),
+            "UMEM slab {}: addr={addr}, len={len} out of slab bounds [{}..{})",
+            self.slab_id,
+            self.base_addr,
+            self.end_addr()
+        );
+
+        // SAFETY: Each `UmemSlab` owns an isolated, non-overlapping range of the UMEM memory area.
+        // We verified that `addr..addr+len` lies strictly within this slab's exclusive address range.
+        // The `&mut self` borrow guarantees that no other code is currently accessing this slab's memory.
+        unsafe {
+            let ptr = self.pool.chunk_ptr_mut(addr, len);
+            std::slice::from_raw_parts_mut(ptr, len)
+        }
+    }
 }
 
 impl Drop for UmemPool {
@@ -244,14 +543,24 @@ impl FillRing {
 
     /// Enqueues a batch of chunk addresses into the ring. Returns count enqueued.
     pub fn produce_batch(&mut self, addrs: &[u64]) -> usize {
-        let mut count = 0;
-        for &addr in addrs {
-            if !self.produce(addr) {
-                break;
-            }
-            count += 1;
+        let available = (self.capacity as usize).saturating_sub(self.len());
+        let to_produce = addrs.len().min(available);
+        if to_produce == 0 {
+            return 0;
         }
-        count
+
+        let mask = (self.capacity - 1) as usize;
+        let start = (self.tail as usize) & mask;
+        let first_len = to_produce.min(self.entries.len() - start);
+        self.entries[start..start + first_len].copy_from_slice(&addrs[..first_len]);
+
+        if first_len < to_produce {
+            let second_len = to_produce - first_len;
+            self.entries[..second_len].copy_from_slice(&addrs[first_len..to_produce]);
+        }
+
+        self.tail = self.tail.wrapping_add(to_produce as u32);
+        to_produce
     }
 
     /// Dequeues a chunk address from the ring.
@@ -267,17 +576,24 @@ impl FillRing {
 
     /// Dequeues up to `out.len()` chunk addresses into `out`. Returns count dequeued.
     pub fn consume_batch(&mut self, out: &mut [u64]) -> usize {
-        let mut count = 0;
-        for item in out.iter_mut() {
-            match self.consume() {
-                Some(addr) => {
-                    *item = addr;
-                    count += 1;
-                }
-                None => break,
-            }
+        let available = self.len();
+        let to_consume = out.len().min(available);
+        if to_consume == 0 {
+            return 0;
         }
-        count
+
+        let mask = (self.capacity - 1) as usize;
+        let start = (self.head as usize) & mask;
+        let first_len = to_consume.min(self.entries.len() - start);
+        out[..first_len].copy_from_slice(&self.entries[start..start + first_len]);
+
+        if first_len < to_consume {
+            let second_len = to_consume - first_len;
+            out[first_len..to_consume].copy_from_slice(&self.entries[..second_len]);
+        }
+
+        self.head = self.head.wrapping_add(to_consume as u32);
+        to_consume
     }
 }
 
@@ -338,14 +654,24 @@ impl CompletionRing {
 
     /// Enqueues a batch of chunk addresses into the ring. Returns count enqueued.
     pub fn produce_batch(&mut self, addrs: &[u64]) -> usize {
-        let mut count = 0;
-        for &addr in addrs {
-            if !self.produce(addr) {
-                break;
-            }
-            count += 1;
+        let available = (self.capacity as usize).saturating_sub(self.len());
+        let to_produce = addrs.len().min(available);
+        if to_produce == 0 {
+            return 0;
         }
-        count
+
+        let mask = (self.capacity - 1) as usize;
+        let start = (self.tail as usize) & mask;
+        let first_len = to_produce.min(self.entries.len() - start);
+        self.entries[start..start + first_len].copy_from_slice(&addrs[..first_len]);
+
+        if first_len < to_produce {
+            let second_len = to_produce - first_len;
+            self.entries[..second_len].copy_from_slice(&addrs[first_len..to_produce]);
+        }
+
+        self.tail = self.tail.wrapping_add(to_produce as u32);
+        to_produce
     }
 
     /// Dequeues a completed chunk address from the ring.
@@ -361,17 +687,24 @@ impl CompletionRing {
 
     /// Dequeues up to `out.len()` chunk addresses into `out`. Returns count dequeued.
     pub fn consume_batch(&mut self, out: &mut [u64]) -> usize {
-        let mut count = 0;
-        for item in out.iter_mut() {
-            match self.consume() {
-                Some(addr) => {
-                    *item = addr;
-                    count += 1;
-                }
-                None => break,
-            }
+        let available = self.len();
+        let to_consume = out.len().min(available);
+        if to_consume == 0 {
+            return 0;
         }
-        count
+
+        let mask = (self.capacity - 1) as usize;
+        let start = (self.head as usize) & mask;
+        let first_len = to_consume.min(self.entries.len() - start);
+        out[..first_len].copy_from_slice(&self.entries[start..start + first_len]);
+
+        if first_len < to_consume {
+            let second_len = to_consume - first_len;
+            out[first_len..to_consume].copy_from_slice(&self.entries[..second_len]);
+        }
+
+        self.head = self.head.wrapping_add(to_consume as u32);
+        to_consume
     }
 }
 
@@ -470,14 +803,24 @@ impl RxRing {
 
     /// Enqueues a batch of descriptors into the RX ring. Returns count enqueued.
     pub fn produce_batch(&mut self, descs: &[XskDesc]) -> usize {
-        let mut count = 0;
-        for &desc in descs {
-            if !self.produce(desc) {
-                break;
-            }
-            count += 1;
+        let available = (self.capacity as usize).saturating_sub(self.len());
+        let to_produce = descs.len().min(available);
+        if to_produce == 0 {
+            return 0;
         }
-        count
+
+        let mask = (self.capacity - 1) as usize;
+        let start = (self.tail as usize) & mask;
+        let first_len = to_produce.min(self.entries.len() - start);
+        self.entries[start..start + first_len].copy_from_slice(&descs[..first_len]);
+
+        if first_len < to_produce {
+            let second_len = to_produce - first_len;
+            self.entries[..second_len].copy_from_slice(&descs[first_len..to_produce]);
+        }
+
+        self.tail = self.tail.wrapping_add(to_produce as u32);
+        to_produce
     }
 
     /// Dequeues a descriptor from the RX ring.
@@ -493,17 +836,24 @@ impl RxRing {
 
     /// Dequeues up to `out.len()` descriptors into `out`. Returns count dequeued.
     pub fn consume_batch(&mut self, out: &mut [XskDesc]) -> usize {
-        let mut count = 0;
-        for item in out.iter_mut() {
-            match self.consume() {
-                Some(desc) => {
-                    *item = desc;
-                    count += 1;
-                }
-                None => break,
-            }
+        let available = self.len();
+        let to_consume = out.len().min(available);
+        if to_consume == 0 {
+            return 0;
         }
-        count
+
+        let mask = (self.capacity - 1) as usize;
+        let start = (self.head as usize) & mask;
+        let first_len = to_consume.min(self.entries.len() - start);
+        out[..first_len].copy_from_slice(&self.entries[start..start + first_len]);
+
+        if first_len < to_consume {
+            let second_len = to_consume - first_len;
+            out[first_len..to_consume].copy_from_slice(&self.entries[..second_len]);
+        }
+
+        self.head = self.head.wrapping_add(to_consume as u32);
+        to_consume
     }
 }
 
@@ -564,14 +914,24 @@ impl TxRing {
 
     /// Enqueues a batch of descriptors into the TX ring. Returns count enqueued.
     pub fn produce_batch(&mut self, descs: &[XskDesc]) -> usize {
-        let mut count = 0;
-        for &desc in descs {
-            if !self.produce(desc) {
-                break;
-            }
-            count += 1;
+        let available = (self.capacity as usize).saturating_sub(self.len());
+        let to_produce = descs.len().min(available);
+        if to_produce == 0 {
+            return 0;
         }
-        count
+
+        let mask = (self.capacity - 1) as usize;
+        let start = (self.tail as usize) & mask;
+        let first_len = to_produce.min(self.entries.len() - start);
+        self.entries[start..start + first_len].copy_from_slice(&descs[..first_len]);
+
+        if first_len < to_produce {
+            let second_len = to_produce - first_len;
+            self.entries[..second_len].copy_from_slice(&descs[first_len..to_produce]);
+        }
+
+        self.tail = self.tail.wrapping_add(to_produce as u32);
+        to_produce
     }
 
     /// Dequeues a descriptor from the TX ring.
@@ -587,17 +947,24 @@ impl TxRing {
 
     /// Dequeues up to `out.len()` descriptors into `out`. Returns count dequeued.
     pub fn consume_batch(&mut self, out: &mut [XskDesc]) -> usize {
-        let mut count = 0;
-        for item in out.iter_mut() {
-            match self.consume() {
-                Some(desc) => {
-                    *item = desc;
-                    count += 1;
-                }
-                None => break,
-            }
+        let available = self.len();
+        let to_consume = out.len().min(available);
+        if to_consume == 0 {
+            return 0;
         }
-        count
+
+        let mask = (self.capacity - 1) as usize;
+        let start = (self.head as usize) & mask;
+        let first_len = to_consume.min(self.entries.len() - start);
+        out[..first_len].copy_from_slice(&self.entries[start..start + first_len]);
+
+        if first_len < to_consume {
+            let second_len = to_consume - first_len;
+            out[first_len..to_consume].copy_from_slice(&self.entries[..second_len]);
+        }
+
+        self.head = self.head.wrapping_add(to_consume as u32);
+        to_consume
     }
 }
 

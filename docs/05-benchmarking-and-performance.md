@@ -434,6 +434,17 @@ Microbenchmarking `FecReassembler::push()` with Criterion compares the zero-allo
 - **In-Place RS Repair**: `reconstruct_missing_sources` repairs missing source shards directly into missing slice windows in the pre-allocated payload buffer using a single scratch slice, eliminating `Vec<Vec<u8>>` heap matrix allocations.
 - **Flat Open-Addressing `ObjectTable`**: Replaces `HashMap<u64, ObjState>` with a bounded flat slot table with SplitMix64 fast hashing and backward-shift deletion, eliminating hash collisions, tombstones, and heap reallocations during packet ingress and eviction.
 
+#### AF_XDP Kernel-Bypass Per-Core Slab Scaling
+
+Microbenchmarking `af_xdp_scale` (`cargo bench -p yip-bench --bench af_xdp_scale -- --nocapture`) verifies that partitioning a single shared `UmemPool` into disjoint per-core `UmemSlab`s eliminates centralized free-list contention, yielding linear multi-worker scaling without cache line bouncing:
+
+| Metric / Scenario | Baseline | UmemSlab + Vectorized Rings | Improvement |
+| :--- | :--- | :--- | :--- |
+| **Circular Rings Throughput (Batch 32)** | 1,438 Mops/s (0.70 ns/op) | **4,057 Mops/s (0.25 ns/op)** | **2.8× faster** (-64.3% latency) |
+| **Ring-to-Ring Batch Recycling (Batch 32)** | Single-chunk loop | **1,063 Mops/s (0.94 ns/op)** | Direct ring transfer |
+| **8-Worker Aggregate Scaling** | 17.17 Gbps (1.677 Mpps) | **19.60 Gbps (1.914 Mpps)** | **+2.43 Gbps** line rate |
+| **Packet Drops / Out-of-Order** | 0 drops / 0 OOO | **0 drops / 0 OOO** | Strict FIFO ordering preserved |
+
 ### Local Network Namespace Netem Integration Tests
 
 These automated test scripts build isolated network namespaces, establish real `yipd` tunnels, inject synthetic packet loss and delay using `tc-netem`, and verify data-plane integrity under load. **Root privileges are required.**
