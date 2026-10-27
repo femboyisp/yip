@@ -1,12 +1,12 @@
 # Decentralized Threshold CA Example & Quickstart
 
-This directory contains reference configurations and an operational guide for deploying an online, distributed **Threshold Certificate Authority** ($t$-of-$n$) using RFC 9591 FROST (Flexible Round-Optimized Schnorr Threshold) signatures over Ed25519.
+This directory contains reference configurations and an operational guide for deploying an online, distributed **Threshold Certificate Authority** (*t*-of-*n*) using RFC 9591 FROST (Flexible Round-Optimized Schnorr Threshold) signatures over Ed25519.
 
 ---
 
 ## Architecture Overview
 
-Unlike the offline single-key CA model where an operator holds the master private key on an air-gapped machine, the decentralized threshold CA distributes signing shares across $n$ independent signer daemons:
+Unlike the offline single-key CA model where an operator holds the master private key on an air-gapped machine, the decentralized threshold CA distributes signing shares across *n* independent signer daemons:
 
 ```text
                ┌────────────────────────────────────────────────────────┐
@@ -37,7 +37,7 @@ Unlike the offline single-key CA model where an operator holds the master privat
 ### Key Properties
 - **Standard Ed25519 Certificates**: FROST signatures aggregate linearly into standard 64-byte Ed25519 signatures. Mesh nodes, root sets, and verifiers validate threshold-issued certificates identically to single-signer certificates with zero wire-format changes.
 - **Single-Round (1-RTT) Online Enrollment**: Signers pre-generate nonce commitment pools (`frost_ed25519::round1::preprocess`) and register them with the coordinator, eliminating Round 1 commitment exchange at enrollment time.
-- **Asynchronous Fault Tolerance (ROAST)**: Certificate issuance succeeds as long as any $t$ of $n$ signers respond, even if $n - t$ signers are offline, high-latency, or malicious.
+- **Asynchronous Fault Tolerance (ROAST)**: Certificate issuance succeeds as long as any *t* of *n* signers respond, even if *n* - *t* signers are offline, high-latency, or malicious.
 - **Rollback-Immune Nonce Vault**: Ephemeral nonces are memory-locked (`libc::mlock`), wiped immediately on single-use consumption (`take_once`), and bound to monotonic 128-bit CSPRNG boot epochs to defeat VM snapshot key-recovery attacks.
 - **Automated Lifecycle**: Nodes running `yipd` automatically monitor certificate lifetime and renew in the background at $\ge 70\%$ of TTL.
 

@@ -536,7 +536,7 @@ In the point-to-point setup in Section 4, each node required an explicit `[peer]
 
 **Mesh mode solves this with zero-trust cryptographic admission.** Instead of maintaining static peer lists, nodes dynamically discover authorized members and establish point-to-point tunnels on demand. `yip` provides two CA models:
 - **Model A: Offline Single-Key Root CA**: For air-gapped root-of-trust deployments where certificates and root sets are minted manually.
-- **Model B: Decentralized Threshold CA ($t$-of-$n$ FROST)**: For online, automated environments where signing authority is distributed across a quorum of independent signer daemons, with 1-RTT enrollment and automated background renewal in `yipd`.
+- **Model B: Decentralized Threshold CA (*t*-of-*n* FROST)**: For online, automated environments where signing authority is distributed across a quorum of independent signer daemons, with 1-RTT enrollment and automated background renewal in `yipd`.
 
 ```mermaid
 flowchart TD
@@ -637,7 +637,7 @@ Distribute `/etc/yip/network.roots` to all member nodes.
 
 ### Model B: Decentralized Threshold CA Workflow (FROST Ed25519)
 
-In this model, no single machine holds the root private key. Instead, authority is partitioned across a $t$-of-$n$ quorum of signer daemons.
+In this model, no single machine holds the root private key. Instead, authority is partitioned across a *t*-of-*n* quorum of signer daemons.
 
 #### Step 1: Generate Threshold Key Packages
 

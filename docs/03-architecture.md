@@ -754,7 +754,7 @@ To defeat packet replay attacks across high-speed connections, `crates/yip-crypt
 
 ## 9. Decentralized Threshold PKI & FROST Consensus Quorum
 
-To eliminate operational friction and single-point-of-compromise vulnerabilities inherent in centralized or offline root authorities, `yip` implements a decentralized **Threshold Certificate Authority** ($t$-of-$n$) grounded in **RFC 9591 Flexible Round-Optimized Schnorr Threshold (FROST)** signatures.
+To eliminate operational friction and single-point-of-compromise vulnerabilities inherent in centralized or offline root authorities, `yip` implements a decentralized **Threshold Certificate Authority** (*t*-of-*n*) grounded in **RFC 9591 Flexible Round-Optimized Schnorr Threshold (FROST)** signatures.
 
 ```mermaid
 flowchart TD
@@ -782,7 +782,7 @@ flowchart TD
 
 `yip` supports two distinct operational modes for Certificate Authorities:
 1. **Offline Single-Signer CA**: Master private scalar $sk$ stored air-gapped on an administrative host (`yip-ca sign-cert`).
-2. **Decentralized Threshold CA**: Secret scalar is partitioned into $n$ Shamir secret shares across independent daemons (`yip-ca serve --role signer`).
+2. **Decentralized Threshold CA**: Secret scalar is partitioned into *n* Shamir secret shares across independent daemons (`yip-ca serve --role signer`).
 
 **The Wire Compatibility Invariant**:
 Under Schnorr threshold signatures (RFC 9591 §5.2), partial signature shares $z_i = d_i + (e_i \cdot \rho_i) + \lambda_i s_i c$ aggregate linearly:
@@ -852,7 +852,7 @@ stateDiagram-v2
 ```
 
 - **Identifiable Aborts**: If a signer returns an invalid partial signature, `frost_ed25519::verify_signature_share` pinpoint-identifies the dishonest participant (`Error::culprit()`), allowing the coordinator to log the fault, mark the signer Byzantine, and substitute an alternate responsive signer without restarting the enrollment session.
-- **$n - t$ Fault Tolerance**: The system guarantees liveness as long as any $t$ honest signers are reachable.
+- ***n* - *t* Fault Tolerance**: The system guarantees liveness as long as any *t* honest signers are reachable.
 
 ### Rollback-Immune Ephemeral Nonce Vault
 
@@ -867,7 +867,7 @@ In virtualized or cloud environments, VM snapshots, live migrations, and contain
 
 To protect long-lived quorums against mobile adversaries who compromise signers sequentially over time, `yip-ca` supports zero-knowledge proactive share refreshing:
 - **Zero-Knowledge Refresh Polynomials**: Signers exchange zero-constant polynomials $f_i(0) = 0$. Each signer updates its secret share $s_i' = s_i + \sum \delta_{j \to i}$, completely invalidating all historical shares while leaving the group verifying key $Y$ strictly invariant.
-- **Lost-Share Repair**: If a signer suffers hardware failure or data corruption, an online repair ceremony allows $t$ active signers to construct a replacement share for the restored node without reconstructing the root secret.
+- **Lost-Share Repair**: If a signer suffers hardware failure or data corruption, an online repair ceremony allows *t* active signers to construct a replacement share for the restored node without reconstructing the root secret.
 
 ### Zero-Touch Background Renewal in yipd (70% TTL)
 

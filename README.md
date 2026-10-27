@@ -29,11 +29,11 @@ Standard VPNs collapse the moment a physical link drops packets. WireGuard deliv
 
 **yip fixes this at the root.** It is a high-performance peer-to-peer mesh VPN in Rust that bakes Reed-Solomon forward error correction (FEC) directly into the datapath. Missing packets are reconstructed in-flight before the kernel TCP stack or user applications ever realize a drop occurred.
 
-Under the hood, yip pairs proactive loss recovery with **40 Gbps AF_XDP zero-copy scaling**, post-quantum **ML-KEM-512 handshakes**, an online **$t$-of-$n$ Decentralized Threshold CA** (RFC 9591 FROST), and authentic **Chrome TLS mimicry** to glide past aggressive DPI firewalls unnoticed.
+Under the hood, yip pairs proactive loss recovery with **40 Gbps AF_XDP zero-copy scaling**, post-quantum **ML-KEM-512 handshakes**, an online ***t*-of-*n* Decentralized Threshold CA** (RFC 9591 FROST), and authentic **Chrome TLS mimicry** to glide past aggressive DPI firewalls unnoticed.
 
 > [!TIP]
 > **Decentralized Threshold CA Hero Feature**:
-> yip avoids single-key CA failure by partitioning root signing authority across a distributed $t$-of-$n$ signer quorum (`yip-ca serve`). Because FROST threshold signatures aggregate linearly into a standard 64-byte Ed25519 signature, threshold credentials require zero changes to node verifiers and support zero-touch 70% TTL auto-renewal inside `yipd`. See the turnkey [Threshold CA Quickstart](examples/threshold-ca/README.md).
+> yip avoids single-key CA failure by partitioning root signing authority across a distributed *t*-of-*n* signer quorum (`yip-ca serve`). Because FROST threshold signatures aggregate linearly into a standard 64-byte Ed25519 signature, threshold credentials require zero changes to node verifiers and support zero-touch 70% TTL auto-renewal inside `yipd`. See the turnkey [Threshold CA Quickstart](examples/threshold-ca/README.md).
 
 > [!NOTE]
 > yip builds an encrypted peer-to-peer overlay, not an anonymizing mix-net like Tor. Connected peers authenticate directly and see each other's physical IP addresses.
@@ -73,7 +73,7 @@ Because throughput is inversely proportional to the square root of loss probabil
 | Use yip for | Stick with WireGuard or others for |
 | :--- | :--- |
 | **Contended, lossy, or wireless links** (cellular, satellite, trans-oceanic transit) where packet drops stall standard tunnels | **Clean zero-loss gigabit LANs** where in-kernel WireGuard already saturates the wire with lower CPU overhead |
-| **Zero-trust mesh networks** requiring decentralized $t$-of-$n$ threshold signing and automated certificate renewal | **Simple point-to-point home VPNs** where static public keys are easily managed manually |
+| **Zero-trust mesh networks** requiring decentralized *t*-of-*n* threshold signing and automated certificate renewal | **Simple point-to-point home VPNs** where static public keys are easily managed manually |
 | **High-packet-rate 40G/100G edge infrastructure** scaling across multiple CPU cores via zero-copy AF_XDP | **Anonymity or mix-net routing** without trusted direct peering (peers authenticate directly) |
 | **Hostile network environments** monitored by active-probing Deep Packet Inspection (DPI) firewalls | **Desktop platforms other than Linux** (macOS and Windows desktop clients are not currently supported) |
 | **Future-proof quantum resistance** via NIST FIPS 203 ML-KEM-512 hybrid handshakes | Environments where legacy unencrypted protocols or centralized proprietary controllers are required |
@@ -155,7 +155,7 @@ member_sign_private = c22239d00522843313aa03a662e8f0cb6abb7889f8f103510ebb5dee0e
 network_id          = f11a8e0df8fa6352eeb62192de7ece47
 ```
 
-### Mode 4: Decentralized Threshold CA Mesh ($t$-of-$n$ FROST)
+### Mode 4: Decentralized Threshold CA Mesh (*t*-of-*n* FROST)
 Eliminates single-point-of-compromise root keys. Online signers jointly issue and renew certificates via online RPC, with `yipd` handling zero-touch renewal in the background at 70% TTL:
 
 ```ini
@@ -189,10 +189,10 @@ sudo yipd cert renew
 - **Zero-Allocation Hot-Path Reassembly**: Pre-allocated contiguous object buffers and in-place Cauchy RS repair (`reconstruct_missing_sources`) deliver clean packets in **117 ns** with zero heap allocations.
 
 ### 2. Zero-Trust PKI & Decentralized Mesh Membership
-- **Dual Cryptographic CA Architecture**: Supports both an air-gapped, offline master key root CA (`yip-ca sign-cert`) and an online, decentralized **$t$-of-$n$ Threshold CA** (`yip-ca serve --role coordinator|signer`).
+- **Dual Cryptographic CA Architecture**: Supports both an air-gapped, offline master key root CA (`yip-ca sign-cert`) and an online, decentralized ***t*-of-*n* Threshold CA** (`yip-ca serve --role coordinator|signer`).
 - **RFC 9591 FROST Ed25519 Quorum**: Threshold signers collaborate using the FROST(Ed25519, SHA-512) ciphersuite. Because Schnorr threshold signatures aggregate linearly into a standard 64-byte Ed25519 signature, threshold credentials are 100% byte-for-byte indistinguishable from single-signer certificates, requiring zero changes to existing node verifiers.
 - **Single-Round (1-RTT) Online Enrollment**: Pre-generated nonce pools (`frost_ed25519::round1::preprocess`) pre-cached at the coordinator collapse online certificate enrollment from two network round-trips to a single RPC round-trip.
-- **Asynchronous Robustness (ROAST)**: Coordinator signing loop is wrapped in a ROAST state machine, guaranteeing progress and unforgeable issuance even if up to $n - t$ signers are unresponsive, delayed, or Byzantine.
+- **Asynchronous Robustness (ROAST)**: Coordinator signing loop is wrapped in a ROAST state machine, guaranteeing progress and unforgeable issuance even if up to *n* - *t* signers are unresponsive, delayed, or Byzantine.
 - **Rollback-Immune Nonce Vault**: Memory-locked (`mlock`), zeroized-on-drop ephemeral nonce pools bound to 128-bit CSPRNG boot-epoch IDs eliminate nonce-reuse private key extraction under VM snapshots.
 - **Automated Lifecycle & Background Renewal**: Proactive zero-knowledge polynomial share refreshing (CVE-2025-58359 hardened), lost-share repair, and automated zero-touch renewal inside `bin/yipd` at $\ge 70\%$ of certificate TTL.
 
@@ -315,7 +315,7 @@ Full methodology and reproducible test harnesses are documented in [`crates/yip-
 └───────────────────────────────────────┴───────────────────────────────────────┘
 ```
 
-- **Threshold Signature Security**: An adversary compromising fewer than $t$ signers obtains zero knowledge of the master CA private scalar.
+- **Threshold Signature Security**: An adversary compromising fewer than *t* signers obtains zero knowledge of the master CA private scalar.
 - **Rollback Immunity**: Ephemeral nonces in `EphemeralNonceVault` are memory-locked (`mlock`) and consumed via atomic single-use primitives to eliminate nonce-reuse private key extraction under VM snapshots.
 - **Identifiable Aborts (ROAST)**: Honest coordinators pinpoint dishonest signers and continue signing without denial-of-service stalls.
 
