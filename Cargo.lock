@@ -2579,6 +2579,7 @@ name = "yip-ca"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "frost-core",
  "frost-ed25519",
  "frost-rerandomized",
  "getrandom 0.4.3",

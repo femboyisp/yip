@@ -21,6 +21,7 @@ path = "src/main.rs"
 yip-membership = { path = "../../crates/yip-membership" }
 ed25519-dalek = { version = "3", features = ["rand_core"] }
 rand_core = "0.10"
+frost-core = "3.0.0"
 frost-ed25519 = "3.0.0"
 frost-rerandomized = "3.0.0"
 rand = "0.8"
