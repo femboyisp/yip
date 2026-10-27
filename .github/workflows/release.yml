@@ -28,14 +28,14 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            musl_cross_url: https://musl.cc/x86_64-linux-musl-cross.tgz
+            musl_cross_url: https://github.com/xmake-mirror/musl.cc/releases/download/20210202/x86_64-linux-musl-cross.linux.tgz
             musl_cross_dir: x86_64-linux-musl-cross
             linker: x86_64-linux-musl-gcc
             cc: x86_64-linux-musl-gcc
             cxx: x86_64-linux-musl-g++
             ar: x86_64-linux-musl-ar
           - target: aarch64-unknown-linux-musl
-            musl_cross_url: https://musl.cc/aarch64-linux-musl-cross.tgz
+            musl_cross_url: https://github.com/xmake-mirror/musl.cc/releases/download/20210202/aarch64-linux-musl-cross.linux.tgz
             musl_cross_dir: aarch64-linux-musl-cross
             linker: aarch64-linux-musl-gcc
             cc: aarch64-linux-musl-gcc
