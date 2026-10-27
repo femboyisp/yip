@@ -135,7 +135,7 @@ pub struct DerivedCertKey {
 /// `n` to a scalar (RFC 9380 §5 style — 48 bytes gives < 2⁻¹²⁸ bias and both
 /// sides land identically). The ~2⁻²⁵⁶ zero case maps to 1 (deterministic;
 /// never diverges). Constant-time throughout (no data-dependent branch on
-/// the scalar) — see [`signing_key_from_wide`].
+/// the scalar) — see `signing_key_from_wide`.
 pub fn derive_cert_key(shared: &[u8; 32]) -> DerivedCertKey {
     let okm48 = hkdf_expand_48(shared, CERT_KEY_HKDF_INFO);
     let signing_key = signing_key_from_wide(&okm48);

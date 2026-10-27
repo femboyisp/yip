@@ -20,6 +20,7 @@ For comprehensive configuration directives and wire protocol internals, refer to
   - [Option B: Pre-Compiled Binaries via cargo-binstall](#option-b-pre-compiled-binaries-via-cargo-binstall)
   - [Option C: Building from Source](#option-c-building-from-source)
   - [Option D: Container / Docker Deployment](#option-d-container--docker-deployment)
+  - [Option E: Embedding as a Rust SDK / Library](#option-e-embedding-as-a-rust-sdk--library)
   - [Control Utility Symlink (yipctl)](#control-utility-symlink-yipctl)
 - [3. Init Service Integration](#3-init-service-integration)
   - [systemd](#systemd)
@@ -160,6 +161,21 @@ docker run -d \
   --device /dev/net/tun:/dev/net/tun \
   -v /etc/yip:/etc/yip:ro \
   ghcr.io/femboyisp/yip:latest
+```
+
+### Option E: Embedding as a Rust SDK / Library
+
+To integrate `yip` directly into your Rust services or network daemons, add the facade crate:
+
+```sh
+cargo add yip --features full
+```
+
+Or cherry-pick specific components in your `Cargo.toml`:
+
+```toml
+[dependencies]
+yip = { version = "0.1", default-features = false, features = ["crypto", "transport", "wire"] }
 ```
 
 ### Control Utility Symlink (`yipctl`)

@@ -1,12 +1,23 @@
 [package]
 name = "yip-transport"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "Cauchy Reed-Solomon proactive FEC erasure coding, zero-alloc in-place reassembly, and thin ARQ for yip"
 
 [dependencies]
-yip-wire = { path = "../yip-wire" }
+yip-wire = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lints]
 workspace = true

@@ -1,14 +1,25 @@
 [package]
 name = "yip-io"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "High-performance I/O engines (AF_XDP zero-copy, io_uring, and vectorized recvmmsg/sendmmsg) for yip"
 
 [dependencies]
 crossbeam-utils = "0.8.22"
 io-uring = "0.7.10"
 libc = "0.2.186"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lints]
 workspace = true

@@ -1,61 +1,49 @@
 [package]
 name = "yipd"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "High-performance userspace WireGuard-alternative overlay network daemon for yip"
 
 [package.metadata.cargo-binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/yip-v{ version }-{ target }.tar.gz"
 bin-dir = "yip-v{ version }-{ target }/{ bin }"
 pkg-fmt = "tgz"
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
-yip-io = { path = "../../crates/yip-io" }
-yip-wire = { path = "../../crates/yip-wire" }
-yip-crypto = { path = "../../crates/yip-crypto" }
-yip-transport = { path = "../../crates/yip-transport" }
-yip-device = { path = "../../crates/yip-device" }
-yip-rendezvous = { path = "../../crates/yip-rendezvous" }
-yip-membership = { path = "../../crates/yip-membership" }
-yip-obf = { path = "../../crates/yip-obf" }
+yip-io = { workspace = true }
+yip-wire = { workspace = true }
+yip-crypto = { workspace = true }
+yip-transport = { workspace = true }
+yip-device = { workspace = true }
+yip-rendezvous = { workspace = true }
+yip-membership = { workspace = true }
+yip-obf = { workspace = true }
 blake2 = { workspace = true }
 getrandom = "0.4"
 libc = "0.2"
-# 3c.1 QUIC mimicry (bin/yipd/src/quic.rs): the sans-IO QUIC state machine
-# (NOT the `quinn` crate -- that pulls in tokio). `rustls-ring` pulls rustls 0.23 configured
-# with the ring crypto provider (matches `rustls`/`rcgen` below). Drives yip's unchanged inner
-# Noise-IK/FEC/AEAD protocol inside RFC 9221 DATAGRAM frames (the outer QUIC is a throwaway
-# costume; the inner yip handshake is the real security). Proven out by the Task-1 spike
-# (bin/yipd/examples/quic_spike.rs); Task 4 promoted these from dev-deps to real deps.
 quinn-proto = { version = "0.11.16", default-features = false, features = ["rustls-ring"] }
-# Needed directly (not just via quinn-proto) to build the outer QUIC costume's rustls
-# ClientConfig/ServerConfig (accept-any-cert client verifier, throwaway server cert).
 rustls = { version = "0.23.41", default-features = false, features = ["ring", "std", "tls12"] }
-# Throwaway self-signed server cert for the outer QUIC costume (zero-auth by design; the inner
-# yip Noise-IK handshake is the real security -- see 3c.1 spec).
 rcgen = { version = "0.14", default-features = false, features = ["ring", "crypto"] }
 bytes = { version = "1", default-features = false }
-# 3c.2 TLS mimicry (bin/yipd/src/tls.rs): BoringSSL bindings for a GREASE-enabled
-# browser-parrot ClientHello -- rustls has no GREASE support, so it cannot produce
-# a browser-shaped JA3/JA4 no matter how its cipher/extension list is coaxed (see
-# the Task-0 spike, crates/yip-bench/RESULTS.md "3c.2 spike"). `boring-sys` vendors
-# and compiles BoringSSL (requires cmake + a C/C++ toolchain) -- a new hard build
-# dependency for yipd + CI, accepted per the spike's decision record. Drives yip's
-# unchanged inner Noise-IK/FEC/AEAD protocol inside a real TLS 1.3 byte-stream over
-# TCP (the outer TLS is a throwaway zero-auth costume; the inner yip handshake is
-# the real security).
 boring = "5"
-# REALITY.4a: the relay-dial thread hosts a CONFINED current-thread tokio
-# runtime to drive yip_utls's async REALITY client. The data-plane loop
-# (run_relay_tls + PeerManager) stays sync/epoll and tokio-free. tokio already
-# enters yipd transitively via yip-utls, so this is not a new heavyweight dep.
 tokio = { version = "1", features = ["rt", "net", "time", "io-util", "sync", "macros"] }
-yip-utls = { path = "../../crates/yip-utls" }
+yip-utls = { workspace = true }
 socket2 = { version = "0.5", features = ["all"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-yip-ca = { path = "../yip-ca" }
+yip-ca = { workspace = true }
 ed25519-dalek = { version = "3" }
 
 [dev-dependencies]

@@ -49,6 +49,7 @@ Find the fastest path to what you need:
 | 🟢 **New User** | Install binary → Generate keypair → Connect two nodes → Ping overlay | [5-Minute Quickstart](#5-minute-quickstart) • [`01. Getting Started`](docs/01-getting-started.md) |
 | 🌐 **Mesh Operator** | Choose deployment topology → Set up root CA / Threshold Quorum → Configure seeds | [Deployment Modes](#primary-deployment-modes) • [`Threshold CA Guide`](examples/threshold-ca/README.md) • [`02. Configuration`](docs/02-configuration.md) |
 | 🛠️ **Developer** | Inspect lock-free ring buffers → Zero-alloc FEC pipeline → Run test suites | [`03. Architecture`](docs/03-architecture.md) • [`crates/yip-bench`](crates/yip-bench/RESULTS.md) |
+| 🦀 **Rust Developer** | Import `yip` facade crate → Embed Cauchy RS-FEC or Noise-IK into custom apps | [Rust Library & SDK](#rust-library--sdk) • [`crates/yip`](crates/yip/README.md) • [docs.rs](https://docs.rs/yip) |
 | 🛡️ **Security Reviewer** | Verify post-quantum hybrid KEM → ROAST threshold quorum → Anti-DPI test oracle | [Trust Model](#crisp-trust-model--security-invariants) • [`04. Security & Threat Model`](docs/04-security-and-threat-model.md) |
 
 ---
@@ -335,6 +336,31 @@ Explore the full documentation curriculum organized by role and interest:
 | [`06. Troubleshooting Runbook`](docs/06-troubleshooting.md) | **Operator / SRE** | Diagnostic flowcharts, MTU discovery issues, NAT traversal debugging, and telemetry inspection |
 | [`Motivation & Philosophy`](docs/motivation.md) | **Everyone** | Design philosophy, anti-censorship regulatory context, and the problem with traditional VPNs |
 | [`Turnkey Threshold CA Tutorial`](examples/threshold-ca/README.md) | **Operator** | Step-by-step setup of a 2-of-3 threshold CA quorum with systemd units |
+
+---
+
+## Rust Library & SDK
+
+The `yip` workspace publishes a unified facade crate [`yip`](crates/yip) for embedding yip's primitives directly into your Rust applications:
+
+```toml
+[dependencies]
+yip = { version = "0.1", features = ["full"] }
+```
+
+### Modular Feature Flags
+
+- **`crypto`** (default): AEAD ciphers (ChaCha20-Poly1305, AES-256-GCM, AES-128-GCM), Noise-IK handshakes, BLAKE2s hashing, and key derivations.
+- **`wire`** (default): Zero-allocation framing, wire codec parsing, header obfuscation, and control frame encoding.
+- **`transport`** (default): Slotted Reed-Solomon Forward Error Correction (FEC), sliding window packet reassembly, and selective ARQ.
+- **`membership`** (default): Cryptographic node identity, self-certifying IPv6 mesh addresses, certificate verification, root sets, and anti-entropy gossip.
+- **`device`**: TUN/TAP virtual network device abstractions across Linux.
+- **`io`**: High-throughput I/O engines supporting Linux `epoll` and `io_uring` with ring buffer pools.
+- **`rendezvous`**: STUN/TURN-independent symmetric NAT traversal with authenticated ticket exchange.
+- **`obf`**: Steganographic wire framing, padding transforms, and timing-jitter obfuscation.
+- **`utls`**: TLS 1.3 browser mimicry and REALITY camouflage transport.
+- **`ca`**: RFC 9591 FROST threshold certificate authority signer and coordinator protocols.
+- **`full`**: Enables all modules above.
 
 ---
 

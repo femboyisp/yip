@@ -1,14 +1,25 @@
 [package]
 name = "yip-rendezvous"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "Blind rendezvous protocol, STUN NAT traversal classification, and relay signaling for yip"
 
 [dependencies]
 blake2 = { workspace = true }
 subtle = "2.6.1"
-yip-membership = { path = "../yip-membership" }
+yip-membership = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dev-dependencies]
 ed25519-dalek = { version = "3", features = ["rand_core"] }

@@ -3,11 +3,29 @@ resolver = "2"
 members = ["crates/*", "bin/*"]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2021"
+rust-version = "1.89.0"
 license = "AGPL-3.0-or-later"
+authors = ["FEMBOY CYBER NETWORKS LLC <security@femboy.is>"]
 repository = "https://github.com/femboyisp/yip"
+homepage = "https://github.com/femboyisp/yip"
+documentation = "https://docs.rs/yip"
+keywords = ["vpn", "mesh", "fec", "cryptography", "peer-to-peer"]
+categories = ["network-programming", "cryptography"]
 
 [workspace.dependencies]
+yip-wire = { version = "0.1.0", path = "crates/yip-wire" }
+yip-crypto = { version = "0.1.0", path = "crates/yip-crypto" }
+yip-device = { version = "0.1.0", path = "crates/yip-device" }
+yip-io = { version = "0.1.0", path = "crates/yip-io" }
+yip-transport = { version = "0.1.0", path = "crates/yip-transport" }
+yip-membership = { version = "0.1.0", path = "crates/yip-membership" }
+yip-rendezvous = { version = "0.1.0", path = "crates/yip-rendezvous" }
+yip-obf = { version = "0.1.0", path = "crates/yip-obf" }
+yip-utls = { version = "0.1.0", path = "crates/yip-utls" }
+yip-ca = { version = "0.1.0", path = "bin/yip-ca" }
+
 blake2 = "=0.10.6"
 thiserror = "2.0.9"
 tracing = "0.1.41"

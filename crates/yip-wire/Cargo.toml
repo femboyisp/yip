@@ -1,14 +1,25 @@
 [package]
 name = "yip-wire"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "Wire format framing and SipHash-CTR keyed header protection for the yip mesh VPN"
 
 [dependencies]
 thiserror = { workspace = true }
 siphasher = "1.0.3"
 subtle = "2.6.1"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lints]
 workspace = true

@@ -1,14 +1,25 @@
 [package]
 name = "yip-obf"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "Anti-DPI packet length quantization (DAITA) and SipHash-CTR wire masking for yip"
 
 [dependencies]
 blake2 = { workspace = true }
 siphasher = "1.0.3"
 getrandom = "0.4"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lints]
 workspace = true

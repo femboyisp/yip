@@ -1,9 +1,16 @@
 [package]
 name = "yip-rendezvous-bin"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "Blind rendezvous server, STUN traversal, and anti-DPI REALITY relay daemon for yip"
 
 [package.metadata.cargo-binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/yip-v{ version }-{ target }.tar.gz"
@@ -13,16 +20,17 @@ pkg-fmt = "tgz"
 [[bin]]
 name = "yip-rendezvous"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
-yip-rendezvous = { path = "../../crates/yip-rendezvous" }
+yip-rendezvous = { workspace = true }
 # rdv.37 Task 3: `--roots`/`--network-id` load a signed `RootSet` (same
 # artifact `yipd` loads) to run this server in mesh mode — RootSet is not
 # re-exported by the `yip-rendezvous` lib crate, so this binary needs the
 # direct dependency.
-yip-membership = { path = "../../crates/yip-membership" }
-yip-obf = { path = "../../crates/yip-obf" }
-yip-utls = { path = "../../crates/yip-utls" }
+yip-membership = { workspace = true }
+yip-obf = { workspace = true }
+yip-utls = { workspace = true }
 getrandom = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
 # 3c.3 TCP/TLS Trojan front: real-cert TLS termination on the rendezvous

@@ -1,6 +1,6 @@
 //! `PeerManager`: multi-peer routing/demux + in-loop lazy handshake.
 //!
-//! This is the integration crux of milestone 2a. It owns one [`DataPlane`]
+//! This is the integration crux of milestone 2a. It owns one `DataPlane`
 //! per established remote peer, drives the [`HandshakeState`] step-functions
 //! to bring a peer up from a cold start (no pre-loop blocking handshake, no
 //! `sock.connect`), and implements [`Dispatch`] so [`yip_io::poll::run_poll`]
@@ -8,7 +8,7 @@
 //!
 //! # Lazy handshake
 //!
-//! A peer starts in [`PeerState::Idle`]: nothing has been sent to it yet.
+//! A peer starts in `PeerState::Idle`: nothing has been sent to it yet.
 //! The first TUN packet routed to that peer (see "TUN routing" below)
 //! buffers the packet in `pending_tun`, starts a [`HandshakeState`] initiator,
 //! and emits `[HandshakeInit]`. The peer stays `Handshaking` until either:
@@ -56,7 +56,7 @@
 //! the *AEAD counter* (see `DataPlane::on_udp_datagram`'s `Control` arm),
 //! not a conn_tag at all, sent unmasked.
 //!
-//! [`PeerManager::route_data`] therefore demuxes primarily by matching the
+//! `PeerManager::route_data` therefore demuxes primarily by matching the
 //! datagram's source address against each peer's learned/configured
 //! `endpoint` — correct uniformly for `Data` and `Control` frames, and
 //! exactly the mechanism the addendum itself specifies for routing

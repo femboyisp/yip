@@ -101,8 +101,8 @@ const MAX_RETRIES: u32 = 5;
 /// Run the Noise-IK initiator role over `sock`.
 ///
 /// Sends `[HandshakeInit] ++ msg1` to `peer`, waits for `[HandshakeResp] ++ msg2`,
-/// then derives an [`Established`] session. Retries up to [`MAX_RETRIES`] times
-/// (each with a [`RETRY_TIMEOUT`] read timeout) so the companion test is not
+/// then derives an [`Established`] session. Retries up to `MAX_RETRIES` times
+/// (each with a `RETRY_TIMEOUT` read timeout) so the companion test is not
 /// flaky even when the responder thread has not started yet.
 ///
 /// Superseded in production by [`HandshakeState`]'s step-functions (Task 5):

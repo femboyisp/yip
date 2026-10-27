@@ -29,7 +29,7 @@ impl AdaptiveController {
 
     /// Start from a class's initial repair ratio.
     ///
-    /// Delegates to [`new_for`], so it has the same class-aware behavior. Kept
+    /// Delegates to [`Self::new_for`], so it has the same class-aware behavior. Kept
     /// for API compatibility.
     pub fn new(params: FlowParams) -> Self {
         Self::new_for(params)

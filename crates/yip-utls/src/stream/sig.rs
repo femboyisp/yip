@@ -48,7 +48,7 @@ pub(crate) fn verify_certificate_verify(
         .map_err(|_| Error::RealityVerify("CertificateVerify signature does not verify"))
 }
 
-/// The signing counterpart of [`verify_certificate_verify`]: sign the TLS 1.3
+/// The signing counterpart of `verify_certificate_verify`: sign the TLS 1.3
 /// server `CertificateVerify` (RFC 8446 §4.4.3) with the derived ECDSA-P256
 /// key `signing_key` (from `crate::auth::derive_cert_key(shared)`), over the SAME
 /// signed content the verifier reconstructs. This IS the REALITY.4b binding,

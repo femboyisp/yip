@@ -256,7 +256,7 @@ pub fn parse_server_hello(record_payload: &[u8]) -> Result<ServerHelloInfo, Erro
 /// (ordered extensions incl. GREASE, compression) for REALITY.5 mimicry. The
 /// per-connection `random` and `key_share` VALUE are not returned here (5b
 /// substitutes the relay's own); the `key_share` group IS
-/// (`key_share_group`). Shares [`parse_server_hello_header`]'s bounded walk
+/// (`key_share_group`). Shares `parse_server_hello_header`'s bounded walk
 /// with `parse_server_hello`, so both stay byte-identical up through the
 /// extensions block; this variant additionally walks every extension
 /// (including ones `parse_server_hello` ignores, like GREASE) and records
@@ -520,7 +520,7 @@ pub struct HandshakeKeys {
 /// shape.
 ///
 /// Every step here uses the `suite`-selected hash (RFC 8446 §7.1) — see
-/// [`digest_algorithm_for_suite`].
+/// `digest_algorithm_for_suite`.
 pub fn derive_handshake_keys(
     ecdhe: &[u8],
     transcript_hash_ch_sh: &[u8],

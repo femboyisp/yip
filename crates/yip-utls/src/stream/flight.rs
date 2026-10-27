@@ -19,7 +19,7 @@ use crate::template::{CertChainShape, EncryptedFlightShape};
 pub(crate) const HS_TYPE_ENCRYPTED_EXTENSIONS: u8 = 0x08;
 
 /// REALITY.5a Task 2: what capturing a dest's server flight needs beyond
-/// [`crate::stream::cert::scan_cert_flight`] (which REALITY.4b's verify path already relies on and
+/// `crate::stream::cert::scan_cert_flight` (which REALITY.4b's verify path already relies on and
 /// which this does not alter) — per-message plaintext lengths (each `4 +
 /// body_len`, the handshake-message length INCLUDING its own 4-byte header —
 /// matching [`crate::template::EncryptedFlightShape`]'s length fields) plus
@@ -42,11 +42,11 @@ pub struct FlightShapeScan {
     pub finished_len: usize,
 }
 
-/// Scans `hs_flight` (see [`crate::stream::record::find_finished_end`] for its shape) for
+/// Scans `hs_flight` (see `crate::stream::record::find_finished_end` for its shape) for
 /// REALITY.5a's flight-shape capture: per-message plaintext lengths of
 /// EncryptedExtensions/Certificate/CertificateVerify/Finished, plus the
 /// leaf certificate's DER and every subsequent chain cert's DER verbatim
-/// (see [`certificate_chain_ders`]). Mirrors [`crate::stream::cert::scan_cert_flight`]'s bounded
+/// (see `certificate_chain_ders`). Mirrors `crate::stream::cert::scan_cert_flight`'s bounded
 /// `while hs_flight.len() >= pos + 4` walk over `msg_type ‖ u24 len ‖ body`,
 /// but records EVERY message's length rather than stopping at the first
 /// `CertificateVerify`. Fail-closed: a missing `Certificate` message,

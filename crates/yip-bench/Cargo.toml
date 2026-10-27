@@ -1,23 +1,23 @@
 [package]
 name = "yip-bench"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
 
 [dependencies]
-yip-crypto = { path = "../yip-crypto" }
+yip-crypto = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.8.0"
-yip-wire = { path = "../yip-wire" }
-yip-transport = { path = "../yip-transport" }
+yip-wire = { workspace = true }
+yip-transport = { workspace = true }
 blake3 = "1.8.5"
 siphasher = "1.0.3"
 libc = "0.2"
 socket2 = "0.5"
-yip-io = { path = "../yip-io" }
+yip-io = { workspace = true }
 
 [[bench]]
 name = "hotpath"

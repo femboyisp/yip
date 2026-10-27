@@ -1,14 +1,25 @@
 [package]
 name = "yip-ca"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "Certificate Authority CLI and online threshold (RFC 9591 FROST) signing daemon for yip"
 
 [package.metadata.cargo-binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/yip-v{ version }-{ target }.tar.gz"
 bin-dir = "yip-v{ version }-{ target }/{ bin }"
 pkg-fmt = "tgz"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
 path = "src/lib.rs"
@@ -18,7 +29,7 @@ name = "yip-ca"
 path = "src/main.rs"
 
 [dependencies]
-yip-membership = { path = "../../crates/yip-membership" }
+yip-membership = { workspace = true }
 ed25519-dalek = { version = "3", features = ["rand_core"] }
 rand_core = "0.10"
 frost-core = "3.0.0"

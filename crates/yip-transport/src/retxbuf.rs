@@ -16,8 +16,8 @@ struct Entry {
 
 /// Bounded LRU+TTL buffer of sent ciphertext objects, keyed by send-counter.
 ///
-/// Used by the ARQ sender: after [`put`]ting an object, a later NACK can
-/// retrieve it via [`get`] and retransmit it with the *same* `object_id` so
+/// Used by the ARQ sender: after [`Self::put`]ting an object, a later NACK can
+/// retrieve it via [`Self::get`] and retransmit it with the *same* `object_id` so
 /// the receiver's existing FEC decoder is topped up rather than a new one
 /// being started.
 pub struct RetxBuffer {

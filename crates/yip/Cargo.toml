@@ -1,0 +1,57 @@
+[package]
+name = "yip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "High-performance userspace WireGuard-alternative overlay network protocol and SDK"
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["crypto", "wire", "transport", "membership"]
+full = [
+    "default",
+    "device",
+    "io",
+    "rendezvous",
+    "obf",
+    "utls",
+    "ca",
+]
+
+# Modular feature flags
+crypto = ["dep:yip-crypto"]
+wire = ["dep:yip-wire"]
+transport = ["dep:yip-transport"]
+membership = ["dep:yip-membership"]
+device = ["dep:yip-device"]
+io = ["dep:yip-io"]
+rendezvous = ["dep:yip-rendezvous"]
+obf = ["dep:yip-obf"]
+utls = ["dep:yip-utls"]
+ca = ["dep:yip-ca"]
+
+[dependencies]
+yip-crypto = { workspace = true, optional = true }
+yip-wire = { workspace = true, optional = true }
+yip-transport = { workspace = true, optional = true }
+yip-membership = { workspace = true, optional = true }
+yip-device = { workspace = true, optional = true }
+yip-io = { workspace = true, optional = true }
+yip-rendezvous = { workspace = true, optional = true }
+yip-obf = { workspace = true, optional = true }
+yip-utls = { workspace = true, optional = true }
+yip-ca = { workspace = true, optional = true }
+
+[lints]
+workspace = true

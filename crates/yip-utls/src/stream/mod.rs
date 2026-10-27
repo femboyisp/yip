@@ -20,7 +20,7 @@
 //! private key, not merely that it can answer a `ClientHello` (which any
 //! camouflage-only decoy site also does). This still never validates a CA
 //! chain — the leaf is always self-signed — and still never checks
-//! `Finished`. See [`verify_reality_binding`].
+//! `Finished`. See `verify_reality_binding`.
 //!
 //! The ephemeral X25519 key is generated once, as raw bytes, and reused for
 //! both the TLS `key_share`/ECDHE *and* the REALITY auth seal's ECDH — see
@@ -242,10 +242,10 @@ async fn send_alert<S: AsyncWrite + Unpin>(
 /// fully received, ADDITIONALLY pins the Certificate leaf's P-256 key to
 /// `auth::derive_cert_key(auth::shared_secret(server_reality_pub,
 /// &eph_priv)).public_sec1` and verifies `CertificateVerify` over it (see
-/// [`verify_reality_binding`]) — proof the peer holds
+/// `verify_reality_binding`) — proof the peer holds
 /// `server_reality_pub`'s private key, not merely that it can answer a
 /// `ClientHello`. On failure, best-effort sends a `bad_certificate` TLS
-/// alert (see [`send_alert`]) and returns `Err(Error::RealityVerify(_))`
+/// alert (see `send_alert`) and returns `Err(Error::RealityVerify(_))`
 /// BEFORE the client `Finished` is sent — this client never completes a
 /// handshake with, nor sends any encrypted client bytes to, a peer that
 /// fails this check.
@@ -512,7 +512,7 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
 ///
 /// A focused SIBLING of [`connect`]: shares [`hello::craft`], the ephemeral
 /// key setup, [`parse_server_hello`]/[`parse_server_hello_shape`],
-/// [`derive_handshake_keys`], [`record_open`], [`find_finished_end`], and
+/// [`derive_handshake_keys`], [`record_open`], `find_finished_end`, and
 /// [`scan_flight_shape`], but DUPLICATES `connect`'s ~15-line encrypted-
 /// flight read loop (with one addition: recording each record's pre-decrypt
 /// ciphertext-payload length into `record_lengths`) rather than refactoring

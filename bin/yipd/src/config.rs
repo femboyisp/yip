@@ -130,12 +130,12 @@ pub struct Config {
     /// List of remote peers.
     pub peers: Vec<PeerConfig>,
     /// Local UDP address to bind. Port defaults to
-    /// [`DEFAULT_LISTEN_PORT`] (443) when `listen=` gives no port, or is
+    /// `DEFAULT_LISTEN_PORT` (443) when `listen=` gives no port, or is
     /// absent entirely — see `listen_port_auto`.
     pub listen: SocketAddr,
     /// `true` when `listen`'s port was auto-selected (absent `listen`, or
     /// `listen=<IP>` with no port) rather than explicitly configured. Lets
-    /// the bind site (`tunnel.rs`) fall back to [`FALLBACK_LISTEN_PORT`]
+    /// the bind site (`tunnel.rs`) fall back to `FALLBACK_LISTEN_PORT`
     /// (8443) if binding the auto-selected 443 fails; an explicit port is
     /// never silently substituted.
     pub listen_port_auto: bool,

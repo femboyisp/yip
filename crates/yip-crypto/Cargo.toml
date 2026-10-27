@@ -1,9 +1,16 @@
 [package]
 name = "yip-crypto"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "Post-quantum hybrid Noise-IKpsk2 + ML-KEM-512 cryptographic handshake and AEAD session ciphers for yip"
 
 [dependencies]
 thiserror = { workspace = true }
@@ -11,6 +18,10 @@ snow = { version = "0.10.0", features = ["risky-raw-split"] }
 ring = "0.17"
 ml-kem = { version = "0.3", features = ["zeroize", "getrandom"] }
 zeroize = "1.8"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lints]
 workspace = true
