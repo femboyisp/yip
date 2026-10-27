@@ -361,6 +361,7 @@ fn main() -> std::io::Result<()> {
             Some("top") => return run_client_subcommand("top", args),
             Some("ping") => return run_client_subcommand("ping", args),
             Some("peer") => return run_client_subcommand("peer", args),
+            Some("cert") => return run_client_subcommand("cert", args),
             Some("genkey") | Some("--genkey") => {
                 let kp = yip_crypto::generate_keypair();
                 println!("private={}", hex_encode(&kp.private));
@@ -396,6 +397,7 @@ fn main() -> std::io::Result<()> {
         Some("top") => run_client_subcommand("top", args),
         Some("ping") => run_client_subcommand("ping", args),
         Some("peer") => run_client_subcommand("peer", args),
+        Some("cert") => run_client_subcommand("cert", args),
         Some("--version") | Some("-V") => {
             println!("{}", banner());
             Ok(())
