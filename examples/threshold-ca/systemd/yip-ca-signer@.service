@@ -1,0 +1,17 @@
+[Unit]
+Description=yip-ca Threshold Signer Daemon (Share %i)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/yip-ca serve --role signer --coordinator 198.51.100.10:4443 --key /etc/yip/ca/signer_%i.json --pubkey /etc/yip/ca/pubkey_package.json --max-ttl 2592000
+Restart=always
+RestartSec=5s
+LimitMEMLOCK=infinity
+CapabilityBoundingSet=CAP_IPC_LOCK
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/yip/ca
+
+[Install]
+WantedBy=multi-user.target

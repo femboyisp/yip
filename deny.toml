@@ -1,5 +1,9 @@
 [advisories]
 yanked = "deny"
+ignore = [
+    # atomic-polyfill is unmaintained, pulled in transitively by frost-core -> postcard -> heapless
+    "RUSTSEC-2023-0089",
+]
 
 [licenses]
 allow = ["AGPL-3.0-or-later", "MIT", "Apache-2.0", "BSD-3-Clause", "ISC", "Unicode-3.0"]

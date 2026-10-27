@@ -496,6 +496,10 @@ pub struct PeerManager {
     device_name: String,
     /// Loop start time for uptime reporting.
     start_time: std::time::Instant,
+    /// Optional online Threshold CA coordinator address for automated 70% TTL certificate rotation.
+    pub threshold_ca_server: Option<SocketAddr>,
+    /// Monotonic timestamp in milliseconds of the last certificate renewal check.
+    last_cert_check_ms: u64,
 }
 
 /// MTU budget (bytes) used to size obfuscation padding: handshakes are padded
@@ -626,6 +630,8 @@ impl PeerManager {
             control: None,
             device_name: "yip0".into(),
             start_time: std::time::Instant::now(),
+            threshold_ca_server: None,
+            last_cert_check_ms: 0,
         };
 
         // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
@@ -812,6 +818,73 @@ impl PeerManager {
         self.control = control;
         self.device_name = device_name;
         self.start_time = start_time;
+    }
+
+    /// Configure online Threshold CA coordinator address for automated 70% TTL certificate rotation.
+    pub fn set_threshold_ca_server(&mut self, addr: Option<SocketAddr>) {
+        self.threshold_ca_server = addr;
+    }
+
+    /// Returns a reference to the membership directory, if configured.
+    pub fn membership(&self) -> Option<&Membership> {
+        self.membership.as_ref()
+    }
+
+    /// Evaluates if the current membership certificate is due for renewal (>= 70% of TTL elapsed).
+    pub fn check_cert_rotation(&self, now_secs: u64) -> Option<bool> {
+        let _server = self.threshold_ca_server?;
+        let m = self.membership.as_ref()?;
+        let cert = m.own_cert();
+        let total_ttl = cert.not_after.saturating_sub(cert.not_before);
+        if total_ttl == 0 {
+            return Some(false);
+        }
+        let elapsed = now_secs.saturating_sub(cert.not_before);
+        Some(elapsed.saturating_mul(10) >= total_ttl.saturating_mul(7))
+    }
+
+    /// Renews the node's membership certificate against the online Threshold CA coordinator.
+    pub fn renew_cert(&mut self) -> Result<yip_membership::Cert, String> {
+        let ca_server = self
+            .threshold_ca_server
+            .ok_or_else(|| "no threshold CA server configured".to_string())?;
+        let membership = self
+            .membership
+            .as_mut()
+            .ok_or_else(|| "membership directory is not enabled".to_string())?;
+
+        let own_cert = membership.own_cert().clone();
+        let own_sign_priv = *membership.own_sign_priv();
+        let network_id = membership.network_id();
+        let member_pubkey = own_cert.member_pubkey;
+        let member_sign_pubkey = own_cert.member_sign_pubkey;
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&own_sign_priv);
+
+        let credential = yip_ca::rpc::EnrollmentCredential::RenewalCert {
+            existing_cert_bytes: Vec::new(),
+            renewal_signature: [0u8; 64],
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
+
+        let new_cert = rt.block_on(async {
+            yip_ca::enroll::enroll_node(
+                ca_server,
+                &signing_key,
+                member_pubkey,
+                member_sign_pubkey,
+                network_id,
+                credential,
+            )
+            .await
+        })?;
+
+        let _rec = membership.update_own_cert(new_cert.clone());
+        Ok(new_cert)
     }
 
     /// Set the RaptorQ symbol size passed to `DataPlane::new` at every
@@ -1740,6 +1813,18 @@ impl PeerManager {
                 .collect();
             for i in stale {
                 self.drop_session(i);
+            }
+        }
+
+        // ── threshold CA certificate auto-renewal (70% TTL) ───────────────────
+        if self.threshold_ca_server.is_some()
+            && self.membership.is_some()
+            && now_ms.saturating_sub(self.last_cert_check_ms) >= 5000
+        {
+            self.last_cert_check_ms = now_ms;
+            let now_s = now_secs();
+            if self.check_cert_rotation(now_s) == Some(true) {
+                let _ = self.renew_cert();
             }
         }
 

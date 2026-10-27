@@ -10,10 +10,25 @@ pkg-url = "{ repo }/releases/download/v{ version }/yip-v{ version }-{ target }.t
 bin-dir = "yip-v{ version }-{ target }/{ bin }"
 pkg-fmt = "tgz"
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "yip-ca"
+path = "src/main.rs"
+
 [dependencies]
 yip-membership = { path = "../../crates/yip-membership" }
 ed25519-dalek = { version = "3", features = ["rand_core"] }
 rand_core = "0.10"
+frost-core = "3.0.0"
+frost-ed25519 = "3.0.0"
+rand = "0.8"
+postcard = "1.1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "io-util", "sync", "macros"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = { workspace = true }
 # The mesh CA's key-generation OS-CSPRNG: `getrandom::SysRng` (wrapped in
 # `rand_core::UnwrapErr` to satisfy ed25519-dalek 3's `CryptoRng` bound),
 # not a determinism-risking substitute.

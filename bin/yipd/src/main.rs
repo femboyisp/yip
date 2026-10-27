@@ -262,6 +262,73 @@ fn run_client_subcommand(
                 }
             }
         }
+        "cert" => {
+            if positional.is_empty() {
+                println!("Usage: yipd cert <status|renew>");
+                return Ok(());
+            }
+            match positional[0].as_str() {
+                "status" => {
+                    let resp = control::client_query(&socket, control::ControlCmd::CertStatus)
+                        .map_err(std::io::Error::other)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&resp).unwrap());
+                    } else if let control::ControlResponse::CertStatus {
+                        not_before,
+                        not_after,
+                        ttl_remaining_secs,
+                        renewal_threshold_secs,
+                        is_threshold_ca,
+                        ..
+                    } = resp
+                    {
+                        println!("Certificate Status:");
+                        println!("  Not Before:        {not_before}");
+                        println!("  Not After:         {not_after}");
+                        println!("  TTL Remaining:     {ttl_remaining_secs}s");
+                        println!("  Renewal Threshold: {renewal_threshold_secs}s (70% TTL)");
+                        println!(
+                            "  Threshold CA:      {}",
+                            if is_threshold_ca {
+                                "configured"
+                            } else {
+                                "none (offline root CA)"
+                            }
+                        );
+                    } else if let control::ControlResponse::Err { error, .. } = resp {
+                        eprintln!("\x1b[1;31m✗\x1b[0m Error: {error}");
+                    }
+                    Ok(())
+                }
+                "renew" => {
+                    let resp = control::client_query(&socket, control::ControlCmd::CertRenew)
+                        .map_err(std::io::Error::other)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&resp).unwrap());
+                    } else if let control::ControlResponse::CertRenew {
+                        message,
+                        new_not_after,
+                        ..
+                    } = resp
+                    {
+                        println!("\x1b[1;32m✓\x1b[0m {message}");
+                        if let Some(na) = new_not_after {
+                            println!("  New Not After: {na}");
+                        }
+                    } else if let control::ControlResponse::Err { error, .. } = resp {
+                        eprintln!("\x1b[1;31m✗\x1b[0m Error: {error}");
+                    }
+                    Ok(())
+                }
+                other => {
+                    eprintln!("Unknown cert action: {other}");
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "unknown cert action",
+                    ))
+                }
+            }
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("unknown subcommand: {subcmd}"),
@@ -294,6 +361,7 @@ fn main() -> std::io::Result<()> {
             Some("top") => return run_client_subcommand("top", args),
             Some("ping") => return run_client_subcommand("ping", args),
             Some("peer") => return run_client_subcommand("peer", args),
+            Some("cert") => return run_client_subcommand("cert", args),
             Some("genkey") | Some("--genkey") => {
                 let kp = yip_crypto::generate_keypair();
                 println!("private={}", hex_encode(&kp.private));
@@ -329,6 +397,7 @@ fn main() -> std::io::Result<()> {
         Some("top") => run_client_subcommand("top", args),
         Some("ping") => run_client_subcommand("ping", args),
         Some("peer") => run_client_subcommand("peer", args),
+        Some("cert") => run_client_subcommand("cert", args),
         Some("--version") | Some("-V") => {
             println!("{}", banner());
             Ok(())
