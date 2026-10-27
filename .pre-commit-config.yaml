@@ -32,3 +32,13 @@ repos:
         language: system
         types: [rust]
         pass_filenames: false
+      - id: deny
+        name: cargo deny
+        entry: cargo deny check
+        language: system
+        pass_filenames: false
+      - id: shear
+        name: cargo shear
+        entry: cargo shear
+        language: system
+        pass_filenames: false

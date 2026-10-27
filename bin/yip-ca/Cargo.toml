@@ -23,11 +23,9 @@ ed25519-dalek = { version = "3", features = ["rand_core"] }
 rand_core = "0.10"
 frost-core = "3.0.0"
 frost-ed25519 = "3.0.0"
-frost-rerandomized = "3.0.0"
 rand = "0.8"
 postcard = "1.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "io-util", "sync", "macros"] }
-zeroize = { version = "1.8", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = { workspace = true }

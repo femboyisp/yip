@@ -2581,7 +2581,6 @@ dependencies = [
  "ed25519-dalek",
  "frost-core",
  "frost-ed25519",
- "frost-rerandomized",
  "getrandom 0.4.3",
  "postcard",
  "rand 0.8.8",
@@ -2591,7 +2590,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "yip-membership",
- "zeroize",
 ]
 
 [[package]]
