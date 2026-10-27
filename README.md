@@ -5,7 +5,7 @@
 # 🦊 yip
 
 **Low-latency P2P mesh VPN in Rust.**<br/>
-*Reed-Solomon FEC loss immunity • 40 Gbps AF_XDP multi-core scaling • NAT traversal • Zero-trust CA mesh • Anti-DPI TLS mimicry*
+*Reed-Solomon FEC loss immunity • 40 Gbps AF_XDP multi-core scaling • Decentralized threshold PKI • Anti-DPI TLS mimicry*
 
 <p align="center">
   <a href="https://github.com/femboyisp/yip/actions/workflows/ci.yml"><img src="https://github.com/femboyisp/yip/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
@@ -25,38 +25,165 @@
 
 ## What is yip?
 
-Ever wonder why standard VPNs choke the moment a packet drops? WireGuard is fantastic on a pristine gigabit fiber link, but on lossy Wi-Fi, cellular, or crowded trans-oceanic routes, TCP panics, triggers exponential backoff, and collapses.
+Standard VPNs collapse the moment a physical link drops packets. WireGuard delivers exceptional throughput on clean fiber, but on lossy Wi-Fi, cellular networks, or congested trans-oceanic routes, even 2% packet loss forces TCP into exponential backoff, cutting effective speeds by up to 99%.
 
-**yip fixes this.** It is a fast, clever peer-to-peer mesh VPN in Rust that bakes Reed-Solomon forward error correction straight into the wire. Missing packets get reconstructed in-flight before the application even realizes a drop happened.
+**yip fixes this at the root.** It is a high-performance peer-to-peer mesh VPN in Rust that bakes Reed-Solomon forward error correction (FEC) directly into the datapath. Missing packets are reconstructed in-flight before the kernel TCP stack or user applications ever realize a drop occurred.
 
-Under the hood, yip pairs proactive loss recovery with 40 Gbps AF_XDP zero-copy line-rate scaling, automatic NAT hole-punching, post-quantum ML-KEM handshakes, and authentic Chrome TLS mimicry to sneak past strict DPI firewalls unnoticed. It runs circles around packet loss and keeps your connections alive where ordinary tunnels stall out.
+Under the hood, yip pairs proactive loss recovery with **40 Gbps AF_XDP zero-copy scaling**, post-quantum **ML-KEM-512 handshakes**, an online **$t$-of-$n$ Decentralized Threshold CA** (RFC 9591 FROST), and authentic **Chrome TLS mimicry** to glide past aggressive DPI firewalls unnoticed.
+
+> [!TIP]
+> **Decentralized Threshold CA Hero Feature**:
+> yip avoids single-key CA failure by partitioning root signing authority across a distributed $t$-of-$n$ signer quorum (`yip-ca serve`). Because FROST threshold signatures aggregate linearly into a standard 64-byte Ed25519 signature, threshold credentials require zero changes to node verifiers and support zero-touch 70% TTL auto-renewal inside `yipd`. See the turnkey [Threshold CA Quickstart](examples/threshold-ca/README.md).
 
 > [!NOTE]
-> yip builds an encrypted peer-to-peer overlay, not an anonymizing mix-net like Tor. Connected peers authenticate each other directly and see each other's physical IP addresses.
+> yip builds an encrypted peer-to-peer overlay, not an anonymizing mix-net like Tor. Connected peers authenticate directly and see each other's physical IP addresses.
+
+---
+
+## Start Here
+
+Find the fastest path to what you need:
+
+| Persona | Immediate Next Steps | Recommended Guide |
+| :--- | :--- | :--- |
+| 🟢 **New User** | Install binary → Generate keypair → Connect two nodes → Ping overlay | [5-Minute Quickstart](#5-minute-quickstart) • [`01. Getting Started`](docs/01-getting-started.md) |
+| 🌐 **Mesh Operator** | Choose deployment topology → Set up root CA / Threshold Quorum → Configure seeds | [Deployment Modes](#primary-deployment-modes) • [`Threshold CA Guide`](examples/threshold-ca/README.md) • [`02. Configuration`](docs/02-configuration.md) |
+| 🛠️ **Developer** | Inspect lock-free ring buffers → Zero-alloc FEC pipeline → Run test suites | [`03. Architecture`](docs/03-architecture.md) • [`crates/yip-bench`](crates/yip-bench/RESULTS.md) |
+| 🛡️ **Security Reviewer** | Verify post-quantum hybrid KEM → ROAST threshold quorum → Anti-DPI test oracle | [Trust Model](#crisp-trust-model--security-invariants) • [`04. Security & Threat Model`](docs/04-security-and-threat-model.md) |
 
 ---
 
 <a id="why-yip"></a>
 ## Why yip Exists: The Problem with Traditional VPNs
 
-Every modern tunnel protocol (WireGuard, OpenVPN, IPsec) operates on a fatal assumption: the underlying transport network delivers packets reliably. On clean local fiber or controlled datacenter cross-connects, that assumption holds. WireGuard achieves stellar throughput with minimal CPU overhead.
+Every traditional tunnel protocol (WireGuard, OpenVPN, IPsec) makes an optimistic assumption: the underlying transport delivers packets reliably. On clean datacenter cross-connects, that assumption holds.
 
-The open internet is not a clean datacenter cross-connect. When you transmit across long-haul continental WANs, congested public Wi-Fi, cellular networks, or international boundaries, packet loss is an inescapable reality.
-
-When an underlying network drops packets, standard VPNs pass that loss straight up the protocol stack. For TCP connections, this triggers catastrophic congestion control backoff. Mathis' formula models this throughput limit:
+The open internet is not a clean datacenter cross-connect. On cellular data, satellite connections, crowded public Wi-Fi, or international transit routes, packet loss is an inescapable reality. When an underlying network drops packets, standard VPNs pass that loss straight up to the kernel. For TCP connections, this triggers catastrophic congestion window throttling modeled by Mathis' formula:
 
 $$T \le \frac{MSS}{RTT} \times \frac{C}{\sqrt{p}}$$
 
-Because throughput is inversely proportional to the square root of packet loss probability ($p$), even a modest 1% to 3% packet loss rate forces TCP into severe window throttling, slashing effective throughput by 90% to 99%. On a 100 Mbit/s link with 60ms round-trip time, injecting just 3% packet loss can plummet transfer speeds from 95 Mbit/s down to under 10 Mbit/s. At 10% packet loss, connections stall completely.
+Because throughput is inversely proportional to the square root of loss probability ($p$), injecting just 3% packet loss on a 100 Mbit/s link (60ms RTT) slashes transfer speeds from 95 Mbit/s down to under 10 Mbit/s. At 10% loss, connections stall completely.
 
-**yip's answer is proactive in-flight repair.** Instead of waiting for timeout expirations and reactive retransmissions, yip computes Cauchy Reed-Solomon erasure coding over Galois Field $GF(2^8)$ directly in the datapath. For every block of data packets, yip generates dynamic mathematical parity packets in-flight. When transit networks drop intermediate packets, yip reconstructs the missing symbols on the fly before kernel TCP stacks or user applications ever detect a gap. The result is sustained throughput and predictable latency across lossy links.
+**yip's answer is proactive in-flight repair.** Instead of waiting for timeout expirations and reactive retransmissions, yip computes Cauchy Reed-Solomon erasure coding over Galois Field $GF(2^8)$ directly in the datapath. For every block of packets, yip generates mathematical parity symbols in-flight. Missing symbols are reconstructed in **117 ns** with zero heap allocations before TCP stacks detect a gap.
+
+---
+
+## When to Choose yip
+
+| Use yip for | Stick with WireGuard or others for |
+| :--- | :--- |
+| **Contended, lossy, or wireless links** (cellular, satellite, trans-oceanic transit) where packet drops stall standard tunnels | **Clean zero-loss gigabit LANs** where in-kernel WireGuard already saturates the wire with lower CPU overhead |
+| **Zero-trust mesh networks** requiring decentralized $t$-of-$n$ threshold signing and automated certificate renewal | **Simple point-to-point home VPNs** where static public keys are easily managed manually |
+| **High-packet-rate 40G/100G edge infrastructure** scaling across multiple CPU cores via zero-copy AF_XDP | **Anonymity or mix-net routing** without trusted direct peering (peers authenticate directly) |
+| **Hostile network environments** monitored by active-probing Deep Packet Inspection (DPI) firewalls | **Desktop platforms other than Linux** (macOS and Windows desktop clients are not currently supported) |
+| **Future-proof quantum resistance** via NIST FIPS 203 ML-KEM-512 hybrid handshakes | Environments where legacy unencrypted protocols or centralized proprietary controllers are required |
+
+---
+
+## 5-Minute Quickstart
+
+Set up an encrypted, forward-error-corrected tunnel between two Linux nodes in four steps:
+
+```bash
+# 1. Install pre-compiled static binary (or: cargo binstall yipd)
+curl -fsSL https://raw.githubusercontent.com/femboyisp/yip/main/install.sh | sh
+
+# 2. Generate identity keypair and print self-certifying overlay IPv6 address
+yipd --genkey > /etc/yip/node.key && yipd --addr $(grep '^public=' /etc/yip/node.key | cut -d= -f2)
+
+# 3. Start the daemon (systemd service or direct configuration file invocation)
+sudo systemctl start yipd
+# Or run manually: sudo yipd /etc/yip/yipd.conf
+
+# 4. Verify telemetry and ping remote overlay peer
+yipctl status
+ping6 <peer-overlay-ip>
+```
+
+---
+
+## Primary Deployment Modes
+
+### Mode 1: Direct Point-to-Point (VPS-to-VPS)
+Direct UDP tunnel between two publicly addressable nodes with Cauchy RS-FEC:
+
+```ini
+# /etc/yip/yipd.conf (Host A: 198.51.100.1)
+local_private = dd152fc311a115549005da852d101a7d3a14594c728f71ff87aa0872da6c0fa9
+local_public  = bf923deeaddb66dde39e99987abdfd789c54eb882a570c340cd338071727ceeb
+listen        = 0.0.0.0:443
+device        = yip0
+
+# Remote peer: Host B (203.0.113.2)
+[peer]
+public_key    = 1f5b6b76d9723a79221777a7450522c32faa7300efd59b0a5efa42665cac0a0a
+endpoint      = 203.0.113.2:443
+```
+
+### Mode 2: NAT Rendezvous (Behind CGNAT)
+Node behind NAT discovering and coordinating through an intermediate rendezvous relay:
+
+```ini
+# /etc/yip/yipd.conf (Node A behind CGNAT)
+local_private = 2f2b5880cc15f29f826e876f5396c6f418e2366b73b415c5441f152b23c0334d
+local_public  = 4cbc48cf095389d829abf3c7d78747ca35c96483375bd73860b2ebba94c99d50
+listen        = 0.0.0.0:443
+device        = yip0
+rendezvous    = 198.51.100.5:443
+
+# Remote peer: Node B (endpoint resolved dynamically via rendezvous)
+[peer]
+public_key    = 6ed3f82ba6450cd14ec52509deb42a87c6a8d2fa91a5a145f2ddcfdb0d675d12
+```
+
+### Mode 3: Zero-Trust Offline CA Mesh
+Nodes discover and peer with authorized members automatically via signed gossip and rendezvous, requiring zero manual `[peer]` entries:
+
+```ini
+# /etc/yip/yipd.conf (Mesh Member Node)
+local_private       = 2f2b5880cc15f29f826e876f5396c6f418e2366b73b415c5441f152b23c0334d
+local_public        = 4cbc48cf095389d829abf3c7d78747ca35c96483375bd73860b2ebba94c99d50
+listen              = 0.0.0.0:443
+device              = yip0
+rendezvous          = 198.51.100.5:443
+
+# Offline CA credentials minted via `yip-ca sign-cert`
+ca_public           = 8a03a4cf43c2907041efb394c0effabad5bdb4cbbc35d17c924c0b6cbfa8ba75
+cert                = /etc/yip/node.cert
+roots               = /etc/yip/network.roots
+member_sign_private = c22239d00522843313aa03a662e8f0cb6abb7889f8f103510ebb5dee0e924857
+network_id          = f11a8e0df8fa6352eeb62192de7ece47
+```
+
+### Mode 4: Decentralized Threshold CA Mesh ($t$-of-$n$ FROST)
+Eliminates single-point-of-compromise root keys. Online signers jointly issue and renew certificates via online RPC, with `yipd` handling zero-touch renewal in the background at 70% TTL:
+
+```ini
+# /etc/yip/yipd.conf (Enrolled Node with Automated Renewal)
+ca_public           = 8a03a4cf43c2907041efb394c0effabad5bdb4cbbc35d17c924c0b6cbfa8ba75
+cert                = /etc/yip/node.cert
+roots               = /etc/yip/network.roots
+member_sign_private = c22239d00522843313aa03a662e8f0cb6abb7889f8f103510ebb5dee0e924857
+network_id          = f11a8e0df8fa6352eeb62192de7ece47
+
+# Online Threshold CA Coordinator for background 70% TTL renewal
+threshold_ca_server = 198.51.100.10:4443
+```
+
+Check status or trigger immediate renewal via the control socket:
+```bash
+sudo yipd cert status
+sudo yipd cert renew
+```
+
+👉 **Complete deployment walk-through**: See the [Turnkey Threshold CA Tutorial & Systemd Units](examples/threshold-ca/README.md).
 
 ---
 
 ## Comprehensive 6-Pillar Feature Showcase
 
 ### 1. Galois Field Proactive FEC
-- **Systematic Cauchy RS + RLNC Streaming**: In-flight erasure coding over $GF(2^8)$ pairs Cauchy Reed-Solomon block codes with Random Linear Network Coding (RLNC) streaming fountain codes.
+- **Systematic Cauchy RS + RLNC Streaming**: In-flight erasure coding over $GF(2^8)$ pairs Cauchy Reed-Solomon block codes with Random Linear Network Coding streaming fountain codes.
 - **Poly-Vector SIMD Acceleration**: Hardware-accelerated matrix multiplication across AVX-512BW, Intel GFNI, AVX2, SSSE3, ARM NEON, and WebAssembly SIMD128.
 - **Adaptive Repair Scaling**: Real-time sliding window telemetry dynamically adjusts repair symbol overhead based on observed channel loss, eliminating goodput waste on clean links.
 - **Zero-Allocation Hot-Path Reassembly**: Pre-allocated contiguous object buffers and in-place Cauchy RS repair (`reconstruct_missing_sources`) deliver clean packets in **117 ns** with zero heap allocations.
@@ -68,29 +195,29 @@ Because throughput is inversely proportional to the square root of packet loss p
 - **Asynchronous Robustness (ROAST)**: Coordinator signing loop is wrapped in a ROAST state machine, guaranteeing progress and unforgeable issuance even if up to $n - t$ signers are unresponsive, delayed, or Byzantine.
 - **Rollback-Immune Nonce Vault**: Memory-locked (`mlock`), zeroized-on-drop ephemeral nonce pools bound to 128-bit CSPRNG boot-epoch IDs eliminate nonce-reuse private key extraction under VM snapshots.
 - **Automated Lifecycle & Background Renewal**: Proactive zero-knowledge polynomial share refreshing (CVE-2025-58359 hardened), lost-share repair, and automated zero-touch renewal inside `bin/yipd` at $\ge 70\%$ of certificate TTL.
-- **Signed RootSets & Epidemic Gossip**: Node identity, authorized endpoints, and routing capabilities propagate across nodes using anti-entropy gossip protocol records (`Record`) with cryptographic signature validation.
-- **TAI64N Anti-Replay Freshness Gating**: Sub-nanosecond monotonic timestamps enforce strict certificate freshness and reject stale or replayed topology announcements.
 
 ```mermaid
 flowchart TD
     subgraph ThresholdCA ["Decentralized Threshold CA Quorum (t-of-n FROST)"]
-        Coord["Coordinator Gateway<br/>(yip-ca serve --role coordinator)<br/>ROAST State Machine"]
+        Coord["ROAST Coordinator Gateway<br/>(yip-ca serve --role coordinator)"]
         S1["Signer 1<br/>KeyShare 1<br/>Nonce Vault"]
         S2["Signer 2<br/>KeyShare 2<br/>Nonce Vault"]
         Sn["Signer n<br/>KeyShare n<br/>Nonce Vault"]
 
-        S1 -.->|1. Preprocessed Nonce Commitments| Coord
-        S2 -.->|1. Preprocessed Nonce Commitments| Coord
-        Sn -.->|1. Preprocessed Nonce Commitments| Coord
+        S1 -.->|"1. Preprocessed Nonce Commitments"| Coord
+        S2 -.->|"1. Preprocessed Nonce Commitments"| Coord
+        Sn -.->|"1. Preprocessed Nonce Commitments"| Coord
     end
 
-    Node["Mesh Member Node (yipd)<br/>Automatic 70% TTL Rotation"]
+    Node["Mesh Member Node (yipd)<br/>Automatic 70% TTL Renewal"]
 
-    Node -->|2. Enroll Request (CSR + PoP)| Coord
-    Coord -->|3. SigningPackage (Single RTT)| S1 & S2
-    S1 & S2 -->|4. Signature Shares| Coord
-    Coord -->|5. Linear Aggregation (RFC 9591)| Coord
-    Coord -->|6. Standard 64-byte Ed25519 Cert| Node
+    Node -->|"2. Enroll Request with PoP"| Coord
+    Coord -->|"3. Single-RTT SigningPackage"| S1
+    Coord -->|"3. Single-RTT SigningPackage"| S2
+    S1 -->|"4. Signature Share"| Coord
+    S2 -->|"4. Signature Share"| Coord
+    Coord -->|"5. Linear Aggregation (RFC 9591)"| Coord
+    Coord -->|"6. Standard 64-byte Ed25519 Cert"| Node
 ```
 
 ### 3. Kernel-Bypass Performance
@@ -122,106 +249,6 @@ flowchart TD
 
 ---
 
-## When to Use yip
-
-| Use yip for | Stick with WireGuard or others for |
-| :--- | :--- |
-| **Contended, lossy, or wireless links** (cellular, satellite, trans-oceanic transit) where packet drops stall standard tunnels | **Clean zero-loss gigabit LANs** where in-kernel WireGuard already saturates the wire with lower CPU overhead |
-| **High-packet-rate 40G/100G edge infrastructure** scaling across multiple CPU cores via zero-copy AF_XDP | **Anonymity or mix-net routing** without trusted multi-hop relay chaining (peers authenticate directly) |
-| **Hostile network environments** monitored by aggressive Deep Packet Inspection (DPI) firewalls | **Desktop platforms other than Linux** (macOS and Windows desktop clients are not currently supported) |
-| **Future-proof quantum resistance** via NIST FIPS 203 ML-KEM-512 hybrid handshakes | Environments where legacy unencrypted protocols or centralized proprietary controllers are required |
-
----
-
-## 5-Minute Quickstart
-
-Set up an encrypted, forward-error-corrected tunnel between two Linux nodes in four steps:
-
-```bash
-# 1. Install pre-compiled static binary (or: cargo binstall yipd)
-curl -fsSL https://raw.githubusercontent.com/femboyisp/yip/main/install.sh | sh
-
-# 2. Generate identity keypair and print self-certifying overlay IPv6 address
-yipd --genkey > /etc/yip/node.key && yipd --addr $(grep '^public=' /etc/yip/node.key | cut -d= -f2)
-
-# 3. Start the daemon (systemd service or direct configuration file invocation)
-sudo systemctl start yipd
-# Or run manually: sudo yipd /etc/yip/yipd.conf
-
-# 4. Verify telemetry and ping remote overlay peer
-yipctl status
-ping6 <peer-overlay-ip>
-```
-
----
-
-## Minimal Working Configurations
-
-### Scenario A: Direct Point-to-Point (VPS-to-VPS)
-
-Direct UDP tunnel between two publicly addressable nodes with Cauchy RS-FEC:
-
-```toml
-# /etc/yip/yipd.conf (Host A: 198.51.100.1)
-local_private = dd152fc311a115549005da852d101a7d3a14594c728f71ff87aa0872da6c0fa9
-local_public  = bf923deeaddb66dde39e99987abdfd789c54eb882a570c340cd338071727ceeb
-listen        = 0.0.0.0:443
-device        = yip0
-
-# Remote peer: Host B (203.0.113.2)
-[peer]
-public_key    = 1f5b6b76d9723a79221777a7450522c32faa7300efd59b0a5efa42665cac0a0a
-endpoint      = 203.0.113.2:443
-```
-
-### Scenario B: NAT Rendezvous (Behind CGNAT)
-
-Node behind NAT discovering and coordinating through an intermediate rendezvous relay:
-
-```toml
-# /etc/yip/yipd.conf (Node A behind CGNAT)
-local_private = 2f2b5880cc15f29f826e876f5396c6f418e2366b73b415c5441f152b23c0334d
-local_public  = 4cbc48cf095389d829abf3c7d78747ca35c96483375bd73860b2ebba94c99d50
-listen        = 0.0.0.0:443
-device        = yip0
-rendezvous    = 198.51.100.5:443
-
-# Remote peer: Node B (endpoint resolved dynamically via rendezvous)
-[peer]
-public_key    = 6ed3f82ba6450cd14ec52509deb42a87c6a8d2fa91a5a145f2ddcfdb0d675d12
-```
-
-### Scenario C: Zero-Trust CA Mesh (Dynamic Discovery)
-
-Nodes discover and peer with authorized members automatically via signed gossip and rendezvous, requiring zero manual `[peer]` entries:
-
-```toml
-# /etc/yip/yipd.conf (Mesh Member Node)
-local_private       = 2f2b5880cc15f29f826e876f5396c6f418e2366b73b415c5441f152b23c0334d
-local_public        = 4cbc48cf095389d829abf3c7d78747ca35c96483375bd73860b2ebba94c99d50
-listen              = 0.0.0.0:443
-device              = yip0
-rendezvous          = 198.51.100.5:443
-
-# Zero-trust CA mesh enrollment (issued via yip-ca offline or online threshold CA)
-ca_public           = 8a03a4cf43c2907041efb394c0effabad5bdb4cbbc35d17c924c0b6cbfa8ba75
-cert                = /etc/yip/node.cert
-roots               = /etc/yip/network.roots
-member_sign_private = c22239d00522843313aa03a662e8f0cb6abb7889f8f103510ebb5dee0e924857
-network_id          = f11a8e0df8fa6352eeb62192de7ece47
-
-# Optional: Online threshold CA coordinator for zero-touch background renewal at >= 70% TTL
-threshold_ca_server = 198.51.100.10:4443
-```
-
-Check certificate validity or trigger immediate renewal via the daemon control socket:
-```bash
-sudo yipd cert status
-sudo yipd cert renew
-```
-
----
-
 ## Performance & Benchmark Highlights
 
 Deterministic benchmarks measured across multi-region cloud WANs (AWS `us-east-1` to `us-west-2`, ~58ms RTT) and multi-core edge hardware:
@@ -235,6 +262,10 @@ Deterministic benchmarks measured across multi-region cloud WANs (AWS `us-east-1
 - **193× throughput advantage at 3% loss**: Delivers **251.3 Mbit/s** compared to WireGuard's **1.3 Mbit/s**.
 - **40.27 Gbps line-rate scaling**: Scales across 8 CPU cores (3.93 Mpps) using zero-copy AF_XDP and lock-free SPSC queues.
 - **Flat ~60ms P99 latency**: In-flight symbol reconstruction eliminates TCP head-of-line blocking and retransmission spikes across 0% to 10% packet loss.
+
+> [!NOTE]
+> **How to Interpret Benchmark Results**:
+> On clean, zero-loss LANs or dedicated datacenter links, in-kernel WireGuard already saturates the wire with minimal CPU overhead. `yip` deliberately trades a minor fraction of clean-path CPU to compute in-flight Reed-Solomon parity symbols. The payoff appears under real-world internet transit conditions: while traditional tunnels trigger TCP window backoff and stall, `yip` sustains high goodput and flat latency.
 
 <details>
 <summary><b>Click to expand raw automated WAN benchmark data table</b></summary>
@@ -258,17 +289,52 @@ Full methodology and reproducible test harnesses are documented in [`crates/yip-
 
 ---
 
+## Crisp Trust Model & Security Invariants
+
+`yip` is built on explicit, verifiable security boundaries:
+
+```
+┌───────────────────────────────────────┬───────────────────────────────────────┐
+│           WHAT IS PROTECTED           │         WHAT IS NOT PROTECTED         │
+├───────────────────────────────────────┼───────────────────────────────────────┤
+│ ✔ Payload Confidentiality & Integrity │ ✘ Physical Peer IP Concealment        │
+│   ChaCha20-Poly1305 with post-quantum │   Peers authenticate directly and     │
+│   hybrid ML-KEM-512 forward secrecy   │   exchange traffic peer-to-peer       │
+├───────────────────────────────────────┼───────────────────────────────────────┤
+│ ✔ Single-Point-of-Failure CA Defense  │ ✘ Mix-Net Anonymity                   │
+│   t-of-n FROST quorum ensures master  │   yip is not Tor; it does not route   │
+│   private key never exists on 1 host  │   through multi-hop onion circuits    │
+├───────────────────────────────────────┼───────────────────────────────────────┤
+│ ✔ Probe Resistance & DPI Bypass       │ ✘ Covert Timing on Raw UDP            │
+│   REALITY splices active probers into │   Without DAITA padding enabled,      │
+│   authentic CDNs (Apple/Microsoft)    │   packet timing mirrors traffic flows │
+├───────────────────────────────────────┼───────────────────────────────────────┤
+│ ✔ Replay & Identity Spoofing          │ ✘ Subverted Host Kernels              │
+│   TAI64N monotonic freshness and      │   The daemon relies on Linux memory   │
+│   BLAKE2s cryptographic addressing    │   isolation and privileged namespaces │
+└───────────────────────────────────────┴───────────────────────────────────────┘
+```
+
+- **Threshold Signature Security**: An adversary compromising fewer than $t$ signers obtains zero knowledge of the master CA private scalar.
+- **Rollback Immunity**: Ephemeral nonces in `EphemeralNonceVault` are memory-locked (`mlock`) and consumed via atomic single-use primitives to eliminate nonce-reuse private key extraction under VM snapshots.
+- **Identifiable Aborts (ROAST)**: Honest coordinators pinpoint dishonest signers and continue signing without denial-of-service stalls.
+
+---
+
 ## Documentation Curriculum
 
-| Document | Purpose |
-| :--- | :--- |
-| [`01. Getting Started`](docs/01-getting-started.md) | Platform requirements, installation options, systemd/init services, and first-tunnel setup |
-| [`02. Configuration Reference`](docs/02-configuration.md) | Comprehensive parameter reference, production deployment scenarios, and `yipctl` command guide |
-| [`03. Architecture & Internals`](docs/03-architecture.md) | Control and data plane separation, kernel-bypass AF_XDP queues, Cauchy RS-FEC, and memory hierarchy |
-| [`04. Security & Threat Model`](docs/04-security-and-threat-model.md) | Post-quantum hybrid handshake, zero-fixed-signature wire format, and anti-DPI test oracle defenses |
-| [`05. Benchmarks & Performance`](docs/05-benchmarking-and-performance.md) | Real-world WAN test data, multi-core scaling charts, loss-recovery mathematical proofs, and kernel tuning |
-| [`06. Troubleshooting Runbook`](docs/06-troubleshooting.md) | Step-by-step diagnostic workflows, MTU discovery issues, NAT traversal debugging, and telemetry inspection |
-| [`Motivation & Philosophy`](docs/motivation.md) | Design philosophy, anti-censorship regulatory context, and the problem with traditional VPNs |
+Explore the full documentation curriculum organized by role and interest:
+
+| Guide | Target Audience | Primary Focus |
+| :--- | :--- | :--- |
+| [`01. Getting Started`](docs/01-getting-started.md) | **Beginner / Operator** | Platform requirements, installation, first tunnel setup, and CA mesh bootstrap |
+| [`02. Configuration Reference`](docs/02-configuration.md) | **Operator / Admin** | Comprehensive parameter reference, deployment recipes, and `yipctl` command guide |
+| [`03. Architecture & Internals`](docs/03-architecture.md) | **Developer / Architect** | Control vs data plane, zero-copy AF_XDP queues, Cauchy RS-FEC, and FROST threshold CA |
+| [`04. Security & Threat Model`](docs/04-security-and-threat-model.md) | **Security Reviewer** | Post-quantum hybrid handshake, adversary model, anti-DPI verification, and crypto ledger |
+| [`05. Benchmarks & Performance`](docs/05-benchmarking-and-performance.md) | **Researcher / Tester** | Real-world WAN test data, multi-core scaling charts, loss-recovery mathematical proofs |
+| [`06. Troubleshooting Runbook`](docs/06-troubleshooting.md) | **Operator / SRE** | Diagnostic flowcharts, MTU discovery issues, NAT traversal debugging, and telemetry inspection |
+| [`Motivation & Philosophy`](docs/motivation.md) | **Everyone** | Design philosophy, anti-censorship regulatory context, and the problem with traditional VPNs |
+| [`Turnkey Threshold CA Tutorial`](examples/threshold-ca/README.md) | **Operator** | Step-by-step setup of a 2-of-3 threshold CA quorum with systemd units |
 
 ---
 
