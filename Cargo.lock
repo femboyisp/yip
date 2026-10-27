@@ -2582,6 +2582,7 @@ dependencies = [
  "frost-ed25519",
  "frost-rerandomized",
  "getrandom 0.4.3",
+ "postcard",
  "rand 0.8.8",
  "rand_core 0.10.1",
  "serde",
