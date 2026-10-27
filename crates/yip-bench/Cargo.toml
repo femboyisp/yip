@@ -45,5 +45,9 @@ harness = false
 name = "rlnc_bench"
 harness = false
 
+[[bench]]
+name = "fec_reassemble"
+harness = false
+
 [lints]
 workspace = true

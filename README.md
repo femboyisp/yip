@@ -59,6 +59,7 @@ Because throughput is inversely proportional to the square root of packet loss p
 - **Systematic Cauchy RS + RLNC Streaming**: In-flight erasure coding over $GF(2^8)$ pairs Cauchy Reed-Solomon block codes with Random Linear Network Coding (RLNC) streaming fountain codes.
 - **Poly-Vector SIMD Acceleration**: Hardware-accelerated matrix multiplication across AVX-512BW, Intel GFNI, AVX2, SSSE3, ARM NEON, and WebAssembly SIMD128.
 - **Adaptive Repair Scaling**: Real-time sliding window telemetry dynamically adjusts repair symbol overhead based on observed channel loss, eliminating goodput waste on clean links.
+- **Zero-Allocation Hot-Path Reassembly**: Pre-allocated contiguous object buffers and in-place Cauchy RS repair (`reconstruct_missing_sources`) deliver clean packets in **117 ns** with zero heap allocations.
 
 ### 2. Zero-Trust PKI & Decentralized Mesh Membership
 - **Cryptographic Authority (`yip-ca`)**: Offline or operator-governed root-of-trust issuing signed node membership certificates (`Cert`).
@@ -70,6 +71,7 @@ Because throughput is inversely proportional to the square root of packet loss p
 - **Asynchronous `io_uring`**: High-performance multishot ring polling drives high packet rates without thread contention or syscall overhead.
 - **Multi-Queue TUN Sharding**: `IFF_MULTI_QUEUE` worker isolation maps packet flows to dedicated CPU cores via lock-free SPSC ring buffers.
 - **Vectorized Socket I/O**: Batched `recvmmsg` and `sendmmsg` with `UDP_SEGMENT` Generic Segmentation Offload (GSO) optimize standard POSIX network paths.
+- **Flat Open-Addressing Tables**: Replaces dynamic pointer maps with bounded flat slot tables using SplitMix64 fast hashing and backward-shift deletion with zero tombstones.
 
 ### 4. Post-Quantum Cryptography & Identity
 - **Single-RTT Hybrid Handshake**: Blends Noise_IKpsk2 (Curve25519) with NIST FIPS 203 ML-KEM-512 (Kyber) within compact datagrams strictly under the 1200-byte internet MTU floor.

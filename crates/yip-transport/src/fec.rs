@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 
 use crate::rs;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 /// Maximum permitted object size for a single FEC-coded frame (256 KiB): bounds
 /// the memory a forged symbol can cause the decoder to allocate.
@@ -223,23 +223,166 @@ impl FecEncoder {
     }
 }
 
-struct ObjState {
-    /// Received shards keyed by symbol_index (deduped).
-    shards: HashMap<u16, Vec<u8>>,
+pub(crate) struct ObjState {
+    /// Pre-allocated buffer for the assembled object.
+    payload: Vec<u8>,
+    /// Bitset of received symbol indices (0..255).
+    seen_mask: [u64; 4],
+    /// Count of received source shards (symbol_index < k).
+    source_count: usize,
+    /// Total count of distinct shards received (source + repair).
+    total_count: usize,
     k: usize,
     shard_len: usize,
     object_size: u32,
     scheme: rs::Scheme,
     done: bool,
     expires_at_ms: u64,
+    /// Repair shards (symbol_index >= k), stored only when packet loss occurs.
+    repair_shards: Vec<(u16, Vec<u8>)>,
+}
+
+#[inline]
+fn is_seen(seen_mask: &[u64; 4], idx: u16) -> bool {
+    let u = idx as usize;
+    if u >= 256 {
+        return false;
+    }
+    (seen_mask[u / 64] & (1u64 << (u % 64))) != 0
+}
+
+#[inline]
+fn mark_seen(seen_mask: &mut [u64; 4], idx: u16) {
+    let u = idx as usize;
+    if u < 256 {
+        seen_mask[u / 64] |= 1u64 << (u % 64);
+    }
+}
+
+#[inline]
+fn hash_key(key: u64, mask: usize) -> usize {
+    let mut x = key;
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^= x >> 31;
+    (x as usize) & mask
+}
+
+pub(crate) struct ObjectTable {
+    slots: Vec<Option<(u64, ObjState)>>,
+    len: usize,
+}
+
+impl ObjectTable {
+    pub fn new(capacity: usize) -> Self {
+        let cap = (capacity.max(1) * 2).next_power_of_two().max(16);
+        let mut slots = Vec::with_capacity(cap);
+        for _ in 0..cap {
+            slots.push(None);
+        }
+        Self { slots, len: 0 }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    pub fn contains_key(&self, key: &u64) -> bool {
+        self.get(key).is_some()
+    }
+
+    pub fn find_index(&self, key: &u64) -> Option<usize> {
+        let mask = self.slots.len() - 1;
+        let mut idx = hash_key(*key, mask);
+        loop {
+            match &self.slots[idx] {
+                Some((k, _)) if *k == *key => return Some(idx),
+                Some(_) => idx = (idx + 1) & mask,
+                None => return None,
+            }
+        }
+    }
+
+    pub fn get(&self, key: &u64) -> Option<&ObjState> {
+        let idx = self.find_index(key)?;
+        self.slots[idx].as_ref().map(|(_, s)| s)
+    }
+
+    pub fn get_mut(&mut self, key: &u64) -> Option<&mut ObjState> {
+        let idx = self.find_index(key)?;
+        self.slots[idx].as_mut().map(|(_, s)| s)
+    }
+
+    pub fn insert(&mut self, key: u64, state: ObjState) -> Option<ObjState> {
+        let mask = self.slots.len() - 1;
+        let mut idx = hash_key(key, mask);
+        loop {
+            match &mut self.slots[idx] {
+                Some((k, s)) if *k == key => {
+                    return Some(std::mem::replace(s, state));
+                }
+                Some(_) => idx = (idx + 1) & mask,
+                None => {
+                    self.slots[idx] = Some((key, state));
+                    self.len += 1;
+                    return None;
+                }
+            }
+        }
+    }
+
+    pub fn remove(&mut self, key: &u64) -> Option<ObjState> {
+        let mask = self.slots.len() - 1;
+        let mut idx = hash_key(*key, mask);
+        loop {
+            match &self.slots[idx] {
+                Some((k, _)) if *k == *key => break,
+                Some(_) => idx = (idx + 1) & mask,
+                None => return None,
+            }
+        }
+        let removed = self.slots[idx].take().map(|(_, s)| s);
+        self.len -= 1;
+
+        // Backward-shift deletion to preserve linear probing invariants without tombstones.
+        let mut next_idx = (idx + 1) & mask;
+        while let Some((k, _)) = self.slots[next_idx] {
+            let natural_idx = hash_key(k, mask);
+            let should_move = if next_idx >= idx {
+                natural_idx <= idx || natural_idx > next_idx
+            } else {
+                natural_idx <= idx && natural_idx > next_idx
+            };
+            if should_move {
+                self.slots[idx] = self.slots[next_idx].take();
+                idx = next_idx;
+            }
+            next_idx = (next_idx + 1) & mask;
+        }
+        removed
+    }
+}
+
+impl std::ops::Index<&u64> for ObjectTable {
+    type Output = ObjState;
+    fn index(&self, key: &u64) -> &Self::Output {
+        self.get(key).expect("key not found in ObjectTable")
+    }
 }
 
 /// Reassembles RS symbols into objects, keeping multiple objects in flight
 /// (keyed by `object_key: u64`), tolerating loss/reordering, evicting oldest at cap.
 pub struct FecReassembler {
     symbol_size: u16,
-    objects: HashMap<u64, ObjState>,
-    order: VecDeque<u64>,
+    pub(crate) objects: ObjectTable,
+    pub(crate) order: VecDeque<u64>,
     max_objects: usize,
     recovered_count: u64,
 }
@@ -248,11 +391,12 @@ impl FecReassembler {
     /// Create a reassembler for a class's `symbol_size`, keeping at most
     /// `max_objects` partially-received objects.
     pub fn new(symbol_size: u16, max_objects: usize) -> Self {
+        let max_obj = max_objects.max(1);
         Self {
             symbol_size,
-            objects: HashMap::new(),
-            order: VecDeque::new(),
-            max_objects: max_objects.max(1),
+            objects: ObjectTable::new(max_obj),
+            order: VecDeque::with_capacity(max_obj + 1),
+            max_objects: max_obj,
             recovered_count: 0,
         }
     }
@@ -265,6 +409,11 @@ impl FecReassembler {
     /// Number of objects currently being reassembled.
     pub fn in_flight(&self) -> usize {
         self.objects.len()
+    }
+
+    /// Whether any objects are currently in flight.
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty()
     }
 
     /// Dynamically update the baseline symbol size for newly arriving objects.
@@ -344,16 +493,22 @@ impl FecReassembler {
                     self.objects.remove(&oldest);
                 }
             }
+            let shard_len = obj_size.min(sym_size);
+            let payload_len = k.checked_mul(shard_len).unwrap_or(0);
             self.objects.insert(
                 object_key,
                 ObjState {
-                    shards: HashMap::new(),
+                    payload: vec![0u8; payload_len],
+                    seen_mask: [0; 4],
+                    source_count: 0,
+                    total_count: 0,
                     k,
-                    shard_len: obj_size.min(sym_size),
+                    shard_len,
                     object_size: symbol.object_size,
                     scheme,
                     done: false,
                     expires_at_ms: now_ms.saturating_add(deadline_ms),
+                    repair_shards: Vec::new(),
                 },
             );
             self.order.push_back(object_key);
@@ -361,7 +516,10 @@ impl FecReassembler {
         let state = self.objects.get_mut(&object_key)?;
         if now_ms > state.expires_at_ms {
             state.done = true;
-            state.shards.clear();
+            state.payload.clear();
+            state.payload.shrink_to_fit();
+            state.repair_shards.clear();
+            state.repair_shards.shrink_to_fit();
             return None;
         }
         if state.done {
@@ -372,35 +530,64 @@ impl FecReassembler {
             return None;
         }
         // Dedupe by index; only store what we don't have.
-        let mut shard_data = symbol.data.clone();
-        if shard_data.len() < state.shard_len {
-            shard_data.resize(state.shard_len, 0);
+        if is_seen(&state.seen_mask, symbol_index) {
+            return None;
         }
-        state.shards.entry(symbol_index).or_insert(shard_data);
+        mark_seen(&mut state.seen_mask, symbol_index);
+        state.total_count += 1;
 
-        if state.shards.len() < state.k {
+        let sym_idx = usize::from(symbol_index);
+        if sym_idx < state.k {
+            state.source_count += 1;
+            let offset = sym_idx * state.shard_len;
+            let copy_len = symbol.data.len().min(state.shard_len);
+            state.payload[offset..offset + copy_len].copy_from_slice(&symbol.data[..copy_len]);
+        } else {
+            let mut shard_data = symbol.data.clone();
+            if shard_data.len() < state.shard_len {
+                shard_data.resize(state.shard_len, 0);
+            }
+            state.repair_shards.push((symbol_index, shard_data));
+        }
+
+        if state.total_count < state.k {
             return None;
         }
 
-        // Decode once we hold K distinct shards.
-        let received: Vec<(u16, &[u8])> = state
-            .shards
-            .iter()
-            .map(|(&idx, d)| (idx, d.as_slice()))
-            .collect();
-        let sources = rs::decode_source(state.k, state.shard_len, &received, state.scheme)?;
+        // We hold at least K distinct shards: complete object reassembly.
         state.done = true;
+        let size = usize::try_from(symbol.object_size).ok()?;
 
-        if state.shards.keys().any(|&idx| usize::from(idx) >= state.k) {
-            self.recovered_count += 1;
+        if state.source_count == state.k {
+            // All K source shards arrived: fast systematic path with no RS decode!
+            let mut object = std::mem::take(&mut state.payload);
+            state.repair_shards.clear();
+            state.repair_shards.shrink_to_fit();
+            object.truncate(size);
+            return Some(object);
         }
 
-        // Concatenate source shards and trim to the original object_size.
-        let size = usize::try_from(symbol.object_size).unwrap();
-        let mut object = Vec::with_capacity(state.k * state.shard_len);
-        for shard in &sources {
-            object.extend_from_slice(shard);
-        }
+        // Loss path: at least one repair shard is required.
+        self.recovered_count += 1;
+
+        let repair_refs: Vec<(u16, &[u8])> = state
+            .repair_shards
+            .iter()
+            .map(|(idx, d)| (*idx, d.as_slice()))
+            .collect();
+
+        rs::reconstruct_missing_sources(
+            state.k,
+            state.shard_len,
+            &mut state.payload,
+            &state.seen_mask,
+            &repair_refs,
+            state.scheme,
+        )?;
+
+        let mut object = std::mem::take(&mut state.payload);
+        state.repair_shards.clear();
+        state.repair_shards.shrink_to_fit();
         object.truncate(size);
         Some(object)
     }
@@ -477,6 +664,34 @@ mod tests {
             out = out.or(re.push(u64::from(s.object_id), s, 0, 1000));
         }
         assert_eq!(out.as_deref(), Some(ct.as_slice()));
+    }
+
+    #[test]
+    fn out_of_order_source_shards_assemble_in_place() {
+        let params = FlowClass::Default.params();
+        let ct: Vec<u8> = (0..3600u32)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect(); // K=3
+        let mut enc = FecEncoder::new();
+        let syms = enc.encode(&ct, params, 0); // K=3, R=0
+        assert_eq!(syms.len(), 3);
+
+        let mut re = FecReassembler::new(params.symbol_size, 64);
+        let obj_key = u64::from(syms[0].object_id);
+
+        // Feed shard 2 first
+        assert_eq!(re.push(obj_key, &syms[2], 100, 500), None);
+        assert_eq!(re.recovered_count(), 0);
+
+        // Feed shard 0 next
+        assert_eq!(re.push(obj_key, &syms[0], 101, 500), None);
+        assert_eq!(re.recovered_count(), 0);
+
+        // Feed shard 1 last -> complete assembly
+        let out = re.push(obj_key, &syms[1], 102, 500);
+        assert_eq!(out.as_deref(), Some(ct.as_slice()));
+        // Must NOT increment recovered_count because all shards were source shards
+        assert_eq!(re.recovered_count(), 0);
     }
 
     #[test]
@@ -644,6 +859,10 @@ mod tests {
         );
         assert_eq!(
             re.push(u64::from(syms[0].object_id), &syms[0], 0, 1000),
+            None
+        );
+        assert_eq!(
+            re.push(u64::from(syms[1].object_id), &syms[1], 0, 1000),
             None
         );
         assert_eq!(
@@ -1018,7 +1237,10 @@ mod tests {
         );
         let state = re.objects.get(&u64::from(syms[0].object_id)).unwrap();
         assert!(state.done, "object must be marked done");
-        assert!(state.shards.is_empty(), "shards must be freed");
+        assert!(
+            state.payload.is_empty() && state.repair_shards.is_empty(),
+            "shards must be freed"
+        );
 
         // Trailing parity symbol 2 arrives at t=165: hits tombstone, does not resurrect
         assert_eq!(
@@ -1027,7 +1249,10 @@ mod tests {
         );
         let state = re.objects.get(&u64::from(syms[0].object_id)).unwrap();
         assert!(state.done, "must remain done");
-        assert!(state.shards.is_empty(), "must not store shard");
+        assert!(
+            state.payload.is_empty() && state.repair_shards.is_empty(),
+            "must not store shard"
+        );
 
         // Trailing parity symbol 3 arrives at t=170: hits tombstone
         assert_eq!(
@@ -1036,7 +1261,10 @@ mod tests {
         );
         let state = re.objects.get(&u64::from(syms[0].object_id)).unwrap();
         assert!(state.done, "must remain done");
-        assert!(state.shards.is_empty(), "must not store shard");
+        assert!(
+            state.payload.is_empty() && state.repair_shards.is_empty(),
+            "must not store shard"
+        );
     }
 
     #[test]
@@ -1108,7 +1336,7 @@ mod tests {
         // Realtime object should be tombstoned
         let rt_state = re.objects.get(&u64::from(rt_syms[0].object_id)).unwrap();
         assert!(rt_state.done);
-        assert!(rt_state.shards.is_empty());
+        assert!(rt_state.payload.is_empty() && rt_state.repair_shards.is_empty());
 
         // Bulk object at head was NOT prematurely evicted and can still decode within its deadline
         let bulk_res = re.push(u64::from(bulk_syms[1].object_id), &bulk_syms[1], 200, 500); // 200 <= 600
@@ -1376,5 +1604,79 @@ mod tests {
             Some(ct1.as_slice()),
             "Object 1 completes using preserved in-flight parameters"
         );
+    }
+
+    #[test]
+    fn test_object_table_churn_and_backward_shift() {
+        let mut table = ObjectTable::new(64);
+        assert!(table.is_empty());
+        assert_eq!(table.len(), 0);
+
+        let dummy = || ObjState {
+            payload: Vec::new(),
+            seen_mask: [0; 4],
+            source_count: 0,
+            total_count: 0,
+            k: 1,
+            shard_len: 100,
+            object_size: 100,
+            scheme: rs::Scheme::Pq,
+            done: false,
+            expires_at_ms: 1000,
+            repair_shards: Vec::new(),
+        };
+
+        // Insert 64 objects (keys 100..164)
+        for k in 100..164u64 {
+            table.insert(k, dummy());
+        }
+        assert_eq!(table.len(), 64);
+        assert!(!table.is_empty());
+
+        // Remove even keys: 100, 102, ...
+        for k in (100..164u64).step_by(2) {
+            let removed = table.remove(&k);
+            assert!(removed.is_some());
+        }
+        assert_eq!(table.len(), 32);
+
+        // Verify odd keys are still present and accessible via get and index
+        for k in (101..164u64).step_by(2) {
+            assert!(table.contains_key(&k));
+            assert_eq!(table.get(&k).unwrap().shard_len, 100);
+            assert_eq!(table[&k].shard_len, 100);
+        }
+
+        // Verify even keys are gone
+        for k in (100..164u64).step_by(2) {
+            assert!(!table.contains_key(&k));
+            assert!(table.get(&k).is_none());
+        }
+
+        // Re-insert 32 new keys
+        for k in 200..232u64 {
+            table.insert(k, dummy());
+        }
+        assert_eq!(table.len(), 64);
+    }
+
+    #[test]
+    fn test_is_seen_and_mark_seen_bounds() {
+        let mut mask = [0u64; 4];
+        assert!(!is_seen(&mask, 0));
+        assert!(!is_seen(&mask, 1));
+        assert!(!is_seen(&mask, 255));
+        assert!(!is_seen(&mask, 256));
+
+        mark_seen(&mut mask, 1);
+        assert!(!is_seen(&mask, 0));
+        assert!(is_seen(&mask, 1));
+
+        mark_seen(&mut mask, 255);
+        assert!(is_seen(&mask, 255));
+
+        // 256 must be ignored safely without panic or out of bounds
+        mark_seen(&mut mask, 256);
+        assert!(!is_seen(&mask, 256));
     }
 }
