@@ -565,8 +565,8 @@ flowchart TD
     NodeB["Node B<br/>Holds node.cert"]
     Roots["network.roots<br/>Lists Bootstrap Seed Nodes"]
 
-    OfflineCA -.->|Issue Cert / Sign Roots| NodeA & NodeB & Roots
-    ThresholdCA -.->|Online 1-RTT Enroll / Renew| NodeA & NodeB
+    OfflineCA -.->|"Issue Cert / Sign Roots"| NodeA & NodeB & Roots
+    ThresholdCA -.->|"Online 1-RTT Enroll / Renew"| NodeA & NodeB
 
     NodeA -- "Boot & Load roots" --> Roots
     NodeB -- "Boot & Load roots" --> Roots

@@ -199,16 +199,16 @@ Where:
 ### Key Insights from the Mathematics
 
 Two critical mathematical relationships emerge from this formulation:
-1. **Linear Inverse Dependency on Round-Trip Time ($1 / \text{RTT}$):** As the physical distance between endpoints increases, throughput drops proportionally. On a trans-oceanic link with $\text{RTT} = 120\text{ ms}$, throughput is half of what it would be on a $\text{RTT} = 60\text{ ms}$ trans-continental link under identical loss.
+1. **Linear Inverse Dependency on Round-Trip Time ($1 / \text{RTT}$):** As the physical distance between endpoints increases, throughput drops proportionally. On a trans-oceanic link with RTT = 120 ms, throughput is half of what it would be on a RTT = 60 ms trans-continental link under identical loss.
 2. **Quadratic Inverse Dependency on Loss ($1 / \sqrt{p}$):** Throughput is sharply constrained by even miniscule packet loss rates. Increasing loss from 0.01% ($p = 0.0001$) to 1% ($p = 0.01$) cuts maximum throughput by a factor of 10. Increasing loss to 4% ($p = 0.04$) cuts throughput by another factor of 2.
 
 When packet loss increases beyond 3% to 5%, the classical Mathis equation becomes an optimistic upper bound. Real-world TCP stacks break down further because packet loss ceases to be isolated: multiple drops occur within a single round-trip window, causing TCP to abandon fast retransmit and enter **Retransmission Timeout (RTO) exponential backoff**.
 
 ### Numerical Impact: LAN vs. WAN Throughput Collapse
 
-Consider the theoretical maximum TCP throughput calculated via the Mathis equation ($\text{MSS} = 1,420\text{ bytes}$, $C = 1.22$) across three distinct network environments:
+Consider the theoretical maximum TCP throughput calculated via the Mathis equation (MSS = 1,420 bytes, $C = 1.22$) across three distinct network environments:
 
-| Channel Loss Rate ($p$) | Local LAN ($\text{RTT} = 0.5\text{ ms}$) | Continental WAN ($\text{RTT} = 60\text{ ms}$) | Satellite / Intercontinental ($\text{RTT} = 150\text{ ms}$) |
+| Channel Loss Rate ($p$) | Local LAN (RTT = 0.5 ms) | Continental WAN (RTT = 60 ms) | Satellite / Intercontinental (RTT = 150 ms) |
 |:-----------------------|:----------------------------------------|:---------------------------------------------|:-----------------------------------------------------------|
 | **0.01% ($p = 0.0001$)**| 2,771 Mbit/s (Line rate bound)          | 230.9 Mbit/s                                 | 92.4 Mbit/s                                                |
 | **0.1% ($p = 0.001$)**  | 876.4 Mbit/s                            | 73.0 Mbit/s                                  | 29.2 Mbit/s                                                |
@@ -218,8 +218,8 @@ Consider the theoretical maximum TCP throughput calculated via the Mathis equati
 | **10.0% ($p = 0.10$)**  | 87.6 Mbit/s                             | 7.3 Mbit/s (Empirical: ~0.1 Mbit/s / Stall)  | 2.9 Mbit/s (Empirical: Complete Stall)                     |
 
 Notice the stark divergence between the theoretical Mathis estimate and real-world empirical performance:
-- In the clean laboratory (LAN, $\text{RTT} = 0.5\text{ ms}$), even 5% packet loss leaves enough bandwidth for interactive use because the 0.5 ms feedback loop allows the TCP sender to recover within a few milliseconds.
-- On a continental WAN ($\text{RTT} = 60\text{ ms}$), at 5% loss, theoretical Reno throughput is 10.3 Mbit/s, but empirical WireGuard throughput drops to **1.8 Mbit/s**.
+- In the clean laboratory (LAN, RTT = 0.5 ms), even 5% packet loss leaves enough bandwidth for interactive use because the 0.5 ms feedback loop allows the TCP sender to recover within a few milliseconds.
+- On a continental WAN (RTT = 60 ms), at 5% loss, theoretical Reno throughput is 10.3 Mbit/s, but empirical WireGuard throughput drops to **1.8 Mbit/s**.
 - At 10% loss on a WAN, empirical WireGuard throughput collapses to **0.1 Mbit/s** (a 99.98% drop from its 0% baseline). The connection effectively freezes.
 
 Why does empirical performance collapse far worse than the Mathis equation predicts? The answers lie in **Head-of-Line blocking**, **exponential backoff**, and **bufferbloat**.
@@ -246,7 +246,7 @@ When multiple packets are dropped within a single congestion window:
    $$\text{RTO}_{n+1} = 2 \times \text{RTO}_n$$
    escalating from 200 ms to 400 ms, 800 ms, 1.6 seconds, and beyond.
 
-During this exponential backoff period, the sender drops its congestion window to a single segment ($\text{cwnd} = 1\text{ MSS}$). Zero useful data moves across the tunnel.
+During this exponential backoff period, the sender drops its congestion window to a single segment (cwnd = 1 MSS). Zero useful data moves across the tunnel.
 
 ### Bufferbloat and Cascading Retransmission Storms
 
@@ -304,7 +304,7 @@ Traditional tunnels rely entirely on **Automatic Repeat reQuest (ARQ)**: wait fo
 
 `yip` uses **Systematic Cauchy Reed-Solomon Erasure Coding** over the finite field $GF(2^8)$:
 - For every block of $K$ source data packets, the encoder computes $R$ redundant parity packets.
-- The transmission ratio is configured dynamically (typically $\sim 10\%$ to $15\%$ parity overhead).
+- The transmission ratio is configured dynamically (typically ~10% to 15% parity overhead).
 - Parity packets are interleaved directly into the outbound UDP datagram stream.
 - When an intermediate router drops up to $R$ packets out of the $K + R$ block, the receiver uses vectorized Galois Field matrix arithmetic to **algebraically reconstruct the missing packets in-place**.
 
@@ -340,11 +340,11 @@ Because reconstruction completes in sub-microsecond time, the repair overhead is
 
 A central tenet of `yip`'s systems philosophy is **engineering for real-world hostility rather than pristine synthetic benchmarks**.
 
-On a perfectly clean link ($0.0\%$ packet loss) over a local fiber gigabit connection:
-- Linux kernel WireGuard achieves **$\sim 716\text{ Mbit/s}$** on single-core instances. It runs entirely inside ring-0 kernel memory, directly steering `sk_buff` structures without userspace context switches.
-- `yip` achieves **$\sim 612.8\text{ Mbit/s}$** on comparable hardware.
+On a perfectly clean link (0.0% packet loss) over a local fiber gigabit connection:
+- Linux kernel WireGuard achieves **~716 Mbit/s** on single-core instances. It runs entirely inside ring-0 kernel memory, directly steering `sk_buff` structures without userspace context switches.
+- `yip` achieves **~612.8 Mbit/s** on comparable hardware.
 
-This difference ($\sim 14\%$) is an intentional, mathematically unavoidable engineering trade-off:
+This difference (~14%) is an intentional, mathematically unavoidable engineering trade-off:
 1. **Userspace Memory Transfers:** Crossing the kernel boundary between TUN devices, ring buffers, and network sockets.
 2. **Proactive Parity Overhead:** Allocating ~10% of outbound bandwidth to systematic FEC parity symbols.
 3. **Double Cryptographic Protection:** Noise-IK transport encryption alongside ChaCha20 header protection and SipHash-1-3 authenticated pre-filtering.
@@ -353,7 +353,7 @@ However, as soon as link quality degrades by even a single percent, **the perfor
 
 ### Empirical Head-to-Head Performance Benchmark
 
-The following table presents verified empirical TCP goodput measured across an AWS inter-region transit path (`us-east-1` to `us-west-2`, $\sim 60.6\text{ ms}$ base RTT) with symmetric packet loss injected via Linux `tc-netem`:
+The following table presents verified empirical TCP goodput measured across an AWS inter-region transit path (`us-east-1` to `us-west-2`, ~60.6 ms base RTT) with symmetric packet loss injected via Linux `tc-netem`:
 
 | Injected Loss Rate | Linux Kernel WireGuard | OpenVPN (UDP) | yip (AF_XDP / epoll) | yip Performance Advantage |
 |:------------------|:-----------------------|:--------------|:---------------------|:--------------------------|

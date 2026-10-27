@@ -79,11 +79,11 @@ Standard tunnels and IP fabrics rely on **Automatic Repeat reQuest (ARQ)**:
 3. The receiver emits duplicate ACKs (or waits for a Retransmission Timeout, RTO).
 4. The sender detects the loss, cuts its Congestion Window (`cwnd`), and retransmits the missing segment across the physical round-trip transit path.
 
-On a high-latency WAN link (e.g. cross-continental transit with a base Round-Trip Time of $\text{RTT} \approx 60\text{ ms}$), reactive ARQ imposes a minimum penalty of **$60\text{ ms}$ to $200+\text{ ms}$** before a single dropped byte can be recovered.
+On a high-latency WAN link (e.g. cross-continental transit with a base Round-Trip Time of RTT ≈ 60 ms), reactive ARQ imposes a minimum penalty of **60 ms to 200+ ms** before a single dropped byte can be recovered.
 
-In contrast, `yip` utilizes **Proactive Systematic Cauchy Reed-Solomon Erasure Coding** ($GF(2^8)$) with an adaptive ratio ($\sim 10\text{--}15\%$). For every block of $K$ source packets, the encoder emits $R$ parity packets interleaved directly into the egress stream. When a drop occurs on the transit network:
+In contrast, `yip` utilizes **Proactive Systematic Cauchy Reed-Solomon Erasure Coding** ($GF(2^8)$) with an adaptive ratio (~10–15%). For every block of $K$ source packets, the encoder emits $R$ parity packets interleaved directly into the egress stream. When a drop occurs on the transit network:
 - The missing packet is algebraically reconstructed **in-place at the receiver** the microsecond the parity symbol arrives.
-- **Zero Round-Trip Penalty:** The recovery latency is $0\text{ ms}$ of network traversal, bounded purely by the sub-microsecond Galois Field matrix multiplication.
+- **Zero Round-Trip Penalty:** The recovery latency is 0 ms of network traversal, bounded purely by the sub-microsecond Galois Field matrix multiplication.
 - Upper-layer TCP congestion control never observes an IP packet drop, preventing congestion window collapse.
 
 ### The Dynamics of TCP Congestion Collapse on Lossy Links
@@ -95,8 +95,8 @@ $$\text{Throughput} \le \frac{\text{MSS}}{\text{RTT} \cdot \sqrt{p}} \cdot C$$
 where $\text{MSS}$ is the Maximum Segment Size, $\text{RTT}$ is the round-trip transit time, $p$ is the packet loss probability, and $C$ is a pacing constant ($\approx 1.22$ for NewReno).
 
 Notice the inverse proportionality to both $\text{RTT}$ and $\sqrt{p}$:
-- On a local LAN ($\text{RTT} = 0.2\text{ ms}$), a $1\%$ loss degrades throughput, but the tight feedback loop allows TCP to quickly ramp back up.
-- On a transcontinental WAN ($\text{RTT} = 60\text{ ms}$), a mere $1\%$ drop rate collapses TCP goodput from several hundred megabits per second down to single digits. At $5\%$ to $10\%$ loss, TCP enters constant retransmission timeouts (exponential backoff), effectively driving goodput to near zero ($< 1\text{ Mbit/s}$).
+- On a local LAN (RTT = 0.2 ms), a 1% loss degrades throughput, but the tight feedback loop allows TCP to quickly ramp back up.
+- On a transcontinental WAN (RTT = 60 ms), a mere 1% drop rate collapses TCP goodput from several hundred megabits per second down to single digits. At 5% to 10% loss, TCP enters constant retransmission timeouts (exponential backoff), effectively driving goodput to near zero (< 1 Mbit/s).
 
 By intercepting and correcting packet loss below the overlay TUN interface, `yip` hides the physical channel degradation from TCP. To the host kernel's TCP stack, the path appears as a clean channel with zero packet drops.
 
@@ -104,20 +104,20 @@ By intercepting and correcting packet loss below the overlay TUN interface, `yip
 
 A core tenet of `yip`'s systems philosophy is **engineering for real-world hostility rather than pristine benchmarks**.
 
-On a perfectly lossless channel ($0.0\%$ loss) running on single-vCPU cloud instances:
+On a perfectly lossless channel (0.0% loss) running on single-vCPU cloud instances:
 - Linux kernel WireGuard achieves **$\sim 716\text{ Mbit/s}$** (or up to $\sim 927\text{ Mbit/s}$ across 4 parallel streams). It operates entirely within ring-0 kernel space, leveraging direct sk_buff steering without userspace context switches.
 - `yip` achieves **$\sim 612.8\text{ Mbit/s}$** on comparable workloads (or $\sim 282\text{--}375\text{ Mbit/s}$ on budget single-core VPS nodes).
 
-This difference ($\sim 14\text{--}20\%$) is the intentional, mathematically necessary trade-off for userspace cryptographic encapsulation and proactive Reed-Solomon parity generation:
+This difference (~14–20%) is the intentional, mathematically necessary trade-off for userspace cryptographic encapsulation and proactive Reed-Solomon parity generation:
 1. **Userspace Context Switches:** TUN/socket buffer transfers across the kernel boundary (`read`/`write` or `recvmmsg`/`sendmmsg`).
-2. **Proactive Parity Overhead:** Allocating $10\%$ of outbound bandwidth to systematic FEC symbols.
+2. **Proactive Parity Overhead:** Allocating 10% of outbound bandwidth to systematic FEC symbols.
 3. **Double Cryptographic Protection:** Noise-IK transport encryption alongside ChaCha20-Poly1305 header protection and SipHash-1-3 filtering.
 
-**However, as soon as link quality degrades by even $1\%$, the dynamic completely reverses:**
-- At **$1\%$ loss**, WireGuard drops to **$98.4\text{ Mbit/s}$**, while `yip` sustains **$494.2\text{ Mbit/s}$** (**$5.0\times$ faster**).
-- At **$3\%$ loss**, WireGuard drops to **$9.6\text{ Mbit/s}$**, while `yip` sustains **$221.3\text{ Mbit/s}$** (**$23.1\times$ faster**).
-- At **$5\%$ loss**, WireGuard drops to **$1.8\text{ Mbit/s}$**, while `yip` sustains **$74.5\text{ Mbit/s}$** (**$41.4\times$ faster**).
-- At **$10\%$ loss**, WireGuard collapses to **$0.1\text{ Mbit/s}$** (total link failure), while `yip` sustains **$14.0\text{ Mbit/s}$** (**$138.0\times$ faster**).
+**However, as soon as link quality degrades by even 1%, the dynamic completely reverses:**
+- At **1% loss**, WireGuard drops to **98.4 Mbit/s**, while `yip` sustains **494.2 Mbit/s** (**5.0× faster**).
+- At **3% loss**, WireGuard drops to **9.6 Mbit/s**, while `yip` sustains **221.3 Mbit/s** (**23.1× faster**).
+- At **5% loss**, WireGuard drops to **1.8 Mbit/s**, while `yip` sustains **74.5 Mbit/s** (**41.4× faster**).
+- At **10% loss**, WireGuard collapses to **0.1 Mbit/s** (total link failure), while `yip` sustains **14.0 Mbit/s** (**138.0× faster**).
 
 On clean fiber, both tunnels provide more than enough bandwidth for typical interactive usage. But on real-world mobile networks, congested satellite links (Starlink), inter-continental transit, and adversarial middleboxes injecting drops, `yip` keeps connections alive and fast when standard tunnels fail completely.
 
@@ -130,8 +130,8 @@ Standard benchmarking tools often report raw wire rate or packet counters. When 
 
 1. **Application Goodput:** Measured exclusively by completed layer-7 application transfers (e.g. `iperf3` TCP payload delivered without duplicate sequence accounting). Wire throughput is misleading if the wire is saturated with retransmissions.
 2. **P99 Tail Latency:** The 99th percentile round-trip latency. While median latency ($P_{50}$) may look acceptable on lossy links, unrecovered packet drops create massive $P_{99}$ latency spikes (hundreds of milliseconds) due to TCP head-of-line blocking.
-3. **Retransmit Storms & Retransmission Multiplier:** The ratio of transmitted packets to useful payloads. Under $5\%$ loss, standard tunnels trigger cascading retransmissions where the sender repeatedly blasts unacknowledged frames, causing queue bufferbloat.
-4. **FEC Recovery Ratio:** The percentage of missing packets successfully reconstructed by the Reed-Solomon decoder before the thin reactive ARQ timeout expires. In `yip`, this exceeds $99.3\%$ under continuous $10\%$ channel loss.
+3. **Retransmit Storms & Retransmission Multiplier:** The ratio of transmitted packets to useful payloads. Under 5% loss, standard tunnels trigger cascading retransmissions where the sender repeatedly blasts unacknowledged frames, causing queue bufferbloat.
+4. **FEC Recovery Ratio:** The percentage of missing packets successfully reconstructed by the Reed-Solomon decoder before the thin reactive ARQ timeout expires. In `yip`, this exceeds 99.3% under continuous 10% channel loss.
 
 ---
 
@@ -143,37 +143,37 @@ All benchmark charts embedded below are generated deterministically using [`crat
 
 ![Throughput Under Packet Loss](../assets/bench-throughput-loss.svg)
 
-Figure 1 illustrates the comparative TCP goodput across an AWS multi-region transit path (`us-east-1` $\leftrightarrow$ `us-west-2`, $\sim 60.6\text{ ms}$ base RTT) as synthetic symmetric packet loss is injected from $0\%$ to $10\%$.
+Figure 1 illustrates the comparative TCP goodput across an AWS multi-region transit path (`us-east-1` ↔ `us-west-2`, ~60.6 ms base RTT) as synthetic symmetric packet loss is injected from 0% to 10%.
 
 Notice the logarithmic cliff experienced by both Linux kernel WireGuard and OpenVPN:
-- Between $0\%$ and $1\%$ packet loss, WireGuard's goodput collapses by **$76\%$**.
-- Between $1\%$ and $5\%$ packet loss, WireGuard degrades by **$98\%$**, falling below $2\text{ Mbit/s}$.
-- `yip` exhibits graceful, linear degradation governed strictly by physical link capacity minus parity overhead, sustaining **$14.0\text{ Mbit/s}$** even at $10\%$ continuous random packet loss ($138\times$ higher than WireGuard).
+- Between 0% and 1% packet loss, WireGuard's goodput collapses by **76%**.
+- Between 1% and 5% packet loss, WireGuard degrades by **98%**, falling below 2 Mbit/s.
+- `yip` exhibits graceful, linear degradation governed strictly by physical link capacity minus parity overhead, sustaining **14.0 Mbit/s** even at 10% continuous random packet loss (138× higher than WireGuard).
 
 ### Figure 2: Systematic FEC Erasure Recovery & Loss Suppression
 
 ![FEC Recovery Efficiency](../assets/bench-fec-recovery.svg)
 
 Figure 2 demonstrates the effective packet loss experienced by application traffic traversing the tunnel versus the actual physical channel loss injected by `tc-netem`:
-- For unencapsulated IP baseline, WireGuard, and OpenVPN, effective loss tracks or exceeds the injected loss (escalating to $12\text{--}17\%$ at the $10\%$ injection mark due to queue drop amplification).
-- For `yip`, the systematic Cauchy Reed-Solomon encoder completely suppresses packet loss: application-level effective loss remains **$0.0\%$** up to $5\%$ injected loss, and only registers $1\text{--}2\%$ at extreme $10\%$ channel degradation where burst drops briefly exceed the repair budget.
+- For unencapsulated IP baseline, WireGuard, and OpenVPN, effective loss tracks or exceeds the injected loss (escalating to 12–17% at the 10% injection mark due to queue drop amplification).
+- For `yip`, the systematic Cauchy Reed-Solomon encoder completely suppresses packet loss: application-level effective loss remains **0.0%** up to 5% injected loss, and only registers 1–2% at extreme 10% channel degradation where burst drops briefly exceed the repair budget.
 
 ### Figure 3: Multi-Core Datapath Scaling Across Driver Tiers
 
 ![Multi-Core Scaling](../assets/bench-multicore-scaling.svg)
 
 Figure 3 compares datapath scaling across 1, 2, 4, and 8 physical CPU cores on dedicated hardware carrying 64 concurrent TCP flows across three `yip` driver engines:
-1. **AF_XDP (XSK) Zero-Copy Engine:** Scales from $8.68\text{ Gbps}$ on 1 core up to **$40.27\text{ Gbps}$** ($3.93\text{ Mpps}$) on 8 cores with zero locks, zero packet drops, and zero out-of-order deliveries.
-2. **`io_uring` Asynchronous Engine:** Scales from $5.12\text{ Gbps}$ up to **$22.10\text{ Gbps}$** on 8 cores using multishot batched rings.
-3. **Standard Vectorized Socket Engine (`recvmmsg`/`sendmmsg` + GSO):** Scales from $4.58\text{ Gbps}$ up to **$21.56\text{ Gbps}$** ($2.10\text{ Mpps}$) on 8 cores.
+1. **AF_XDP (XSK) Zero-Copy Engine:** Scales from 8.68 Gbps on 1 core up to **40.27 Gbps** ($3.93\text{ Mpps}$) on 8 cores with zero locks, zero packet drops, and zero out-of-order deliveries.
+2. **`io_uring` Asynchronous Engine:** Scales from 5.12 Gbps up to **22.10 Gbps** on 8 cores using multishot batched rings.
+3. **Standard Vectorized Socket Engine (`recvmmsg`/`sendmmsg` + GSO):** Scales from 4.58 Gbps up to **21.56 Gbps** ($2.10\text{ Mpps}$) on 8 cores.
 
 ### Figure 4: P99 Tail Latency and Jitter Distribution
 
 ![Latency and Jitter](../assets/bench-latency-jitter.svg)
 
 Figure 4 illustrates round-trip tail latency ($P_{99}$) as packet loss increases on the AWS cross-continental WAN link:
-- **WireGuard & OpenVPN:** Tail latency escalates rapidly from $\sim 55\text{ ms}$ at baseline to **$235.6\text{ ms}$** (WireGuard) and **$> 240\text{ ms}$** (OpenVPN) at $5\text{--}10\%$ loss, caused by TCP retransmission timers and queue stall.
-- **`yip`:** Tail latency remains virtually flat at **$\sim 61.5\text{--}63.8\text{ ms}$** across the entire loss spectrum ($0\%$ to $10\%$). Because packets are reconstructed immediately upon parity arrival, jitter is eliminated and head-of-line blocking never occurs.
+- **WireGuard & OpenVPN:** Tail latency escalates rapidly from ~55 ms at baseline to **235.6 ms** (WireGuard) and **> 240 ms** (OpenVPN) at 5–10% loss, caused by TCP retransmission timers and queue stall.
+- **`yip`:** Tail latency remains virtually flat at **~61.5–63.8 ms** across the entire loss spectrum (0% to 10%). Because packets are reconstructed immediately upon parity arrival, jitter is eliminated and head-of-line blocking never occurs.
 
 ---
 
@@ -210,7 +210,7 @@ The following empirical measurements are extracted from the canonical historical
 | Tail Latency ($P_{99}$) | > 200 ms | 235.6 ms | > 250 ms | **63.8 ms** | **No TCP timeout collapse** |
 
 > [!NOTE]
-> The exact throughput multipliers fluctuate between test runs based on dynamic cloud hypervisor contention and ISP routing jitter. Across all benchmark runs recorded in [`history.csv`](../crates/yip-bench/wan/results/history.csv), `yip` consistently achieves between **$23\times$ and $177\times$** higher TCP goodput than WireGuard once packet loss exceeds $3\%$.
+> The exact throughput multipliers fluctuate between test runs based on dynamic cloud hypervisor contention and ISP routing jitter. Across all benchmark runs recorded in [`history.csv`](../crates/yip-bench/wan/results/history.csv), `yip` consistently achieves between **23× and 177×** higher TCP goodput than WireGuard once packet loss exceeds 3%.
 
 ---
 
@@ -269,8 +269,8 @@ The Dedicated Multi-Core Server testbed isolates raw datapath throughput and eva
   - Zero-copy in-place AEAD sealing (`seal_in_place` and `open_in_place_with_window`) inside pinned UMEM chunks.
 - **Concurrency & Workload:** 64 concurrent TCP streams generated by hardware packet blast engines (`cargo bench --bench af_xdp_scale`), pushing 60,000 1280-byte IPv4 packets per core.
 - **Empirical Results:**
-  - Peak throughput: **$40.27\text{ Gbps}$** at **$3.933\text{ Mpps}$** across 8 worker cores.
-  - Single-core line rate: **$8.68\text{ Gbps}$** ($0.848\text{ Mpps}$).
+  - Peak throughput: **40.27 Gbps** at **$3.933\text{ Mpps}$** across 8 worker cores.
+  - Single-core line rate: **8.68 Gbps** ($0.848\text{ Mpps}$).
   - Safety Invariants: **0 packet drops**, **0 out-of-order packets**, and **0 lock contention points**.
 
 ### Testbed 3: 10G Network Namespace Parity (Local Netns A/B)
@@ -278,16 +278,16 @@ The Dedicated Multi-Core Server testbed isolates raw datapath throughput and eva
 The Local Network Namespace Parity testbed removes cross-cloud internet transit variance, allowing direct, deterministic side-by-side comparison between the Linux in-kernel WireGuard module and `yipd`.
 
 - **Host Platform:** Linux 6.12 x86_64 multi-core development system.
-- **Namespace Topology:** Two network namespaces (`wg_ns_a` $\leftrightarrow$ `wg_ns_b`) interconnected via a high-speed virtual Ethernet (`veth`) pair (`10.44.0.1/24` $\leftrightarrow$ `10.44.0.2/24`).
+- **Namespace Topology:** Two network namespaces (`wg_ns_a` ↔ `wg_ns_b`) interconnected via a high-speed virtual Ethernet (`veth`) pair (`10.44.0.1/24` ↔ `10.44.0.2/24`).
 - **Interface Bindings:**
-  - Kernel WireGuard: `wg0` (`10.88.0.1/24` $\leftrightarrow$ `10.88.0.2/24`).
-  - `yip` Daemon: `yip0` (`10.99.0.1/24` $\leftrightarrow$ `10.99.0.2/24`), running release binary with AVX2 SIMD FEC and adaptive busy-polling.
+  - Kernel WireGuard: `wg0` (`10.88.0.1/24` ↔ `10.88.0.2/24`).
+  - `yip` Daemon: `yip0` (`10.99.0.1/24` ↔ `10.99.0.2/24`), running release binary with AVX2 SIMD FEC and adaptive busy-polling.
 - **Workload:** 4 concurrent TCP streams via `iperf3 -P 4` and 50-packet sub-millisecond ICMP pings.
 - **Channel Degradation & Retention Results:**
-  - **At 0% Loss (Clean Baseline):** WireGuard achieves $2.71\text{ Gbps}$; `yip` achieves $1.05\text{ Gbps}$.
-  - **At 1% Loss:** WireGuard achieves $2.61\text{ Gbps}$ ($96.3\%$ retention, $2.0\%$ TCP drop); `yip` achieves $0.98\text{ Gbps}$ ($92.9\%$ retention, **$0.0\%$ TCP drop**).
-  - **At 5% Loss:** WireGuard drops to **$0.15\text{ Gbps}$** ($10.0\%$ observed TCP packet loss, $94.5\%$ throughput collapse); `yip` delivers **$0.80\text{ Gbps}$** (**$76.2\%$ goodput retention**, **$0.0\%$ observed TCP loss**).
-  - **Multiplier:** At $5\%$ loss, `yip` delivers **$5.33\times$ higher goodput** than Linux kernel WireGuard while maintaining a tighter tail latency ($P_{99} = 5.39\text{ ms}$).
+  - **At 0% Loss (Clean Baseline):** WireGuard achieves 2.71 Gbps; `yip` achieves 1.05 Gbps.
+  - **At 1% Loss:** WireGuard achieves 2.61 Gbps (96.3% retention, 2.0% TCP drop); `yip` achieves 0.98 Gbps (92.9% retention, **0.0% TCP drop**).
+  - **At 5% Loss:** WireGuard drops to **0.15 Gbps** (10.0% observed TCP packet loss, 94.5% throughput collapse); `yip` delivers **0.80 Gbps** (**76.2% goodput retention**, **0.0% observed TCP loss**).
+  - **Multiplier:** At 5% loss, `yip` delivers **5.33× higher goodput** than Linux kernel WireGuard while maintaining a tighter tail latency (P99 = 5.39 ms).
 
 ---
 
@@ -342,7 +342,7 @@ Galois Field multiplication cannot be executed with standard integer multiply in
 | **AVX-512BW** | 2.00 µs | 59.85 Gbps | 41.73× | 142.9 ns / packet |
 | **Hardware GFNI** | **1.71 µs** | **70.21 Gbps** | **48.95×** | **122.1 ns / packet** |
 
-Under AVX2 and GFNI, the per-packet compute cost of Reed-Solomon parity generation drops to **$\sim 122\text{--}134\text{ ns}$**. Parity encoding requires less than $2\%$ of a single CPU core at $10\text{ Gbps}$ line rates.
+Under AVX2 and GFNI, the per-packet compute cost of Reed-Solomon parity generation drops to **~122–134 ns**. Parity encoding requires less than 2% of a single CPU core at 10 Gbps line rates.
 
 ### Systematic Cauchy RS-FEC vs. Rateless RLNC Benchmark
 
@@ -357,7 +357,7 @@ In addition to Cauchy Reed-Solomon coding, `yip` incorporates a streaming **Rate
 | **Rateless RLNC** | Window $W = 32$, 1500 B | 1,400.9 ns | 0.71 Mpps | 8.57 Gbps |
 | **Cauchy RS-FEC** | $K = 32, R = 4$, 1500 B | 1,378.4 ns | 0.72 Mpps | 8.70 Gbps |
 
-RLNC generation operates within $2\text{--}14\%$ of Cauchy RS performance while unlocking rateless fountain properties (producing an unbounded stream of linearly independent parity symbols on demand without fixed block constraints).
+RLNC generation operates within 2–14% of Cauchy RS performance while unlocking rateless fountain properties (producing an unbounded stream of linearly independent parity symbols on demand without fixed block constraints).
 
 ### Zero-Copy In-Place AEAD & Ring Buffer Latencies
 
@@ -393,7 +393,7 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release --workspace
 ```
 
 > [!WARNING]
-> Benchmarking a debug build (`cargo build`) will misrepresent performance by up to $75\times$. The Galois Field matrix multiplication, AEAD pipelines, and SIMD loops must be compiled with `--release`.
+> Benchmarking a debug build (`cargo build`) will misrepresent performance by up to 75×. The Galois Field matrix multiplication, AEAD pipelines, and SIMD loops must be compiled with `--release`.
 
 ### Hot-Path & Kernel-Bypass Microbenchmarks
 
@@ -463,7 +463,7 @@ sudo bash bin/yipd/tests/run-netns-wireguard-comp.sh target/release/yipd
 
 ### Automated Multi-Region Cloud WAN Harness
 
-To run the live multi-cloud WAN benchmark across two internet hosts (e.g. AWS `us-east-1` $\leftrightarrow$ AWS `us-west-2`):
+To run the live multi-cloud WAN benchmark across two internet hosts (e.g. AWS `us-east-1` ↔ AWS `us-west-2`):
 
 ```bash
 cd crates/yip-bench/wan
@@ -530,7 +530,7 @@ batch_size = 32           # Opportunistic sendmmsg/recvmmsg batching
 
 ### AF_XDP Driver & UMEM Memory Alignment
 
-For line rates exceeding $10\text{ Gbps}$ on dedicated hardware:
+For line rates exceeding 10 Gbps on dedicated hardware:
 1. Ensure the network interface driver supports native XDP (`XDP_DRV`).
 2. Unlock locked memory limits for unprivileged UMEM registration:
    ```bash

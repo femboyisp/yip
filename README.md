@@ -8,9 +8,12 @@
 *Reed-Solomon FEC loss immunity • 40 Gbps AF_XDP multi-core scaling • Decentralized threshold PKI • Anti-DPI TLS mimicry*
 
 <p align="center">
+  <a href="https://crates.io/crates/yip"><img src="https://img.shields.io/crates/v/yip.svg?logo=rust" alt="Crates.io" /></a>
+  <a href="https://docs.rs/yip"><img src="https://img.shields.io/docsrs/yip?logo=docsdotrs" alt="docs.rs" /></a>
   <a href="https://github.com/femboyisp/yip/actions/workflows/ci.yml"><img src="https://github.com/femboyisp/yip/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/femboyisp/yip/actions/workflows/mutants.yml"><img src="https://img.shields.io/badge/cargo--mutants-tested-blueviolet.svg" alt="cargo-mutants" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License: AGPL-3.0" /></a>
-  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.85%2B-orange.svg" alt="Rust 1.85+" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.89%2B-orange.svg" alt="Rust 1.89+" /></a>
   <a href="docs/01-getting-started.md"><img src="https://img.shields.io/badge/platform-linux-lightgrey.svg" alt="Platform: Linux" /></a>
   <a href="bin/yipd/tests/run-multi-dpi-oracle.sh"><img src="https://img.shields.io/badge/dpi%20oracle-4%20engines%20clean-brightgreen.svg" alt="DPI Oracle" /></a>
 </p>
@@ -86,8 +89,10 @@ Because throughput is inversely proportional to the square root of loss probabil
 Set up an encrypted, forward-error-corrected tunnel between two Linux nodes in four steps:
 
 ```bash
-# 1. Install pre-compiled static binary (or: cargo binstall yipd)
-curl -fsSL https://raw.githubusercontent.com/femboyisp/yip/main/install.sh | sh
+# 1. Install binaries
+cargo install yipd yip-ca
+# Or automated installer: curl -fsSL https://raw.githubusercontent.com/femboyisp/yip/main/install.sh | sh
+# Or pre-compiled binary: cargo binstall yipd yip-ca
 
 # 2. Generate identity keypair and print self-certifying overlay IPv6 address
 yipd --genkey > /etc/yip/node.key && yipd --addr $(grep '^public=' /etc/yip/node.key | cut -d= -f2)
@@ -195,7 +200,7 @@ sudo yipd cert renew
 - **Single-Round (1-RTT) Online Enrollment**: Pre-generated nonce pools (`frost_ed25519::round1::preprocess`) pre-cached at the coordinator collapse online certificate enrollment from two network round-trips to a single RPC round-trip.
 - **Asynchronous Robustness (ROAST)**: Coordinator signing loop is wrapped in a ROAST state machine, guaranteeing progress and unforgeable issuance even if up to *n* - *t* signers are unresponsive, delayed, or Byzantine.
 - **Rollback-Immune Nonce Vault**: Memory-locked (`mlock`), zeroized-on-drop ephemeral nonce pools bound to 128-bit CSPRNG boot-epoch IDs eliminate nonce-reuse private key extraction under VM snapshots.
-- **Automated Lifecycle & Background Renewal**: Proactive zero-knowledge polynomial share refreshing (CVE-2025-58359 hardened), lost-share repair, and automated zero-touch renewal inside `bin/yipd` at $\ge 70\%$ of certificate TTL.
+- **Automated Lifecycle & Background Renewal**: Proactive zero-knowledge polynomial share refreshing (CVE-2025-58359 hardened), lost-share repair, and automated zero-touch renewal inside `bin/yipd` at ≥ 70% of certificate TTL.
 
 ```mermaid
 flowchart TD

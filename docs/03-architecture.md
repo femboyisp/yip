@@ -416,7 +416,7 @@ On multi-socket NUMA hardware (e.g., dual AMD EPYC or Intel Xeon systems), cross
 | :--- | :--- | :--- | :--- |
 | **Primary Primitives** | `recvmmsg` / `sendmmsg` | SQE / CQE Rings | UMEM, Fill / Rx / Tx / Comp Rings |
 | **Syscall Overhead** | Amortized (32 pkts/call) | Zero in steady-state (busy-poll) | Absolute Zero (Kernel Bypass) |
-| **Packet Copying** | Kernel $\leftrightarrow$ Userspace | Kernel $\leftrightarrow$ Registered Buffers | Zero Copy (NIC DMA $\leftrightarrow$ UMEM) |
+| **Packet Copying** | Kernel ↔ Userspace | Kernel ↔ Registered Buffers | Zero Copy (NIC DMA ↔ UMEM) |
 | **Minimum Kernel** | Linux 3.10+ | Linux 5.11+ | Linux 5.4+ (5.10+ recommended) |
 | **Required Capabilities**| `CAP_NET_ADMIN` | `CAP_NET_ADMIN` | `CAP_NET_ADMIN` + `CAP_BPF` |
 | **Hardware Dependency** | None (Generic) | Modern Kernel | Supported NIC (Intel, Mellanox) |
@@ -877,8 +877,8 @@ Nodes running `yipd` with `threshold_ca_server` configured eliminate manual cert
 flowchart LR
     subgraph yipd ["yipd Background Monitor"]
         Check["Periodic Tick<br/>Measure Cert Lifetime"]
-        Check -->|< 70% TTL| Sleep["No Action<br/>Continue Fast Datapath"]
-        Check -->|>= 70% TTL| Renew["Non-Blocking Online Renewal<br/>RPC to threshold_ca_server"]
+        Check -->|"< 70% TTL"| Sleep["No Action<br/>Continue Fast Datapath"]
+        Check -->|">= 70% TTL"| Renew["Non-Blocking Online Renewal<br/>RPC to threshold_ca_server"]
         Renew --> Success["Atomically Update Memory Cert<br/>& Overwrite Disk File"]
     end
 ```

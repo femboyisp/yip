@@ -93,13 +93,13 @@ This scenario connects two publicly addressable Linux cloud instances over a dir
 
 ```mermaid
 flowchart LR
-    subgraph Host A [Host A: 198.51.100.1]
+    subgraph Host_A ["Host A: 198.51.100.1"]
         A_D[yipd daemon]
         A_TUN[yip0: 10.100.0.1/24<br/>fc00::1/64]
         A_D --- A_TUN
     end
 
-    subgraph Host B [Host B: 203.0.113.2]
+    subgraph Host_B ["Host B: 203.0.113.2"]
         B_D[yipd daemon]
         B_TUN[yip0: 10.100.0.2/24<br/>fc00::2/64]
         B_D --- B_TUN
@@ -335,21 +335,21 @@ This scenario configures a high-throughput enterprise edge gateway serving hundr
 
 ```mermaid
 flowchart TD
-    subgraph NIC [Hardware NIC (10G/40G/100G)]
+    subgraph NIC ["Hardware NIC (10G/40G/100G)"]
         Q0[RX/TX Queue 0]
         Q1[RX/TX Queue 1]
         Q2[RX/TX Queue 2]
         Q3[RX/TX Queue 3]
     end
 
-    subgraph Datapath [yipd Multi-Queue Worker Shards]
+    subgraph Datapath ["yipd Multi-Queue Worker Shards"]
         W0[Worker Shard 0<br/>CPU Core 0 / io_uring]
         W1[Worker Shard 1<br/>CPU Core 1 / io_uring]
         W2[Worker Shard 2<br/>CPU Core 2 / io_uring]
         W3[Worker Shard 3<br/>CPU Core 3 / io_uring]
     end
 
-    subgraph TUN [Multi-Queue TUN Device (IFF_MULTI_QUEUE)]
+    subgraph TUN ["Multi-Queue TUN Device (IFF_MULTI_QUEUE)"]
         T0[Queue Handle 0]
         T1[Queue Handle 1]
         T2[Queue Handle 2]
@@ -616,7 +616,7 @@ Parameters governing NAT traversal, blind relays, and decentralized cryptographi
 | `roots` | String (Path) | *None* | Filesystem path | Path to file containing the CA-signed root set. Verified against `ca_public` at boot. |
 | `member_sign_private` | String (Hex) | *None* | 64 hex characters (32 bytes) | Node Ed25519 signing key used to sign gossip membership records. Kept strictly secret. |
 | `network_id` | String (Hex) | *None* | 32 hex characters (16 bytes) | Unique 16-byte identifier for the private mesh network. |
-| `threshold_ca_server`<br/>*(Alias: `ca_server`)* | String | *None* (Optional) | `IP:port` (IPv4 or `[IPv6]:port`) | Address of online threshold CA coordinator. Enables automatic background renewal at $\ge 70\%$ of certificate TTL. |
+| `threshold_ca_server`<br/>*(Alias: `ca_server`)* | String | *None* (Optional) | `IP:port` (IPv4 or `[IPv6]:port`) | Address of online threshold CA coordinator. Enables automatic background renewal at ≥ 70% of certificate TTL. |
 
 #### Rendezvous Dial Scheme Formats
 - **Plain UDP**: `rendezvous=198.51.100.5:51821`
@@ -663,13 +663,13 @@ sudo yipd /etc/yip/yipd.conf
 The configuration loader enforces strict compile-time and run-time invariants:
 
 ```mermaid
-graph TD
-    A[transport = quic | tls] -->|FORBIDS| B[obf_psk]
-    A -->|FORBIDS| C[traffic_defense]
-    D[traffic_defense = balanced | paranoid] -->|REQUIRES| B
-    E[rendezvous = tls:// | reality://] -->|REQUIRES| B
-    E -->|FORCES| F[driver = epoll]
-    G[Mesh Mode] -->|REQUIRES ALL 5| H[ca_public + cert + roots + member_sign_private + network_id]
+flowchart TD
+    A["transport = quic | tls"] -->|"FORBIDS"| B["obf_psk"]
+    A -->|"FORBIDS"| C["traffic_defense"]
+    D["traffic_defense = balanced | paranoid"] -->|"REQUIRES"| B
+    E["rendezvous = tls:// | reality://"] -->|"REQUIRES"| B
+    E -->|"FORCES"| F["driver = epoll"]
+    G["Mesh Mode"] -->|"REQUIRES ALL 5"| H["ca_public + cert + roots + member_sign_private + network_id"]
 ```
 
 - `transport=quic` or `transport=tls` **cannot** be combined with `obf_psk` or `traffic_defense` (double-wrapping is rejected).

@@ -211,8 +211,8 @@ Every received ML-KEM-512 encapsulation key ($ek_A$) undergoes strict cryptograp
 - The first 768 bytes of $ek_A$ encode 512 polynomial coefficients, each represented by a 12-bit integer packed across 3 bytes per 2 coefficients:
   $$d_0 = \text{chunk}[0] \mid ((\text{chunk}[1] \& 0\text{x0F}) \ll 8)$$
   $$d_1 = (\text{chunk}[1] \gg 4) \mid (\text{chunk}[2] \ll 4)$$
-- The modulus check verifies that **every** 12-bit coefficient strictly satisfies $d_i < 3329$ (the prime modulus $q = 3329$).
-- If any coefficient $d_i \ge 3329$, the handshake aborts immediately with `CryptoError::Handshake`.
+- The modulus check verifies that **every** 12-bit coefficient strictly satisfies `d_i < 3329` (the prime modulus `q = 3329`).
+- If any coefficient `d_i >= 3329`, the handshake aborts immediately with `CryptoError::Handshake`.
 - Furthermore, ML-KEM-512 guarantees **IND-CCA2** (Indistinguishability under Adaptive Chosen Ciphertext Attack) security via Fujisaki-Okamoto transformation with implicit rejection: an adversary who modifies bits in $ct$ cannot force an observable error oracle; decapsulation deterministically outputs a pseudorandom secret derived from the decapsulation key's internal rejection seed, causing subsequent AEAD authentication to fail indistinguishably from a random transmission error.
 
 ### Harvest-Now-Decrypt-Later (HNDL) Resistance
