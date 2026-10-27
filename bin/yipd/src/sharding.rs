@@ -153,7 +153,7 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use yip_io::af_xdp::{
-    FillRing, UmemPool, UmemSlab, XskBindMode, XskDesc, XskSocket, UMEM_RING_SIZE,
+    FillRing, UmemPool, UmemPoolConfig, UmemSlab, XskBindMode, XskDesc, XskSocket, UMEM_RING_SIZE,
 };
 use yip_io::poll::Dispatch;
 
@@ -647,7 +647,19 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
 
     // Allocate single shared UMEM pool partitioned into per-worker slabs for AF_XDP
     let mut slabs: Option<Vec<UmemSlab>> = if std::env::var("YIP_XDP_IFNAME").is_ok() {
-        UmemPool::new_slabs(2048 * num_shards, 4096, num_shards)
+        let lazy = std::env::var("YIP_UMEM_LAZY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let mlock = std::env::var("YIP_UMEM_MLOCK")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let pool_cfg = UmemPoolConfig {
+            num_chunks: 2048 * num_shards,
+            chunk_size: 4096,
+            pre_fault: !lazy,
+            lock_memory: mlock,
+        };
+        UmemPool::new_slabs_with_config(pool_cfg, num_shards)
             .ok()
             .map(|(_, s)| s)
     } else {

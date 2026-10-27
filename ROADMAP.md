@@ -14,7 +14,9 @@ maintainer.
   wire-auth 64-bit counter-bound FEC reassembly with pre-AEAD anti-replay gating, and
   bidirectional flow accounting in the traffic classifier (#11).
 - **Multi-core throughput & kernel-bypass** — multi-queue TUN worker sharding (`IFF_MULTI_QUEUE`),
-  core-pinned flow hashing, lock-free chunked nonce dispensers, circular replay windows, and
+  core-pinned flow hashing, lock-free chunked nonce dispensers, circular replay windows,
+  per-core UMEM slab partitioning with vectorized ring recycling (#172), configurable lazy on-demand paging vs `MAP_POPULATE` and `mlock` page pinning (#173),
+  tunable 32/64/128-datagram syscall burst sizing in `BatchUdpSocket` (#173), and
   AF_XDP zero-copy driver (over 40 Gbps aggregate throughput, 5.3x higher goodput than kernel
   WireGuard under 5% packet loss).
 - **Control plane & mesh routing** — multi-peer routing, self-certifying key-derived addresses

@@ -17,6 +17,38 @@ pub const UMEM_CHUNK_SIZE: usize = 2048;
 /// Default ring size in descriptors (must be a power of two).
 pub const UMEM_RING_SIZE: u32 = 2048;
 
+/// Configuration parameters for allocating an AF_XDP [`UmemPool`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UmemPoolConfig {
+    /// Number of chunk buffers in the pool.
+    pub num_chunks: usize,
+    /// Size of each chunk in bytes (typically 2048 or 4096).
+    pub chunk_size: usize,
+    /// Pre-fault all memory pages during allocation via `MAP_POPULATE`.
+    ///
+    /// When `true` (the default), eliminates page fault jitter during packet I/O
+    /// at the expense of higher startup latency and immediate RSS allocation.
+    /// When `false`, pages are faulted lazily on-demand, reducing startup time
+    /// and memory footprint on resource-constrained hosts.
+    pub pre_fault: bool,
+    /// Pin pages in physical RAM via `libc::mlock` to prevent swapping.
+    ///
+    /// Requires `CAP_IPC_LOCK` or sufficient `RLIMIT_MEMLOCK`. If `true` and `mlock`
+    /// fails, an error is returned.
+    pub lock_memory: bool,
+}
+
+impl Default for UmemPoolConfig {
+    fn default() -> Self {
+        Self {
+            num_chunks: 4096,
+            chunk_size: 2048,
+            pre_fault: true,
+            lock_memory: false,
+        }
+    }
+}
+
 /// Pre-allocated page-aligned shared memory pool for AF_XDP kernel-bypass I/O.
 pub struct UmemPool {
     area: *mut libc::c_void,
@@ -27,18 +59,45 @@ pub struct UmemPool {
 
 impl UmemPool {
     /// Allocates an anonymous, page-aligned shared memory region for `num_chunks` chunks
-    /// of size `chunk_size`.
+    /// of size `chunk_size` with default pre-faulting (`MAP_POPULATE`) enabled.
     pub fn new(num_chunks: usize, chunk_size: usize) -> io::Result<Self> {
-        if num_chunks == 0 || chunk_size == 0 {
+        Self::with_config(UmemPoolConfig {
+            num_chunks,
+            chunk_size,
+            pre_fault: true,
+            lock_memory: false,
+        })
+    }
+
+    /// Allocates a new `UmemPool` with lazy on-demand page allocation (`MAP_POPULATE` disabled),
+    /// minimizing startup latency and initial RSS footprint.
+    pub fn new_lazy(num_chunks: usize, chunk_size: usize) -> io::Result<Self> {
+        Self::with_config(UmemPoolConfig {
+            num_chunks,
+            chunk_size,
+            pre_fault: false,
+            lock_memory: false,
+        })
+    }
+
+    /// Allocates a new `UmemPool` according to the provided [`UmemPoolConfig`].
+    pub fn with_config(config: UmemPoolConfig) -> io::Result<Self> {
+        if config.num_chunks == 0 || config.chunk_size == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "num_chunks and chunk_size must be positive",
             ));
         }
 
-        let size = num_chunks
-            .checked_mul(chunk_size)
+        let size = config
+            .num_chunks
+            .checked_mul(config.chunk_size)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "UMEM size overflow"))?;
+
+        let mut flags = libc::MAP_ANONYMOUS | libc::MAP_SHARED;
+        if config.pre_fault {
+            flags |= libc::MAP_POPULATE;
+        }
 
         // SAFETY: We request an anonymous, shared, page-aligned memory mapping of `size` bytes.
         // The address is NULL so the kernel selects the starting address.
@@ -48,7 +107,7 @@ impl UmemPool {
                 std::ptr::null_mut(),
                 size,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANONYMOUS | libc::MAP_SHARED | libc::MAP_POPULATE,
+                flags,
                 -1,
                 0,
             )
@@ -58,16 +117,29 @@ impl UmemPool {
             return Err(io::Error::last_os_error());
         }
 
+        if config.lock_memory {
+            // SAFETY: `area` points to `size` bytes of freshly mapped valid memory.
+            let lock_ret = unsafe { libc::mlock(area, size) };
+            if lock_ret != 0 {
+                let err = io::Error::last_os_error();
+                // SAFETY: On mlock failure, unmap the allocated area before returning error.
+                unsafe {
+                    libc::munmap(area, size);
+                }
+                return Err(err);
+            }
+        }
+
         // Populates free_chunks so popping yields 0, chunk_size, 2*chunk_size, ...
-        let free_chunks: Vec<u64> = (0..num_chunks)
+        let free_chunks: Vec<u64> = (0..config.num_chunks)
             .rev()
-            .map(|i| (i * chunk_size) as u64)
+            .map(|i| (i * config.chunk_size) as u64)
             .collect();
 
         Ok(Self {
             area,
             size,
-            chunk_size,
+            chunk_size: config.chunk_size,
             free_chunks,
         })
     }
@@ -241,13 +313,29 @@ impl UmemPool {
         Ok(slabs)
     }
 
-    /// Allocates a new `UmemPool` and partitions it into `num_slabs` disjoint slabs.
+    /// Allocates a new `UmemPool` with default configuration and partitions it into `num_slabs` disjoint slabs.
     pub fn new_slabs(
         num_chunks: usize,
         chunk_size: usize,
         num_slabs: usize,
     ) -> io::Result<(Arc<Self>, Vec<UmemSlab>)> {
-        let pool = Arc::new(Self::new(num_chunks, chunk_size)?);
+        Self::new_slabs_with_config(
+            UmemPoolConfig {
+                num_chunks,
+                chunk_size,
+                pre_fault: true,
+                lock_memory: false,
+            },
+            num_slabs,
+        )
+    }
+
+    /// Allocates a new `UmemPool` using the specified [`UmemPoolConfig`] and partitions it into `num_slabs` disjoint slabs.
+    pub fn new_slabs_with_config(
+        config: UmemPoolConfig,
+        num_slabs: usize,
+    ) -> io::Result<(Arc<Self>, Vec<UmemSlab>)> {
+        let pool = Arc::new(Self::with_config(config)?);
         let slabs = pool.create_slabs(num_slabs)?;
         Ok((pool, slabs))
     }

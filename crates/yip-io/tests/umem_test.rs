@@ -1,6 +1,61 @@
 use yip_io::af_xdp::{
-    CompletionRing, FillRing, UmemPool, UmemSlab, UMEM_CHUNK_SIZE, UMEM_RING_SIZE,
+    CompletionRing, FillRing, UmemPool, UmemPoolConfig, UmemSlab, UMEM_CHUNK_SIZE, UMEM_RING_SIZE,
 };
+
+#[test]
+fn test_umem_pool_lazy_allocation() {
+    let mut pool = UmemPool::new_lazy(64, UMEM_CHUNK_SIZE).expect("allocate lazy UMEM pool");
+    assert_eq!(pool.free_chunk_count(), 64);
+    assert_eq!(pool.size(), 64 * UMEM_CHUNK_SIZE);
+
+    let c1 = pool.alloc_chunk().expect("alloc lazy chunk 1");
+    let c2 = pool.alloc_chunk().expect("alloc lazy chunk 2");
+    assert_ne!(c1, c2);
+
+    // Fault in page on demand via memory write
+    {
+        let slice = pool.chunk_slice_mut(c1, 256);
+        slice[0] = 0xAA;
+        slice[255] = 0x55;
+    }
+
+    let read_slice = pool.chunk_slice(c1, 256);
+    assert_eq!(read_slice[0], 0xAA);
+    assert_eq!(read_slice[255], 0x55);
+
+    pool.free_chunk(c1);
+    pool.free_chunk(c2);
+    assert_eq!(pool.free_chunk_count(), 64);
+}
+
+#[test]
+fn test_umem_pool_with_config_and_slabs() {
+    let config = UmemPoolConfig {
+        num_chunks: 32,
+        chunk_size: UMEM_CHUNK_SIZE,
+        pre_fault: false,
+        lock_memory: false,
+    };
+    let (_pool, mut slabs) =
+        UmemPool::new_slabs_with_config(config, 4).expect("new_slabs_with_config");
+    assert_eq!(slabs.len(), 4);
+
+    for (i, slab) in slabs.iter_mut().enumerate() {
+        assert_eq!(slab.slab_id(), i);
+        assert_eq!(slab.num_chunks(), 8);
+        assert_eq!(slab.free_chunk_count(), 8);
+
+        let chunk = slab.alloc_chunk().expect("alloc from slab");
+        assert!(slab.contains_addr(chunk));
+
+        let slice = slab.chunk_slice_mut(chunk, 128);
+        slice[0] = (i + 1) as u8;
+        assert_eq!(slab.chunk_slice(chunk, 128)[0], (i + 1) as u8);
+
+        slab.free_chunk(chunk);
+        assert_eq!(slab.free_chunk_count(), 8);
+    }
+}
 
 #[test]
 fn test_umem_pool_allocation_and_slicing() {

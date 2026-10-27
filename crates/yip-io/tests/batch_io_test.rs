@@ -159,3 +159,109 @@ fn test_udp_gso_segment_and_superpacket() {
     let res = yip_io::batch::send_gso_superpacket(&s1, &payload, 1420, addr2);
     let _ = res;
 }
+
+#[test]
+fn test_batch_size_64_burst() {
+    use yip_io::batch::BATCH_SIZE_64;
+
+    let s1 = UdpSocket::bind("127.0.0.1:0").expect("bind s1");
+    let s2 = UdpSocket::bind("127.0.0.1:0").expect("bind s2");
+    s1.set_nonblocking(true).unwrap();
+    s2.set_nonblocking(true).unwrap();
+
+    let addr1 = s1.local_addr().unwrap();
+    let addr2 = s2.local_addr().unwrap();
+    let mut b1 = BatchUdpSocket::new(&s1);
+    let mut b2 = BatchUdpSocket::new(&s2);
+
+    let mut payloads = Vec::with_capacity(BATCH_SIZE_64);
+    let mut to_send = Vec::with_capacity(BATCH_SIZE_64);
+    for i in 0..BATCH_SIZE_64 {
+        payloads.push(format!("payload-64-burst-{i}").into_bytes());
+    }
+    for p in &payloads {
+        to_send.push((p.as_slice(), addr2));
+    }
+
+    let sent = b1
+        .sendmmsg_burst::<BATCH_SIZE_64>(&to_send)
+        .expect("sendmmsg 64");
+    assert_eq!(sent, BATCH_SIZE_64);
+
+    std::thread::sleep(std::time::Duration::from_millis(25));
+
+    let mut buffers = [[0u8; yip_io::MAX_WIRE_DATAGRAM]; BATCH_SIZE_64];
+    let mut out = [const { yip_io::batch::ReceivedDatagram::empty() }; BATCH_SIZE_64];
+
+    let mut total_recvd = 0;
+    while total_recvd < BATCH_SIZE_64 {
+        let recvd = b2
+            .recvmmsg_batch(&mut buffers, &mut out)
+            .expect("recvmmsg 64");
+        if recvd == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+        for i in 0..recvd {
+            let idx = total_recvd + i;
+            assert_eq!(out[i].len, payloads[idx].len());
+            assert_eq!(&buffers[i][..out[i].len], payloads[idx].as_slice());
+            assert_eq!(out[i].src, addr1);
+        }
+        total_recvd += recvd;
+    }
+    assert_eq!(total_recvd, BATCH_SIZE_64);
+}
+
+#[test]
+fn test_batch_size_128_burst() {
+    use yip_io::batch::BATCH_SIZE_128;
+
+    let s1 = UdpSocket::bind("127.0.0.1:0").expect("bind s1");
+    let s2 = UdpSocket::bind("127.0.0.1:0").expect("bind s2");
+    s1.set_nonblocking(true).unwrap();
+    s2.set_nonblocking(true).unwrap();
+
+    let addr1 = s1.local_addr().unwrap();
+    let addr2 = s2.local_addr().unwrap();
+    let mut b1 = BatchUdpSocket::new(&s1);
+    let mut b2 = BatchUdpSocket::new(&s2);
+
+    let mut payloads = Vec::with_capacity(BATCH_SIZE_128);
+    let mut to_send = Vec::with_capacity(BATCH_SIZE_128);
+    for i in 0..BATCH_SIZE_128 {
+        payloads.push(format!("payload-128-burst-{i}").into_bytes());
+    }
+    for p in &payloads {
+        to_send.push((p.as_slice(), addr2));
+    }
+
+    let sent = b1
+        .sendmmsg_burst::<BATCH_SIZE_128>(&to_send)
+        .expect("sendmmsg 128");
+    assert_eq!(sent, BATCH_SIZE_128);
+
+    std::thread::sleep(std::time::Duration::from_millis(30));
+
+    let mut buffers = [[0u8; yip_io::MAX_WIRE_DATAGRAM]; BATCH_SIZE_128];
+    let mut out = [const { yip_io::batch::ReceivedDatagram::empty() }; BATCH_SIZE_128];
+
+    let mut total_recvd = 0;
+    while total_recvd < BATCH_SIZE_128 {
+        let recvd = b2
+            .recvmmsg_batch(&mut buffers, &mut out)
+            .expect("recvmmsg 128");
+        if recvd == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+        for i in 0..recvd {
+            let idx = total_recvd + i;
+            assert_eq!(out[i].len, payloads[idx].len());
+            assert_eq!(&buffers[i][..out[i].len], payloads[idx].as_slice());
+            assert_eq!(out[i].src, addr1);
+        }
+        total_recvd += recvd;
+    }
+    assert_eq!(total_recvd, BATCH_SIZE_128);
+}
