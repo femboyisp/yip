@@ -4,6 +4,7 @@ use frost::round2::SignatureShare;
 use frost::{Identifier, SigningPackage};
 use frost_ed25519 as frost;
 pub mod dkg;
+pub mod refresh;
 
 use std::collections::BTreeMap;
 use thiserror::Error;
