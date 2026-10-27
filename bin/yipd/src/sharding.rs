@@ -152,7 +152,9 @@ use std::net::ToSocketAddrs;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use yip_io::af_xdp::{FillRing, UmemPool, XskBindMode, XskDesc, XskSocket, UMEM_RING_SIZE};
+use yip_io::af_xdp::{
+    FillRing, UmemPool, UmemSlab, XskBindMode, XskDesc, XskSocket, UMEM_RING_SIZE,
+};
 use yip_io::poll::Dispatch;
 
 use crate::config::Config;
@@ -643,6 +645,15 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
         }
     }
 
+    // Allocate single shared UMEM pool partitioned into per-worker slabs for AF_XDP
+    let mut slabs: Option<Vec<UmemSlab>> = if std::env::var("YIP_XDP_IFNAME").is_ok() {
+        UmemPool::new_slabs(2048 * num_shards, 4096, num_shards)
+            .ok()
+            .map(|(_, s)| s)
+    } else {
+        None
+    };
+
     let mut handles = Vec::with_capacity(num_shards);
 
     for shard_id in 0..num_shards {
@@ -652,6 +663,13 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
         let rx_channels = std::mem::take(&mut rx_matrix[shard_id]);
         let peers = all_peers.clone();
         let cfg = config.clone();
+        let mut slab = slabs.as_mut().and_then(|s| {
+            if !s.is_empty() {
+                Some(s.remove(0))
+            } else {
+                None
+            }
+        });
 
         let handle = std::thread::Builder::new()
             .name(format!("yipd-shard-{shard_id}"))
@@ -672,10 +690,9 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                 let tun_fd = tun_dev.as_raw_fd();
 
                 // Probe opportunistic AF_XDP socket with 3-tier fallback
-                let mut umem_pool = UmemPool::new(2048, 4096).ok();
-                let mut xsk_sock = if let Some(ref pool) = umem_pool {
+                let mut xsk_sock = if let Some(ref s) = slab {
                     if let Ok(xsk_ifname) = std::env::var("YIP_XDP_IFNAME") {
-                        XskSocket::bind_opportunistic(&xsk_ifname, shard_id as u32, pool)
+                        XskSocket::bind_opportunistic(&xsk_ifname, shard_id as u32, s.pool())
                             .unwrap_or_else(|_| XskSocket::fallback())
                     } else {
                         XskSocket::fallback()
@@ -685,14 +702,8 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                 };
 
                 let mut fill_ring = FillRing::new(UMEM_RING_SIZE);
-                if let Some(ref mut pool) = umem_pool {
-                    while !fill_ring.is_full() {
-                        if let Some(addr) = pool.alloc_chunk() {
-                            fill_ring.produce(addr);
-                        } else {
-                            break;
-                        }
-                    }
+                if let Some(ref mut s) = slab {
+                    s.populate_fill_ring(&mut fill_ring, UMEM_RING_SIZE as usize);
                 }
 
                 let sock_fd =
@@ -866,7 +877,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                     Err(e) => return Err(e),
                                 }
                             }
-                        } else if let Some(ref mut pool) = umem_pool {
+                        } else if let Some(ref mut s) = slab {
                             let mut descs = [XskDesc::default(); 32];
                             loop {
                                 let count = xsk_sock.rx_ring_mut().consume_batch(&mut descs);
@@ -876,9 +887,9 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                 packets_this_iter =
                                     packets_this_iter.wrapping_add(count as u64);
                                 for desc in &descs[..count] {
-                                    if (desc.len as usize) <= pool.chunk_size() {
+                                    if (desc.len as usize) <= s.chunk_size() {
                                         let payload =
-                                            pool.chunk_slice(desc.addr, desc.len as usize);
+                                            s.chunk_slice(desc.addr, desc.len as usize);
                                         let is_hs = !payload.is_empty()
                                             && (payload[0] == crate::handshake::PacketType::HandshakeInit as u8
                                                 || payload[0] == crate::handshake::PacketType::HandshakeResp as u8);
@@ -931,7 +942,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                         }
                                     }
                                     if !fill_ring.produce(desc.addr) {
-                                        pool.free_chunk(desc.addr);
+                                        s.free_chunk(desc.addr);
                                     }
                                 }
                             }

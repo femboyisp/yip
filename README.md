@@ -67,7 +67,7 @@ Because throughput is inversely proportional to the square root of packet loss p
 - **TAI64N Anti-Replay Freshness Gating**: Sub-nanosecond monotonic timestamps enforce strict certificate freshness and reject stale or replayed topology announcements.
 
 ### 3. Kernel-Bypass Performance
-- **Zero-Copy AF_XDP (XSK)**: Direct UMEM memory ring driver bypasses the Linux network stack, sustaining 40.27 Gbps and 3.93 Mpps across 8 CPU cores.
+- **Zero-Copy AF_XDP (XSK)**: Direct UMEM memory ring driver with per-core slab partitioning and lock-free ring recycling bypasses the Linux network stack, sustaining 40.27 Gbps and 3.93 Mpps across 8 CPU cores.
 - **Asynchronous `io_uring`**: High-performance multishot ring polling drives high packet rates without thread contention or syscall overhead.
 - **Multi-Queue TUN Sharding**: `IFF_MULTI_QUEUE` worker isolation maps packet flows to dedicated CPU cores via lock-free SPSC ring buffers.
 - **Vectorized Socket I/O**: Batched `recvmmsg` and `sendmmsg` with `UDP_SEGMENT` Generic Segmentation Offload (GSO) optimize standard POSIX network paths.

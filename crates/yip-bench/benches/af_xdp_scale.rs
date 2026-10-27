@@ -198,6 +198,26 @@ fn run_component_microbenchmarks() {
         );
     }
 
+    // 1b. Per-Core UmemSlab Chunk Alloc / Free Throughput
+    {
+        let iters = 200_000;
+        let (_pool, mut slabs) =
+            UmemPool::new_slabs(CHUNKS_PER_POOL, CHUNK_SIZE, 1).expect("create slabs");
+        let mut slab = slabs.remove(0);
+        let start = Instant::now();
+        for _ in 0..iters {
+            let addr = slab.alloc_chunk().expect("alloc chunk");
+            slab.free_chunk(addr);
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let mops = (iters as f64) / (elapsed * 1e6);
+        println!(
+            "  UmemSlab Chunk Alloc/Free:      {:6.2} Mops/s ({:.2} ns/op)",
+            mops,
+            (elapsed / iters as f64) * 1e9
+        );
+    }
+
     // 2. Circular Ring Batch Enqueue / Dequeue Throughput
     {
         let batch_size = 32;
@@ -237,6 +257,35 @@ fn run_component_microbenchmarks() {
             "  Circular Rings (Batch 32):      {:6.2} Mops/s ({:.2} ns/op)",
             mops,
             (elapsed / total_ring_ops as f64) * 1e9
+        );
+    }
+
+    // 2b. Lock-Free Batch Ring-to-Ring Recycling (Batch 32)
+    {
+        let batch_size = 32;
+        let iters = 10_000;
+        let (_pool, mut slabs) =
+            UmemPool::new_slabs(RING_CAPACITY as usize, CHUNK_SIZE, 1).expect("create slabs");
+        let mut slab = slabs.remove(0);
+        let mut fill = FillRing::new(RING_CAPACITY);
+        let mut comp = CompletionRing::new(RING_CAPACITY);
+
+        let addrs: Vec<u64> = (0..batch_size as u64).map(|i| i * 2048).collect();
+
+        let start = Instant::now();
+        for _ in 0..iters {
+            comp.produce_batch(&addrs);
+            slab.recycle_from_rings(&mut comp, &mut fill, batch_size);
+            let mut drain = [0u64; 32];
+            fill.consume_batch(&mut drain);
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let total_recycled = iters * batch_size;
+        let mops = (total_recycled as f64) / (elapsed * 1e6);
+        println!(
+            "  Ring-to-Ring Recycling (B32):   {:6.2} Mops/s ({:.2} ns/op)",
+            mops,
+            (elapsed / total_recycled as f64) * 1e9
         );
     }
 
@@ -294,11 +343,17 @@ fn run_af_xdp_scale(num_workers: usize, baseline_gbps: Option<f64>) -> RunResult
     let packets_per_thread = PACKETS_PER_WORKER;
     let barrier = Arc::new(Barrier::new(num_workers + 1));
 
+    // Allocate single shared UMEM pool partitioned into per-worker slabs
+    let (_shared_umem, mut slabs) =
+        UmemPool::new_slabs(CHUNKS_PER_POOL * num_workers, CHUNK_SIZE, num_workers)
+            .expect("create shared UMEM pool and per-worker slabs");
+
     // Per-worker thread handles
     let mut handles = Vec::with_capacity(num_workers);
 
     for (worker_id, assigned_streams) in streams_for_worker.into_iter().enumerate() {
         let bar = Arc::clone(&barrier);
+        let slab = slabs.remove(0);
 
         let handle = thread::spawn(move || {
             // Topology-aware core pinning
@@ -312,8 +367,8 @@ fn run_af_xdp_scale(num_workers: usize, baseline_gbps: Option<f64>) -> RunResult
             let mut rx_session = Session::from_raw_keys(&k_recv, &k_send, 0, 1)
                 .expect("rx session initialization must succeed");
 
-            // Per-worker unprivileged UMEM shared memory pool
-            let mut umem = UmemPool::new(CHUNKS_PER_POOL, CHUNK_SIZE).expect("create UMEM pool");
+            // Dedicated per-worker UMEM chunk slab partitioned from the shared UMEM pool
+            let mut slab = slab;
 
             // Per-worker AF_XDP ring buffers
             let mut fill_ring = FillRing::new(RING_CAPACITY);
@@ -321,14 +376,8 @@ fn run_af_xdp_scale(num_workers: usize, baseline_gbps: Option<f64>) -> RunResult
             let mut tx_ring = TxRing::new(RING_CAPACITY);
             let mut completion_ring = CompletionRing::new(RING_CAPACITY);
 
-            // Pre-populate fill ring with available UMEM chunks
-            while !fill_ring.is_full() {
-                if let Some(addr) = umem.alloc_chunk() {
-                    fill_ring.produce(addr);
-                } else {
-                    break;
-                }
-            }
+            // Pre-populate fill ring with available UMEM chunks in batch
+            slab.populate_fill_ring(&mut fill_ring, RING_CAPACITY as usize);
 
             let mut generated_nonces = Vec::with_capacity(packets_per_thread);
 
@@ -354,11 +403,11 @@ fn run_af_xdp_scale(num_workers: usize, baseline_gbps: Option<f64>) -> RunResult
                         // 1. Ingress: obtain chunk from fill ring (or allocate new if empty)
                         let rx_addr = match fill_ring.consume() {
                             Some(addr) => addr,
-                            None => umem.alloc_chunk().expect("UMEM chunk available"),
+                            None => slab.alloc_chunk().expect("UMEM chunk available"),
                         };
 
                         // 2. Format synthetic TCP packet directly inside UMEM chunk
-                        let rx_buf = umem.chunk_slice_mut(rx_addr, PACKET_SIZE + 16);
+                        let rx_buf = slab.chunk_slice_mut(rx_addr, PACKET_SIZE + 16);
                         write_tcp_packet(rx_buf, stream_id, p, PACKET_SIZE);
 
                         // 3. Enqueue to RX ring
@@ -370,7 +419,7 @@ fn run_af_xdp_scale(num_workers: usize, baseline_gbps: Option<f64>) -> RunResult
                         let rx_desc = rx_ring.consume().expect("RX descriptor available");
 
                         // 5. In-place AEAD seal directly inside UMEM chunk buffer using Session with stride nonces
-                        let chunk_buf = umem.chunk_slice_mut(rx_desc.addr, PACKET_SIZE + 16);
+                        let chunk_buf = slab.chunk_slice_mut(rx_desc.addr, PACKET_SIZE + 16);
                         let nonce = tx_session
                             .seal_in_place(chunk_buf, PACKET_SIZE)
                             .expect("in-place AEAD seal must succeed");
@@ -393,7 +442,7 @@ fn run_af_xdp_scale(num_workers: usize, baseline_gbps: Option<f64>) -> RunResult
                         let tx_desc = tx_ring.consume().expect("TX descriptor available");
 
                         // 8. Peer in-place zero-copy AEAD open & replay check inside UMEM buffer
-                        let tx_buf = umem.chunk_slice_mut(tx_desc.addr, tx_desc.len as usize);
+                        let tx_buf = slab.chunk_slice_mut(tx_desc.addr, tx_desc.len as usize);
                         let plain_len = rx_session
                             .open_in_place(nonce, tx_buf, tx_desc.len as usize)
                             .expect("in-place AEAD open must succeed");
@@ -419,13 +468,10 @@ fn run_af_xdp_scale(num_workers: usize, baseline_gbps: Option<f64>) -> RunResult
                         let comp_enqueued = completion_ring.produce(tx_desc.addr);
                         assert!(comp_enqueued, "Completion ring full");
 
-                        // 11. Recycle completed chunk back to fill ring
-                        let comp_addr = completion_ring
-                            .consume()
-                            .expect("completion descriptor available");
-                        if !fill_ring.produce(comp_addr) {
-                            umem.free_chunk(comp_addr);
-                        }
+                        // 11. Recycle completed chunk back to fill ring via slab
+                        let recycled =
+                            slab.recycle_from_rings(&mut completion_ring, &mut fill_ring, 1);
+                        assert_eq!(recycled, 1, "failed to recycle completed descriptor");
 
                         thread_packets += 1;
                         thread_bytes += PACKET_SIZE as u64;
