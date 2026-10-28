@@ -16,6 +16,7 @@ import argparse
 import csv
 import math
 from pathlib import Path
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
@@ -1031,6 +1032,18 @@ def main():
     for path, content in targets.items():
         path.write_text(content, encoding="utf-8")
         print(f"Generated {path}")
+
+        # Rasterize PNG
+        png_path = path.with_suffix(".png")
+        for cmd in ["magick", "convert"]:
+            try:
+                subprocess.run([cmd, "-density", "192", str(path), str(png_path)],
+                               check=True, capture_output=True)
+                if png_path.exists() and png_path.stat().st_size > 0:
+                    print(f"Rasterized: {png_path} ({png_path.stat().st_size / 1024:.1f} KB)")
+                    break
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                continue
 
 
 if __name__ == "__main__":

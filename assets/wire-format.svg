@@ -24,37 +24,37 @@
   <text x="81.00" y="98.00" fill="#fb923c" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">PANEL A</text>
   <text x="132.00" y="98.00" fill="#f0f6fc" font-size="13.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="start">Data-Plane Datagram Framing</text>
   <text x="40.00" y="118.00" fill="#8b949e" font-size="10.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">Anti-DPI Keyed Header Protection (XOR Keystream &amp; SipHash MAC)</text>
-  <rect x="40.00" y="130.00" width="110.00" height="46.00" fill="#271406" rx="4.00" stroke="#f97316" stroke-width="1.00" />
-  <text x="95.00" y="144.00" fill="#fb923c" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Bytes 0..4 (4B)</text>
-  <text x="95.00" y="158.00" fill="#f0f6fc" font-size="10.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="middle">Encrypted Header</text>
-  <text x="95.00" y="170.00" fill="#8b949e" font-size="8.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">SipHash-CTR Mask</text>
-  <rect x="154.00" y="130.00" width="114.00" height="46.00" fill="#1c1917" rx="4.00" stroke="#f97316" stroke-width="1.00" />
-  <text x="211.00" y="144.00" fill="#fb923c" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Bytes 4..12 (8B)</text>
-  <text x="211.00" y="158.00" fill="#f0f6fc" font-size="10.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="middle">SipHash-1-3 MAC</text>
-  <text x="211.00" y="170.00" fill="#8b949e" font-size="8.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Header Auth Tag</text>
-  <rect x="272.00" y="130.00" width="222.00" height="46.00" fill="#083344" rx="4.00" stroke="#06b6d4" stroke-width="1.00" />
-  <text x="383.00" y="144.00" fill="#22d3ee" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Bytes 12..N (Variable MTU)</text>
-  <text x="383.00" y="158.00" fill="#f0f6fc" font-size="10.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="middle">ChaCha20-Poly1305 Ciphertext</text>
-  <text x="383.00" y="170.00" fill="#8b949e" font-size="8.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">RS-FEC Symbol / TUN Packet + 16B Poly1305 Tag</text>
-  <text x="40.00" y="195.00" fill="#8b949e" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="start">Unmasked Header Bitfield (32 bits / 4 Bytes):</text>
-  <rect x="40.00" y="204.00" width="64.00" height="36.00" fill="#1e1b4b" rx="3.00" stroke="#818cf8" stroke-width="1.00" />
-  <text x="72.00" y="218.00" fill="#818cf8" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Type (2b)</text>
-  <text x="72.00" y="232.00" fill="#8b949e" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">00=Init 10=Data</text>
-  <rect x="106.00" y="204.00" width="76.00" height="36.00" fill="#3b0764" rx="3.00" stroke="#c084fc" stroke-width="1.00" />
-  <text x="144.00" y="218.00" fill="#c084fc" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Epoch (6b)</text>
-  <text x="144.00" y="232.00" fill="#8b949e" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Key Id (0..63)</text>
-  <rect x="184.00" y="204.00" width="186.00" height="36.00" fill="#083344" rx="3.00" stroke="#22d3ee" stroke-width="1.00" />
-  <text x="277.00" y="218.00" fill="#22d3ee" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Payload Length (16b)</text>
-  <text x="277.00" y="232.00" fill="#8b949e" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Encrypted Symbol / TUN Packet Len</text>
-  <rect x="372.00" y="204.00" width="122.00" height="36.00" fill="#161b22" rx="3.00" stroke="#6e7681" stroke-width="1.00" />
-  <text x="433.00" y="218.00" fill="#8b949e" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Reserved (8b)</text>
-  <text x="433.00" y="232.00" fill="#6e7681" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Flags / Zero Padding</text>
-  <text x="40.00" y="251.00" fill="#fb923c" font-size="8.8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="start">⊕ XOR keystream mask: zero magic bytes or fixed wire discriminators.</text>
+  <rect x="40.00" y="130.00" width="140.00" height="46.00" fill="#271406" rx="4.00" stroke="#f97316" stroke-width="1.00" />
+  <text x="110.00" y="144.00" fill="#fb923c" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Bytes 0..15 (15B)</text>
+  <text x="110.00" y="158.00" fill="#f0f6fc" font-size="10.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="middle">Masked Wire Header</text>
+  <text x="110.00" y="170.00" fill="#8b949e" font-size="8.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">SipHash-1-3 CTR Mask</text>
+  <rect x="184.00" y="130.00" width="206.00" height="46.00" fill="#083344" rx="4.00" stroke="#06b6d4" stroke-width="1.00" />
+  <text x="287.00" y="144.00" fill="#22d3ee" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Bytes 15..(N-8) (Variable MTU)</text>
+  <text x="287.00" y="158.00" fill="#f0f6fc" font-size="10.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="middle">Encrypted Symbol Payload</text>
+  <text x="287.00" y="170.00" fill="#8b949e" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Counter(8B) ‖ Size(4B) ‖ Ciphertext + Poly1305</text>
+  <rect x="394.00" y="130.00" width="100.00" height="46.00" fill="#1c1917" rx="4.00" stroke="#f97316" stroke-width="1.00" />
+  <text x="444.00" y="144.00" fill="#fb923c" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Bytes (N-8)..N (8B)</text>
+  <text x="444.00" y="158.00" fill="#f0f6fc" font-size="10.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="middle">Trailing Auth Tag</text>
+  <text x="444.00" y="170.00" fill="#8b949e" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">SipHash-1-3 Coverage MAC</text>
+  <text x="40.00" y="195.00" fill="#8b949e" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="start">Unmasked Logical Header Layout (15 Bytes / 120 bits):</text>
+  <rect x="40.00" y="204.00" width="176.00" height="36.00" fill="#1e1b4b" rx="3.00" stroke="#818cf8" stroke-width="1.00" />
+  <text x="128.00" y="218.00" fill="#818cf8" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">conn_tag (8B / 64b)</text>
+  <text x="128.00" y="232.00" fill="#8b949e" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Rotating Session Token</text>
+  <rect x="220.00" y="204.00" width="86.00" height="36.00" fill="#3b0764" rx="3.00" stroke="#c084fc" stroke-width="1.00" />
+  <text x="263.00" y="218.00" fill="#c084fc" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">object_id (2B / 16b)</text>
+  <text x="263.00" y="232.00" fill="#8b949e" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">FEC Object ID</text>
+  <rect x="310.00" y="204.00" width="114.00" height="36.00" fill="#083344" rx="3.00" stroke="#22d3ee" stroke-width="1.00" />
+  <text x="367.00" y="218.00" fill="#22d3ee" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">payload_id (4B / 32b)</text>
+  <text x="367.00" y="232.00" fill="#8b949e" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">RS Tag + Symbol Idx</text>
+  <rect x="428.00" y="204.00" width="66.00" height="36.00" fill="#161b22" rx="3.00" stroke="#6e7681" stroke-width="1.00" />
+  <text x="461.00" y="218.00" fill="#8b949e" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">flags (1B / 8b)</text>
+  <text x="461.00" y="232.00" fill="#6e7681" font-size="8.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Flow Class</text>
+  <text x="40.00" y="251.00" fill="#fb923c" font-size="8.8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="start">⊕ Zero heap-alloc SipHash-1-3 CTR mask; datagrams appear random to DPI.</text>
   <rect x="40.00" y="265.00" width="454.00" height="72.00" fill="#1c1917" rx="6.00" stroke="#f97316" stroke-width="1.00" />
   <path d="M 54.00,283.00 L 60.00,280.00 L 66.00,283.00 L 66.00,290.00 C 66.00,297.00 60.00,301.00 60.00,301.00 C 60.00,301.00 54.00,297.00 54.00,290.00 Z" fill="#fb923c" />
-  <text x="74.00" y="285.00" fill="#f0f6fc" font-size="10.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="start">Anti-DPI Guarantee: Pure High-Entropy Random Bytes</text>
-  <text x="74.00" y="300.00" fill="#8b949e" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">Keyed Header Protection eliminates static signatures; datagrams appear</text>
-  <text x="74.00" y="313.00" fill="#8b949e" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">as uniform random bytes to DPI engines (nDPI, Zeek, Suricata, Wireshark).</text>
+  <text x="74.00" y="285.00" fill="#f0f6fc" font-size="10.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="start">Anti-DPI Guarantee: Zero Static Signatures</text>
+  <text x="74.00" y="300.00" fill="#8b949e" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">15B header protected by SipHash-1-3 CTR keystream seeded by 8B trailing auth tag.</text>
+  <text x="74.00" y="313.00" fill="#8b949e" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">Eliminates magic bytes, packet types, and static discriminators across the entire wire.</text>
   <text x="74.00" y="327.00" fill="#6e7681" font-size="8.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">Constant-time SipHash MAC tag check rejects forged headers in &lt;12ns prior to decode.</text>
   <rect x="40.00" y="344.00" width="454.00" height="24.00" fill="#0d1117" rx="4.00" stroke="#30363d" stroke-width="1.00" />
   <text x="267.00" y="360.00" fill="#34d399" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">DPI Resistance: Pass (0 signatures detected across 4-Engine Oracle)</text>

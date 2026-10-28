@@ -16,7 +16,10 @@ Visualizes yip's dual-path pipeline:
 Standard library only. Strict determinism (fixed formatting, no timestamps).
 """
 
+import argparse
 from pathlib import Path
+import subprocess
+import sys
 import xml.etree.ElementTree as ET
 
 FONT_SANS = "ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
@@ -126,7 +129,8 @@ def build_architecture_svg() -> str:
     badges = [
         ("40+ Gbps eBPF", COLOR_FAST_BG, COLOR_FAST_LIGHT, COLOR_FAST),
         ("GF(256) RS-FEC", COLOR_FEC_BG, COLOR_FEC_LIGHT, COLOR_FEC),
-        ("Noise-IKpsk2 + ML-KEM-512", COLOR_CONTROL_BG, COLOR_CONTROL_LIGHT, COLOR_CONTROL),
+        ("t-of-n Threshold CA", COLOR_CONTROL_BG, COLOR_CONTROL_LIGHT, COLOR_CONTROL),
+        ("ML-KEM-512 PQ", COLOR_CONTROL_BG, COLOR_CONTROL_LIGHT, COLOR_CONTROL),
     ]
     bx = w - 24
     for btext, bbg, bfg, bborder in reversed(badges):
@@ -166,13 +170,13 @@ def build_architecture_svg() -> str:
     lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 49:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• Noise-IKpsk2 Token Sequencing</text>')
     lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 65:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_CONTROL_LIGHT}">• Ephemeral Rekeying (120s Ratchet)</text>')
 
-    # Module 2: CA-Gated Mesh Discovery (yip-ca)
+    # Module 2: Decentralized Threshold CA (yip-ca)
     m2_x = m1_x + card_w + gap
     lines.append(f'    <rect x="{m2_x:.2f}" y="{card_y:.2f}" width="{card_w:.2f}" height="{card_h:.2f}" rx="6.00" fill="{COLOR_SUB_CARD_BG}" stroke="{COLOR_CANVAS_BORDER}" stroke-width="1.00" />')
-    lines.append(f'    <text x="{m2_x + 12:.2f}" y="{card_y + 17:.2f}" font-family="{FONT_SANS}" font-size="12" font-weight="700" fill="{COLOR_TEXT_WHITE}">CA-Gated Mesh Discovery <tspan fill="{COLOR_CONTROL_LIGHT}" font-family="{FONT_MONO}" font-size="11">(yip-ca)</tspan></text>')
-    lines.append(f'    <text x="{m2_x + 12:.2f}" y="{card_y + 33:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• mTLS Node Identity &amp; Role Claims</text>')
-    lines.append(f'    <text x="{m2_x + 12:.2f}" y="{card_y + 49:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• Gossip Membership &amp; Dynamic Topology</text>')
-    lines.append(f'    <text x="{m2_x + 12:.2f}" y="{card_y + 65:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_CONTROL_LIGHT}">• Cryptographic Access Control List (ACL)</text>')
+    lines.append(f'    <text x="{m2_x + 12:.2f}" y="{card_y + 17:.2f}" font-family="{FONT_SANS}" font-size="12" font-weight="700" fill="{COLOR_TEXT_WHITE}">Threshold CA Quorum <tspan fill="{COLOR_CONTROL_LIGHT}" font-family="{FONT_MONO}" font-size="11">(yip-ca)</tspan></text>')
+    lines.append(f'    <text x="{m2_x + 12:.2f}" y="{card_y + 33:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• t-of-n FROST (RFC 9591) + ROAST</text>')
+    lines.append(f'    <text x="{m2_x + 12:.2f}" y="{card_y + 49:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• Byzantine Fault Tolerant Signers</text>')
+    lines.append(f'    <text x="{m2_x + 12:.2f}" y="{card_y + 65:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_CONTROL_LIGHT}">• Proactive Refresh &amp; 70% TTL Renewal</text>')
 
     # Module 3: NAT Hole-Punching & Relay (yip-rendezvous)
     m3_x = m2_x + card_w + gap
@@ -405,19 +409,72 @@ def build_architecture_svg() -> str:
     return "\n".join(lines) + "\n"
 
 
-def main():
-    repo_root = Path(__file__).resolve().parent.parent.parent
-    assets_dir = repo_root / "assets"
-    assets_dir.mkdir(parents=True, exist_ok=True)
+def rasterize_svg_to_png(svg_path: Path, png_path: Path, density: int = 192) -> bool:
+    for cmd in ["magick", "convert"]:
+        try:
+            subprocess.run([cmd, "-density", str(density), str(svg_path), str(png_path)],
+                           check=True, capture_output=True)
+            if png_path.exists() and png_path.stat().st_size > 0:
+                print(f"Rasterized: {png_path} ({png_path.stat().st_size / 1024:.1f} KB)")
+                return True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            continue
+    return False
 
-    svg_path = assets_dir / "architecture.svg"
+
+def main():
+    parser = argparse.ArgumentParser(description="Deterministic SVG system architecture diagram generator.")
+    parser.add_argument("--output", type=Path, default=None,
+                        help="Path to output SVG file (defaults to assets/architecture.svg).")
+    parser.add_argument("--check", action="store_true",
+                        help="Check if SVG asset is up-to-date and valid XML without writing to disk.")
+    parser.add_argument("--repo-root", type=Path, default=None,
+                        help="Path to repository root (defaults to auto-detection).")
+    args = parser.parse_args()
+
+    if args.repo_root:
+        repo_root = args.repo_root.resolve()
+    else:
+        repo_root = Path(__file__).resolve().parent.parent.parent
+
+    target_path = args.output.resolve() if args.output else (repo_root / "assets" / "architecture.svg")
+
     svg_content = build_architecture_svg()
 
-    # Validate XML before writing
-    ET.fromstring(svg_content)
+    # Validate XML
+    try:
+        ET.fromstring(svg_content)
+    except ET.ParseError as e:
+        print(f"Error: Generated SVG is not valid XML: {e}", file=sys.stderr)
+        sys.exit(1)
 
-    svg_path.write_text(svg_content, encoding="utf-8")
-    print(f"Generated: {svg_path} ({len(svg_content)} bytes)")
+    if args.check:
+        if not target_path.exists():
+            print(f"Check failed: {target_path} does not exist on disk", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            disk_content = target_path.read_text(encoding="utf-8")
+            ET.fromstring(disk_content)
+        except Exception as e:
+            print(f"Check failed: {target_path} is not valid XML on disk: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        if disk_content != svg_content:
+            print(f"Check failed: {target_path} differs from generated output (drift detected)", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"OK: {target_path.name} is up-to-date and valid XML.")
+        sys.exit(0)
+
+    # Generation mode
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(svg_content, encoding="utf-8")
+    print(f"Generated: {target_path} ({len(svg_content)} bytes)")
+
+    # Rasterize PNG
+    png_path = target_path.with_suffix(".png")
+    rasterize_svg_to_png(target_path, png_path)
 
 
 if __name__ == "__main__":

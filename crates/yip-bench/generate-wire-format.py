@@ -17,6 +17,7 @@ Standard library only. Strict determinism (fixed formatting, fixed float precisi
 
 import argparse
 from pathlib import Path
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
@@ -258,55 +259,55 @@ def generate_wire_format_svg() -> str:
 
     # Byte-by-byte visual breakdown strip
     # Usable width: 454px (from 40 to 494)
-    # Block 1: Bytes 0..4 (w = 110)
-    # Block 2: Bytes 4..12 (w = 114)
-    # Block 3: Bytes 12..N (w = 222)
-    # Spacing: 40, 154, 272
-    canvas.rect(40.0, 130.0, 110.0, 46.0, rx=4.0, fill="#271406", stroke=COLOR_OBF, stroke_width=1.0)
-    canvas.text(95.0, 144.0, "Bytes 0..4 (4B)", fill=COLOR_OBF_LIGHT, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
-    canvas.text(95.0, 158.0, "Encrypted Header", fill=COLOR_TEXT_MAIN, font_size=10.5, font_weight="700", text_anchor="middle")
-    canvas.text(95.0, 170.0, "SipHash-CTR Mask", fill=COLOR_TEXT_MUTED, font_size=8.5, text_anchor="middle")
+    # Block 1: Bytes 0..15 (w = 140)
+    # Block 2: Bytes 15..(N-8) (w = 206)
+    # Block 3: Bytes (N-8)..N (w = 100)
+    # Spacing: 40, 184, 394
+    canvas.rect(40.0, 130.0, 140.0, 46.0, rx=4.0, fill="#271406", stroke=COLOR_OBF, stroke_width=1.0)
+    canvas.text(110.0, 144.0, "Bytes 0..15 (15B)", fill=COLOR_OBF_LIGHT, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
+    canvas.text(110.0, 158.0, "Masked Wire Header", fill=COLOR_TEXT_MAIN, font_size=10.5, font_weight="700", text_anchor="middle")
+    canvas.text(110.0, 170.0, "SipHash-1-3 CTR Mask", fill=COLOR_TEXT_MUTED, font_size=8.5, text_anchor="middle")
 
-    canvas.rect(154.0, 130.0, 114.0, 46.0, rx=4.0, fill="#1c1917", stroke=COLOR_OBF, stroke_width=1.0)
-    canvas.text(211.0, 144.0, "Bytes 4..12 (8B)", fill=COLOR_OBF_LIGHT, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
-    canvas.text(211.0, 158.0, "SipHash-1-3 MAC", fill=COLOR_TEXT_MAIN, font_size=10.5, font_weight="700", text_anchor="middle")
-    canvas.text(211.0, 170.0, "Header Auth Tag", fill=COLOR_TEXT_MUTED, font_size=8.5, text_anchor="middle")
+    canvas.rect(184.0, 130.0, 206.0, 46.0, rx=4.0, fill=COLOR_DATA_BG, stroke=COLOR_DATA, stroke_width=1.0)
+    canvas.text(287.0, 144.0, "Bytes 15..(N-8) (Variable MTU)", fill=COLOR_DATA_LIGHT, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
+    canvas.text(287.0, 158.0, "Encrypted Symbol Payload", fill=COLOR_TEXT_MAIN, font_size=10.5, font_weight="700", text_anchor="middle")
+    canvas.text(287.0, 170.0, "Counter(8B) ‖ Size(4B) ‖ Ciphertext + Poly1305", fill=COLOR_TEXT_MUTED, font_size=8.0, text_anchor="middle")
 
-    canvas.rect(272.0, 130.0, 222.0, 46.0, rx=4.0, fill=COLOR_DATA_BG, stroke=COLOR_DATA, stroke_width=1.0)
-    canvas.text(383.0, 144.0, "Bytes 12..N (Variable MTU)", fill=COLOR_DATA_LIGHT, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
-    canvas.text(383.0, 158.0, "ChaCha20-Poly1305 Ciphertext", fill=COLOR_TEXT_MAIN, font_size=10.5, font_weight="700", text_anchor="middle")
-    canvas.text(383.0, 170.0, "RS-FEC Symbol / TUN Packet + 16B Poly1305 Tag", fill=COLOR_TEXT_MUTED, font_size=8.5, text_anchor="middle")
+    canvas.rect(394.0, 130.0, 100.0, 46.0, rx=4.0, fill="#1c1917", stroke=COLOR_OBF, stroke_width=1.0)
+    canvas.text(444.0, 144.0, "Bytes (N-8)..N (8B)", fill=COLOR_OBF_LIGHT, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
+    canvas.text(444.0, 158.0, "Trailing Auth Tag", fill=COLOR_TEXT_MAIN, font_size=10.5, font_weight="700", text_anchor="middle")
+    canvas.text(444.0, 170.0, "SipHash-1-3 Coverage MAC", fill=COLOR_TEXT_MUTED, font_size=8.0, text_anchor="middle")
 
     # Bitfield breakdown sub-card
-    canvas.text(40.0, 195.0, "Unmasked Header Bitfield (32 bits / 4 Bytes):", fill=COLOR_TEXT_MUTED, font_size=9.5, font_family=FONT_MONO)
+    canvas.text(40.0, 195.0, "Unmasked Logical Header Layout (15 Bytes / 120 bits):", fill=COLOR_TEXT_MUTED, font_size=9.5, font_family=FONT_MONO)
     bf_y = 204.0
-    # Bitfields: Type(2b): 64px, Epoch(6b): 76px, Payload Len(16b): 186px, Reserved(8b): 122px (sum = 448 + 6 gaps = 454)
-    canvas.rect(40.0, bf_y, 64.0, 36.0, rx=3.0, fill=COLOR_NOISE_BG, stroke=COLOR_NOISE_LIGHT, stroke_width=1.0)
-    canvas.text(72.0, bf_y + 14.0, "Type (2b)", fill=COLOR_NOISE_LIGHT, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
-    canvas.text(72.0, bf_y + 28.0, "00=Init 10=Data", fill=COLOR_TEXT_MUTED, font_size=8.0, text_anchor="middle")
+    # Fields: conn_tag (u64 / 8B): 176px, object_id (u16 / 2B): 86px, payload_id ([u8; 4] / 4B): 114px, flags (u8 / 1B): 66px
+    canvas.rect(40.0, bf_y, 176.0, 36.0, rx=3.0, fill=COLOR_NOISE_BG, stroke=COLOR_NOISE_LIGHT, stroke_width=1.0)
+    canvas.text(128.0, bf_y + 14.0, "conn_tag (8B / 64b)", fill=COLOR_NOISE_LIGHT, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
+    canvas.text(128.0, bf_y + 28.0, "Rotating Session Token", fill=COLOR_TEXT_MUTED, font_size=8.0, text_anchor="middle")
 
-    canvas.rect(106.0, bf_y, 76.0, 36.0, rx=3.0, fill=COLOR_EPOCH_BG, stroke=COLOR_EPOCH_LIGHT, stroke_width=1.0)
-    canvas.text(144.0, bf_y + 14.0, "Epoch (6b)", fill=COLOR_EPOCH_LIGHT, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
-    canvas.text(144.0, bf_y + 28.0, "Key Id (0..63)", fill=COLOR_TEXT_MUTED, font_size=8.0, text_anchor="middle")
+    canvas.rect(220.0, bf_y, 86.0, 36.0, rx=3.0, fill=COLOR_EPOCH_BG, stroke=COLOR_EPOCH_LIGHT, stroke_width=1.0)
+    canvas.text(263.0, bf_y + 14.0, "object_id (2B / 16b)", fill=COLOR_EPOCH_LIGHT, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
+    canvas.text(263.0, bf_y + 28.0, "FEC Object ID", fill=COLOR_TEXT_MUTED, font_size=8.0, text_anchor="middle")
 
-    canvas.rect(184.0, bf_y, 186.0, 36.0, rx=3.0, fill=COLOR_DATA_BG, stroke=COLOR_DATA_LIGHT, stroke_width=1.0)
-    canvas.text(277.0, bf_y + 14.0, "Payload Length (16b)", fill=COLOR_DATA_LIGHT, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
-    canvas.text(277.0, bf_y + 28.0, "Encrypted Symbol / TUN Packet Len", fill=COLOR_TEXT_MUTED, font_size=8.0, text_anchor="middle")
+    canvas.rect(310.0, bf_y, 114.0, 36.0, rx=3.0, fill=COLOR_DATA_BG, stroke=COLOR_DATA_LIGHT, stroke_width=1.0)
+    canvas.text(367.0, bf_y + 14.0, "payload_id (4B / 32b)", fill=COLOR_DATA_LIGHT, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
+    canvas.text(367.0, bf_y + 28.0, "RS Tag + Symbol Idx", fill=COLOR_TEXT_MUTED, font_size=8.0, text_anchor="middle")
 
-    canvas.rect(372.0, bf_y, 122.0, 36.0, rx=3.0, fill=COLOR_CARD_BG, stroke=COLOR_TEXT_DIM, stroke_width=1.0)
-    canvas.text(433.0, bf_y + 14.0, "Reserved (8b)", fill=COLOR_TEXT_MUTED, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
-    canvas.text(433.0, bf_y + 28.0, "Flags / Zero Padding", fill=COLOR_TEXT_DIM, font_size=8.0, text_anchor="middle")
+    canvas.rect(428.0, bf_y, 66.0, 36.0, rx=3.0, fill=COLOR_CARD_BG, stroke=COLOR_TEXT_DIM, stroke_width=1.0)
+    canvas.text(461.0, bf_y + 14.0, "flags (1B / 8b)", fill=COLOR_TEXT_MUTED, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
+    canvas.text(461.0, bf_y + 28.0, "Flow Class", fill=COLOR_TEXT_DIM, font_size=8.0, text_anchor="middle")
 
-    canvas.text(40.0, 251.0, "⊕ XOR keystream mask: zero magic bytes or fixed wire discriminators.", fill=COLOR_OBF_LIGHT, font_size=8.8, font_family=FONT_MONO)
+    canvas.text(40.0, 251.0, "⊕ Zero heap-alloc SipHash-1-3 CTR mask; datagrams appear random to DPI.", fill=COLOR_OBF_LIGHT, font_size=8.8, font_family=FONT_MONO)
 
     # Explanatory callout box
     cb_y = 265.0
     canvas.rect(40.0, cb_y, 454.0, 72.0, rx=6.0, fill="#1c1917", stroke=COLOR_OBF, stroke_width=1.0)
     # Shield icon path
     canvas.path(f"M 54.00,{cb_y + 18.0:.2f} L 60.00,{cb_y + 15.0:.2f} L 66.00,{cb_y + 18.0:.2f} L 66.00,{cb_y + 25.0:.2f} C 66.00,{cb_y + 32.0:.2f} 60.00,{cb_y + 36.0:.2f} 60.00,{cb_y + 36.0:.2f} C 60.00,{cb_y + 36.0:.2f} 54.00,{cb_y + 32.0:.2f} 54.00,{cb_y + 25.0:.2f} Z", fill=COLOR_OBF_LIGHT)
-    canvas.text(74.0, cb_y + 20.0, "Anti-DPI Guarantee: Pure High-Entropy Random Bytes", fill=COLOR_TEXT_MAIN, font_size=10.5, font_weight="700")
-    canvas.text(74.0, cb_y + 35.0, "Keyed Header Protection eliminates static signatures; datagrams appear", fill=COLOR_TEXT_MUTED, font_size=9.0)
-    canvas.text(74.0, cb_y + 48.0, "as uniform random bytes to DPI engines (nDPI, Zeek, Suricata, Wireshark).", fill=COLOR_TEXT_MUTED, font_size=9.0)
+    canvas.text(74.0, cb_y + 20.0, "Anti-DPI Guarantee: Zero Static Signatures", fill=COLOR_TEXT_MAIN, font_size=10.5, font_weight="700")
+    canvas.text(74.0, cb_y + 35.0, "15B header protected by SipHash-1-3 CTR keystream seeded by 8B trailing auth tag.", fill=COLOR_TEXT_MUTED, font_size=9.0)
+    canvas.text(74.0, cb_y + 48.0, "Eliminates magic bytes, packet types, and static discriminators across the entire wire.", fill=COLOR_TEXT_MUTED, font_size=9.0)
     canvas.text(74.0, cb_y + 62.0, "Constant-time SipHash MAC tag check rejects forged headers in <12ns prior to decode.", fill=COLOR_TEXT_DIM, font_size=8.5)
 
     # Outcome banner
@@ -573,6 +574,18 @@ def main():
     target_path.parent.mkdir(parents=True, exist_ok=True)
     target_path.write_text(svg_content, encoding="utf-8")
     print(f"Generated {target_path} ({len(svg_content)} bytes)")
+
+    # Rasterize PNG
+    png_path = target_path.with_suffix(".png")
+    for cmd in ["magick", "convert"]:
+        try:
+            subprocess.run([cmd, "-density", "192", str(target_path), str(png_path)],
+                           check=True, capture_output=True)
+            if png_path.exists() and png_path.stat().st_size > 0:
+                print(f"Rasterized: {png_path} ({png_path.stat().st_size / 1024:.1f} KB)")
+                break
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            continue
 
 
 if __name__ == "__main__":
