@@ -321,9 +321,24 @@ impl DataPlane {
         self.transport.bulk_repair_ratio()
     }
 
+    /// Dynamically override the FEC repair ratio across transport controllers.
+    pub fn set_fec_repair_ratio(&mut self, ratio: f32) {
+        self.transport.set_fec_repair_ratio(ratio);
+    }
+
+    /// Total count of FEC symbols produced and transmitted.
+    pub fn total_symbols_tx(&self) -> u64 {
+        self.transport.total_symbols_tx()
+    }
+
     /// Total count of FEC objects reconstructed via repair shards.
     pub fn fec_recovered_count(&self) -> u64 {
         self.transport.fec_recovered_count()
+    }
+
+    /// Total count of FEC objects dropped due to expiration or capacity eviction.
+    pub fn fec_unrecoverable_count(&self) -> u64 {
+        self.transport.fec_unrecoverable_count()
     }
 
     /// Reconfigure shard start object id and stride increment for multi-core scaling.

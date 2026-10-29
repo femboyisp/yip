@@ -40,6 +40,16 @@ impl AdaptiveController {
         self.ratio
     }
 
+    /// Dynamically override the current repair ratio.
+    pub fn set_ratio(&mut self, ratio: f32) {
+        self.ratio = ratio.clamp(0.0, 1.0);
+    }
+
+    /// Dynamically set the minimum ratio floor.
+    pub fn set_min_ratio(&mut self, min_ratio: f32) {
+        self.min_ratio = min_ratio.clamp(0.0, 1.0);
+    }
+
     /// Update from an observed loss fraction (0.0..=1.0). When loss exceeds
     /// what the current redundancy can mask, the ratio is immediately set to
     /// `loss + 0.05` (jump to just above the observed loss rate with a small

@@ -41,10 +41,116 @@ pub enum ControlCmd {
     CertStatus,
     #[serde(rename = "cert_renew")]
     CertRenew,
+    #[serde(rename = "get_fec_status")]
+    GetFecStatus,
+    #[serde(rename = "set_fec_config")]
+    SetFecConfig {
+        #[serde(default)]
+        preset: Option<String>,
+        #[serde(default)]
+        redundancy_pct: Option<u8>,
+        #[serde(default)]
+        data_shards: Option<usize>,
+        #[serde(default)]
+        parity_shards: Option<usize>,
+    },
+}
+
+/// Supported Reed-Solomon dynamic FEC presets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FecPreset {
+    Off,
+    Low,
+    #[default]
+    Adaptive,
+    Hostile,
+    Custom,
+}
+
+impl std::str::FromStr for FecPreset {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "off" => Ok(FecPreset::Off),
+            "low" => Ok(FecPreset::Low),
+            "adaptive" => Ok(FecPreset::Adaptive),
+            "hostile" => Ok(FecPreset::Hostile),
+            "custom" => Ok(FecPreset::Custom),
+            other => Err(format!(
+                "unknown FEC preset: {other} (valid: off, low, adaptive, hostile, custom)"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for FecPreset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FecPreset::Off => write!(f, "off"),
+            FecPreset::Low => write!(f, "low"),
+            FecPreset::Adaptive => write!(f, "adaptive"),
+            FecPreset::Hostile => write!(f, "hostile"),
+            FecPreset::Custom => write!(f, "custom"),
+        }
+    }
+}
+
+impl FecPreset {
+    pub fn default_config(&self) -> FecConfig {
+        match self {
+            FecPreset::Off => FecConfig {
+                preset: *self,
+                redundancy_pct: 0,
+                data_shards: 10,
+                parity_shards: 0,
+            },
+            FecPreset::Low => FecConfig {
+                preset: *self,
+                redundancy_pct: 5,
+                data_shards: 10,
+                parity_shards: 1,
+            },
+            FecPreset::Adaptive => FecConfig {
+                preset: *self,
+                redundancy_pct: 12,
+                data_shards: 10,
+                parity_shards: 2,
+            },
+            FecPreset::Hostile => FecConfig {
+                preset: *self,
+                redundancy_pct: 30,
+                data_shards: 10,
+                parity_shards: 4,
+            },
+            FecPreset::Custom => FecConfig {
+                preset: *self,
+                redundancy_pct: 15,
+                data_shards: 10,
+                parity_shards: 2,
+            },
+        }
+    }
+}
+
+/// Dynamic Reed-Solomon FEC runtime configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FecConfig {
+    pub preset: FecPreset,
+    pub redundancy_pct: u8,
+    pub data_shards: usize,
+    pub parity_shards: usize,
+}
+
+impl Default for FecConfig {
+    fn default() -> Self {
+        FecPreset::Adaptive.default_config()
+    }
 }
 
 /// Outbound control command responses returned to clients.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum ControlResponse {
     Status {
@@ -74,6 +180,17 @@ pub enum ControlResponse {
         renewed: bool,
         message: String,
         new_not_after: Option<u64>,
+    },
+    FecStatus {
+        ok: bool,
+        preset: String,
+        redundancy_pct: u8,
+        data_shards: usize,
+        parity_shards: usize,
+        total_symbols_tx: u64,
+        recovered_symbols_rx: u64,
+        unrecoverable_burst_drops: u64,
+        loss_recovery_rate_pct: f32,
     },
     Ack {
         ok: bool,
@@ -391,6 +508,86 @@ pub fn dispatch_cmd(
                 error: format!("certificate renewal failed: {e}"),
             },
         },
+        ControlCmd::GetFecStatus => {
+            let (
+                total_symbols_tx,
+                recovered_symbols_rx,
+                unrecoverable_burst_drops,
+                loss_recovery_rate_pct,
+            ) = pm.fec_status();
+            let cfg = pm.fec_config();
+            ControlResponse::FecStatus {
+                ok: true,
+                preset: cfg.preset.to_string(),
+                redundancy_pct: cfg.redundancy_pct,
+                data_shards: cfg.data_shards,
+                parity_shards: cfg.parity_shards,
+                total_symbols_tx,
+                recovered_symbols_rx,
+                unrecoverable_burst_drops,
+                loss_recovery_rate_pct,
+            }
+        }
+        ControlCmd::SetFecConfig {
+            preset,
+            redundancy_pct,
+            data_shards,
+            parity_shards,
+        } => {
+            let mut current = pm.fec_config();
+            if let Some(p_str) = preset {
+                match p_str.parse::<FecPreset>() {
+                    Ok(p) => {
+                        current = p.default_config();
+                    }
+                    Err(e) => {
+                        return ControlResponse::Err {
+                            ok: false,
+                            error: e,
+                        };
+                    }
+                }
+            }
+            if let Some(pct) = redundancy_pct {
+                if pct > 100 {
+                    return ControlResponse::Err {
+                        ok: false,
+                        error: "redundancy percentage must be between 0 and 100".into(),
+                    };
+                }
+                current.redundancy_pct = pct;
+                if current.preset != FecPreset::Custom && current.preset != FecPreset::Adaptive {
+                    current.preset = FecPreset::Custom;
+                }
+            }
+            if let Some(k) = data_shards {
+                if k == 0 {
+                    return ControlResponse::Err {
+                        ok: false,
+                        error: "data shards (k) must be at least 1".into(),
+                    };
+                }
+                current.data_shards = k;
+                current.preset = FecPreset::Custom;
+            }
+            if let Some(m) = parity_shards {
+                current.parity_shards = m;
+                current.preset = FecPreset::Custom;
+            }
+
+            pm.set_fec_config(current);
+
+            ControlResponse::Ack {
+                ok: true,
+                message: format!(
+                    "FEC configuration updated: preset={}, redundancy={}%, k={}, m={}",
+                    current.preset,
+                    current.redundancy_pct,
+                    current.data_shards,
+                    current.parity_shards
+                ),
+            }
+        }
     }
 }
 
@@ -722,6 +919,80 @@ pub fn run_cli_peer_add(
         transport: transport.map(|s| s.into()),
     };
     match client_query(socket_path, cmd)? {
+        ControlResponse::Ack { message, .. } => {
+            println!("\x1b[1;32m✓\x1b[0m {message}");
+            Ok(())
+        }
+        ControlResponse::Err { error, .. } => Err(error),
+        _ => Err("unexpected response format from daemon".into()),
+    }
+}
+
+/// Query and display Reed-Solomon dynamic FEC status.
+pub fn run_cli_fec_status(socket_path: &Path, json: bool) -> Result<(), String> {
+    let resp = client_query(socket_path, ControlCmd::GetFecStatus)?;
+    if json {
+        let text = serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?;
+        println!("{text}");
+        return Ok(());
+    }
+    match resp {
+        ControlResponse::FecStatus {
+            ok,
+            preset,
+            redundancy_pct,
+            data_shards,
+            parity_shards,
+            total_symbols_tx,
+            recovered_symbols_rx,
+            unrecoverable_burst_drops,
+            loss_recovery_rate_pct,
+        } => {
+            if !ok {
+                return Err("daemon reported FEC status error".into());
+            }
+            println!("\x1b[1;38;5;208m●\x1b[0m \x1b[1mReed-Solomon FEC Controller\x1b[0m");
+            println!("  Preset:              \x1b[1;36m{preset}\x1b[0m");
+            println!("  Redundancy Ratio:    \x1b[1;32m{redundancy_pct}%\x1b[0m");
+            println!(
+                "  Shards (K/M):        \x1b[1m{data_shards}\x1b[0m data / \x1b[1m{parity_shards}\x1b[0m parity"
+            );
+            println!("  Symbols Transmitted: {total_symbols_tx}");
+            println!("  Symbols Recovered:   \x1b[1;32m{recovered_symbols_rx}\x1b[0m");
+            println!(
+                "  Unrecoverable Drops: {}",
+                if unrecoverable_burst_drops > 0 {
+                    format!("\x1b[1;31m{unrecoverable_burst_drops}\x1b[0m")
+                } else {
+                    "\x1b[1;32m0\x1b[0m".to_string()
+                }
+            );
+            println!("  Loss Recovery Rate:  \x1b[1;38;5;48m{loss_recovery_rate_pct:.1}%\x1b[0m");
+            Ok(())
+        }
+        ControlResponse::Err { error, .. } => Err(error),
+        _ => Err("unexpected response format from daemon".into()),
+    }
+}
+
+/// Dynamically update Reed-Solomon FEC configuration.
+pub fn run_cli_fec_set(
+    socket_path: &Path,
+    preset: Option<String>,
+    redundancy_pct: Option<u8>,
+    data_shards: Option<usize>,
+    parity_shards: Option<usize>,
+) -> Result<(), String> {
+    let resp = client_query(
+        socket_path,
+        ControlCmd::SetFecConfig {
+            preset,
+            redundancy_pct,
+            data_shards,
+            parity_shards,
+        },
+    )?;
+    match resp {
         ControlResponse::Ack { message, .. } => {
             println!("\x1b[1;32m✓\x1b[0m {message}");
             Ok(())
@@ -1260,6 +1531,10 @@ mod tests {
         assert!(
             run_cli_peer_add(path, &"04".repeat(32), Some("1.2.3.4:51820"), Some("TLS")).is_ok()
         );
+        assert!(run_cli_fec_status(path, false).is_ok());
+        assert!(run_cli_fec_status(path, true).is_ok());
+        assert!(run_cli_fec_set(path, Some("hostile".into()), Some(30), Some(10), Some(4)).is_ok());
+        assert!(run_cli_fec_set(path, Some("invalid_preset".into()), None, None, None).is_err());
 
         running.store(false, Ordering::Relaxed);
         let _ = srv.join();
@@ -1271,5 +1546,100 @@ mod tests {
             ControlCmd::Status
         )
         .is_err());
+    }
+
+    #[test]
+    fn test_fec_control_cmd_and_presets() {
+        assert_eq!("off".parse::<FecPreset>().unwrap(), FecPreset::Off);
+        assert_eq!("low".parse::<FecPreset>().unwrap(), FecPreset::Low);
+        assert_eq!(
+            "adaptive".parse::<FecPreset>().unwrap(),
+            FecPreset::Adaptive
+        );
+        assert_eq!("hostile".parse::<FecPreset>().unwrap(), FecPreset::Hostile);
+        assert_eq!("custom".parse::<FecPreset>().unwrap(), FecPreset::Custom);
+        assert!("unknown".parse::<FecPreset>().is_err());
+
+        let off_cfg = FecPreset::Off.default_config();
+        assert_eq!(off_cfg.redundancy_pct, 0);
+        assert_eq!(off_cfg.parity_shards, 0);
+
+        let hostile_cfg = FecPreset::Hostile.default_config();
+        assert_eq!(hostile_cfg.redundancy_pct, 30);
+        assert_eq!(hostile_cfg.parity_shards, 4);
+
+        let mut pm = crate::peer_manager::testutil::test_peer_manager();
+        let start = Instant::now();
+
+        // Initial FEC status query
+        let resp = dispatch_cmd(&mut pm, ControlCmd::GetFecStatus, "yip0", start);
+        match resp {
+            ControlResponse::FecStatus {
+                ok,
+                preset,
+                redundancy_pct,
+                data_shards,
+                parity_shards,
+                loss_recovery_rate_pct,
+                ..
+            } => {
+                assert!(ok);
+                assert_eq!(preset, "adaptive");
+                assert_eq!(redundancy_pct, 12);
+                assert_eq!(data_shards, 10);
+                assert_eq!(parity_shards, 2);
+                assert_eq!(loss_recovery_rate_pct, 100.0);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        // Set FEC config with valid preset
+        let set_cmd = ControlCmd::SetFecConfig {
+            preset: Some("hostile".into()),
+            redundancy_pct: Some(30),
+            data_shards: Some(12),
+            parity_shards: Some(5),
+        };
+        let resp = dispatch_cmd(&mut pm, set_cmd, "yip0", start);
+        assert!(matches!(resp, ControlResponse::Ack { ok: true, .. }));
+        assert_eq!(pm.fec_config().data_shards, 12);
+        assert_eq!(pm.fec_config().parity_shards, 5);
+        assert_eq!(pm.fec_config().redundancy_pct, 30);
+
+        // Set FEC config with bad preset
+        let bad_preset = ControlCmd::SetFecConfig {
+            preset: Some("bogus".into()),
+            redundancy_pct: None,
+            data_shards: None,
+            parity_shards: None,
+        };
+        assert!(matches!(
+            dispatch_cmd(&mut pm, bad_preset, "yip0", start),
+            ControlResponse::Err { .. }
+        ));
+
+        // Set FEC config with redundancy > 100
+        let bad_redundancy = ControlCmd::SetFecConfig {
+            preset: None,
+            redundancy_pct: Some(150),
+            data_shards: None,
+            parity_shards: None,
+        };
+        assert!(matches!(
+            dispatch_cmd(&mut pm, bad_redundancy, "yip0", start),
+            ControlResponse::Err { .. }
+        ));
+
+        // Set FEC config with data shards == 0
+        let bad_k = ControlCmd::SetFecConfig {
+            preset: None,
+            redundancy_pct: None,
+            data_shards: Some(0),
+            parity_shards: None,
+        };
+        assert!(matches!(
+            dispatch_cmd(&mut pm, bad_k, "yip0", start),
+            ControlResponse::Err { .. }
+        ));
     }
 }

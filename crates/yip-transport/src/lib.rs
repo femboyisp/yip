@@ -237,11 +237,32 @@ impl Transport {
         self.controllers[class_index(FlowClass::Bulk)].ratio()
     }
 
+    /// Dynamically override the repair ratio across all flow class controllers.
+    pub fn set_fec_repair_ratio(&mut self, ratio: f32) {
+        for c in &mut self.controllers {
+            c.set_ratio(ratio);
+            c.set_min_ratio(ratio);
+        }
+    }
+
+    /// Total count of FEC symbols produced by the encoder.
+    pub fn total_symbols_tx(&self) -> u64 {
+        self.encoder.symbols_encoded()
+    }
+
     /// Total number of objects reconstructed via repair/parity shards across all classes.
     pub fn fec_recovered_count(&self) -> u64 {
         self.reassemblers
             .values()
             .map(|r| r.recovered_count())
+            .sum()
+    }
+
+    /// Total number of objects dropped due to expiration or capacity eviction before decoding.
+    pub fn fec_unrecoverable_count(&self) -> u64 {
+        self.reassemblers
+            .values()
+            .map(|r| r.unrecoverable_count())
             .sum()
     }
 }

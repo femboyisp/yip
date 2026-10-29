@@ -500,6 +500,8 @@ pub struct PeerManager {
     pub threshold_ca_server: Option<SocketAddr>,
     /// Monotonic timestamp in milliseconds of the last certificate renewal check.
     last_cert_check_ms: u64,
+    /// Dynamic Reed-Solomon FEC runtime configuration (#181).
+    pub fec_config: crate::control::FecConfig,
 }
 
 /// MTU budget (bytes) used to size obfuscation padding: handshakes are padded
@@ -632,6 +634,7 @@ impl PeerManager {
             start_time: std::time::Instant::now(),
             threshold_ca_server: None,
             last_cert_check_ms: 0,
+            fec_config: crate::control::FecConfig::default(),
         };
 
         // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
@@ -1019,8 +1022,55 @@ impl PeerManager {
         self.peers[idx].session_obf_key = sess_obf;
         self.peers[idx].path.committed(PathKind::Direct);
         self.peers[idx].path_kind = Some(PathKind::Direct);
-        self.peers[idx].state =
-            PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, 0)));
+        let mut epoch_set = Box::new(crate::epoch::EpochSet::new(dp, 0));
+        epoch_set.set_fec_repair_ratio(self.fec_config.redundancy_pct as f32 / 100.0);
+        self.peers[idx].state = PeerState::Established(epoch_set);
+    }
+
+    /// Returns the active FEC runtime configuration.
+    pub fn fec_config(&self) -> crate::control::FecConfig {
+        self.fec_config
+    }
+
+    /// Dynamically update the FEC configuration across all established sessions.
+    pub fn set_fec_config(&mut self, config: crate::control::FecConfig) {
+        self.fec_config = config;
+        let ratio = config.redundancy_pct as f32 / 100.0;
+        for peer in &mut self.peers {
+            if let PeerState::Established(ref mut epochs) = peer.state {
+                epochs.set_fec_repair_ratio(ratio);
+            }
+        }
+    }
+
+    /// Aggregate FEC telemetry statistics across all established sessions.
+    pub fn fec_status(&self) -> (u64, u64, u64, f32) {
+        let mut total_symbols_tx = 0u64;
+        let mut recovered_symbols_rx = 0u64;
+        let mut unrecoverable_burst_drops = 0u64;
+
+        for peer in &self.peers {
+            if let PeerState::Established(ref epochs) = peer.state {
+                total_symbols_tx += epochs.total_symbols_tx();
+                recovered_symbols_rx += epochs.fec_recovered_count();
+                unrecoverable_burst_drops += epochs.fec_unrecoverable_count();
+            }
+        }
+
+        let loss_recovery_rate_pct = if (recovered_symbols_rx + unrecoverable_burst_drops) > 0 {
+            (recovered_symbols_rx as f32
+                / (recovered_symbols_rx + unrecoverable_burst_drops) as f32)
+                * 100.0
+        } else {
+            100.0
+        };
+
+        (
+            total_symbols_tx,
+            recovered_symbols_rx,
+            unrecoverable_burst_drops,
+            loss_recovery_rate_pct,
+        )
     }
 
     /// Dynamically add a new remote peer.

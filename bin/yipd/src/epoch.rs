@@ -100,8 +100,23 @@ impl EpochSet {
         self.current.bulk_repair_ratio()
     }
 
+    pub fn set_fec_repair_ratio(&mut self, ratio: f32) {
+        self.current.set_fec_repair_ratio(ratio);
+        if let Some(ref mut n) = self.next {
+            n.dp.set_fec_repair_ratio(ratio);
+        }
+    }
+
+    pub fn total_symbols_tx(&self) -> u64 {
+        self.current.total_symbols_tx()
+    }
+
     pub fn fec_recovered_count(&self) -> u64 {
         self.current.fec_recovered_count()
+    }
+
+    pub fn fec_unrecoverable_count(&self) -> u64 {
+        self.current.fec_unrecoverable_count()
     }
 
     pub fn current_obf_key(&self) -> Option<[u8; 16]> {

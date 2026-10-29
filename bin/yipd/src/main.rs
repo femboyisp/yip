@@ -114,6 +114,24 @@ fn print_cli_usage(subcmd: &str) {
             println!("  -c, --control <SOCKET>  Path to yipd UNIX control socket");
             println!("  -h, --help              Print help");
         }
+        "fec" => {
+            println!("Usage: yipctl fec <status|set> [OPTIONS]");
+            println!();
+            println!("Inspect or dynamically tune Reed-Solomon Forward Error Correction (FEC).");
+            println!();
+            println!("Commands:");
+            println!("  status                               Query FEC recovery telemetry");
+            println!("  set [--preset P] [--redundancy PCT]  Update redundancy ratio & shards");
+            println!();
+            println!("Options:");
+            println!("  -c, --control <SOCKET>    Path to yipd UNIX control socket");
+            println!("  -p, --preset <PRESET>     Preset (off, low, adaptive, hostile, custom)");
+            println!("  -r, --redundancy <PCT>    Redundancy percentage (0..100)");
+            println!("      --k <SHARDS>          Data shards count (K >= 1)");
+            println!("      --m <SHARDS>          Parity shards count (M)");
+            println!("      --json                Output raw JSON");
+            println!("  -h, --help                Print help");
+        }
         _ => {
             println!("Usage: yipctl <COMMAND> [OPTIONS]");
             println!();
@@ -123,6 +141,8 @@ fn print_cli_usage(subcmd: &str) {
             println!("  top     Real-time ANSI telemetry dashboard");
             println!("  ping    Probe round-trip latency to a peer");
             println!("  peer    Dynamically add or remove peers");
+            println!("  fec     Query or configure dynamic Reed-Solomon FEC");
+            println!("  cert    Display certificate status or trigger manual renewal");
             println!();
             println!("Options:");
             println!("  -V, --version  Print version");
@@ -138,6 +158,10 @@ fn run_client_subcommand(
     let mut control_path = None;
     let mut json = false;
     let mut interval_ms = 500u64;
+    let mut preset = None;
+    let mut redundancy = None;
+    let mut k_shards = None;
+    let mut m_shards = None;
     let mut positional: Vec<String> = Vec::new();
 
     while let Some(arg) = args.next() {
@@ -164,6 +188,60 @@ fn run_client_subcommand(
                 interval_ms = s.parse::<u64>().map_err(|e| {
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
                 })?;
+            }
+            "--preset" | "-p" => {
+                let p = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--preset requires a preset name (off, low, adaptive, hostile)",
+                    )
+                })?;
+                preset = Some(p);
+            }
+            "--redundancy" | "-r" => {
+                let r = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--redundancy requires a percentage (0..100)",
+                    )
+                })?;
+                let pct = r.parse::<u8>().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid redundancy percentage: {e}"),
+                    )
+                })?;
+                redundancy = Some(pct);
+            }
+            "--k" => {
+                let k = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--k requires data shards count",
+                    )
+                })?;
+                let k_val = k.parse::<usize>().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid data shards: {e}"),
+                    )
+                })?;
+                k_shards = Some(k_val);
+            }
+            "--m" => {
+                let m = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--m requires parity shards count",
+                    )
+                })?;
+                let m_val = m.parse::<usize>().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid parity shards: {e}"),
+                    )
+                })?;
+                m_shards = Some(m_val);
             }
             "--help" | "-h" => {
                 print_cli_usage(subcmd);
@@ -329,6 +407,23 @@ fn run_client_subcommand(
                 }
             }
         }
+        "fec" => {
+            let action = positional.first().map(|s| s.as_str()).unwrap_or("status");
+            match action {
+                "status" => {
+                    control::run_cli_fec_status(&socket, json).map_err(std::io::Error::other)
+                }
+                "set" => control::run_cli_fec_set(&socket, preset, redundancy, k_shards, m_shards)
+                    .map_err(std::io::Error::other),
+                other => {
+                    eprintln!("Unknown fec action: {other}");
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("unknown fec action: {other}"),
+                    ))
+                }
+            }
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("unknown subcommand: {subcmd}"),
@@ -361,6 +456,7 @@ fn main() -> std::io::Result<()> {
             Some("top") => return run_client_subcommand("top", args),
             Some("ping") => return run_client_subcommand("ping", args),
             Some("peer") => return run_client_subcommand("peer", args),
+            Some("fec") => return run_client_subcommand("fec", args),
             Some("cert") => return run_client_subcommand("cert", args),
             Some("genkey") | Some("--genkey") => {
                 let kp = yip_crypto::generate_keypair();
@@ -397,6 +493,7 @@ fn main() -> std::io::Result<()> {
         Some("top") => run_client_subcommand("top", args),
         Some("ping") => run_client_subcommand("ping", args),
         Some("peer") => run_client_subcommand("peer", args),
+        Some("fec") => run_client_subcommand("fec", args),
         Some("cert") => run_client_subcommand("cert", args),
         Some("--version") | Some("-V") => {
             println!("{}", banner());

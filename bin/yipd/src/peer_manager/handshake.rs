@@ -364,8 +364,9 @@ impl PeerManager {
                     let out = dp.on_tun_packet(inner, now_ms);
                     self.egress.extend(out.iter().cloned());
                 }
-                self.peers[idx].state =
-                    PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, now_ms)));
+                let mut epoch_set = Box::new(crate::epoch::EpochSet::new(dp, now_ms));
+                epoch_set.set_fec_repair_ratio(self.fec_config.redundancy_pct as f32 / 100.0);
+                self.peers[idx].state = PeerState::Established(epoch_set);
                 self.record_new_epoch(idx);
 
                 DispatchOut::Udp(&self.egress)
@@ -452,8 +453,9 @@ impl PeerManager {
                     let out = dp.on_tun_packet(inner, now_ms);
                     self.egress.extend(out.iter().cloned());
                 }
-                self.peers[idx].state =
-                    PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, now_ms)));
+                let mut epoch_set = Box::new(crate::epoch::EpochSet::new(dp, now_ms));
+                epoch_set.set_fec_repair_ratio(self.fec_config.redundancy_pct as f32 / 100.0);
+                self.peers[idx].state = PeerState::Established(epoch_set);
                 self.record_new_epoch(idx);
 
                 if self.egress.is_empty() {

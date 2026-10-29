@@ -97,4 +97,50 @@ fn control_socket_tick_integration() {
     reader.read_line(&mut line).unwrap();
     assert!(line.contains("\"ok\":true"));
     assert!(line.contains("\"message\":\"peer removed\""));
+
+    // 5. Query FEC status over control socket
+    writer.write_all(b"{\"cmd\":\"get_fec_status\"}\n").unwrap();
+    writer.flush().unwrap();
+
+    for _ in 0..50 {
+        let _ = pm.tick(1_040);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("\"ok\":true"));
+    assert!(line.contains("\"preset\":\"adaptive\""));
+    assert!(line.contains("\"redundancy_pct\":12"));
+
+    // 6. Set FEC configuration to hostile preset with custom redundancy
+    writer
+        .write_all(b"{\"cmd\":\"set_fec_config\",\"preset\":\"hostile\",\"redundancy_pct\":35}\n")
+        .unwrap();
+    writer.flush().unwrap();
+
+    for _ in 0..50 {
+        let _ = pm.tick(1_050);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("\"ok\":true"));
+    assert!(line.contains("FEC configuration updated"));
+
+    // 7. Verify updated FEC status over control socket
+    writer.write_all(b"{\"cmd\":\"get_fec_status\"}\n").unwrap();
+    writer.flush().unwrap();
+
+    for _ in 0..50 {
+        let _ = pm.tick(1_060);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("\"ok\":true"));
+    assert!(line.contains("\"redundancy_pct\":35"));
+    assert_eq!(pm.fec_config().redundancy_pct, 35);
 }

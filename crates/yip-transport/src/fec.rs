@@ -82,6 +82,7 @@ fn split_source(ciphertext: &[u8], k: usize, sym: usize) -> Vec<Vec<u8>> {
 pub struct FecEncoder {
     next_object_id: u16,
     stride: u16,
+    symbols_encoded: u64,
 }
 
 impl Default for FecEncoder {
@@ -89,6 +90,7 @@ impl Default for FecEncoder {
         Self {
             next_object_id: 0,
             stride: 1,
+            symbols_encoded: 0,
         }
     }
 }
@@ -97,6 +99,11 @@ impl FecEncoder {
     /// Create an encoder starting at object id 0.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Total count of FEC symbols produced by this encoder.
+    pub fn symbols_encoded(&self) -> u64 {
+        self.symbols_encoded
     }
 
     /// Reconfigure shard start object id and stride increment.
@@ -114,7 +121,9 @@ impl FecEncoder {
     ) -> Vec<Symbol> {
         let object_id = self.next_object_id;
         self.next_object_id = self.next_object_id.wrapping_add(self.stride);
-        self.build(ciphertext, params, object_id, repair)
+        let syms = self.build(ciphertext, params, object_id, repair);
+        self.symbols_encoded = self.symbols_encoded.saturating_add(syms.len() as u64);
+        syms
     }
 
     /// Re-encode `ciphertext` under an EXPLICIT `object_id` (ARQ retransmit),
@@ -131,7 +140,9 @@ impl FecEncoder {
         object_id: u16,
         extra_repair: u32,
     ) -> Vec<Symbol> {
-        self.build(ciphertext, params, object_id, extra_repair)
+        let syms = self.build(ciphertext, params, object_id, extra_repair);
+        self.symbols_encoded = self.symbols_encoded.saturating_add(syms.len() as u64);
+        syms
     }
 
     /// Shared encode: K source + R repair (R clamped to 255-K), K bounds enforced.
@@ -385,6 +396,7 @@ pub struct FecReassembler {
     pub(crate) order: VecDeque<u64>,
     max_objects: usize,
     recovered_count: u64,
+    unrecoverable_count: u64,
 }
 
 impl FecReassembler {
@@ -398,12 +410,18 @@ impl FecReassembler {
             order: VecDeque::with_capacity(max_obj + 1),
             max_objects: max_obj,
             recovered_count: 0,
+            unrecoverable_count: 0,
         }
     }
 
     /// Number of objects reconstructed via repair/parity shards.
     pub fn recovered_count(&self) -> u64 {
         self.recovered_count
+    }
+
+    /// Total count of objects dropped due to expiration or capacity eviction before decoding.
+    pub fn unrecoverable_count(&self) -> u64 {
+        self.unrecoverable_count
     }
 
     /// Number of objects currently being reassembled.
@@ -476,6 +494,9 @@ impl FecReassembler {
             }
             if let Some(state) = self.objects.get(&oldest_id) {
                 if now_ms > state.expires_at_ms || state.done {
+                    if !state.done {
+                        self.unrecoverable_count = self.unrecoverable_count.saturating_add(1);
+                    }
                     self.order.pop_front();
                     self.objects.remove(&oldest_id);
                     continue;
@@ -490,7 +511,11 @@ impl FecReassembler {
         if !self.objects.contains_key(&object_key) {
             if self.objects.len() >= self.max_objects {
                 if let Some(oldest) = self.order.pop_front() {
-                    self.objects.remove(&oldest);
+                    if let Some(st) = self.objects.remove(&oldest) {
+                        if !st.done {
+                            self.unrecoverable_count = self.unrecoverable_count.saturating_add(1);
+                        }
+                    }
                 }
             }
             let shard_len = obj_size.min(sym_size);
