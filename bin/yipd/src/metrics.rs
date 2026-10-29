@@ -1,8 +1,12 @@
 //! Lock-free metrics registry and Prometheus 0.0.4 exposition formatter.
 
 use std::fmt::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::io::{BufRead, BufReader, Write as IoWrite};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -578,6 +582,184 @@ pub struct PeerTelemetryItem {
     pub cert_status: String,
 }
 
+/// Embedded HTTP/1.1 scraper server exposing Prometheus metrics and health check.
+pub struct MetricsHttpServer {
+    local_addr: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+    thread_handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for MetricsHttpServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetricsHttpServer")
+            .field("local_addr", &self.local_addr)
+            .field("shutdown", &self.shutdown.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl MetricsHttpServer {
+    /// Start the HTTP scraper server bound to `addr`.
+    pub fn start(
+        addr: SocketAddr,
+        registry: Arc<MetricsRegistry>,
+        stats_fn: Box<dyn Fn() -> Vec<crate::peer_manager::PeerStats> + Send + Sync + 'static>,
+    ) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(addr)?;
+        let local_addr = listener.local_addr()?;
+        listener.set_nonblocking(true)?;
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown);
+        let stats_fn: Arc<dyn Fn() -> Vec<crate::peer_manager::PeerStats> + Send + Sync + 'static> =
+            Arc::from(stats_fn);
+
+        let thread_handle = std::thread::Builder::new()
+            .name("metrics-http-server".into())
+            .spawn(move || {
+                while !shutdown_clone.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let reg = Arc::clone(&registry);
+                            let s_fn = Arc::clone(&stats_fn);
+                            let _ = std::thread::Builder::new()
+                                .name("metrics-http-conn".into())
+                                .spawn(move || {
+                                    let _ = handle_client(stream, &reg, &*s_fn);
+                                });
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                }
+            })?;
+
+        Ok(Self {
+            local_addr,
+            shutdown,
+            thread_handle: Mutex::new(Some(thread_handle)),
+        })
+    }
+
+    /// Return the local socket address this server is listening on.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Signal shutdown to the background server thread and await its termination.
+    pub fn stop(&self) {
+        if self.shutdown.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Ok(mut lock) = self.thread_handle.lock() {
+            if let Some(handle) = lock.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+impl Drop for MetricsHttpServer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn handle_client(
+    mut stream: TcpStream,
+    registry: &MetricsRegistry,
+    stats_fn: &(dyn Fn() -> Vec<crate::peer_manager::PeerStats> + Send + Sync),
+) -> std::io::Result<()> {
+    let _ = stream.set_nonblocking(false);
+    stream.set_read_timeout(Some(Duration::from_millis(3000)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(3000)))?;
+
+    let (method, path) = {
+        let mut reader = BufReader::new(&mut stream);
+        let mut first_line = String::new();
+        if reader.read_line(&mut first_line)? == 0 {
+            return Ok(());
+        }
+
+        let mut header_line = String::new();
+        let mut header_count = 0;
+        while header_count < 64 && reader.read_line(&mut header_line)? > 0 {
+            let trimmed = header_line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                break;
+            }
+            header_line.clear();
+            header_count += 1;
+        }
+
+        let parts: Vec<&str> = first_line.split_whitespace().collect();
+        if parts.len() < 2 {
+            ("".to_string(), "".to_string())
+        } else {
+            (
+                parts[0].to_string(),
+                parts[1].split('?').next().unwrap_or(parts[1]).to_string(),
+            )
+        }
+    };
+
+    if method.is_empty() {
+        let response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        IoWrite::write_all(&mut stream, response.as_bytes())?;
+        IoWrite::flush(&mut stream)?;
+        return Ok(());
+    }
+
+    if method != "GET" && method != "HEAD" {
+        let body = "Method Not Allowed";
+        let response = format!(
+            "HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        IoWrite::write_all(&mut stream, response.as_bytes())?;
+        IoWrite::flush(&mut stream)?;
+        return Ok(());
+    }
+
+    match path.as_str() {
+        "/metrics" => {
+            let peer_stats = stats_fn();
+            let body = registry.render_prometheus(&peer_stats);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                if method == "HEAD" { "" } else { &body }
+            );
+            IoWrite::write_all(&mut stream, response.as_bytes())?;
+        }
+        "/healthz" => {
+            let body = "ok";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                if method == "HEAD" { "" } else { body }
+            );
+            IoWrite::write_all(&mut stream, response.as_bytes())?;
+        }
+        _ => {
+            let body = "Not Found";
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                if method == "HEAD" { "" } else { body }
+            );
+            IoWrite::write_all(&mut stream, response.as_bytes())?;
+        }
+    }
+    IoWrite::flush(&mut stream)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -732,5 +914,159 @@ mod tests {
         assert_eq!(snap.traffic.tx_packets, 1000);
         assert_eq!(snap.traffic.rx_bytes, 20000);
         assert_eq!(snap.traffic.rx_packets, 1000);
+    }
+
+    #[test]
+    fn test_http_metrics_and_healthz_endpoint() {
+        use std::io::{Read, Write};
+        use std::sync::Arc;
+
+        let registry = Arc::new(MetricsRegistry::new());
+        registry.record_tx(4096, 4);
+
+        let server = MetricsHttpServer::start(
+            "127.0.0.1:0".parse().unwrap(),
+            registry.clone(),
+            Box::new(Vec::new),
+        )
+        .expect("failed to start metrics http server");
+
+        let port = server.local_addr().port();
+
+        // Test GET /metrics
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"));
+        assert!(resp.contains("Content-Type: text/plain; version=0.0.4"));
+        assert!(resp.contains("yip_traffic_tx_bytes_total 4096"));
+
+        // Test GET /healthz
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"));
+        assert!(resp.ends_with("ok"));
+
+        server.stop();
+    }
+
+    #[test]
+    fn test_http_not_found_and_method_not_allowed() {
+        use std::io::{Read, Write};
+        use std::sync::Arc;
+
+        let registry = Arc::new(MetricsRegistry::new());
+        let server =
+            MetricsHttpServer::start("127.0.0.1:0".parse().unwrap(), registry, Box::new(Vec::new))
+                .expect("failed to start server");
+
+        let port = server.local_addr().port();
+
+        // Test 404 on unknown route
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(b"GET /notfound HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 404 Not Found"));
+        assert!(resp.ends_with("Not Found"));
+
+        // Test 405 on POST
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(b"POST /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 405 Method Not Allowed"));
+
+        // Test HEAD on /healthz
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(b"HEAD /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"));
+        assert!(resp.contains("Content-Length: 2"));
+        // HEAD must not include response body
+        assert!(resp.ends_with("\r\n\r\n"));
+
+        server.stop();
+    }
+
+    #[test]
+    fn test_http_server_stop_idempotent_and_drop() {
+        use std::sync::Arc;
+
+        let registry = Arc::new(MetricsRegistry::new());
+        let server = MetricsHttpServer::start(
+            "127.0.0.1:0".parse().unwrap(),
+            registry.clone(),
+            Box::new(Vec::new),
+        )
+        .expect("failed to start server");
+
+        // Idempotent stop calls
+        server.stop();
+        server.stop();
+
+        // Clean drop without explicit stop
+        let server2 =
+            MetricsHttpServer::start("127.0.0.1:0".parse().unwrap(), registry, Box::new(Vec::new))
+                .expect("failed to start server2");
+        drop(server2);
+    }
+
+    #[test]
+    fn test_http_metrics_with_live_peers() {
+        use std::io::{Read, Write};
+        use std::sync::Arc;
+
+        let registry = Arc::new(MetricsRegistry::new());
+        let peer = crate::peer_manager::PeerStats {
+            public_key: [0x11; 32],
+            endpoint: Some("127.0.0.1:51820".parse().unwrap()),
+            node_addr: "fd00::99".parse().unwrap(),
+            state: "established".into(),
+            last_activity_ms: 100,
+            tx_bytes: 512,
+            rx_bytes: 256,
+            tx_packets: 4,
+            rx_packets: 2,
+            fec_recovered: 1,
+            transport: "Direct UDP".into(),
+            rtt_ms: Some(25),
+            fec_ratio_pct: 10,
+            cert_status: "CA Valid".into(),
+        };
+
+        let server = MetricsHttpServer::start(
+            "127.0.0.1:0".parse().unwrap(),
+            registry,
+            Box::new(move || vec![peer.clone()]),
+        )
+        .expect("failed to start server");
+
+        let port = server.local_addr().port();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        assert!(resp.contains("yip_peers_active 1"));
+        assert!(resp
+            .contains("yip_peer_tx_bytes_total{peer=\"fd00::99\",transport=\"Direct UDP\"} 512"));
+
+        server.stop();
     }
 }
