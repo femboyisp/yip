@@ -12,6 +12,7 @@ pub(crate) mod flow;
 mod handshake;
 mod mac_table;
 mod membership;
+pub mod metrics;
 mod mode;
 mod path;
 mod peer_manager;
