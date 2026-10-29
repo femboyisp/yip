@@ -5,6 +5,14 @@ All notable changes to this project are documented here, following
 
 ## [Unreleased]
 
+### Added
+- **Multi-hop circuit tracing and path diagnostic probes (`bin/yipd`, `yip trace`, `yip ping`, #187).**
+  Added live circuit tracing (`ControlCmd::TracePath`) and latency diagnostic probes (`ControlCmd::PingPeer`) to the daemon IPC protocol. Supports flexible peer resolution via 64-character public key, short prefix hex, IPv6 node address, socket endpoint, or numeric index. Projects multi-hop path segments across direct P2P and TLS-relayed overlay routes, returning hop identifiers, next-hops, and segment latencies. Added ping sampling with deterministic jitter variance, packet loss accounting, and min/avg/max/stddev RTT calculations, exposed via CLI subcommands `yip trace <peer>` and `yip ping <peer> [-n count] [-W timeout_ms] [--json]`.
+- **Live mesh routing table and topology discovery commands (`bin/yipd`, `yip routes`, `yip topology`, #183).**
+  Added dynamic routing table inspection (`ControlCmd::GetRoutes`) and topology graph projection (`ControlCmd::GetTopology`) over UNIX domain socket and CLI. Categorizes active peer links into latency tiers (`Optimal`, `Normal`, `Elevated`) and computes next-hop metrics, MTU budgets, and transport boundaries across the mesh.
+- **Split-tunnel CIDR, domain, and application route bypass control (`bin/yipd`, `yip split`, #184).**
+  Added granular traffic bypass policy management (`ControlCmd::GetSplitTunnelStatus`, `ControlCmd::SetSplitTunnelConfig`). Implemented zero-allocation IPv4/IPv6 bitmask parsing and subnet matching with shift-overflow guards, integrating directly into `PeerManager::on_tun_dispatch` to bypass overlay encapsulation for local networks and custom subnets.
+
 ## [0.1.0] - 2026-10-27
 
 ### Security
