@@ -143,4 +143,60 @@ fn control_socket_tick_integration() {
     assert!(line.contains("\"ok\":true"));
     assert!(line.contains("\"redundancy_pct\":35"));
     assert_eq!(pm.fec_config().redundancy_pct, 35);
+
+    // 8. Query DAITA status over control socket
+    writer
+        .write_all(b"{\"cmd\":\"get_daita_status\"}\n")
+        .unwrap();
+    writer.flush().unwrap();
+
+    for _ in 0..50 {
+        let _ = pm.tick(1_070);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("\"ok\":true"));
+    assert!(line.contains("\"preset\":\"off\""));
+
+    // 9. Reconfigure DAITA defense via set_daita_config
+    writer
+        .write_all(
+            b"{\"cmd\":\"set_daita_config\",\"preset\":\"balanced\",\"cover_interval_ms\":250}\n",
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    for _ in 0..50 {
+        let _ = pm.tick(1_080);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("\"ok\":true"));
+    assert!(line.contains("DAITA traffic defense configuration updated"));
+
+    // 10. Verify updated DAITA status
+    writer
+        .write_all(b"{\"cmd\":\"get_daita_status\"}\n")
+        .unwrap();
+    writer.flush().unwrap();
+
+    for _ in 0..50 {
+        let _ = pm.tick(1_090);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("\"ok\":true"));
+    assert!(line.contains("\"preset\":\"balanced\""));
+    assert!(line.contains("\"cover_interval_ms\":250"));
+    assert_eq!(
+        pm.traffic_defense.preset,
+        yip_obf::TrafficDefensePreset::Balanced
+    );
+    assert_eq!(pm.traffic_defense.cover_interval_ms, Some(250));
 }

@@ -132,6 +132,29 @@ fn print_cli_usage(subcmd: &str) {
             println!("      --json                Output raw JSON");
             println!("  -h, --help                Print help");
         }
+        "daita" => {
+            println!("Usage: yipctl daita <status|set> [OPTIONS]");
+            println!();
+            println!("Inspect or dynamically tune DAITA traffic analysis defenses.");
+            println!();
+            println!("Commands:");
+            println!(
+                "  status                               Query padding & decoy burst telemetry"
+            );
+            println!("  set [--preset P] [--buckets B1,B2]   Update quantization & cover bursts");
+            println!();
+            println!("Options:");
+            println!("  -c, --control <SOCKET>          Path to yipd UNIX control socket");
+            println!(
+                "  -p, --preset <PRESET>           Preset (off, low, balanced, max, paranoid)"
+            );
+            println!("      --buckets <B1,B2,...>       Quantization buckets in bytes (e.g. 256,512,1024,1420)");
+            println!("      --cover-interval <MILLIS>   Decoy burst interval in ms (0 to disable)");
+            println!("      --burst <COUNT>             Decoy burst packet ceiling");
+            println!("      --jitter <MILLIS>           Maximum egress micro-jitter delay in ms");
+            println!("      --json                      Output raw JSON");
+            println!("  -h, --help                      Print help");
+        }
         _ => {
             println!("Usage: yipctl <COMMAND> [OPTIONS]");
             println!();
@@ -142,6 +165,7 @@ fn print_cli_usage(subcmd: &str) {
             println!("  ping    Probe round-trip latency to a peer");
             println!("  peer    Dynamically add or remove peers");
             println!("  fec     Query or configure dynamic Reed-Solomon FEC");
+            println!("  daita   Query or configure dynamic DAITA traffic defense");
             println!("  cert    Display certificate status or trigger manual renewal");
             println!();
             println!("Options:");
@@ -162,6 +186,10 @@ fn run_client_subcommand(
     let mut redundancy = None;
     let mut k_shards = None;
     let mut m_shards = None;
+    let mut buckets: Option<Vec<usize>> = None;
+    let mut cover_interval: Option<u64> = None;
+    let mut cover_burst: Option<u64> = None;
+    let mut jitter: Option<u64> = None;
     let mut positional: Vec<String> = Vec::new();
 
     while let Some(arg) = args.next() {
@@ -242,6 +270,74 @@ fn run_client_subcommand(
                     )
                 })?;
                 m_shards = Some(m_val);
+            }
+            "--buckets" => {
+                let s = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--buckets requires comma-separated byte sizes (e.g. 256,512,1024)",
+                    )
+                })?;
+                let mut parsed_buckets = Vec::new();
+                for part in s.split(',') {
+                    let trimmed = part.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let b = trimmed.parse::<usize>().map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("invalid bucket size '{trimmed}': {e}"),
+                        )
+                    })?;
+                    parsed_buckets.push(b);
+                }
+                buckets = Some(parsed_buckets);
+            }
+            "--cover-interval" => {
+                let s = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--cover-interval requires milliseconds (e.g. 500)",
+                    )
+                })?;
+                let civ = s.parse::<u64>().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid cover interval: {e}"),
+                    )
+                })?;
+                cover_interval = Some(civ);
+            }
+            "--burst" | "--cover-burst" => {
+                let s = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--burst requires packet count (e.g. 2)",
+                    )
+                })?;
+                let b = s.parse::<u64>().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid burst count: {e}"),
+                    )
+                })?;
+                cover_burst = Some(b);
+            }
+            "--jitter" => {
+                let s = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--jitter requires milliseconds (e.g. 2)",
+                    )
+                })?;
+                let j = s.parse::<u64>().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid jitter: {e}"),
+                    )
+                })?;
+                jitter = Some(j);
             }
             "--help" | "-h" => {
                 print_cli_usage(subcmd);
@@ -424,6 +520,30 @@ fn run_client_subcommand(
                 }
             }
         }
+        "daita" => {
+            let action = positional.first().map(|s| s.as_str()).unwrap_or("status");
+            match action {
+                "status" => {
+                    control::run_cli_daita_status(&socket, json).map_err(std::io::Error::other)
+                }
+                "set" => control::run_cli_daita_set(
+                    &socket,
+                    preset,
+                    buckets,
+                    cover_interval,
+                    cover_burst,
+                    jitter,
+                )
+                .map_err(std::io::Error::other),
+                other => {
+                    eprintln!("Unknown daita action: {other}");
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("unknown daita action: {other}"),
+                    ))
+                }
+            }
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("unknown subcommand: {subcmd}"),
@@ -457,6 +577,7 @@ fn main() -> std::io::Result<()> {
             Some("ping") => return run_client_subcommand("ping", args),
             Some("peer") => return run_client_subcommand("peer", args),
             Some("fec") => return run_client_subcommand("fec", args),
+            Some("daita") => return run_client_subcommand("daita", args),
             Some("cert") => return run_client_subcommand("cert", args),
             Some("genkey") | Some("--genkey") => {
                 let kp = yip_crypto::generate_keypair();
@@ -494,6 +615,7 @@ fn main() -> std::io::Result<()> {
         Some("ping") => run_client_subcommand("ping", args),
         Some("peer") => run_client_subcommand("peer", args),
         Some("fec") => run_client_subcommand("fec", args),
+        Some("daita") => run_client_subcommand("daita", args),
         Some("cert") => run_client_subcommand("cert", args),
         Some("--version") | Some("-V") => {
             println!("{}", banner());

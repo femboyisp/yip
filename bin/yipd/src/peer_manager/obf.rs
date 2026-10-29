@@ -192,8 +192,8 @@ impl PeerManager {
                 let Some(key) = self.obf_key else {
                     return true;
                 };
+                let raw_wire = yip_obf::MIN_ENVELOPE + d.bytes.len();
                 let pad = if defense_active {
-                    let raw_wire = yip_obf::MIN_ENVELOPE + d.bytes.len();
                     let target_wire = yip_obf::round_to_bucket(
                         raw_wire,
                         &self.traffic_defense.buckets,
@@ -211,6 +211,8 @@ impl PeerManager {
                     &mut self.obf_scratch,
                 ) {
                     std::mem::swap(&mut d.bytes, &mut self.obf_scratch);
+                    self.daita_stats.authentic_bytes_tx += raw_wire as u64;
+                    self.daita_stats.padding_bytes_tx += pad as u64;
                     true
                 } else {
                     false
@@ -220,9 +222,9 @@ impl PeerManager {
                 let Some(key) = self.obf_key_for_egress(d.dst, ptype) else {
                     return true;
                 };
+                let body_len = d.bytes.len().saturating_sub(1);
+                let raw_wire = yip_obf::MIN_ENVELOPE + body_len;
                 let pad = if defense_active {
-                    let body_len = d.bytes.len().saturating_sub(1);
-                    let raw_wire = yip_obf::MIN_ENVELOPE + body_len;
                     let target_wire = if ptype == yip_obf::JUNK_TYPE
                         && d.fate > 0
                         && self.traffic_defense.buckets.contains(&(d.fate as usize))
@@ -261,6 +263,13 @@ impl PeerManager {
                 };
                 if yip_obf::obfuscate_into(&key, ptype, &d.bytes[1..], pad, &mut self.obf_scratch) {
                     std::mem::swap(&mut d.bytes, &mut self.obf_scratch);
+                    if ptype == yip_obf::JUNK_TYPE {
+                        self.daita_stats.decoy_packets_tx += 1;
+                        self.daita_stats.decoy_bytes_tx += (raw_wire + pad) as u64;
+                    } else {
+                        self.daita_stats.authentic_bytes_tx += raw_wire as u64;
+                        self.daita_stats.padding_bytes_tx += pad as u64;
+                    }
                     true
                 } else {
                     false

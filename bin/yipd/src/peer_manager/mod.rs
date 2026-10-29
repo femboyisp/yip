@@ -502,6 +502,17 @@ pub struct PeerManager {
     last_cert_check_ms: u64,
     /// Dynamic Reed-Solomon FEC runtime configuration (#181).
     pub fec_config: crate::control::FecConfig,
+    /// Live DAITA traffic defense counters and telemetry (#182).
+    pub daita_stats: DaitaStats,
+}
+
+/// Dynamic DAITA traffic analysis defense runtime metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct DaitaStats {
+    pub authentic_bytes_tx: u64,
+    pub padding_bytes_tx: u64,
+    pub decoy_packets_tx: u64,
+    pub decoy_bytes_tx: u64,
 }
 
 /// MTU budget (bytes) used to size obfuscation padding: handshakes are padded
@@ -635,6 +646,7 @@ impl PeerManager {
             threshold_ca_server: None,
             last_cert_check_ms: 0,
             fec_config: crate::control::FecConfig::default(),
+            daita_stats: DaitaStats::default(),
         };
 
         // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
@@ -738,6 +750,18 @@ impl PeerManager {
     /// Store traffic defense (DAITA packet length quantization and decoy bursts) configuration.
     pub fn set_traffic_defense(&mut self, cfg: TrafficDefenseConfig) {
         self.traffic_defense = cfg;
+    }
+
+    /// Return the active traffic defense configuration, telemetry counters, and padding overhead ratio.
+    pub fn daita_status(&self) -> (TrafficDefenseConfig, DaitaStats, f32) {
+        let stats = self.daita_stats;
+        let total = stats.authentic_bytes_tx + stats.padding_bytes_tx;
+        let ratio = if total > 0 {
+            (stats.padding_bytes_tx as f32 / total as f32) * 100.0
+        } else {
+            0.0
+        };
+        (self.traffic_defense.clone(), stats, ratio)
     }
 
     /// Query the milliseconds remaining until the earliest scheduled micro-jitter datagram is due.

@@ -54,6 +54,21 @@ pub enum ControlCmd {
         #[serde(default)]
         parity_shards: Option<usize>,
     },
+    #[serde(rename = "get_daita_status")]
+    GetDaitaStatus,
+    #[serde(rename = "set_daita_config")]
+    SetDaitaConfig {
+        #[serde(default)]
+        preset: Option<String>,
+        #[serde(default)]
+        buckets: Option<Vec<usize>>,
+        #[serde(default)]
+        cover_interval_ms: Option<u64>,
+        #[serde(default)]
+        cover_burst_max: Option<u64>,
+        #[serde(default)]
+        jitter_max_ms: Option<u64>,
+    },
 }
 
 /// Supported Reed-Solomon dynamic FEC presets.
@@ -149,6 +164,93 @@ impl Default for FecConfig {
     }
 }
 
+/// Supported DAITA traffic defense presets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DaitaPreset {
+    #[default]
+    Off,
+    Low,
+    Balanced,
+    Max,
+    Paranoid,
+    Custom,
+}
+
+impl std::str::FromStr for DaitaPreset {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "off" => Ok(DaitaPreset::Off),
+            "low" => Ok(DaitaPreset::Low),
+            "balanced" => Ok(DaitaPreset::Balanced),
+            "max" => Ok(DaitaPreset::Max),
+            "paranoid" => Ok(DaitaPreset::Paranoid),
+            "custom" => Ok(DaitaPreset::Custom),
+            other => Err(format!(
+                "unknown DAITA preset: {other} (valid: off, low, balanced, max, paranoid, custom)"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for DaitaPreset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DaitaPreset::Off => write!(f, "off"),
+            DaitaPreset::Low => write!(f, "low"),
+            DaitaPreset::Balanced => write!(f, "balanced"),
+            DaitaPreset::Max => write!(f, "max"),
+            DaitaPreset::Paranoid => write!(f, "paranoid"),
+            DaitaPreset::Custom => write!(f, "custom"),
+        }
+    }
+}
+
+impl DaitaPreset {
+    pub fn to_defense_config(self) -> crate::config::TrafficDefenseConfig {
+        match self {
+            DaitaPreset::Off => crate::config::TrafficDefenseConfig {
+                preset: yip_obf::TrafficDefensePreset::Off,
+                buckets: vec![],
+                cover_interval_ms: None,
+                cover_burst_max: 1,
+                jitter_max_ms: 0,
+            },
+            DaitaPreset::Low | DaitaPreset::Balanced => crate::config::TrafficDefenseConfig {
+                preset: yip_obf::TrafficDefensePreset::Balanced,
+                buckets: vec![256, 512, 1024, 1420],
+                cover_interval_ms: Some(500),
+                cover_burst_max: 2,
+                jitter_max_ms: 2,
+            },
+            DaitaPreset::Max | DaitaPreset::Paranoid => crate::config::TrafficDefenseConfig {
+                preset: yip_obf::TrafficDefensePreset::Paranoid,
+                buckets: vec![512, 1420],
+                cover_interval_ms: Some(150),
+                cover_burst_max: 4,
+                jitter_max_ms: 4,
+            },
+            DaitaPreset::Custom => crate::config::TrafficDefenseConfig {
+                preset: yip_obf::TrafficDefensePreset::Balanced,
+                buckets: vec![256, 512, 1024, 1420],
+                cover_interval_ms: Some(500),
+                cover_burst_max: 2,
+                jitter_max_ms: 2,
+            },
+        }
+    }
+}
+
+pub fn defense_preset_name(preset: yip_obf::TrafficDefensePreset) -> &'static str {
+    match preset {
+        yip_obf::TrafficDefensePreset::Off => "off",
+        yip_obf::TrafficDefensePreset::Balanced => "balanced",
+        yip_obf::TrafficDefensePreset::Paranoid => "paranoid",
+    }
+}
+
 /// Outbound control command responses returned to clients.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(untagged)]
@@ -191,6 +293,19 @@ pub enum ControlResponse {
         recovered_symbols_rx: u64,
         unrecoverable_burst_drops: u64,
         loss_recovery_rate_pct: f32,
+    },
+    DaitaStatus {
+        ok: bool,
+        preset: String,
+        buckets: Vec<usize>,
+        cover_interval_ms: Option<u64>,
+        cover_burst_max: u64,
+        jitter_max_ms: u64,
+        authentic_bytes_tx: u64,
+        padding_bytes_tx: u64,
+        decoy_packets_tx: u64,
+        decoy_bytes_tx: u64,
+        padding_ratio_pct: f32,
     },
     Ack {
         ok: bool,
@@ -586,6 +701,79 @@ pub fn dispatch_cmd(
                     current.data_shards,
                     current.parity_shards
                 ),
+            }
+        }
+        ControlCmd::GetDaitaStatus => {
+            let (cfg, stats, ratio) = pm.daita_status();
+            ControlResponse::DaitaStatus {
+                ok: true,
+                preset: defense_preset_name(cfg.preset).to_string(),
+                buckets: cfg.buckets,
+                cover_interval_ms: cfg.cover_interval_ms,
+                cover_burst_max: cfg.cover_burst_max,
+                jitter_max_ms: cfg.jitter_max_ms,
+                authentic_bytes_tx: stats.authentic_bytes_tx,
+                padding_bytes_tx: stats.padding_bytes_tx,
+                decoy_packets_tx: stats.decoy_packets_tx,
+                decoy_bytes_tx: stats.decoy_bytes_tx,
+                padding_ratio_pct: ratio,
+            }
+        }
+        ControlCmd::SetDaitaConfig {
+            preset,
+            buckets,
+            cover_interval_ms,
+            cover_burst_max,
+            jitter_max_ms,
+        } => {
+            let mut current = pm.traffic_defense.clone();
+            if let Some(p_str) = preset {
+                match p_str.parse::<DaitaPreset>() {
+                    Ok(p) => {
+                        current = p.to_defense_config();
+                    }
+                    Err(e) => {
+                        return ControlResponse::Err {
+                            ok: false,
+                            error: e,
+                        };
+                    }
+                }
+            }
+            if let Some(b) = buckets {
+                let mut sorted = b;
+                sorted.sort_unstable();
+                current.buckets = sorted;
+            }
+            if let Some(civ) = cover_interval_ms {
+                current.cover_interval_ms = if civ == 0 { None } else { Some(civ) };
+            }
+            if let Some(bm) = cover_burst_max {
+                if bm == 0 {
+                    return ControlResponse::Err {
+                        ok: false,
+                        error: "cover_burst_max must be at least 1".into(),
+                    };
+                }
+                current.cover_burst_max = bm;
+            }
+            if let Some(j) = jitter_max_ms {
+                current.jitter_max_ms = j;
+            }
+
+            let summary = format!(
+                "preset={}, buckets={:?}, cover_interval={:?}, burst_max={}, jitter={}ms",
+                defense_preset_name(current.preset),
+                current.buckets,
+                current.cover_interval_ms,
+                current.cover_burst_max,
+                current.jitter_max_ms,
+            );
+            pm.set_traffic_defense(current);
+
+            ControlResponse::Ack {
+                ok: true,
+                message: format!("DAITA traffic defense configuration updated: {summary}"),
             }
         }
     }
@@ -990,6 +1178,100 @@ pub fn run_cli_fec_set(
             redundancy_pct,
             data_shards,
             parity_shards,
+        },
+    )?;
+    match resp {
+        ControlResponse::Ack { message, .. } => {
+            println!("\x1b[1;32m✓\x1b[0m {message}");
+            Ok(())
+        }
+        ControlResponse::Err { error, .. } => Err(error),
+        _ => Err("unexpected response format from daemon".into()),
+    }
+}
+
+/// Query and display DAITA traffic defense status.
+pub fn run_cli_daita_status(socket_path: &Path, json: bool) -> Result<(), String> {
+    let resp = client_query(socket_path, ControlCmd::GetDaitaStatus)?;
+    if json {
+        let text = serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?;
+        println!("{text}");
+        return Ok(());
+    }
+    match resp {
+        ControlResponse::DaitaStatus {
+            ok,
+            preset,
+            buckets,
+            cover_interval_ms,
+            cover_burst_max,
+            jitter_max_ms,
+            authentic_bytes_tx,
+            padding_bytes_tx,
+            decoy_packets_tx,
+            decoy_bytes_tx,
+            padding_ratio_pct,
+        } => {
+            if !ok {
+                return Err("daemon reported DAITA status error".into());
+            }
+            println!("\x1b[1;38;5;208m●\x1b[0m \x1b[1mDAITA Traffic Defense Controller\x1b[0m");
+            println!("  Preset:              \x1b[1;36m{preset}\x1b[0m");
+            let buckets_str = if buckets.is_empty() {
+                "none (raw wire size)".to_string()
+            } else {
+                buckets
+                    .iter()
+                    .map(|b| format!("{b}B"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            println!("  Quantization Buckets: \x1b[1;32m{buckets_str}\x1b[0m");
+            println!(
+                "  Cover Interval:      {}",
+                cover_interval_ms
+                    .map(|ms| format!("{ms} ms"))
+                    .unwrap_or_else(|| "disabled".into())
+            );
+            println!("  Burst Ceiling:       {cover_burst_max} pkts");
+            println!("  Max Egress Jitter:   {jitter_max_ms} ms");
+            println!(
+                "  Authentic Data:      {} ({authentic_bytes_tx} B)",
+                format_bytes(authentic_bytes_tx)
+            );
+            println!(
+                "  Padding Overhead:    {} ({padding_bytes_tx} B)",
+                format_bytes(padding_bytes_tx)
+            );
+            println!(
+                "  Decoy Cover Bursts:  {decoy_packets_tx} pkts / {} ({decoy_bytes_tx} B)",
+                format_bytes(decoy_bytes_tx)
+            );
+            println!("  Padding Ratio:       \x1b[1;38;5;48m{padding_ratio_pct:.1}%\x1b[0m");
+            Ok(())
+        }
+        ControlResponse::Err { error, .. } => Err(error),
+        _ => Err("unexpected response format from daemon".into()),
+    }
+}
+
+/// Dynamically update DAITA traffic defense configuration.
+pub fn run_cli_daita_set(
+    socket_path: &Path,
+    preset: Option<String>,
+    buckets: Option<Vec<usize>>,
+    cover_interval_ms: Option<u64>,
+    cover_burst_max: Option<u64>,
+    jitter_max_ms: Option<u64>,
+) -> Result<(), String> {
+    let resp = client_query(
+        socket_path,
+        ControlCmd::SetDaitaConfig {
+            preset,
+            buckets,
+            cover_interval_ms,
+            cover_burst_max,
+            jitter_max_ms,
         },
     )?;
     match resp {
@@ -1535,6 +1817,20 @@ mod tests {
         assert!(run_cli_fec_status(path, true).is_ok());
         assert!(run_cli_fec_set(path, Some("hostile".into()), Some(30), Some(10), Some(4)).is_ok());
         assert!(run_cli_fec_set(path, Some("invalid_preset".into()), None, None, None).is_err());
+        assert!(run_cli_daita_status(path, false).is_ok());
+        assert!(run_cli_daita_status(path, true).is_ok());
+        assert!(run_cli_daita_set(
+            path,
+            Some("balanced".into()),
+            Some(vec![256, 512, 1024, 1420]),
+            Some(500),
+            Some(2),
+            Some(2)
+        )
+        .is_ok());
+        assert!(
+            run_cli_daita_set(path, Some("invalid_preset".into()), None, None, None, None).is_err()
+        );
 
         running.store(false, Ordering::Relaxed);
         let _ = srv.join();
@@ -1639,6 +1935,120 @@ mod tests {
         };
         assert!(matches!(
             dispatch_cmd(&mut pm, bad_k, "yip0", start),
+            ControlResponse::Err { .. }
+        ));
+    }
+
+    #[test]
+    fn test_daita_control_cmd_and_presets() {
+        assert_eq!("off".parse::<DaitaPreset>().unwrap(), DaitaPreset::Off);
+        assert_eq!("low".parse::<DaitaPreset>().unwrap(), DaitaPreset::Low);
+        assert_eq!(
+            "balanced".parse::<DaitaPreset>().unwrap(),
+            DaitaPreset::Balanced
+        );
+        assert_eq!("max".parse::<DaitaPreset>().unwrap(), DaitaPreset::Max);
+        assert_eq!(
+            "paranoid".parse::<DaitaPreset>().unwrap(),
+            DaitaPreset::Paranoid
+        );
+        assert_eq!(
+            "custom".parse::<DaitaPreset>().unwrap(),
+            DaitaPreset::Custom
+        );
+        assert!("unknown".parse::<DaitaPreset>().is_err());
+
+        let off_cfg = DaitaPreset::Off.to_defense_config();
+        assert_eq!(off_cfg.preset, yip_obf::TrafficDefensePreset::Off);
+        assert!(off_cfg.buckets.is_empty());
+        assert_eq!(off_cfg.cover_interval_ms, None);
+
+        let bal_cfg = DaitaPreset::Balanced.to_defense_config();
+        assert_eq!(bal_cfg.preset, yip_obf::TrafficDefensePreset::Balanced);
+        assert_eq!(bal_cfg.buckets, vec![256, 512, 1024, 1420]);
+        assert_eq!(bal_cfg.cover_interval_ms, Some(500));
+
+        let par_cfg = DaitaPreset::Paranoid.to_defense_config();
+        assert_eq!(par_cfg.preset, yip_obf::TrafficDefensePreset::Paranoid);
+        assert_eq!(par_cfg.buckets, vec![512, 1420]);
+        assert_eq!(par_cfg.cover_interval_ms, Some(150));
+
+        let mut pm = crate::peer_manager::testutil::test_peer_manager();
+        let start = Instant::now();
+
+        // Initial DAITA status query
+        let resp = dispatch_cmd(&mut pm, ControlCmd::GetDaitaStatus, "yip0", start);
+        match resp {
+            ControlResponse::DaitaStatus {
+                ok,
+                preset,
+                buckets,
+                cover_interval_ms,
+                cover_burst_max,
+                jitter_max_ms,
+                authentic_bytes_tx,
+                padding_bytes_tx,
+                decoy_packets_tx,
+                decoy_bytes_tx,
+                padding_ratio_pct,
+            } => {
+                assert!(ok);
+                assert_eq!(preset, "off");
+                assert!(buckets.is_empty());
+                assert_eq!(cover_interval_ms, None);
+                assert_eq!(cover_burst_max, 1);
+                assert_eq!(jitter_max_ms, 0);
+                assert_eq!(authentic_bytes_tx, 0);
+                assert_eq!(padding_bytes_tx, 0);
+                assert_eq!(decoy_packets_tx, 0);
+                assert_eq!(decoy_bytes_tx, 0);
+                assert_eq!(padding_ratio_pct, 0.0);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        // Set DAITA config with valid preset
+        let set_cmd = ControlCmd::SetDaitaConfig {
+            preset: Some("paranoid".into()),
+            buckets: Some(vec![1420, 512]),
+            cover_interval_ms: Some(100),
+            cover_burst_max: Some(3),
+            jitter_max_ms: Some(5),
+        };
+        let resp = dispatch_cmd(&mut pm, set_cmd, "yip0", start);
+        assert!(matches!(resp, ControlResponse::Ack { ok: true, .. }));
+        assert_eq!(
+            pm.traffic_defense.preset,
+            yip_obf::TrafficDefensePreset::Paranoid
+        );
+        assert_eq!(pm.traffic_defense.buckets, vec![512, 1420]); // Sorted
+        assert_eq!(pm.traffic_defense.cover_interval_ms, Some(100));
+        assert_eq!(pm.traffic_defense.cover_burst_max, 3);
+        assert_eq!(pm.traffic_defense.jitter_max_ms, 5);
+
+        // Set DAITA config with bad preset
+        let bad_preset = ControlCmd::SetDaitaConfig {
+            preset: Some("invalid".into()),
+            buckets: None,
+            cover_interval_ms: None,
+            cover_burst_max: None,
+            jitter_max_ms: None,
+        };
+        assert!(matches!(
+            dispatch_cmd(&mut pm, bad_preset, "yip0", start),
+            ControlResponse::Err { .. }
+        ));
+
+        // Set DAITA config with burst == 0
+        let bad_burst = ControlCmd::SetDaitaConfig {
+            preset: None,
+            buckets: None,
+            cover_interval_ms: None,
+            cover_burst_max: Some(0),
+            jitter_max_ms: None,
+        };
+        assert!(matches!(
+            dispatch_cmd(&mut pm, bad_burst, "yip0", start),
             ControlResponse::Err { .. }
         ));
     }
