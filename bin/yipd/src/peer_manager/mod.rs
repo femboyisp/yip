@@ -504,6 +504,8 @@ pub struct PeerManager {
     pub fec_config: crate::control::FecConfig,
     /// Live DAITA traffic defense counters and telemetry (#182).
     pub daita_stats: DaitaStats,
+    /// Split-tunnel routing and traffic bypass engine (#184).
+    pub split_tunnel: crate::control::SplitTunnelState,
 }
 
 /// Dynamic DAITA traffic analysis defense runtime metrics.
@@ -647,6 +649,7 @@ impl PeerManager {
             last_cert_check_ms: 0,
             fec_config: crate::control::FecConfig::default(),
             daita_stats: DaitaStats::default(),
+            split_tunnel: crate::control::SplitTunnelState::default(),
         };
 
         // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
@@ -762,6 +765,179 @@ impl PeerManager {
             0.0
         };
         (self.traffic_defense.clone(), stats, ratio)
+    }
+
+    /// Return the active overlay routing table entries (#183).
+    pub fn routes(&self) -> Vec<crate::control::RouteEntry> {
+        self.peers
+            .iter()
+            .map(|p| {
+                let direct = matches!(
+                    p.path_kind,
+                    Some(PathKind::Direct) | Some(PathKind::Punched)
+                ) || (p.endpoint.is_some() && !p.relay);
+                let next_hop = if let Some(ep) = p.endpoint {
+                    ep.to_string()
+                } else if p.relay {
+                    "DERP Relay".to_string()
+                } else {
+                    "P2P Direct (pending)".to_string()
+                };
+                let peer_name: String = p.pubkey[..8].iter().map(|b| format!("{b:02x}")).collect();
+                let rtt = p.rtt_ms.unwrap_or(if direct { 10 } else { 45 });
+                let metric = if direct {
+                    10 + rtt.min(500)
+                } else {
+                    100 + rtt.min(500) * 2
+                };
+                crate::control::RouteEntry {
+                    prefix: format!("{}/128", p.addr),
+                    next_hop,
+                    peer_name,
+                    direct,
+                    mtu: 1420,
+                    margin: 80,
+                    metric,
+                }
+            })
+            .collect()
+    }
+
+    /// Project the mesh peer connections into an interactive topology graph (#183).
+    pub fn topology(&self, device_name: &str) -> crate::control::MeshTopologyGraph {
+        let self_node = crate::control::TopologyNode {
+            id: "node-self".to_string(),
+            label: if device_name.is_empty() {
+                "Local Node".to_string()
+            } else {
+                format!("{device_name} (Self)")
+            },
+            ip: self.local_addr().to_string(),
+            is_self: true,
+            is_relay: false,
+            rtt_ms: 0.0,
+            kem_algo: "ML-KEM-768".to_string(),
+            rx_bytes: 0,
+            tx_bytes: 0,
+        };
+
+        let mut nodes = vec![self_node];
+        let mut links = Vec::new();
+        let mut direct_peers = 0;
+        let mut relay_peers = 0;
+        let mut total_rtt = 0.0;
+        let total_peers = self.peers.len();
+
+        for p in &self.peers {
+            let direct = matches!(
+                p.path_kind,
+                Some(PathKind::Direct) | Some(PathKind::Punched)
+            ) || (p.endpoint.is_some() && !p.relay);
+            if direct {
+                direct_peers += 1;
+            } else {
+                relay_peers += 1;
+            }
+            let rtt = p.rtt_ms.unwrap_or(if direct { 10 } else { 45 }) as f64;
+            total_rtt += rtt;
+
+            let hex_id: String = p.pubkey[..8].iter().map(|b| format!("{b:02x}")).collect();
+            let peer_id = format!("node-{hex_id}");
+            let label = hex_id;
+
+            nodes.push(crate::control::TopologyNode {
+                id: peer_id.clone(),
+                label,
+                ip: p.addr.to_string(),
+                is_self: false,
+                is_relay: !direct,
+                rtt_ms: rtt,
+                kem_algo: "ML-KEM-768".to_string(),
+                rx_bytes: p.rx_bytes,
+                tx_bytes: p.tx_bytes,
+            });
+
+            let metric = if direct {
+                10 + (rtt as u32).min(500)
+            } else {
+                100 + (rtt as u32).min(500) * 2
+            };
+
+            let latency_category = if rtt <= 20.0 {
+                crate::control::LatencyCategory::Optimal
+            } else if rtt <= 60.0 {
+                crate::control::LatencyCategory::Normal
+            } else {
+                crate::control::LatencyCategory::Elevated
+            };
+
+            links.push(crate::control::TopologyLink {
+                source: "node-self".to_string(),
+                target: peer_id,
+                direct,
+                rtt_ms: rtt,
+                metric,
+                latency_category,
+            });
+        }
+
+        let avg_rtt_ms = if total_peers > 0 {
+            total_rtt / total_peers as f64
+        } else {
+            0.0
+        };
+
+        crate::control::MeshTopologyGraph {
+            nodes,
+            links,
+            total_peers,
+            direct_peers,
+            relay_peers,
+            avg_rtt_ms,
+        }
+    }
+
+    /// Return active split-tunnel configuration and telemetry statistics (#184).
+    pub fn split_tunnel_status(
+        &self,
+    ) -> (
+        crate::control::SplitTunnelConfig,
+        crate::control::SplitTunnelTelemetry,
+    ) {
+        (self.split_tunnel.config(), self.split_tunnel.telemetry)
+    }
+
+    /// Dynamically update split-tunnel bypass rules and operational mode (#184).
+    pub fn set_split_tunnel_config(
+        &mut self,
+        enabled: Option<bool>,
+        mode: Option<crate::control::SplitMode>,
+        cidrs: Option<Vec<String>>,
+        domains: Option<Vec<String>>,
+        apps: Option<Vec<String>>,
+    ) -> Result<crate::control::SplitTunnelConfig, String> {
+        if let Some(en) = enabled {
+            self.split_tunnel.enabled = en;
+        }
+        if let Some(m) = mode {
+            self.split_tunnel.mode = m;
+        }
+        if let Some(c_list) = cidrs {
+            let mut parsed = Vec::new();
+            for c in &c_list {
+                let p = crate::control::parse_cidr(c)?;
+                parsed.push(p);
+            }
+            self.split_tunnel.cidrs = c_list;
+            self.split_tunnel.parsed_cidrs = parsed;
+        }
+        if let Some(d_list) = domains {
+            self.split_tunnel.domains = d_list;
+        }
+        if let Some(a_list) = apps {
+            self.split_tunnel.apps = a_list;
+        }
+        Ok(self.split_tunnel.config())
     }
 
     /// Query the milliseconds remaining until the earliest scheduled micro-jitter datagram is due.
@@ -1459,6 +1635,14 @@ impl PeerManager {
     }
 
     fn on_tun_dispatch(&mut self, inner: &[u8], now_ms: u64) -> &[EgressDatagram] {
+        if let Some(dst) = crate::control::extract_ip_dst(inner) {
+            if self.split_tunnel.should_bypass(dst) {
+                self.split_tunnel.record_bypassed(inner.len() as u64);
+                return &[];
+            }
+        }
+        self.split_tunnel.record_routed(inner.len() as u64);
+
         let idx = match self.route_tun_index(inner) {
             Some(i) => i,
             None => {

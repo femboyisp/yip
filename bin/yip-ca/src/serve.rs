@@ -178,7 +178,7 @@ pub async fn run_coordinator(
                     let mut session_info = None;
                     let mut signers_to_dispatch = Vec::new();
 
-                    {
+                    for _ in 0..60 {
                         let mut s = state.lock().await;
                         s.roast.message = msg.clone();
                         if let Some((session_id, pkg, slot_map)) = s.roast.try_spawn_session() {
@@ -197,7 +197,10 @@ pub async fn run_coordinator(
                                     signers_to_dispatch.push((tx.clone(), req));
                                 }
                             }
+                            break;
                         }
+                        drop(s);
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
 
                     if let Some((session_id, _)) = session_info {
@@ -209,8 +212,8 @@ pub async fn run_coordinator(
 
                         // Wait for ROAST completion (polling shares)
                         let mut final_sig = None;
-                        for _ in 0..100 {
-                            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                        for _ in 0..200 {
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                             let s = state.lock().await;
                             if let Some(session) = s.roast.active_sessions.get(&session_id) {
                                 if session.collected_shares.len() >= s.threshold {

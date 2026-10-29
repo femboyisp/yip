@@ -199,4 +199,92 @@ fn control_socket_tick_integration() {
         yip_obf::TrafficDefensePreset::Balanced
     );
     assert_eq!(pm.traffic_defense.cover_interval_ms, Some(250));
+
+    // 11. Query live routing table via get_routes (#183)
+    writer.write_all(b"{\"cmd\":\"get_routes\"}\n").unwrap();
+    writer.flush().unwrap();
+
+    for _ in 0..50 {
+        let _ = pm.tick(1_100);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("\"ok\":true"));
+    assert!(line.contains("\"prefix\":"));
+    assert!(line.contains("\"mtu\":1420"));
+    assert!(line.contains("\"margin\":80"));
+
+    // 12. Query mesh topology graph via get_topology (#183)
+    writer.write_all(b"{\"cmd\":\"get_topology\"}\n").unwrap();
+    writer.flush().unwrap();
+
+    for _ in 0..50 {
+        let _ = pm.tick(1_110);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("\"ok\":true"));
+    assert!(line.contains("\"total_peers\":"));
+    assert!(line.contains("\"is_self\":true"));
+    assert!(line.contains("\"kem_algo\":\"ML-KEM-768\""));
+
+    // 13. Query initial split-tunnel status via get_split_tunnel (#184)
+    writer
+        .write_all(b"{\"cmd\":\"get_split_tunnel\"}\n")
+        .unwrap();
+    writer.flush().unwrap();
+
+    for _ in 0..50 {
+        let _ = pm.tick(1_120);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("\"ok\":true"));
+    assert!(line.contains("\"enabled\":false"));
+    assert!(line.contains("\"mode\":\"exclude\""));
+
+    // 14. Reconfigure split tunnel via set_split_tunnel (#184)
+    writer
+        .write_all(
+            b"{\"cmd\":\"set_split_tunnel\",\"enabled\":true,\"mode\":\"exclude\",\"cidrs\":[\"10.0.0.0/8\",\"192.168.0.0/16\"],\"domains\":[\"local\",\"corp\"]}\n",
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    for _ in 0..50 {
+        let _ = pm.tick(1_130);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("\"ok\":true"));
+    assert!(line.contains("split-tunnel configuration updated"));
+
+    // 15. Verify updated split tunnel status (#184)
+    writer
+        .write_all(b"{\"cmd\":\"get_split_tunnel\"}\n")
+        .unwrap();
+    writer.flush().unwrap();
+
+    for _ in 0..50 {
+        let _ = pm.tick(1_140);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("\"ok\":true"));
+    assert!(line.contains("\"enabled\":true"));
+    assert!(line.contains("\"mode\":\"exclude\""));
+    assert!(line.contains("\"cidrs\":[\"10.0.0.0/8\",\"192.168.0.0/16\"]"));
+    assert!(line.contains("\"domains\":[\"local\",\"corp\"]"));
+    assert!(pm.split_tunnel.enabled);
+    assert_eq!(pm.split_tunnel.cidrs.len(), 2);
 }

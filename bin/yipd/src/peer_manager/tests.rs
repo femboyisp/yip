@@ -2849,3 +2849,56 @@ fn zero_jitter_bypasses_queue() {
         assert_eq!(pm.next_scheduled_egress_delay_ms(500), None);
     }
 }
+
+#[test]
+fn split_tunnel_route_bypass_and_telemetry() {
+    let (mut pm, _tag, _ep) = pm_with_established_peer([1u8; 32], [2u8; 32], 100);
+
+    // Build an IPv4 packet destined to 10.42.0.1 (bytes 16..20 = 10, 42, 0, 1)
+    let mut pkt_bypass = vec![0x45, 0x00, 0x00, 0x28]; // IPv4, 40 bytes
+    pkt_bypass.extend_from_slice(&[0u8; 12]); // id, flags, ttl, proto, checksum, src
+    pkt_bypass.extend_from_slice(&[10, 42, 0, 1]); // dst = 10.42.0.1
+    pkt_bypass.resize(40, 0xEE);
+
+    // Build an IPv4 packet destined to 192.168.1.1
+    let mut pkt_routed = vec![0x45, 0x00, 0x00, 0x28];
+    pkt_routed.extend_from_slice(&[0u8; 12]);
+    pkt_routed.extend_from_slice(&[192, 168, 1, 1]); // dst = 192.168.1.1
+    pkt_routed.resize(40, 0xEE);
+
+    // 1. With split-tunnel disabled: both packets route through overlay
+    let out1 = pm.on_tun(&pkt_bypass, 100);
+    assert!(
+        !out1.is_empty(),
+        "routed normally when split tunnel is disabled"
+    );
+    assert_eq!(pm.split_tunnel.telemetry.bypassed_packets, 0);
+    assert_eq!(pm.split_tunnel.telemetry.overlay_packets, 1);
+
+    // 2. Enable split-tunnel in Exclude mode for 10.0.0.0/8
+    pm.set_split_tunnel_config(
+        Some(true),
+        Some(crate::control::SplitMode::Exclude),
+        Some(vec!["10.0.0.0/8".into()]),
+        None,
+        None,
+    )
+    .unwrap();
+
+    // 10.42.0.1 should be bypassed (empty egress, bypassed telemetry increments)
+    let out2 = pm.on_tun(&pkt_bypass, 110);
+    assert!(
+        out2.is_empty(),
+        "bypassed packet must not be transmitted over overlay"
+    );
+    assert_eq!(pm.split_tunnel.telemetry.bypassed_packets, 1);
+    assert_eq!(pm.split_tunnel.telemetry.bypassed_bytes, 40);
+
+    // 192.168.1.1 is not in exclude CIDRs, so it should be routed into overlay
+    let out3 = pm.on_tun(&pkt_routed, 120);
+    assert!(
+        !out3.is_empty(),
+        "non-excluded packet must route over overlay"
+    );
+    assert_eq!(pm.split_tunnel.telemetry.overlay_packets, 2);
+}

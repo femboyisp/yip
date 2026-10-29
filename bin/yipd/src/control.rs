@@ -69,6 +69,25 @@ pub enum ControlCmd {
         #[serde(default)]
         jitter_max_ms: Option<u64>,
     },
+    #[serde(rename = "get_routes")]
+    GetRoutes,
+    #[serde(rename = "get_topology")]
+    GetTopology,
+    #[serde(rename = "get_split_tunnel")]
+    GetSplitTunnelStatus,
+    #[serde(rename = "set_split_tunnel")]
+    SetSplitTunnelConfig {
+        #[serde(default)]
+        enabled: Option<bool>,
+        #[serde(default)]
+        mode: Option<String>,
+        #[serde(default)]
+        cidrs: Option<Vec<String>>,
+        #[serde(default)]
+        domains: Option<Vec<String>>,
+        #[serde(default)]
+        apps: Option<Vec<String>>,
+    },
 }
 
 /// Supported Reed-Solomon dynamic FEC presets.
@@ -251,6 +270,248 @@ pub fn defense_preset_name(preset: yip_obf::TrafficDefensePreset) -> &'static st
     }
 }
 
+/// An entry in the active overlay routing table (#183).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
+pub struct RouteEntry {
+    pub prefix: String,
+    pub next_hop: String,
+    pub peer_name: String,
+    pub direct: bool,
+    pub mtu: u16,
+    pub margin: u16,
+    pub metric: u32,
+}
+
+/// A node in the projected mesh topology graph (#183).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Default)]
+pub struct TopologyNode {
+    pub id: String,
+    pub label: String,
+    pub ip: String,
+    pub is_self: bool,
+    pub is_relay: bool,
+    pub rtt_ms: f64,
+    pub kem_algo: String,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+}
+
+/// Latency classification for link visualization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum LatencyCategory {
+    #[default]
+    Optimal,
+    Normal,
+    Elevated,
+}
+
+/// A bidirectional or directional edge in the projected mesh topology graph (#183).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Default)]
+pub struct TopologyLink {
+    pub source: String,
+    pub target: String,
+    pub direct: bool,
+    pub rtt_ms: f64,
+    pub metric: u32,
+    pub latency_category: LatencyCategory,
+}
+
+/// Complete network mesh topology projection (#183).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Default)]
+pub struct MeshTopologyGraph {
+    pub nodes: Vec<TopologyNode>,
+    pub links: Vec<TopologyLink>,
+    pub total_peers: usize,
+    pub direct_peers: usize,
+    pub relay_peers: usize,
+    pub avg_rtt_ms: f64,
+}
+
+/// Supported split-tunnel policy routing modes (#184).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SplitMode {
+    #[default]
+    Exclude,
+    Include,
+}
+
+impl std::str::FromStr for SplitMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "exclude" => Ok(SplitMode::Exclude),
+            "include" => Ok(SplitMode::Include),
+            other => Err(format!(
+                "unknown split mode: {other} (valid: exclude, include)"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for SplitMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SplitMode::Exclude => write!(f, "exclude"),
+            SplitMode::Include => write!(f, "include"),
+        }
+    }
+}
+
+/// Split-tunnel route and application bypass configuration (#184).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct SplitTunnelConfig {
+    pub enabled: bool,
+    pub mode: SplitMode,
+    pub cidrs: Vec<String>,
+    pub domains: Vec<String>,
+    pub apps: Vec<String>,
+}
+
+/// Live split-tunnel traffic counters (#184).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct SplitTunnelTelemetry {
+    pub bypassed_packets: u64,
+    pub bypassed_bytes: u64,
+    pub overlay_packets: u64,
+    pub overlay_bytes: u64,
+}
+
+/// Internal split-tunnel engine state with pre-parsed CIDR masks.
+#[derive(Debug, Clone, Default)]
+pub struct SplitTunnelState {
+    pub enabled: bool,
+    pub mode: SplitMode,
+    pub cidrs: Vec<String>,
+    pub parsed_cidrs: Vec<(std::net::IpAddr, u8)>,
+    pub domains: Vec<String>,
+    pub apps: Vec<String>,
+    pub telemetry: SplitTunnelTelemetry,
+}
+
+impl SplitTunnelState {
+    pub fn config(&self) -> SplitTunnelConfig {
+        SplitTunnelConfig {
+            enabled: self.enabled,
+            mode: self.mode,
+            cidrs: self.cidrs.clone(),
+            domains: self.domains.clone(),
+            apps: self.apps.clone(),
+        }
+    }
+
+    pub fn matches_ip(&self, ip: std::net::IpAddr) -> bool {
+        for &(net, prefix) in &self.parsed_cidrs {
+            if ip_matches_cidr(ip, net, prefix) {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn should_bypass(&self, ip: std::net::IpAddr) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        match self.mode {
+            SplitMode::Exclude => self.matches_ip(ip),
+            SplitMode::Include => !self.matches_ip(ip),
+        }
+    }
+
+    pub fn record_bypassed(&mut self, bytes: u64) {
+        self.telemetry.bypassed_packets += 1;
+        self.telemetry.bypassed_bytes += bytes;
+    }
+
+    pub fn record_routed(&mut self, bytes: u64) {
+        self.telemetry.overlay_packets += 1;
+        self.telemetry.overlay_bytes += bytes;
+    }
+}
+
+/// Parse a CIDR string into an IP address and prefix length.
+pub fn parse_cidr(cidr_str: &str) -> Result<(std::net::IpAddr, u8), String> {
+    let parts: Vec<&str> = cidr_str.trim().split('/').collect();
+    if parts.is_empty() || parts.len() > 2 {
+        return Err(format!("invalid CIDR syntax: '{cidr_str}'"));
+    }
+    let ip: std::net::IpAddr = parts[0]
+        .parse()
+        .map_err(|e| format!("invalid IP address '{}': {e}", parts[0]))?;
+    let prefix = if parts.len() == 2 {
+        let p: u8 = parts[1]
+            .parse()
+            .map_err(|e| format!("invalid prefix '{}': {e}", parts[1]))?;
+        match ip {
+            std::net::IpAddr::V4(_) if p > 32 => {
+                return Err(format!("IPv4 prefix /{p} must be <= 32"));
+            }
+            std::net::IpAddr::V6(_) if p > 128 => {
+                return Err(format!("IPv6 prefix /{p} must be <= 128"));
+            }
+            _ => p,
+        }
+    } else {
+        match ip {
+            std::net::IpAddr::V4(_) => 32,
+            std::net::IpAddr::V6(_) => 128,
+        }
+    };
+    Ok((ip, prefix))
+}
+
+/// Check if an IP address falls within a given CIDR subnet.
+pub fn ip_matches_cidr(target: std::net::IpAddr, net: std::net::IpAddr, prefix: u8) -> bool {
+    match (target, net) {
+        (std::net::IpAddr::V4(t), std::net::IpAddr::V4(n)) => {
+            if prefix == 0 {
+                return true;
+            }
+            if prefix > 32 {
+                return false;
+            }
+            let mask = if prefix >= 32 {
+                !0u32
+            } else {
+                !((1u32 << (32 - prefix)) - 1)
+            };
+            (u32::from(t) & mask) == (u32::from(n) & mask)
+        }
+        (std::net::IpAddr::V6(t), std::net::IpAddr::V6(n)) => {
+            if prefix == 0 {
+                return true;
+            }
+            if prefix > 128 {
+                return false;
+            }
+            let mask = if prefix >= 128 {
+                !0u128
+            } else {
+                !((1u128 << (128 - prefix)) - 1)
+            };
+            (u128::from(t) & mask) == (u128::from(n) & mask)
+        }
+        _ => false,
+    }
+}
+
+/// Extract destination IP address from raw IPv4 or IPv6 packet bytes.
+pub fn extract_ip_dst(inner: &[u8]) -> Option<std::net::IpAddr> {
+    if inner.len() >= 20 && inner[0] >> 4 == 4 {
+        let mut octets = [0u8; 4];
+        octets.copy_from_slice(&inner[16..20]);
+        Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets)))
+    } else if inner.len() >= 40 && inner[0] >> 4 == 6 {
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(&inner[24..40]);
+        Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)))
+    } else {
+        None
+    }
+}
+
 /// Outbound control command responses returned to clients.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(untagged)]
@@ -306,6 +567,26 @@ pub enum ControlResponse {
         decoy_packets_tx: u64,
         decoy_bytes_tx: u64,
         padding_ratio_pct: f32,
+    },
+    Routes {
+        ok: bool,
+        routes: Vec<RouteEntry>,
+    },
+    Topology {
+        ok: bool,
+        topology: MeshTopologyGraph,
+    },
+    SplitTunnelStatus {
+        ok: bool,
+        enabled: bool,
+        mode: String,
+        cidrs: Vec<String>,
+        domains: Vec<String>,
+        apps: Vec<String>,
+        bypassed_packets: u64,
+        bypassed_bytes: u64,
+        overlay_packets: u64,
+        overlay_bytes: u64,
     },
     Ack {
         ok: bool,
@@ -774,6 +1055,65 @@ pub fn dispatch_cmd(
             ControlResponse::Ack {
                 ok: true,
                 message: format!("DAITA traffic defense configuration updated: {summary}"),
+            }
+        }
+        ControlCmd::GetRoutes => {
+            let routes = pm.routes();
+            ControlResponse::Routes { ok: true, routes }
+        }
+        ControlCmd::GetTopology => {
+            let topology = pm.topology(device_name);
+            ControlResponse::Topology { ok: true, topology }
+        }
+        ControlCmd::GetSplitTunnelStatus => {
+            let (cfg, telem) = pm.split_tunnel_status();
+            ControlResponse::SplitTunnelStatus {
+                ok: true,
+                enabled: cfg.enabled,
+                mode: cfg.mode.to_string(),
+                cidrs: cfg.cidrs,
+                domains: cfg.domains,
+                apps: cfg.apps,
+                bypassed_packets: telem.bypassed_packets,
+                bypassed_bytes: telem.bypassed_bytes,
+                overlay_packets: telem.overlay_packets,
+                overlay_bytes: telem.overlay_bytes,
+            }
+        }
+        ControlCmd::SetSplitTunnelConfig {
+            enabled,
+            mode,
+            cidrs,
+            domains,
+            apps,
+        } => {
+            let parsed_mode = if let Some(m_str) = mode {
+                match m_str.parse::<SplitMode>() {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        return ControlResponse::Err {
+                            ok: false,
+                            error: e,
+                        };
+                    }
+                }
+            } else {
+                None
+            };
+            match pm.set_split_tunnel_config(enabled, parsed_mode, cidrs, domains, apps) {
+                Ok(cfg) => ControlResponse::Ack {
+                    ok: true,
+                    message: format!(
+                        "split-tunnel configuration updated: enabled={}, mode={}, cidrs={}",
+                        cfg.enabled,
+                        cfg.mode,
+                        cfg.cidrs.len()
+                    ),
+                },
+                Err(e) => ControlResponse::Err {
+                    ok: false,
+                    error: e,
+                },
             }
         }
     }
@@ -1272,6 +1612,218 @@ pub fn run_cli_daita_set(
             cover_interval_ms,
             cover_burst_max,
             jitter_max_ms,
+        },
+    )?;
+    match resp {
+        ControlResponse::Ack { message, .. } => {
+            println!("\x1b[1;32m✓\x1b[0m {message}");
+            Ok(())
+        }
+        ControlResponse::Err { error, .. } => Err(error),
+        _ => Err("unexpected response format from daemon".into()),
+    }
+}
+
+/// Query and display the live mesh overlay routing table (#183).
+pub fn run_cli_routes(socket_path: &Path, json: bool) -> Result<(), String> {
+    let resp = client_query(socket_path, ControlCmd::GetRoutes)?;
+    if json {
+        let text = serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?;
+        println!("{text}");
+        return Ok(());
+    }
+    match resp {
+        ControlResponse::Routes { ok, routes } => {
+            if !ok {
+                return Err("daemon reported routes error".into());
+            }
+            println!(
+                "\x1b[1;38;5;208m●\x1b[0m \x1b[1mActive Overlay Routing Table\x1b[0m ({} routes)",
+                routes.len()
+            );
+            if routes.is_empty() {
+                println!("  No active routes established.");
+                return Ok(());
+            }
+            println!(
+                "  {:<36} {:<24} {:<18} {:<8} {:<6} {:<8} {:<6}",
+                "PREFIX", "NEXT_HOP", "PEER", "KIND", "MTU", "MARGIN", "METRIC"
+            );
+            println!("  {}", "-".repeat(112));
+            for r in routes {
+                let kind_str = if r.direct {
+                    "\x1b[1;32mDirect\x1b[0m"
+                } else {
+                    "\x1b[1;33mRelayed\x1b[0m"
+                };
+                println!(
+                    "  {:<36} {:<24} {:<18} {:<8} {:<6} {:<8} {:<6}",
+                    r.prefix, r.next_hop, r.peer_name, kind_str, r.mtu, r.margin, r.metric
+                );
+            }
+            Ok(())
+        }
+        ControlResponse::Err { error, .. } => Err(error),
+        _ => Err("unexpected response format from daemon".into()),
+    }
+}
+
+/// Query and display the projected mesh topology graph (#183).
+pub fn run_cli_topology(socket_path: &Path, json: bool) -> Result<(), String> {
+    let resp = client_query(socket_path, ControlCmd::GetTopology)?;
+    if json {
+        let text = serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?;
+        println!("{text}");
+        return Ok(());
+    }
+    match resp {
+        ControlResponse::Topology { ok, topology } => {
+            if !ok {
+                return Err("daemon reported topology error".into());
+            }
+            println!(
+                "\x1b[1;38;5;208m●\x1b[0m \x1b[1mMesh Topology Graph\x1b[0m ({} peers: {} direct, {} relayed, avg {:.1}ms RTT)",
+                topology.total_peers, topology.direct_peers, topology.relay_peers, topology.avg_rtt_ms
+            );
+            println!("\n  \x1b[1mNodes:\x1b[0m");
+            for n in &topology.nodes {
+                let role = if n.is_self {
+                    "\x1b[1;32m[SELF]\x1b[0m"
+                } else if n.is_relay {
+                    "\x1b[1;33m[RELAY]\x1b[0m"
+                } else {
+                    "\x1b[1;36m[PEER]\x1b[0m"
+                };
+                let rtt_str = if n.is_self {
+                    "local".to_string()
+                } else {
+                    format!("{:.1}ms", n.rtt_ms)
+                };
+                println!(
+                    "    {:<8} {:<20} {:<36} {:<12} {}",
+                    role, n.label, n.ip, n.kem_algo, rtt_str
+                );
+            }
+            if !topology.links.is_empty() {
+                println!("\n  \x1b[1mLinks:\x1b[0m");
+                for l in &topology.links {
+                    let direct_str = if l.direct { "Direct P2P" } else { "Relayed" };
+                    let cat_color = match l.latency_category {
+                        LatencyCategory::Optimal => "\x1b[1;32mOptimal\x1b[0m",
+                        LatencyCategory::Normal => "\x1b[1;36mNormal\x1b[0m",
+                        LatencyCategory::Elevated => "\x1b[1;31mElevated\x1b[0m",
+                    };
+                    println!(
+                        "    {} -> {} ({}, {:.1}ms, metric {}, category: {})",
+                        l.source, l.target, direct_str, l.rtt_ms, l.metric, cat_color
+                    );
+                }
+            }
+            Ok(())
+        }
+        ControlResponse::Err { error, .. } => Err(error),
+        _ => Err("unexpected response format from daemon".into()),
+    }
+}
+
+/// Query and display split-tunnel route and application bypass status (#184).
+pub fn run_cli_split_status(socket_path: &Path, json: bool) -> Result<(), String> {
+    let resp = client_query(socket_path, ControlCmd::GetSplitTunnelStatus)?;
+    if json {
+        let text = serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?;
+        println!("{text}");
+        return Ok(());
+    }
+    match resp {
+        ControlResponse::SplitTunnelStatus {
+            ok,
+            enabled,
+            mode,
+            cidrs,
+            domains,
+            apps,
+            bypassed_packets,
+            bypassed_bytes,
+            overlay_packets,
+            overlay_bytes,
+        } => {
+            if !ok {
+                return Err("daemon reported split tunnel error".into());
+            }
+            println!("\x1b[1;38;5;208m●\x1b[0m \x1b[1mSplit-Tunnel Policy Controller\x1b[0m");
+            println!(
+                "  Status:              {}",
+                if enabled {
+                    "\x1b[1;32mENABLED\x1b[0m"
+                } else {
+                    "\x1b[1;31mDISABLED\x1b[0m"
+                }
+            );
+            println!(
+                "  Policy Mode:         \x1b[1;36m{}\x1b[0m",
+                mode.to_uppercase()
+            );
+            println!(
+                "  Bypass CIDRs ({}):     {}",
+                cidrs.len(),
+                if cidrs.is_empty() {
+                    "none".into()
+                } else {
+                    cidrs.join(", ")
+                }
+            );
+            println!(
+                "  Bypass Domains ({}):   {}",
+                domains.len(),
+                if domains.is_empty() {
+                    "none".into()
+                } else {
+                    domains.join(", ")
+                }
+            );
+            println!(
+                "  Bypass Apps ({}):      {}",
+                apps.len(),
+                if apps.is_empty() {
+                    "none".into()
+                } else {
+                    apps.join(", ")
+                }
+            );
+            println!(
+                "  Bypassed Traffic:    {} pkts / {} ({bypassed_bytes} B)",
+                bypassed_packets,
+                format_bytes(bypassed_bytes)
+            );
+            println!(
+                "  Overlay Traffic:     {} pkts / {} ({overlay_bytes} B)",
+                overlay_packets,
+                format_bytes(overlay_bytes)
+            );
+            Ok(())
+        }
+        ControlResponse::Err { error, .. } => Err(error),
+        _ => Err("unexpected response format from daemon".into()),
+    }
+}
+
+/// Dynamically update split-tunnel route and application bypass configuration (#184).
+pub fn run_cli_split_set(
+    socket_path: &Path,
+    enabled: Option<bool>,
+    mode: Option<String>,
+    cidrs: Option<Vec<String>>,
+    domains: Option<Vec<String>>,
+    apps: Option<Vec<String>>,
+) -> Result<(), String> {
+    let resp = client_query(
+        socket_path,
+        ControlCmd::SetSplitTunnelConfig {
+            enabled,
+            mode,
+            cidrs,
+            domains,
+            apps,
         },
     )?;
     match resp {
@@ -1831,6 +2383,33 @@ mod tests {
         assert!(
             run_cli_daita_set(path, Some("invalid_preset".into()), None, None, None, None).is_err()
         );
+        assert!(run_cli_routes(path, false).is_ok());
+        assert!(run_cli_routes(path, true).is_ok());
+        assert!(run_cli_topology(path, false).is_ok());
+        assert!(run_cli_topology(path, true).is_ok());
+        assert!(run_cli_split_status(path, false).is_ok());
+        assert!(run_cli_split_status(path, true).is_ok());
+        assert!(run_cli_split_set(
+            path,
+            Some(true),
+            Some("exclude".into()),
+            Some(vec!["10.0.0.0/8".into()]),
+            Some(vec!["corp".into()]),
+            Some(vec!["curl".into()])
+        )
+        .is_ok());
+        assert!(
+            run_cli_split_set(path, None, Some("invalid_mode".into()), None, None, None).is_err()
+        );
+        assert!(run_cli_split_set(
+            path,
+            None,
+            None,
+            Some(vec!["invalid_cidr".into()]),
+            None,
+            None
+        )
+        .is_err());
 
         running.store(false, Ordering::Relaxed);
         let _ = srv.join();
@@ -2051,5 +2630,163 @@ mod tests {
             dispatch_cmd(&mut pm, bad_burst, "yip0", start),
             ControlResponse::Err { .. }
         ));
+    }
+
+    #[test]
+    fn control_protocol_routes_and_topology() {
+        let mut pm = crate::peer_manager::testutil::test_peer_manager();
+        let start = Instant::now();
+
+        // 1. GetRoutes
+        let routes_resp = dispatch_cmd(&mut pm, ControlCmd::GetRoutes, "yip0", start);
+        match routes_resp {
+            ControlResponse::Routes { ok, routes } => {
+                assert!(ok);
+                assert_eq!(routes.len(), 1);
+                assert_eq!(routes[0].mtu, 1420);
+                assert_eq!(routes[0].margin, 80);
+                assert!(routes[0].direct);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        // 2. GetTopology
+        let topo_resp = dispatch_cmd(&mut pm, ControlCmd::GetTopology, "yip0", start);
+        match topo_resp {
+            ControlResponse::Topology { ok, topology } => {
+                assert!(ok);
+                assert_eq!(topology.total_peers, 1);
+                assert_eq!(topology.direct_peers, 1);
+                assert_eq!(topology.relay_peers, 0);
+                assert_eq!(topology.nodes.len(), 2);
+                assert!(topology.nodes[0].is_self);
+                assert_eq!(topology.nodes[0].kem_algo, "ML-KEM-768");
+                assert_eq!(topology.links.len(), 1);
+                assert_eq!(topology.links[0].source, "node-self");
+                assert!(topology.links[0].direct);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn control_protocol_split_tunnel() {
+        let mut pm = crate::peer_manager::testutil::test_peer_manager();
+        let start = Instant::now();
+
+        // Initial default status
+        let status_resp = dispatch_cmd(&mut pm, ControlCmd::GetSplitTunnelStatus, "yip0", start);
+        match status_resp {
+            ControlResponse::SplitTunnelStatus {
+                ok,
+                enabled,
+                mode,
+                cidrs,
+                domains,
+                apps,
+                bypassed_packets,
+                bypassed_bytes,
+                overlay_packets,
+                overlay_bytes,
+            } => {
+                assert!(ok);
+                assert!(!enabled);
+                assert_eq!(mode, "exclude");
+                assert!(cidrs.is_empty());
+                assert!(domains.is_empty());
+                assert!(apps.is_empty());
+                assert_eq!(bypassed_packets, 0);
+                assert_eq!(bypassed_bytes, 0);
+                assert_eq!(overlay_packets, 0);
+                assert_eq!(overlay_bytes, 0);
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+
+        // Set valid config
+        let set_cmd = ControlCmd::SetSplitTunnelConfig {
+            enabled: Some(true),
+            mode: Some("exclude".into()),
+            cidrs: Some(vec!["10.0.0.0/8".into(), "192.168.1.0/24".into()]),
+            domains: Some(vec!["local".into()]),
+            apps: Some(vec!["curl".into()]),
+        };
+        let resp = dispatch_cmd(&mut pm, set_cmd, "yip0", start);
+        assert!(matches!(resp, ControlResponse::Ack { ok: true, .. }));
+        assert!(pm.split_tunnel.enabled);
+        assert_eq!(pm.split_tunnel.mode, SplitMode::Exclude);
+        assert_eq!(pm.split_tunnel.cidrs.len(), 2);
+        assert_eq!(pm.split_tunnel.domains, vec!["local"]);
+        assert_eq!(pm.split_tunnel.apps, vec!["curl"]);
+
+        // Set bad CIDR
+        let bad_cidr = ControlCmd::SetSplitTunnelConfig {
+            enabled: None,
+            mode: None,
+            cidrs: Some(vec!["invalid_cidr".into()]),
+            domains: None,
+            apps: None,
+        };
+        assert!(matches!(
+            dispatch_cmd(&mut pm, bad_cidr, "yip0", start),
+            ControlResponse::Err { .. }
+        ));
+
+        // Set bad mode
+        let bad_mode = ControlCmd::SetSplitTunnelConfig {
+            enabled: None,
+            mode: Some("bad_mode".into()),
+            cidrs: None,
+            domains: None,
+            apps: None,
+        };
+        assert!(matches!(
+            dispatch_cmd(&mut pm, bad_mode, "yip0", start),
+            ControlResponse::Err { .. }
+        ));
+    }
+
+    #[test]
+    fn test_cidr_parsing_and_matching() {
+        // IPv4 valid CIDRs
+        let (ip, p) = parse_cidr("10.0.0.0/8").unwrap();
+        assert_eq!(ip, "10.0.0.0".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(p, 8);
+        assert!(ip_matches_cidr("10.42.1.99".parse().unwrap(), ip, p));
+        assert!(!ip_matches_cidr("192.168.1.1".parse().unwrap(), ip, p));
+
+        // Single IPv4 without prefix defaults to /32
+        let (ip32, p32) = parse_cidr("192.168.1.50").unwrap();
+        assert_eq!(p32, 32);
+        assert!(ip_matches_cidr("192.168.1.50".parse().unwrap(), ip32, p32));
+        assert!(!ip_matches_cidr("192.168.1.51".parse().unwrap(), ip32, p32));
+
+        // IPv6 valid CIDRs
+        let (v6_net, v6_p) = parse_cidr("fd00::/8").unwrap();
+        assert_eq!(v6_p, 8);
+        assert!(ip_matches_cidr(
+            "fd00:7969:70::1".parse().unwrap(),
+            v6_net,
+            v6_p
+        ));
+        assert!(!ip_matches_cidr(
+            "2001:db8::1".parse().unwrap(),
+            v6_net,
+            v6_p
+        ));
+
+        // IPv4 /0 matches everything IPv4
+        let (zero_net, zero_p) = parse_cidr("0.0.0.0/0").unwrap();
+        assert!(ip_matches_cidr(
+            "1.2.3.4".parse().unwrap(),
+            zero_net,
+            zero_p
+        ));
+
+        // Error cases
+        assert!(parse_cidr("not_an_ip/24").is_err());
+        assert!(parse_cidr("10.0.0.1/33").is_err());
+        assert!(parse_cidr("fd00::/129").is_err());
+        assert!(parse_cidr("10.0.0.1/bad").is_err());
     }
 }

@@ -155,18 +155,63 @@ fn print_cli_usage(subcmd: &str) {
             println!("      --json                      Output raw JSON");
             println!("  -h, --help                      Print help");
         }
+        "routes" => {
+            println!("Usage: yipctl routes [OPTIONS]");
+            println!();
+            println!("Display the live mesh overlay routing table and next-hop metrics.");
+            println!();
+            println!("Options:");
+            println!("  -c, --control <SOCKET>  Path to yipd UNIX control socket");
+            println!("      --json              Output raw JSON");
+            println!("  -h, --help              Print help");
+        }
+        "topology" => {
+            println!("Usage: yipctl topology [OPTIONS]");
+            println!();
+            println!("Display the interactive mesh topology graph with nodes and link categories.");
+            println!();
+            println!("Options:");
+            println!("  -c, --control <SOCKET>  Path to yipd UNIX control socket");
+            println!("      --json              Output raw JSON");
+            println!("  -h, --help              Print help");
+        }
+        "split" | "split-tunnel" => {
+            println!("Usage: yipctl split <status|set> [OPTIONS]");
+            println!();
+            println!("Inspect or dynamically tune split-tunnel routing and traffic bypass rules.");
+            println!();
+            println!("Commands:");
+            println!(
+                "  status                               Query split-tunnel policy & telemetry"
+            );
+            println!("  set [--enable|--disable] [--mode M]  Update bypass rules & subnets");
+            println!();
+            println!("Options:");
+            println!("  -c, --control <SOCKET>          Path to yipd UNIX control socket");
+            println!("      --enable                    Enable split-tunnel policy enforcement");
+            println!("      --disable                   Disable split-tunnel policy enforcement");
+            println!("  -m, --mode <MODE>               Policy mode (exclude, include)");
+            println!("      --cidrs <C1,C2,...>         Comma-separated subnets (e.g. 10.0.0.0/8)");
+            println!("      --domains <D1,D2,...>       Comma-separated domain suffixes");
+            println!("      --apps <A1,A2,...>          Comma-separated application names");
+            println!("      --json                      Output raw JSON");
+            println!("  -h, --help                      Print help");
+        }
         _ => {
             println!("Usage: yipctl <COMMAND> [OPTIONS]");
             println!();
             println!("Commands:");
-            println!("  status  Display daemon status and summary");
-            println!("  peers   List connected peers and statistics");
-            println!("  top     Real-time ANSI telemetry dashboard");
-            println!("  ping    Probe round-trip latency to a peer");
-            println!("  peer    Dynamically add or remove peers");
-            println!("  fec     Query or configure dynamic Reed-Solomon FEC");
-            println!("  daita   Query or configure dynamic DAITA traffic defense");
-            println!("  cert    Display certificate status or trigger manual renewal");
+            println!("  status    Display daemon status and summary");
+            println!("  peers     List connected peers and statistics");
+            println!("  routes    Display live mesh overlay routing table");
+            println!("  topology  Display mesh topology graph projection");
+            println!("  split     Inspect or configure split-tunnel bypass rules");
+            println!("  top       Real-time ANSI telemetry dashboard");
+            println!("  ping      Probe round-trip latency to a peer");
+            println!("  peer      Dynamically add or remove peers");
+            println!("  fec       Query or configure dynamic Reed-Solomon FEC");
+            println!("  daita     Query or configure dynamic DAITA traffic defense");
+            println!("  cert      Display certificate status or trigger manual renewal");
             println!();
             println!("Options:");
             println!("  -V, --version  Print version");
@@ -190,6 +235,11 @@ fn run_client_subcommand(
     let mut cover_interval: Option<u64> = None;
     let mut cover_burst: Option<u64> = None;
     let mut jitter: Option<u64> = None;
+    let mut mode: Option<String> = None;
+    let mut split_enabled: Option<bool> = None;
+    let mut cidrs: Option<Vec<String>> = None;
+    let mut domains: Option<Vec<String>> = None;
+    let mut apps: Option<Vec<String>> = None;
     let mut positional: Vec<String> = Vec::new();
 
     while let Some(arg) = args.next() {
@@ -338,6 +388,63 @@ fn run_client_subcommand(
                     )
                 })?;
                 jitter = Some(j);
+            }
+            "--mode" | "-m" => {
+                let m = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--mode requires mode name (exclude, include)",
+                    )
+                })?;
+                mode = Some(m);
+            }
+            "--enable" => {
+                split_enabled = Some(true);
+            }
+            "--disable" => {
+                split_enabled = Some(false);
+            }
+            "--cidrs" => {
+                let s = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--cidrs requires comma-separated subnets (e.g. 10.0.0.0/8,192.168.0.0/16)",
+                    )
+                })?;
+                let list = s
+                    .split(',')
+                    .map(|c| c.trim().to_string())
+                    .filter(|c| !c.is_empty())
+                    .collect();
+                cidrs = Some(list);
+            }
+            "--domains" => {
+                let s = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--domains requires comma-separated domain suffixes",
+                    )
+                })?;
+                let list = s
+                    .split(',')
+                    .map(|d| d.trim().to_string())
+                    .filter(|d| !d.is_empty())
+                    .collect();
+                domains = Some(list);
+            }
+            "--apps" => {
+                let s = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--apps requires comma-separated application names",
+                    )
+                })?;
+                let list = s
+                    .split(',')
+                    .map(|a| a.trim().to_string())
+                    .filter(|a| !a.is_empty())
+                    .collect();
+                apps = Some(list);
             }
             "--help" | "-h" => {
                 print_cli_usage(subcmd);
@@ -544,6 +651,27 @@ fn run_client_subcommand(
                 }
             }
         }
+        "routes" => control::run_cli_routes(&socket, json).map_err(std::io::Error::other),
+        "topology" => control::run_cli_topology(&socket, json).map_err(std::io::Error::other),
+        "split" | "split-tunnel" => {
+            let action = positional.first().map(|s| s.as_str()).unwrap_or("status");
+            match action {
+                "status" => {
+                    control::run_cli_split_status(&socket, json).map_err(std::io::Error::other)
+                }
+                "set" => {
+                    control::run_cli_split_set(&socket, split_enabled, mode, cidrs, domains, apps)
+                        .map_err(std::io::Error::other)
+                }
+                other => {
+                    eprintln!("Unknown split action: {other}");
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("unknown split action: {other}"),
+                    ))
+                }
+            }
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("unknown subcommand: {subcmd}"),
@@ -579,6 +707,9 @@ fn main() -> std::io::Result<()> {
             Some("fec") => return run_client_subcommand("fec", args),
             Some("daita") => return run_client_subcommand("daita", args),
             Some("cert") => return run_client_subcommand("cert", args),
+            Some("routes") => return run_client_subcommand("routes", args),
+            Some("topology") => return run_client_subcommand("topology", args),
+            Some("split") | Some("split-tunnel") => return run_client_subcommand("split", args),
             Some("genkey") | Some("--genkey") => {
                 let kp = yip_crypto::generate_keypair();
                 println!("private={}", hex_encode(&kp.private));
@@ -617,6 +748,9 @@ fn main() -> std::io::Result<()> {
         Some("fec") => run_client_subcommand("fec", args),
         Some("daita") => run_client_subcommand("daita", args),
         Some("cert") => run_client_subcommand("cert", args),
+        Some("routes") => run_client_subcommand("routes", args),
+        Some("topology") => run_client_subcommand("topology", args),
+        Some("split") | Some("split-tunnel") => run_client_subcommand("split", args),
         Some("--version") | Some("-V") => {
             println!("{}", banner());
             Ok(())
