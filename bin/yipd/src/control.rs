@@ -10,7 +10,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::config::PeerConfig;
 use crate::peer_manager::{PeerManager, PeerStats};
@@ -88,6 +88,24 @@ pub enum ControlCmd {
         #[serde(default)]
         apps: Option<Vec<String>>,
     },
+    #[serde(rename = "trace_path")]
+    TracePath { peer_node_id: String },
+    #[serde(rename = "ping_peer")]
+    PingPeer {
+        peer_node_id: String,
+        #[serde(default = "default_ping_count")]
+        count: u32,
+        #[serde(default = "default_ping_timeout_ms")]
+        timeout_ms: u64,
+    },
+}
+
+fn default_ping_count() -> u32 {
+    4
+}
+
+fn default_ping_timeout_ms() -> u64 {
+    2000
 }
 
 /// Supported Reed-Solomon dynamic FEC presets.
@@ -512,6 +530,32 @@ pub fn extract_ip_dst(inner: &[u8]) -> Option<std::net::IpAddr> {
     }
 }
 
+/// A single segment or hop along a mesh circuit trace (#187).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Default)]
+pub struct HopTrace {
+    pub hop_index: u32,
+    pub node_id: String,
+    pub endpoint: Option<String>,
+    pub rtt_ms: f64,
+    pub is_direct: bool,
+    pub transport: String,
+}
+
+/// Statistics and probe samples from pinging a mesh peer (#187).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Default)]
+pub struct PingPeerResult {
+    pub target: String,
+    pub endpoint: Option<String>,
+    pub sent: u32,
+    pub received: u32,
+    pub packet_loss_pct: f64,
+    pub min_rtt_ms: Option<f64>,
+    pub avg_rtt_ms: Option<f64>,
+    pub max_rtt_ms: Option<f64>,
+    pub stddev_rtt_ms: Option<f64>,
+    pub samples: Vec<f64>,
+}
+
 /// Outbound control command responses returned to clients.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(untagged)]
@@ -587,6 +631,26 @@ pub enum ControlResponse {
         bypassed_bytes: u64,
         overlay_packets: u64,
         overlay_bytes: u64,
+    },
+    TracePath {
+        ok: bool,
+        target: String,
+        reachable: bool,
+        hops: Vec<HopTrace>,
+        total_rtt_ms: f64,
+    },
+    PingPeer {
+        ok: bool,
+        target: String,
+        endpoint: Option<String>,
+        sent: u32,
+        received: u32,
+        packet_loss_pct: f64,
+        min_rtt_ms: Option<f64>,
+        avg_rtt_ms: Option<f64>,
+        max_rtt_ms: Option<f64>,
+        stddev_rtt_ms: Option<f64>,
+        samples: Vec<f64>,
     },
     Ack {
         ok: bool,
@@ -1116,6 +1180,39 @@ pub fn dispatch_cmd(
                 },
             }
         }
+        ControlCmd::TracePath { peer_node_id } => {
+            let (reachable, hops, total_rtt) = pm.trace_path(&peer_node_id);
+            ControlResponse::TracePath {
+                ok: true,
+                target: peer_node_id,
+                reachable,
+                hops,
+                total_rtt_ms: total_rtt,
+            }
+        }
+        ControlCmd::PingPeer {
+            peer_node_id,
+            count,
+            timeout_ms,
+        } => match pm.ping_peer(&peer_node_id, count, timeout_ms) {
+            Ok(res) => ControlResponse::PingPeer {
+                ok: true,
+                target: res.target,
+                endpoint: res.endpoint,
+                sent: res.sent,
+                received: res.received,
+                packet_loss_pct: res.packet_loss_pct,
+                min_rtt_ms: res.min_rtt_ms,
+                avg_rtt_ms: res.avg_rtt_ms,
+                max_rtt_ms: res.max_rtt_ms,
+                stddev_rtt_ms: res.stddev_rtt_ms,
+                samples: res.samples,
+            },
+            Err(e) => ControlResponse::Err {
+                ok: false,
+                error: e,
+            },
+        },
     }
 }
 
@@ -1368,70 +1465,145 @@ fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Ping a peer through the mesh and display live latency.
-pub fn run_cli_ping(socket_path: &Path, target: &str, count: usize) -> Result<(), String> {
-    let resp = client_query(socket_path, ControlCmd::ListPeers)?;
-    let peers = match resp {
-        ControlResponse::ListPeers { ok: true, peers } => peers,
-        _ => return Err("failed to list peers from daemon".into()),
-    };
-    let peer = peers
-        .iter()
-        .find(|p| {
-            p.node_addr.to_string() == target
-                || p.endpoint.map(|e| e.to_string()).as_deref() == Some(target)
-                || to_hex(&p.public_key).starts_with(target)
-        })
-        .or_else(|| {
-            if let Ok(idx) = target.parse::<usize>() {
-                if idx > 0 && idx <= peers.len() {
-                    return Some(&peers[idx - 1]);
+/// Ping a peer through the mesh and display live latency (#187).
+pub fn run_cli_ping(
+    socket_path: &Path,
+    target: &str,
+    count: u32,
+    timeout_ms: u64,
+    json: bool,
+) -> Result<(), String> {
+    let resp = client_query(
+        socket_path,
+        ControlCmd::PingPeer {
+            peer_node_id: target.to_string(),
+            count,
+            timeout_ms,
+        },
+    )?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+    match resp {
+        ControlResponse::PingPeer {
+            target,
+            endpoint,
+            sent,
+            received,
+            packet_loss_pct,
+            min_rtt_ms,
+            avg_rtt_ms,
+            max_rtt_ms,
+            stddev_rtt_ms,
+            samples,
+            ..
+        } => {
+            let ep_str = endpoint.as_deref().unwrap_or("overlay-mesh");
+            println!(
+                "\x1b[1mPING\x1b[0m \x1b[36m{}\x1b[0m ({}): 56 data bytes",
+                target, ep_str
+            );
+            if samples.is_empty() {
+                for seq in 1..=sent {
+                    println!("Request timeout for seq {}", seq);
+                }
+            } else {
+                for (seq, sample) in samples.iter().enumerate() {
+                    println!(
+                        "64 bytes from {}: seq={} time={:.2} ms",
+                        target,
+                        seq + 1,
+                        sample
+                    );
                 }
             }
-            peers.first()
-        });
-
-    let (peer_addr, ep_str, transport, rtt_ms) = match peer {
-        Some(p) => (
-            p.node_addr.to_string(),
-            p.endpoint
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "none".into()),
-            p.transport.clone(),
-            p.rtt_ms.unwrap_or(28),
-        ),
-        None => (target.to_string(), "none".into(), "Direct UDP".into(), 28),
-    };
-
-    println!(
-        "\x1b[1mPING\x1b[0m \x1b[36m{}\x1b[0m ({} via \x1b[1;34m{}\x1b[0m) 56 data bytes",
-        peer_addr, ep_str, transport
-    );
-
-    let count = count.clamp(1, 10);
-    let mut rtts = Vec::new();
-    for seq in 1..=count {
-        std::thread::sleep(Duration::from_millis(350));
-        let jitter = ((seq * 7 + 13) % 5) as f64 - 2.0;
-        let sample_rtt = ((rtt_ms as f64) + jitter).max(1.0);
-        rtts.push(sample_rtt);
-        println!(
-            "64 bytes from {}: icmp_seq={} time={:.2} ms  (\x1b[32mFEC RS-8/12 active\x1b[0m, loss=0%)",
-            peer_addr, seq, sample_rtt
-        );
+            println!();
+            println!("--- {} ping statistics ---", target);
+            let loss_color = if packet_loss_pct == 0.0 {
+                "\x1b[32m"
+            } else if packet_loss_pct < 20.0 {
+                "\x1b[33m"
+            } else {
+                "\x1b[31m"
+            };
+            println!(
+                "{} packets transmitted, {} received, {}{:.1}% packet loss\x1b[0m",
+                sent, received, loss_color, packet_loss_pct
+            );
+            if let (Some(min), Some(avg), Some(max), Some(stddev)) =
+                (min_rtt_ms, avg_rtt_ms, max_rtt_ms, stddev_rtt_ms)
+            {
+                println!(
+                    "rtt min/avg/max/stddev = {:.2}/{:.2}/{:.2}/{:.2} ms",
+                    min, avg, max, stddev
+                );
+            }
+            Ok(())
+        }
+        ControlResponse::Err { error, .. } => {
+            eprintln!("\x1b[1;31m✗\x1b[0m Error: {error}");
+            Err(error)
+        }
+        _ => Err("unexpected response format from daemon".into()),
     }
+}
 
-    let min_rtt = rtts.iter().copied().fold(f64::INFINITY, f64::min);
-    let max_rtt = rtts.iter().copied().fold(0.0, f64::max);
-    let avg_rtt = rtts.iter().copied().sum::<f64>() / rtts.len() as f64;
-
-    println!();
-    println!("--- {} ping statistics ---", peer_addr);
-    println!(
-        "{} packets transmitted, {} received, \x1b[32m0% packet loss\x1b[0m, rtt min/avg/max = {:.2}/{:.2}/{:.2} ms",
-        count, count, min_rtt, avg_rtt, max_rtt
-    );
-    Ok(())
+/// Trace the multi-hop path and segment latencies across the mesh (#187).
+pub fn run_cli_trace(socket_path: &Path, target: &str, json: bool) -> Result<(), String> {
+    let resp = client_query(
+        socket_path,
+        ControlCmd::TracePath {
+            peer_node_id: target.to_string(),
+        },
+    )?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+    match resp {
+        ControlResponse::TracePath {
+            target,
+            reachable,
+            hops,
+            total_rtt_ms,
+            ..
+        } => {
+            println!("traceroute to {} ({} hops max):", target, hops.len().max(1));
+            if !reachable {
+                println!("  \x1b[1;31m* * * Destination unreachable (session not established or peer offline)\x1b[0m");
+                return Ok(());
+            }
+            for hop in &hops {
+                let ep_display = hop.endpoint.as_deref().unwrap_or("overlay-internal");
+                let direct_badge = if hop.is_direct {
+                    "\x1b[32m[DIRECT]\x1b[0m"
+                } else {
+                    "\x1b[33m[RELAYED]\x1b[0m"
+                };
+                println!(
+                    " {:>2}  {:<16} ({})  {:.2} ms  {} via \x1b[1;34m{}\x1b[0m",
+                    hop.hop_index, hop.node_id, ep_display, hop.rtt_ms, direct_badge, hop.transport
+                );
+            }
+            println!(
+                "Trace complete: {:.2} ms total circuit latency",
+                total_rtt_ms
+            );
+            Ok(())
+        }
+        ControlResponse::Err { error, .. } => {
+            eprintln!("\x1b[1;31m✗\x1b[0m Error: {error}");
+            Err(error)
+        }
+        _ => Err("unexpected response format from daemon".into()),
+    }
 }
 
 /// Dynamically add a new remote peer.
@@ -2360,8 +2532,12 @@ mod tests {
         assert!(run_cli_status(path, true).is_ok());
         assert!(run_cli_peers(path, false).is_ok());
         assert!(run_cli_peers(path, true).is_ok());
-        assert!(run_cli_ping(path, "10.0.0.1", 1).is_ok());
-        assert!(run_cli_ping(path, "nonexistent", 1).is_ok());
+        assert!(run_cli_ping(path, "10.0.0.1", 1, 1000, false).is_ok());
+        assert!(run_cli_ping(path, "10.0.0.1", 1, 1000, true).is_ok());
+        assert!(run_cli_ping(path, "nonexistent", 1, 1000, false).is_err());
+        assert!(run_cli_trace(path, "10.0.0.1", false).is_ok());
+        assert!(run_cli_trace(path, "10.0.0.1", true).is_ok());
+        assert!(run_cli_trace(path, "nonexistent", false).is_ok());
         assert!(
             run_cli_peer_add(path, &"04".repeat(32), Some("1.2.3.4:51820"), Some("TLS")).is_ok()
         );
@@ -2788,5 +2964,116 @@ mod tests {
         assert!(parse_cidr("10.0.0.1/33").is_err());
         assert!(parse_cidr("fd00::/129").is_err());
         assert!(parse_cidr("10.0.0.1/bad").is_err());
+    }
+
+    #[test]
+    fn control_protocol_trace_path_and_ping_peer() {
+        let mut pm = crate::peer_manager::testutil::test_peer_manager();
+        let start = Instant::now();
+
+        // 1. Serialization / deserialization of TracePath command
+        let trace_json = r#"{"cmd":"trace_path","peer_node_id":"0101010101010101"}"#;
+        let trace_cmd: ControlCmd = serde_json::from_str(trace_json).unwrap();
+        match &trace_cmd {
+            ControlCmd::TracePath { peer_node_id } => {
+                assert_eq!(peer_node_id, "0101010101010101");
+            }
+            _ => panic!("unexpected command variant"),
+        }
+
+        // 2. Dispatch TracePath to peer manager
+        let trace_resp = dispatch_cmd(&mut pm, trace_cmd, "yip0", start);
+        match trace_resp {
+            ControlResponse::TracePath {
+                ok,
+                target,
+                reachable,
+                hops,
+                total_rtt_ms,
+            } => {
+                assert!(ok);
+                assert_eq!(target, "0101010101010101");
+                assert!(reachable);
+                assert_eq!(hops.len(), 1);
+                assert_eq!(hops[0].hop_index, 1);
+                assert!(hops[0].is_direct);
+                assert!(hops[0].endpoint.is_some());
+                assert!(total_rtt_ms > 0.0);
+            }
+            other => panic!("expected TracePath response, got: {other:?}"),
+        }
+
+        // 3. Serialization / deserialization of PingPeer command
+        let ping_json =
+            r#"{"cmd":"ping_peer","peer_node_id":"10.0.0.1","count":3,"timeout_ms":1500}"#;
+        let ping_cmd: ControlCmd = serde_json::from_str(ping_json).unwrap();
+        match &ping_cmd {
+            ControlCmd::PingPeer {
+                peer_node_id,
+                count,
+                timeout_ms,
+            } => {
+                assert_eq!(peer_node_id, "10.0.0.1");
+                assert_eq!(*count, 3);
+                assert_eq!(*timeout_ms, 1500);
+            }
+            _ => panic!("unexpected command variant"),
+        }
+
+        // 4. Dispatch PingPeer to peer manager
+        let ping_resp = dispatch_cmd(&mut pm, ping_cmd, "yip0", start);
+        match ping_resp {
+            ControlResponse::PingPeer {
+                ok,
+                target,
+                endpoint,
+                sent,
+                received,
+                packet_loss_pct,
+                min_rtt_ms,
+                avg_rtt_ms,
+                max_rtt_ms,
+                stddev_rtt_ms,
+                samples,
+            } => {
+                assert!(ok);
+                assert_eq!(target, "10.0.0.1");
+                assert_eq!(endpoint, Some("10.0.0.1:1000".to_string()));
+                assert_eq!(sent, 3);
+                assert_eq!(received, 3);
+                assert_eq!(packet_loss_pct, 0.0);
+                assert_eq!(samples.len(), 3);
+                assert!(min_rtt_ms.is_some());
+                assert!(avg_rtt_ms.is_some());
+                assert!(max_rtt_ms.is_some());
+                assert!(stddev_rtt_ms.is_some());
+                assert!(max_rtt_ms.unwrap() >= min_rtt_ms.unwrap());
+            }
+            other => panic!("expected PingPeer response, got: {other:?}"),
+        }
+
+        // 5. Query non-existent peer
+        let bad_ping = ControlCmd::PingPeer {
+            peer_node_id: "nonexistent".into(),
+            count: 2,
+            timeout_ms: 1000,
+        };
+        assert!(matches!(
+            dispatch_cmd(&mut pm, bad_ping, "yip0", start),
+            ControlResponse::Err { ok: false, .. }
+        ));
+
+        let bad_trace = ControlCmd::TracePath {
+            peer_node_id: "nonexistent".into(),
+        };
+        match dispatch_cmd(&mut pm, bad_trace, "yip0", start) {
+            ControlResponse::TracePath {
+                reachable, hops, ..
+            } => {
+                assert!(!reachable);
+                assert!(hops.is_empty());
+            }
+            other => panic!("expected TracePath response, got: {other:?}"),
+        }
     }
 }

@@ -2902,3 +2902,68 @@ fn split_tunnel_route_bypass_and_telemetry() {
     );
     assert_eq!(pm.split_tunnel.telemetry.overlay_packets, 2);
 }
+
+#[test]
+fn trace_path_and_ping_peer_telemetry() {
+    let (mut pm, _tag, ep) = pm_with_established_peer([1u8; 32], [2u8; 32], 100);
+
+    // 1. Direct established peer trace
+    let (reachable, hops, total_rtt) = pm.trace_path("02020202");
+    assert!(reachable, "established peer must be reachable");
+    assert_eq!(hops.len(), 1, "direct peer must have single hop");
+    assert_eq!(hops[0].hop_index, 1);
+    assert_eq!(hops[0].node_id, "0202020202020202");
+    assert_eq!(hops[0].endpoint, Some(ep.to_string()));
+    assert!(hops[0].is_direct);
+    assert_eq!(hops[0].transport, "udp");
+    assert!(total_rtt > 0.0);
+
+    // 2. Direct peer ping with valid timeout
+    let ping_res = pm.ping_peer("02020202", 4, 2000).unwrap();
+    assert_eq!(ping_res.target, "02020202");
+    assert_eq!(ping_res.endpoint, Some(ep.to_string()));
+    assert_eq!(ping_res.sent, 4);
+    assert_eq!(ping_res.received, 4);
+    assert_eq!(ping_res.packet_loss_pct, 0.0);
+    assert_eq!(ping_res.samples.len(), 4);
+    assert!(ping_res.min_rtt_ms.unwrap() > 0.0);
+    assert!(ping_res.max_rtt_ms.unwrap() >= ping_res.min_rtt_ms.unwrap());
+    assert!(ping_res.avg_rtt_ms.is_some());
+    assert!(ping_res.stddev_rtt_ms.is_some());
+
+    // 3. Ping with timeout lower than latency induces packet loss
+    let ping_timeout_res = pm.ping_peer("02020202", 4, 1).unwrap();
+    assert_eq!(ping_timeout_res.sent, 4);
+    assert_eq!(ping_timeout_res.received, 0);
+    assert_eq!(ping_timeout_res.packet_loss_pct, 100.0);
+    assert!(ping_timeout_res.min_rtt_ms.is_none());
+
+    // 4. Trace and ping relayed peer
+    pm.peers[0].relay = true;
+    let (rel_reachable, rel_hops, rel_total_rtt) = pm.trace_path("02020202");
+    assert!(rel_reachable);
+    assert_eq!(
+        rel_hops.len(),
+        2,
+        "relayed peer must have gateway + target hops"
+    );
+    assert_eq!(rel_hops[0].hop_index, 1);
+    assert_eq!(rel_hops[0].node_id, "relay-gateway");
+    assert!(rel_hops[0].is_direct);
+    assert_eq!(rel_hops[0].transport, "tls-relay");
+    assert_eq!(rel_hops[1].hop_index, 2);
+    assert_eq!(rel_hops[1].node_id, "0202020202020202");
+    assert!(!rel_hops[1].is_direct);
+    assert_eq!(rel_hops[1].transport, "relay-mesh");
+    assert!(rel_total_rtt >= rel_hops[0].rtt_ms);
+
+    // 5. Query non-existent peer
+    let bad_ping = pm.ping_peer("ffffffff", 4, 1000);
+    assert!(bad_ping.is_err());
+    assert!(bad_ping.unwrap_err().contains("not found"));
+
+    let (bad_reach, bad_hops, bad_rtt) = pm.trace_path("ffffffff");
+    assert!(!bad_reach);
+    assert!(bad_hops.is_empty());
+    assert_eq!(bad_rtt, 0.0);
+}

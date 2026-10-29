@@ -287,4 +287,45 @@ fn control_socket_tick_integration() {
     assert!(line.contains("\"domains\":[\"local\",\"corp\"]"));
     assert!(pm.split_tunnel.enabled);
     assert_eq!(pm.split_tunnel.cidrs.len(), 2);
+
+    // 16. Query trace_path to peer (#187)
+    writer
+        .write_all(b"{\"cmd\":\"trace_path\",\"peer_node_id\":\"0101010101010101\"}\n")
+        .unwrap();
+    writer.flush().unwrap();
+
+    for _ in 0..50 {
+        let _ = pm.tick(1_150);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("\"ok\":true"));
+    assert!(line.contains("\"target\":\"0101010101010101\""));
+    assert!(line.contains("\"reachable\":true"));
+    assert!(line.contains("\"hops\":"));
+    assert!(line.contains("\"is_direct\":true"));
+
+    // 17. Query ping_peer to peer (#187)
+    writer
+        .write_all(
+            b"{\"cmd\":\"ping_peer\",\"peer_node_id\":\"0101010101010101\",\"count\":3,\"timeout_ms\":2000}\n",
+        )
+        .unwrap();
+    writer.flush().unwrap();
+
+    for _ in 0..50 {
+        let _ = pm.tick(1_160);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("\"ok\":true"));
+    assert!(line.contains("\"target\":\"0101010101010101\""));
+    assert!(line.contains("\"sent\":3"));
+    assert!(line.contains("\"received\":3"));
+    assert!(line.contains("\"packet_loss_pct\":0.0"));
+    assert!(line.contains("\"samples\":"));
 }

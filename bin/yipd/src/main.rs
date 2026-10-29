@@ -99,6 +99,21 @@ fn print_cli_usage(subcmd: &str) {
             println!();
             println!("Options:");
             println!("  -c, --control <SOCKET>  Path to yipd UNIX control socket");
+            println!("  -n, --count <COUNT>     Number of probes to transmit [default: 4]");
+            println!(
+                "  -W, --timeout <MILLIS>  Probe response timeout in milliseconds [default: 2000]"
+            );
+            println!("      --json              Output raw JSON");
+            println!("  -h, --help              Print help");
+        }
+        "trace" | "traceroute" => {
+            println!("Usage: yipctl trace <PEER> [OPTIONS]");
+            println!();
+            println!("Trace the multi-hop path and segment latencies across the mesh.");
+            println!();
+            println!("Options:");
+            println!("  -c, --control <SOCKET>  Path to yipd UNIX control socket");
+            println!("      --json              Output raw JSON");
             println!("  -h, --help              Print help");
         }
         "peer" => {
@@ -208,6 +223,7 @@ fn print_cli_usage(subcmd: &str) {
             println!("  split     Inspect or configure split-tunnel bypass rules");
             println!("  top       Real-time ANSI telemetry dashboard");
             println!("  ping      Probe round-trip latency to a peer");
+            println!("  trace     Trace multi-hop path and segment latencies across mesh");
             println!("  peer      Dynamically add or remove peers");
             println!("  fec       Query or configure dynamic Reed-Solomon FEC");
             println!("  daita     Query or configure dynamic DAITA traffic defense");
@@ -240,6 +256,8 @@ fn run_client_subcommand(
     let mut cidrs: Option<Vec<String>> = None;
     let mut domains: Option<Vec<String>> = None;
     let mut apps: Option<Vec<String>> = None;
+    let mut ping_count = 4u32;
+    let mut ping_timeout = 2000u64;
     let mut positional: Vec<String> = Vec::new();
 
     while let Some(arg) = args.next() {
@@ -446,6 +464,36 @@ fn run_client_subcommand(
                     .collect();
                 apps = Some(list);
             }
+            "--count" | "-n" => {
+                let s = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--count requires packet count (e.g. 4)",
+                    )
+                })?;
+                let c = s.parse::<u32>().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid count: {e}"),
+                    )
+                })?;
+                ping_count = c;
+            }
+            "--timeout" | "-W" => {
+                let s = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--timeout requires milliseconds (e.g. 2000)",
+                    )
+                })?;
+                let t = s.parse::<u64>().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid timeout: {e}"),
+                    )
+                })?;
+                ping_timeout = t;
+            }
             "--help" | "-h" => {
                 print_cli_usage(subcmd);
                 return Ok(());
@@ -470,7 +518,12 @@ fn run_client_subcommand(
         "top" => control::run_cli_top(&socket, interval_ms).map_err(std::io::Error::other),
         "ping" => {
             let target = positional.first().map(|s| s.as_str()).unwrap_or("");
-            control::run_cli_ping(&socket, target, 3).map_err(std::io::Error::other)
+            control::run_cli_ping(&socket, target, ping_count, ping_timeout, json)
+                .map_err(std::io::Error::other)
+        }
+        "trace" | "traceroute" => {
+            let target = positional.first().map(|s| s.as_str()).unwrap_or("");
+            control::run_cli_trace(&socket, target, json).map_err(std::io::Error::other)
         }
         "peer" => {
             if positional.is_empty() {
@@ -703,6 +756,7 @@ fn main() -> std::io::Result<()> {
             Some("peers") => return run_client_subcommand("peers", args),
             Some("top") => return run_client_subcommand("top", args),
             Some("ping") => return run_client_subcommand("ping", args),
+            Some("trace") | Some("traceroute") => return run_client_subcommand("trace", args),
             Some("peer") => return run_client_subcommand("peer", args),
             Some("fec") => return run_client_subcommand("fec", args),
             Some("daita") => return run_client_subcommand("daita", args),
@@ -744,6 +798,7 @@ fn main() -> std::io::Result<()> {
         Some("peers") => run_client_subcommand("peers", args),
         Some("top") => run_client_subcommand("top", args),
         Some("ping") => run_client_subcommand("ping", args),
+        Some("trace") | Some("traceroute") => run_client_subcommand("trace", args),
         Some("peer") => run_client_subcommand("peer", args),
         Some("fec") => run_client_subcommand("fec", args),
         Some("daita") => run_client_subcommand("daita", args),
