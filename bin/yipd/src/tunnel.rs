@@ -209,6 +209,14 @@ pub fn run(config: Config) -> io::Result<()> {
         config.device.clone(),
         std::time::Instant::now(),
     );
+    let _metrics_server = match config.metrics_listen {
+        Some(addr) => Some(crate::metrics::MetricsHttpServer::start(
+            addr,
+            manager.metrics(),
+            Box::new(Vec::new),
+        )?),
+        None => None,
+    };
     let local_addr = manager.local_addr();
 
     // ── create the tunnel device (TUN or TAP) ────────────────────────────────
