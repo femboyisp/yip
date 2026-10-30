@@ -176,6 +176,7 @@ impl PeerManager {
         }
         self.peers[idx].state = PeerState::Idle;
         self.peers[idx].admitted_cert_not_after = None;
+        self.metrics.update_peer_stats(self.list_peers());
     }
 
     pub(super) fn handle_handshake_init(
@@ -375,6 +376,7 @@ impl PeerManager {
                 self.peers[idx].state = PeerState::Established(epoch_set);
                 self.record_new_epoch(idx);
                 self.metrics.record_handshake_success();
+                self.metrics.update_peer_stats(self.list_peers());
 
                 DispatchOut::Udp(&self.egress)
             }
@@ -469,6 +471,7 @@ impl PeerManager {
                 self.peers[idx].state = PeerState::Established(epoch_set);
                 self.record_new_epoch(idx);
                 self.metrics.record_handshake_success();
+                self.metrics.update_peer_stats(self.list_peers());
 
                 if self.egress.is_empty() {
                     DispatchOut::None

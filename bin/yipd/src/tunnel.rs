@@ -209,11 +209,13 @@ pub fn run(config: Config) -> io::Result<()> {
         config.device.clone(),
         std::time::Instant::now(),
     );
+    let metrics_registry = manager.metrics();
+    let reg_for_stats = std::sync::Arc::clone(&metrics_registry);
     let _metrics_server = match config.metrics_listen {
         Some(addr) => Some(crate::metrics::MetricsHttpServer::start(
             addr,
-            manager.metrics(),
-            Box::new(Vec::new),
+            metrics_registry,
+            Box::new(move || reg_for_stats.get_cached_peer_stats()),
         )?),
         None => None,
     };

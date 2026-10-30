@@ -75,6 +75,7 @@ pub struct EpochSet {
     pub(crate) previous: Option<Box<DataPlane>>,
     pub(crate) previous_retire_ms: u64,
     pub(crate) rekey: Option<RekeyInFlight>,
+    pub(crate) epoch: u64,
 }
 
 impl EpochSet {
@@ -86,7 +87,12 @@ impl EpochSet {
             previous: None,
             previous_retire_ms: 0,
             rekey: None,
+            epoch: 1,
         }
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     pub fn current(&self) -> &DataPlane {
@@ -212,6 +218,7 @@ impl EpochSet {
                 self.current_created_ms = now_ms;
                 self.previous = Some(old);
                 self.previous_retire_ms = now_ms.saturating_add(PREVIOUS_EPOCH_GRACE_MS);
+                self.epoch = self.epoch.saturating_add(1);
                 return out;
             }
         }
@@ -231,6 +238,7 @@ impl EpochSet {
         self.previous = Some(old);
         self.previous_retire_ms = now_ms.saturating_add(PREVIOUS_EPOCH_GRACE_MS);
         self.rekey = None;
+        self.epoch = self.epoch.saturating_add(1);
     }
 
     /// Responder: a new epoch derived from a received rekey Init, kept for

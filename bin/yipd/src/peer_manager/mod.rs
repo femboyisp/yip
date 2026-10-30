@@ -508,6 +508,8 @@ pub struct PeerManager {
     pub split_tunnel: crate::control::SplitTunnelState,
     /// Shared lock-free metrics registry for daemon and telemetry reporting.
     metrics: std::sync::Arc<crate::metrics::MetricsRegistry>,
+    /// Monotonic timestamp in milliseconds of the last cached metrics peer stats update.
+    last_metrics_update_ms: u64,
 }
 
 /// Dynamic DAITA traffic analysis defense runtime metrics.
@@ -653,6 +655,7 @@ impl PeerManager {
             daita_stats: DaitaStats::default(),
             split_tunnel: crate::control::SplitTunnelState::default(),
             metrics: std::sync::Arc::new(crate::metrics::MetricsRegistry::new()),
+            last_metrics_update_ms: 0,
         };
 
         // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
@@ -1580,6 +1583,7 @@ impl PeerManager {
             rtt_ms: None,
             transport_name: transport,
         });
+        self.metrics.update_peer_stats(self.list_peers());
         Ok(())
     }
 
@@ -1619,6 +1623,7 @@ impl PeerManager {
             }
         }
 
+        self.metrics.update_peer_stats(self.list_peers());
         Ok(())
     }
 
@@ -1677,6 +1682,11 @@ impl PeerManager {
                 }
             })
             .collect()
+    }
+
+    /// Retrieve summary status telemetry for all known peers (alias for peer_stats).
+    pub fn list_peers(&self) -> Vec<PeerStats> {
+        self.peer_stats()
     }
 
     // ── rendezvous / path helpers ─────────────────────────────────────────
@@ -2014,6 +2024,13 @@ impl PeerManager {
 
     fn tick_dispatch(&mut self, now_ms: u64) -> Option<&[EgressDatagram]> {
         self.tick_egress.clear();
+
+        if now_ms.saturating_sub(self.last_metrics_update_ms) >= 500
+            || self.last_metrics_update_ms == 0
+        {
+            self.last_metrics_update_ms = now_ms.max(1);
+            self.metrics.update_peer_stats(self.list_peers());
+        }
 
         // ── registration refresh ──────────────────────────────────────────
         // Keep our reflexive binding fresh on the server so peers can find us.

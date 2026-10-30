@@ -512,19 +512,20 @@ impl PeerManager {
             self.push_rekey_egress(idx, dg, via_relay);
         }
 
-        let old_tag = {
+        let (old_tag, new_epoch, obf_key) = {
             let PeerState::Established(epochs) = &mut self.peers[idx].state else {
                 unreachable!("state cannot change between the borrows above")
             };
             let old_tag = epochs.current().conn_tag();
             epochs.promote_from_rekey(dp, now_ms);
-            self.peers[idx].session_obf_key = epochs.current_obf_key();
-            old_tag
+            (old_tag, epochs.epoch(), epochs.current_obf_key())
         };
+        self.peers[idx].session_obf_key = obf_key;
         self.by_tag.remove(&old_tag);
         self.by_tag.insert(conn_tag, idx);
         self.record_new_epoch(idx);
         self.metrics.record_rekey();
+        self.metrics.set_current_epoch(new_epoch);
 
         if self.egress.is_empty() {
             DispatchOut::None
@@ -802,6 +803,7 @@ mod tests {
 
         let new_tag = established_tag(&pm_a, 0).unwrap();
         assert_ne!(new_tag, old_tag, "current must become the NEW epoch");
+        assert_eq!(pm_a.metrics().snapshot(&[]).crypto.current_epoch, 2);
         match &pm_a.peers[0].state {
             PeerState::Established(epochs) => {
                 assert!(
@@ -835,6 +837,7 @@ mod tests {
             Some(new_tag),
             "B must have confirmed the switch to the SAME new epoch"
         );
+        assert_eq!(pm_b.metrics().snapshot(&[]).crypto.current_epoch, 2);
 
         // NEW-epoch frame (B -> A, now both on `current`) opens via
         // `current`.

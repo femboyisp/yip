@@ -632,3 +632,76 @@ fn test_monotonic_counter_progression_under_simulated_packet_traffic() {
 
     server.stop();
 }
+
+#[test]
+fn test_metrics_registry_cached_peer_stats_fallback_in_http_scraper() {
+    let registry = Arc::new(yipd::metrics::MetricsRegistry::new());
+    let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+    // Start server with an empty stats closure (simulating production fallback)
+    let server = MetricsHttpServer::start(listen_addr, Arc::clone(&registry), Box::new(Vec::new))
+        .expect("failed to start metrics HTTP server");
+    let http_addr = server.local_addr();
+
+    // Initial scrape: no peers cached yet, active should be 0
+    let (status, _, body) = http_request(http_addr, "GET", "/metrics");
+    assert!(status.contains("200 OK"));
+    assert!(body.contains("yip_peers_active 0"));
+    assert!(body.contains("yip_peers_total 0"));
+
+    // Update peer stats via MetricsRegistry::update_peer_stats
+    let peer = PeerStats {
+        public_key: [7u8; 32],
+        endpoint: Some("192.168.1.100:51820".parse().unwrap()),
+        node_addr: "fd00::7".parse().unwrap(),
+        state: "established".to_string(),
+        last_activity_ms: 12345,
+        tx_bytes: 54321,
+        rx_bytes: 12345,
+        tx_packets: 42,
+        rx_packets: 24,
+        fec_recovered: 5,
+        transport: "Direct UDP".to_string(),
+        rtt_ms: Some(15),
+        fec_ratio_pct: 3,
+        cert_status: "CA Valid".to_string(),
+    };
+    registry.update_peer_stats(vec![peer]);
+
+    // Scrape again: even though stats_fn returns empty, registry cached stats fallback must populate metrics
+    let (status2, _, body2) = http_request(http_addr, "GET", "/metrics");
+    assert!(status2.contains("200 OK"));
+    assert!(body2.contains("yip_peers_active 1"));
+    assert!(body2.contains("yip_peers_total 1"));
+    assert!(
+        body2.contains("yip_peer_tx_bytes_total{peer=\"fd00::7\",transport=\"Direct UDP\"} 54321")
+    );
+    assert!(
+        body2.contains("yip_peer_rtt_milliseconds{peer=\"fd00::7\",transport=\"Direct UDP\"} 15")
+    );
+
+    // Also verify get_cached_peer_stats
+    let cached = registry.get_cached_peer_stats();
+    assert_eq!(cached.len(), 1);
+    assert_eq!(cached[0].tx_bytes, 54321);
+
+    server.stop();
+}
+
+#[test]
+fn test_metrics_http_server_bounded_concurrency_and_healthz() {
+    let registry = Arc::new(yipd::metrics::MetricsRegistry::new());
+    let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = MetricsHttpServer::start(listen_addr, Arc::clone(&registry), Box::new(Vec::new))
+        .expect("failed to start metrics HTTP server");
+    let http_addr = server.local_addr();
+
+    assert_eq!(yipd::metrics::MAX_CONCURRENT_HTTP_CLIENTS, 16);
+    assert_eq!(server.active_connections(), 0);
+
+    let (status, _, body) = http_request(http_addr, "GET", "/healthz");
+    assert!(status.contains("200 OK"));
+    assert_eq!(body, "ok");
+
+    server.stop();
+}

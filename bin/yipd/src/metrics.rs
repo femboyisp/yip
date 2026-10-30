@@ -1,19 +1,23 @@
 //! Lock-free metrics registry and Prometheus 0.0.4 exposition formatter.
 
 use std::fmt::Write;
-use std::io::{BufRead, BufReader, Write as IoWrite};
+use std::io::{BufRead, BufReader, Read, Write as IoWrite};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+/// Maximum concurrent HTTP client connections allowed to the scraper server.
+pub const MAX_CONCURRENT_HTTP_CLIENTS: usize = 16;
+
 /// Lock-free metrics registry holding data-plane counters and gauges.
 #[derive(Debug)]
 pub struct MetricsRegistry {
     start_time: Instant,
+    cached_peer_stats: RwLock<Vec<crate::peer_manager::PeerStats>>,
     // Traffic
     tx_bytes: AtomicU64,
     rx_bytes: AtomicU64,
@@ -51,6 +55,7 @@ impl MetricsRegistry {
     pub fn new() -> Self {
         Self {
             start_time: Instant::now(),
+            cached_peer_stats: RwLock::new(Vec::new()),
             tx_bytes: AtomicU64::new(0),
             rx_bytes: AtomicU64::new(0),
             tx_packets: AtomicU64::new(0),
@@ -71,6 +76,21 @@ impl MetricsRegistry {
             split_overlay_packets: AtomicU64::new(0),
             split_overlay_bytes: AtomicU64::new(0),
         }
+    }
+
+    /// Update the cached peer telemetry statistics for exposition fallback.
+    pub fn update_peer_stats(&self, stats: Vec<crate::peer_manager::PeerStats>) {
+        if let Ok(mut lock) = self.cached_peer_stats.write() {
+            *lock = stats;
+        }
+    }
+
+    /// Retrieve the cached peer telemetry statistics.
+    pub fn get_cached_peer_stats(&self) -> Vec<crate::peer_manager::PeerStats> {
+        self.cached_peer_stats
+            .read()
+            .map(|lock| lock.clone())
+            .unwrap_or_default()
     }
 
     /// Record transmitted payload and packets.
@@ -160,6 +180,13 @@ impl MetricsRegistry {
 
     /// Take a structured snapshot of all telemetry metrics.
     pub fn snapshot(&self, peer_stats: &[crate::peer_manager::PeerStats]) -> TelemetrySnapshot {
+        let fallback_stats;
+        let peer_stats = if peer_stats.is_empty() {
+            fallback_stats = self.get_cached_peer_stats();
+            &fallback_stats[..]
+        } else {
+            peer_stats
+        };
         let uptime_seconds = self.start_time.elapsed().as_secs();
         let tx_bytes = self.tx_bytes.load(Ordering::Relaxed);
         let rx_bytes = self.rx_bytes.load(Ordering::Relaxed);
@@ -265,6 +292,13 @@ impl MetricsRegistry {
 
     /// Render metrics in standard Prometheus 0.0.4 text format.
     pub fn render_prometheus(&self, peer_stats: &[crate::peer_manager::PeerStats]) -> String {
+        let fallback_stats;
+        let peer_stats = if peer_stats.is_empty() {
+            fallback_stats = self.get_cached_peer_stats();
+            &fallback_stats[..]
+        } else {
+            peer_stats
+        };
         let mut out = String::with_capacity(2048);
 
         let uptime_seconds = self.start_time.elapsed().as_secs();
@@ -587,6 +621,7 @@ pub struct MetricsHttpServer {
     local_addr: SocketAddr,
     shutdown: Arc<AtomicBool>,
     thread_handle: Mutex<Option<JoinHandle<()>>>,
+    active_conns: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for MetricsHttpServer {
@@ -594,6 +629,7 @@ impl std::fmt::Debug for MetricsHttpServer {
         f.debug_struct("MetricsHttpServer")
             .field("local_addr", &self.local_addr)
             .field("shutdown", &self.shutdown.load(Ordering::Relaxed))
+            .field("active_conns", &self.active_conns.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -611,6 +647,8 @@ impl MetricsHttpServer {
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
+        let active_conns = Arc::new(AtomicUsize::new(0));
+        let active_conns_clone = Arc::clone(&active_conns);
         let stats_fn: Arc<dyn Fn() -> Vec<crate::peer_manager::PeerStats> + Send + Sync + 'static> =
             Arc::from(stats_fn);
 
@@ -619,20 +657,40 @@ impl MetricsHttpServer {
             .spawn(move || {
                 while !shutdown_clone.load(Ordering::Relaxed) {
                     match listener.accept() {
-                        Ok((stream, _)) => {
+                        Ok((mut stream, _)) => {
+                            if active_conns_clone.load(Ordering::Relaxed) >= MAX_CONCURRENT_HTTP_CLIENTS {
+                                let _ = IoWrite::write_all(
+                                    &mut stream,
+                                    b"HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\ntoo many requests\n",
+                                );
+                                let _ = IoWrite::flush(&mut stream);
+                                continue;
+                            }
+                            active_conns_clone.fetch_add(1, Ordering::Relaxed);
                             let reg = Arc::clone(&registry);
                             let s_fn = Arc::clone(&stats_fn);
-                            let _ = std::thread::Builder::new()
+                            let conns = Arc::clone(&active_conns_clone);
+                            let spawned = std::thread::Builder::new()
                                 .name("metrics-http-conn".into())
                                 .spawn(move || {
+                                    struct ConnGuard(Arc<AtomicUsize>);
+                                    impl Drop for ConnGuard {
+                                        fn drop(&mut self) {
+                                            self.0.fetch_sub(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                    let _guard = ConnGuard(conns);
                                     let _ = handle_client(stream, &reg, &*s_fn);
                                 });
+                            if spawned.is_err() {
+                                active_conns_clone.fetch_sub(1, Ordering::Relaxed);
+                            }
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(10));
+                            std::thread::sleep(Duration::from_millis(100));
                         }
                         Err(_) => {
-                            std::thread::sleep(Duration::from_millis(10));
+                            std::thread::sleep(Duration::from_millis(100));
                         }
                     }
                 }
@@ -642,12 +700,18 @@ impl MetricsHttpServer {
             local_addr,
             shutdown,
             thread_handle: Mutex::new(Some(thread_handle)),
+            active_conns,
         })
     }
 
     /// Return the local socket address this server is listening on.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Return the number of currently active HTTP scraper connections.
+    pub fn active_connections(&self) -> usize {
+        self.active_conns.load(Ordering::Relaxed)
     }
 
     /// Signal shutdown to the background server thread and await its termination.
@@ -679,7 +743,7 @@ fn handle_client(
     stream.set_write_timeout(Some(Duration::from_millis(3000)))?;
 
     let (method, path) = {
-        let mut reader = BufReader::new(&mut stream);
+        let mut reader = BufReader::new(&mut stream).take(4096);
         let mut first_line = String::new();
         if reader.read_line(&mut first_line)? == 0 {
             return Ok(());
@@ -728,7 +792,10 @@ fn handle_client(
 
     match path.as_str() {
         "/metrics" => {
-            let peer_stats = stats_fn();
+            let mut peer_stats = stats_fn();
+            if peer_stats.is_empty() {
+                peer_stats = registry.get_cached_peer_stats();
+            }
             let body = registry.render_prometheus(&peer_stats);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

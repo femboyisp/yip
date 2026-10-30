@@ -181,7 +181,15 @@ impl PeerManager {
         // for relay-established peers (their `DataPlane::peer_addr` is a
         // `server_addr()` stand-in; `endpoint` may hold an unconfirmed
         // candidate or `None`).
+        let prev_epoch = epochs.epoch();
         let opened = epochs.inbound_open(dg, now_ms);
+        let promoted_epoch = if epochs.epoch() != prev_epoch {
+            let ep = epochs.epoch();
+            let obf = epochs.current_obf_key();
+            Some((ep, obf))
+        } else {
+            None
+        };
         let rec_diff = epochs.fec_recovered_count().saturating_sub(prev_rec);
         if rec_diff > 0 {
             self.metrics.record_fec_recovered(rec_diff);
@@ -189,6 +197,11 @@ impl PeerManager {
         let burst_diff = epochs.fec_unrecoverable_count().saturating_sub(prev_burst);
         if burst_diff > 0 {
             self.metrics.record_fec_burst_drop(burst_diff);
+        }
+        if let Some((ep, obf)) = promoted_epoch {
+            self.peers[idx].session_obf_key = obf;
+            self.metrics.record_rekey();
+            self.metrics.set_current_epoch(ep);
         }
         if !matches!(opened, crate::epoch::EpochInbound::None) {
             // Authenticated + non-replayed (M2 roaming) — safe to roam.
@@ -258,13 +271,21 @@ impl PeerManager {
             .map(|(i, _)| i)
             .collect();
         for idx in candidates {
-            let (hit, rec_diff, burst_diff) = {
+            let (hit, rec_diff, burst_diff, promoted_epoch) = {
                 let PeerState::Established(epochs) = &mut self.peers[idx].state else {
                     continue;
                 };
                 let prev_rec = epochs.fec_recovered_count();
                 let prev_burst = epochs.fec_unrecoverable_count();
+                let prev_epoch = epochs.epoch();
                 let opened = epochs.inbound_open(dg, now_ms);
+                let promoted_epoch = if epochs.epoch() != prev_epoch {
+                    let ep = epochs.epoch();
+                    let obf = epochs.current_obf_key();
+                    Some((ep, obf))
+                } else {
+                    None
+                };
                 let rec_diff = epochs.fec_recovered_count().saturating_sub(prev_rec);
                 let burst_diff = epochs.fec_unrecoverable_count().saturating_sub(prev_burst);
                 let h = match opened {
@@ -273,8 +294,13 @@ impl PeerManager {
                     crate::epoch::EpochInbound::Send(dgs) => Some((None, dgs)),
                     crate::epoch::EpochInbound::TunThenSend(buf, dgs) => Some((Some(buf), dgs)),
                 };
-                (h, rec_diff, burst_diff)
+                (h, rec_diff, burst_diff, promoted_epoch)
             };
+            if let Some((ep, obf)) = promoted_epoch {
+                self.peers[idx].session_obf_key = obf;
+                self.metrics.record_rekey();
+                self.metrics.set_current_epoch(ep);
+            }
             if rec_diff > 0 {
                 self.metrics.record_fec_recovered(rec_diff);
             }
