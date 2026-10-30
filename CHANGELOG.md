@@ -5,6 +5,10 @@ All notable changes to this project are documented here, following
 
 ## [Unreleased]
 
+### Added
+- Native Prometheus text format exposition and OpenTelemetry mesh telemetry (`ControlCmd::GetMetrics`, `yip metrics`).
+- Embedded, zero-dependency HTTP/1.1 metrics scraper endpoint (`--metrics-listen <ADDR>`, `GET /metrics`, `GET /healthz`).
+
 ## [0.1.0] - 2026-10-27
 
 ### Security
