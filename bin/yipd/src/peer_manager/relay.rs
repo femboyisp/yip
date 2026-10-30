@@ -445,17 +445,42 @@ impl PeerManager {
     /// real `dst`/`fate` on each `EgressDatagram` are irrelevant for a
     /// relayed peer (the actual wire destination is the relay server).
     fn relayed_data(&mut self, idx: usize, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
+        if !dg.is_empty() && dg[0] == PacketType::Data as u8 {
+            self.peers[idx].last_activity_ms = now_ms;
+        }
         let (tun, udp): (Option<Vec<u8>>, Vec<Vec<u8>>) = {
             let PeerState::Established(epochs) = &mut self.peers[idx].state else {
                 return DispatchOut::None;
             };
-            match epochs.inbound_open(dg, now_ms) {
-                crate::epoch::EpochInbound::None => (None, Vec::new()),
-                crate::epoch::EpochInbound::Tun(buf) => (Some(buf), Vec::new()),
+            let prev_rec = epochs.fec_recovered_count();
+            let prev_burst = epochs.fec_unrecoverable_count();
+            let opened = epochs.inbound_open(dg, now_ms);
+            let rec_diff = epochs.fec_recovered_count().saturating_sub(prev_rec);
+            if rec_diff > 0 {
+                self.metrics.record_fec_recovered(rec_diff);
+            }
+            let burst_diff = epochs.fec_unrecoverable_count().saturating_sub(prev_burst);
+            if burst_diff > 0 {
+                self.metrics.record_fec_burst_drop(burst_diff);
+            }
+            match opened {
+                crate::epoch::EpochInbound::None => {
+                    self.metrics.record_drop(1);
+                    (None, Vec::new())
+                }
+                crate::epoch::EpochInbound::Tun(buf) => {
+                    self.peers[idx].rx_bytes += buf.len() as u64;
+                    self.peers[idx].rx_packets += 1;
+                    self.metrics.record_rx(buf.len() as u64, 1);
+                    (Some(buf), Vec::new())
+                }
                 crate::epoch::EpochInbound::Send(dgs) => {
                     (None, dgs.iter().map(|d| d.bytes.clone()).collect())
                 }
                 crate::epoch::EpochInbound::TunThenSend(buf, dgs) => {
+                    self.peers[idx].rx_bytes += buf.len() as u64;
+                    self.peers[idx].rx_packets += 1;
+                    self.metrics.record_rx(buf.len() as u64, 1);
                     (Some(buf), dgs.iter().map(|d| d.bytes.clone()).collect())
                 }
             }

@@ -1261,7 +1261,11 @@ impl PeerManager {
         &mut self,
         cmd: crate::control::ControlCmd,
     ) -> crate::control::ControlResponse {
-        crate::control::dispatch_cmd(self, cmd, &self.device_name.clone(), self.start_time)
+        let device_name = std::mem::take(&mut self.device_name);
+        let start_time = self.start_time;
+        let resp = crate::control::dispatch_cmd(self, cmd, &device_name, start_time);
+        self.device_name = device_name;
+        resp
     }
 
     /// Configure online Threshold CA coordinator address for automated 70% TTL certificate rotation.

@@ -3050,3 +3050,73 @@ fn test_peer_manager_metrics_drops_and_split_tunnel() {
     let drops_after_unroutable = manager.metrics().snapshot(&[]).traffic.dropped_packets;
     assert_eq!(drops_after_unroutable, drops_after_empty + 1);
 }
+
+#[test]
+fn test_peer_manager_metrics_relayed_traffic() {
+    let kp_a = generate_keypair();
+    let kp_b = generate_keypair();
+    let ep_a: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+    let ep_b: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+    let cfg_b = PeerConfig {
+        public_key: kp_b.public,
+        endpoint: Some(ep_b),
+    };
+    let cfg_a = PeerConfig {
+        public_key: kp_a.public,
+        endpoint: Some(ep_a),
+    };
+
+    let (mut pm_a, _sent_a) = pm_with_mock_rdv(&kp_a, &[cfg_b]);
+    let (mut pm_b, _sent_b) = pm_with_mock_rdv(&kp_b, &[cfg_a]);
+
+    peer_test_key_registry()
+        .lock()
+        .unwrap()
+        .insert(kp_b.public, (kp_b.private, [0xBB; 32]));
+    peer_test_key_registry()
+        .lock()
+        .unwrap()
+        .insert(kp_a.public, (kp_a.private, [0xAA; 32]));
+
+    // Perform handshake to establish session between pm_a and pm_b
+    let init = pm_a.on_tun(&dummy_tun_pkt(), 0)[0].bytes.clone();
+    let resp = resp_bytes(&pm_b.on_udp(ep_a, &init, 0));
+    assert_eq!(resp.len(), 1, "cold-start init must produce one resp");
+    pm_a.on_udp(ep_b, &resp[0], 0);
+    assert!(established_tag(&pm_a, 0).is_some());
+    assert_eq!(established_tag(&pm_a, 0), established_tag(&pm_b, 0));
+
+    let snap_before = pm_b.metrics().snapshot(&[]);
+    let rx_pkts_before = snap_before.traffic.rx_packets;
+    let rx_bytes_before = snap_before.traffic.rx_bytes;
+    let drops_before = snap_before.traffic.dropped_packets;
+
+    // Initiator pm_a transmits a TUN data packet
+    let tun_pkt = dummy_tun_pkt();
+    let data = pm_a.on_tun(&tun_pkt, 100).to_vec();
+    assert_eq!(data[0].bytes[0], PacketType::Data as u8);
+
+    // Deliver data packet via rendezvous relay server to pm_b
+    let relayed = wrap_relay_deliver(&pm_b, &data[0].bytes);
+    let out = pm_b.on_udp(mock_server(), &relayed, 150);
+
+    // Verify TUN delivery and metrics incrementation
+    assert!(matches!(out, DispatchOut::Tun(_)));
+    let snap_after = pm_b.metrics().snapshot(&[]);
+    assert_eq!(snap_after.traffic.rx_packets, rx_pkts_before + 1);
+    assert_eq!(
+        snap_after.traffic.rx_bytes,
+        rx_bytes_before + tun_pkt.len() as u64
+    );
+    assert_eq!(pm_b.peers[0].rx_packets, 1);
+    assert_eq!(pm_b.peers[0].rx_bytes, tun_pkt.len() as u64);
+
+    // Verify unauthenticated / corrupted relayed packet increments drop metrics
+    let bad_data = vec![PacketType::Data as u8, 0xDE, 0xAD, 0xBE, 0xEF];
+    let bad_relayed = wrap_relay_deliver(&pm_b, &bad_data);
+    let bad_out = pm_b.on_udp(mock_server(), &bad_relayed, 200);
+    assert!(matches!(bad_out, DispatchOut::None));
+
+    let snap_dropped = pm_b.metrics().snapshot(&[]);
+    assert_eq!(snap_dropped.traffic.dropped_packets, drops_before + 1);
+}
