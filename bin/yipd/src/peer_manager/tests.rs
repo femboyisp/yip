@@ -2967,3 +2967,86 @@ fn trace_path_and_ping_peer_telemetry() {
     assert!(bad_hops.is_empty());
     assert_eq!(bad_rtt, 0.0);
 }
+
+#[test]
+fn test_peer_manager_metrics_increment_on_traffic() {
+    let manager = make_test_peer_manager();
+    let initial_tx = manager.metrics().snapshot(&[]).traffic.tx_bytes;
+    // Dispatch dummy packet
+    manager.record_test_tx_packet(128);
+    let after_tx = manager.metrics().snapshot(&[]).traffic.tx_bytes;
+    assert_eq!(after_tx, initial_tx + 128);
+}
+
+#[test]
+fn test_peer_manager_metrics_injection_and_control_cmd() {
+    use crate::control::{ControlCmd, ControlResponse};
+    use crate::metrics::MetricsRegistry;
+    use std::sync::Arc;
+
+    let custom_registry = Arc::new(MetricsRegistry::new());
+    custom_registry.record_tx(256, 2);
+    custom_registry.record_rx(512, 4);
+    custom_registry.record_fec_tx(10);
+    custom_registry.record_fec_recovered(5);
+    custom_registry.record_fec_burst_drop(1);
+    custom_registry.record_daita_padding(64);
+    custom_registry.record_daita_decoy(2, 200);
+    custom_registry.record_handshake_success();
+    custom_registry.record_handshake_failure();
+    custom_registry.record_rekey();
+
+    let mut manager = make_test_peer_manager().with_metrics(Arc::clone(&custom_registry));
+    assert_eq!(manager.metrics().snapshot(&[]).traffic.tx_bytes, 256);
+    assert_eq!(manager.metrics().snapshot(&[]).traffic.rx_bytes, 512);
+
+    let replaced_registry = Arc::new(MetricsRegistry::new());
+    replaced_registry.record_tx(1024, 8);
+    manager.set_metrics(replaced_registry);
+    assert_eq!(manager.metrics().snapshot(&[]).traffic.tx_bytes, 1024);
+
+    // Test handle_control_cmd arm for ControlCmd::GetMetrics
+    let resp = manager.handle_control_cmd(ControlCmd::GetMetrics { peer: None });
+    match resp {
+        ControlResponse::Metrics {
+            ok,
+            metrics,
+            prometheus,
+        } => {
+            assert!(ok);
+            assert_eq!(metrics.traffic.tx_bytes, 1024);
+            assert_eq!(metrics.traffic.tx_packets, 8);
+            assert!(prometheus.contains("yip_traffic_tx_bytes_total 1024"));
+        }
+        other => panic!("expected ControlResponse::Metrics, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_peer_manager_metrics_drops_and_split_tunnel() {
+    use std::net::SocketAddr;
+
+    let mut manager = make_test_peer_manager();
+    let initial_drops = manager.metrics().snapshot(&[]).traffic.dropped_packets;
+
+    // Ingress empty UDP datagram should record drop
+    let fake_addr: SocketAddr = "192.0.2.1:12345".parse().unwrap();
+    let _ = manager.on_udp(fake_addr, &[], 0);
+    let drops_after_empty = manager.metrics().snapshot(&[]).traffic.dropped_packets;
+    assert_eq!(drops_after_empty, initial_drops + 1);
+
+    // Unroutable TUN packet (no peer matches and membership is None)
+    // Create an IPv6 packet pointing to an unconfigured address
+    let mut bad_ip_pkt = vec![0x60, 0, 0, 0, 0, 0, 0, 64];
+    bad_ip_pkt.extend_from_slice(&[0xfd, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]); // src
+    bad_ip_pkt.extend_from_slice(&[0xfd, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]); // dst
+    bad_ip_pkt.extend_from_slice(&[0u8; 32]);
+
+    // Give manager 2 peers so sole-peer fallback does not engage
+    let p2 = peer_cfg(2, "10.0.0.2:2000");
+    manager.add_peer(p2).unwrap();
+
+    let _ = manager.on_tun(&bad_ip_pkt, 0);
+    let drops_after_unroutable = manager.metrics().snapshot(&[]).traffic.dropped_packets;
+    assert_eq!(drops_after_unroutable, drops_after_empty + 1);
+}

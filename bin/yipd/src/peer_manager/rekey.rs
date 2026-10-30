@@ -498,7 +498,14 @@ impl PeerManager {
         } else {
             pending
                 .iter()
-                .flat_map(|inner| dp.on_tun_packet(inner, now_ms).to_vec())
+                .flat_map(|inner| {
+                    self.peers[idx].tx_bytes += inner.len() as u64;
+                    self.peers[idx].tx_packets += 1;
+                    self.metrics.record_tx(inner.len() as u64, 1);
+                    let out = dp.on_tun_packet(inner, now_ms);
+                    self.metrics.record_fec_tx(out.len() as u64);
+                    out.to_vec()
+                })
                 .collect()
         };
         for dg in primed {
@@ -517,6 +524,7 @@ impl PeerManager {
         self.by_tag.remove(&old_tag);
         self.by_tag.insert(conn_tag, idx);
         self.record_new_epoch(idx);
+        self.metrics.record_rekey();
 
         if self.egress.is_empty() {
             DispatchOut::None

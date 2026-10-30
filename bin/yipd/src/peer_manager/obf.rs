@@ -213,6 +213,7 @@ impl PeerManager {
                     std::mem::swap(&mut d.bytes, &mut self.obf_scratch);
                     self.daita_stats.authentic_bytes_tx += raw_wire as u64;
                     self.daita_stats.padding_bytes_tx += pad as u64;
+                    self.metrics.record_daita_padding(pad as u64);
                     true
                 } else {
                     false
@@ -266,9 +267,11 @@ impl PeerManager {
                     if ptype == yip_obf::JUNK_TYPE {
                         self.daita_stats.decoy_packets_tx += 1;
                         self.daita_stats.decoy_bytes_tx += (raw_wire + pad) as u64;
+                        self.metrics.record_daita_decoy(1, (raw_wire + pad) as u64);
                     } else {
                         self.daita_stats.authentic_bytes_tx += raw_wire as u64;
                         self.daita_stats.padding_bytes_tx += pad as u64;
+                        self.metrics.record_daita_padding(pad as u64);
                     }
                     true
                 } else {

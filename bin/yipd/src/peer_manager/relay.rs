@@ -328,15 +328,17 @@ impl PeerManager {
                 let pending = std::mem::take(&mut self.peers[idx].pending_tun);
                 let mut owned: Vec<Vec<u8>> = Vec::new();
                 for inner in &pending {
-                    owned.extend(
-                        dp.on_tun_packet(inner, now_ms)
-                            .iter()
-                            .map(|d| d.bytes.clone()),
-                    );
+                    self.peers[idx].tx_bytes += inner.len() as u64;
+                    self.peers[idx].tx_packets += 1;
+                    self.metrics.record_tx(inner.len() as u64, 1);
+                    let out = dp.on_tun_packet(inner, now_ms);
+                    self.metrics.record_fec_tx(out.len() as u64);
+                    owned.extend(out.iter().map(|d| d.bytes.clone()));
                 }
                 self.peers[idx].state =
                     PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, now_ms)));
                 self.record_new_epoch(idx);
+                self.metrics.record_handshake_success();
                 for b in owned {
                     if let Some(d) = self.relay_wrap(idx, b) {
                         self.egress.push(d);
@@ -405,15 +407,17 @@ impl PeerManager {
                 let pending = std::mem::take(&mut self.peers[idx].pending_tun);
                 let mut owned: Vec<Vec<u8>> = Vec::new();
                 for inner in &pending {
-                    owned.extend(
-                        dp.on_tun_packet(inner, now_ms)
-                            .iter()
-                            .map(|d| d.bytes.clone()),
-                    );
+                    self.peers[idx].tx_bytes += inner.len() as u64;
+                    self.peers[idx].tx_packets += 1;
+                    self.metrics.record_tx(inner.len() as u64, 1);
+                    let out = dp.on_tun_packet(inner, now_ms);
+                    self.metrics.record_fec_tx(out.len() as u64);
+                    owned.extend(out.iter().map(|d| d.bytes.clone()));
                 }
                 self.peers[idx].state =
                     PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, now_ms)));
                 self.record_new_epoch(idx);
+                self.metrics.record_handshake_success();
                 for b in owned {
                     if let Some(d) = self.relay_wrap(idx, b) {
                         self.egress.push(d);
@@ -427,6 +431,7 @@ impl PeerManager {
             }
             Err(e) => {
                 eprintln!("peer_manager: relayed read_response failed: {e}");
+                self.metrics.record_handshake_failure();
                 DispatchOut::None
             }
         }

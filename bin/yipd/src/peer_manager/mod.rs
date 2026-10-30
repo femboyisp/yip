@@ -506,6 +506,8 @@ pub struct PeerManager {
     pub daita_stats: DaitaStats,
     /// Split-tunnel routing and traffic bypass engine (#184).
     pub split_tunnel: crate::control::SplitTunnelState,
+    /// Shared lock-free metrics registry for daemon and telemetry reporting.
+    metrics: std::sync::Arc<crate::metrics::MetricsRegistry>,
 }
 
 /// Dynamic DAITA traffic analysis defense runtime metrics.
@@ -650,6 +652,7 @@ impl PeerManager {
             fec_config: crate::control::FecConfig::default(),
             daita_stats: DaitaStats::default(),
             split_tunnel: crate::control::SplitTunnelState::default(),
+            metrics: std::sync::Arc::new(crate::metrics::MetricsRegistry::new()),
         };
 
         // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
@@ -1217,6 +1220,50 @@ impl PeerManager {
         self.start_time = start_time;
     }
 
+    /// Access the shared lock-free telemetry metrics registry.
+    pub fn metrics(&self) -> std::sync::Arc<crate::metrics::MetricsRegistry> {
+        std::sync::Arc::clone(&self.metrics)
+    }
+
+    /// Set or inject a custom metrics registry.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "metrics registry injection helper")
+    )]
+    pub fn set_metrics(&mut self, metrics: std::sync::Arc<crate::metrics::MetricsRegistry>) {
+        self.metrics = metrics;
+    }
+
+    /// Builder method to inject a metrics registry.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "metrics registry builder helper")
+    )]
+    pub fn with_metrics(
+        mut self,
+        metrics: std::sync::Arc<crate::metrics::MetricsRegistry>,
+    ) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Record test packet transmission for data-plane telemetry testing.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "test-only packet instrumentation helper")
+    )]
+    pub fn record_test_tx_packet(&self, bytes: u64) {
+        self.metrics.record_tx(bytes, 1);
+    }
+
+    /// Handle an inbound control command directly on PeerManager.
+    pub fn handle_control_cmd(
+        &mut self,
+        cmd: crate::control::ControlCmd,
+    ) -> crate::control::ControlResponse {
+        crate::control::dispatch_cmd(self, cmd, &self.device_name.clone(), self.start_time)
+    }
+
     /// Configure online Threshold CA coordinator address for automated 70% TTL certificate rotation.
     pub fn set_threshold_ca_server(&mut self, addr: Option<SocketAddr>) {
         self.threshold_ca_server = addr;
@@ -1718,6 +1765,7 @@ impl Dispatch for PeerManager {
             };
         }
         if dg.is_empty() {
+            self.metrics.record_drop(1);
             return DispatchOut::None;
         }
         // A datagram from the configured rendezvous server is an obfuscated
@@ -1740,6 +1788,7 @@ impl Dispatch for PeerManager {
             return self.finish_wrapped(tun, udp, now_ms);
         }
         let Some(plain) = self.deobf_ingress(src, dg) else {
+            self.metrics.record_drop(1);
             return DispatchOut::None;
         };
         let (tun, udp) = own_dispatch(self.on_udp_dispatch(src, &plain, now_ms));
@@ -1804,6 +1853,7 @@ impl Dispatch for PeerManager {
 impl PeerManager {
     fn on_udp_dispatch(&mut self, src: SocketAddr, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
         if dg.is_empty() {
+            self.metrics.record_drop(1);
             return DispatchOut::None;
         }
         // Rendezvous-server demux: a datagram from the configured server is a
@@ -1832,10 +1882,14 @@ impl PeerManager {
         if let Some(dst) = crate::control::extract_ip_dst(inner) {
             if self.split_tunnel.should_bypass(dst) {
                 self.split_tunnel.record_bypassed(inner.len() as u64);
+                self.metrics
+                    .record_split_tunnel_bypass(inner.len() as u64, 1);
                 return &[];
             }
         }
         self.split_tunnel.record_routed(inner.len() as u64);
+        self.metrics
+            .record_split_tunnel_overlay(inner.len() as u64, 1);
 
         let idx = match self.route_tun_index(inner) {
             Some(i) => i,
@@ -1857,10 +1911,16 @@ impl PeerManager {
                         // now resolves to it; re-drive the normal path below.
                         match self.route_tun_index(inner) {
                             Some(i) => i,
-                            None => return &[],
+                            None => {
+                                self.metrics.record_drop(1);
+                                return &[];
+                            }
                         }
                     }
-                    None => return &[],
+                    None => {
+                        self.metrics.record_drop(1);
+                        return &[];
+                    }
                 }
             }
         };
@@ -1879,6 +1939,7 @@ impl PeerManager {
             self.peers[idx].last_activity_ms = now_ms;
             self.peers[idx].tx_bytes += inner.len() as u64;
             self.peers[idx].tx_packets += 1;
+            self.metrics.record_tx(inner.len() as u64, 1);
             // A relay-reached peer's data-plane egress must be re-wrapped
             // through the server (dst = server); copy the bytes out first (the
             // DataPlane borrows `self.peers[idx]`) then wrap. A direct/punched
@@ -1888,18 +1949,17 @@ impl PeerManager {
                 let PeerState::Established(epochs) = &mut self.peers[idx].state else {
                     unreachable!("just matched Established above");
                 };
-                return epochs.current_mut().on_tun_packet(inner, now_ms);
+                let out = epochs.current_mut().on_tun_packet(inner, now_ms);
+                self.metrics.record_fec_tx(out.len() as u64);
+                return out;
             }
             let owned: Vec<Vec<u8>> = {
                 let PeerState::Established(epochs) = &mut self.peers[idx].state else {
                     unreachable!("just matched Established above");
                 };
-                epochs
-                    .current_mut()
-                    .on_tun_packet(inner, now_ms)
-                    .iter()
-                    .map(|d| d.bytes.clone())
-                    .collect()
+                let out = epochs.current_mut().on_tun_packet(inner, now_ms);
+                self.metrics.record_fec_tx(out.len() as u64);
+                out.iter().map(|d| d.bytes.clone()).collect()
             };
             self.egress.clear();
             for b in owned {
@@ -2287,10 +2347,8 @@ impl PeerManager {
                 reqs.push(req);
             }
             if !reqs.is_empty() {
-                let dev = self.device_name.clone();
-                let start = self.start_time;
                 for req in reqs {
-                    let resp = crate::control::dispatch_cmd(self, req.cmd, &dev, start);
+                    let resp = self.handle_control_cmd(req.cmd);
                     let _ = req.responder.send(resp);
                 }
             }

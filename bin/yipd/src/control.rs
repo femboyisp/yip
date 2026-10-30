@@ -1235,7 +1235,7 @@ pub fn dispatch_cmd(
                             .starts_with(&target)
                 });
             }
-            let registry = crate::metrics::MetricsRegistry::new();
+            let registry = pm.metrics();
             let snapshot = registry.snapshot(&stats);
             let prometheus = registry.render_prometheus(&stats);
             ControlResponse::Metrics {

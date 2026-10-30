@@ -33,6 +33,10 @@ pub fn test_peer_manager() -> PeerManager {
     )
 }
 
+pub fn make_test_peer_manager() -> PeerManager {
+    test_peer_manager()
+}
+
 /// Build a real `DataPlane` (via an in-process Noise handshake) with a
 /// specific `conn_tag`, standing in for "a peer that has already
 /// completed its handshake" — the "test seam" for demux tests: rather
