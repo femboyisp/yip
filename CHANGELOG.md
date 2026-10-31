@@ -6,6 +6,8 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **Prometheus and OpenTelemetry mesh telemetry exposition (`bin/yipd`, `yip metrics`, `--metrics-listen`, #188).**
+  Added native Prometheus 0.0.4 text-format telemetry exposition and structured OpenTelemetry-aligned snapshots (`ControlCmd::GetMetrics`, `yip metrics [--json]`). Built lock-free `MetricsRegistry` in `bin/yipd` backed by atomic counters for packet I/O, FEC symbol recovery, DAITA padding/decoys, cryptographic ratchets, and split-tunnel bypass. Implemented embedded, zero-dependency HTTP/1.1 scraper server (`--metrics-listen <ADDR>`, config `metrics_listen`) with bounded concurrency (16 max connections), 3000ms socket timeout guards, and `/metrics` and `/healthz` endpoints.
 - **Multi-hop circuit tracing and path diagnostic probes (`bin/yipd`, `yip trace`, `yip ping`, #187).**
   Added live circuit tracing (`ControlCmd::TracePath`) and latency diagnostic probes (`ControlCmd::PingPeer`) to the daemon IPC protocol. Supports flexible peer resolution via 64-character public key, short prefix hex, IPv6 node address, socket endpoint, or numeric index. Projects multi-hop path segments across direct P2P and TLS-relayed overlay routes, returning hop identifiers, next-hops, and segment latencies. Added ping sampling with deterministic jitter variance, packet loss accounting, and min/avg/max/stddev RTT calculations, exposed via CLI subcommands `yip trace <peer>` and `yip ping <peer> [-n count] [-W timeout_ms] [--json]`.
 - **Live mesh routing table and topology discovery commands (`bin/yipd`, `yip routes`, `yip topology`, #183).**

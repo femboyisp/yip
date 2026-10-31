@@ -11,6 +11,7 @@ pub mod flow;
 pub mod handshake;
 mod mac_table;
 pub mod membership;
+pub mod metrics;
 pub mod mode;
 mod path;
 pub mod peer_manager;

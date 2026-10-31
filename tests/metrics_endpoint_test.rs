@@ -1,0 +1,1 @@
+../bin/yipd/tests/metrics_endpoint_test.rs

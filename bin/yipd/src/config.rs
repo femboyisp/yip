@@ -196,6 +196,8 @@ pub struct Config {
     pub control_socket: Option<std::path::PathBuf>,
     /// Configured TUN device MTU (`mtu=<576..=65535>`).
     pub mtu: Option<u32>,
+    /// Optional Prometheus/OpenTelemetry HTTP metrics scraping endpoint (`metrics_listen=<ip:port>`).
+    pub metrics_listen: Option<SocketAddr>,
 }
 
 // ── hex decode helper ─────────────────────────────────────────────────────────
@@ -547,6 +549,7 @@ impl Config {
         let mut shards: Option<usize> = None;
         let mut control_socket: Option<std::path::PathBuf> = None;
         let mut mtu: Option<u32> = None;
+        let mut metrics_listen: Option<SocketAddr> = None;
 
         for line in text.lines() {
             let line = line.trim();
@@ -612,7 +615,7 @@ impl Config {
                         ));
                     }
                 }
-                "device" => device = Some(val.to_owned()),
+                "device" => device = Some(val.trim_matches('"').to_owned()),
                 "device_kind" => device_kind = TunnelMode::parse_device_kind(val)?,
                 "rendezvous" => {
                     rendezvous = Some(if let Some(rest) = val.strip_prefix("reality://") {
@@ -754,6 +757,13 @@ impl Config {
                         ));
                     }
                     mtu = Some(m);
+                }
+                "metrics_listen" | "metrics" => {
+                    let clean = val.trim_matches('"');
+                    let addr = clean
+                        .parse::<SocketAddr>()
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    metrics_listen = Some(addr);
                 }
                 // Silently ignore unknown keys for forward-compatibility. The
                 // netns config files still contain `initiate=true|false` from
@@ -986,6 +996,7 @@ impl Config {
             shards: shards.unwrap_or(1),
             control_socket,
             mtu,
+            metrics_listen,
         })
     }
 }
@@ -2498,5 +2509,41 @@ local_public=0000000000000000000000000000000000000000000000000000000000000002
         // bucket > 1500
         let text_bucket_large = format!("{base}defense_buckets=512,1600\n");
         assert!(Config::parse(&text_bucket_large).is_err());
+    }
+
+    #[test]
+    fn test_config_metrics_listen_parsing() {
+        let conf =
+            "local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
+                    local_public=00000000000000000000000000000000000000000000000000000000000000aa\n\
+                    peer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:51820\n\
+                    device = \"tun0\"\nmetrics_listen = \"127.0.0.1:9184\"\n";
+        let parsed = Config::parse(conf).unwrap();
+        assert_eq!(
+            parsed.metrics_listen,
+            Some("127.0.0.1:9184".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_config_metrics_listen_absent_and_invalid() {
+        let base =
+            "local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
+                    local_public=00000000000000000000000000000000000000000000000000000000000000aa\n\
+                    peer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:51820\n\
+                    device=tun0\n";
+        let parsed_none = Config::parse(base).unwrap();
+        assert_eq!(parsed_none.metrics_listen, None);
+
+        let parsed_alias = Config::parse(&format!("{base}metrics=0.0.0.0:9090\n")).unwrap();
+        assert_eq!(
+            parsed_alias.metrics_listen,
+            Some("0.0.0.0:9090".parse().unwrap())
+        );
+
+        let bad_conf = format!("{base}metrics_listen=invalid_addr\n");
+        assert!(Config::parse(&bad_conf).is_err());
     }
 }

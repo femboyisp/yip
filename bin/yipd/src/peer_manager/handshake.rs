@@ -44,6 +44,7 @@ impl PeerManager {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("peer_manager: failed to start handshake: {e}");
+                    self.metrics.record_handshake_failure();
                     return None;
                 }
             };
@@ -175,6 +176,7 @@ impl PeerManager {
         }
         self.peers[idx].state = PeerState::Idle;
         self.peers[idx].admitted_cert_not_after = None;
+        self.metrics.update_peer_stats(self.list_peers());
     }
 
     pub(super) fn handle_handshake_init(
@@ -194,6 +196,7 @@ impl PeerManager {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("peer_manager: start_responder failed: {e}");
+                    self.metrics.record_handshake_failure();
                     return DispatchOut::None;
                 }
             };
@@ -361,13 +364,19 @@ impl PeerManager {
                 });
                 let pending = std::mem::take(&mut self.peers[idx].pending_tun);
                 for inner in &pending {
+                    self.peers[idx].tx_bytes += inner.len() as u64;
+                    self.peers[idx].tx_packets += 1;
+                    self.metrics.record_tx(inner.len() as u64, 1);
                     let out = dp.on_tun_packet(inner, now_ms);
+                    self.metrics.record_fec_tx(out.len() as u64);
                     self.egress.extend(out.iter().cloned());
                 }
                 let mut epoch_set = Box::new(crate::epoch::EpochSet::new(dp, now_ms));
                 epoch_set.set_fec_repair_ratio(self.fec_config.redundancy_pct as f32 / 100.0);
                 self.peers[idx].state = PeerState::Established(epoch_set);
                 self.record_new_epoch(idx);
+                self.metrics.record_handshake_success();
+                self.metrics.update_peer_stats(self.list_peers());
 
                 DispatchOut::Udp(&self.egress)
             }
@@ -450,13 +459,19 @@ impl PeerManager {
                 self.egress.clear();
                 let pending = std::mem::take(&mut self.peers[idx].pending_tun);
                 for inner in &pending {
+                    self.peers[idx].tx_bytes += inner.len() as u64;
+                    self.peers[idx].tx_packets += 1;
+                    self.metrics.record_tx(inner.len() as u64, 1);
                     let out = dp.on_tun_packet(inner, now_ms);
+                    self.metrics.record_fec_tx(out.len() as u64);
                     self.egress.extend(out.iter().cloned());
                 }
                 let mut epoch_set = Box::new(crate::epoch::EpochSet::new(dp, now_ms));
                 epoch_set.set_fec_repair_ratio(self.fec_config.redundancy_pct as f32 / 100.0);
                 self.peers[idx].state = PeerState::Established(epoch_set);
                 self.record_new_epoch(idx);
+                self.metrics.record_handshake_success();
+                self.metrics.update_peer_stats(self.list_peers());
 
                 if self.egress.is_empty() {
                     DispatchOut::None
@@ -466,6 +481,7 @@ impl PeerManager {
             }
             Err(e) => {
                 eprintln!("peer_manager: read_response failed: {e}");
+                self.metrics.record_handshake_failure();
                 // State was already reverted to `Idle` above (via the
                 // `mem::replace`); `pending_tun` stays queued and the next
                 // `on_tun` call will start a fresh handshake.

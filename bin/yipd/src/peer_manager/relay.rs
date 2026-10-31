@@ -328,15 +328,18 @@ impl PeerManager {
                 let pending = std::mem::take(&mut self.peers[idx].pending_tun);
                 let mut owned: Vec<Vec<u8>> = Vec::new();
                 for inner in &pending {
-                    owned.extend(
-                        dp.on_tun_packet(inner, now_ms)
-                            .iter()
-                            .map(|d| d.bytes.clone()),
-                    );
+                    self.peers[idx].tx_bytes += inner.len() as u64;
+                    self.peers[idx].tx_packets += 1;
+                    self.metrics.record_tx(inner.len() as u64, 1);
+                    let out = dp.on_tun_packet(inner, now_ms);
+                    self.metrics.record_fec_tx(out.len() as u64);
+                    owned.extend(out.iter().map(|d| d.bytes.clone()));
                 }
                 self.peers[idx].state =
                     PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, now_ms)));
                 self.record_new_epoch(idx);
+                self.metrics.record_handshake_success();
+                self.metrics.update_peer_stats(self.list_peers());
                 for b in owned {
                     if let Some(d) = self.relay_wrap(idx, b) {
                         self.egress.push(d);
@@ -405,15 +408,18 @@ impl PeerManager {
                 let pending = std::mem::take(&mut self.peers[idx].pending_tun);
                 let mut owned: Vec<Vec<u8>> = Vec::new();
                 for inner in &pending {
-                    owned.extend(
-                        dp.on_tun_packet(inner, now_ms)
-                            .iter()
-                            .map(|d| d.bytes.clone()),
-                    );
+                    self.peers[idx].tx_bytes += inner.len() as u64;
+                    self.peers[idx].tx_packets += 1;
+                    self.metrics.record_tx(inner.len() as u64, 1);
+                    let out = dp.on_tun_packet(inner, now_ms);
+                    self.metrics.record_fec_tx(out.len() as u64);
+                    owned.extend(out.iter().map(|d| d.bytes.clone()));
                 }
                 self.peers[idx].state =
                     PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, now_ms)));
                 self.record_new_epoch(idx);
+                self.metrics.record_handshake_success();
+                self.metrics.update_peer_stats(self.list_peers());
                 for b in owned {
                     if let Some(d) = self.relay_wrap(idx, b) {
                         self.egress.push(d);
@@ -427,6 +433,7 @@ impl PeerManager {
             }
             Err(e) => {
                 eprintln!("peer_manager: relayed read_response failed: {e}");
+                self.metrics.record_handshake_failure();
                 DispatchOut::None
             }
         }
@@ -440,21 +447,60 @@ impl PeerManager {
     /// real `dst`/`fate` on each `EgressDatagram` are irrelevant for a
     /// relayed peer (the actual wire destination is the relay server).
     fn relayed_data(&mut self, idx: usize, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
-        let (tun, udp): (Option<Vec<u8>>, Vec<Vec<u8>>) = {
+        if !dg.is_empty() && dg[0] == PacketType::Data as u8 {
+            self.peers[idx].last_activity_ms = now_ms;
+        }
+        let ((tun, udp), promoted_epoch) = {
             let PeerState::Established(epochs) = &mut self.peers[idx].state else {
                 return DispatchOut::None;
             };
-            match epochs.inbound_open(dg, now_ms) {
-                crate::epoch::EpochInbound::None => (None, Vec::new()),
-                crate::epoch::EpochInbound::Tun(buf) => (Some(buf), Vec::new()),
+            let prev_rec = epochs.fec_recovered_count();
+            let prev_burst = epochs.fec_unrecoverable_count();
+            let prev_epoch = epochs.epoch();
+            let opened = epochs.inbound_open(dg, now_ms);
+            let promoted_epoch = if epochs.epoch() != prev_epoch {
+                let ep = epochs.epoch();
+                let obf = epochs.current_obf_key();
+                Some((ep, obf))
+            } else {
+                None
+            };
+            let rec_diff = epochs.fec_recovered_count().saturating_sub(prev_rec);
+            if rec_diff > 0 {
+                self.metrics.record_fec_recovered(rec_diff);
+            }
+            let burst_diff = epochs.fec_unrecoverable_count().saturating_sub(prev_burst);
+            if burst_diff > 0 {
+                self.metrics.record_fec_burst_drop(burst_diff);
+            }
+            let res = match opened {
+                crate::epoch::EpochInbound::None => {
+                    self.metrics.record_drop(1);
+                    (None, Vec::new())
+                }
+                crate::epoch::EpochInbound::Tun(buf) => {
+                    self.peers[idx].rx_bytes += buf.len() as u64;
+                    self.peers[idx].rx_packets += 1;
+                    self.metrics.record_rx(buf.len() as u64, 1);
+                    (Some(buf), Vec::new())
+                }
                 crate::epoch::EpochInbound::Send(dgs) => {
                     (None, dgs.iter().map(|d| d.bytes.clone()).collect())
                 }
                 crate::epoch::EpochInbound::TunThenSend(buf, dgs) => {
+                    self.peers[idx].rx_bytes += buf.len() as u64;
+                    self.peers[idx].rx_packets += 1;
+                    self.metrics.record_rx(buf.len() as u64, 1);
                     (Some(buf), dgs.iter().map(|d| d.bytes.clone()).collect())
                 }
-            }
+            };
+            (res, promoted_epoch)
         };
+        if let Some((ep, obf)) = promoted_epoch {
+            self.peers[idx].session_obf_key = obf;
+            self.metrics.record_rekey();
+            self.metrics.set_current_epoch(ep);
+        }
         self.egress.clear();
         for b in udp {
             if let Some(d) = self.relay_wrap(idx, b) {

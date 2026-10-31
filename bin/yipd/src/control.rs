@@ -98,6 +98,11 @@ pub enum ControlCmd {
         #[serde(default = "default_ping_timeout_ms")]
         timeout_ms: u64,
     },
+    #[serde(rename = "get_metrics")]
+    GetMetrics {
+        #[serde(default)]
+        peer: Option<String>,
+    },
 }
 
 fn default_ping_count() -> u32 {
@@ -651,6 +656,11 @@ pub enum ControlResponse {
         max_rtt_ms: Option<f64>,
         stddev_rtt_ms: Option<f64>,
         samples: Vec<f64>,
+    },
+    Metrics {
+        ok: bool,
+        metrics: crate::metrics::TelemetrySnapshot,
+        prometheus: String,
     },
     Ack {
         ok: bool,
@@ -1213,6 +1223,27 @@ pub fn dispatch_cmd(
                 error: e,
             },
         },
+        ControlCmd::GetMetrics { peer } => {
+            let mut stats = pm.peer_stats();
+            if let Some(target) = peer {
+                stats.retain(|p| {
+                    p.node_addr.to_string() == target
+                        || p.public_key
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>()
+                            .starts_with(&target)
+                });
+            }
+            let registry = pm.metrics();
+            let snapshot = registry.snapshot(&stats);
+            let prometheus = registry.render_prometheus(&stats);
+            ControlResponse::Metrics {
+                ok: true,
+                metrics: snapshot,
+                prometheus,
+            }
+        }
     }
 }
 
@@ -2008,6 +2039,33 @@ pub fn run_cli_split_set(
     }
 }
 
+/// Query and display telemetry metrics.
+pub fn run_cli_metrics(socket_path: &Path, json: bool) -> Result<(), String> {
+    let resp = client_query(socket_path, ControlCmd::GetMetrics { peer: None })?;
+    match resp {
+        ControlResponse::Metrics {
+            ok,
+            metrics,
+            prometheus,
+        } => {
+            if !ok {
+                return Err("daemon reported metrics error".into());
+            }
+            if json {
+                let text = serde_json::to_string_pretty(&metrics).map_err(|e| e.to_string())?;
+                println!("{text}");
+            } else if prometheus.ends_with('\n') {
+                print!("{prometheus}");
+            } else {
+                println!("{prometheus}");
+            }
+            Ok(())
+        }
+        ControlResponse::Err { error, .. } => Err(error),
+        _ => Err("unexpected response format from daemon".into()),
+    }
+}
+
 struct CursorGuard;
 impl Drop for CursorGuard {
     fn drop(&mut self) {
@@ -2586,6 +2644,8 @@ mod tests {
             None
         )
         .is_err());
+        assert!(run_cli_metrics(path, false).is_ok());
+        assert!(run_cli_metrics(path, true).is_ok());
 
         running.store(false, Ordering::Relaxed);
         let _ = srv.join();
@@ -3075,5 +3135,92 @@ mod tests {
             }
             other => panic!("expected TracePath response, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_control_protocol_get_metrics_serde() {
+        let cmd = ControlCmd::GetMetrics {
+            peer: Some("node1".into()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"cmd\":\"get_metrics\""));
+        let parsed: ControlCmd = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ControlCmd::GetMetrics { peer } => assert_eq!(peer.as_deref(), Some("node1")),
+            _ => panic!("wrong variant"),
+        }
+
+        // Test omitting peer field
+        let json_no_peer = r#"{"cmd":"get_metrics"}"#;
+        let parsed_no_peer: ControlCmd = serde_json::from_str(json_no_peer).unwrap();
+        match parsed_no_peer {
+            ControlCmd::GetMetrics { peer } => assert_eq!(peer, None),
+            _ => panic!("wrong variant"),
+        }
+
+        // Test ControlResponse::Metrics serde
+        let reg = crate::metrics::MetricsRegistry::new();
+        let snapshot = reg.snapshot(&[]);
+        let prom_text = reg.render_prometheus(&[]);
+        let resp = ControlResponse::Metrics {
+            ok: true,
+            metrics: snapshot.clone(),
+            prometheus: prom_text.clone(),
+        };
+        let resp_json = serde_json::to_string(&resp).unwrap();
+        let parsed_resp: ControlResponse = serde_json::from_str(&resp_json).unwrap();
+        match parsed_resp {
+            ControlResponse::Metrics {
+                ok,
+                metrics,
+                prometheus,
+            } => {
+                assert!(ok);
+                assert_eq!(metrics, snapshot);
+                assert_eq!(prometheus, prom_text);
+            }
+            other => panic!("expected ControlResponse::Metrics, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_run_cli_metrics_error_handling() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let sock_path = format!("/tmp/test_cli_metrics_err_{}.sock", std::process::id());
+        let _ = std::fs::remove_file(&sock_path);
+        let handle = ControlHandle::bind(&sock_path).unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let running_clone = running.clone();
+        let srv = std::thread::spawn(move || {
+            while running_clone.load(Ordering::Relaxed) {
+                if let Ok(req) = handle.try_recv() {
+                    let resp = ControlResponse::Err {
+                        ok: false,
+                        error: "internal daemon error".into(),
+                    };
+                    let _ = req.responder.send(resp);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let path = Path::new(&sock_path);
+
+        let err = run_cli_metrics(path, false).unwrap_err();
+        assert_eq!(err, "internal daemon error");
+
+        let err_json = run_cli_metrics(path, true).unwrap_err();
+        assert_eq!(err_json, "internal daemon error");
+
+        running.store(false, Ordering::Relaxed);
+        let _ = srv.join();
+        let _ = std::fs::remove_file(&sock_path);
+
+        // Non-existent socket error
+        assert!(run_cli_metrics(Path::new("/tmp/nonexistent_metrics.sock"), false).is_err());
     }
 }

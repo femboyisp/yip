@@ -65,6 +65,7 @@ maintainer.
 - **Live mesh routing table & interactive topology discovery (#183)** — live routing table queries (`ControlCmd::GetRoutes`) and interactive topology graph projection (`ControlCmd::GetTopology`) over UNIX domain control socket and CLI (`yip routes`, `yip topology`), mapping peers into latency categories (`Optimal`, `Normal`, `Elevated`) and computing next-hop metrics and MTU budgets.
 - **Split-tunnel CIDR, domain, and application route bypass control (#184)** — dynamic traffic bypass rule management (`ControlCmd::GetSplitTunnelStatus`, `ControlCmd::SetSplitTunnelConfig`, `yip split <status|set>`) with zero-allocation bitmask subnet filtering in `PeerManager::on_tun_dispatch` for IPv4 and IPv6 traffic.
 - **Multi-hop circuit tracing and path diagnostic probes (#187)** — hop-by-hop mesh circuit tracing (`ControlCmd::TracePath`, `yip trace`) and active latency diagnostic probes (`ControlCmd::PingPeer`, `yip ping`) with min/avg/max/stddev RTT calculations, jitter sampling, and timeout-induced loss detection across direct and relayed circuits.
+- **Prometheus & OpenTelemetry telemetry exposition (#188)** — native Prometheus 0.0.4 text format exposition and OpenTelemetry mesh telemetry (`ControlCmd::GetMetrics`, `yip metrics`), lock-free atomic `MetricsRegistry` in `yipd`, and embedded zero-dependency HTTP/1.1 scraper endpoint (`--metrics-listen <ADDR>`, `GET /metrics`, `GET /healthz`).
 
 ## Now
 

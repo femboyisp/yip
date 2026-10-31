@@ -173,22 +173,49 @@ impl PeerManager {
         let PeerState::Established(epochs) = &mut self.peers[idx].state else {
             return DispatchOut::None;
         };
+        let prev_rec = epochs.fec_recovered_count();
+        let prev_burst = epochs.fec_unrecoverable_count();
         // `EpochInbound::Send`/`TunThenSend` carry the full `EgressDatagram`
         // (real `dst` + `fate`), so no reconstruction from
         // `self.peers[idx].endpoint` is needed — that placeholder is wrong
         // for relay-established peers (their `DataPlane::peer_addr` is a
         // `server_addr()` stand-in; `endpoint` may hold an unconfirmed
         // candidate or `None`).
+        let prev_epoch = epochs.epoch();
         let opened = epochs.inbound_open(dg, now_ms);
+        let promoted_epoch = if epochs.epoch() != prev_epoch {
+            let ep = epochs.epoch();
+            let obf = epochs.current_obf_key();
+            Some((ep, obf))
+        } else {
+            None
+        };
+        let rec_diff = epochs.fec_recovered_count().saturating_sub(prev_rec);
+        if rec_diff > 0 {
+            self.metrics.record_fec_recovered(rec_diff);
+        }
+        let burst_diff = epochs.fec_unrecoverable_count().saturating_sub(prev_burst);
+        if burst_diff > 0 {
+            self.metrics.record_fec_burst_drop(burst_diff);
+        }
+        if let Some((ep, obf)) = promoted_epoch {
+            self.peers[idx].session_obf_key = obf;
+            self.metrics.record_rekey();
+            self.metrics.set_current_epoch(ep);
+        }
         if !matches!(opened, crate::epoch::EpochInbound::None) {
             // Authenticated + non-replayed (M2 roaming) — safe to roam.
             self.relearn_endpoint(idx, src);
         }
         match opened {
-            crate::epoch::EpochInbound::None => DispatchOut::None,
+            crate::epoch::EpochInbound::None => {
+                self.metrics.record_drop(1);
+                DispatchOut::None
+            }
             crate::epoch::EpochInbound::Tun(buf) => {
                 self.peers[idx].rx_bytes += buf.len() as u64;
                 self.peers[idx].rx_packets += 1;
+                self.metrics.record_rx(buf.len() as u64, 1);
                 self.tun_scratch = buf;
                 DispatchOut::Tun(&self.tun_scratch)
             }
@@ -199,6 +226,7 @@ impl PeerManager {
             crate::epoch::EpochInbound::TunThenSend(buf, dgs) => {
                 self.peers[idx].rx_bytes += buf.len() as u64;
                 self.peers[idx].rx_packets += 1;
+                self.metrics.record_rx(buf.len() as u64, 1);
                 self.tun_scratch = buf;
                 self.egress = dgs;
                 DispatchOut::Both(&self.tun_scratch, &self.egress)
@@ -243,23 +271,49 @@ impl PeerManager {
             .map(|(i, _)| i)
             .collect();
         for idx in candidates {
-            let hit = {
+            let (hit, rec_diff, burst_diff, promoted_epoch) = {
                 let PeerState::Established(epochs) = &mut self.peers[idx].state else {
                     continue;
                 };
-                match epochs.inbound_open(dg, now_ms) {
+                let prev_rec = epochs.fec_recovered_count();
+                let prev_burst = epochs.fec_unrecoverable_count();
+                let prev_epoch = epochs.epoch();
+                let opened = epochs.inbound_open(dg, now_ms);
+                let promoted_epoch = if epochs.epoch() != prev_epoch {
+                    let ep = epochs.epoch();
+                    let obf = epochs.current_obf_key();
+                    Some((ep, obf))
+                } else {
+                    None
+                };
+                let rec_diff = epochs.fec_recovered_count().saturating_sub(prev_rec);
+                let burst_diff = epochs.fec_unrecoverable_count().saturating_sub(prev_burst);
+                let h = match opened {
                     crate::epoch::EpochInbound::None => None,
                     crate::epoch::EpochInbound::Tun(buf) => Some((Some(buf), Vec::new())),
                     crate::epoch::EpochInbound::Send(dgs) => Some((None, dgs)),
                     crate::epoch::EpochInbound::TunThenSend(buf, dgs) => Some((Some(buf), dgs)),
-                }
+                };
+                (h, rec_diff, burst_diff, promoted_epoch)
             };
+            if let Some((ep, obf)) = promoted_epoch {
+                self.peers[idx].session_obf_key = obf;
+                self.metrics.record_rekey();
+                self.metrics.set_current_epoch(ep);
+            }
+            if rec_diff > 0 {
+                self.metrics.record_fec_recovered(rec_diff);
+            }
+            if burst_diff > 0 {
+                self.metrics.record_fec_burst_drop(burst_diff);
+            }
             let Some((tun, udp)) = hit else {
                 continue;
             };
             if let Some(ref t) = tun {
                 self.peers[idx].rx_bytes += t.len() as u64;
                 self.peers[idx].rx_packets += 1;
+                self.metrics.record_rx(t.len() as u64, 1);
             }
             // Authenticated + non-replayed (M2 roaming) — safe to roam.
             self.relearn_endpoint(idx, src);
@@ -283,6 +337,7 @@ impl PeerManager {
                 (None, true) => DispatchOut::None,
             };
         }
+        self.metrics.record_drop(1);
         DispatchOut::None
     }
 }

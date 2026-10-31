@@ -12,6 +12,7 @@ pub(crate) mod flow;
 mod handshake;
 mod mac_table;
 mod membership;
+pub mod metrics;
 mod mode;
 mod path;
 mod peer_manager;
@@ -49,11 +50,13 @@ fn print_daemon_usage() {
     println!("Commands:");
     println!("  status       Display daemon status and summary");
     println!("  peers        List connected peers and statistics");
+    println!("  metrics      Display runtime metrics and telemetry");
     println!("  top          Real-time ANSI telemetry dashboard");
     println!();
     println!("Options:");
     println!("  -c, --control <SOCKET>  UNIX domain control socket path");
     println!("      --mtu <BYTES>       TUN device MTU (576-65535, default: 1400)");
+    println!("      --metrics-listen <ADDR> Prometheus/OTEL HTTP metrics listen address (e.g. 127.0.0.1:9184)");
     println!("      --genkey            Generate a fresh X25519 keypair");
     println!("      --addr <HEX-KEY>    Derive self-certifying mesh IPv6 address");
     println!("  -V, --version           Print version");
@@ -76,6 +79,16 @@ fn print_cli_usage(subcmd: &str) {
             println!("Usage: yipctl peers [OPTIONS]");
             println!();
             println!("List peers and transport telemetry from the local yipd daemon.");
+            println!();
+            println!("Options:");
+            println!("  -c, --control <SOCKET>  Path to yipd UNIX control socket");
+            println!("      --json              Output raw JSON");
+            println!("  -h, --help              Print help");
+        }
+        "metrics" => {
+            println!("Usage: yipctl metrics [OPTIONS]");
+            println!();
+            println!("Display system, transport, crypto, and peer metrics.");
             println!();
             println!("Options:");
             println!("  -c, --control <SOCKET>  Path to yipd UNIX control socket");
@@ -218,6 +231,7 @@ fn print_cli_usage(subcmd: &str) {
             println!("Commands:");
             println!("  status    Display daemon status and summary");
             println!("  peers     List connected peers and statistics");
+            println!("  metrics   Display runtime metrics and telemetry");
             println!("  routes    Display live mesh overlay routing table");
             println!("  topology  Display mesh topology graph projection");
             println!("  split     Inspect or configure split-tunnel bypass rules");
@@ -725,11 +739,75 @@ fn run_client_subcommand(
                 }
             }
         }
+        "metrics" => control::run_cli_metrics(&socket, json).map_err(std::io::Error::other),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("unknown subcommand: {subcmd}"),
         )),
     }
+}
+
+pub(crate) fn parse_daemon_flags(
+    args: &mut impl Iterator<Item = String>,
+) -> std::io::Result<(
+    Option<std::path::PathBuf>,
+    Option<u32>,
+    Option<std::net::SocketAddr>,
+)> {
+    let mut control_override = None;
+    let mut mtu_override = None;
+    let mut metrics_listen_override = None;
+    while let Some(arg) = args.next() {
+        if arg == "--control" || arg == "-c" {
+            let cpath = args.next().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--control requires a socket path argument",
+                )
+            })?;
+            control_override = Some(std::path::PathBuf::from(cpath));
+        } else if arg == "--mtu" {
+            let mstr = args.next().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--mtu requires a byte count argument",
+                )
+            })?;
+            let m: u32 = mstr.parse().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid mtu '{mstr}': must be an integer"),
+                )
+            })?;
+            if !(576..=65535).contains(&m) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid mtu '{m}': must be between 576 and 65535"),
+                ));
+            }
+            mtu_override = Some(m);
+        } else if arg == "--metrics-listen" {
+            let mstr = args.next().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--metrics-listen requires a socket address argument (e.g. 127.0.0.1:9184)",
+                )
+            })?;
+            let addr: std::net::SocketAddr = mstr.parse().map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid metrics listen address '{mstr}': {e}"),
+                )
+            })?;
+            metrics_listen_override = Some(addr);
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unrecognized option: {arg}"),
+            ));
+        }
+    }
+    Ok((control_override, mtu_override, metrics_listen_override))
 }
 
 fn main() -> std::io::Result<()> {
@@ -764,6 +842,7 @@ fn main() -> std::io::Result<()> {
             Some("routes") => return run_client_subcommand("routes", args),
             Some("topology") => return run_client_subcommand("topology", args),
             Some("split") | Some("split-tunnel") => return run_client_subcommand("split", args),
+            Some("metrics") => return run_client_subcommand("metrics", args),
             Some("genkey") | Some("--genkey") => {
                 let kp = yip_crypto::generate_keypair();
                 println!("private={}", hex_encode(&kp.private));
@@ -806,6 +885,7 @@ fn main() -> std::io::Result<()> {
         Some("routes") => run_client_subcommand("routes", args),
         Some("topology") => run_client_subcommand("topology", args),
         Some("split") | Some("split-tunnel") => run_client_subcommand("split", args),
+        Some("metrics") => run_client_subcommand("metrics", args),
         Some("--version") | Some("-V") => {
             println!("{}", banner());
             Ok(())
@@ -840,39 +920,8 @@ fn main() -> std::io::Result<()> {
             ))
         }
         Some(path) => {
-            let mut control_override = None;
-            let mut mtu_override = None;
-            while let Some(arg) = args.next() {
-                if arg == "--control" || arg == "-c" {
-                    let cpath = args.next().ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            "--control requires a socket path argument",
-                        )
-                    })?;
-                    control_override = Some(std::path::PathBuf::from(cpath));
-                } else if arg == "--mtu" {
-                    let mstr = args.next().ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            "--mtu requires a byte count argument",
-                        )
-                    })?;
-                    let m: u32 = mstr.parse().map_err(|_| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            format!("invalid mtu '{mstr}': must be an integer"),
-                        )
-                    })?;
-                    if !(576..=65535).contains(&m) {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            format!("invalid mtu '{m}': must be between 576 and 65535"),
-                        ));
-                    }
-                    mtu_override = Some(m);
-                }
-            }
+            let (control_override, mtu_override, metrics_listen_override) =
+                parse_daemon_flags(&mut args)?;
 
             let text = std::fs::read_to_string(path)?;
             let mut config = Config::parse(&text)?;
@@ -881,6 +930,9 @@ fn main() -> std::io::Result<()> {
             }
             if let Some(mtu) = mtu_override {
                 config.mtu = Some(mtu);
+            }
+            if let Some(maddr) = metrics_listen_override {
+                config.metrics_listen = Some(maddr);
             }
             tunnel::run(config)
         }
@@ -927,5 +979,37 @@ mod tests {
     fn hex_decode_32_rejects_bad_digit() {
         let bad = "zz".repeat(32);
         assert!(hex_decode_32(&bad).is_err());
+    }
+
+    #[test]
+    fn test_parse_daemon_flags_metrics_listen() {
+        let args = vec![
+            "--metrics-listen".to_string(),
+            "127.0.0.1:9184".to_string(),
+            "--control".to_string(),
+            "/run/yipd.sock".to_string(),
+            "--mtu".to_string(),
+            "1420".to_string(),
+        ];
+        let (ctl, mtu, metrics) = parse_daemon_flags(&mut args.into_iter()).unwrap();
+        assert_eq!(metrics, Some("127.0.0.1:9184".parse().unwrap()));
+        assert_eq!(ctl, Some(std::path::PathBuf::from("/run/yipd.sock")));
+        assert_eq!(mtu, Some(1420));
+    }
+
+    #[test]
+    fn test_parse_daemon_flags_invalid_metrics_listen() {
+        let missing_arg = vec!["--metrics-listen".to_string()];
+        assert!(parse_daemon_flags(&mut missing_arg.into_iter()).is_err());
+
+        let invalid_addr = vec!["--metrics-listen".to_string(), "not-an-ip-addr".to_string()];
+        assert!(parse_daemon_flags(&mut invalid_addr.into_iter()).is_err());
+    }
+
+    #[test]
+    fn test_print_cli_usage_metrics() {
+        print_cli_usage("metrics");
+        print_cli_usage("");
+        print_daemon_usage();
     }
 }
