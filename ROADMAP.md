@@ -31,7 +31,7 @@ maintainer.
   obfuscation key rotation; handshake anti-replay (TAI64N freshness gating); signed rendezvous
   registration; authenticated endpoint roaming.
 - **Quality gates & maintainability** — 90% control plane line-coverage floor in CI; widened
-  mutation testing (`cargo mutants`) across logic crates; modularized `peer_manager` and
+  mutation testing (`cargo mutants`) across logic crates (`yip-wire`, `yip-transport`, `yip-crypto`, `yip-obf`, `yip-membership`, `yip-rendezvous`) with 100% caught/equivalent rate and bounded linear-probing execution guards; modularized `peer_manager` and
   `yip-utls/src/stream/`.
 - **Real WAN benchmark harness & ephemeral AWS multi-region testing (#109)** — automated, reproducible
   WAN benchmarking suite across cloud VPSes and ephemeral multi-region AWS EC2 instances, comparing

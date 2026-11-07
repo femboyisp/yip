@@ -508,4 +508,66 @@ mod tests {
         assert_eq!(decoded.as_deref(), Some(fwd.as_slice()));
         assert_eq!(t.fec_recovered_count(), 1);
     }
+
+    #[test]
+    fn test_transport_set_fec_repair_ratio() {
+        let mut t = Transport::new(vec![], 1200);
+        t.set_fec_repair_ratio(0.42);
+        for class in &[FlowClass::Default, FlowClass::Realtime, FlowClass::Bulk] {
+            let ratio = t.controllers[class_index(*class)].ratio();
+            assert!((ratio - 0.42).abs() < 1e-5);
+            assert!((t.controllers[class_index(*class)].min_ratio() - 0.42).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_transport_total_symbols_tx() {
+        let mut t = Transport::new(vec![], 1200);
+        assert_eq!(t.total_symbols_tx(), 0);
+        let data = vec![0x42u8; 2500];
+        let inner = vec![0x42u8; 64];
+        let (_, syms) = t.encode(&data, &inner, false, 0);
+        let count = syms.len() as u64;
+        assert!(count >= 3);
+        assert_eq!(t.total_symbols_tx(), count);
+        assert_ne!(t.total_symbols_tx(), 0);
+        assert_ne!(t.total_symbols_tx(), 1);
+    }
+
+    #[test]
+    fn test_transport_fec_unrecoverable_count() {
+        let mut tx = Transport::new(vec![], 1200);
+        let mut rx = Transport::new(vec![], 1200);
+        assert_eq!(rx.fec_unrecoverable_count(), 0);
+
+        let data = vec![0x55u8; 3000];
+        let inner = vec![0x55u8; 64];
+
+        // Encode 2 objects requiring multiple symbols
+        let (class1, syms1) = tx.encode(&data, &inner, false, 0);
+        let (class2, syms2) = tx.encode(&data, &inner, false, 0);
+        assert!(syms1.len() >= 3);
+        assert!(syms2.len() >= 3);
+
+        // Decode only the first symbol for each object
+        assert!(rx
+            .decode(u64::from(syms1[0].object_id), &syms1[0], class1, 0)
+            .is_none());
+        assert!(rx
+            .decode(u64::from(syms2[0].object_id), &syms2[0], class2, 0)
+            .is_none());
+        assert_eq!(rx.fec_unrecoverable_count(), 0);
+
+        // Sweep both objects past deadline by decoding a single-symbol object at 100_000ms
+        let small = vec![0xaau8; 100];
+        let (class3, syms3) = tx.encode(&small, &small, false, 100_000);
+        assert_eq!(syms3.len(), 2);
+        let dec3 = rx.decode(u64::from(syms3[0].object_id), &syms3[0], class3, 100_000);
+        assert!(dec3.is_some());
+        assert_eq!(rx.fec_unrecoverable_count(), 2);
+        assert_ne!(rx.fec_unrecoverable_count(), 0);
+        assert_ne!(rx.fec_unrecoverable_count(), 1);
+        assert_ne!(rx.fec_unrecoverable_count(), 0);
+        assert_ne!(rx.fec_unrecoverable_count(), 1);
+    }
 }

@@ -138,12 +138,28 @@
 #     causes `EncapsulationKey::new` to reject the invalid key and return the identical
 #     `CryptoError::Handshake`, making all mutations within the manual ByteDecode_12 loop
 #     equivalent mutants.
-# 15. `replace < with <= in FecReassembler::push` (yip-transport/src/fec.rs ~line 376)
+# 15. `replace < with (<=|==) in FecReassembler::push` (yip-transport/src/fec.rs ~line 584)
 #     `if shard_data.len() < state.shard_len { shard_data.resize(state.shard_len, 0); }`.
-#     Incoming shard wire lengths are strictly bounded by `<= state.shard_len` via the
+#     Incoming shard wire lengths are strictly bounded by `== state.shard_len` via the
 #     preceding `expected_wire_len` guard. When `shard_data.len() == state.shard_len`,
 #     resizing to `state.shard_len` is an exact no-op on a `Vec` whose length already equals
-#     the target length. Both `<` and `<=` produce byte-for-byte identical shard states.
+#     the target length. Therefore `<`, `<=`, and `==` all produce byte-for-byte identical
+#     shard states.
+# 16. `replace < with > in reconstruct_missing_sources` (yip-transport/src/rs.rs ~line 298)
+#     `if rows.len() < k { return None; }`.
+#     `rows.len()` is capped at `k` by line 289 (`if rows.len() == k { break; }`), so
+#     `rows.len() > k` is impossible. If `rows.len() < k`, at most `rows.len()` rows of
+#     generator submatrix `m` are populated from received shards, leaving at least one
+#     row of `m` as all-zeros. A matrix with an all-zero row has determinant 0 and is
+#     singular over GF(256), so `invert(&mut m)?` returns `None` regardless of whether
+#     the line 298 guard fires.
+# 17. `replace << with >> in reconstruct_missing_sources` (yip-transport/src/rs.rs ~line 321)
+#     `let is_present = (seen_mask[u / 64] & (1u64 << (u % 64))) != 0;`.
+#     For any source shard `i` present in `seen_mask`, row `i` of generator submatrix M is
+#     the unit vector e_i. Because M^{-1} * M = I, row `i` of M^{-1} has a 1 at column `i`
+#     and 0 everywhere else. Multiplying M^{-1} row `i` by the rows of M reconstructs
+#     1 * shard_i. Whether `is_present` skips the reconstruction (`continue`) or recomputes
+#     and writes it into `payload`, the bytes written to `payload` are mathematically identical.
 exclude_re = [
     "replace \\| with \\^ in ReplayWindow::commit",
     "replace > with >= in ReplayWindow::commit",
@@ -154,6 +170,9 @@ exclude_re = [
     "replace < with <= in split_source",
     "replace < with > in FecReassembler::push",
     "replace < with <= in FecReassembler::push",
+    "replace < with == in FecReassembler::push",
+    "replace < with > in reconstruct_missing_sources",
+    "replace << with >> in reconstruct_missing_sources",
     "replace > with >= in LossDetector::on_seen",
     "replace \\+ with \\* in LossDetector::on_seen",
     "replace neon_supported -> bool with (true|false)",

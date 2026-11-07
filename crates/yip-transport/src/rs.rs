@@ -615,6 +615,12 @@ mod tests {
             let offset = i * len;
             assert_eq!(&payload[offset..offset + len], exp.as_slice());
         }
+
+        // Buffer bounds: too small must return None, larger buffer must succeed.
+        let mut too_small = vec![0u8; k * len - 1];
+        assert!(decode_source_into(k, len, &recv, Scheme::Pq, &mut too_small).is_none());
+        let mut larger = vec![0u8; k * len + 16];
+        assert!(decode_source_into(k, len, &recv, Scheme::Pq, &mut larger).is_some());
     }
 
     #[test]
@@ -636,6 +642,44 @@ mod tests {
 
         let repair_shards: Vec<(u16, &[u8])> =
             vec![(4, repair[0].as_slice()), (5, repair[1].as_slice())];
+
+        // Insufficient shards (< k) must return None
+        let insufficient: Vec<(u16, &[u8])> = vec![(4, repair[0].as_slice())];
+        assert!(reconstruct_missing_sources(
+            k,
+            len,
+            &mut payload,
+            &seen_mask,
+            &insufficient,
+            Scheme::Pq
+        )
+        .is_none());
+
+        // Buffer too small (< k * len) must return None
+        let mut too_small = vec![0u8; k * len - 1];
+        assert!(reconstruct_missing_sources(
+            k,
+            len,
+            &mut too_small,
+            &seen_mask,
+            &repair_shards,
+            Scheme::Pq
+        )
+        .is_none());
+
+        // Buffer larger (> k * len) must succeed
+        let mut larger = vec![0u8; k * len + 32];
+        larger[0..len].copy_from_slice(&source[0]);
+        larger[2 * len..3 * len].copy_from_slice(&source[2]);
+        assert!(reconstruct_missing_sources(
+            k,
+            len,
+            &mut larger,
+            &seen_mask,
+            &repair_shards,
+            Scheme::Pq
+        )
+        .is_some());
 
         reconstruct_missing_sources(k, len, &mut payload, &seen_mask, &repair_shards, Scheme::Pq)
             .unwrap();

@@ -312,13 +312,14 @@ impl ObjectTable {
     pub fn find_index(&self, key: &u64) -> Option<usize> {
         let mask = self.slots.len() - 1;
         let mut idx = hash_key(*key, mask);
-        loop {
+        for _ in 0..self.slots.len() {
             match &self.slots[idx] {
                 Some((k, _)) if *k == *key => return Some(idx),
                 Some(_) => idx = (idx + 1) & mask,
                 None => return None,
             }
         }
+        None
     }
 
     pub fn get(&self, key: &u64) -> Option<&ObjState> {
@@ -334,7 +335,7 @@ impl ObjectTable {
     pub fn insert(&mut self, key: u64, state: ObjState) -> Option<ObjState> {
         let mask = self.slots.len() - 1;
         let mut idx = hash_key(key, mask);
-        loop {
+        for _ in 0..self.slots.len() {
             match &mut self.slots[idx] {
                 Some((k, s)) if *k == key => {
                     return Some(std::mem::replace(s, state));
@@ -347,24 +348,35 @@ impl ObjectTable {
                 }
             }
         }
+        None
     }
 
     pub fn remove(&mut self, key: &u64) -> Option<ObjState> {
         let mask = self.slots.len() - 1;
         let mut idx = hash_key(*key, mask);
-        loop {
+        let mut found = false;
+        for _ in 0..self.slots.len() {
             match &self.slots[idx] {
-                Some((k, _)) if *k == *key => break,
+                Some((k, _)) if *k == *key => {
+                    found = true;
+                    break;
+                }
                 Some(_) => idx = (idx + 1) & mask,
                 None => return None,
             }
+        }
+        if !found {
+            return None;
         }
         let removed = self.slots[idx].take().map(|(_, s)| s);
         self.len -= 1;
 
         // Backward-shift deletion to preserve linear probing invariants without tombstones.
         let mut next_idx = (idx + 1) & mask;
-        while let Some((k, _)) = self.slots[next_idx] {
+        for _ in 0..self.slots.len() {
+            let Some((k, _)) = self.slots[next_idx] else {
+                break;
+            };
             let natural_idx = hash_key(k, mask);
             let should_move = if next_idx >= idx {
                 natural_idx <= idx || natural_idx > next_idx
@@ -1672,6 +1684,15 @@ mod tests {
             assert_eq!(table[&k].shard_len, 100);
         }
 
+        // Re-inserting an existing key replaces its value and returns the old state
+        let mut updated = dummy();
+        updated.shard_len = 999;
+        let old = table.insert(101, updated);
+        assert!(old.is_some());
+        assert_eq!(old.unwrap().shard_len, 100);
+        assert_eq!(table.get(&101).unwrap().shard_len, 999);
+        assert_eq!(table.len(), 32);
+
         // Verify even keys are gone
         for k in (100..164u64).step_by(2) {
             assert!(!table.contains_key(&k));
@@ -1703,5 +1724,150 @@ mod tests {
         // 256 must be ignored safely without panic or out of bounds
         mark_seen(&mut mask, 256);
         assert!(!is_seen(&mask, 256));
+    }
+
+    #[test]
+    fn test_hash_key_exact_vector() {
+        assert_eq!(hash_key(1, 0x3f), 37);
+        assert_eq!(hash_key(1, 0x7f), 101);
+        assert_eq!(hash_key(2, 0x3f), 10);
+        assert_eq!(hash_key(42, 0x3f), 34);
+        assert_eq!(hash_key(100, 0x3f), 52);
+        assert_eq!(hash_key(0x1234_5678_9abc_def0, 0x3f), 6);
+        assert_eq!(hash_key(0xdead_beef_cafe_babe, 0x3f), 44);
+    }
+
+    #[test]
+    fn test_object_table_backward_shift_wraparound() {
+        let dummy = |shard_len| ObjState {
+            payload: Vec::new(),
+            seen_mask: [0; 4],
+            source_count: 0,
+            total_count: 0,
+            k: 1,
+            shard_len,
+            object_size: 100,
+            scheme: rs::Scheme::Pq,
+            done: false,
+            expires_at_ms: 1000,
+            repair_shards: Vec::new(),
+        };
+
+        // Table capacity 8 yields 16 slots (mask 15).
+        // Scenario 1: k49 (slot 15), k61 (slot 15 -> 0), k3 (slot 0 -> 1).
+        // Removing 49 tests next_idx < idx (0 < 15) with natural_idx 15 moving to 15.
+        let mut t1 = ObjectTable::new(8);
+        t1.insert(49, dummy(49));
+        t1.insert(61, dummy(61));
+        t1.insert(3, dummy(3));
+        assert!(t1.remove(&49).is_some());
+        assert_eq!(t1.get(&61).unwrap().shard_len, 61);
+        assert_eq!(t1.get(&3).unwrap().shard_len, 3);
+        assert!(t1.get(&49).is_none());
+
+        // Scenario 2: k17 (slot 14), k49 (slot 15), k3 (slot 0).
+        // Removing 17 tests next_idx < idx (0 < 14) with natural_idx 0 staying at 0.
+        let mut t2 = ObjectTable::new(8);
+        t2.insert(17, dummy(17));
+        t2.insert(49, dummy(49));
+        t2.insert(3, dummy(3));
+        assert!(t2.remove(&17).is_some());
+        assert_eq!(t2.get(&49).unwrap().shard_len, 49);
+        assert_eq!(t2.get(&3).unwrap().shard_len, 3);
+        assert!(t2.get(&17).is_none());
+    }
+
+    #[test]
+    fn test_fec_reassembler_is_empty_and_unrecoverable() {
+        let mut re = FecReassembler::new(1200, 16);
+        assert!(re.is_empty());
+        assert_eq!(re.in_flight(), 0);
+        assert_eq!(re.unrecoverable_count(), 0);
+
+        let params = FlowClass::Bulk.params();
+        let ct = vec![0x11u8; 2400];
+        let mut enc = FecEncoder::new();
+        let syms1 = enc.encode(&ct, params, 1);
+        let syms2 = enc.encode(&ct, params, 1);
+        let syms3 = enc.encode(&ct, params, 1);
+
+        // Push first symbol of object 1 -> in flight (at now_ms = 0, deadline_ms = 1000)
+        assert!(re.push(1, &syms1[0], 0, 1000).is_none());
+        assert!(!re.is_empty());
+        assert_eq!(re.in_flight(), 1);
+        assert_eq!(re.unrecoverable_count(), 0);
+
+        // Push first symbol of object 2 -> in flight (at now_ms = 0, deadline_ms = 1000)
+        assert!(re.push(2, &syms2[0], 0, 1000).is_none());
+        assert_eq!(re.in_flight(), 2);
+        assert_eq!(re.unrecoverable_count(), 0);
+
+        // Advance time to 5000ms and push for object 3:
+        // Sweeps both object 1 and 2 past their 1000ms deadline.
+        assert!(re.push(3, &syms3[0], 5000, 1000).is_none());
+        assert_eq!(re.unrecoverable_count(), 2);
+        assert_ne!(re.unrecoverable_count(), 0);
+        assert_ne!(re.unrecoverable_count(), 1);
+    }
+
+    #[test]
+    fn test_completed_objects_do_not_increment_unrecoverable() {
+        let params = FlowClass::Default.params();
+        let ct = vec![0x22u8; 1200];
+        let mut enc = FecEncoder::new();
+        let syms1 = enc.encode(&ct, params, 0); // K=1
+        let syms2 = enc.encode(&ct, params, 0);
+
+        // Part A: FIFO deadline sweep does not count completed object as unrecoverable
+        let mut re_sweep = FecReassembler::new(1200, 16);
+        let completed = re_sweep.push(1, &syms1[0], 0, 1000);
+        assert!(completed.is_some());
+        assert_eq!(re_sweep.unrecoverable_count(), 0);
+
+        // Push symbol for object 2 at 5000ms: sweeps object 1 (done == true)
+        let _ = re_sweep.push(2, &syms2[0], 5000, 1000);
+        assert_eq!(re_sweep.unrecoverable_count(), 0);
+
+        // Part B: Capacity eviction does not count completed object as unrecoverable
+        let mut re_evict = FecReassembler::new(1200, 1);
+        let completed = re_evict.push(1, &syms1[0], 0, 100_000);
+        assert!(completed.is_some());
+        assert_eq!(re_evict.unrecoverable_count(), 0);
+
+        // Max objects is 1. Pushing symbol for object 2 evicts completed object 1.
+        let _ = re_evict.push(2, &syms2[0], 0, 100_000);
+        assert_eq!(re_evict.unrecoverable_count(), 0);
+    }
+
+    #[test]
+    fn test_capacity_eviction_of_incomplete_object_increments_unrecoverable() {
+        let params = FlowClass::Bulk.params();
+        let ct = vec![0x11u8; 2400]; // K=2
+        let mut enc = FecEncoder::new();
+        let syms1 = enc.encode(&ct, params, 1);
+        let syms2 = enc.encode(&ct, params, 1);
+
+        let mut re = FecReassembler::new(1200, 1);
+        // Push only 1 of 2 shards for object 1 (incomplete)
+        assert!(re.push(1, &syms1[0], 0, 100_000).is_none());
+        assert_eq!(re.unrecoverable_count(), 0);
+
+        // Capacity is 1. Pushing symbol for object 2 evicts incomplete object 1.
+        assert!(re.push(2, &syms2[0], 0, 100_000).is_none());
+        assert_eq!(re.unrecoverable_count(), 1);
+        assert_ne!(re.unrecoverable_count(), 0);
+    }
+
+    #[test]
+    fn test_fec_encoder_symbols_encoded() {
+        let mut enc = FecEncoder::new();
+        assert_eq!(enc.symbols_encoded(), 0);
+        let params = FlowClass::Bulk.params();
+        let ct = vec![0x11u8; 2400];
+        let syms = enc.encode(&ct, params, 3);
+        assert_eq!(syms.len(), 5);
+        assert_eq!(enc.symbols_encoded(), 5);
+        assert_ne!(enc.symbols_encoded(), 0);
+        assert_ne!(enc.symbols_encoded(), 1);
     }
 }

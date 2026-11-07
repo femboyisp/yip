@@ -50,6 +50,11 @@ impl AdaptiveController {
         self.min_ratio = min_ratio.clamp(0.0, 1.0);
     }
 
+    /// The current minimum ratio floor.
+    pub fn min_ratio(&self) -> f32 {
+        self.min_ratio
+    }
+
     /// Update from an observed loss fraction (0.0..=1.0). When loss exceeds
     /// what the current redundancy can mask, the ratio is immediately set to
     /// `loss + 0.05` (jump to just above the observed loss rate with a small
@@ -207,5 +212,23 @@ mod tests {
         c.observe_loss(0.10);
         assert!(c.ratio() >= 0.10, "any loss re-arms FEC immediately");
         assert!(c.repair_count(10) >= 1);
+    }
+
+    #[test]
+    fn test_set_ratio_and_set_min_ratio() {
+        let mut c = AdaptiveController::new(FlowClass::Default.params());
+        c.set_ratio(0.35);
+        assert!((c.ratio() - 0.35).abs() < 1e-6);
+        c.set_ratio(1.5);
+        assert_eq!(c.ratio(), 1.0);
+        c.set_ratio(-0.5);
+        assert_eq!(c.ratio(), 0.0);
+
+        c.set_min_ratio(0.25);
+        assert_eq!(c.min_ratio(), 0.25);
+        c.set_min_ratio(2.0);
+        assert_eq!(c.min_ratio(), 1.0);
+        c.set_min_ratio(-1.0);
+        assert_eq!(c.min_ratio(), 0.0);
     }
 }
