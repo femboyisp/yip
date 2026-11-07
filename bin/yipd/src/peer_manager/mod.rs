@@ -946,48 +946,48 @@ impl PeerManager {
         Ok(self.split_tunnel.config())
     }
 
-    /// Lookup a peer by full hex public key, short hex prefix, IPv6 address, endpoint, or index (#187).
-    fn find_peer_by_id(&self, target: &str) -> Option<&Peer> {
+    /// Lookup a peer index by full hex public key, short hex prefix, IPv6 address, endpoint, or index (#187, #185).
+    pub fn find_peer_index_by_id(&self, target: &str) -> Option<usize> {
         let cleaned = target.trim().to_ascii_lowercase();
         if cleaned.is_empty() {
-            return self.peers.first();
+            return if self.peers.is_empty() { None } else { Some(0) };
         }
 
         // 1. Match full hex or prefix hex
-        for p in &self.peers {
+        for (i, p) in self.peers.iter().enumerate() {
             let full_hex: String = p.pubkey.iter().map(|b| format!("{b:02x}")).collect();
             if full_hex == cleaned || (cleaned.len() >= 4 && full_hex.starts_with(&cleaned)) {
-                return Some(p);
+                return Some(i);
             }
         }
 
         // 2. Match node address IPv6
         if let Ok(ip) = cleaned.parse::<std::net::Ipv6Addr>() {
-            for p in &self.peers {
+            for (i, p) in self.peers.iter().enumerate() {
                 if p.addr == ip {
-                    return Some(p);
+                    return Some(i);
                 }
             }
         }
-        for p in &self.peers {
+        for (i, p) in self.peers.iter().enumerate() {
             if p.addr.to_string().to_ascii_lowercase() == cleaned {
-                return Some(p);
+                return Some(i);
             }
         }
 
         // 3. Match socket endpoint
         if let Ok(sa) = cleaned.parse::<std::net::SocketAddr>() {
-            for p in &self.peers {
+            for (i, p) in self.peers.iter().enumerate() {
                 if p.endpoint == Some(sa) {
-                    return Some(p);
+                    return Some(i);
                 }
             }
         }
-        for p in &self.peers {
+        for (i, p) in self.peers.iter().enumerate() {
             if let Some(ep) = p.endpoint {
                 if ep.ip().to_string() == cleaned || ep.to_string().to_ascii_lowercase() == cleaned
                 {
-                    return Some(p);
+                    return Some(i);
                 }
             }
         }
@@ -995,11 +995,108 @@ impl PeerManager {
         // 4. Match 1-based index
         if let Ok(idx) = cleaned.parse::<usize>() {
             if idx >= 1 && idx <= self.peers.len() {
-                return self.peers.get(idx - 1);
+                return Some(idx - 1);
             }
         }
 
         None
+    }
+
+    /// Lookup a peer by full hex public key, short hex prefix, IPv6 address, endpoint, or index (#187).
+    fn find_peer_by_id(&self, target: &str) -> Option<&Peer> {
+        self.find_peer_index_by_id(target).map(|i| &self.peers[i])
+    }
+
+    fn peer_crypto_status(&self, p: &Peer, now_ms: u64) -> crate::control::PeerCryptoStatus {
+        let peer_hex: String = p.pubkey.iter().map(|b| format!("{b:02x}")).collect();
+        let (
+            session_state,
+            current_epoch,
+            current_epoch_age_secs,
+            next_epoch,
+            previous_epoch,
+            rekey_in_flight,
+            send_counter,
+            replay_floor,
+            replay_latest,
+        ) = match &p.state {
+            PeerState::Established(epochs) => {
+                let age_ms = now_ms.saturating_sub(epochs.current_created_ms());
+                (
+                    "Established".to_string(),
+                    Some(epochs.epoch()),
+                    Some(age_ms / 1000),
+                    epochs.next_epoch(),
+                    epochs.previous_epoch(),
+                    epochs.rekey_in_flight(),
+                    Some(epochs.current_send_counter()),
+                    Some(epochs.current_replay_floor()),
+                    Some(epochs.current_replay_latest()),
+                )
+            }
+            PeerState::Handshaking(_) => (
+                "Handshaking".to_string(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+            ),
+            PeerState::Idle => (
+                "Idle".to_string(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+            ),
+        };
+
+        crate::control::PeerCryptoStatus {
+            peer: peer_hex,
+            node_addr: p.addr.to_string(),
+            endpoint: p.endpoint.map(|ep| ep.to_string()),
+            session_state,
+            cipher_suite: "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s + ML-KEM-512".to_string(),
+            current_epoch,
+            current_epoch_age_secs,
+            next_epoch,
+            previous_epoch,
+            rekey_in_flight,
+            send_counter,
+            replay_floor,
+            replay_latest,
+            last_accepted_init_tai64n: p
+                .last_accepted_init_ts
+                .as_ref()
+                .map(|ts| ts.iter().map(|b| format!("{b:02x}")).collect()),
+        }
+    }
+
+    /// Query active cryptographic session status for one or all peers (#185).
+    pub fn crypto_status(
+        &self,
+        target: Option<&str>,
+        now_ms: u64,
+    ) -> Result<Vec<crate::control::PeerCryptoStatus>, String> {
+        if let Some(t) = target {
+            let p = self
+                .find_peer_by_id(t)
+                .ok_or_else(|| format!("peer '{t}' not found in mesh routing table"))?;
+            Ok(vec![self.peer_crypto_status(p, now_ms)])
+        } else {
+            Ok(self
+                .peers
+                .iter()
+                .map(|p| self.peer_crypto_status(p, now_ms))
+                .collect())
+        }
     }
 
     /// Trace the multi-hop path and segment latencies across the mesh (#187).

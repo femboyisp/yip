@@ -3120,3 +3120,78 @@ fn test_peer_manager_metrics_relayed_traffic() {
     let snap_dropped = pm_b.metrics().snapshot(&[]);
     assert_eq!(snap_dropped.traffic.dropped_packets, drops_before + 1);
 }
+
+#[test]
+fn test_trigger_rekey_and_crypto_status() {
+    let local_pub = [1u8; 32];
+    let peer_pub = [2u8; 32];
+    let peer_hex: String = peer_pub.iter().map(|b| format!("{b:02x}")).collect();
+    let (mut pm, _fake_tag, ep) = pm_with_established_peer(local_pub, peer_pub, 120_000);
+
+    // 1. Query crypto_status before rekey
+    let status_list = pm
+        .crypto_status(None, 5000)
+        .expect("crypto_status all peers");
+    assert_eq!(status_list.len(), 1);
+    let s = &status_list[0];
+    assert_eq!(s.peer, peer_hex);
+    assert_eq!(s.endpoint.as_deref(), Some("10.0.0.1:1000"));
+    assert_eq!(s.session_state, "Established");
+    assert_eq!(s.current_epoch, Some(1));
+    assert_eq!(s.current_epoch_age_secs, Some(5)); // (5000 - 0) / 1000
+    assert!(!s.rekey_in_flight);
+    assert_eq!(s.next_epoch, None);
+    assert_eq!(s.previous_epoch, None);
+    assert_eq!(s.send_counter, Some(0));
+    assert_eq!(s.replay_floor, Some(0));
+    assert_eq!(s.replay_latest, Some(0));
+
+    // Query single peer by hex prefix
+    let s_single = pm
+        .crypto_status(Some(&peer_hex[..8]), 5000)
+        .expect("crypto_status single peer");
+    assert_eq!(s_single.len(), 1);
+    assert_eq!(s_single[0].peer, peer_hex);
+
+    // Query non-existent peer
+    let err_query = pm.crypto_status(Some("deadbeef"), 5000).unwrap_err();
+    assert!(err_query.contains("not found in mesh routing table"));
+
+    // 2. Trigger rekey
+    let rekey_res = pm.trigger_rekey(&peer_hex, 5000).expect("trigger_rekey ok");
+    assert!(rekey_res.contains("epoch 1"));
+    assert_eq!(pm.tick_egress.len(), 1);
+    assert_eq!(pm.tick_egress[0].dst, ep);
+    assert_eq!(
+        pm.tick_egress[0].bytes.first(),
+        Some(&(PacketType::HandshakeInit as u8))
+    );
+
+    // 3. Inspect crypto_status while rekey in flight
+    let status_after = pm
+        .crypto_status(Some(&peer_hex), 6000)
+        .expect("crypto_status after rekey");
+    assert_eq!(status_after.len(), 1);
+    assert!(status_after[0].rekey_in_flight);
+    assert_eq!(status_after[0].current_epoch, Some(1));
+    assert_eq!(status_after[0].next_epoch, None);
+
+    // 4. Trigger rekey again while in flight -> Err
+    let err_inflight = pm.trigger_rekey(&peer_hex, 6000).unwrap_err();
+    assert!(err_inflight.contains("already in progress"));
+
+    // 5. Test trigger_rekey on non-existent peer
+    let err_nf = pm.trigger_rekey("unknown_peer", 6000).unwrap_err();
+    assert!(err_nf.contains("not found in mesh routing table"));
+
+    // 6. Test trigger_rekey on peer in Idle state
+    let idle_cfg = peer_cfg(3, "10.0.0.3:3000");
+    let idle_hex: String = idle_cfg
+        .public_key
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    pm.add_peer_with_transport(idle_cfg, None).unwrap();
+    let err_idle = pm.trigger_rekey(&idle_hex, 6000).unwrap_err();
+    assert!(err_idle.contains("not established (state: Idle)"));
+}
