@@ -5,6 +5,10 @@ All notable changes to this project are documented here, following
 
 ## [Unreleased]
 
+### Fixed
+- **Mutation testing suite resilience and zero-timeout bounded linear probing (`crates/yip-transport`, `.cargo/mutants.toml`).**
+  Eliminated all 37 surviving mutants and 9 linear-probe timeouts in `crates/yip-transport`. Replaced unbounded search loops in `ObjectTable::find_index`, `insert`, and `remove` with bounded slot-capacity traversals, preventing infinite loops on mutated probe increments. Added unit test suites covering `AdaptiveController` ratio accessors, `Transport` symbol and unrecoverable drop metrics, exact `hash_key` golden output vectors, duplicate-key replacements, and backward-shift wrap-around probe deletion across slot 0 boundaries. Formally documented and excluded equivalent mutants in Reed-Solomon missing source reconstruction and FEC reassembler wire shard sizing in `.cargo/mutants.toml`.
+
 ### Added
 - **Prometheus and OpenTelemetry mesh telemetry exposition (`bin/yipd`, `yip metrics`, `--metrics-listen`, #188).**
   Added native Prometheus 0.0.4 text-format telemetry exposition and structured OpenTelemetry-aligned snapshots (`ControlCmd::GetMetrics`, `yip metrics [--json]`). Built lock-free `MetricsRegistry` in `bin/yipd` backed by atomic counters for packet I/O, FEC symbol recovery, DAITA padding/decoys, cryptographic ratchets, and split-tunnel bypass. Implemented embedded, zero-dependency HTTP/1.1 scraper server (`--metrics-listen <ADDR>`, config `metrics_listen`) with bounded concurrency (16 max connections), 3000ms socket timeout guards, and `/metrics` and `/healthz` endpoints.
