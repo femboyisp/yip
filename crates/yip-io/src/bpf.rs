@@ -422,7 +422,12 @@ pub fn bpf_prog_load_xdp(listen_port: u16, xsk_map_fd: RawFd) -> io::Result<RawF
 }
 
 /// Fallback netlink-based attachment for older Linux kernels.
-fn netlink_attach_xdp(ifindex: u32, prog_fd: RawFd) -> io::Result<RawFd> {
+/// Linux Netlink XDP flags for `IFLA_XDP_FLAGS` (#186).
+pub const XDP_FLAGS_SKB_MODE: u32 = 1 << 1;
+pub const XDP_FLAGS_DRV_MODE: u32 = 1 << 2;
+pub const XDP_FLAGS_HW_MODE: u32 = 1 << 3;
+
+fn netlink_attach_xdp_with_flags(ifindex: u32, prog_fd: RawFd, flags: u32) -> io::Result<RawFd> {
     // SAFETY: Invokes socket() to allocate an AF_NETLINK socket for ROUTE subsystem.
     let nl_sock = unsafe {
         libc::socket(
@@ -445,36 +450,84 @@ fn netlink_attach_xdp(ifindex: u32, prog_fd: RawFd) -> io::Result<RawFd> {
         fd_val: i32,
     }
 
+    #[repr(C)]
+    struct NlReqWithFlags {
+        nlh: libc::nlmsghdr,
+        ifi: libc::ifinfomsg,
+        xdp_hdr: libc::nlattr,
+        fd_hdr: libc::nlattr,
+        fd_val: i32,
+        flags_hdr: libc::nlattr,
+        flags_val: u32,
+    }
+
     let fd_attr_len = std::mem::size_of::<libc::nlattr>() + std::mem::size_of::<i32>();
-    let xdp_attr_len = std::mem::size_of::<libc::nlattr>() + fd_attr_len;
+    let flags_attr_len = if flags != 0 {
+        std::mem::size_of::<libc::nlattr>() + std::mem::size_of::<u32>()
+    } else {
+        0
+    };
+    let xdp_attr_len = std::mem::size_of::<libc::nlattr>() + fd_attr_len + flags_attr_len;
     let total_len = std::mem::size_of::<libc::nlmsghdr>()
         + std::mem::size_of::<libc::ifinfomsg>()
         + xdp_attr_len;
 
-    // SAFETY: Zeroed NlReq POD structure is safely formatted before sending.
-    let mut req: NlReq = unsafe { std::mem::zeroed() };
-    req.nlh.nlmsg_len = total_len as u32;
-    req.nlh.nlmsg_type = libc::RTM_SETLINK;
-    req.nlh.nlmsg_flags = (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16;
-    req.nlh.nlmsg_seq = 1;
-    req.ifi.ifi_family = libc::AF_UNSPEC as u8;
-    req.ifi.ifi_index = ifindex as i32;
+    let send_ret = if flags != 0 {
+        // SAFETY: Zeroed NlReqWithFlags POD structure is safely formatted before sending.
+        let mut req: NlReqWithFlags = unsafe { std::mem::zeroed() };
+        req.nlh.nlmsg_len = total_len as u32;
+        req.nlh.nlmsg_type = libc::RTM_SETLINK;
+        req.nlh.nlmsg_flags = (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16;
+        req.nlh.nlmsg_seq = 1;
+        req.ifi.ifi_family = libc::AF_UNSPEC as u8;
+        req.ifi.ifi_index = ifindex as i32;
 
-    req.xdp_hdr.nla_len = xdp_attr_len as u16;
-    req.xdp_hdr.nla_type = libc::NLA_F_NESTED as u16 | 43; // 43 = IFLA_XDP
+        req.xdp_hdr.nla_len = xdp_attr_len as u16;
+        req.xdp_hdr.nla_type = libc::NLA_F_NESTED as u16 | 43; // 43 = IFLA_XDP
 
-    req.fd_hdr.nla_len = fd_attr_len as u16;
-    req.fd_hdr.nla_type = 1; // 1 = IFLA_XDP_FD
-    req.fd_val = prog_fd;
+        req.fd_hdr.nla_len = fd_attr_len as u16;
+        req.fd_hdr.nla_type = 1; // 1 = IFLA_XDP_FD
+        req.fd_val = prog_fd;
 
-    // SAFETY: Sending exactly total_len bytes from stack-local req to valid open netlink socket.
-    let send_ret = unsafe {
-        libc::send(
-            nl_sock,
-            std::ptr::addr_of!(req).cast::<libc::c_void>(),
-            total_len,
-            0,
-        )
+        req.flags_hdr.nla_len = flags_attr_len as u16;
+        req.flags_hdr.nla_type = 3; // 3 = IFLA_XDP_FLAGS
+        req.flags_val = flags;
+
+        // SAFETY: Sending exactly total_len bytes from stack-local req to valid open netlink socket.
+        unsafe {
+            libc::send(
+                nl_sock,
+                std::ptr::addr_of!(req).cast::<libc::c_void>(),
+                total_len,
+                0,
+            )
+        }
+    } else {
+        // SAFETY: Zeroed NlReq POD structure is safely formatted before sending.
+        let mut req: NlReq = unsafe { std::mem::zeroed() };
+        req.nlh.nlmsg_len = total_len as u32;
+        req.nlh.nlmsg_type = libc::RTM_SETLINK;
+        req.nlh.nlmsg_flags = (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16;
+        req.nlh.nlmsg_seq = 1;
+        req.ifi.ifi_family = libc::AF_UNSPEC as u8;
+        req.ifi.ifi_index = ifindex as i32;
+
+        req.xdp_hdr.nla_len = xdp_attr_len as u16;
+        req.xdp_hdr.nla_type = libc::NLA_F_NESTED as u16 | 43; // 43 = IFLA_XDP
+
+        req.fd_hdr.nla_len = fd_attr_len as u16;
+        req.fd_hdr.nla_type = 1; // 1 = IFLA_XDP_FD
+        req.fd_val = prog_fd;
+
+        // SAFETY: Sending exactly total_len bytes from stack-local req to valid open netlink socket.
+        unsafe {
+            libc::send(
+                nl_sock,
+                std::ptr::addr_of!(req).cast::<libc::c_void>(),
+                total_len,
+                0,
+            )
+        }
     };
     if send_ret < 0 {
         return Err(io::Error::last_os_error());
@@ -521,13 +574,18 @@ fn netlink_attach_xdp(ifindex: u32, prog_fd: RawFd) -> io::Result<RawFd> {
 ///
 /// Tries modern `BPF_LINK_CREATE` first, falling back to netlink `RTM_SETLINK` if unsupported.
 pub fn bpf_attach_xdp(ifindex: u32, prog_fd: RawFd) -> io::Result<RawFd> {
+    bpf_attach_xdp_with_flags(ifindex, prog_fd, 0)
+}
+
+/// Attaches an XDP program to the network interface with explicit driver/offload flags (#186).
+pub fn bpf_attach_xdp_with_flags(ifindex: u32, prog_fd: RawFd, flags: u32) -> io::Result<RawFd> {
     // 1. Try BPF_LINK_CREATE (Linux 5.7+)
     let mut attr = BpfAttr { pad: [0u8; 152] };
     attr.link_create = BpfLinkCreateAttr {
         prog_fd: prog_fd as u32,
         target_ifindex: ifindex,
         attach_type: BPF_XDP,
-        flags: 0,
+        flags,
     };
 
     // SAFETY: sys_bpf called with BPF_LINK_CREATE and valid initialized link_create attributes.
@@ -547,7 +605,7 @@ pub fn bpf_attach_xdp(ifindex: u32, prog_fd: RawFd) -> io::Result<RawFd> {
     match link_err.raw_os_error() {
         Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP) => {
             // Fallback to Netlink RTM_SETLINK
-            netlink_attach_xdp(ifindex, prog_fd)
+            netlink_attach_xdp_with_flags(ifindex, prog_fd, flags)
         }
         _ => Err(link_err),
     }

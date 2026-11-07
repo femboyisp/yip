@@ -506,6 +506,8 @@ pub struct PeerManager {
     pub daita_stats: DaitaStats,
     /// Split-tunnel routing and traffic bypass engine (#184).
     pub split_tunnel: crate::control::SplitTunnelState,
+    /// eBPF XDP hardware offload and zero-copy packet telemetry state (#186).
+    pub xdp_state: crate::control::XdpState,
     /// Shared lock-free metrics registry for daemon and telemetry reporting.
     metrics: std::sync::Arc<crate::metrics::MetricsRegistry>,
     /// Monotonic timestamp in milliseconds of the last cached metrics peer stats update.
@@ -654,6 +656,7 @@ impl PeerManager {
             fec_config: crate::control::FecConfig::default(),
             daita_stats: DaitaStats::default(),
             split_tunnel: crate::control::SplitTunnelState::default(),
+            xdp_state: crate::control::XdpState::default(),
             metrics: std::sync::Arc::new(crate::metrics::MetricsRegistry::new()),
             last_metrics_update_ms: 0,
         };
@@ -1097,6 +1100,16 @@ impl PeerManager {
                 .map(|p| self.peer_crypto_status(p, now_ms))
                 .collect())
         }
+    }
+
+    /// Returns live eBPF XDP hardware offload and zero-copy packet telemetry (#186).
+    pub fn xdp_status(&self) -> crate::control::ControlResponse {
+        self.xdp_state.status()
+    }
+
+    /// Sets or updates the active XDP mode flags (#186).
+    pub fn set_xdp_mode(&mut self, mode_str: &str) -> Result<String, String> {
+        self.xdp_state.set_mode(mode_str)
     }
 
     /// Trace the multi-hop path and segment latencies across the mesh (#187).

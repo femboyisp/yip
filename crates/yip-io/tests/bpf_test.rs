@@ -1,7 +1,8 @@
 use yip_io::af_xdp::XskSocket;
 use yip_io::bpf::{
-    bpf_map_create_xsk, bpf_prog_assemble_xdp, bpf_prog_load_xdp, BpfFilterStatus, BpfInsn,
-    XdpRedirectFilter,
+    bpf_attach_xdp_with_flags, bpf_map_create_xsk, bpf_prog_assemble_xdp, bpf_prog_load_xdp,
+    BpfFilterStatus, BpfInsn, XdpRedirectFilter, XDP_FLAGS_DRV_MODE, XDP_FLAGS_HW_MODE,
+    XDP_FLAGS_SKB_MODE,
 };
 
 #[test]
@@ -216,4 +217,15 @@ fn test_bpf_filter_dual_stack_bytecode_validation() {
         | BpfFilterStatus::FallbackUnprivileged
         | BpfFilterStatus::Unsupported => {}
     }
+}
+
+#[test]
+fn test_xdp_flags_constants_and_bpf_attach_with_flags() {
+    assert_eq!(XDP_FLAGS_SKB_MODE, 1 << 1);
+    assert_eq!(XDP_FLAGS_DRV_MODE, 1 << 2);
+    assert_eq!(XDP_FLAGS_HW_MODE, 1 << 3);
+
+    // Calling bpf_attach_xdp_with_flags on invalid ifindex must fail gracefully
+    let res = bpf_attach_xdp_with_flags(999999, -1, XDP_FLAGS_SKB_MODE);
+    assert!(res.is_err());
 }

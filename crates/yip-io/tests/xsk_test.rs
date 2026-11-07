@@ -1,5 +1,6 @@
 use yip_io::af_xdp::{
-    RxRing, TxRing, UmemPool, XskBindMode, XskDesc, XskSocket, UMEM_CHUNK_SIZE, UMEM_RING_SIZE,
+    RxRing, TxRing, UmemPool, XdpStatistics, XskBindMode, XskDesc, XskSocket, UMEM_CHUNK_SIZE,
+    UMEM_RING_SIZE,
 };
 
 #[test]
@@ -229,4 +230,39 @@ fn test_bind_multi_queue() {
         assert_eq!(*qid, i as u32);
         assert!(sock.rx_ring().is_empty());
     }
+}
+
+#[test]
+fn test_xdp_statistics_default_and_traits() {
+    let stats = XdpStatistics::default();
+    assert_eq!(stats.rx_dropped, 0);
+    assert_eq!(stats.rx_invalid_descs, 0);
+    assert_eq!(stats.tx_invalid_descs, 0);
+    assert_eq!(stats.rx_ring_full, 0);
+    assert_eq!(stats.rx_fill_ring_empty_descs, 0);
+    assert_eq!(stats.tx_ring_empty_descs, 0);
+
+    let stats_copy = stats;
+    assert_eq!(stats, stats_copy);
+    assert_eq!(
+        format!("{:?}", stats),
+        "XdpStatistics { rx_dropped: 0, rx_invalid_descs: 0, tx_invalid_descs: 0, rx_ring_full: 0, rx_fill_ring_empty_descs: 0, tx_ring_empty_descs: 0 }"
+    );
+}
+
+#[test]
+fn test_xsk_socket_statistics_fallback() {
+    let sock = XskSocket::fallback();
+    let stats = sock.statistics().expect("statistics on fallback socket");
+    assert_eq!(stats, XdpStatistics::default());
+}
+
+#[test]
+fn test_xsk_bind_mode_display() {
+    assert_eq!(format!("{}", XskBindMode::ZeroCopy), "zero-copy");
+    assert_eq!(format!("{}", XskBindMode::Copy), "copy");
+    assert_eq!(
+        format!("{}", XskBindMode::FallbackRecvmmsg),
+        "fallback-recvmmsg"
+    );
 }

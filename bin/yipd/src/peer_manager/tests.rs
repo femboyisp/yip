@@ -3195,3 +3195,48 @@ fn test_trigger_rekey_and_crypto_status() {
     let err_idle = pm.trigger_rekey(&idle_hex, 6000).unwrap_err();
     assert!(err_idle.contains("not established (state: Idle)"));
 }
+
+#[test]
+fn test_peer_manager_xdp_status_and_mode() {
+    let mut pm = testutil::test_peer_manager();
+
+    // Query status directly on PeerManager
+    let resp = pm.xdp_status();
+    match resp {
+        crate::control::ControlResponse::XdpStatus {
+            ok,
+            mode,
+            bound_mode,
+            attached_mode,
+            ..
+        } => {
+            assert!(ok);
+            assert_eq!(mode, "auto");
+            assert_eq!(bound_mode, "fallback-recvmmsg");
+            assert_eq!(attached_mode, "none");
+        }
+        other => panic!("expected XdpStatus, got: {other:?}"),
+    }
+
+    // Set XDP mode to native
+    let set_res = pm.set_xdp_mode("native").expect("set mode ok");
+    assert!(set_res.contains("native"));
+
+    // Verify status updated
+    let resp_after = pm.xdp_status();
+    match resp_after {
+        crate::control::ControlResponse::XdpStatus {
+            mode,
+            attached_mode,
+            ..
+        } => {
+            assert_eq!(mode, "native");
+            assert_eq!(attached_mode, "native");
+        }
+        other => panic!("expected XdpStatus, got: {other:?}"),
+    }
+
+    // Set invalid mode fails
+    let err = pm.set_xdp_mode("bad_mode").unwrap_err();
+    assert!(err.contains("invalid xdp mode"));
+}
