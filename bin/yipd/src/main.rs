@@ -240,6 +240,25 @@ fn print_cli_usage(subcmd: &str) {
             println!("      --json              Output raw JSON");
             println!("  -h, --help              Print help");
         }
+        "xdp" => {
+            println!("Usage: yipctl xdp <status|set> [OPTIONS]");
+            println!();
+            println!("Inspect eBPF XDP zero-copy telemetry or tune hardware offload driver modes.");
+            println!();
+            println!("Commands:");
+            println!(
+                "  status                       Query XDP driver mode, ring drops, and telemetry"
+            );
+            println!("  set [--mode <M>] [M]         Set XDP attachment mode (auto, generic, native, offload)");
+            println!();
+            println!("Options:");
+            println!("  -c, --control <SOCKET>  Path to yipd UNIX control socket");
+            println!(
+                "  -m, --mode <MODE>       XDP attachment mode (auto, generic, native, offload)"
+            );
+            println!("      --json              Output raw JSON");
+            println!("  -h, --help              Print help");
+        }
         _ => {
             println!("Usage: yipctl <COMMAND> [OPTIONS]");
             println!();
@@ -247,6 +266,7 @@ fn print_cli_usage(subcmd: &str) {
             println!("  status    Display daemon status and summary");
             println!("  peers     List connected peers and statistics");
             println!("  crypto    Inspect active crypto session states or trigger rekeying");
+            println!("  xdp       Inspect eBPF XDP telemetry or configure hardware offload mode");
             println!("  metrics   Display runtime metrics and telemetry");
             println!("  routes    Display live mesh overlay routing table");
             println!("  topology  Display mesh topology graph projection");
@@ -756,6 +776,31 @@ fn run_client_subcommand(
             }
         }
         "metrics" => control::run_cli_metrics(&socket, json).map_err(std::io::Error::other),
+        "xdp" => {
+            let action = positional.first().map(|s| s.as_str()).unwrap_or("status");
+            match action {
+                "status" => {
+                    control::run_cli_xdp_status(&socket, json).map_err(std::io::Error::other)
+                }
+                "set" => {
+                    let chosen_mode = mode.or_else(|| positional.get(1).cloned()).ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "xdp set requires --mode <auto|generic|native|offload> or positional mode",
+                        )
+                    })?;
+                    control::run_cli_xdp_set(&socket, &chosen_mode, json)
+                        .map_err(std::io::Error::other)
+                }
+                other => {
+                    eprintln!("Unknown xdp action: {other}");
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("unknown xdp action: {other} (valid: status, set)"),
+                    ))
+                }
+            }
+        }
         "crypto" => {
             let action = positional.first().map(|s| s.as_str()).unwrap_or("status");
             match action {
@@ -887,6 +932,7 @@ fn main() -> std::io::Result<()> {
             Some("split") | Some("split-tunnel") => return run_client_subcommand("split", args),
             Some("metrics") => return run_client_subcommand("metrics", args),
             Some("crypto") => return run_client_subcommand("crypto", args),
+            Some("xdp") => return run_client_subcommand("xdp", args),
             Some("genkey") | Some("--genkey") => {
                 let kp = yip_crypto::generate_keypair();
                 println!("private={}", hex_encode(&kp.private));
@@ -931,6 +977,7 @@ fn main() -> std::io::Result<()> {
         Some("split") | Some("split-tunnel") => run_client_subcommand("split", args),
         Some("metrics") => run_client_subcommand("metrics", args),
         Some("crypto") => run_client_subcommand("crypto", args),
+        Some("xdp") => run_client_subcommand("xdp", args),
         Some("--version") | Some("-V") => {
             println!("{}", banner());
             Ok(())

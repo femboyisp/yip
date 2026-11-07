@@ -808,6 +808,38 @@ pub const XDP_ZEROCOPY: u16 = XDP_ZERO_COPY;
 /// Linux internal errno for unsupported operation (`ENOTSUPP`).
 pub const ENOTSUPP: i32 = 524;
 
+/// Socket option for querying AF_XDP socket drop and queue telemetry (`SOL_XDP`, `XDP_STATISTICS`).
+pub const XDP_STATISTICS: libc::c_int = 7;
+
+/// Low-level kernel `struct xdp_statistics` layout.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct KernelXdpStatistics {
+    rx_dropped: u64,
+    rx_invalid_descs: u64,
+    tx_invalid_descs: u64,
+    rx_ring_full: u64,
+    rx_fill_ring_empty_descs: u64,
+    tx_ring_empty_descs: u64,
+}
+
+/// AF_XDP socket drop and queue telemetry counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct XdpStatistics {
+    /// Packets dropped for reasons other than RX ring being full.
+    pub rx_dropped: u64,
+    /// Descriptors with invalid chunk address or length received in RX ring.
+    pub rx_invalid_descs: u64,
+    /// Descriptors with invalid chunk address or length submitted to TX ring.
+    pub tx_invalid_descs: u64,
+    /// Packets dropped because the RX ring was full.
+    pub rx_ring_full: u64,
+    /// Packets dropped because the UMEM fill ring was empty when an incoming packet arrived.
+    pub rx_fill_ring_empty_descs: u64,
+    /// Packets dropped because the TX ring was empty.
+    pub tx_ring_empty_descs: u64,
+}
+
 /// The operational mode for AF_XDP binding, with automatic fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XskBindMode {
@@ -817,6 +849,16 @@ pub enum XskBindMode {
     Copy,
     /// Graceful portable fallback using standard recvmmsg/sendmmsg socket I/O.
     FallbackRecvmmsg,
+}
+
+impl std::fmt::Display for XskBindMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroCopy => write!(f, "zero-copy"),
+            Self::Copy => write!(f, "copy"),
+            Self::FallbackRecvmmsg => write!(f, "fallback-recvmmsg"),
+        }
+    }
 }
 
 /// Descriptor for AF_XDP packets in RX and TX rings.
@@ -1307,6 +1349,43 @@ impl XskSocket {
     /// The raw file descriptor of the underlying AF_XDP socket, or -1 in fallback mode.
     pub fn fd(&self) -> RawFd {
         self.fd
+    }
+
+    /// Queries low-level AF_XDP socket statistics from the kernel via `SOL_XDP` `XDP_STATISTICS`.
+    ///
+    /// If the socket is running in fallback mode (`fd < 0`), returns zeroed statistics.
+    pub fn statistics(&self) -> io::Result<XdpStatistics> {
+        if self.fd < 0 {
+            return Ok(XdpStatistics::default());
+        }
+
+        let mut kstats = KernelXdpStatistics::default();
+        let mut optlen = std::mem::size_of::<KernelXdpStatistics>() as libc::socklen_t;
+
+        // SAFETY: `self.fd` is an open AF_XDP socket descriptor. `kstats` is a stack-local
+        // POD struct, and `optlen` specifies the exact capacity of the struct.
+        let ret = unsafe {
+            libc::getsockopt(
+                self.fd,
+                libc::SOL_XDP,
+                XDP_STATISTICS,
+                std::ptr::addr_of_mut!(kstats).cast::<libc::c_void>(),
+                std::ptr::addr_of_mut!(optlen),
+            )
+        };
+
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(XdpStatistics {
+            rx_dropped: kstats.rx_dropped,
+            rx_invalid_descs: kstats.rx_invalid_descs,
+            tx_invalid_descs: kstats.tx_invalid_descs,
+            rx_ring_full: kstats.rx_ring_full,
+            rx_fill_ring_empty_descs: kstats.rx_fill_ring_empty_descs,
+            tx_ring_empty_descs: kstats.tx_ring_empty_descs,
+        })
     }
 
     /// Mutable reference to the socket's RX ring buffer.

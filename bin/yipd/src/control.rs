@@ -110,6 +110,10 @@ pub enum ControlCmd {
     },
     #[serde(rename = "trigger_rekey")]
     TriggerRekey { peer: String },
+    #[serde(rename = "get_xdp_status")]
+    GetXdpStatus,
+    #[serde(rename = "set_xdp_mode")]
+    SetXdpMode { mode: String },
 }
 
 fn default_ping_count() -> u32 {
@@ -587,6 +591,168 @@ pub struct PeerCryptoStatus {
     pub last_accepted_init_tai64n: Option<String>,
 }
 
+/// eBPF XDP attachment and driver offload modes (#186).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum XdpMode {
+    Auto,
+    Generic,
+    Native,
+    Offload,
+}
+
+impl std::str::FromStr for XdpMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "generic" | "skb" => Ok(Self::Generic),
+            "native" | "drv" | "driver" => Ok(Self::Native),
+            "offload" | "hw" | "hardware" => Ok(Self::Offload),
+            other => Err(format!(
+                "invalid xdp mode '{other}', expected one of: auto, generic, native, offload"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for XdpMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::Generic => write!(f, "generic"),
+            Self::Native => write!(f, "native"),
+            Self::Offload => write!(f, "offload"),
+        }
+    }
+}
+
+impl XdpMode {
+    pub fn to_flags(self) -> u32 {
+        match self {
+            Self::Auto => 0,
+            Self::Generic => yip_io::bpf::XDP_FLAGS_SKB_MODE,
+            Self::Native => yip_io::bpf::XDP_FLAGS_DRV_MODE,
+            Self::Offload => yip_io::bpf::XDP_FLAGS_HW_MODE,
+        }
+    }
+}
+
+/// Runtime eBPF XDP and zero-copy packet telemetry state (#186).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XdpState {
+    pub interface: Option<String>,
+    pub configured_mode: XdpMode,
+    pub bound_mode: String,
+    pub attached_mode: String,
+    pub zero_copy_supported: bool,
+    pub prog_id: Option<u32>,
+    pub queues_count: usize,
+    pub hardware_offload_queues: Vec<u32>,
+    pub umem_slabs: usize,
+    pub umem_chunk_size: usize,
+    pub umem_total_chunks: usize,
+    pub umem_free_chunks: usize,
+    pub fill_ring_drops: u64,
+    pub rx_ring_drops: u64,
+    pub tx_ring_drops: u64,
+    pub completion_ring_drops: u64,
+    pub rx_packets: u64,
+    pub tx_packets: u64,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+}
+
+impl Default for XdpState {
+    fn default() -> Self {
+        Self {
+            interface: None,
+            configured_mode: XdpMode::Auto,
+            bound_mode: "fallback-recvmmsg".to_string(),
+            attached_mode: "none".to_string(),
+            zero_copy_supported: false,
+            prog_id: None,
+            queues_count: 1,
+            hardware_offload_queues: Vec::new(),
+            umem_slabs: 0,
+            umem_chunk_size: yip_io::af_xdp::UMEM_CHUNK_SIZE,
+            umem_total_chunks: 0,
+            umem_free_chunks: 0,
+            fill_ring_drops: 0,
+            rx_ring_drops: 0,
+            tx_ring_drops: 0,
+            completion_ring_drops: 0,
+            rx_packets: 0,
+            tx_packets: 0,
+            rx_bytes: 0,
+            tx_bytes: 0,
+        }
+    }
+}
+
+impl XdpState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn status(&self) -> ControlResponse {
+        ControlResponse::XdpStatus {
+            ok: true,
+            interface: self.interface.clone(),
+            mode: self.configured_mode.to_string(),
+            bound_mode: self.bound_mode.clone(),
+            attached_mode: self.attached_mode.clone(),
+            zero_copy_supported: self.zero_copy_supported,
+            prog_id: self.prog_id,
+            queues_count: self.queues_count,
+            hardware_offload_queues: self.hardware_offload_queues.clone(),
+            umem_slabs: self.umem_slabs,
+            umem_chunk_size: self.umem_chunk_size,
+            umem_total_chunks: self.umem_total_chunks,
+            umem_free_chunks: self.umem_free_chunks,
+            fill_ring_drops: self.fill_ring_drops,
+            rx_ring_drops: self.rx_ring_drops,
+            tx_ring_drops: self.tx_ring_drops,
+            completion_ring_drops: self.completion_ring_drops,
+            rx_packets: self.rx_packets,
+            tx_packets: self.tx_packets,
+            rx_bytes: self.rx_bytes,
+            tx_bytes: self.tx_bytes,
+        }
+    }
+
+    pub fn set_mode(&mut self, mode_str: &str) -> Result<String, String> {
+        let mode: XdpMode = mode_str.parse()?;
+        self.configured_mode = mode;
+        match mode {
+            XdpMode::Auto => {
+                if self.attached_mode != "none" {
+                    self.attached_mode = "auto".to_string();
+                }
+            }
+            XdpMode::Generic => {
+                self.attached_mode = "generic".to_string();
+            }
+            XdpMode::Native => {
+                self.attached_mode = "native".to_string();
+            }
+            XdpMode::Offload => {
+                self.attached_mode = "offload".to_string();
+                if self.hardware_offload_queues.is_empty() {
+                    self.hardware_offload_queues = (0..self.queues_count as u32).collect();
+                }
+            }
+        }
+        let msg = format!(
+            "XDP mode updated to '{}' (flags: 0x{:x})",
+            mode,
+            mode.to_flags()
+        );
+        Ok(msg)
+    }
+}
+
 /// Outbound control command responses returned to clients.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(untagged)]
@@ -686,6 +852,29 @@ pub enum ControlResponse {
     CryptoStatus {
         ok: bool,
         sessions: Vec<PeerCryptoStatus>,
+    },
+    XdpStatus {
+        ok: bool,
+        interface: Option<String>,
+        mode: String,
+        bound_mode: String,
+        attached_mode: String,
+        zero_copy_supported: bool,
+        prog_id: Option<u32>,
+        queues_count: usize,
+        hardware_offload_queues: Vec<u32>,
+        umem_slabs: usize,
+        umem_chunk_size: usize,
+        umem_total_chunks: usize,
+        umem_free_chunks: usize,
+        fill_ring_drops: u64,
+        rx_ring_drops: u64,
+        tx_ring_drops: u64,
+        completion_ring_drops: u64,
+        rx_packets: u64,
+        tx_packets: u64,
+        rx_bytes: u64,
+        tx_bytes: u64,
     },
     Metrics {
         ok: bool,
@@ -1294,6 +1483,11 @@ pub fn dispatch_cmd(
                 Err(error) => ControlResponse::Err { ok: false, error },
             }
         }
+        ControlCmd::GetXdpStatus => pm.xdp_status(),
+        ControlCmd::SetXdpMode { mode } => match pm.set_xdp_mode(&mode) {
+            Ok(message) => ControlResponse::Ack { ok: true, message },
+            Err(error) => ControlResponse::Err { ok: false, error },
+        },
     }
 }
 
@@ -2201,6 +2395,134 @@ pub fn run_cli_trigger_rekey(socket_path: &Path, target: &str, json: bool) -> Re
         socket_path,
         ControlCmd::TriggerRekey {
             peer: target.to_string(),
+        },
+    )?;
+    if json {
+        let text = serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?;
+        println!("{text}");
+        if let ControlResponse::Err { error, .. } = resp {
+            return Err(error);
+        }
+        return Ok(());
+    }
+    match resp {
+        ControlResponse::Ack { message, .. } => {
+            println!("\x1b[1;32m✓\x1b[0m {message}");
+            Ok(())
+        }
+        ControlResponse::Err { error, .. } => Err(error),
+        _ => Err("unexpected response format from daemon".into()),
+    }
+}
+
+/// Query live eBPF XDP zero-copy packet telemetry and driver status (#186).
+pub fn run_cli_xdp_status(socket_path: &Path, json: bool) -> Result<(), String> {
+    let resp = client_query(socket_path, ControlCmd::GetXdpStatus)?;
+    if json {
+        let text = serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?;
+        println!("{text}");
+        if let ControlResponse::Err { error, .. } = resp {
+            return Err(error);
+        }
+        return Ok(());
+    }
+    match resp {
+        ControlResponse::XdpStatus {
+            ok,
+            interface,
+            mode,
+            bound_mode,
+            attached_mode,
+            zero_copy_supported,
+            prog_id,
+            queues_count,
+            hardware_offload_queues,
+            umem_slabs,
+            umem_chunk_size,
+            umem_total_chunks,
+            umem_free_chunks,
+            fill_ring_drops,
+            rx_ring_drops,
+            tx_ring_drops,
+            completion_ring_drops,
+            rx_packets,
+            tx_packets,
+            rx_bytes,
+            tx_bytes,
+        } => {
+            if !ok {
+                return Err("daemon reported error querying XDP status".into());
+            }
+            println!("\x1b[1;36meBPF XDP & Zero-Copy Packet Telemetry\x1b[0m");
+            println!(
+                "  {:<24} {}",
+                "Interface:",
+                interface.unwrap_or_else(|| "none (unbound)".to_string())
+            );
+            println!("  {:<24} {}", "Configured Mode:", mode);
+            println!("  {:<24} {}", "Bound Mode:", bound_mode);
+            let prog_str = prog_id
+                .map(|id| format!(" (prog id: {id})"))
+                .unwrap_or_default();
+            println!(
+                "  {:<24} {}{}",
+                "Attached BPF Mode:", attached_mode, prog_str
+            );
+            let zc_str = if zero_copy_supported {
+                "\x1b[32msupported (hardware zero-copy enabled)\x1b[0m"
+            } else {
+                "\x1b[33munsupported (using skb copy or fallback)\x1b[0m"
+            };
+            println!("  {:<24} {}", "Zero-Copy:", zc_str);
+            let hw_queues_str = if hardware_offload_queues.is_empty() {
+                "none".to_string()
+            } else {
+                format!("{:?}", hardware_offload_queues)
+            };
+            println!(
+                "  {:<24} {} (offloaded queues: {})",
+                "Queues:", queues_count, hw_queues_str
+            );
+            println!();
+            println!("\x1b[1mUMEM Shared Memory Pool:\x1b[0m");
+            println!("  {:<24} {}", "Slabs:", umem_slabs);
+            println!("  {:<24} {} B", "Chunk Size:", umem_chunk_size);
+            println!("  {:<24} {}", "Total Chunks:", umem_total_chunks);
+            let avail_pct = if umem_total_chunks > 0 {
+                (umem_free_chunks as f64 / umem_total_chunks as f64) * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "  {:<24} {} ({:.1}% available)",
+                "Free Chunks:", umem_free_chunks, avail_pct
+            );
+            println!();
+            println!("\x1b[1mRing Drop Counters:\x1b[0m");
+            println!("  {:<24} {}", "Fill Ring Drops:", fill_ring_drops);
+            println!("  {:<24} {}", "RX Ring Drops:", rx_ring_drops);
+            println!("  {:<24} {}", "TX Ring Drops:", tx_ring_drops);
+            println!(
+                "  {:<24} {}",
+                "Completion Ring Drops:", completion_ring_drops
+            );
+            println!();
+            println!("\x1b[1mTraffic Counters:\x1b[0m");
+            println!("  {:<24} {} pkts ({} B)", "RX:", rx_packets, rx_bytes);
+            println!("  {:<24} {} pkts ({} B)", "TX:", tx_packets, tx_bytes);
+            Ok(())
+        }
+        ControlResponse::Err { error, .. } => Err(error),
+        _ => Err("unexpected response format from daemon".into()),
+    }
+}
+
+/// Set or update eBPF XDP hardware offload and attachment mode (#186).
+pub fn run_cli_xdp_set(socket_path: &Path, mode: &str, json: bool) -> Result<(), String> {
+    let resp = client_query(
+        socket_path,
+        ControlCmd::SetXdpMode {
+            mode: mode.to_string(),
         },
     )?;
     if json {
@@ -3553,5 +3875,256 @@ mod tests {
             run_cli_trigger_rekey(Path::new("/tmp/nonexistent_crypto.sock"), "peer1", false)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_xdp_mode_parsing_and_flags() {
+        assert_eq!("auto".parse::<XdpMode>().unwrap(), XdpMode::Auto);
+        assert_eq!("generic".parse::<XdpMode>().unwrap(), XdpMode::Generic);
+        assert_eq!("skb".parse::<XdpMode>().unwrap(), XdpMode::Generic);
+        assert_eq!("native".parse::<XdpMode>().unwrap(), XdpMode::Native);
+        assert_eq!("drv".parse::<XdpMode>().unwrap(), XdpMode::Native);
+        assert_eq!("driver".parse::<XdpMode>().unwrap(), XdpMode::Native);
+        assert_eq!("offload".parse::<XdpMode>().unwrap(), XdpMode::Offload);
+        assert_eq!("hw".parse::<XdpMode>().unwrap(), XdpMode::Offload);
+        assert_eq!("hardware".parse::<XdpMode>().unwrap(), XdpMode::Offload);
+        assert!("invalid_xyz".parse::<XdpMode>().is_err());
+
+        assert_eq!(format!("{}", XdpMode::Auto), "auto");
+        assert_eq!(format!("{}", XdpMode::Generic), "generic");
+        assert_eq!(format!("{}", XdpMode::Native), "native");
+        assert_eq!(format!("{}", XdpMode::Offload), "offload");
+
+        assert_eq!(XdpMode::Auto.to_flags(), 0);
+        assert_eq!(XdpMode::Generic.to_flags(), yip_io::bpf::XDP_FLAGS_SKB_MODE);
+        assert_eq!(XdpMode::Native.to_flags(), yip_io::bpf::XDP_FLAGS_DRV_MODE);
+        assert_eq!(XdpMode::Offload.to_flags(), yip_io::bpf::XDP_FLAGS_HW_MODE);
+    }
+
+    #[test]
+    fn test_xdp_status_and_mode_serde_and_dispatch() {
+        let mut pm = crate::peer_manager::testutil::test_peer_manager();
+        let start_time = Instant::now();
+
+        // 1. Serde test for GetXdpStatus
+        let get_json = r#"{"cmd":"get_xdp_status"}"#;
+        let get_cmd: ControlCmd = serde_json::from_str(get_json).unwrap();
+        assert!(matches!(get_cmd, ControlCmd::GetXdpStatus));
+        let get_serialized = serde_json::to_string(&ControlCmd::GetXdpStatus).unwrap();
+        assert!(get_serialized.contains("\"get_xdp_status\""));
+
+        // 2. Serde test for SetXdpMode
+        let set_json = r#"{"cmd":"set_xdp_mode","mode":"native"}"#;
+        let set_cmd: ControlCmd = serde_json::from_str(set_json).unwrap();
+        match set_cmd {
+            ControlCmd::SetXdpMode { mode } => assert_eq!(mode, "native"),
+            _ => panic!("wrong variant"),
+        }
+
+        // 3. Dispatch GetXdpStatus on freshly initialized peer manager
+        let resp_initial = dispatch_cmd(&mut pm, ControlCmd::GetXdpStatus, "yip0", start_time);
+        match resp_initial {
+            ControlResponse::XdpStatus {
+                ok,
+                interface,
+                mode,
+                bound_mode,
+                attached_mode,
+                zero_copy_supported,
+                prog_id,
+                queues_count,
+                hardware_offload_queues,
+                umem_slabs,
+                umem_chunk_size,
+                umem_total_chunks,
+                umem_free_chunks,
+                fill_ring_drops,
+                rx_ring_drops,
+                tx_ring_drops,
+                completion_ring_drops,
+                rx_packets,
+                tx_packets,
+                rx_bytes,
+                tx_bytes,
+            } => {
+                assert!(ok);
+                assert_eq!(interface, None);
+                assert_eq!(mode, "auto");
+                assert_eq!(bound_mode, "fallback-recvmmsg");
+                assert_eq!(attached_mode, "none");
+                assert!(!zero_copy_supported);
+                assert_eq!(prog_id, None);
+                assert_eq!(queues_count, 1);
+                assert!(hardware_offload_queues.is_empty());
+                assert_eq!(umem_slabs, 0);
+                assert_eq!(umem_chunk_size, yip_io::af_xdp::UMEM_CHUNK_SIZE);
+                assert_eq!(umem_total_chunks, 0);
+                assert_eq!(umem_free_chunks, 0);
+                assert_eq!(fill_ring_drops, 0);
+                assert_eq!(rx_ring_drops, 0);
+                assert_eq!(tx_ring_drops, 0);
+                assert_eq!(completion_ring_drops, 0);
+                assert_eq!(rx_packets, 0);
+                assert_eq!(tx_packets, 0);
+                assert_eq!(rx_bytes, 0);
+                assert_eq!(tx_bytes, 0);
+            }
+            other => panic!("expected XdpStatus, got: {other:?}"),
+        }
+
+        // 4. Dispatch SetXdpMode to "native"
+        let set_resp = dispatch_cmd(
+            &mut pm,
+            ControlCmd::SetXdpMode {
+                mode: "native".into(),
+            },
+            "yip0",
+            start_time,
+        );
+        match set_resp {
+            ControlResponse::Ack { ok, message } => {
+                assert!(ok);
+                assert!(message.contains("native"));
+            }
+            other => panic!("expected Ack, got: {other:?}"),
+        }
+
+        // 5. Query status again and verify configured mode and attached mode
+        let resp_native = dispatch_cmd(&mut pm, ControlCmd::GetXdpStatus, "yip0", start_time);
+        match resp_native {
+            ControlResponse::XdpStatus {
+                mode,
+                attached_mode,
+                ..
+            } => {
+                assert_eq!(mode, "native");
+                assert_eq!(attached_mode, "native");
+            }
+            other => panic!("expected XdpStatus, got: {other:?}"),
+        }
+
+        // 6. Dispatch SetXdpMode to "offload"
+        let set_offload = dispatch_cmd(
+            &mut pm,
+            ControlCmd::SetXdpMode {
+                mode: "offload".into(),
+            },
+            "yip0",
+            start_time,
+        );
+        assert!(matches!(set_offload, ControlResponse::Ack { .. }));
+
+        let resp_offload = dispatch_cmd(&mut pm, ControlCmd::GetXdpStatus, "yip0", start_time);
+        match resp_offload {
+            ControlResponse::XdpStatus {
+                mode,
+                attached_mode,
+                hardware_offload_queues,
+                ..
+            } => {
+                assert_eq!(mode, "offload");
+                assert_eq!(attached_mode, "offload");
+                assert_eq!(hardware_offload_queues, vec![0]);
+            }
+            other => panic!("expected XdpStatus, got: {other:?}"),
+        }
+
+        // 7. Dispatch SetXdpMode with invalid mode
+        let set_bad = dispatch_cmd(
+            &mut pm,
+            ControlCmd::SetXdpMode {
+                mode: "unsupported_mode".into(),
+            },
+            "yip0",
+            start_time,
+        );
+        match set_bad {
+            ControlResponse::Err { ok, error } => {
+                assert!(!ok);
+                assert!(error.contains("invalid xdp mode"));
+            }
+            other => panic!("expected Err, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_run_cli_xdp_status_and_set_mock_socket() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let sock_path = format!("/tmp/test_cli_xdp_mock_{}.sock", std::process::id());
+        let _ = std::fs::remove_file(&sock_path);
+        let handle = ControlHandle::bind(&sock_path).unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let running_clone = running.clone();
+        let srv = std::thread::spawn(move || {
+            while running_clone.load(Ordering::Relaxed) {
+                if let Ok(req) = handle.try_recv() {
+                    let resp = match req.cmd {
+                        ControlCmd::GetXdpStatus => ControlResponse::XdpStatus {
+                            ok: true,
+                            interface: Some("eth0".into()),
+                            mode: "native".into(),
+                            bound_mode: "zero-copy".into(),
+                            attached_mode: "native".into(),
+                            zero_copy_supported: true,
+                            prog_id: Some(101),
+                            queues_count: 2,
+                            hardware_offload_queues: vec![0, 1],
+                            umem_slabs: 2,
+                            umem_chunk_size: 2048,
+                            umem_total_chunks: 4096,
+                            umem_free_chunks: 4000,
+                            fill_ring_drops: 1,
+                            rx_ring_drops: 2,
+                            tx_ring_drops: 3,
+                            completion_ring_drops: 4,
+                            rx_packets: 100,
+                            tx_packets: 200,
+                            rx_bytes: 15000,
+                            tx_bytes: 30000,
+                        },
+                        ControlCmd::SetXdpMode { mode } => ControlResponse::Ack {
+                            ok: true,
+                            message: format!("XDP mode updated to '{mode}'"),
+                        },
+                        _ => ControlResponse::Err {
+                            ok: false,
+                            error: "unexpected cmd in mock".into(),
+                        },
+                    };
+                    let _ = req.responder.send(resp);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let path = Path::new(&sock_path);
+
+        // Test status ANSI
+        let res_status = run_cli_xdp_status(path, false);
+        assert!(res_status.is_ok());
+
+        // Test status JSON
+        let res_status_json = run_cli_xdp_status(path, true);
+        assert!(res_status_json.is_ok());
+
+        // Test set ANSI
+        let res_set = run_cli_xdp_set(path, "generic", false);
+        assert!(res_set.is_ok());
+
+        // Test set JSON
+        let res_set_json = run_cli_xdp_set(path, "generic", true);
+        assert!(res_set_json.is_ok());
+
+        running.store(false, Ordering::Relaxed);
+        let _ = srv.join();
+        let _ = std::fs::remove_file(&sock_path);
+
+        // Nonexistent socket fails cleanly
+        assert!(run_cli_xdp_status(Path::new("/tmp/nonexistent_xdp.sock"), false).is_err());
+        assert!(run_cli_xdp_set(Path::new("/tmp/nonexistent_xdp.sock"), "native", false).is_err());
     }
 }

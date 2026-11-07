@@ -6,6 +6,11 @@ maintainer.
 
 ## Done (merged, with integration tests on both I/O drivers)
 
+- **eBPF XDP hardware offload & zero-copy packet telemetry (#186)** — real-time driver mode
+  tuning (`ControlCmd::SetXdpMode`, `yip xdp set`) and zero-copy telemetry inspection
+  (`ControlCmd::GetXdpStatus`, `yip xdp status`), exposing kernel Netlink and BPF attachment flags
+  (`generic`/SKB, `native`/DRV, `offload`/HW), UMEM slab allocation metrics, fill ring drops, and
+  RX/TX ring drop counters.
 - **On-demand epoch rekeying and crypto session status (#185)** — real-time cryptographic
   session inspection (`ControlCmd::GetCryptoStatus`, `yip crypto status`) and on-demand session
   rekeying (`ControlCmd::TriggerRekey`, `yip crypto rekey`), exposing active epochs, key ages,
