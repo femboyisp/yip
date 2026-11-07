@@ -294,6 +294,21 @@ impl ReplayWindow {
             false
         }
     }
+
+    /// Returns the greatest counter accepted so far (or 0 if unstarted).
+    pub fn latest(&self) -> u64 {
+        self.latest
+    }
+
+    /// Returns the minimum counter that could be accepted without being rejected as too old.
+    pub fn floor(&self) -> u64 {
+        if !self.started {
+            0
+        } else {
+            self.latest
+                .saturating_sub(self.profile.bits().saturating_sub(1))
+        }
+    }
 }
 
 impl Default for ReplayWindow {
@@ -654,6 +669,16 @@ impl Session {
         self.replay.check(counter)
     }
 
+    /// Returns the greatest counter seen by the anti-replay window.
+    pub fn replay_latest(&self) -> u64 {
+        self.replay.latest()
+    }
+
+    /// Returns the lowest counter acceptable by the anti-replay window without being too old.
+    pub fn replay_floor(&self) -> u64 {
+        self.replay.floor()
+    }
+
     /// Seal into a caller-owned reusable buffer (no per-call allocation).
     pub fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> Result<u64, CryptoError> {
         let counter = self.send_counter;
@@ -967,17 +992,54 @@ mod tests {
     #[test]
     fn replay_window_accepts_fresh_rejects_replays_and_old() {
         let mut w = ReplayWindow::new();
+        assert_eq!(w.latest(), 0);
+        assert_eq!(w.floor(), 0);
         assert!(w.check_and_set(0), "first counter accepted");
+        assert_eq!(w.latest(), 0);
+        assert_eq!(w.floor(), 0);
         assert!(!w.check_and_set(0), "exact replay rejected");
         assert!(w.check_and_set(1), "next in order accepted");
+        assert_eq!(w.latest(), 1);
         assert!(w.check_and_set(5), "jump ahead accepted");
+        assert_eq!(w.latest(), 5);
         assert!(w.check_and_set(3), "in-window out-of-order accepted");
         assert!(!w.check_and_set(3), "replay of out-of-order rejected");
         assert!(w.check_and_set(100), "large advance accepted");
+        assert_eq!(w.latest(), 100);
         assert!(
             !w.check_and_set(5),
             "counter now far below window rejected as too old"
         );
+
+        let big = 200_000u64;
+        w.commit(big);
+        assert_eq!(w.latest(), big);
+        assert_eq!(w.floor(), big - (w.profile().bits() - 1));
+        assert!(w.check(w.floor()));
+        assert!(!w.check(w.floor() - 1));
+    }
+
+    #[test]
+    fn session_replay_latest_and_floor() {
+        let k1 = [1u8; 32];
+        let k2 = [2u8; 32];
+        let mut s = Session::from_raw_keys(&k1, &k2, 0, 1).unwrap();
+        assert_eq!(s.send_counter(), 0);
+        assert_eq!(s.replay_latest(), 0);
+        assert_eq!(s.replay_floor(), 0);
+
+        let sealed = s.seal(b"hello").unwrap();
+        assert_eq!(sealed.counter, 0);
+        assert_eq!(s.send_counter(), 1);
+
+        let mut s_peer = Session::from_raw_keys(&k2, &k1, 0, 1).unwrap();
+        let sealed_peer = s_peer.seal(b"reply").unwrap();
+        let opened = s
+            .open(sealed_peer.counter, &sealed_peer.ciphertext)
+            .unwrap();
+        assert_eq!(opened, b"reply");
+        assert_eq!(s.replay_latest(), 0);
+        assert_eq!(s.replay_floor(), 0);
     }
 
     /// Advancing the window from counter A to B and then replaying A must be

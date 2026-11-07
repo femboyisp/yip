@@ -185,6 +185,95 @@ impl PeerManager {
         }
     }
 
+    /// Trigger immediate on-demand session rekeying for a peer without traffic interruption (#185).
+    pub fn trigger_rekey(&mut self, target: &str, now_ms: u64) -> Result<String, String> {
+        let idx = self
+            .find_peer_index_by_id(target)
+            .ok_or_else(|| format!("peer '{target}' not found in mesh routing table"))?;
+
+        let relay = self.peers[idx].relay;
+        let pubkey = self.peers[idx].pubkey;
+        let endpoint = self.peers[idx].endpoint;
+        let peer_hex: String = pubkey.iter().map(|b| format!("{b:02x}")).collect();
+
+        match &self.peers[idx].state {
+            PeerState::Established(epochs) => {
+                if epochs.rekey.is_some() {
+                    return Err(format!("rekey already in progress for peer {peer_hex}"));
+                }
+            }
+            PeerState::Handshaking(_) => {
+                return Err(format!(
+                    "cannot rekey peer {peer_hex}: initial handshake is in progress"
+                ))
+            }
+            PeerState::Idle => {
+                return Err(format!(
+                    "cannot rekey peer {peer_hex}: session is not established (state: Idle)"
+                ))
+            }
+        }
+
+        let target_ep = if relay {
+            self.server_addr()
+        } else {
+            match endpoint {
+                Some(ep) => ep,
+                None => {
+                    return Err(format!(
+                        "cannot rekey peer {peer_hex}: direct endpoint is unknown"
+                    ))
+                }
+            }
+        };
+
+        let cert = self
+            .membership
+            .as_ref()
+            .map(Membership::own_cert_bytes)
+            .unwrap_or_default();
+        let payload = crate::handshake::frame_init_payload(&cert);
+        let (hs, init_pkt) = HandshakeState::start_initiator(&self.local_priv, &pubkey, &payload)
+            .map_err(|e| format!("failed to start rekey handshake: {e}"))?;
+
+        let retry_ms = if self.obf_key.is_some() {
+            jitter_ms(HANDSHAKE_RETRY_MS)
+        } else {
+            HANDSHAKE_RETRY_MS
+        };
+
+        let epoch_num = match &mut self.peers[idx].state {
+            PeerState::Established(epochs) => {
+                epochs.rekey = Some(crate::epoch::RekeyInFlight {
+                    hs,
+                    init_pkt: init_pkt.clone(),
+                    started_ms: now_ms,
+                    last_sent_ms: now_ms,
+                    retry_ms,
+                    target: target_ep,
+                });
+                epochs.epoch()
+            }
+            _ => unreachable!(),
+        };
+
+        if relay {
+            if let Some(d) = self.relay_wrap(idx, init_pkt) {
+                self.tick_egress.push(d);
+            }
+        } else {
+            self.tick_egress.push(EgressDatagram {
+                fate: 0,
+                dst: target_ep,
+                bytes: init_pkt,
+            });
+        }
+
+        Ok(format!(
+            "rekey initiated for peer {peer_hex} (epoch {epoch_num})"
+        ))
+    }
+
     /// Rekey (9a Task 4) counterpart of the `Established(_)` arm in
     /// `handle_handshake_init`: `established`/`resp_pkt` were already built
     /// by the SAME `start_responder` call (and this peer already passed

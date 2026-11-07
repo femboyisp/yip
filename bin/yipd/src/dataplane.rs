@@ -227,6 +227,21 @@ impl DataPlane {
         &self.session
     }
 
+    /// The current send counter of the underlying AEAD session.
+    pub fn send_counter(&self) -> u64 {
+        self.session.send_counter()
+    }
+
+    /// The highest counter seen by the AEAD replay window.
+    pub fn replay_latest(&self) -> u64 {
+        self.session.replay_latest()
+    }
+
+    /// The anti-replay window floor counter below which packets are dropped.
+    pub fn replay_floor(&self) -> u64 {
+        self.session.replay_floor()
+    }
+
     /// Mutable access to the underlying AEAD session.
     pub fn session_mut(&mut self) -> &mut yip_crypto::Session {
         &mut self.session

@@ -95,6 +95,47 @@ impl EpochSet {
         self.epoch
     }
 
+    pub fn current_created_ms(&self) -> u64 {
+        self.current_created_ms
+    }
+
+    pub fn next_epoch(&self) -> Option<u64> {
+        if self.next.is_some() {
+            Some(self.epoch.saturating_add(1))
+        } else {
+            None
+        }
+    }
+
+    pub fn previous_epoch(&self) -> Option<u64> {
+        if self.previous.is_some() && self.epoch > 1 {
+            Some(self.epoch.saturating_sub(1))
+        } else {
+            None
+        }
+    }
+
+    pub fn rekey_in_flight(&self) -> bool {
+        self.rekey.is_some()
+    }
+
+    #[cfg(test)]
+    pub fn rekey(&self) -> Option<&RekeyInFlight> {
+        self.rekey.as_ref()
+    }
+
+    pub fn current_send_counter(&self) -> u64 {
+        self.current.send_counter()
+    }
+
+    pub fn current_replay_latest(&self) -> u64 {
+        self.current.replay_latest()
+    }
+
+    pub fn current_replay_floor(&self) -> u64 {
+        self.current.replay_floor()
+    }
+
     pub fn current(&self) -> &DataPlane {
         &self.current
     }
@@ -651,5 +692,39 @@ mod tests {
         assert!(candidates.len() >= 2);
         assert!(candidates.contains(&k4));
         assert!(candidates.contains(&k1));
+    }
+
+    #[test]
+    fn epoch_set_crypto_accessors() {
+        let (_peer, us) = epoch_pair();
+        let mut set = EpochSet::new(us, 1234);
+        assert_eq!(set.epoch(), 1);
+        assert_eq!(set.current_created_ms(), 1234);
+        assert_eq!(set.next_epoch(), None);
+        assert_eq!(set.previous_epoch(), None);
+        assert!(!set.rekey_in_flight());
+        assert_eq!(set.current_send_counter(), 0);
+        assert_eq!(set.current_replay_latest(), 0);
+        assert_eq!(set.current_replay_floor(), 0);
+
+        // Install next
+        let (_peer2, us2) = epoch_pair();
+        set.install_next(us2, [2u8; 32], vec![]);
+        assert_eq!(set.next_epoch(), Some(2));
+        assert_eq!(set.previous_epoch(), None);
+
+        // Rekey in flight
+        let target: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        set.rekey = Some(rekey_in_flight(target));
+        assert!(set.rekey_in_flight());
+        assert_eq!(set.rekey().unwrap().target, target);
+
+        // Promote
+        let (_peer3, us3) = epoch_pair();
+        set.promote_from_rekey(us3, 5678);
+        assert_eq!(set.epoch(), 2);
+        assert_eq!(set.current_created_ms(), 5678);
+        assert_eq!(set.previous_epoch(), Some(1));
+        assert!(!set.rekey_in_flight());
     }
 }

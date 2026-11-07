@@ -103,6 +103,13 @@ pub enum ControlCmd {
         #[serde(default)]
         peer: Option<String>,
     },
+    #[serde(rename = "get_crypto_status")]
+    GetCryptoStatus {
+        #[serde(default)]
+        peer: Option<String>,
+    },
+    #[serde(rename = "trigger_rekey")]
+    TriggerRekey { peer: String },
 }
 
 fn default_ping_count() -> u32 {
@@ -561,6 +568,25 @@ pub struct PingPeerResult {
     pub samples: Vec<f64>,
 }
 
+/// Active cryptographic session states and anti-replay floors (#185).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Default)]
+pub struct PeerCryptoStatus {
+    pub peer: String,
+    pub node_addr: String,
+    pub endpoint: Option<String>,
+    pub session_state: String,
+    pub cipher_suite: String,
+    pub current_epoch: Option<u64>,
+    pub current_epoch_age_secs: Option<u64>,
+    pub next_epoch: Option<u64>,
+    pub previous_epoch: Option<u64>,
+    pub rekey_in_flight: bool,
+    pub send_counter: Option<u64>,
+    pub replay_floor: Option<u64>,
+    pub replay_latest: Option<u64>,
+    pub last_accepted_init_tai64n: Option<String>,
+}
+
 /// Outbound control command responses returned to clients.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(untagged)]
@@ -656,6 +682,10 @@ pub enum ControlResponse {
         max_rtt_ms: Option<f64>,
         stddev_rtt_ms: Option<f64>,
         samples: Vec<f64>,
+    },
+    CryptoStatus {
+        ok: bool,
+        sessions: Vec<PeerCryptoStatus>,
     },
     Metrics {
         ok: bool,
@@ -1242,6 +1272,26 @@ pub fn dispatch_cmd(
                 ok: true,
                 metrics: snapshot,
                 prometheus,
+            }
+        }
+        ControlCmd::GetCryptoStatus { peer } => {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            match pm.crypto_status(peer.as_deref(), now_ms) {
+                Ok(sessions) => ControlResponse::CryptoStatus { ok: true, sessions },
+                Err(error) => ControlResponse::Err { ok: false, error },
+            }
+        }
+        ControlCmd::TriggerRekey { peer } => {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            match pm.trigger_rekey(&peer, now_ms) {
+                Ok(message) => ControlResponse::Ack { ok: true, message },
+                Err(error) => ControlResponse::Err { ok: false, error },
             }
         }
     }
@@ -2066,6 +2116,111 @@ pub fn run_cli_metrics(socket_path: &Path, json: bool) -> Result<(), String> {
     }
 }
 
+/// Query and display cryptographic session status and anti-replay counters (#185).
+pub fn run_cli_crypto_status(
+    socket_path: &Path,
+    target: Option<&str>,
+    json: bool,
+) -> Result<(), String> {
+    let resp = client_query(
+        socket_path,
+        ControlCmd::GetCryptoStatus {
+            peer: target.map(|s| s.to_string()),
+        },
+    )?;
+    if json {
+        let text = serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?;
+        println!("{text}");
+        if let ControlResponse::Err { error, .. } = resp {
+            return Err(error);
+        }
+        return Ok(());
+    }
+    match resp {
+        ControlResponse::CryptoStatus { ok, sessions } => {
+            if !ok {
+                return Err("daemon reported error querying crypto status".into());
+            }
+            if sessions.is_empty() {
+                println!("No active crypto sessions found.");
+                return Ok(());
+            }
+            println!(
+                "\x1b[1;4m{:<20} {:<13} {:<7} {:<8} {:<10} {:<14} {:<18}\x1b[0m",
+                "PEER", "STATE", "EPOCH", "AGE", "REKEY", "TX COUNTER", "REPLAY WINDOW"
+            );
+            for s in &sessions {
+                let short_peer = if s.peer.len() > 16 {
+                    format!("{}...", &s.peer[..16])
+                } else {
+                    s.peer.clone()
+                };
+                let state_colored = match s.session_state.as_str() {
+                    "Established" => format!("\x1b[32m{}\x1b[0m", s.session_state),
+                    "Handshaking" => format!("\x1b[33m{}\x1b[0m", s.session_state),
+                    _ => format!("\x1b[90m{}\x1b[0m", s.session_state),
+                };
+                let epoch_str = match (s.current_epoch, s.next_epoch) {
+                    (Some(curr), Some(next)) => format!("{curr} (->{next})"),
+                    (Some(curr), None) => format!("{curr}"),
+                    _ => "--".to_string(),
+                };
+                let age_str = s
+                    .current_epoch_age_secs
+                    .map(|secs| format!("{secs}s"))
+                    .unwrap_or_else(|| "--".into());
+                let rekey_str = if s.rekey_in_flight {
+                    "\x1b[33min-flight\x1b[0m".to_string()
+                } else {
+                    "\x1b[90midle\x1b[0m".to_string()
+                };
+                let tx_str = s
+                    .send_counter
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "--".into());
+                let replay_str = match (s.replay_floor, s.replay_latest) {
+                    (Some(floor), Some(latest)) => format!("{floor}..{latest}"),
+                    _ => "--".to_string(),
+                };
+
+                println!(
+                    "{:<20} {:<22} {:<7} {:<8} {:<19} {:<14} {:<18}",
+                    short_peer, state_colored, epoch_str, age_str, rekey_str, tx_str, replay_str
+                );
+            }
+            Ok(())
+        }
+        ControlResponse::Err { error, .. } => Err(error),
+        _ => Err("unexpected response format from daemon".into()),
+    }
+}
+
+/// Trigger on-demand session rekeying for a target peer (#185).
+pub fn run_cli_trigger_rekey(socket_path: &Path, target: &str, json: bool) -> Result<(), String> {
+    let resp = client_query(
+        socket_path,
+        ControlCmd::TriggerRekey {
+            peer: target.to_string(),
+        },
+    )?;
+    if json {
+        let text = serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?;
+        println!("{text}");
+        if let ControlResponse::Err { error, .. } = resp {
+            return Err(error);
+        }
+        return Ok(());
+    }
+    match resp {
+        ControlResponse::Ack { message, .. } => {
+            println!("\x1b[1;32m✓\x1b[0m {message}");
+            Ok(())
+        }
+        ControlResponse::Err { error, .. } => Err(error),
+        _ => Err("unexpected response format from daemon".into()),
+    }
+}
+
 struct CursorGuard;
 impl Drop for CursorGuard {
     fn drop(&mut self) {
@@ -2646,6 +2801,11 @@ mod tests {
         .is_err());
         assert!(run_cli_metrics(path, false).is_ok());
         assert!(run_cli_metrics(path, true).is_ok());
+        assert!(run_cli_crypto_status(path, None, false).is_ok());
+        assert!(run_cli_crypto_status(path, None, true).is_ok());
+        assert!(run_cli_crypto_status(path, Some("nonexistent"), false).is_err());
+        assert!(run_cli_trigger_rekey(path, "nonexistent", false).is_err());
+        assert!(run_cli_trigger_rekey(path, "nonexistent", true).is_err());
 
         running.store(false, Ordering::Relaxed);
         let _ = srv.join();
@@ -3222,5 +3382,176 @@ mod tests {
 
         // Non-existent socket error
         assert!(run_cli_metrics(Path::new("/tmp/nonexistent_metrics.sock"), false).is_err());
+    }
+
+    #[test]
+    fn test_crypto_status_and_trigger_rekey_serde_and_dispatch() {
+        let cmd = ControlCmd::GetCryptoStatus {
+            peer: Some("node1".into()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"cmd\":\"get_crypto_status\""));
+        let parsed: ControlCmd = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ControlCmd::GetCryptoStatus { peer } => assert_eq!(peer.as_deref(), Some("node1")),
+            _ => panic!("wrong variant"),
+        }
+
+        let json_no_peer = r#"{"cmd":"get_crypto_status"}"#;
+        let parsed_no_peer: ControlCmd = serde_json::from_str(json_no_peer).unwrap();
+        match parsed_no_peer {
+            ControlCmd::GetCryptoStatus { peer } => assert_eq!(peer, None),
+            _ => panic!("wrong variant"),
+        }
+
+        let cmd_rekey = ControlCmd::TriggerRekey {
+            peer: "node1".into(),
+        };
+        let json_rekey = serde_json::to_string(&cmd_rekey).unwrap();
+        assert!(json_rekey.contains("\"cmd\":\"trigger_rekey\""));
+        let parsed_rekey: ControlCmd = serde_json::from_str(&json_rekey).unwrap();
+        match parsed_rekey {
+            ControlCmd::TriggerRekey { peer } => assert_eq!(peer, "node1"),
+            _ => panic!("wrong variant"),
+        }
+
+        let dummy_status = PeerCryptoStatus {
+            peer: "01020304".into(),
+            node_addr: "200:1::1".into(),
+            endpoint: Some("127.0.0.1:51820".into()),
+            session_state: "Established".into(),
+            cipher_suite: "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s".into(),
+            current_epoch: Some(1),
+            current_epoch_age_secs: Some(10),
+            next_epoch: None,
+            previous_epoch: None,
+            rekey_in_flight: false,
+            send_counter: Some(42),
+            replay_floor: Some(0),
+            replay_latest: Some(41),
+            last_accepted_init_tai64n: None,
+        };
+        let resp = ControlResponse::CryptoStatus {
+            ok: true,
+            sessions: vec![dummy_status.clone()],
+        };
+        let resp_json = serde_json::to_string(&resp).unwrap();
+        let parsed_resp: ControlResponse = serde_json::from_str(&resp_json).unwrap();
+        match parsed_resp {
+            ControlResponse::CryptoStatus { ok, sessions } => {
+                assert!(ok);
+                assert_eq!(sessions.len(), 1);
+                assert_eq!(sessions[0].peer, dummy_status.peer);
+                assert_eq!(sessions[0].session_state, "Established");
+                assert_eq!(sessions[0].current_epoch, Some(1));
+                assert_eq!(sessions[0].send_counter, Some(42));
+            }
+            other => panic!("expected ControlResponse::CryptoStatus, got {other:?}"),
+        }
+
+        let mut pm = crate::peer_manager::testutil::test_peer_manager();
+        let start_time = Instant::now();
+
+        let status_resp = dispatch_cmd(
+            &mut pm,
+            ControlCmd::GetCryptoStatus { peer: None },
+            "test0",
+            start_time,
+        );
+        match status_resp {
+            ControlResponse::CryptoStatus { ok, sessions } => {
+                assert!(ok);
+                assert_eq!(sessions.len(), 1);
+                assert_eq!(sessions[0].session_state, "Idle");
+            }
+            other => panic!("expected CryptoStatus, got: {other:?}"),
+        }
+
+        let rekey_resp = dispatch_cmd(
+            &mut pm,
+            ControlCmd::TriggerRekey {
+                peer: "01010101".into(),
+            },
+            "test0",
+            start_time,
+        );
+        match rekey_resp {
+            ControlResponse::Err { ok, error } => {
+                assert!(!ok);
+                assert!(error.contains("not established (state: Idle)"));
+            }
+            other => panic!("expected Err, got: {other:?}"),
+        }
+
+        let rekey_nf = dispatch_cmd(
+            &mut pm,
+            ControlCmd::TriggerRekey {
+                peer: "nonexistent".into(),
+            },
+            "test0",
+            start_time,
+        );
+        match rekey_nf {
+            ControlResponse::Err { ok, error } => {
+                assert!(!ok);
+                assert!(
+                    error.contains("not found in mesh routing table"),
+                    "actual error was: {error}"
+                );
+            }
+            other => panic!("expected Err, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_run_cli_crypto_status_and_rekey_error_handling() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let sock_path = format!("/tmp/test_cli_crypto_err_{}.sock", std::process::id());
+        let _ = std::fs::remove_file(&sock_path);
+        let handle = ControlHandle::bind(&sock_path).unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let running_clone = running.clone();
+        let srv = std::thread::spawn(move || {
+            while running_clone.load(Ordering::Relaxed) {
+                if let Ok(req) = handle.try_recv() {
+                    let resp = ControlResponse::Err {
+                        ok: false,
+                        error: "internal daemon error".into(),
+                    };
+                    let _ = req.responder.send(resp);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let path = Path::new(&sock_path);
+
+        let err_status = run_cli_crypto_status(path, None, false).unwrap_err();
+        assert_eq!(err_status, "internal daemon error");
+
+        let err_status_json = run_cli_crypto_status(path, None, true).unwrap_err();
+        assert_eq!(err_status_json, "internal daemon error");
+
+        let err_rekey = run_cli_trigger_rekey(path, "peer1", false).unwrap_err();
+        assert_eq!(err_rekey, "internal daemon error");
+
+        let err_rekey_json = run_cli_trigger_rekey(path, "peer1", true).unwrap_err();
+        assert_eq!(err_rekey_json, "internal daemon error");
+
+        running.store(false, Ordering::Relaxed);
+        let _ = srv.join();
+        let _ = std::fs::remove_file(&sock_path);
+
+        assert!(
+            run_cli_crypto_status(Path::new("/tmp/nonexistent_crypto.sock"), None, false).is_err()
+        );
+        assert!(
+            run_cli_trigger_rekey(Path::new("/tmp/nonexistent_crypto.sock"), "peer1", false)
+                .is_err()
+        );
     }
 }

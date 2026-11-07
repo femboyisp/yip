@@ -50,6 +50,7 @@ fn print_daemon_usage() {
     println!("Commands:");
     println!("  status       Display daemon status and summary");
     println!("  peers        List connected peers and statistics");
+    println!("  crypto       Inspect active cryptographic session states or trigger rekeying");
     println!("  metrics      Display runtime metrics and telemetry");
     println!("  top          Real-time ANSI telemetry dashboard");
     println!();
@@ -225,12 +226,27 @@ fn print_cli_usage(subcmd: &str) {
             println!("      --json                      Output raw JSON");
             println!("  -h, --help                      Print help");
         }
+        "crypto" => {
+            println!("Usage: yipctl crypto <status|rekey> [ARGS] [OPTIONS]");
+            println!();
+            println!("Inspect active cryptographic session states or trigger on-demand rekeying.");
+            println!();
+            println!("Commands:");
+            println!("  status [PEER]  Display session epoch, handshake params, and replay floors");
+            println!("  rekey <PEER>   Trigger immediate on-demand session rekeying");
+            println!();
+            println!("Options:");
+            println!("  -c, --control <SOCKET>  Path to yipd UNIX control socket");
+            println!("      --json              Output raw JSON");
+            println!("  -h, --help              Print help");
+        }
         _ => {
             println!("Usage: yipctl <COMMAND> [OPTIONS]");
             println!();
             println!("Commands:");
             println!("  status    Display daemon status and summary");
             println!("  peers     List connected peers and statistics");
+            println!("  crypto    Inspect active crypto session states or trigger rekeying");
             println!("  metrics   Display runtime metrics and telemetry");
             println!("  routes    Display live mesh overlay routing table");
             println!("  topology  Display mesh topology graph projection");
@@ -740,6 +756,33 @@ fn run_client_subcommand(
             }
         }
         "metrics" => control::run_cli_metrics(&socket, json).map_err(std::io::Error::other),
+        "crypto" => {
+            let action = positional.first().map(|s| s.as_str()).unwrap_or("status");
+            match action {
+                "status" => {
+                    let peer_target = positional.get(1).cloned();
+                    control::run_cli_crypto_status(&socket, peer_target.as_deref(), json)
+                        .map_err(std::io::Error::other)
+                }
+                "rekey" => {
+                    let peer_target = positional.get(1).cloned().ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "crypto rekey requires a <PEER> argument",
+                        )
+                    })?;
+                    control::run_cli_trigger_rekey(&socket, &peer_target, json)
+                        .map_err(std::io::Error::other)
+                }
+                other => {
+                    eprintln!("Unknown crypto action: {other}");
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("unknown crypto action: {other} (valid: status, rekey)"),
+                    ))
+                }
+            }
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("unknown subcommand: {subcmd}"),
@@ -843,6 +886,7 @@ fn main() -> std::io::Result<()> {
             Some("topology") => return run_client_subcommand("topology", args),
             Some("split") | Some("split-tunnel") => return run_client_subcommand("split", args),
             Some("metrics") => return run_client_subcommand("metrics", args),
+            Some("crypto") => return run_client_subcommand("crypto", args),
             Some("genkey") | Some("--genkey") => {
                 let kp = yip_crypto::generate_keypair();
                 println!("private={}", hex_encode(&kp.private));
@@ -886,6 +930,7 @@ fn main() -> std::io::Result<()> {
         Some("topology") => run_client_subcommand("topology", args),
         Some("split") | Some("split-tunnel") => run_client_subcommand("split", args),
         Some("metrics") => run_client_subcommand("metrics", args),
+        Some("crypto") => run_client_subcommand("crypto", args),
         Some("--version") | Some("-V") => {
             println!("{}", banner());
             Ok(())

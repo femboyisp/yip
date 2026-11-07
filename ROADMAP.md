@@ -6,6 +6,11 @@ maintainer.
 
 ## Done (merged, with integration tests on both I/O drivers)
 
+- **On-demand epoch rekeying and crypto session status (#185)** — real-time cryptographic
+  session inspection (`ControlCmd::GetCryptoStatus`, `yip crypto status`) and on-demand session
+  rekeying (`ControlCmd::TriggerRekey`, `yip crypto rekey`), exposing active epochs, key ages,
+  rekey in-flight states, monotonic transmit sequence counters, and anti-replay window bounds
+  (`replay_floor`..`replay_latest`).
 - **Data plane + FEC transport** — encrypted L2/L3 tunnel over systematic Reed–Solomon-FEC
   UDP transport, streaming rateless RLNC (fountain coding), poly-vector SIMD Galois Field engine
   (GFNI, AVX-512BW, AVX2, SSSE3, ARM NEON, Wasm SIMD128), batched `sendmmsg`/`recvmmsg`,
