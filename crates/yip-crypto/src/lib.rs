@@ -11,6 +11,9 @@
 //! byte-identical to snow's own transport state but faster.
 #![forbid(unsafe_code)]
 
+pub mod symmetric;
+pub use symmetric::SymmetricState;
+
 use ml_kem::{
     array::Array,
     kem::{Decapsulate, Encapsulate, Kem, KeyExport},

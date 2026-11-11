@@ -19,7 +19,7 @@ ring = "0.17"
 snow = { version = "0.10.0", features = ["risky-raw-split"] }
 subtle = { workspace = true }
 thiserror = { workspace = true }
-zeroize = "1.8"
+zeroize = { version = "1.8", features = ["derive"] }
 
 [package.metadata.docs.rs]
 all-features = true
