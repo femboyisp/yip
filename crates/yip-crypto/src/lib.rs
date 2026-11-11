@@ -11,7 +11,9 @@
 //! byte-identical to snow's own transport state but faster.
 #![forbid(unsafe_code)]
 
+pub mod handshake;
 pub mod symmetric;
+pub use handshake::{InitiatorHandshake, ResponderHandshake};
 pub use symmetric::SymmetricState;
 
 use ml_kem::{
@@ -55,12 +57,37 @@ pub const PQ_CIPHERTEXT_LEN: usize = 768;
 /// ML-KEM-512 shared secret length in bytes (FIPS 203).
 pub const PQ_SHARED_SECRET_LEN: usize = 32;
 
+/// ML-KEM-512 decapsulation key length in bytes (FIPS 203).
+pub const PQ_DECAPS_KEY_LEN: usize = 1632;
+
 /// An ML-KEM-512 public encapsulation key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PqEncapsKey(pub [u8; PQ_ENCAPS_KEY_LEN]);
 
 /// An ML-KEM-512 private decapsulation key wrapped in zeroizing memory.
-pub struct PqDecapsKey(Box<ml_kem_512::DecapsulationKey>);
+pub struct PqDecapsKey(pub(crate) Box<ml_kem_512::DecapsulationKey>);
+
+impl PqDecapsKey {
+    /// Export the 1632-byte expanded ML-KEM-512 decapsulation key bytes.
+    #[expect(deprecated)]
+    pub fn to_bytes(&self) -> [u8; PQ_DECAPS_KEY_LEN] {
+        use ml_kem::ExpandedKeyEncoding;
+        let arr = self.0.to_expanded_bytes();
+        let mut out = [0u8; PQ_DECAPS_KEY_LEN];
+        out.copy_from_slice(arr.as_slice());
+        out
+    }
+
+    /// Import an expanded ML-KEM-512 decapsulation key from 1632 bytes.
+    #[expect(deprecated)]
+    pub fn from_bytes(bytes: &[u8; PQ_DECAPS_KEY_LEN]) -> Result<Self, CryptoError> {
+        use ml_kem::ExpandedKeyEncoding;
+        let arr = ml_kem::array::Array::from(*bytes);
+        let dk = ml_kem_512::DecapsulationKey::from_expanded_bytes(&arr)
+            .map_err(|_| CryptoError::Handshake)?;
+        Ok(Self(Box::new(dk)))
+    }
+}
 
 impl std::fmt::Debug for PqDecapsKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -333,6 +360,9 @@ pub enum CryptoError {
     /// Handshake step failed (bad message, wrong state, or key error).
     #[error("handshake failed")]
     Handshake,
+    /// Cryptographic key was invalid (e.g. low-order point or invalid encoding).
+    #[error("invalid key")]
+    InvalidKey,
 }
 
 /// Internal role-specific state for post-quantum hybrid key exchange.

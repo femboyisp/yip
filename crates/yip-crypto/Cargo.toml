@@ -14,11 +14,13 @@ description = "Post-quantum hybrid Noise-IKpsk2 + ML-KEM-512 cryptographic hands
 
 [dependencies]
 blake3 = { workspace = true }
+chacha20poly1305 = "0.11"
 ml-kem = { version = "0.3", features = ["zeroize", "getrandom"] }
 ring = "0.17"
 snow = { version = "0.10.0", features = ["risky-raw-split"] }
 subtle = { workspace = true }
 thiserror = { workspace = true }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 zeroize = { version = "1.8", features = ["derive"] }
 
 [package.metadata.docs.rs]
