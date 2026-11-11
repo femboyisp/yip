@@ -13,10 +13,12 @@ rust-version.workspace = true
 description = "Post-quantum hybrid Noise-IKpsk2 + ML-KEM-512 cryptographic handshake and AEAD session ciphers for yip"
 
 [dependencies]
-thiserror = { workspace = true }
-snow = { version = "0.10.0", features = ["risky-raw-split"] }
-ring = "0.17"
+blake3 = { workspace = true }
 ml-kem = { version = "0.3", features = ["zeroize", "getrandom"] }
+ring = "0.17"
+snow = { version = "0.10.0", features = ["risky-raw-split"] }
+subtle = { workspace = true }
+thiserror = { workspace = true }
 zeroize = "1.8"
 
 [package.metadata.docs.rs]

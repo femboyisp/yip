@@ -82,6 +82,9 @@ name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "asn1-rs"
@@ -214,6 +217,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -2596,9 +2600,11 @@ dependencies = [
 name = "yip-crypto"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "ml-kem",
  "ring",
  "snow",
+ "subtle",
  "thiserror",
  "zeroize",
 ]
@@ -2660,6 +2666,7 @@ name = "yip-rendezvous"
 version = "0.1.0"
 dependencies = [
  "blake2",
+ "blake3",
  "ed25519-dalek",
  "getrandom 0.4.3",
  "rand_core 0.10.1",
@@ -2725,6 +2732,7 @@ name = "yipd"
 version = "0.1.0"
 dependencies = [
  "blake2",
+ "blake3",
  "boring",
  "bytes",
  "ed25519-dalek",
