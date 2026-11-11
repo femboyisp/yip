@@ -582,3 +582,66 @@ fn test_key_introspection() {
     assert_eq!(responder.local_static(), responder_static.public);
     assert_eq!(responder.local_pq_ek(), &responder_pq_ek.0);
 }
+
+#[test]
+fn test_abort_clears_transport_keys() {
+    let initiator_static = generate_keypair();
+    let responder_static = generate_keypair();
+    let (responder_pq_ek, responder_pq_dk) = generate_pq_keypair();
+    let responder_dk_bytes = responder_pq_dk.to_bytes();
+    let psk = [0x55u8; 32];
+    let prologue = b"test_abort";
+
+    let mut initiator = InitiatorHandshake::new(
+        &initiator_static.private,
+        &responder_static.public,
+        &responder_pq_ek.0,
+        &psk,
+        prologue,
+    )
+    .expect("initiator handshake creation");
+
+    let mut responder = ResponderHandshake::new(
+        &responder_static.private,
+        &responder_pq_ek.0,
+        &psk,
+        prologue,
+    )
+    .expect("responder handshake creation");
+
+    let mut msg1 = [0u8; 1024];
+    let n1 = initiator
+        .write_message_1(&[], &mut msg1)
+        .expect("write_message_1");
+
+    let mut payload1_out = [0u8; 64];
+    responder
+        .read_message_1(&msg1[..n1], &responder_dk_bytes, &mut payload1_out)
+        .expect("read_message_1");
+
+    let mut msg2 = [0u8; 256];
+    let n2 = responder
+        .write_message_2(&[], &mut msg2)
+        .expect("write_message_2");
+
+    let mut payload2_out = [0u8; 64];
+    initiator
+        .read_message_2(&msg2[..n2], &mut payload2_out)
+        .expect("read_message_2");
+
+    // Before abort, transport_keys and split succeed
+    assert!(initiator.split().is_ok());
+    assert!(responder.split().is_ok());
+    assert!(initiator.transport_keys().is_ok());
+    assert!(responder.transport_keys().is_ok());
+
+    // Abort initiator
+    initiator.abort();
+    assert_eq!(initiator.split(), Err(CryptoError::Handshake));
+    assert_eq!(initiator.transport_keys(), Err(CryptoError::Handshake));
+
+    // Abort responder
+    responder.abort();
+    assert_eq!(responder.split(), Err(CryptoError::Handshake));
+    assert_eq!(responder.transport_keys(), Err(CryptoError::Handshake));
+}

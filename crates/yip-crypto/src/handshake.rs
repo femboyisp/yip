@@ -11,15 +11,14 @@
 use chacha20poly1305::aead::inout::InOutBuf;
 use chacha20poly1305::aead::{AeadInOut, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
+use ml_kem::kem::Decapsulate;
+use ml_kem::ml_kem_512;
 use ring::rand::{SecureRandom, SystemRandom};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
 use crate::symmetric::SymmetricState;
-use crate::{
-    pq_decapsulate, pq_encapsulate, CryptoError, PqCiphertext, PqDecapsKey, PqEncapsKey, Session,
-    PQ_ENCAPS_KEY_LEN,
-};
+use crate::{pq_encapsulate, CryptoError, PqEncapsKey, Session, PQ_ENCAPS_KEY_LEN};
 
 /// Protocol identifier string.
 pub const PROTOCOL_NAME: &[u8] = b"PQNoise_IKpsk2_25519_MLKEM512_ChaChaPoly_BLAKE3";
@@ -153,6 +152,10 @@ impl InitiatorHandshake {
         self.psk.zeroize();
         if let Some(mut eph) = self.ephemeral_private.take() {
             eph.zeroize();
+        }
+        if let Some((mut k1, mut k2)) = self.transport_keys.take() {
+            k1.zeroize();
+            k2.zeroize();
         }
         self.symmetric.zeroize();
         self.state = InitiatorState::Failed;
@@ -310,20 +313,19 @@ impl InitiatorHandshake {
                 return Err(e);
             }
         };
+        eph_priv.zeroize();
         let mut k_4 = self.symmetric.mix_key(&dh_ee);
         dh_ee.zeroize();
         k_4.zeroize();
 
-        // 3. se: DH(e_i, rs_x25519)
-        let mut dh_se = match constant_time_dh(&eph_priv, &self.remote_static) {
+        // 3. se: DH(s_i, e_r)
+        let mut dh_se = match constant_time_dh(&self.static_private, &e_r) {
             Ok(dh) => dh,
             Err(e) => {
-                eph_priv.zeroize();
                 self.abort();
                 return Err(e);
             }
         };
-        eph_priv.zeroize();
         let mut k_5 = self.symmetric.mix_key(&dh_se);
         dh_se.zeroize();
         k_5.zeroize();
@@ -395,8 +397,11 @@ impl InitiatorHandshake {
 
     /// Convert completed handshake into an AEAD [`Session`].
     pub fn into_session(self) -> Result<Session, CryptoError> {
-        let (k_send, k_recv) = self.transport_keys()?;
-        Session::from_raw_keys(&k_send, &k_recv, 0, 1)
+        let (mut k_send, mut k_recv) = self.transport_keys()?;
+        let session = Session::from_raw_keys(&k_send, &k_recv, 0, 1);
+        k_send.zeroize();
+        k_recv.zeroize();
+        session
     }
 }
 
@@ -463,8 +468,15 @@ impl ResponderHandshake {
     pub fn abort(&mut self) {
         self.static_private.zeroize();
         self.psk.zeroize();
+        if let Some(mut eph) = self.remote_ephemeral.take() {
+            eph.zeroize();
+        }
+        if let Some((mut k1, mut k2)) = self.transport_keys.take() {
+            k1.zeroize();
+            k2.zeroize();
+        }
         self.symmetric.zeroize();
-        self.remote_ephemeral = None;
+        self.remote_static = None;
         self.state = ResponderState::Failed;
     }
 
@@ -472,12 +484,14 @@ impl ResponderHandshake {
     ///
     /// Decrypts static public key and application payload into `payload_out`.
     /// On any MAC or key validation failure, intermediate state is wiped and an error returned.
+    #[expect(deprecated)]
     pub fn read_message_1(
         &mut self,
         msg: &[u8],
         dk: &[u8; 1632],
         payload_out: &mut [u8],
     ) -> Result<usize, CryptoError> {
+        use ml_kem::ExpandedKeyEncoding;
         if self.state != ResponderState::ReadyToRead1 {
             return Err(CryptoError::Handshake);
         }
@@ -534,24 +548,16 @@ impl ResponderHandshake {
         let mut ct_bytes = [0u8; 768];
         ct_bytes.copy_from_slice(&msg[80..848]);
 
-        let decaps_key = match PqDecapsKey::from_bytes(dk) {
-            Ok(k) => k,
-            Err(_) => {
+        let dk_arr = ml_kem::array::Array::from(*dk);
+        let decaps_key =
+            ml_kem_512::DecapsulationKey::from_expanded_bytes(&dk_arr).map_err(|_| {
                 self.abort();
-                return Err(CryptoError::Handshake);
-            }
-        };
-        let pq_ct = PqCiphertext(ct_bytes);
-        let ss = match pq_decapsulate(&decaps_key, &pq_ct) {
-            Ok(s) => s,
-            Err(e) => {
-                self.abort();
-                return Err(e);
-            }
-        };
+                CryptoError::Handshake
+            })?;
+        let ct_arr = ml_kem::array::Array::from(ct_bytes);
+        let mut ss_kem: [u8; 32] = decaps_key.decapsulate(&ct_arr).into();
         self.symmetric.mix_hash(&ct_bytes);
 
-        let mut ss_kem = *ss;
         let mut k_3 = self.symmetric.mix_key(&ss_kem);
         ss_kem.zeroize();
 
@@ -619,6 +625,14 @@ impl ResponderHandshake {
             }
         };
 
+        let remote_static = match self.remote_static {
+            Some(s) => s,
+            None => {
+                self.abort();
+                return Err(CryptoError::Handshake);
+            }
+        };
+
         // 1. Generate ephemeral keypair e_r
         let rng = SystemRandom::new();
         let mut eph_priv = [0u8; 32];
@@ -644,16 +658,17 @@ impl ResponderHandshake {
         let mut k_4 = self.symmetric.mix_key(&dh_ee);
         dh_ee.zeroize();
         k_4.zeroize();
-        eph_priv.zeroize();
 
-        // 3. se: DH(s_r, e_i)
-        let mut dh_se = match constant_time_dh(&self.static_private, &e_i) {
+        // 3. se: DH(e_r, s_i)
+        let mut dh_se = match constant_time_dh(&eph_priv, &remote_static) {
             Ok(dh) => dh,
             Err(e) => {
+                eph_priv.zeroize();
                 self.abort();
                 return Err(e);
             }
         };
+        eph_priv.zeroize();
         let mut k_5 = self.symmetric.mix_key(&dh_se);
         dh_se.zeroize();
         k_5.zeroize();
@@ -724,7 +739,10 @@ impl ResponderHandshake {
 
     /// Convert completed handshake into an AEAD [`Session`].
     pub fn into_session(self) -> Result<Session, CryptoError> {
-        let (k_send, k_recv) = self.transport_keys()?;
-        Session::from_raw_keys(&k_send, &k_recv, 0, 1)
+        let (mut k_send, mut k_recv) = self.transport_keys()?;
+        let session = Session::from_raw_keys(&k_send, &k_recv, 0, 1);
+        k_send.zeroize();
+        k_recv.zeroize();
+        session
     }
 }

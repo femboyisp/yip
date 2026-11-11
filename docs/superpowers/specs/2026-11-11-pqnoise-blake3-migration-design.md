@@ -173,7 +173,7 @@ Pattern: `-> e, es, s, ss, skem, payload`
 Pattern: `<- e, ee, se, psk, payload`
 1. `e`: Responder generates ephemeral X25519 keypair $e_r$. Writes $e_r.\text{public}$ (32 B). `MixHash(&e_r.public)`.
 2. `ee`: Computes $\text{X25519}(e_r.\text{secret}, e_i.\text{public})$. Enforces constant-time non-zero check. `k_4 = MixKey(&dh_ee)`. Zeroizes `dh_ee`.
-3. `se`: Computes $\text{X25519}(s_r.\text{secret}, e_i.\text{public})$. Enforces constant-time non-zero check. `k_5 = MixKey(&dh_se)`. Zeroizes `dh_se`.
+3. `se`: Computes X25519(s_i.public, e_r.secret) on responder / X25519(s_i.secret, e_r.public) on initiator. Enforces constant-time non-zero check. `k_5 = MixKey(&dh_se)`. Zeroizes `dh_se`.
 4. `psk`: `k_6 = MixKeyAndHash(&psk)`.
 5. `payload`: Encrypts handshake payload with $k_6$ (`ad = h`). Writes ciphertext + 16 B Poly1305 MAC.
 6. `Split()`: Invokes `symmetric.split()` to emit directional 32-byte transport AEAD keys.
