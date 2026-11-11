@@ -263,14 +263,16 @@ pub fn init_ephemeral(init_pkt: &[u8]) -> Option<[u8; 32]> {
 
 /// The responder's Noise ephemeral public key: the raw, unencrypted 32 bytes
 /// that lead Noise Msg 2 (`<- e, ee, se, psk`), located immediately after the
-/// 1-byte [`PacketType::HandshakeResp`] prefix and the 768-byte ML-KEM ciphertext.
+/// 1-byte [`PacketType::HandshakeResp`] prefix.
 ///
-/// Offset: `1 + 768 .. 1 + 768 + 32` = `769..801`.
+/// In native PQNoise, the ML-KEM ciphertext is placed in Flight 1 (Init),
+/// so Flight 2 begins immediately with the responder ephemeral public key $e_r$
+/// at offset 1..33.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "exported for wire witnesses and tests")
 )]
-pub const RESP_EPHEMERAL_OFFSET: usize = 1 + yip_crypto::PQ_CIPHERTEXT_LEN;
+pub const RESP_EPHEMERAL_OFFSET: usize = 1;
 
 #[cfg_attr(
     not(test),
