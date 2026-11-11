@@ -35,7 +35,7 @@ By eliminating `snow` and utilizing BLAKE3's native keyed PRF and Extendable Out
 
 ### 3.1 State Representation
 
-The state machine is implemented without dynamic dispatch or trait objects:
+The state machine is implemented without dynamic dispatch or trait objects. To preserve stack efficiency across concurrent tasks, the 1,632-byte ML-KEM-512 decapsulation key (`dk`) is passed directly into `read_message_1` as a reference (`&[u8; 1632]`) rather than stored inside `HandshakeState`:
 
 ```rust
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -61,10 +61,13 @@ pub struct HandshakeState {
 
 ### 3.2 BLAKE3 Keyed XOF Ratchet with Domain Separation
 
-Because BLAKE3 XOF outputs are prefix-compatible, shorter outputs are exact prefixes of longer outputs. To maintain dual-PRF security and prevent key reuse across 64-byte and 96-byte derivations, the state machine prepends an explicit 1-byte operational domain tag to the input key material before hashing:
+Because BLAKE3 XOF outputs are prefix-compatible, shorter outputs are exact prefixes of longer outputs. To maintain dual-PRF security and prevent key reuse across 64-byte, 96-byte, and 32-byte derivations, the state machine prepends an explicit 1-byte operational domain tag to the input key material before hashing:
 - `0x01`: `MixKey` (emits 64 bytes: 32 B chaining key `ck'`, 32 B AEAD cipher key `k`)
 - `0x02`: `MixKeyAndHash` (emits 96 bytes: 32 B chaining key `ck'`, 32 B transcript update `temp_h`, 32 B AEAD cipher key `k`)
 - `0x03`: `Split` (emits 64 bytes: 32 B initiator-to-responder transport key, 32 B responder-to-initiator transport key)
+- `0x04`: `Rekey` (emits 32 bytes: 32 B next transport AEAD key for 120s forward-secrecy epoch rotation)
+
+All stack-allocated intermediate key output buffers are explicitly zeroized prior to returning from the call:
 
 ```rust
 impl SymmetricState {
@@ -93,6 +96,7 @@ impl SymmetricState {
         self.ck.copy_from_slice(&out[0..32]);
         let mut k = [0u8; 32];
         k.copy_from_slice(&out[32..64]);
+        out.zeroize();
         k
     }
 
@@ -104,10 +108,14 @@ impl SymmetricState {
         hasher.finalize_xof().fill(&mut out);
 
         self.ck.copy_from_slice(&out[0..32]);
-        let temp_h = &out[32..64];
-        self.mix_hash(temp_h);
+        let mut temp_h = [0u8; 32];
+        temp_h.copy_from_slice(&out[32..64]);
+        self.mix_hash(&temp_h);
+        temp_h.zeroize();
+
         let mut k = [0u8; 32];
         k.copy_from_slice(&out[64..96]);
+        out.zeroize();
         k
     }
 
@@ -121,7 +129,16 @@ impl SymmetricState {
         let mut k_recv = [0u8; 32];
         k_send.copy_from_slice(&out[0..32]);
         k_recv.copy_from_slice(&out[32..64]);
+        out.zeroize();
         (k_send, k_recv)
+    }
+
+    pub fn rekey(current_key: &[u8; 32]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_keyed(current_key);
+        hasher.update(&[0x04]);
+        let mut next_key = [0u8; 32];
+        hasher.finalize_xof().fill(&mut next_key);
+        next_key
     }
 }
 ```
@@ -144,24 +161,24 @@ PQNoise_IKpsk2_25519_MLKEM512_ChaChaPoly_BLAKE3
 ### 4.2 Message Flight 1 (Initiator $\rightarrow$ Responder)
 Pattern: `-> e, es, s, ss, skem, payload`
 1. `e`: Initiator generates ephemeral X25519 keypair $e_i$. Writes $e_i.\text{public}$ (32 B). `MixHash(&e_i.public)`.
-2. `es`: Computes $\text{X25519}(e_i.\text{secret}, rs_{\text{X25519}})$. `k_1 = MixKey(&dh_es)`.
-3. `s`: Encrypts $s_i.\text{public}$ with $k_1$ using `ChaCha20Poly1305`. Writes 48 bytes (32 B ciphertext + 16 B MAC). `MixHash(enc_s)`.
-4. `ss`: Computes $\text{X25519}(s_i.\text{secret}, rs_{\text{X25519}})$. `k_2 = MixKey(&dh_ss)`.
-5. `skem`: Encapsulates against $rs_{\text{MLKEM512\_EK}}$, producing $(ct_{\text{KEM}}\,[768\text{ B}], ss_{\text{KEM}}\,[32\text{ B}])$. Writes $ct_{\text{KEM}}$ (768 B). `MixHash(&ct_KEM)`. `k_3 = MixKey(&ss_KEM)`.
-6. `payload`: Encrypts optional application handshake payload with $k_3$. Writes ciphertext + 16 B Poly1305 MAC.
+2. `es`: Computes $\text{X25519}(e_i.\text{secret}, rs_{\text{X25519}})$. Enforces constant-time non-zero check via `subtle::ConstantTimeEq` (rejects all-zeros). `k_1 = MixKey(&dh_es)`. Zeroizes `dh_es`.
+3. `s`: Encrypts $s_i.\text{public}$ with $k_1$ using `ChaCha20Poly1305` (`ad = h`). Writes 48 bytes (32 B ciphertext + 16 B MAC). `MixHash(enc_s)`.
+4. `ss`: Computes $\text{X25519}(s_i.\text{secret}, rs_{\text{X25519}})$. Enforces constant-time non-zero check. `k_2 = MixKey(&dh_ss)`. Zeroizes `dh_ss`.
+5. `skem`: Encapsulates against $rs_{\text{MLKEM512\_EK}}$, producing $(ct_{\text{KEM}}\,[768\text{ B}], ss_{\text{KEM}}\,[32\text{ B}])$. Writes $ct_{\text{KEM}}$ in plaintext (768 B). `MixHash(&ct_KEM)`. `k_3 = MixKey(&ss_KEM)`. Zeroizes `ss_KEM`.
+6. `payload`: Mandatory authenticated AEAD envelope under $k_3$ with `ad = h`. Even when application payload is 0 bytes, this step writes at least a 16-byte Poly1305 MAC, ensuring `ct_KEM` and `ss_KEM` are cryptographically authenticated before the Responder commits state.
 
-*Flight 1 Framing Overhead*: $32 + 48 + 768 + 16 = 864$ bytes base cryptographic overhead.
+*Flight 1 Framing Overhead*: $32\text{ B } (e) + 48\text{ B } (s) + 768\text{ B } (ct) + 16\text{ B } (\text{MAC}) = 864$ bytes base cryptographic overhead.
 
 ### 4.3 Message Flight 2 (Responder $\rightarrow$ Initiator & Split)
 Pattern: `<- e, ee, se, psk, payload`
 1. `e`: Responder generates ephemeral X25519 keypair $e_r$. Writes $e_r.\text{public}$ (32 B). `MixHash(&e_r.public)`.
-2. `ee`: Computes $\text{X25519}(e_r.\text{secret}, e_i.\text{public})$. `k_4 = MixKey(&dh_ee)`.
-3. `se`: Computes $\text{X25519}(s_r.\text{secret}, e_i.\text{public})$. `k_5 = MixKey(&dh_se)`.
+2. `ee`: Computes $\text{X25519}(e_r.\text{secret}, e_i.\text{public})$. Enforces constant-time non-zero check. `k_4 = MixKey(&dh_ee)`. Zeroizes `dh_ee`.
+3. `se`: Computes $\text{X25519}(s_r.\text{secret}, e_i.\text{public})$. Enforces constant-time non-zero check. `k_5 = MixKey(&dh_se)`. Zeroizes `dh_se`.
 4. `psk`: `k_6 = MixKeyAndHash(&psk)`.
-5. `payload`: Encrypts handshake payload with $k_6$. Writes ciphertext + 16 B Poly1305 MAC.
+5. `payload`: Encrypts handshake payload with $k_6$ (`ad = h`). Writes ciphertext + 16 B Poly1305 MAC.
 6. `Split()`: Invokes `symmetric.split()` to emit directional 32-byte transport AEAD keys.
 
-*Flight 2 Framing Overhead*: $32 + 16 = 48$ bytes base cryptographic overhead.
+*Flight 2 Framing Overhead*: $32\text{ B } (e) + 16\text{ B } (\text{MAC}) = 48$ bytes base cryptographic overhead.
 
 ---
 
@@ -223,6 +240,8 @@ pub fn derive_overlay_ipv6(public_key: &[u8; 32]) -> std::net::Ipv6Addr {
    - Create `crates/yip-crypto/tests/pqnoise_vectors.rs` testing known static keys, ephemeral keys, and PSKs against recorded hex dumps of `ck`, `h`, and split keys.
 2. **Replay & Corruption Tests**:
    - Ensure corrupted ML-KEM-512 ciphertexts or modified Flight 1 payloads trigger Poly1305 MAC failure and abort the handshake with zero state leakage.
+   - Enforce atomic Responder verification: `read_message_1` verifies static key authorization and payload MAC before committing any state to long-lived session stores. On failure, all intermediate state is wiped via `zeroize`.
+   - Validate constant-time rejection of all-zero Diffie-Hellman outputs (`ct_eq(&[0u8; 32])`) on low-order point attacks.
 3. **Address Derivation Compatibility**:
    - Update address derivation unit tests and shell integration scripts (`run-netns-registration-hijack.sh`) to the v2 context strings and expected hashes.
 4. **CI Gates**:
