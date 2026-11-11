@@ -98,7 +98,7 @@ pub fn classify_first_frame_at(
         let Message::RegisterAuth { node, counter, mac } = msg else {
             return Classify::Decoy;
         };
-        if !yip_rendezvous::verify_register_mac(obf_key, &node, counter, &mac) {
+        if !yip_rendezvous::verify_register_auth_mac(obf_key, &node, counter, &mac) {
             return Classify::Decoy;
         }
         if !server.register_if_fresh_tls(node, counter, now_ms) {
@@ -298,7 +298,7 @@ mod tests {
     use yip_rendezvous::{node_id, Message};
 
     fn framed_register_auth(obf_key: &[u8; 16], node: NodeId, counter: u64) -> Vec<u8> {
-        let mac = yip_rendezvous::compute_register_mac(obf_key, &node, counter);
+        let mac = yip_rendezvous::compute_register_auth_mac(obf_key, &node, counter);
         crate::frame_obf(obf_key, &Message::RegisterAuth { node, counter, mac })
     }
 
@@ -751,7 +751,7 @@ mod tests {
         let key = yip_obf::derive_key(b"test-obf-psk");
         let node = node_id(&[1u8; 32]);
         let counter = 100u64;
-        let mac = yip_rendezvous::compute_register_mac(&key, &node, counter);
+        let mac = yip_rendezvous::compute_register_auth_mac(&key, &node, counter);
         let mut s = RendezvousServer::new(0);
 
         let frame = crate::frame_obf(&key, &Message::RegisterAuth { node, counter, mac });
@@ -813,7 +813,7 @@ mod tests {
         let key = yip_obf::derive_key(b"test-obf-psk");
         let node = node_id(&[1u8; 32]);
         let counter = 100u64;
-        let mac = yip_rendezvous::compute_register_mac(&key, &node, counter);
+        let mac = yip_rendezvous::compute_register_auth_mac(&key, &node, counter);
         let mut s = RendezvousServer::new(0);
 
         let frame = crate::frame_obf(&key, &Message::RegisterAuth { node, counter, mac });

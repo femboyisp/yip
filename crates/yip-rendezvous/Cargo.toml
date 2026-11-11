@@ -13,7 +13,6 @@ rust-version.workspace = true
 description = "Blind rendezvous protocol, STUN NAT traversal classification, and relay signaling for yip"
 
 [dependencies]
-blake2 = { workspace = true }
 blake3 = { workspace = true }
 subtle = "2.6.1"
 yip-membership = { workspace = true }

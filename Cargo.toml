@@ -26,14 +26,13 @@ yip-obf = { version = "0.1.0", path = "crates/yip-obf" }
 yip-utls = { version = "0.1.0", path = "crates/yip-utls" }
 yip-ca = { version = "0.1.0", path = "bin/yip-ca" }
 
-blake2 = "=0.10.6"
 blake3 = { version = "1.8", default-features = false, features = ["zeroize"] }
 subtle = "2.6"
 thiserror = "2.0.9"
 tracing = "0.1.41"
 
 [workspace.metadata.cargo-shear]
-ignored = ["tracing", "blake3", "subtle"]
+ignored = ["tracing"]
 
 [workspace.lints.clippy]
 allow_attributes = "warn"

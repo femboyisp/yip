@@ -100,7 +100,7 @@ impl Counter {
 
 /// Build the framed `[u16 len][obf(RDV_TYPE, RegisterAuth{node,counter,mac})]` bytes.
 pub(crate) fn build_register(obf_key: &[u8; 16], node: NodeId, counter: u64) -> Vec<u8> {
-    let mac = yip_rendezvous::compute_register_mac(obf_key, &node, counter);
+    let mac = yip_rendezvous::compute_register_auth_mac(obf_key, &node, counter);
     let mut plain = Vec::new();
     encode(&Message::RegisterAuth { node, counter, mac }, &mut plain);
     let env = yip_obf::obfuscate(obf_key, yip_obf::RDV_TYPE, &plain, 0)
@@ -845,7 +845,7 @@ mod tests {
         let (pt, body) = yip_obf::deobfuscate(&key, env).expect("deobfuscates");
         assert_eq!(pt, yip_obf::RDV_TYPE);
         let msg = yip_rendezvous::decode(&body);
-        let mac = yip_rendezvous::compute_register_mac(&key, &node, 1);
+        let mac = yip_rendezvous::compute_register_auth_mac(&key, &node, 1);
         assert_eq!(
             msg,
             Some(yip_rendezvous::Message::RegisterAuth {
@@ -922,7 +922,7 @@ mod tests {
         let env = r.next().unwrap().unwrap();
         let (pt, body) = yip_obf::deobfuscate(&key, &env).unwrap();
         assert_eq!(pt, yip_obf::RDV_TYPE);
-        let mac = yip_rendezvous::compute_register_mac(&key, &node, 42);
+        let mac = yip_rendezvous::compute_register_auth_mac(&key, &node, 42);
         assert_eq!(
             yip_rendezvous::decode(&body),
             Some(yip_rendezvous::Message::RegisterAuth {
@@ -1124,7 +1124,7 @@ mod tests {
                 Some(yip_rendezvous::Message::RegisterAuth { node, counter, mac }) => {
                     assert_eq!(node, self_node);
                     assert!(counter > 0, "seeded counter must be positive");
-                    assert!(yip_rendezvous::verify_register_mac(
+                    assert!(yip_rendezvous::verify_register_auth_mac(
                         &obf_key, &node, counter, &mac
                     ));
                 }

@@ -13,7 +13,7 @@ rust-version.workspace = true
 description = "Cryptographic membership certificates, RootSets, and epidemic gossip protocol records for yip"
 
 [dependencies]
-blake2 = { workspace = true }
+blake3 = { workspace = true }
 ed25519-dalek = { version = "3", default-features = false }
 
 [package.metadata.docs.rs]

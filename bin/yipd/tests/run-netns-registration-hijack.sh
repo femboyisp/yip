@@ -81,12 +81,11 @@
 # the wire, BOTH before and after the attack. If the forged Register had been
 # accepted, A's directory entry would now point at S's address; assertion (a)
 # below is that the reflexive address is IDENTICAL (still A's real
-# `IP_A:PORT`) across the attack. `hashlib.blake2s(..., digest_size=16)` is
+# `IP_A:PORT`) across the attack. BLAKE3 key derivation is
 # confirmed bit-for-bit equal to `crates/yip-rendezvous/src/proto.rs`'s
-# `Blake2sVar::new(16)` node-id derivation (both are standard-compliant
-# BLAKE2s with the digest length folded into the parameter block) --
-# verified directly against the crate's own `node_id_is_deterministic_and_
-# 16_bytes` fixture before this script was written.
+# `derive_node_id` node-id derivation --
+# verified directly against the crate's own `test_blake3_node_id_kat`
+# fixture before this script was written.
 #
 # ── obfuscation deliberately OFF ──
 # Same reasoning as run-netns-replay-hijack.sh: the attack and probe scripts
@@ -418,7 +417,64 @@ import ssl
 import struct
 import sys
 
-DOMAIN = b"yip-rdv-v1"
+IV = [
+    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+    0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+]
+
+MSG_PERMUTATION = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8]
+
+
+def blake3_rotr32(w, b):
+    return ((w >> b) | (w << (32 - b))) & 0xFFFFFFFF
+
+
+def blake3_g(v, a, b, c, d, mx, my):
+    v[a] = (v[a] + v[b] + mx) & 0xFFFFFFFF
+    v[d] = blake3_rotr32(v[d] ^ v[a], 16)
+    v[c] = (v[c] + v[d]) & 0xFFFFFFFF
+    v[b] = blake3_rotr32(v[b] ^ v[c], 12)
+    v[a] = (v[a] + v[b] + my) & 0xFFFFFFFF
+    v[d] = blake3_rotr32(v[d] ^ v[a], 8)
+    v[c] = (v[c] + v[d]) & 0xFFFFFFFF
+    v[b] = blake3_rotr32(v[b] ^ v[c], 7)
+
+
+def blake3_round(v, m):
+    blake3_g(v, 0, 4, 8, 12, m[0], m[1])
+    blake3_g(v, 1, 5, 9, 13, m[2], m[3])
+    blake3_g(v, 2, 6, 10, 14, m[4], m[5])
+    blake3_g(v, 3, 7, 11, 15, m[6], m[7])
+    blake3_g(v, 0, 5, 10, 15, m[8], m[9])
+    blake3_g(v, 1, 6, 11, 12, m[10], m[11])
+    blake3_g(v, 2, 7, 8, 13, m[12], m[13])
+    blake3_g(v, 3, 4, 9, 14, m[14], m[15])
+
+
+def blake3_compress(cv, block, block_len, counter, flags):
+    m = list(struct.unpack("<16I", block.ljust(64, b"\x00")))
+    v = list(cv) + [
+        IV[0], IV[1], IV[2], IV[3],
+        counter & 0xFFFFFFFF, (counter >> 32) & 0xFFFFFFFF,
+        block_len, flags,
+    ]
+    for _ in range(7):
+        blake3_round(v, m)
+        m = [m[i] for i in MSG_PERMUTATION]
+    return [v[i] ^ v[i + 8] for i in range(8)]
+
+
+def blake3_derive_key(context: str, material: bytes) -> bytes:
+    try:
+        import blake3
+        return blake3.blake3(material, derive_key_context=context).digest()
+    except ImportError:
+        ctx_bytes = context.encode("utf-8")
+        flags1 = 0x01 | 0x02 | 0x08 | 0x20
+        ctx_cv = blake3_compress(IV, ctx_bytes, len(ctx_bytes), 0, flags1)
+        flags2 = 0x01 | 0x02 | 0x08 | 0x40 | 0x10
+        mat_cv = blake3_compress(ctx_cv, material, len(material), 0, flags2)
+        return struct.pack("<8I", *mat_cv)
 
 
 def rotl(x, b):
@@ -473,10 +529,7 @@ def siphash24(k, msg):
 
 
 def derive_key(psk):
-    h = hashlib.blake2s(digest_size=16)
-    h.update(b"yip-obf-v1")
-    h.update(psk)
-    return h.digest()
+    return blake3_derive_key("yip-obf-v1", psk)[:16]
 
 
 def keystream(key, nonce, n):
@@ -500,10 +553,7 @@ def obfuscate(key, ptype, body, nonce):
 def node_id_hex(pubkey_hex):
     pk = bytes.fromhex(pubkey_hex)
     assert len(pk) == 32, f"pubkey must be 32 bytes, got {len(pk)}"
-    h = hashlib.blake2s(digest_size=16)
-    h.update(DOMAIN)
-    h.update(pk)
-    return h.hexdigest()
+    return blake3_derive_key("yip-v2-rendezvous-node-id", pk)[:16].hex()
 
 
 def cmd_nodeid(argv):
