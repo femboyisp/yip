@@ -17,8 +17,11 @@ use ring::rand::{SecureRandom, SystemRandom};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
+use crate::session::{Session, SessionPair};
 use crate::symmetric::SymmetricState;
-use crate::{pq_encapsulate, CryptoError, PqEncapsKey, Session, PQ_ENCAPS_KEY_LEN};
+use crate::{
+    pq_encapsulate, pq_encapsulate_deterministic, CryptoError, PqEncapsKey, PQ_ENCAPS_KEY_LEN,
+};
 
 /// Protocol identifier string.
 pub const PROTOCOL_NAME: &[u8] = b"PQNoise_IKpsk2_25519_MLKEM512_ChaChaPoly_BLAKE3";
@@ -104,6 +107,7 @@ pub struct InitiatorHandshake {
     psk: [u8; 32],
     symmetric: SymmetricState,
     ephemeral_private: Option<[u8; 32]>,
+    flight_1_keys: Option<([u8; 32], [u8; 32], [u8; 32])>,
     state: InitiatorState,
     transport_keys: Option<([u8; 32], [u8; 32])>,
 }
@@ -141,6 +145,7 @@ impl InitiatorHandshake {
             psk: *psk,
             symmetric,
             ephemeral_private: None,
+            flight_1_keys: None,
             state: InitiatorState::ReadyToWrite1,
             transport_keys: None,
         })
@@ -152,6 +157,11 @@ impl InitiatorHandshake {
         self.psk.zeroize();
         if let Some(mut eph) = self.ephemeral_private.take() {
             eph.zeroize();
+        }
+        if let Some((mut k1, mut k2, mut k3)) = self.flight_1_keys.take() {
+            k1.zeroize();
+            k2.zeroize();
+            k3.zeroize();
         }
         if let Some((mut k1, mut k2)) = self.transport_keys.take() {
             k1.zeroize();
@@ -170,6 +180,25 @@ impl InitiatorHandshake {
         payload: &[u8],
         out: &mut [u8],
     ) -> Result<usize, CryptoError> {
+        let rng = SystemRandom::new();
+        let mut eph_priv = [0u8; 32];
+        if rng.fill(&mut eph_priv).is_err() {
+            self.abort();
+            return Err(CryptoError::Handshake);
+        }
+        self.write_message_1_with_ephemeral(payload, out, eph_priv, None)
+    }
+
+    /// Produce Flight 1 handshake message using explicit ephemeral private key and optional KEM seed.
+    ///
+    /// Used for deterministic test vector generation and verification.
+    pub fn write_message_1_with_ephemeral(
+        &mut self,
+        payload: &[u8],
+        out: &mut [u8],
+        eph_priv: [u8; 32],
+        kem_seed: Option<[u8; 32]>,
+    ) -> Result<usize, CryptoError> {
         if self.state != InitiatorState::ReadyToWrite1 {
             return Err(CryptoError::Handshake);
         }
@@ -181,24 +210,19 @@ impl InitiatorHandshake {
             return Err(CryptoError::Handshake);
         }
 
-        // 1. Generate ephemeral keypair e_i
-        let rng = SystemRandom::new();
-        let mut eph_priv = [0u8; 32];
-        if rng.fill(&mut eph_priv).is_err() {
-            self.abort();
-            return Err(CryptoError::Handshake);
-        }
-        let eph_secret = x25519_dalek::StaticSecret::from(eph_priv);
+        // 1. Process ephemeral keypair e_i
+        let mut eph_priv_buf = eph_priv;
+        let eph_secret = x25519_dalek::StaticSecret::from(eph_priv_buf);
         let eph_pub = x25519_dalek::PublicKey::from(&eph_secret).to_bytes();
 
         out[0..32].copy_from_slice(&eph_pub);
         self.symmetric.mix_hash(&eph_pub);
 
         // 2. es: DH(e_i, rs_x25519)
-        let mut dh_es = match constant_time_dh(&eph_priv, &self.remote_static) {
+        let mut dh_es = match constant_time_dh(&eph_priv_buf, &self.remote_static) {
             Ok(dh) => dh,
             Err(e) => {
-                eph_priv.zeroize();
+                eph_priv_buf.zeroize();
                 self.abort();
                 return Err(e);
             }
@@ -211,10 +235,11 @@ impl InitiatorHandshake {
         let mut s_tag = [0u8; 16];
         if let Err(e) = encrypt_and_tag(&k_1, &self.symmetric.h, &mut s_buf, &mut s_tag) {
             k_1.zeroize();
-            eph_priv.zeroize();
+            eph_priv_buf.zeroize();
             self.abort();
             return Err(e);
         }
+        let k_1_copy = k_1;
         k_1.zeroize();
         out[32..64].copy_from_slice(&s_buf);
         out[64..80].copy_from_slice(&s_tag);
@@ -224,29 +249,42 @@ impl InitiatorHandshake {
         let mut dh_ss = match constant_time_dh(&self.static_private, &self.remote_static) {
             Ok(dh) => dh,
             Err(e) => {
-                eph_priv.zeroize();
+                eph_priv_buf.zeroize();
                 self.abort();
                 return Err(e);
             }
         };
         let mut k_2 = self.symmetric.mix_key(&dh_ss);
         dh_ss.zeroize();
+        let k_2_copy = k_2;
         k_2.zeroize();
 
         // 5. skem: Encapsulate against rs_mlkem512
-        let (pq_ct, pq_ss) = match pq_encapsulate(&PqEncapsKey(self.remote_pq_ek)) {
-            Ok(res) => res,
-            Err(e) => {
-                eph_priv.zeroize();
-                self.abort();
-                return Err(e);
-            }
+        let ek = PqEncapsKey(self.remote_pq_ek);
+        let (pq_ct, pq_ss) = match kem_seed {
+            Some(m) => match pq_encapsulate_deterministic(&ek, &m) {
+                Ok(res) => res,
+                Err(e) => {
+                    eph_priv_buf.zeroize();
+                    self.abort();
+                    return Err(e);
+                }
+            },
+            None => match pq_encapsulate(&ek) {
+                Ok(res) => res,
+                Err(e) => {
+                    eph_priv_buf.zeroize();
+                    self.abort();
+                    return Err(e);
+                }
+            },
         };
         out[80..848].copy_from_slice(&pq_ct.0);
         self.symmetric.mix_hash(&pq_ct.0);
         let mut ss_kem = *pq_ss;
         let mut k_3 = self.symmetric.mix_key(&ss_kem);
         ss_kem.zeroize();
+        let k_3_copy = k_3;
 
         // 6. payload: Encrypt application payload with k_3 (ad = h)
         let payload_offset = 848;
@@ -261,7 +299,7 @@ impl InitiatorHandshake {
             &mut payload_tag,
         ) {
             k_3.zeroize();
-            eph_priv.zeroize();
+            eph_priv_buf.zeroize();
             self.abort();
             return Err(e);
         }
@@ -269,7 +307,8 @@ impl InitiatorHandshake {
         out[payload_end..tag_end].copy_from_slice(&payload_tag);
         self.symmetric.mix_hash(&out[payload_offset..tag_end]);
 
-        self.ephemeral_private = Some(eph_priv);
+        self.flight_1_keys = Some((k_1_copy, k_2_copy, k_3_copy));
+        self.ephemeral_private = Some(eph_priv_buf);
         self.state = InitiatorState::ReadyToRead2;
         Ok(total_len)
     }
@@ -395,13 +434,34 @@ impl InitiatorHandshake {
         Some(self.remote_static)
     }
 
-    /// Convert completed handshake into an AEAD [`Session`].
-    pub fn into_session(self) -> Result<Session, CryptoError> {
+    /// Returns whether the handshake has completed and transport keys are ready.
+    pub fn is_finished(&self) -> bool {
+        self.state == InitiatorState::Completed
+    }
+
+    /// Access intermediate flight 1 cipher keys (k1, k2, k3) if flight 1 has been written.
+    pub fn flight_1_keys(&self) -> Option<([u8; 32], [u8; 32], [u8; 32])> {
+        self.flight_1_keys
+    }
+
+    /// Access the underlying symmetric state machine.
+    pub fn symmetric_state(&self) -> &SymmetricState {
+        &self.symmetric
+    }
+
+    /// Convert completed handshake into an established [`SessionPair`].
+    pub fn into_session_pair(self) -> Result<SessionPair, CryptoError> {
         let (mut k_send, mut k_recv) = self.transport_keys()?;
-        let session = Session::from_raw_keys(&k_send, &k_recv, 0, 1);
+        let pair = SessionPair::from_raw_keys(&k_send, &k_recv);
         k_send.zeroize();
         k_recv.zeroize();
-        session
+        Ok(pair)
+    }
+
+    /// Convert completed handshake into an AEAD [`Session`].
+    pub fn into_session(self) -> Result<Session, CryptoError> {
+        let pair = self.into_session_pair()?;
+        Ok(pair.into_session(0, 1))
     }
 }
 
@@ -606,6 +666,24 @@ impl ResponderHandshake {
         payload: &[u8],
         out: &mut [u8],
     ) -> Result<usize, CryptoError> {
+        let rng = SystemRandom::new();
+        let mut eph_priv = [0u8; 32];
+        if rng.fill(&mut eph_priv).is_err() {
+            self.abort();
+            return Err(CryptoError::Handshake);
+        }
+        self.write_message_2_with_ephemeral(payload, out, eph_priv)
+    }
+
+    /// Produce Flight 2 handshake message into `out` with an explicit ephemeral private key.
+    ///
+    /// Used for deterministic test vector generation and verification.
+    pub fn write_message_2_with_ephemeral(
+        &mut self,
+        payload: &[u8],
+        out: &mut [u8],
+        eph_priv: [u8; 32],
+    ) -> Result<usize, CryptoError> {
         if self.state != ResponderState::ReadyToWrite2 {
             return Err(CryptoError::Handshake);
         }
@@ -633,24 +711,19 @@ impl ResponderHandshake {
             }
         };
 
-        // 1. Generate ephemeral keypair e_r
-        let rng = SystemRandom::new();
-        let mut eph_priv = [0u8; 32];
-        if rng.fill(&mut eph_priv).is_err() {
-            self.abort();
-            return Err(CryptoError::Handshake);
-        }
-        let eph_secret = x25519_dalek::StaticSecret::from(eph_priv);
+        // 1. Process ephemeral keypair e_r
+        let mut eph_priv_buf = eph_priv;
+        let eph_secret = x25519_dalek::StaticSecret::from(eph_priv_buf);
         let eph_pub = x25519_dalek::PublicKey::from(&eph_secret).to_bytes();
 
         out[0..32].copy_from_slice(&eph_pub);
         self.symmetric.mix_hash(&eph_pub);
 
         // 2. ee: DH(e_r, e_i)
-        let mut dh_ee = match constant_time_dh(&eph_priv, &e_i) {
+        let mut dh_ee = match constant_time_dh(&eph_priv_buf, &e_i) {
             Ok(dh) => dh,
             Err(e) => {
-                eph_priv.zeroize();
+                eph_priv_buf.zeroize();
                 self.abort();
                 return Err(e);
             }
@@ -660,15 +733,15 @@ impl ResponderHandshake {
         k_4.zeroize();
 
         // 3. se: DH(e_r, s_i)
-        let mut dh_se = match constant_time_dh(&eph_priv, &remote_static) {
+        let mut dh_se = match constant_time_dh(&eph_priv_buf, &remote_static) {
             Ok(dh) => dh,
             Err(e) => {
-                eph_priv.zeroize();
+                eph_priv_buf.zeroize();
                 self.abort();
                 return Err(e);
             }
         };
-        eph_priv.zeroize();
+        eph_priv_buf.zeroize();
         let mut k_5 = self.symmetric.mix_key(&dh_se);
         dh_se.zeroize();
         k_5.zeroize();
@@ -737,12 +810,28 @@ impl ResponderHandshake {
         self.remote_static
     }
 
-    /// Convert completed handshake into an AEAD [`Session`].
-    pub fn into_session(self) -> Result<Session, CryptoError> {
+    /// Returns whether the handshake has completed and transport keys are ready.
+    pub fn is_finished(&self) -> bool {
+        self.state == ResponderState::Completed
+    }
+
+    /// Access the underlying symmetric state machine.
+    pub fn symmetric_state(&self) -> &SymmetricState {
+        &self.symmetric
+    }
+
+    /// Convert completed handshake into an established [`SessionPair`].
+    pub fn into_session_pair(self) -> Result<SessionPair, CryptoError> {
         let (mut k_send, mut k_recv) = self.transport_keys()?;
-        let session = Session::from_raw_keys(&k_send, &k_recv, 0, 1);
+        let pair = SessionPair::from_raw_keys(&k_send, &k_recv);
         k_send.zeroize();
         k_recv.zeroize();
-        session
+        Ok(pair)
+    }
+
+    /// Convert completed handshake into an AEAD [`Session`].
+    pub fn into_session(self) -> Result<Session, CryptoError> {
+        let pair = self.into_session_pair()?;
+        Ok(pair.into_session(0, 1))
     }
 }
