@@ -454,7 +454,7 @@ def generate_wire_format_svg() -> str:
     canvas.text(638.0, 454.0, "Cryptographic Node Addressing", fill=COLOR_TEXT_MAIN, font_size=13.0, font_weight="700")
     canvas.text(546.0, 474.0, "Self-Certifying IPv6 ULA (fd00::/8) • Zero Central Authority", fill=COLOR_TEXT_MUTED, font_size=10.5)
 
-    # Flow pipeline: Step 1 (Keypair) -> Step 2 (BLAKE2s) -> Step 3 (IPv6 Address)
+    # Flow pipeline: Step 1 (Keypair) -> Step 2 (BLAKE3) -> Step 3 (IPv6 Address)
     flow_y = 492.0
     # Box 1: Node Keypair
     canvas.rect(546.0, flow_y, 126.0, 44.0, rx=4.0, fill=COLOR_NOISE_BG, stroke=COLOR_NOISE_LIGHT, stroke_width=1.0)

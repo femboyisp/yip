@@ -481,11 +481,11 @@ impl PeerManager {
     /// only the rotation is denied, and `drive_rekey_schedule` starts a
     /// fresh rekey attempt next interval. The clean fix would be to `clone`
     /// `rk.hs`, try `read_response` on the clone, and only `take()`/clear
-    /// `rekey` on success — but `snow::HandshakeState` (which
+    /// `rekey` on success — but `InitiatorHandshake` (which
     /// `yip_crypto::Handshake`/`crate::handshake::HandshakeState` wrap) is
-    /// NOT `Clone` (it owns `Box<dyn Dh>`/`Box<dyn Random>` trait objects),
-    /// so that fix is not available without hand-rolling handshake state
-    /// duplication in `yip-crypto` — out of scope here. An off-path
+    /// intentionally consuming and non-Clone to prevent state-reuse attacks,
+    /// so that fix is not available without manual state rollback —
+    /// out of scope here. An off-path
     /// attacker that can spoof this peer's endpoint as `src` can therefore
     /// repeatedly deny rekey rotation (never break the tunnel); closing that
     /// rides with the #34 authenticated-endpoint work (verifying `src`
