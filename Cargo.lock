@@ -2499,9 +2499,6 @@ dependencies = [
 [[package]]
 name = "yip-transport"
 version = "0.1.0"
-dependencies = [
- "yip-wire",
-]
 
 [[package]]
 name = "yip-utls"

@@ -183,8 +183,8 @@ mod tests {
             "missing should be capped at MAX_NACK"
         );
         // Verify the first MAX_NACK values are correctly decoded
-        for i in 0..MAX_NACK {
-            assert_eq!(report.missing[i], u64::try_from(i).unwrap());
+        for (i, &val) in report.missing.iter().take(MAX_NACK).enumerate() {
+            assert_eq!(val, u64::try_from(i).unwrap());
         }
     }
 }
