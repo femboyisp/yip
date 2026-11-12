@@ -31,8 +31,8 @@ impl LossReport {
         bytes.extend_from_slice(&self.delivered_count.to_be_bytes());
         bytes.extend_from_slice(&self.high_counter.to_be_bytes());
         bytes.extend_from_slice(&u16::try_from(n_missing).unwrap().to_be_bytes());
-        for i in 0..n_missing {
-            bytes.extend_from_slice(&self.missing[i].to_be_bytes());
+        for item in self.missing.iter().take(n_missing) {
+            bytes.extend_from_slice(&item.to_be_bytes());
         }
         bytes
     }

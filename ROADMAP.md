@@ -6,6 +6,13 @@ maintainer.
 
 ## Done (merged, with integration tests on both I/O drivers)
 
+- **Zero-allocation PQNoise state machine & BLAKE3 migration (#200)** — replaced `snow`, `blake2` (v0.10.6),
+  `hkdf`, and `hmac` across the workspace with a native post-quantum Noise state machine
+  (`PQNoise_IKpsk2_25519_MLKEM512_ChaChaPoly_BLAKE3`), reducing handshake KDF compression invocations
+  from 87 down to 8 (10.9x reduction) and permutation work by 15.5x via single-pass BLAKE3 Keyed XOF
+  ratchets (`0x01` MixKey, `0x02` MixKeyAndHash, `0x03` Split, `0x04` Rekey). Zero heap allocations on the
+  handshake path, stack-based ML-KEM-512 decapsulation, standard Noise IK token semantics (`se` = $DH(s_i, e_r)$),
+  v2 BLAKE3 overlay IPv6 addressing (`fd00::/8`), and 128-bit BLAKE3 rendezvous registration authentication.
 - **eBPF XDP hardware offload & zero-copy packet telemetry (#186)** — real-time driver mode
   tuning (`ControlCmd::SetXdpMode`, `yip xdp set`) and zero-copy telemetry inspection
   (`ControlCmd::GetXdpStatus`, `yip xdp status`), exposing kernel Netlink and BPF attachment flags
@@ -35,7 +42,7 @@ maintainer.
   control socket (`yip-ctl`).
 - **Anti-DPI transports & verification panel** — 4 transport modes (`raw/obf`, `quic`, `tls`,
   `relay` Trojan front), REALITY TLS 1.3 browser mimicry with ML-KEM-768 hybrid key exchange,
-  authenticated relay discriminator (constant-time BLAKE2s-MAC), and an industry-standard
+  authenticated relay discriminator (constant-time BLAKE3-MAC), and an industry-standard
   4-engine DPI verification panel (nDPI, tshark, Suricata, Zeek) with CI gating.
 - **Session security & anti-replay** — ~120 s rekey with epoch overlap; per-epoch data-plane
   obfuscation key rotation; handshake anti-replay (TAI64N freshness gating); signed rendezvous

@@ -9,7 +9,6 @@ rust-version = "1.89.0"
 license = "AGPL-3.0-or-later"
 authors = ["FEMBOY CYBER NETWORKS LLC <security@femboy.is>"]
 repository = "https://github.com/femboyisp/yip"
-homepage = "https://github.com/femboyisp/yip"
 documentation = "https://docs.rs/yip-mesh"
 keywords = ["vpn", "mesh", "fec", "cryptography", "peer-to-peer"]
 categories = ["network-programming", "cryptography"]
@@ -29,10 +28,6 @@ yip-ca = { version = "0.1.0", path = "bin/yip-ca" }
 blake3 = { version = "1.8", default-features = false, features = ["zeroize"] }
 subtle = "2.6"
 thiserror = "2.0.9"
-tracing = "0.1.41"
-
-[workspace.metadata.cargo-shear]
-ignored = ["tracing"]
 
 [workspace.lints.clippy]
 allow_attributes = "warn"

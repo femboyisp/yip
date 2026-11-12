@@ -5,6 +5,10 @@ All notable changes to this project are documented here, following
 
 ## [Unreleased]
 
+### Changed
+- **Zero-allocation native PQNoise state machine and BLAKE3 migration (`crates/yip-crypto`, `bin/yipd`, `crates/yip-rendezvous`, `crates/yip-membership`, `crates/yip-obf`, #200).**
+  Completely purged `snow`, `blake2` (v0.10.6), `hkdf`, and `hmac` from the workspace. Replaced with a bespoke stack-allocated post-quantum Noise state machine (`PQNoise_IKpsk2_25519_MLKEM512_ChaChaPoly_BLAKE3`), collapsing key-derivation compression calls from 87 down to 8 (10.9x reduction) and permutation work by 15.5x per handshake via single-pass BLAKE3 Keyed XOF ratchets (`0x01` MixKey, `0x02` MixKeyAndHash, `0x03` Split, `0x04` Rekey). Operates with zero dynamic heap allocations on the handshake hot path, referencing the 1,632-byte ML-KEM-512 decapsulation key directly on the stack. Enforces standard Noise IK token semantics (`se` = $DH(s_i, e_r)$), exact framing overheads (Flight 1 base 864 bytes; Flight 2 base 48 bytes), constant-time low-order point rejection, FIPS 203 Section 7.2 modulus validation, and strict zeroization of intermediate secrets. Migrated self-certifying IPv6 overlay addressing (`fd00::/8`) to `blake3::derive_key("yip-v2-overlay-ipv6-addr", pubkey)` and rendezvous node identity/MACs to BLAKE3.
+
 ### Fixed
 - **Mutation testing suite resilience and zero-timeout bounded linear probing (`crates/yip-transport`, `.cargo/mutants.toml`).**
   Eliminated all 37 surviving mutants and 9 linear-probe timeouts in `crates/yip-transport`. Replaced unbounded search loops in `ObjectTable::find_index`, `insert`, and `remove` with bounded slot-capacity traversals, preventing infinite loops on mutated probe increments. Added unit test suites covering `AdaptiveController` ratio accessors, `Transport` symbol and unrecoverable drop metrics, exact `hash_key` golden output vectors, duplicate-key replacements, and backward-shift wrap-around probe deletion across slot 0 boundaries. Formally documented and excluded equivalent mutants in Reed-Solomon missing source reconstruction and FEC reassembler wire shard sizing in `.cargo/mutants.toml`.

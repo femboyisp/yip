@@ -182,43 +182,38 @@ The Initiator extracts `ct` prior to decrypting Message 2's AEAD envelope, execu
 
 Handshake packets are designed to fit strictly within the MTU budget (`OBF_MTU_BUDGET = 1,200` bytes) to prevent IP fragmentation on paths with restricted MTUs:
 
-#### Message 1 (Initiator $\to$ Responder): 1,028 Bytes Total
+#### Message 1 (Initiator $\to$ Responder): 864 Bytes Base (~1,028 Bytes with Certificate)
 
 ```
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       Wire Header (4 B)                       |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                                                               |
-+                 ML-KEM-512 Encapsulation Key                  +
-|                          ek_A (800 B)                         |
-|                                                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|       Packet Type (1 B)       |                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
 |                 Noise Ephemeral Public Key e_A (32 B)         |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|       Encrypted Static Public Key s_A + CA Certificate        |
-|                  + Poly1305 AEAD Tag (144 B)                  |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-```
-
-#### Message 2 (Responder $\to$ Initiator): 948 Bytes Total
-
-```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       Wire Header (4 B)                       |
+|       Encrypted Static Public Key s_A + Poly1305 Tag (48 B)   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                                                               |
 +                   ML-KEM-512 Ciphertext                       +
 |                          ct (768 B)                           |
 |                                                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|       Encrypted Payload (Admission Cert) + Poly1305 (16+ B)   |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+#### Message 2 (Responder $\to$ Initiator): 48 Bytes Base (~212 Bytes with Certificate)
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|       Packet Type (1 B)       |                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
 |                 Noise Ephemeral Public Key e_B (32 B)         |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|            Encrypted Responder CA Certificate                 |
-|                  + Poly1305 AEAD Tag (144 B)                  |
+|       Encrypted Payload (Responder Cert) + Poly1305 (16+ B)   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
@@ -748,7 +743,7 @@ To defeat packet replay attacks across high-speed connections, `crates/yip-crypt
 ### Blind Packet Injection & DoS Defense
 
 1. **State-Free Discard**: Forged UDP packets injected by third parties fail the 8-byte SipHash-1-3 tag check and are dropped in under 17 ns without allocating heap memory or modifying daemon state.
-2. **Amplification Prevention**: Handshake responses are strictly bounded in size (Message 2 is 948 bytes, smaller than Message 1's 1,028 bytes). Senders cannot use `yipd` nodes as reflection amplification vectors.
+2. **Amplification Prevention**: Handshake responses are strictly bounded in size (Message 2 is ~212 bytes with certificate, significantly smaller than Message 1's ~1,028 bytes). Senders cannot use `yipd` nodes as reflection amplification vectors.
 3. **Cookie / Rate Limiting**: In unauthenticated flood scenarios, nodes transition to stateless cryptographic challenge-cookie verification, requiring initiators to solve a lightweight proof before state allocations occur.
 
 ---
