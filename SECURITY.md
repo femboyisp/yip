@@ -36,6 +36,6 @@ Fixes land on `main` and are tagged for release.
 ## What yip does *not* protect — read this
 
 - **Physical Peer IP Concealment**: yip is a peer-to-peer overlay network, not an anonymizing mix-net like Tor. Connected nodes authenticate directly and see each other's physical IP addresses.
-- **No independent commercial audit**: The implementation uses audited cryptographic primitives (`ring`, `snow`, `frost-ed25519`), but the full protocol composition and daemon have not yet undergone an external third-party commercial audit.
+- **No independent commercial audit**: The implementation uses audited cryptographic primitives (`ring`, `blake3`, `ml-kem`, `frost-ed25519`), but the full protocol composition and daemon have not yet undergone an external third-party commercial audit.
 
 If a documented limitation above matters to your threat model, that's a reason to plan accordingly — but a *new* way to break the stated guarantees is exactly what we want to hear about privately.
