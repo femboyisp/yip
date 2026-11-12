@@ -360,18 +360,18 @@ public=9b49ffeb4566b53a0f78cae08920bc9e30a6e0c60f252cfdf4740e74f8c92b21
 
 ### Step 2: Derive Mesh IPv6 Addresses
 
-`yip` features self-certifying IPv6 addresses: a node's overlay address is derived directly from its public key (`0xfd || BLAKE2s(DOMAIN || pubkey)[..15]`). You can derive this address via `--addr`:
+`yip` features self-certifying IPv6 addresses: a node's overlay address is derived directly from its public key (`0xfd || BLAKE3-KDF("yip-v2-overlay-ipv6-addr", pubkey)[..15]`). You can derive this address via `--addr`:
 
 #### On Host A:
 ```sh
 yipd --addr 7df4d68205f03a2cae7e1713444fcda80ff43a29de7e9b0b4b2c159286d9a11a
-# Output: fd6a:9b12:ec41:882b:9912:65aa:1204:88ef
+# Output: fd88:e289:fa2e:4c29:8669:468a:7a3f:93bb
 ```
 
 #### On Host B:
 ```sh
 yipd --addr 9b49ffeb4566b53a0f78cae08920bc9e30a6e0c60f252cfdf4740e74f8c92b21
-# Output: fdb2:44cc:701a:32aa:01aa:89fe:412b:7710
+# Output: fd30:5fd1:5032:4e65:f368:54d7:4a23:c339
 ```
 
 You can choose either standard custom ULA prefixes (such as `fd00:1::1/64`) or these self-certifying key addresses for your overlay. For this tutorial, we will assign `fd00:1::1/64` to Host A and `fd00:1::2/64` to Host B.
@@ -510,7 +510,7 @@ sudo yipctl peers
 ```text
 PEER: 9b49ffeb4566b53a...
   Endpoint:       203.0.113.2:443 (Direct)
-  Handshake:      Completed (authenticated via Noise_IKpsk2)
+  Handshake:      Completed (authenticated via PQNoise_IKpsk2)
   Rekey:          In 114s (epoch 1)
   Tx Packets:     42 (6.2 KiB)
   Rx Packets:     38 (5.8 KiB)
@@ -572,7 +572,7 @@ flowchart TD
     NodeB -- "Boot & Load roots" --> Roots
 
     NodeA <-->|"Authenticated Gossip<br/>(TAI64N Timestamped)"| NodeB
-    NodeA <===>|"Dynamic Encrypted Tunnel<br/>(Noise-IK + RS-FEC)"| NodeB
+    NodeA <===>|"Dynamic Encrypted Tunnel<br/>(PQNoise-IK + RS-FEC)"| NodeB
 ```
 
 ---

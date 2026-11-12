@@ -66,7 +66,7 @@ The table below summarizes the core cryptographic primitives employed across `yi
 | **Session Ratchet** | Epoch Rekeying (120s) | In-band ephemeral rekey | 20s dual-receive grace window | Bounded key lifetime, forward secrecy against late compromise |
 | **Header Protection** | SipHash-CTR Keystream | [SipHash](https://131002.net/siphash/) CTR mode | Key: 16 B, Header Mask: 15 B | Wire signature elimination, uniform randomness |
 | **Pre-Filter MAC** | SipHash-1-3 Tag | SipHash-1-3 streaming MAC | Key: 16 B, Tag: 8 B (64-bit) | 16.76 ns unauthorized probe drop before AEAD |
-| **Obfuscation Envelope** | `yip-obf` Masking | SipHash-2-4 CTR + Blake2s | Nonce: 8 B, Key: 16 B | Anti-DPI entropy normalization, packet-length hiding |
+| **Obfuscation Envelope** | `yip-obf` Masking | SipHash-2-4 CTR + BLAKE3 | Nonce: 8 B, Key: 16 B | Anti-DPI entropy normalization, packet-length hiding |
 | **uTLS Emulation** | Chrome 150 Profile | [RFC 8701](https://www.rfc-editor.org/rfc/rfc8701) (GREASE), TLS 1.3 | JA3 / JA4 exact parity | Indistinguishable from legitimate Google Chrome traffic |
 | **TLS Trojan / Relay** | Xray-REALITY Splicing | TLS 1.3 Certificate Borrowing | X25519: 32 B, Poly1305 Tag: 16 B | Active probe redirection via transparent TCP splicing |
 | **Node Identity & CA** | Ed25519 Signatures | [RFC 8032](https://www.rfc-editor.org/rfc/rfc8032) | Public Key: 32 B, Sig: 64 B | Offline CA-signed member authorization and gossip identity |
@@ -87,7 +87,7 @@ The architecture enforces five fundamental security invariants across all implem
 
 ### Protocol Composition: Noise-IKpsk2 + ML-KEM-512
 
-The control plane implements a post-quantum hybrid cryptographic handshake implemented in [`crates/yip-crypto/src/lib.rs`](../crates/yip-crypto/src/lib.rs). It integrates the standard **Noise-IKpsk2** pattern (`Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s`) with NIST FIPS 203 **ML-KEM-512** (Kyber-512):
+The control plane implements a post-quantum hybrid cryptographic handshake implemented in [`crates/yip-crypto/src/lib.rs`](../crates/yip-crypto/src/lib.rs). It integrates the bespoke post-quantum extended **PQNoise-IKpsk2** protocol (`PQNoise_IKpsk2_25519_MLKEM512_ChaChaPoly_BLAKE3`) with NIST FIPS 203 **ML-KEM-512** (Kyber-512) and native BLAKE3 keyed XOF ratchets:
 
 - **IK (Initiator knows Responder static key beforehand)**: The initiator possesses the responder's static public key prior to initiating the handshake (configured via certificate or rendezvous record). The initiator encrypts its own static identity key in the first flight, preserving initiator identity confidentiality against passive eavesdroppers.
 - **psk2 (Pre-Shared Key slot 2)**: Noise provides designated points in its token sequences where external entropy can be injected into the running symmetric chaining key ($ck$) and handshake hash ($h$). `yip` utilizes PSK slot 2 to inject the 32-byte post-quantum shared secret ($ss_{pq}$) derived from ML-KEM-512.
@@ -138,9 +138,9 @@ Both peers derive identical session transport keys (k_send, k_recv)
 |   - Ciphertext (ct):             768 bytes                                    |
 |   - Shared Secret (ss_pq):       32 bytes                                     |
 +-------------------------------------------------------------------------------+
-| Symmetric Cipher & Hash:         ChaCha20-Poly1305 AEAD + BLAKE2s Hash        |
+| Symmetric Cipher & Hash:         ChaCha20-Poly1305 AEAD + BLAKE3 Hash         |
 |   - Handshake Cipher:            ChaCha20-Poly1305 (RFC 8439)                 |
-|   - Transcript Hash:             BLAKE2s-256 (32 bytes)                       |
+|   - Transcript Hash:             BLAKE3 (32 bytes)                            |
 |   - AEAD Tag Size:               16 bytes                                     |
 +-------------------------------------------------------------------------------+
 ```
@@ -220,7 +220,7 @@ Every received ML-KEM-512 encapsulation key ($ek_A$) undergoes strict cryptograp
 State-level intelligence agencies and adversaries routinely record petabytes of encrypted transit traffic on transatlantic cables and IXPs under the "Harvest-Now, Decrypt-Later" (HNDL) doctrine. When a Cryptographically Relevant Quantum Computer (CRQC) running Shor's algorithm becomes operational, recorded classical sessions using standard Diffie-Hellman (Curve25519 or NIST P-256) or RSA will be decrypted retrospectively.
 
 `yip` neutralizes HNDL attacks through its dual-entropy hybrid design:
-- The session key derivation binds both the classical Diffie-Hellman shared secret ($ss_{dh} = \text{X25519}(e_A, e_B)$) and the quantum-resistant lattice shared secret ($ss_{pq} = \text{ML-KEM-512}(ek_A, ct)$) into the Noise HKDF-BLAKE2s ratchet.
+- The session key derivation binds both the classical Diffie-Hellman shared secret ($ss_{dh} = \text{X25519}(e_A, e_B)$) and the quantum-resistant lattice shared secret ($ss_{pq} = \text{ML-KEM-512}(ek_A, ct)$) into the native PQNoise BLAKE3 keyed XOF ratchet.
 - Even if a quantum adversary retrospectively solves the discrete logarithm problem on Curve25519, the session keys remain protected by the Module Learning With Errors (M-LWE) lattice problem of ML-KEM-512.
 - Conversely, if a future mathematical advance identifies unexpected structure in ML-KEM lattices, the 128-bit classical security margin of Curve25519 remains fully intact.
 
@@ -615,7 +615,7 @@ The table below provides a quick reference to all cryptographic algorithms, key 
 | **PQ KEM** | NIST FIPS 203 ML-KEM-512 | `ek`: 800 B, `dk`: 1,632 B, `ct`: 768 B, `ss`: 32 B | [`crates/yip-crypto/src/lib.rs`](../crates/yip-crypto/src/lib.rs#L46-L118) | Quantum-safe key encapsulation |
 | **Modulus Check** | FIPS 203 §7.2 ByteDecode_12 | Modulus $q = 3329$ | [`crates/yip-crypto/src/lib.rs`](../crates/yip-crypto/src/lib.rs#L85-L96) | Input validation, attack prevention |
 | **Classical DH** | X25519 (RFC 7748) | 32 B Public, 32 B Private | [`crates/yip-crypto/src/lib.rs`](../crates/yip-crypto/src/lib.rs#L25-L44) | Classical 128-bit Diffie-Hellman |
-| **Noise Pattern** | `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` | Transcript: 32 B | [`crates/yip-crypto/src/lib.rs`](../crates/yip-crypto/src/lib.rs#L22-L24) | 1-RTT mutual authentication & KDF |
+| **Noise Pattern** | `PQNoise_IKpsk2_25519_MLKEM512_ChaChaPoly_BLAKE3` | Transcript: 32 B | [`crates/yip-crypto/src/handshake.rs`](../crates/yip-crypto/src/handshake.rs) | 1-RTT mutual authentication & KDF |
 | **Data AEAD** | ChaCha20-Poly1305 (RFC 8439) | Key: 32 B, Nonce: 12 B, Tag: 16 B | [`crates/yip-crypto/src/lib.rs`](../crates/yip-crypto/src/lib.rs#L550-L649) | Inner payload confidentiality & integrity |
 | **Replay Window** | Monotonic Circular Bit Ring | 131,072 bits (16 KB) / 8,192 bits (1 KB) | [`crates/yip-crypto/src/lib.rs`](../crates/yip-crypto/src/lib.rs#L120-L297) | Anti-replay with zero false positives |
 | **Wire Codec** | SipHash-CTR Keystream | Key: 16 B, Header: 15 B | [`crates/yip-wire/src/lib.rs`](../crates/yip-wire/src/lib.rs#L61-L90) | Keyed header protection, zero magic bytes |
@@ -626,4 +626,4 @@ The table below provides a quick reference to all cryptographic algorithms, key 
 | **REALITY Front** | TLS 1.3 Certificate Borrowing | Auth Seal: 32 B in `legacy_session_id` | [`bin/yip-rendezvous/src/reality.rs`](../bin/yip-rendezvous/src/reality.rs) | Active probe redirection via TCP splicing |
 | **CA Signatures** | Ed25519 (RFC 8032) | Public: 32 B, Signature: 64 B | [`crates/yip-membership/src/cert.rs`](../crates/yip-membership/src/cert.rs#L1-L50) | Node authorization without online PKI |
 | **Threshold CA** | RFC 9591 FROST(Ed25519, SHA-512) | Group PK: 32 B, Share: 32 B, Sig: 64 B | [`bin/yip-ca/src/threshold/mod.rs`](../bin/yip-ca/src/threshold/mod.rs) | *t*-of-*n* decentralized issuance & ROAST quorum |
-| **Self-Cert IPv6** | BLAKE2s Variable Digest (`fd00::/8`) | 128-bit IPv6 Address | [`bin/yipd/src/addr.rs`](../bin/yipd/src/addr.rs) | Cryptographic anti-spoofing overlay IP |
+| **Self-Cert IPv6** | BLAKE3 Key Derivation (`fd00::/8`) | 128-bit IPv6 Address | [`bin/yipd/src/addr.rs`](../bin/yipd/src/addr.rs) | Cryptographic anti-spoofing overlay IP |

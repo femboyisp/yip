@@ -10,7 +10,7 @@
 //! ## Feature Flags
 //!
 //! By default, the following core features are enabled:
-//! - `crypto`: Noise-IK cryptography, AEAD ciphers, BLAKE2s hashing.
+//! - `crypto`: Post-quantum hybrid Noise cryptography, AEAD ciphers, and BLAKE3 ratchets.
 //! - `wire`: Packet framing, wire codec, and header obfuscation.
 //! - `transport`: Slotted Reed-Solomon FEC, sliding-window reassembly, and adaptive ARQ.
 //! - `membership`: Cryptographic node identity, self-certifying IPv6 addressing, RootSet verification, and gossip.

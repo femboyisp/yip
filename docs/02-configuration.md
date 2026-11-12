@@ -636,7 +636,7 @@ Parameters defined within repeatable `[peer]` blocks to establish connections to
 
 > [!IMPORTANT]
 > **Cryptographic Addressing vs. WireGuard `allowed_ips`**:
-> Unlike WireGuard, `yip` does **not** parse or rely on `allowed_ips` prefix filtering for access control. In `yip`, peer overlay addresses in `fd00::/8` are **cryptographically derived** from the peer's public key (via `BLAKE2s-120`). Inbound packets are authenticated against the sender's authenticated cryptographic session key; address spoofing and squatting are mathematically prevented at the crypto layer. Direct route configuration is handled via the operating system network stack (`ip -6 route`). Advanced per-peer overrides (`fec_ratio_override`, custom `keepalive_secs`) are planned extensions; link maintenance and adaptive FEC recovery are handled automatically by `yip`'s transport engine.
+> Unlike WireGuard, `yip` does **not** parse or rely on `allowed_ips` prefix filtering for access control. In `yip`, peer overlay addresses in `fd00::/8` are **cryptographically derived** from the peer's public key (via `BLAKE3-120`). Inbound packets are authenticated against the sender's authenticated cryptographic session key; address spoofing and squatting are mathematically prevented at the crypto layer. Direct route configuration is handled via the operating system network stack (`ip -6 route`). Advanced per-peer overrides (`fec_ratio_override`, custom `keepalive_secs`) are planned extensions; link maintenance and adaptive FEC recovery are handled automatically by `yip`'s transport engine.
 
 ---
 

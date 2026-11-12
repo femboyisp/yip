@@ -14,7 +14,7 @@ use std::net::Ipv6Addr;
 /// Map an IPv6 address to a shard index deterministically in `0..num_shards`.
 ///
 /// For mesh addresses in `fd00::/8` (where octet 0 is `0xfd`), octets `[1..9]`
-/// (the first 8 bytes of the BLAKE2s identity digest) are converted to a 64-bit integer
+/// (the first 8 bytes of the BLAKE3 identity digest) are converted to a 64-bit integer
 /// and modulo-divided by `num_shards`.
 ///
 /// For non-mesh IPv6 addresses (e.g., link-local, loopback, or global unicast),

@@ -10,7 +10,7 @@ Visualizes four key architectural pillars of yip:
   1. Panel A: Data-Plane Datagram Framing (Anti-DPI Keyed Header Protection & SipHash-1-3 MAC)
   2. Panel B: Post-Quantum Hybrid Handshake Framing (Noise-IKpsk2 + ML-KEM-512 Kyber)
   3. Panel C: 120-Second Epoch Ratchet Overlap (Zero-Loss Rekey Rotation)
-  4. Panel D: Cryptographic Self-Certifying Node Addressing (fd00::/8 ULA via BLAKE2s)
+  4. Panel D: Cryptographic Self-Certifying Node Addressing (fd00::/8 ULA via BLAKE3)
 
 Standard library only. Strict determinism (fixed formatting, fixed float precision, no timestamps).
 """
@@ -464,10 +464,10 @@ def generate_wire_format_svg() -> str:
     # Arrow 1
     canvas.line(674.0, flow_y + 22.0, 692.0, flow_y + 22.0, stroke=COLOR_TEXT_DIM, stroke_width=1.2, marker_end="url(#arrow-dim)")
 
-    # Box 2: BLAKE2s Hash
+    # Box 2: BLAKE3 Key Derivation
     canvas.rect(696.0, flow_y, 148.0, 44.0, rx=4.0, fill=COLOR_DATA_BG, stroke=COLOR_DATA_LIGHT, stroke_width=1.0)
-    canvas.text(770.0, flow_y + 16.0, "BLAKE2s-128", fill=COLOR_DATA_LIGHT, font_size=9.5, font_weight="700", text_anchor="middle")
-    canvas.text(770.0, flow_y + 30.0, '"yip-node-v1" ‖ pubkey', fill=COLOR_TEXT_MUTED, font_size=8.5, font_family=FONT_MONO, text_anchor="middle")
+    canvas.text(770.0, flow_y + 16.0, "BLAKE3 KDF", fill=COLOR_DATA_LIGHT, font_size=9.5, font_weight="700", text_anchor="middle")
+    canvas.text(770.0, flow_y + 30.0, '"yip-v2-overlay-ipv6-addr"', fill=COLOR_TEXT_MUTED, font_size=8.5, font_family=FONT_MONO, text_anchor="middle")
 
     # Arrow 2
     canvas.line(846.0, flow_y + 22.0, 864.0, flow_y + 22.0, stroke=COLOR_TEXT_DIM, stroke_width=1.2, marker_end="url(#arrow-dim)")
@@ -498,14 +498,14 @@ def generate_wire_format_svg() -> str:
     canvas.rect(546.0, addr_info_y, 454.0, 98.0, rx=6.0, fill=COLOR_SUB_CARD_BG, stroke=COLOR_CANVAS_BORDER, stroke_width=1.0)
     canvas.text(558.0, addr_info_y + 17.0, "• Self-Certifying: Address IS public key digest; IP spoofing impossible.", fill=COLOR_TEXT_MUTED, font_size=9.0)
     canvas.text(558.0, addr_info_y + 34.0, "• Zero Central Infrastructure: Autonomous routing without DHCP/IPAM/coordinators.", fill=COLOR_TEXT_MUTED, font_size=9.0)
-    canvas.text(558.0, addr_info_y + 51.0, "• Collision Resistance: 120-bit BLAKE2s digest provides 2^60 collision floor.", fill=COLOR_TEXT_MUTED, font_size=9.0)
+    canvas.text(558.0, addr_info_y + 51.0, "• Collision Resistance: 120-bit BLAKE3 digest provides 2^60 collision floor.", fill=COLOR_TEXT_MUTED, font_size=9.0)
     canvas.text(558.0, addr_info_y + 68.0, "• Zero-Trust Admission: Node identity bound to CA Root Cert before admission.", fill=COLOR_NOISE, font_size=9.0, font_weight="700")
     canvas.text(558.0, addr_info_y + 85.0, "• Autonomous Routing: Nodes route directly to fd00::/8 ULA addresses across mesh.", fill=COLOR_TEXT_DIM, font_size=8.5)
 
     # Outcome banner
     ob4_y = 704.0
     canvas.rect(546.0, ob4_y, 454.0, 24.0, rx=4.0, fill=COLOR_NOISE_BG, stroke=COLOR_NOISE, stroke_width=1.0)
-    canvas.text(773.0, ob4_y + 16.0, "Identity Invariant: Address = 0xfd ‖ BLAKE2s(pubkey)[0..15] (Zero Central IPAM)", fill=COLOR_NOISE, font_size=9.5, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
+    canvas.text(773.0, ob4_y + 16.0, "Identity Invariant: Address = 0xfd ‖ BLAKE3(pubkey)[0..15] (Zero Central IPAM)", fill=COLOR_NOISE, font_size=9.5, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
 
     # =========================================================================
     # FOOTER SECTION
@@ -513,7 +513,7 @@ def generate_wire_format_svg() -> str:
     canvas.line(24.0, 780.0, w - 24.0, 780.0, stroke=COLOR_CANVAS_BORDER, stroke_width=1.0)
     canvas.text(
         28.0, 800.0,
-        "Protocol: Noise-IKpsk2 • NIST FIPS 203 ML-KEM-512 • SipHash-CTR/2-4 • ChaCha20-Poly1305 • BLAKE2s",
+        "Protocol: PQNoise_IKpsk2 • NIST FIPS 203 ML-KEM-512 • SipHash-CTR/2-4 • ChaCha20-Poly1305 • BLAKE3",
         fill=COLOR_TEXT_DIM, font_size=9.0, font_family=FONT_MONO
     )
     canvas.text(

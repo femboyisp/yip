@@ -69,7 +69,7 @@
     <rect x="36.00" y="106.00" width="312.00" height="76.00" rx="6.00" fill="#0d1117" stroke="#30363d" stroke-width="1.00" />
     <text x="48.00" y="123.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">PQ Hybrid Handshake &amp; KDF</text>
     <text x="48.00" y="139.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• ML-KEM-512 (FIPS 203) + X25519</text>
-    <text x="48.00" y="155.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• Noise-IKpsk2 Token Sequencing</text>
+    <text x="48.00" y="155.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#8b949e">• PQNoise-IKpsk2 Token Sequencing</text>
     <text x="48.00" y="171.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="10.5" fill="#818cf8">• Ephemeral Rekeying (120s Ratchet)</text>
     <rect x="364.00" y="106.00" width="312.00" height="76.00" rx="6.00" fill="#0d1117" stroke="#30363d" stroke-width="1.00" />
     <text x="376.00" y="123.00" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" font-weight="700" fill="#f0f6fc">Threshold CA Quorum <tspan fill="#818cf8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">(yip-ca)</tspan></text>
