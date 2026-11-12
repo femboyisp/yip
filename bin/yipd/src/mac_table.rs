@@ -205,17 +205,8 @@ impl MacTable {
 }
 
 pub(crate) fn is_learnable_source_mac(mac: [u8; 6]) -> bool {
-    if mac == [0u8; 6] {
-        return false;
-    }
-    if mac == [0xFFu8; 6] {
-        return false;
-    }
-    // I/G bit set means multicast/group address.
-    if mac[0] & 0x01 != 0 {
-        return false;
-    }
-    true
+    // Drop all-zeros, broadcast, and multicast/group addresses (I/G bit set).
+    mac != [0u8; 6] && mac != [0xFFu8; 6] && (mac[0] & 0x01 == 0)
 }
 
 #[cfg(test)]
