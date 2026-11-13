@@ -46,6 +46,29 @@ fn test_circular_object_table_insert_and_lookup() {
     // Non-existent key lookups
     assert!(table.get(&999).is_none());
     assert!(table.get_mut(&999).is_none());
+
+    // find_index checks
+    table.insert(1, dummy_obj(50));
+    assert_eq!(table.find_index(&10), Some(36));
+    assert_eq!(table.find_index(&20), Some(8));
+    assert_eq!(table.find_index(&30), Some(9));
+    assert_eq!(table.find_index(&1), Some(20));
+    assert_eq!(table.find_index(&999), None);
+}
+
+#[test]
+fn test_circular_object_table_fallback_eviction() {
+    let mut table = ObjectTable::new(1);
+    table.insert(10, dummy_obj(100)); // bucket 9
+    assert_eq!(table.len(), 1);
+    // Key 20 hashes to bucket 2 (probes 2..5), which does not overlap 9..12.
+    // At capacity 1, candidate slots in probe sequence are empty, triggering fallback eviction.
+    let evicted = table.insert(20, dummy_obj(200));
+    assert!(evicted.is_some());
+    assert_eq!(evicted.unwrap().shard_len, 100);
+    assert_eq!(table.len(), 1);
+    assert!(!table.contains_key(&10));
+    assert!(table.contains_key(&20));
 }
 
 #[test]
