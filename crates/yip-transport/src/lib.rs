@@ -29,8 +29,8 @@ pub use plpmtu::{
 
 pub mod fec;
 pub use fec::{
-    shard_for_fec_symbol, FecEncoder, FecReassembler, FecScratchArena, ObjState, ObjectTable,
-    Symbol,
+    hash_key, shard_for_fec_symbol, FecEncoder, FecReassembler, FecScratchArena, ObjState,
+    ObjectTable, Symbol,
 };
 
 pub mod gf256;

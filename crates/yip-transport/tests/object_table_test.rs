@@ -1,5 +1,5 @@
 use std::alloc::System;
-use yip_transport::fec::{FecEncoder, FecReassembler, ObjState, ObjectTable};
+use yip_transport::fec::{FecEncoder, FecReassembler, ObjState, ObjectTable, Symbol};
 use yip_transport::FlowParams;
 use yip_verify::{assert_no_alloc, TrackingAllocator};
 
@@ -191,10 +191,12 @@ fn test_circular_object_table_boundary_conditions() {
 #[test]
 fn test_circular_object_table_high_churn() {
     let mut table = ObjectTable::new(32);
-    for k in 0..1000u64 {
-        table.insert(k, dummy_obj(k as usize));
-        assert!(table.len() <= 32);
-    }
+    assert_no_alloc!({
+        for k in 0..1000u64 {
+            table.insert(k, dummy_obj(k as usize));
+            assert!(table.len() <= 32);
+        }
+    });
     assert_eq!(table.len(), 32);
     for k in 968..1000u64 {
         assert!(table.contains_key(&k), "Key {k} must be present");
@@ -231,4 +233,69 @@ fn test_zero_copy_repair_shards_under_loss() {
     let decoded = reassembler.push(obj_key, &symbols[4], 0, 1000);
     assert_eq!(decoded.as_deref(), Some(original_payload.as_slice()));
     assert_eq!(reassembler.recovered_count(), 1);
+}
+
+#[test]
+fn test_fec_reassembler_zero_alloc_under_steady_state_churn() {
+    let symbol_size = 1200;
+    let max_objects = 16;
+    let mut reassembler = FecReassembler::new(symbol_size, max_objects);
+
+    let dummy_symbol = Symbol {
+        object_id: 1,
+        object_size: 2400,
+        payload_id: [0x01, 0, 0, 0],
+        data: vec![0xAA; 1200],
+    };
+
+    // Warm up the reassembler across capacity to populate recycled buffer pools.
+    for k in 0..(max_objects * 2) as u64 {
+        let _ = reassembler.push(k, &dummy_symbol, 0, 10_000);
+    }
+
+    // Steady-state churn: stream 10,000 objects through FecReassembler.
+    // Generational slot-map eviction and buffer recycling guarantee zero heap allocations.
+    assert_no_alloc!({
+        for k in 1000..11_000u64 {
+            let _ = reassembler.push(k, &dummy_symbol, 0, 10_000);
+        }
+    });
+
+    assert_eq!(reassembler.in_flight(), max_objects);
+}
+
+#[test]
+fn test_fec_reassembler_collision_eviction_unrecoverable_accounting() {
+    let symbol_size = 1200;
+    // Capacity 64: max_objects is large enough that table capacity won't evict first
+    let mut reassembler = FecReassembler::new(symbol_size, 64);
+
+    let dummy_symbol = Symbol {
+        object_id: 1,
+        object_size: 2400,
+        payload_id: [0x01, 0, 0, 0],
+        data: vec![0xAA; 1200],
+    };
+
+    // Find keys that hash to the exact same bucket slot to trigger collision eviction
+    let mask = 127; // For cap 64, num_buckets is 128 (mask 127)
+    let target_hash = yip_transport::fec::hash_key(0, mask);
+    let mut colliding_keys = Vec::new();
+    let mut cand = 0u64;
+    while colliding_keys.len() < 10 {
+        if yip_transport::fec::hash_key(cand, mask) == target_hash {
+            colliding_keys.push(cand);
+        }
+        cand += 1;
+    }
+
+    // Insert 8 colliding keys (filling all candidate ways across 2 probe buckets)
+    for &k in &colliding_keys[..8] {
+        let _ = reassembler.push(k, &dummy_symbol, 0, 10_000);
+    }
+    assert_eq!(reassembler.unrecoverable_count(), 0);
+
+    // 9th colliding key must trigger collision eviction in candidate buckets
+    let _ = reassembler.push(colliding_keys[8], &dummy_symbol, 0, 10_000);
+    assert_eq!(reassembler.unrecoverable_count(), 1);
 }
