@@ -1,9 +1,9 @@
 use std::alloc::System;
 use yip_verify::{
     assert_bounded_ops, assert_no_alloc, assert_no_blocking_io, get_step_counter,
-    get_thread_bytes_allocated, get_thread_dealloc_count, is_tracking_enabled,
-    record_algorithmic_step, record_algorithmic_steps, reset_step_counter, AllocationScopeGuard,
-    TrackingAllocator,
+    get_thread_alloc_count, get_thread_bytes_allocated, get_thread_dealloc_count,
+    get_thread_hard_limit_bytes, is_tracking_enabled, record_algorithmic_step,
+    record_algorithmic_steps, reset_step_counter, AllocationScopeGuard, TrackingAllocator,
 };
 
 #[global_allocator]
@@ -43,8 +43,13 @@ fn test_assert_no_alloc_panics_on_realloc() {
 fn test_allocation_scope_guard_tracks_metrics() {
     let guard = AllocationScopeGuard::enter();
     assert!(is_tracking_enabled());
+    assert_eq!(get_thread_alloc_count(), 0);
+    assert_eq!(get_thread_dealloc_count(), 0);
+    assert_eq!(get_thread_hard_limit_bytes(), None);
     let boxed = Box::new(99u64);
     assert_eq!(*boxed, 99);
+    assert_eq!(get_thread_alloc_count(), 1);
+    assert_eq!(get_thread_dealloc_count(), 0);
     assert!(get_thread_bytes_allocated() >= 8);
     drop(boxed);
     assert_eq!(get_thread_dealloc_count(), 1);
@@ -55,6 +60,7 @@ fn test_allocation_scope_guard_tracks_metrics() {
 #[test]
 fn test_allocation_scope_guard_enter_with_limit_ok() {
     let _guard = AllocationScopeGuard::enter_with_limit(1024);
+    assert_eq!(get_thread_hard_limit_bytes(), Some(1024));
     let mut v = vec![1u8, 2, 3, 4];
     v.push(5);
     assert_eq!(v.len(), 5);

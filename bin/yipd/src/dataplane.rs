@@ -1104,6 +1104,39 @@ mod tests {
     }
 
     #[test]
+    fn control_packet_length_bounds_distinguish_short_from_decrypt_failure() {
+        let (mut a, _b) = dataplane_pair(TunnelMode::L3Tun, false);
+
+        // 8 bytes: shorter than 9 bytes (missing counter) -> short error
+        let short = vec![PacketType::Control as u8; 8];
+        let _ = a.on_udp_datagram(&short, 0);
+        assert_eq!(
+            a.counters
+                .ingress_control_short_errors
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(a.counters.ingress_open_errors.load(Ordering::Relaxed), 0);
+
+        // Exactly 9 bytes: [1-byte type][8-byte counter] with empty ciphertext -> passes length gate, fails open
+        let mut exact_9 = vec![PacketType::Control as u8];
+        exact_9.extend_from_slice(&1u64.to_be_bytes());
+        let _ = a.on_udp_datagram(&exact_9, 0);
+        assert_eq!(
+            a.counters
+                .ingress_control_short_errors
+                .load(Ordering::Relaxed),
+            1,
+            "exactly 9 bytes must not trigger ingress_control_short_errors"
+        );
+        assert_eq!(
+            a.counters.ingress_open_errors.load(Ordering::Relaxed),
+            1,
+            "exactly 9 bytes must proceed past length check to session.open"
+        );
+    }
+
+    #[test]
     fn tunnel_mode_controls_l2_encode_hint() {
         // Ethernet + IPv4 header with DSCP EF should classify as Realtime only
         // when the classifier is told this is an L2 frame (l2=true).
