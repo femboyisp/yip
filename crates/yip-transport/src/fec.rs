@@ -436,23 +436,49 @@ impl FecEncoder {
     }
 }
 
-pub(crate) struct ObjState {
+pub const BUCKET_WAYS: usize = 4;
+pub const MAX_PROBE_BUCKETS: usize = 2;
+
+/// State for an object currently being received and reassembled.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObjState {
     /// Pre-allocated buffer for the assembled object.
-    payload: Vec<u8>,
+    pub payload: Vec<u8>,
     /// Bitset of received symbol indices (0..255).
-    seen_mask: [u64; 4],
+    pub seen_mask: [u64; 4],
     /// Count of received source shards (symbol_index < k).
-    source_count: usize,
+    pub source_count: usize,
     /// Total count of distinct shards received (source + repair).
-    total_count: usize,
-    k: usize,
-    shard_len: usize,
-    object_size: u32,
-    scheme: rs::Scheme,
-    done: bool,
-    expires_at_ms: u64,
+    pub total_count: usize,
+    pub k: usize,
+    pub shard_len: usize,
+    pub object_size: u32,
+    pub scheme: rs::Scheme,
+    pub done: bool,
+    pub expires_at_ms: u64,
     /// Repair shards (symbol_index >= k), stored only when packet loss occurs.
-    repair_shards: Vec<(u16, Vec<u8>)>,
+    pub repair_shards: Vec<(u16, Vec<u8>)>,
+    /// Pre-allocated repair buffers for zero-allocation reassembly under loss.
+    pub repair_pool: Vec<Vec<u8>>,
+}
+
+impl Default for ObjState {
+    fn default() -> Self {
+        Self {
+            payload: Vec::new(),
+            seen_mask: [0; 4],
+            source_count: 0,
+            total_count: 0,
+            k: 1,
+            shard_len: 0,
+            object_size: 0,
+            scheme: rs::Scheme::Pq,
+            done: false,
+            expires_at_ms: 0,
+            repair_shards: Vec::new(),
+            repair_pool: Vec::new(),
+        }
+    }
 }
 
 #[inline]
@@ -481,19 +507,50 @@ fn hash_key(key: u64, mask: usize) -> usize {
     (x as usize) & mask
 }
 
-pub(crate) struct ObjectTable {
-    slots: Vec<Option<(u64, ObjState)>>,
+#[derive(Clone, Debug)]
+pub struct SlotEntry {
+    pub key: u64,
+    pub generation: u64,
+    pub state: ObjState,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Bucket {
+    pub entries: [Option<SlotEntry>; BUCKET_WAYS],
+}
+
+/// Bounded circular slot-map table mapping `u64` keys to `ObjState`.
+/// Uses power-of-two bounded collision buckets with generational tracking and ring-buffer
+/// FIFO eviction, ensuring strictly bounded O(1) eviction, lookup, and removal without
+/// backward-shift cascades.
+#[derive(Clone, Debug)]
+pub struct ObjectTable {
+    buckets: Vec<Bucket>,
+    mask: usize,
     len: usize,
+    capacity: usize,
+    ring: VecDeque<u64>,
+    next_generation: u64,
 }
 
 impl ObjectTable {
+    /// Create a new circular ObjectTable bounded to `capacity` active entries.
     pub fn new(capacity: usize) -> Self {
-        let cap = (capacity.max(1) * 2).next_power_of_two().max(16);
-        let mut slots = Vec::with_capacity(cap);
-        for _ in 0..cap {
-            slots.push(None);
+        let cap = capacity.max(1);
+        let num_buckets = (cap * 2).next_power_of_two().max(16);
+        let mask = num_buckets - 1;
+        let mut buckets = Vec::with_capacity(num_buckets);
+        for _ in 0..num_buckets {
+            buckets.push(Bucket::default());
         }
-        Self { slots, len: 0 }
+        Self {
+            buckets,
+            mask,
+            len: 0,
+            capacity: cap,
+            ring: VecDeque::with_capacity(cap * 2),
+            next_generation: 1,
+        }
     }
 
     #[inline]
@@ -507,91 +564,116 @@ impl ObjectTable {
     }
 
     #[inline]
-    pub fn contains_key(&self, key: &u64) -> bool {
-        self.get(key).is_some()
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
-    pub fn find_index(&self, key: &u64) -> Option<usize> {
-        let mask = self.slots.len() - 1;
-        let mut idx = hash_key(*key, mask);
-        for _ in 0..self.slots.len() {
-            match &self.slots[idx] {
-                Some((k, _)) if *k == *key => return Some(idx),
-                Some(_) => idx = (idx + 1) & mask,
-                None => return None,
+    #[inline]
+    pub fn contains_key(&self, key: &u64) -> bool {
+        self.find_slot(*key).is_some()
+    }
+
+    fn find_slot(&self, key: u64) -> Option<(usize, usize)> {
+        let b0 = hash_key(key, self.mask);
+        for probe in 0..MAX_PROBE_BUCKETS {
+            let b_idx = (b0 + probe) & self.mask;
+            for (way, entry) in self.buckets[b_idx].entries.iter().enumerate() {
+                if let Some(entry) = entry {
+                    if entry.key == key {
+                        return Some((b_idx, way));
+                    }
+                }
             }
         }
         None
     }
 
+    pub fn find_index(&self, key: &u64) -> Option<usize> {
+        let (b_idx, way) = self.find_slot(*key)?;
+        Some(b_idx * BUCKET_WAYS + way)
+    }
+
     pub fn get(&self, key: &u64) -> Option<&ObjState> {
-        let idx = self.find_index(key)?;
-        self.slots[idx].as_ref().map(|(_, s)| s)
+        let (b_idx, way) = self.find_slot(*key)?;
+        self.buckets[b_idx].entries[way].as_ref().map(|e| &e.state)
     }
 
     pub fn get_mut(&mut self, key: &u64) -> Option<&mut ObjState> {
-        let idx = self.find_index(key)?;
-        self.slots[idx].as_mut().map(|(_, s)| s)
+        let (b_idx, way) = self.find_slot(*key)?;
+        self.buckets[b_idx].entries[way]
+            .as_mut()
+            .map(|e| &mut e.state)
     }
 
     pub fn insert(&mut self, key: u64, state: ObjState) -> Option<ObjState> {
-        let mask = self.slots.len() - 1;
-        let mut idx = hash_key(key, mask);
-        for _ in 0..self.slots.len() {
-            match &mut self.slots[idx] {
-                Some((k, s)) if *k == key => {
-                    return Some(std::mem::replace(s, state));
+        // If key is already present, update in-place and return old state.
+        if let Some((b_idx, way)) = self.find_slot(key) {
+            let entry = self.buckets[b_idx].entries[way].as_mut().unwrap();
+            entry.generation = self.next_generation;
+            self.next_generation = self.next_generation.wrapping_add(1);
+            return Some(std::mem::replace(&mut entry.state, state));
+        }
+
+        // Table at capacity: evict oldest active item from ring buffer.
+        if self.len >= self.capacity {
+            while let Some(oldest_key) = self.ring.pop_front() {
+                if self.remove(&oldest_key).is_some() {
+                    break;
                 }
-                Some(_) => idx = (idx + 1) & mask,
-                None => {
-                    self.slots[idx] = Some((key, state));
+            }
+        }
+
+        let gen = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+
+        let b0 = hash_key(key, self.mask);
+        // Find empty slot across candidate buckets
+        for probe in 0..MAX_PROBE_BUCKETS {
+            let b_idx = (b0 + probe) & self.mask;
+            for way in 0..BUCKET_WAYS {
+                if self.buckets[b_idx].entries[way].is_none() {
+                    self.buckets[b_idx].entries[way] = Some(SlotEntry {
+                        key,
+                        generation: gen,
+                        state,
+                    });
                     self.len += 1;
+                    self.ring.push_back(key);
                     return None;
                 }
             }
         }
+
+        // Bounded collision eviction: if all candidate slots are occupied, evict slot with oldest generation.
+        let mut min_gen = u64::MAX;
+        let mut target_slot = (b0, 0);
+        for probe in 0..MAX_PROBE_BUCKETS {
+            let b_idx = (b0 + probe) & self.mask;
+            for (way, entry) in self.buckets[b_idx].entries.iter().enumerate() {
+                if let Some(entry) = entry {
+                    if entry.generation < min_gen {
+                        min_gen = entry.generation;
+                        target_slot = (b_idx, way);
+                    }
+                }
+            }
+        }
+
+        let (b_idx, way) = target_slot;
+        self.buckets[b_idx].entries[way] = Some(SlotEntry {
+            key,
+            generation: gen,
+            state,
+        });
+        self.ring.push_back(key);
         None
     }
 
     pub fn remove(&mut self, key: &u64) -> Option<ObjState> {
-        let mask = self.slots.len() - 1;
-        let mut idx = hash_key(*key, mask);
-        let mut found = false;
-        for _ in 0..self.slots.len() {
-            match &self.slots[idx] {
-                Some((k, _)) if *k == *key => {
-                    found = true;
-                    break;
-                }
-                Some(_) => idx = (idx + 1) & mask,
-                None => return None,
-            }
-        }
-        if !found {
-            return None;
-        }
-        let removed = self.slots[idx].take().map(|(_, s)| s);
+        let (b_idx, way) = self.find_slot(*key)?;
+        let entry = self.buckets[b_idx].entries[way].take()?;
         self.len -= 1;
-
-        // Backward-shift deletion to preserve linear probing invariants without tombstones.
-        let mut next_idx = (idx + 1) & mask;
-        for _ in 0..self.slots.len() {
-            let Some((k, _)) = self.slots[next_idx] else {
-                break;
-            };
-            let natural_idx = hash_key(k, mask);
-            let should_move = if next_idx >= idx {
-                natural_idx <= idx || natural_idx > next_idx
-            } else {
-                natural_idx <= idx && natural_idx > next_idx
-            };
-            if should_move {
-                self.slots[idx] = self.slots[next_idx].take();
-                idx = next_idx;
-            }
-            next_idx = (next_idx + 1) & mask;
-        }
-        removed
+        Some(entry.state)
     }
 }
 
@@ -734,6 +816,10 @@ impl FecReassembler {
             }
             let shard_len = obj_size.min(sym_size);
             let payload_len = k.checked_mul(shard_len).unwrap_or(0);
+            let mut repair_pool = Vec::with_capacity(k);
+            for _ in 0..k {
+                repair_pool.push(vec![0u8; shard_len]);
+            }
             self.objects.insert(
                 object_key,
                 ObjState {
@@ -747,7 +833,8 @@ impl FecReassembler {
                     scheme,
                     done: false,
                     expires_at_ms: now_ms.saturating_add(deadline_ms),
-                    repair_shards: Vec::new(),
+                    repair_shards: Vec::with_capacity(k),
+                    repair_pool,
                 },
             );
             self.order.push_back(object_key);
@@ -759,6 +846,8 @@ impl FecReassembler {
             state.payload.shrink_to_fit();
             state.repair_shards.clear();
             state.repair_shards.shrink_to_fit();
+            state.repair_pool.clear();
+            state.repair_pool.shrink_to_fit();
             return None;
         }
         if state.done {
@@ -782,11 +871,16 @@ impl FecReassembler {
             let copy_len = symbol.data.len().min(state.shard_len);
             state.payload[offset..offset + copy_len].copy_from_slice(&symbol.data[..copy_len]);
         } else {
-            let mut shard_data = symbol.data.clone();
-            if shard_data.len() < state.shard_len {
-                shard_data.resize(state.shard_len, 0);
+            let mut shard_buf = state
+                .repair_pool
+                .pop()
+                .unwrap_or_else(|| vec![0u8; state.shard_len]);
+            let copy_len = symbol.data.len().min(state.shard_len);
+            shard_buf[..copy_len].copy_from_slice(&symbol.data[..copy_len]);
+            if copy_len < state.shard_len {
+                shard_buf[copy_len..state.shard_len].fill(0);
             }
-            state.repair_shards.push((symbol_index, shard_data));
+            state.repair_shards.push((symbol_index, shard_buf));
         }
 
         if state.total_count < state.k {
@@ -802,6 +896,8 @@ impl FecReassembler {
             let mut object = std::mem::take(&mut state.payload);
             state.repair_shards.clear();
             state.repair_shards.shrink_to_fit();
+            state.repair_pool.clear();
+            state.repair_pool.shrink_to_fit();
             object.truncate(size);
             return Some(object);
         }
@@ -809,24 +905,26 @@ impl FecReassembler {
         // Loss path: at least one repair shard is required.
         self.recovered_count += 1;
 
-        let repair_refs: Vec<(u16, &[u8])> = state
-            .repair_shards
-            .iter()
-            .map(|(idx, d)| (*idx, d.as_slice()))
-            .collect();
+        let mut repair_refs = [(0u16, &[][..]); 256];
+        let num_repair = state.repair_shards.len().min(256);
+        for (i, (idx, d)) in state.repair_shards[..num_repair].iter().enumerate() {
+            repair_refs[i] = (*idx, d.as_slice());
+        }
 
         rs::reconstruct_missing_sources(
             state.k,
             state.shard_len,
             &mut state.payload,
             &state.seen_mask,
-            &repair_refs,
+            &repair_refs[..num_repair],
             state.scheme,
         )?;
 
         let mut object = std::mem::take(&mut state.payload);
         state.repair_shards.clear();
         state.repair_shards.shrink_to_fit();
+        state.repair_pool.clear();
+        state.repair_pool.shrink_to_fit();
         object.truncate(size);
         Some(object)
     }
@@ -1863,6 +1961,7 @@ mod tests {
             done: false,
             expires_at_ms: 1000,
             repair_shards: Vec::new(),
+            repair_pool: Vec::new(),
         };
 
         // Insert 64 objects (keys 100..164)
@@ -1953,6 +2052,7 @@ mod tests {
             done: false,
             expires_at_ms: 1000,
             repair_shards: Vec::new(),
+            repair_pool: Vec::new(),
         };
 
         // Table capacity 8 yields 16 slots (mask 15).
