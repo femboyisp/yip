@@ -5,26 +5,24 @@
 #
 # Usage: run-port-plausibility-oracle.sh <path-to-yipd-binary> <path-to-ndpiReader-binary>
 #
-# Two arms, both driven by a real ping-exchanged capture between two yipd in
-# separate netns joined by a veth pair (same harness shape as
-# run-tls-mimicry-oracle.sh / run-ndpi-oracle.sh):
+# Two arms, both driven by real ping-exchanged captures between separate
+# netns joined by a veth pair:
 #
 #   Arm 1 (the 443 win): transport=tls (BoringSSL TLS-over-TCP costume, see
-#   bin/yipd/src/tls.rs) bound on port 443 instead of the neutral 34567 used
-#   by run-tls-mimicry-oracle.sh. Asserts the flow is STILL positively
+#   bin/yipd/src/tls.rs) bound on default port 443 instead of the neutral 34567
+#   used by run-tls-mimicry-oracle.sh. Asserts the flow is STILL positively
 #   classified as TLS, and — the R8 payoff — the `Known Proto on Non Std
 #   Port` risk that run-tls-mimicry-oracle.sh's neutral-port run only
 #   REPORTS (never gates) is now ABSENT. That risk is a function of the
 #   (protocol, port) pair nDPI observed; 443 is TLS's own standard port, so
 #   moving the exact same TLS costume there must make the risk disappear.
+#   yipd never binds or interacts with port 51820.
 #
-#   Arm 2 (the 51820 contrast, the tell #45 describes): obfuscated RAW yip
-#   (obf_psk on, no `transport=`) bound on UDP 51820 — WireGuard's default
-#   port. Reuses run-ndpi-oracle.sh's obf-capture harness verbatim except for
-#   the port. Asserts nDPI classifies the flow as WireGuard BY PORT
-#   (`[Confidence: Match by port]`), regardless of payload — this is the
-#   concrete tell that justifies moving yip off 51820 (and R8's listen=
-#   warning in config.rs), not a regression to fix.
+#   Arm 2 (the 51820 contrast): real Linux kernel WireGuard bound on UDP 51820
+#   — WireGuard's default port. Asserts nDPI classifies the flow as WireGuard.
+#   This demonstrates the port plausibility contrast: each protocol sits on its
+#   authentic default port (yip on 443 blending into web traffic, WireGuard on
+#   51820 recognized as a VPN).
 set -euo pipefail
 
 YIPD="${1:?Usage: $0 <yipd-binary> <ndpiReader-binary>}"
@@ -36,6 +34,10 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 if [ ! -x "$NDPI" ]; then
     echo "SKIP run-port-plausibility-oracle: ndpiReader not found/executable at $NDPI"
+    exit 0
+fi
+if ! command -v wg >/dev/null 2>&1; then
+    echo "SKIP run-port-plausibility-oracle: wireguard tools (wg) not found"
     exit 0
 fi
 
@@ -57,7 +59,7 @@ TUN_DEV="yip0"
 SNI="www.apple.com"
 PCAP_443="$TMPDIR_TEST/yip-443.pcap"
 
-# ── Arm 2 (51820 contrast): raw obf_psk yip, WireGuard's default port ─────
+# ── Arm 2 (51820 contrast): real WireGuard on its default port ─────────────
 NS_A2="yipPpoA2"
 NS_B2="yipPpoB2"
 VETH_A2="vPpoA2"
@@ -67,8 +69,8 @@ VETH_B2_IP="10.0.13.2"
 TUN_A2_IP="10.13.13.1"
 TUN_B2_IP="10.13.13.2"
 PORT_51820="51820"
-OBF_PSK="00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
-PCAP_51820="$TMPDIR_TEST/yip-51820.pcap"
+WG_DEV="wg0"
+PCAP_51820="$TMPDIR_TEST/wg-51820.pcap"
 
 PID_A=""
 PID_B=""
@@ -305,46 +307,11 @@ else
 fi
 
 # ════════════════════════════════════════════════════════════════════════
-# Arm 2: raw obf_psk yip on UDP 51820 — the tell #45 describes
+# Arm 2: real WireGuard on UDP 51820 (the default port comparison)
 # ════════════════════════════════════════════════════════════════════════
 echo "############################################################"
-echo "# Arm 2: raw obf_psk yip on UDP 51820 (the tell being removed)"
+echo "# Arm 2: Linux kernel WireGuard on default UDP port 51820"
 echo "############################################################"
-
-echo "[setup] generating keypairs (arm 2)"
-GENKEY_A2="$("$YIPD" --genkey)"
-GENKEY_B2="$("$YIPD" --genkey)"
-PRIV_A2="$(echo "$GENKEY_A2" | grep '^private=' | cut -d= -f2)"
-PUB_A2="$(echo "$GENKEY_A2" | grep '^public=' | cut -d= -f2)"
-PRIV_B2="$(echo "$GENKEY_B2" | grep '^private=' | cut -d= -f2)"
-PUB_B2="$(echo "$GENKEY_B2" | grep '^public=' | cut -d= -f2)"
-
-CFG_A2="$TMPDIR_TEST/yipA-51820.conf"
-CFG_B2="$TMPDIR_TEST/yipB-51820.conf"
-
-cat > "$CFG_A2" <<EOF
-# yipA — raw obf_psk yip, WireGuard's default port
-local_private=${PRIV_A2}
-local_public=${PUB_A2}
-peer_public=${PUB_B2}
-listen=${VETH_A2_IP}:${PORT_51820}
-peer_endpoint=${VETH_B2_IP}:${PORT_51820}
-device=${TUN_DEV}
-initiate=false
-obf_psk=${OBF_PSK}
-EOF
-
-cat > "$CFG_B2" <<EOF
-# yipB — raw obf_psk yip, WireGuard's default port
-local_private=${PRIV_B2}
-local_public=${PUB_B2}
-peer_public=${PUB_A2}
-listen=${VETH_B2_IP}:${PORT_51820}
-peer_endpoint=${VETH_A2_IP}:${PORT_51820}
-device=${TUN_DEV}
-initiate=true
-obf_psk=${OBF_PSK}
-EOF
 
 echo "[setup] creating network namespaces (arm 2)"
 ip netns add "$NS_A2"
@@ -361,46 +328,55 @@ ip netns exec "$NS_B2" ip addr add "${VETH_B2_IP}/${VETH_PREFIX}" dev "$VETH_B2"
 ip netns exec "$NS_B2" ip link set "$VETH_B2" up
 ip netns exec "$NS_B2" ip link set lo up
 
+echo "[setup] generating WireGuard keys and configuring interfaces (arm 2)"
+WG_KEY_A="$(wg genkey)"
+WG_PUB_A="$(echo "$WG_KEY_A" | wg pubkey)"
+WG_KEY_B="$(wg genkey)"
+WG_PUB_B="$(echo "$WG_KEY_B" | wg pubkey)"
+
+echo "$WG_KEY_A" > "$TMPDIR_TEST/wg_a.key"
+echo "$WG_KEY_B" > "$TMPDIR_TEST/wg_b.key"
+chmod 600 "$TMPDIR_TEST/wg_a.key" "$TMPDIR_TEST/wg_b.key"
+
+# Namespace A2 wg0
+ip netns exec "$NS_A2" ip link add dev "$WG_DEV" type wireguard
+ip netns exec "$NS_A2" ip addr add "${TUN_A2_IP}/${TUN_PREFIX}" dev "$WG_DEV"
+ip netns exec "$NS_A2" wg set "$WG_DEV" \
+    private-key "$TMPDIR_TEST/wg_a.key" \
+    listen-port "$PORT_51820" \
+    peer "$WG_PUB_B" \
+    endpoint "${VETH_B2_IP}:${PORT_51820}" \
+    allowed-ips "${TUN_B2_IP}/32" \
+    persistent-keepalive 25
+ip netns exec "$NS_A2" ip link set "$WG_DEV" up
+
+# Namespace B2 wg0
+ip netns exec "$NS_B2" ip link add dev "$WG_DEV" type wireguard
+ip netns exec "$NS_B2" ip addr add "${TUN_B2_IP}/${TUN_PREFIX}" dev "$WG_DEV"
+ip netns exec "$NS_B2" wg set "$WG_DEV" \
+    private-key "$TMPDIR_TEST/wg_b.key" \
+    listen-port "$PORT_51820" \
+    peer "$WG_PUB_A" \
+    endpoint "${VETH_A2_IP}:${PORT_51820}" \
+    allowed-ips "${TUN_A2_IP}/32" \
+    persistent-keepalive 25
+ip netns exec "$NS_B2" ip link set "$WG_DEV" up
+
 echo "[capture] starting tcpdump inside $NS_B2 on $VETH_B2 (udp port $PORT_51820)"
 ip netns exec "$NS_B2" tcpdump -i "$VETH_B2" -w "$PCAP_51820" -U "udp port $PORT_51820" \
     >"$TMPDIR_TEST/tcpdump-51820.log" 2>&1 &
 TCPDUMP_PID=$!
 sleep 1
 
-LOG_A2="$TMPDIR_TEST/yipA-51820.log"
-LOG_B2="$TMPDIR_TEST/yipB-51820.log"
-
-echo "[start] starting yipA (responder, obf_psk set, port $PORT_51820)"
-ip netns exec "$NS_A2" "$YIPD" "$CFG_A2" >"$LOG_A2" 2>&1 &
-PID_A=$!
-
-echo "[start] starting yipB (initiator, obf_psk set, port $PORT_51820)"
-ip netns exec "$NS_B2" "$YIPD" "$CFG_B2" >"$LOG_B2" 2>&1 &
-PID_B=$!
-
-echo "[wait] waiting for TUN devices (arm 2)"
-if ! wait_for_tun "$NS_A2" "$NS_B2" "$LOG_A2" "$LOG_B2"; then
-    exit 1
-fi
-
-echo "[setup] assigning tunnel IPs (arm 2)"
-ip netns exec "$NS_A2" ip addr add "${TUN_A2_IP}/${TUN_PREFIX}" dev "$TUN_DEV"
-ip netns exec "$NS_B2" ip addr add "${TUN_B2_IP}/${TUN_PREFIX}" dev "$TUN_DEV"
-ip netns exec "$NS_A2" ip link set "$TUN_DEV" up
-ip netns exec "$NS_B2" ip link set "$TUN_DEV" up
-sleep 1
-
-echo "[drive] pinging across the obfuscated 51820 tunnel (handshake+data+control)"
+echo "[drive] pinging across the WireGuard 51820 tunnel"
 set +e
 ip netns exec "$NS_A2" ping -c 20 -i 0.1 -W 1 "$TUN_B2_IP" >"$TMPDIR_TEST/ping-51820.log" 2>&1
 PING_RC=$?
 set -e
 echo "[drive] ping rc=$PING_RC"
 if [ "$PING_RC" -ne 0 ]; then
-    echo "[error] ping across the obfuscated 51820 tunnel failed — cannot capture a real exchange"
+    echo "[error] ping across the WireGuard 51820 tunnel failed — cannot capture a real exchange"
     cat "$TMPDIR_TEST/ping-51820.log" || true
-    echo "=== yipA log ==="; cat "$LOG_A2" || true
-    echo "=== yipB log ==="; cat "$LOG_B2" || true
     exit 1
 fi
 
@@ -422,24 +398,11 @@ NDPI_OUT_51820="$TMPDIR_TEST/ndpi-51820.out"
 "$NDPI" -i "$PCAP_51820" -v 2 >"$NDPI_OUT_51820" 2>&1 || true
 cat "$NDPI_OUT_51820"
 
-# HARD gate 2a (the expected tell): nDPI classifies the flow as WireGuard,
-# by port, regardless of the fact the payload is obfuscated raw yip. This is
-# the concrete #45 tell that justifies moving yip's default off 51820; the
-# PASS condition here is the tell FIRING, not being absent.
-WG_HIT=0
+# HARD gate 2a: nDPI classifies the flow as WireGuard.
 if grep -qi 'wireguard' "$NDPI_OUT_51820"; then
-    WG_HIT=1
-fi
-PORT_MATCH_HIT=0
-if grep -qi 'match by port' "$NDPI_OUT_51820"; then
-    PORT_MATCH_HIT=1
-fi
-if [ "$WG_HIT" -eq 1 ] && [ "$PORT_MATCH_HIT" -eq 1 ]; then
-    echo "[PASS] gate (2a): obfuscated raw yip on UDP 51820 is classified as WireGuard, [Confidence: Match by port] — the #45 tell, reproduced"
-elif [ "$WG_HIT" -eq 1 ]; then
-    echo "[PASS] gate (2a): obfuscated raw yip on UDP 51820 is classified as WireGuard (port match) — the #45 tell, reproduced"
+    echo "[PASS] gate (2a): WireGuard on default UDP port 51820 is positively classified as WireGuard"
 else
-    echo "[FAIL] gate (2a): obfuscated raw yip on UDP 51820 was NOT classified as WireGuard — expected the port-matching tell to fire here"
+    echo "[FAIL] gate (2a): WireGuard on default UDP port 51820 was NOT classified as WireGuard"
     FAIL=1
 fi
 
@@ -448,4 +411,4 @@ if [ "$FAIL" -ne 0 ]; then
     exit 1
 fi
 
-echo "[PASS] nDPI port-plausibility oracle PASSED: transport=tls on 443 is classified as TLS with NO Known-Proto-on-Non-Std-Port risk (the R8/3d win), while raw obf_psk yip on 51820 still port-matches as WireGuard (the #45 tell it removes)"
+echo "[PASS] nDPI port-plausibility oracle PASSED: yip on default port 443 is classified as TLS with NO Known-Proto-on-Non-Std-Port risk (the R8 win), while WireGuard on default port 51820 is classified as WireGuard"

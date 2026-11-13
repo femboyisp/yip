@@ -636,10 +636,9 @@ jobs:
         # "unknown thing on a weird port" risk. Arm 1 reruns the TLS-mimicry
         # costume on 443 (instead of the neutral port above) and asserts
         # `Known Proto on Non Std Port` — reported, never gated, by the
-        # neutral-port oracle above — is now ABSENT. Arm 2 reruns the
-        # undetectability oracle's obf capture on UDP 51820 (WireGuard's
-        # default) and asserts nDPI classifies it as WireGuard BY PORT — the
-        # concrete #45 tell that motivates moving off 51820. See
+        # neutral-port oracle above — is now ABSENT. Arm 2 runs WireGuard on
+        # UDP 51820 (WireGuard's default port) and asserts nDPI classifies it as
+        # WireGuard, contrasting with yipd on default port 443. See
         # run-port-plausibility-oracle.sh for the full assertion set.
         run: |
           sudo bash bin/yipd/tests/run-port-plausibility-oracle.sh \
@@ -653,7 +652,7 @@ jobs:
             exit 1
           fi
           if grep -q "\[FAIL\]" /tmp/port-plausibility-oracle.log; then
-            echo "::error::the 443 TLS-mimicry flow still showed Known-Proto-on-Non-Std-Port / a VPN classification, or the 51820 raw-yip flow was not port-matched as WireGuard — 3d port-plausibility regression"
+            echo "::error::the 443 TLS-mimicry flow still showed Known-Proto-on-Non-Std-Port / a VPN classification, or the 51820 WireGuard flow was not classified as WireGuard — port-plausibility regression"
             exit 1
           fi
 
