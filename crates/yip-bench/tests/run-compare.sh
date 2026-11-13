@@ -31,7 +31,8 @@ WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 BENCH_DIR="$WORKSPACE_ROOT/crates/yip-bench"
 
 # ── tmpdir ────────────────────────────────────────────────────────────────────
-TMPDIR_TEST="$(mktemp -d /tmp/yip-compare.XXXXXX)"
+TMPDIR_TEST="$(mktemp -d /dev/shm/yip-compare.XXXXXX 2>/dev/null || mktemp -d /tmp/yip-compare.XXXXXX)"
+chmod 777 "$TMPDIR_TEST"
 
 # ── yip netns/veth ───────────────────────────────────────────────────────────
 NS_A="yipA"
@@ -255,7 +256,7 @@ setup_wg() {
     WG_PRIV_B_FILE="$TMPDIR_TEST/wg_priv_b"
     printf '%s' "$WG_PRIV_A" > "$WG_PRIV_A_FILE"
     printf '%s' "$WG_PRIV_B" > "$WG_PRIV_B_FILE"
-    chmod 600 "$WG_PRIV_A_FILE" "$WG_PRIV_B_FILE"
+    chmod 644 "$WG_PRIV_A_FILE" "$WG_PRIV_B_FILE"
 
     echo "[wg] configuring wgA (listen-port ${WG_PORT_A}, peer = wgB)"
     ip netns exec "$NS_WGA" wg set wg0 \
