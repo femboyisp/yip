@@ -1,8 +1,12 @@
+#![deny(clippy::print_stderr, clippy::print_stdout)]
+
 //! Mutex-free data plane: owns the AEAD session, FEC transport, wire codec,
 //! and auxiliary buffers.  Driven by the epoll event loop in `yip_io::poll`.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use yip_transport::{
     ControlFrame, FlowClass, LossDetector, PlpmtuController, RetxBuffer, Transport,
@@ -16,6 +20,18 @@ use crate::mac_table::{
 use crate::mode::TunnelMode;
 use crate::wire_glue;
 
+/// Lock-free atomic counters for data-plane ingress and egress error conditions.
+#[derive(Debug, Default)]
+pub struct DataPlaneCounters {
+    pub ingress_deframe_errors: AtomicU64,
+    pub ingress_frame_to_symbol_errors: AtomicU64,
+    pub ingress_open_errors: AtomicU64,
+    pub ingress_control_short_errors: AtomicU64,
+    pub ingress_control_malformed_errors: AtomicU64,
+    pub ingress_seal_errors: AtomicU64,
+    pub tick_seal_errors: AtomicU64,
+}
+
 // ── constants (wired into DataPlane::new; tunnel.rs keeps its own copies until
 //    Task 3 replaces the two-thread loop with this DataPlane) ─────────────────
 
@@ -28,8 +44,6 @@ const RETX_EXTRA_REPAIR: u32 = 4;
 // a loss-feedback Control packet to the peer.
 const FEEDBACK_INTERVAL_MS: u64 = 30;
 
-// Periodic log interval for controller ratio (every ~5 s).
-const LOG_INTERVAL_MS: u64 = 5_000;
 // How often to sweep the MAC table for expired entries. `tick` fires on every
 // epoll iteration (≥100 Hz), so an unconditional O(n) sweep would scan the whole
 // table on every loop pass; gate it to ~1 s (TTL is independently enforced on
@@ -137,6 +151,7 @@ pub enum Outcome<'a> {
 /// the caller must consume or clone them before calling any other `&mut self`
 /// method.
 pub struct DataPlane {
+    pub counters: Arc<DataPlaneCounters>,
     session: yip_crypto::Session,
     raw_send_key: [u8; 32],
     raw_recv_key: [u8; 32],
@@ -160,7 +175,6 @@ pub struct DataPlane {
 
     // Feedback / log timers (mirror what ingress thread holds in tunnel.rs).
     last_feedback_ms: u64,
-    last_log_ms: u64,
     last_sweep_ms: u64,
     /// Whether obfuscation is on for this session (`PeerManager::obf_key.is_some()`
     /// at construction). Gates whether the feedback cadence is jittered (3b Task 5).
@@ -274,6 +288,7 @@ impl DataPlane {
         let raw_recv_key = established.raw_recv_key;
         let codec = Codec::new(auth_key, hp_key);
         Self {
+            counters: Arc::default(),
             session: established.session,
             raw_send_key,
             raw_recv_key,
@@ -290,7 +305,6 @@ impl DataPlane {
             mac_table: MacTable::new(DEFAULT_MAC_TABLE_CAPACITY, DEFAULT_MAC_TABLE_TTL_MS),
             last_loss_report_high: 0,
             last_feedback_ms: 0,
-            last_log_ms: 0,
             last_sweep_ms: 0,
             obf_on,
             obf_key: if obf_on {
@@ -461,8 +475,10 @@ impl DataPlane {
                 // Deframe (auth + header-deprotect). On failure, drop the packet.
                 let frame = match self.codec.deframe(wire) {
                     Ok(f) => f,
-                    Err(e) => {
-                        eprintln!("dataplane ingress: deframe error: {e}");
+                    Err(_) => {
+                        self.counters
+                            .ingress_deframe_errors
+                            .fetch_add(1, Ordering::Relaxed);
                         return Outcome::None;
                     }
                 };
@@ -471,7 +487,9 @@ impl DataPlane {
                 let (sym, counter, class) = match wire_glue::frame_to_symbol(&frame) {
                     Some(t) => t,
                     None => {
-                        eprintln!("dataplane ingress: frame_to_symbol returned None");
+                        self.counters
+                            .ingress_frame_to_symbol_errors
+                            .fetch_add(1, Ordering::Relaxed);
                         return Outcome::None;
                     }
                 };
@@ -495,8 +513,10 @@ impl DataPlane {
                 // Open the AEAD ciphertext.
                 let inner = match self.session.open(counter, &ciphertext) {
                     Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("dataplane ingress: open error: {e}");
+                    Err(_) => {
+                        self.counters
+                            .ingress_open_errors
+                            .fetch_add(1, Ordering::Relaxed);
                         return Outcome::None;
                     }
                 };
@@ -525,7 +545,9 @@ impl DataPlane {
                 // Control packet layout:
                 //   [1-byte type][8-byte counter BE][ciphertext...]
                 if dg.len() < 9 {
-                    eprintln!("dataplane ingress: control packet too short");
+                    self.counters
+                        .ingress_control_short_errors
+                        .fetch_add(1, Ordering::Relaxed);
                     return Outcome::None;
                 }
                 let counter = u64::from_be_bytes(dg[1..9].try_into().expect("exactly 8 bytes"));
@@ -536,10 +558,10 @@ impl DataPlane {
                 // poison the loss detector's high_counter.
                 let plaintext = match self.session.open(counter, ct) {
                     Ok(p) => p,
-                    Err(e) => {
-                        eprintln!(
-                            "dataplane ingress: control open error on counter={counter}: {e}"
-                        );
+                    Err(_) => {
+                        self.counters
+                            .ingress_open_errors
+                            .fetch_add(1, Ordering::Relaxed);
                         return Outcome::None;
                     }
                 };
@@ -553,7 +575,9 @@ impl DataPlane {
                 let frame = match ControlFrame::decode(&plaintext) {
                     Some(f) => f,
                     None => {
-                        eprintln!("dataplane ingress: malformed ControlFrame");
+                        self.counters
+                            .ingress_control_malformed_errors
+                            .fetch_add(1, Ordering::Relaxed);
                         return Outcome::None;
                     }
                 };
@@ -698,8 +722,10 @@ impl DataPlane {
                         let ack_bytes = ack.encode();
                         let sealed = match self.session.seal(&ack_bytes) {
                             Ok(s) => s,
-                            Err(e) => {
-                                eprintln!("dataplane ingress: seal error on MtuProbeAck: {e}");
+                            Err(_) => {
+                                self.counters
+                                    .ingress_seal_errors
+                                    .fetch_add(1, Ordering::Relaxed);
                                 return Outcome::None;
                             }
                         };
@@ -748,20 +774,6 @@ impl DataPlane {
             self.mac_table.sweep(now_ms);
         }
 
-        // ── periodic controller ratio log ─────────────────────────────────────
-        if now_ms.saturating_sub(self.last_log_ms) >= LOG_INTERVAL_MS {
-            self.last_log_ms = now_ms;
-            eprintln!(
-                "yipd [{}ms] bulk controller repair ratio: {:.4}",
-                now_ms,
-                self.transport.bulk_repair_ratio(),
-            );
-            eprintln!(
-                "yipd [{}ms] ARQ retransmits: {}",
-                now_ms, self.arq_retx_count
-            );
-        }
-
         // ── periodic feedback emission ─────────────────────────────────────────
         if now_ms.saturating_sub(self.last_feedback_ms) < self.feedback_interval_ms {
             // Check if PLPMTUD has an in-band probe to emit between feedback ticks
@@ -774,8 +786,10 @@ impl DataPlane {
                 let probe_bytes = probe.encode();
                 let sealed = match self.session.seal(&probe_bytes) {
                     Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("dataplane tick: seal error on MtuProbe: {e}");
+                    Err(_) => {
+                        self.counters
+                            .tick_seal_errors
+                            .fetch_add(1, Ordering::Relaxed);
                         return None;
                     }
                 };
@@ -816,8 +830,10 @@ impl DataPlane {
         // the peer's detector will call on_seen for it.
         let sealed = match self.session.seal(&report_bytes) {
             Ok(s) => s,
-            Err(e) => {
-                eprintln!("dataplane tick: seal error: {e}");
+            Err(_) => {
+                self.counters
+                    .tick_seal_errors
+                    .fetch_add(1, Ordering::Relaxed);
                 return None;
             }
         };
@@ -1084,6 +1100,7 @@ mod tests {
         forged.extend_from_slice(&[0xAB; 32]); // garbage ciphertext
                                                // Must not panic; auth fails so no observe_loss / retransmit.
         let _ = a.on_udp_datagram(&forged, 0);
+        assert_eq!(a.counters.ingress_open_errors.load(Ordering::Relaxed), 1);
     }
 
     #[test]
