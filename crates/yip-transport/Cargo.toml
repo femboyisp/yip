@@ -17,3 +17,6 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+yip-verify = { workspace = true }

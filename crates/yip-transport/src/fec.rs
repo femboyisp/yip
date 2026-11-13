@@ -64,25 +64,107 @@ fn source_count(object_size: u32, symbol_size: u16) -> usize {
     size.div_ceil(sym)
 }
 
-/// Split `ciphertext` into `k` source shards of `sym` bytes each (last zero-padded).
-fn split_source(ciphertext: &[u8], k: usize, sym: usize) -> Vec<Vec<u8>> {
-    let mut shards = vec![vec![0u8; sym]; k];
-    for (i, shard) in shards.iter_mut().enumerate() {
-        let start = i * sym;
-        let end = (start + sym).min(ciphertext.len());
-        if start < ciphertext.len() {
-            shard[..end - start].copy_from_slice(&ciphertext[start..end]);
+/// Default pre-allocated shard count in [`FecScratchArena`], matching the maximum
+/// GF(256) codeword symbol count (K + R <= 255).
+pub const DEFAULT_MAX_SHARDS: usize = 256;
+
+/// Default pre-allocated maximum shard length in bytes in [`FecScratchArena`],
+/// sizing each shard buffer to comfortably fit standard MTU envelopes (1500-2048 bytes).
+pub const DEFAULT_MAX_SHARD_LEN: usize = 2048;
+
+/// Reusable scratch arena for systematic and repair shard generation, eliminating
+/// heap allocations on the packet transmit hotpath once initialized/warmed.
+#[derive(Debug, Clone)]
+pub struct FecScratchArena {
+    /// Pre-allocated repair shard buffers.
+    repair_shards: Vec<Vec<u8>>,
+    /// Scratch buffer for zero-padding the last source shard when length is sub-symbol.
+    last_source_pad: Vec<u8>,
+    /// Pre-allocated symbol structs returned as a borrowed slice.
+    symbols: Vec<Symbol>,
+}
+
+impl Default for FecScratchArena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FecScratchArena {
+    /// Create a new scratch arena pre-allocated with default capacity
+    /// (256 shards of 2048 bytes each).
+    pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_MAX_SHARDS, DEFAULT_MAX_SHARD_LEN)
+    }
+
+    /// Create a new scratch arena with specified maximum shard count and shard capacity.
+    pub fn with_capacity(max_shards: usize, max_shard_len: usize) -> Self {
+        let mut repair_shards = Vec::with_capacity(max_shards);
+        let mut symbols = Vec::with_capacity(max_shards);
+        for _ in 0..max_shards {
+            repair_shards.push(vec![0u8; max_shard_len]);
+            symbols.push(Symbol {
+                object_id: 0,
+                object_size: 0,
+                payload_id: [0u8; 4],
+                data: Vec::with_capacity(max_shard_len),
+            });
+        }
+        Self {
+            repair_shards,
+            last_source_pad: vec![0u8; max_shard_len],
+            symbols,
         }
     }
-    shards
+
+    /// Ensure internal shard buffers and symbols have sufficient capacity for `required_symbols`
+    /// of length `shard_len`. Once warmed, this performs zero allocations.
+    pub fn ensure_capacity(&mut self, required_symbols: usize, shard_len: usize) {
+        if self.last_source_pad.len() < shard_len {
+            self.last_source_pad.resize(shard_len, 0);
+        }
+        if self.repair_shards.len() < required_symbols {
+            let additional = required_symbols - self.repair_shards.len();
+            for _ in 0..additional {
+                self.repair_shards.push(vec![0u8; shard_len]);
+            }
+        }
+        for shard in &mut self.repair_shards[..required_symbols] {
+            if shard.len() < shard_len {
+                shard.resize(shard_len, 0);
+            }
+        }
+        if self.symbols.len() < required_symbols {
+            let additional = required_symbols - self.symbols.len();
+            for _ in 0..additional {
+                self.symbols.push(Symbol {
+                    object_id: 0,
+                    object_size: 0,
+                    payload_id: [0u8; 4],
+                    data: Vec::with_capacity(shard_len),
+                });
+            }
+        }
+        for sym in &mut self.symbols[..required_symbols] {
+            if sym.data.capacity() < shard_len {
+                sym.data.reserve(shard_len - sym.data.capacity());
+            }
+        }
+    }
+
+    /// Returns the pre-allocated symbols slice.
+    pub fn symbols(&self) -> &[Symbol] {
+        &self.symbols
+    }
 }
 
 /// Encodes ciphertext frames into RS symbols, assigning monotonic object ids.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FecEncoder {
     next_object_id: u16,
     stride: u16,
     symbols_encoded: u64,
+    arena: FecScratchArena,
 }
 
 impl Default for FecEncoder {
@@ -91,14 +173,35 @@ impl Default for FecEncoder {
             next_object_id: 0,
             stride: 1,
             symbols_encoded: 0,
+            arena: FecScratchArena::default(),
         }
     }
 }
 
 impl FecEncoder {
-    /// Create an encoder starting at object id 0.
+    /// Create an encoder starting at object id 0 with a default scratch arena.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create an encoder with a custom-capacity scratch arena.
+    pub fn with_arena_capacity(max_shards: usize, max_shard_len: usize) -> Self {
+        Self {
+            next_object_id: 0,
+            stride: 1,
+            symbols_encoded: 0,
+            arena: FecScratchArena::with_capacity(max_shards, max_shard_len),
+        }
+    }
+
+    /// Access the internal scratch arena.
+    pub fn arena(&self) -> &FecScratchArena {
+        &self.arena
+    }
+
+    /// Access the internal scratch arena mutably.
+    pub fn arena_mut(&mut self) -> &mut FecScratchArena {
+        &mut self.arena
     }
 
     /// Total count of FEC symbols produced by this encoder.
@@ -112,7 +215,8 @@ impl FecEncoder {
         self.stride = if num_shards == 0 { 1 } else { num_shards };
     }
 
-    /// Encode one ciphertext frame into K source + `repair` repair symbols.
+    /// Encode one ciphertext frame into K source + `repair` repair symbols, returning
+    /// an owned `Vec<Symbol>`.
     pub fn encode(
         &mut self,
         ciphertext: &[u8],
@@ -121,7 +225,50 @@ impl FecEncoder {
     ) -> Vec<Symbol> {
         let object_id = self.next_object_id;
         self.next_object_id = self.next_object_id.wrapping_add(self.stride);
-        let syms = self.build(ciphertext, params, object_id, repair);
+        let syms = Self::build_with_arena(ciphertext, params, object_id, repair, &mut self.arena);
+        self.symbols_encoded = self.symbols_encoded.saturating_add(syms.len() as u64);
+        syms.to_vec()
+    }
+
+    /// Encode one ciphertext frame into K source + `repair` repair symbols directly using
+    /// an external [`FecScratchArena`], returning a borrowed slice of symbols with zero
+    /// heap allocations once warmed.
+    pub fn encode_with_arena<'a>(
+        &mut self,
+        ciphertext: &[u8],
+        params: crate::FlowParams,
+        repair: u32,
+        arena: &'a mut FecScratchArena,
+    ) -> &'a [Symbol] {
+        let object_id = self.next_object_id;
+        self.next_object_id = self.next_object_id.wrapping_add(self.stride);
+        let syms = Self::build_with_arena(ciphertext, params, object_id, repair, arena);
+        self.symbols_encoded = self.symbols_encoded.saturating_add(syms.len() as u64);
+        syms
+    }
+
+    /// Alias for [`Self::encode_with_arena`] to write encoded symbols into `arena`.
+    pub fn encode_into<'a>(
+        &mut self,
+        ciphertext: &[u8],
+        params: crate::FlowParams,
+        repair: u32,
+        arena: &'a mut FecScratchArena,
+    ) -> &'a [Symbol] {
+        self.encode_with_arena(ciphertext, params, repair, arena)
+    }
+
+    /// Zero-allocation encode using the encoder's internal scratch arena, returning a
+    /// borrowed slice of symbols.
+    pub fn encode_scratch(
+        &mut self,
+        ciphertext: &[u8],
+        params: crate::FlowParams,
+        repair: u32,
+    ) -> &[Symbol] {
+        let object_id = self.next_object_id;
+        self.next_object_id = self.next_object_id.wrapping_add(self.stride);
+        let syms = Self::build_with_arena(ciphertext, params, object_id, repair, &mut self.arena);
         self.symbols_encoded = self.symbols_encoded.saturating_add(syms.len() as u64);
         syms
     }
@@ -129,7 +276,7 @@ impl FecEncoder {
     /// Re-encode `ciphertext` under an EXPLICIT `object_id` (ARQ retransmit),
     /// returning all K source symbols + `extra_repair` repair symbols at indices
     /// K..K+extra_repair-1. Both `encode` and `repair_with_id` select the scheme
-    /// via `build` from `(params.arq, r)`: an ARQ (retransmit-eligible) class
+    /// via `build_with_arena` from `(params.arq, r)`: an ARQ (retransmit-eligible) class
     /// always uses Cauchy, regardless of `r`, so a retransmit batch stays
     /// scheme-compatible with the original send and a receiver that got zero
     /// original symbols can reconstruct from this batch alone.
@@ -140,28 +287,55 @@ impl FecEncoder {
         object_id: u16,
         extra_repair: u32,
     ) -> Vec<Symbol> {
-        let syms = self.build(ciphertext, params, object_id, extra_repair);
+        let syms =
+            Self::build_with_arena(ciphertext, params, object_id, extra_repair, &mut self.arena);
+        self.symbols_encoded = self.symbols_encoded.saturating_add(syms.len() as u64);
+        syms.to_vec()
+    }
+
+    /// Zero-allocation ARQ re-encode under an explicit `object_id` using an external [`FecScratchArena`].
+    pub fn repair_with_id_with_arena<'a>(
+        &mut self,
+        ciphertext: &[u8],
+        params: crate::FlowParams,
+        object_id: u16,
+        extra_repair: u32,
+        arena: &'a mut FecScratchArena,
+    ) -> &'a [Symbol] {
+        let syms = Self::build_with_arena(ciphertext, params, object_id, extra_repair, arena);
         self.symbols_encoded = self.symbols_encoded.saturating_add(syms.len() as u64);
         syms
     }
 
+    /// Alias for [`Self::repair_with_id_with_arena`].
+    pub fn repair_with_id_into<'a>(
+        &mut self,
+        ciphertext: &[u8],
+        params: crate::FlowParams,
+        object_id: u16,
+        extra_repair: u32,
+        arena: &'a mut FecScratchArena,
+    ) -> &'a [Symbol] {
+        self.repair_with_id_with_arena(ciphertext, params, object_id, extra_repair, arena)
+    }
+
     /// Shared encode: K source + R repair (R clamped to 255-K), K bounds enforced.
-    fn build(
-        &self,
+    fn build_with_arena<'a>(
         ciphertext: &[u8],
         params: crate::FlowParams,
         object_id: u16,
         repair: u32,
-    ) -> Vec<Symbol> {
+        arena: &'a mut FecScratchArena,
+    ) -> &'a [Symbol] {
         let object_size = u32::try_from(ciphertext.len()).expect("frame fits u32");
         let sym = usize::from(params.symbol_size);
         if sym == 0 {
-            return Vec::new();
+            return &[];
         }
         let k = source_count(object_size, params.symbol_size);
-        // Guard: K==0 (empty frame) or K>=255 (no GF(256) codeword room) → no symbols.
+        // Guard: K==0 (empty frame) or K>=255 (no GF(256) codeword room) -> no symbols.
         if k == 0 || k >= 255 {
-            return Vec::new();
+            return &[];
         }
         let max_repair = 255 - k;
         let r = usize::try_from(repair)
@@ -174,63 +348,91 @@ impl FecEncoder {
             rs::Scheme::Cauchy
         };
         let scheme_u8 = scheme.to_u8();
-        let mut out = Vec::with_capacity(k + r);
+
+        let total_symbols = k + r;
+        let shard_len = if k == 1 { ciphertext.len() } else { sym };
+        arena.ensure_capacity(total_symbols, shard_len);
 
         if k == 1 {
-            let source = vec![ciphertext.to_vec()];
-            out.push(Symbol {
-                object_id,
-                object_size,
-                payload_id: pack_payload_id(0, scheme_u8),
-                data: ciphertext.to_vec(),
-            });
+            let sym_slot = &mut arena.symbols[0];
+            sym_slot.object_id = object_id;
+            sym_slot.object_size = object_size;
+            sym_slot.payload_id = pack_payload_id(0, scheme_u8);
+            sym_slot.data.clear();
+            sym_slot.data.extend_from_slice(ciphertext);
+
             if r > 0 {
-                for (m, rep) in rs::encode_repair(&source, r, scheme)
-                    .into_iter()
-                    .enumerate()
-                {
+                let mut coefs = [0u8; 256];
+                for (m, rep_slot) in arena.repair_shards[..r].iter_mut().enumerate() {
+                    let rep = &mut rep_slot[..shard_len];
+                    rep.fill(0);
+                    rs::repair_row_into(scheme, 1, m, &mut coefs[..1]);
+                    rs::mul_add_row(coefs[0], ciphertext, rep);
+
                     let idx = u16::try_from(1 + m).expect("1+m < 255");
-                    out.push(Symbol {
-                        object_id,
-                        object_size,
-                        payload_id: pack_payload_id(idx, scheme_u8),
-                        data: rep,
-                    });
+                    let sym_slot = &mut arena.symbols[1 + m];
+                    sym_slot.object_id = object_id;
+                    sym_slot.object_size = object_size;
+                    sym_slot.payload_id = pack_payload_id(idx, scheme_u8);
+                    sym_slot.data.clear();
+                    sym_slot.data.extend_from_slice(rep);
                 }
             }
         } else {
-            let source = split_source(ciphertext, k, sym);
             let obj_len = usize::try_from(object_size).expect("fits usize");
             let last_source_len = obj_len - (k - 1) * sym;
-            for (i, shard) in source.iter().enumerate() {
-                let data = if i == k - 1 {
-                    shard[..last_source_len].to_vec()
+
+            for i in 0..k {
+                let slice = if i == k - 1 {
+                    &ciphertext[(k - 1) * sym..]
                 } else {
-                    shard.clone()
+                    &ciphertext[i * sym..(i + 1) * sym]
                 };
-                out.push(Symbol {
-                    object_id,
-                    object_size,
-                    payload_id: pack_payload_id(u16::try_from(i).expect("i < 255"), scheme_u8),
-                    data,
-                });
+                let sym_slot = &mut arena.symbols[i];
+                sym_slot.object_id = object_id;
+                sym_slot.object_size = object_size;
+                sym_slot.payload_id =
+                    pack_payload_id(u16::try_from(i).expect("i < 255"), scheme_u8);
+                sym_slot.data.clear();
+                sym_slot.data.extend_from_slice(slice);
             }
+
             if r > 0 {
-                for (m, rep) in rs::encode_repair(&source, r, scheme)
-                    .into_iter()
-                    .enumerate()
-                {
+                if last_source_len < sym {
+                    arena.last_source_pad[..last_source_len]
+                        .copy_from_slice(&ciphertext[(k - 1) * sym..]);
+                    arena.last_source_pad[last_source_len..sym].fill(0);
+                }
+
+                let mut coefs = [0u8; 256];
+                for (m, rep_slot) in arena.repair_shards[..r].iter_mut().enumerate() {
+                    let rep = &mut rep_slot[..sym];
+                    rep.fill(0);
+                    rs::repair_row_into(scheme, k, m, &mut coefs[..k]);
+
+                    for i in 0..k {
+                        let src_slice = if i < k - 1 {
+                            &ciphertext[i * sym..(i + 1) * sym]
+                        } else if last_source_len == sym {
+                            &ciphertext[(k - 1) * sym..]
+                        } else {
+                            &arena.last_source_pad[..sym]
+                        };
+                        rs::mul_add_row(coefs[i], src_slice, rep);
+                    }
+
                     let idx = u16::try_from(k + m).expect("k+m < 255");
-                    out.push(Symbol {
-                        object_id,
-                        object_size,
-                        payload_id: pack_payload_id(idx, scheme_u8),
-                        data: rep,
-                    });
+                    let sym_slot = &mut arena.symbols[k + m];
+                    sym_slot.object_id = object_id;
+                    sym_slot.object_size = object_size;
+                    sym_slot.payload_id = pack_payload_id(idx, scheme_u8);
+                    sym_slot.data.clear();
+                    sym_slot.data.extend_from_slice(rep);
                 }
             }
         }
-        out
+
+        &arena.symbols[..total_symbols]
     }
 }
 

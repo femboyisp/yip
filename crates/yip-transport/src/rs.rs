@@ -46,22 +46,34 @@ impl Scheme {
 /// For `Scheme::Pq`, only `m ∈ {0,1}` is valid (P, Q); callers guard higher `m`
 /// (an out-of-range PQ row here yields an all-zero row, never reached in practice).
 pub fn repair_row(scheme: Scheme, k: usize, m: usize) -> Vec<u8> {
+    let mut row = vec![0u8; k];
+    repair_row_into(scheme, k, m, &mut row);
+    row
+}
+
+/// Write repair row coefficients for repair row `m` into `dst` (which must be at least `k` bytes).
+pub fn repair_row_into(scheme: Scheme, k: usize, m: usize, dst: &mut [u8]) {
+    assert!(dst.len() >= k, "dst buffer must have length >= k");
     match scheme {
-        Scheme::Cauchy => (0..k).map(|i| cauchy_coef(k, m, i)).collect(),
-        Scheme::Pq => match m {
-            0 => vec![1u8; k], // P: all ones (XOR)
-            1 => {
-                // Q: [2^0, 2^1, ..., 2^(k-1)] over GF(256), built incrementally.
-                let mut p = 1u8;
-                (0..k)
-                    .map(|_| {
-                        let c = p;
-                        p = gf256::mul(p, 2);
-                        c
-                    })
-                    .collect()
+        Scheme::Cauchy => {
+            for (i, d) in dst[..k].iter_mut().enumerate() {
+                *d = cauchy_coef(k, m, i);
             }
-            _ => vec![0u8; k],
+        }
+        Scheme::Pq => match m {
+            0 => {
+                dst[..k].fill(1);
+            }
+            1 => {
+                let mut p = 1u8;
+                for d in dst[..k].iter_mut() {
+                    *d = p;
+                    p = gf256::mul(p, 2);
+                }
+            }
+            _ => {
+                dst[..k].fill(0);
+            }
         },
     }
 }
@@ -148,17 +160,29 @@ pub fn mul_add_row(coeff: u8, src: &[u8], dst: &mut [u8]) {
     crate::gf256::mul_slice_into(dst, src, coeff);
 }
 
-/// Generate `r` repair shards from the `source` shards (all equal length) under `scheme`.
-pub fn encode_repair(source: &[Vec<u8>], r: usize, scheme: Scheme) -> Vec<Vec<u8>> {
+/// Generate `r` repair shards from `source` slices directly into `repairs` under `scheme` without heap allocation.
+pub fn encode_repair_into(source: &[&[u8]], repairs: &mut [&mut [u8]], scheme: Scheme) {
     let k = source.len();
-    let len = source.first().map_or(0, Vec::len);
-    let mut repair = vec![vec![0u8; len]; r];
-    for (m, rep) in repair.iter_mut().enumerate() {
-        let coefs = repair_row(scheme, k, m);
-        for (src, &c) in source.iter().zip(coefs.iter()) {
+    if k == 0 || repairs.is_empty() {
+        return;
+    }
+    let mut coefs = [0u8; 256];
+    for (m, rep) in repairs.iter_mut().enumerate() {
+        rep.fill(0);
+        repair_row_into(scheme, k, m, &mut coefs[..k]);
+        for (src, &c) in source.iter().zip(&coefs[..k]) {
             mul_add_row(c, src, rep);
         }
     }
+}
+
+/// Generate `r` repair shards from the `source` shards (all equal length) under `scheme`.
+pub fn encode_repair(source: &[Vec<u8>], r: usize, scheme: Scheme) -> Vec<Vec<u8>> {
+    let len = source.first().map_or(0, Vec::len);
+    let mut repair = vec![vec![0u8; len]; r];
+    let source_slices: Vec<&[u8]> = source.iter().map(|s| s.as_slice()).collect();
+    let mut repair_slices: Vec<&mut [u8]> = repair.iter_mut().map(|s| s.as_mut_slice()).collect();
+    encode_repair_into(&source_slices, &mut repair_slices, scheme);
     repair
 }
 
