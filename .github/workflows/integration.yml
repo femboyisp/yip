@@ -532,7 +532,9 @@ jobs:
           # iproute2 + iputils-ping + tcpdump: what run-ndpi-oracle.sh drives
           # directly (`ip` 33x, `tcpdump` 8x, `ping` 7x). All absent from the
           # runner image, so every attempt died at run-ndpi-oracle.sh:129.
-          sudo apt-get install -y libpcap-dev libjson-c-dev libgcrypt20-dev autoconf automake libtool pkg-config gettext cmake clang libclang-dev iproute2 iputils-ping tcpdump
+          # wireguard-tools: provides `wg` for the port-plausibility oracle.
+          sudo apt-get install -y libpcap-dev libjson-c-dev libgcrypt20-dev autoconf automake libtool pkg-config gettext cmake clang libclang-dev iproute2 iputils-ping tcpdump wireguard-tools
+          sudo modprobe wireguard || true
 
       - name: Install DPI evaluation toolchains (tshark, Suricata, Zeek)
         run: |
