@@ -59,6 +59,12 @@ jobs:
         run: cargo test -p yip-bench --test zero_alloc_hotpath
       - name: Loom weak-memory SPSC verification
         run: RUSTFLAGS="--cfg loom" cargo test --package yip-io --test loom_spsc
+      - name: Miri strict-provenance memory check
+        run: |
+          rustup toolchain install nightly --component miri
+          cargo +nightly miri test --package yip-wire --package yip-verify
+        env:
+          MIRIFLAGS: "-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-disable-isolation"
 
   shear:
     runs-on: ubuntu-latest

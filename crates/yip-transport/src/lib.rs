@@ -9,6 +9,9 @@ pub use rs_simd::{
     wasm_simd_supported,
 };
 
+#[cfg(any(test, kani))]
+pub mod rs_simd_kani;
+
 pub mod rlnc;
 pub use rlnc::{RlncDecoder, RlncEncoder};
 

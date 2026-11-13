@@ -53,6 +53,6 @@ missing_abi = "deny"
 non_ascii_idents = "forbid"
 rust_2018_idioms = { level = "deny", priority = -1 }
 single_use_lifetimes = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(kani)'] }
 unused_lifetimes = "warn"
 unused_macro_rules = "warn"
