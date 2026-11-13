@@ -144,8 +144,8 @@
   <text x="609.00" y="522.00" fill="#8b949e" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">32-byte Public Key</text>
   <line x1="674.00" y1="514.00" x2="692.00" y2="514.00" stroke="#6e7681" stroke-width="1.20" marker-end="url(#arrow-dim)" />
   <rect x="696.00" y="492.00" width="148.00" height="44.00" fill="#083344" rx="4.00" stroke="#22d3ee" stroke-width="1.00" />
-  <text x="770.00" y="508.00" fill="#22d3ee" font-size="9.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="middle">BLAKE2s-128</text>
-  <text x="770.00" y="522.00" fill="#8b949e" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">&quot;yip-node-v1&quot; ‖ pubkey</text>
+  <text x="770.00" y="508.00" fill="#22d3ee" font-size="9.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="middle">BLAKE3 KDF</text>
+  <text x="770.00" y="522.00" fill="#8b949e" font-size="8.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">&quot;yip-v2-overlay-ipv6-addr&quot;</text>
   <line x1="846.00" y1="514.00" x2="864.00" y2="514.00" stroke="#6e7681" stroke-width="1.20" marker-end="url(#arrow-dim)" />
   <rect x="868.00" y="492.00" width="132.00" height="44.00" fill="#064e3b" rx="4.00" stroke="#34d399" stroke-width="1.00" />
   <text x="934.00" y="508.00" fill="#34d399" font-size="9.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="middle">IPv6 Node Address</text>
@@ -163,12 +163,12 @@
   <rect x="546.00" y="598.00" width="454.00" height="98.00" fill="#0d1117" rx="6.00" stroke="#30363d" stroke-width="1.00" />
   <text x="558.00" y="615.00" fill="#8b949e" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">• Self-Certifying: Address IS public key digest; IP spoofing impossible.</text>
   <text x="558.00" y="632.00" fill="#8b949e" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">• Zero Central Infrastructure: Autonomous routing without DHCP/IPAM/coordinators.</text>
-  <text x="558.00" y="649.00" fill="#8b949e" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">• Collision Resistance: 120-bit BLAKE2s digest provides 2^60 collision floor.</text>
+  <text x="558.00" y="649.00" fill="#8b949e" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">• Collision Resistance: 120-bit BLAKE3 digest provides 2^60 collision floor.</text>
   <text x="558.00" y="666.00" fill="#38bdf8" font-size="9.0" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="700" text-anchor="start">• Zero-Trust Admission: Node identity bound to CA Root Cert before admission.</text>
   <text x="558.00" y="683.00" fill="#6e7681" font-size="8.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">• Autonomous Routing: Nodes route directly to fd00::/8 ULA addresses across mesh.</text>
   <rect x="546.00" y="704.00" width="454.00" height="24.00" fill="#1e1b4b" rx="4.00" stroke="#38bdf8" stroke-width="1.00" />
-  <text x="773.00" y="720.00" fill="#38bdf8" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Identity Invariant: Address = 0xfd ‖ BLAKE2s(pubkey)[0..15] (Zero Central IPAM)</text>
+  <text x="773.00" y="720.00" fill="#38bdf8" font-size="9.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" text-anchor="middle">Identity Invariant: Address = 0xfd ‖ BLAKE3(pubkey)[0..15] (Zero Central IPAM)</text>
   <line x1="24.00" y1="780.00" x2="1016.00" y2="780.00" stroke="#30363d" stroke-width="1.00" />
-  <text x="28.00" y="800.00" fill="#6e7681" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="start">Protocol: Noise-IKpsk2 • NIST FIPS 203 ML-KEM-512 • SipHash-CTR/2-4 • ChaCha20-Poly1305 • BLAKE2s</text>
+  <text x="28.00" y="800.00" fill="#6e7681" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="start">Protocol: PQNoise_IKpsk2 • NIST FIPS 203 ML-KEM-512 • SipHash-CTR/2-4 • ChaCha20-Poly1305 • BLAKE3</text>
   <text x="1012.00" y="800.00" fill="#6e7681" font-size="9.0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">Deterministic Vector Wire Format • github.com/femboyisp/yip</text>
 </svg>

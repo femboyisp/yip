@@ -66,7 +66,7 @@ The table below summarizes the core cryptographic primitives employed across `yi
 | **Session Ratchet** | Epoch Rekeying (120s) | In-band ephemeral rekey | 20s dual-receive grace window | Bounded key lifetime, forward secrecy against late compromise |
 | **Header Protection** | SipHash-CTR Keystream | [SipHash](https://131002.net/siphash/) CTR mode | Key: 16 B, Header Mask: 15 B | Wire signature elimination, uniform randomness |
 | **Pre-Filter MAC** | SipHash-1-3 Tag | SipHash-1-3 streaming MAC | Key: 16 B, Tag: 8 B (64-bit) | 16.76 ns unauthorized probe drop before AEAD |
-| **Obfuscation Envelope** | `yip-obf` Masking | SipHash-2-4 CTR + Blake2s | Nonce: 8 B, Key: 16 B | Anti-DPI entropy normalization, packet-length hiding |
+| **Obfuscation Envelope** | `yip-obf` Masking | SipHash-2-4 CTR + BLAKE3 | Nonce: 8 B, Key: 16 B | Anti-DPI entropy normalization, packet-length hiding |
 | **uTLS Emulation** | Chrome 150 Profile | [RFC 8701](https://www.rfc-editor.org/rfc/rfc8701) (GREASE), TLS 1.3 | JA3 / JA4 exact parity | Indistinguishable from legitimate Google Chrome traffic |
 | **TLS Trojan / Relay** | Xray-REALITY Splicing | TLS 1.3 Certificate Borrowing | X25519: 32 B, Poly1305 Tag: 16 B | Active probe redirection via transparent TCP splicing |
 | **Node Identity & CA** | Ed25519 Signatures | [RFC 8032](https://www.rfc-editor.org/rfc/rfc8032) | Public Key: 32 B, Sig: 64 B | Offline CA-signed member authorization and gossip identity |
@@ -87,7 +87,7 @@ The architecture enforces five fundamental security invariants across all implem
 
 ### Protocol Composition: Noise-IKpsk2 + ML-KEM-512
 
-The control plane implements a post-quantum hybrid cryptographic handshake implemented in [`crates/yip-crypto/src/lib.rs`](../crates/yip-crypto/src/lib.rs). It integrates the standard **Noise-IKpsk2** pattern (`Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s`) with NIST FIPS 203 **ML-KEM-512** (Kyber-512):
+The control plane implements a post-quantum hybrid cryptographic handshake implemented in [`crates/yip-crypto/src/lib.rs`](../crates/yip-crypto/src/lib.rs). It integrates the bespoke post-quantum extended **PQNoise-IKpsk2** protocol (`PQNoise_IKpsk2_25519_MLKEM512_ChaChaPoly_BLAKE3`) with NIST FIPS 203 **ML-KEM-512** (Kyber-512) and native BLAKE3 keyed XOF ratchets:
 
 - **IK (Initiator knows Responder static key beforehand)**: The initiator possesses the responder's static public key prior to initiating the handshake (configured via certificate or rendezvous record). The initiator encrypts its own static identity key in the first flight, preserving initiator identity confidentiality against passive eavesdroppers.
 - **psk2 (Pre-Shared Key slot 2)**: Noise provides designated points in its token sequences where external entropy can be injected into the running symmetric chaining key ($ck$) and handshake hash ($h$). `yip` utilizes PSK slot 2 to inject the 32-byte post-quantum shared secret ($ss_{pq}$) derived from ML-KEM-512.
@@ -138,71 +138,62 @@ Both peers derive identical session transport keys (k_send, k_recv)
 |   - Ciphertext (ct):             768 bytes                                    |
 |   - Shared Secret (ss_pq):       32 bytes                                     |
 +-------------------------------------------------------------------------------+
-| Symmetric Cipher & Hash:         ChaCha20-Poly1305 AEAD + BLAKE2s Hash        |
+| Symmetric Cipher & Hash:         ChaCha20-Poly1305 AEAD + BLAKE3 Hash         |
 |   - Handshake Cipher:            ChaCha20-Poly1305 (RFC 8439)                 |
-|   - Transcript Hash:             BLAKE2s-256 (32 bytes)                       |
+|   - Transcript Hash:             BLAKE3 (32 bytes)                            |
 |   - AEAD Tag Size:               16 bytes                                     |
 +-------------------------------------------------------------------------------+
 ```
 
-### Deadlock-Free Single-RTT Key Derivation
+### Native Post-Quantum Handshake Key Derivation
 
-Standard integrations of post-quantum KEMs into Noise often introduce a protocol deadlock:
-- In Noise-IKpsk2, Message 2 contains the `psk` token (`<- e, ee, se, psk`). The receiver cannot decrypt any ciphertext payload in Message 2 until `set_psk(2, psk_bytes)` has been invoked on the handshake state.
-- However, if the KEM ciphertext $ct$ is transmitted *inside* the encrypted payload of Message 2, the initiator cannot read $ct$ without first decrypting the payload, creating a circular dependency.
-
-`yip` resolves this deadlock through outer-envelope framing:
-1. The Responder generates $(ct, ss_{pq})$ via `pq_encapsulate(&ek_A)`.
-2. The Responder calls `set_psk(2, &ss_pq)` on its `snow::HandshakeState`, processes the Noise message tokens, and produces the encrypted Noise Message 2.
-3. The Responder constructs the on-wire datagram by placing $ct$ (768 bytes) in the **outer wire frame envelope** directly ahead of the Noise message bytes (bytes `[4..772]`).
-4. Upon receiving Message 2, the Initiator extracts $ct$ from bytes `[4..772]` **before** invoking Noise decryption.
-5. The Initiator decapsulates $ss_{pq} = \text{pq\_decapsulate}(dk_A, ct)$, injects $ss_{pq}$ via `inner.set_psk(2, &ss_pq)`, and immediately scrubs $dk_A$ from memory.
-6. The Initiator then feeds the remainder of Message 2 (`&msg[772..]`) into `inner.read_message()`, completing the handshake in a single round trip ($1.0 \times \text{RTT}$) with zero extra protocol flights.
+Standard integrations of post-quantum KEMs into Noise often introduce a protocol deadlock or require awkward outer-frame envelopes. `yip` eliminates this via native **`PQNoise_IKpsk2_25519_MLKEM512_ChaChaPoly_BLAKE3`**:
+1. The Initiator encapsulates against the Responder's known static ML-KEM-512 encapsulation key ($rs_{\text{MLKEM512\_EK}}$), generating $(ct, ss_{\text{KEM}})$.
+2. The Initiator transmits $ct$ (768 bytes) directly in Flight 1 following the ephemeral key $e_i$ and encrypted static key $s_i$.
+3. The KEM shared secret $ss_{\text{KEM}}$ is ratcheted directly into the chaining key $ck$ via a single-pass BLAKE3 Keyed XOF (`MixKey`), deriving cipher key $k_3$.
+4. The Initiator's application payload (or admission certificate) is encrypted under $k_3$ with an authenticated Poly1305 AEAD tag over $ad = h$. This guarantees that $ct$ and $ss_{\text{KEM}}$ are cryptographically authenticated before the Responder commits state.
+5. Upon receiving Flight 1, the Responder parses $e_i$, computes $DH(e_i, rs)$, decrypts $s_i$, computes $DH(s_i, rs)$, decapsulates $ss_{\text{KEM}} = \text{pq\_decapsulate}(dk, ct)$ directly on the stack, ratchets $ck$, and verifies the Flight 1 payload MAC.
+6. In Flight 2, the Responder generates fresh ephemeral $e_r$, computes $DH(e_r, e_i)$ and $DH(e_r, s_i)$, ratchets the pre-shared key via BLAKE3 XOF (`MixKeyAndHash`), encrypts the response payload, and calls `Split()` to derive transport keys.
 
 ### Sub-1,200B Datagram Wire Budget (`OBF_MTU_BUDGET`)
 
 To prevent Path MTU (PMTU) blackholing and avoid IP fragmentation across restrictive internet paths (such as cellular networks, nested tunnels, PPPoE, and international transit links), both handshake flights strictly adhere to `OBF_MTU_BUDGET = 1200` bytes:
 
-#### Message 1 (Initiator $\to$ Responder): 1,028 Bytes Total
+#### Message 1 (Initiator $\to$ Responder): 864 Bytes Base (~1,028 Bytes with Certificate)
 
 ```
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       Wire Header (4 B)                       |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                                                               |
-+                 ML-KEM-512 Encapsulation Key                  +
-|                          ek_A (800 B)                         |
-|                                                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|       Packet Type (1 B)       |                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
 |                 Noise Ephemeral Public Key e_A (32 B)         |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|       Encrypted Static Public Key s_A + CA Certificate        |
-|                  + Poly1305 AEAD Tag (144 B)                  |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-Total: 4 + 800 + 32 + 144 = 1,028 Bytes (<= 1,200 B OBF_MTU_BUDGET)
-```
-
-#### Message 2 (Responder $\to$ Initiator): 948 Bytes Total
-
-```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       Wire Header (4 B)                       |
+|       Encrypted Static Public Key s_A + Poly1305 Tag (48 B)   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                                                               |
 +                   ML-KEM-512 Ciphertext                       +
 |                          ct (768 B)                           |
 |                                                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|       Encrypted Payload (Admission Cert) + Poly1305 (16+ B)   |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+Base Framing: 1 + 32 + 48 + 768 + 16 = 865 Bytes (<= 1,200 B OBF_MTU_BUDGET)
+```
+
+#### Message 2 (Responder $\to$ Initiator): 48 Bytes Base (~212 Bytes with Certificate)
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|       Packet Type (1 B)       |                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
 |                 Noise Ephemeral Public Key e_B (32 B)         |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|            Encrypted Responder CA Certificate                 |
-|                  + Poly1305 AEAD Tag (144 B)                  |
+|       Encrypted Payload (Responder Cert) + Poly1305 (16+ B)   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-Total: 4 + 768 + 32 + 144 = 948 Bytes (<= 1,200 B OBF_MTU_BUDGET)
+Base Framing: 1 + 32 + 16 = 49 Bytes (<= 1,200 B OBF_MTU_BUDGET)
 ```
 
 ### FIPS 203 §7.2 Modulus Verification & IND-CCA2 Security
@@ -220,7 +211,7 @@ Every received ML-KEM-512 encapsulation key ($ek_A$) undergoes strict cryptograp
 State-level intelligence agencies and adversaries routinely record petabytes of encrypted transit traffic on transatlantic cables and IXPs under the "Harvest-Now, Decrypt-Later" (HNDL) doctrine. When a Cryptographically Relevant Quantum Computer (CRQC) running Shor's algorithm becomes operational, recorded classical sessions using standard Diffie-Hellman (Curve25519 or NIST P-256) or RSA will be decrypted retrospectively.
 
 `yip` neutralizes HNDL attacks through its dual-entropy hybrid design:
-- The session key derivation binds both the classical Diffie-Hellman shared secret ($ss_{dh} = \text{X25519}(e_A, e_B)$) and the quantum-resistant lattice shared secret ($ss_{pq} = \text{ML-KEM-512}(ek_A, ct)$) into the Noise HKDF-BLAKE2s ratchet.
+- The session key derivation binds both the classical Diffie-Hellman shared secret ($ss_{dh} = \text{X25519}(e_A, e_B)$) and the quantum-resistant lattice shared secret ($ss_{pq} = \text{ML-KEM-512}(ek_A, ct)$) into the native PQNoise BLAKE3 keyed XOF ratchet.
 - Even if a quantum adversary retrospectively solves the discrete logarithm problem on Curve25519, the session keys remain protected by the Module Learning With Errors (M-LWE) lattice problem of ML-KEM-512.
 - Conversely, if a future mathematical advance identifies unexpected structure in ML-KEM lattices, the 128-bit classical security margin of Curve25519 remains fully intact.
 
@@ -230,7 +221,7 @@ State-level intelligence agencies and adversaries routinely record petabytes of 
 
 ### Data-Plane AEAD: ChaCha20-Poly1305
 
-Once the Noise-IKpsk2 handshake completes, transport keys are extracted from the Noise state via `dangerously_get_raw_split()` and installed into `ring`'s assembly-optimized ChaCha20-Poly1305 implementation ([`crates/yip-crypto/src/lib.rs`](../crates/yip-crypto/src/lib.rs#L550-L649)).
+Once the PQNoise handshake completes, transport keys are extracted directly via `split()` (`Tag 0x03` BLAKE3 Keyed XOF) and installed into `ring`'s assembly-optimized ChaCha20-Poly1305 implementation ([`crates/yip-crypto/src/lib.rs`](../crates/yip-crypto/src/lib.rs)).
 
 - **Cipher**: ChaCha20 stream cipher with 20 rounds (RFC 8439).
 - **Authenticator**: Poly1305 one-time authenticator evaluating a polynomial over the Galois field $\text{GF}(2^{130} - 5)$ with a 128-bit authenticating tag.
@@ -615,7 +606,7 @@ The table below provides a quick reference to all cryptographic algorithms, key 
 | **PQ KEM** | NIST FIPS 203 ML-KEM-512 | `ek`: 800 B, `dk`: 1,632 B, `ct`: 768 B, `ss`: 32 B | [`crates/yip-crypto/src/lib.rs`](../crates/yip-crypto/src/lib.rs#L46-L118) | Quantum-safe key encapsulation |
 | **Modulus Check** | FIPS 203 §7.2 ByteDecode_12 | Modulus $q = 3329$ | [`crates/yip-crypto/src/lib.rs`](../crates/yip-crypto/src/lib.rs#L85-L96) | Input validation, attack prevention |
 | **Classical DH** | X25519 (RFC 7748) | 32 B Public, 32 B Private | [`crates/yip-crypto/src/lib.rs`](../crates/yip-crypto/src/lib.rs#L25-L44) | Classical 128-bit Diffie-Hellman |
-| **Noise Pattern** | `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` | Transcript: 32 B | [`crates/yip-crypto/src/lib.rs`](../crates/yip-crypto/src/lib.rs#L22-L24) | 1-RTT mutual authentication & KDF |
+| **Noise Pattern** | `PQNoise_IKpsk2_25519_MLKEM512_ChaChaPoly_BLAKE3` | Transcript: 32 B | [`crates/yip-crypto/src/handshake.rs`](../crates/yip-crypto/src/handshake.rs) | 1-RTT mutual authentication & KDF |
 | **Data AEAD** | ChaCha20-Poly1305 (RFC 8439) | Key: 32 B, Nonce: 12 B, Tag: 16 B | [`crates/yip-crypto/src/lib.rs`](../crates/yip-crypto/src/lib.rs#L550-L649) | Inner payload confidentiality & integrity |
 | **Replay Window** | Monotonic Circular Bit Ring | 131,072 bits (16 KB) / 8,192 bits (1 KB) | [`crates/yip-crypto/src/lib.rs`](../crates/yip-crypto/src/lib.rs#L120-L297) | Anti-replay with zero false positives |
 | **Wire Codec** | SipHash-CTR Keystream | Key: 16 B, Header: 15 B | [`crates/yip-wire/src/lib.rs`](../crates/yip-wire/src/lib.rs#L61-L90) | Keyed header protection, zero magic bytes |
@@ -626,4 +617,4 @@ The table below provides a quick reference to all cryptographic algorithms, key 
 | **REALITY Front** | TLS 1.3 Certificate Borrowing | Auth Seal: 32 B in `legacy_session_id` | [`bin/yip-rendezvous/src/reality.rs`](../bin/yip-rendezvous/src/reality.rs) | Active probe redirection via TCP splicing |
 | **CA Signatures** | Ed25519 (RFC 8032) | Public: 32 B, Signature: 64 B | [`crates/yip-membership/src/cert.rs`](../crates/yip-membership/src/cert.rs#L1-L50) | Node authorization without online PKI |
 | **Threshold CA** | RFC 9591 FROST(Ed25519, SHA-512) | Group PK: 32 B, Share: 32 B, Sig: 64 B | [`bin/yip-ca/src/threshold/mod.rs`](../bin/yip-ca/src/threshold/mod.rs) | *t*-of-*n* decentralized issuance & ROAST quorum |
-| **Self-Cert IPv6** | BLAKE2s Variable Digest (`fd00::/8`) | 128-bit IPv6 Address | [`bin/yipd/src/addr.rs`](../bin/yipd/src/addr.rs) | Cryptographic anti-spoofing overlay IP |
+| **Self-Cert IPv6** | BLAKE3 Key Derivation (`fd00::/8`) | 128-bit IPv6 Address | [`bin/yipd/src/addr.rs`](../bin/yipd/src/addr.rs) | Cryptographic anti-spoofing overlay IP |

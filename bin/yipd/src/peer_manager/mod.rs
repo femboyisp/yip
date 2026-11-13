@@ -1066,7 +1066,7 @@ impl PeerManager {
             node_addr: p.addr.to_string(),
             endpoint: p.endpoint.map(|ep| ep.to_string()),
             session_state,
-            cipher_suite: "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s + ML-KEM-512".to_string(),
+            cipher_suite: "PQNoise_IKpsk2_25519_MLKEM512_ChaChaPoly_BLAKE3".to_string(),
             current_epoch,
             current_epoch_age_secs,
             next_epoch,

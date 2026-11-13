@@ -225,7 +225,7 @@ fn test_af_xdp_zero_copy_rx_ring_processing_simulation() {
     let mut mock = MockDispatch {
         received_packets: Vec::new(),
     };
-    let dummy_src = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 51820));
+    let dummy_src = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 443));
 
     // Drain descriptors from RX ring and verify chunk slicing and replenish logic
     let mut drained_descs = [XskDesc::default(); 32];

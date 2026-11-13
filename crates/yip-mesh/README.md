@@ -10,7 +10,7 @@ The unified Rust library and SDK for the **yip** high-performance overlay networ
 
 The `yip-mesh` crate provides modular facade access to all underlying protocol components:
 
-- **`crypto`** (default): AEAD ciphers (ChaCha20-Poly1305, AES-256-GCM, AES-128-GCM), Noise-IK handshakes, BLAKE2s hashing, and key derivations.
+- **`crypto`** (default): AEAD ciphers (ChaCha20-Poly1305), post-quantum hybrid Noise handshakes, BLAKE3 ratchets, and key derivations.
 - **`wire`** (default): Zero-allocation framing, wire codec parsing, header obfuscation, and control frame encoding.
 - **`transport`** (default): Slotted Reed-Solomon Forward Error Correction (FEC), sliding window packet reassembly, and selective ARQ.
 - **`membership`** (default): Cryptographic node identity, self-certifying IPv6 mesh addresses, certificate verification, root sets, and anti-entropy gossip.

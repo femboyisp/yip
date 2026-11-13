@@ -3742,7 +3742,7 @@ mod tests {
             node_addr: "200:1::1".into(),
             endpoint: Some("127.0.0.1:51820".into()),
             session_state: "Established".into(),
-            cipher_suite: "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s".into(),
+            cipher_suite: "PQNoise_IKpsk2_25519_MLKEM512_ChaChaPoly_BLAKE3".into(),
             current_epoch: Some(1),
             current_epoch_age_secs: Some(10),
             next_epoch: None,

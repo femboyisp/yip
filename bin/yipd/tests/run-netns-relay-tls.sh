@@ -70,8 +70,8 @@ IP_B="10.81.0.2"
 IP_R_B="10.81.0.1"   # R's address on B's subnet
 PREFIX="24"
 
-PORT_A="51820"
-PORT_B="51820"
+PORT_A="443"
+PORT_B="443"
 RDV_UDP_PORT="51821"   # bound by yip-rendezvous but never reachable/used —
                         # UDP is blocked in A/B and relay_only mode never
                         # tries it anyway.

@@ -7,15 +7,10 @@ use yip_wire::Frame;
 /// Derive the wire codec's (auth_key, hp_key) from the session channel binding.
 /// Both peers compute the same binding, so both derive the same keys.
 pub fn derive_wire_keys(channel_binding: &[u8; 32]) -> ([u8; 16], [u8; 16]) {
-    use blake2::{Blake2s256, Digest};
     let mut auth = [0u8; 16];
     let mut hp = [0u8; 16];
-    let a = Blake2s256::new_with_prefix(b"yip wire auth")
-        .chain_update(channel_binding)
-        .finalize();
-    let h = Blake2s256::new_with_prefix(b"yip wire hp")
-        .chain_update(channel_binding)
-        .finalize();
+    let a = blake3::derive_key("yip wire auth", channel_binding);
+    let h = blake3::derive_key("yip wire hp", channel_binding);
     auth.copy_from_slice(&a[..16]);
     hp.copy_from_slice(&h[..16]);
     (auth, hp)

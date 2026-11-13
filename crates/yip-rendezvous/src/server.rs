@@ -158,10 +158,7 @@ impl RendezvousServer {
         let min_seq = now_wall_ms.saturating_sub(REG_TTL_MS.saturating_add(skew_ms));
         let max_seq = now_wall_ms.saturating_add(skew_ms);
 
-        if record.seq < min_seq || record.seq > max_seq {
-            return false;
-        }
-        true
+        record.seq >= min_seq && record.seq <= max_seq
     }
 
     /// True iff `src` is within its per-window budget (and records the hit).

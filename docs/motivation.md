@@ -474,7 +474,7 @@ If your goal is auditing the cryptographic foundations, session ratchets, threat
 
 1. **Executive Security Architecture and Primitives:**
    - Read [04-security-and-threat-model.md#1-executive-security-summary--cryptographic-primitives](04-security-and-threat-model.md#1-executive-security-summary--cryptographic-primitives).
-   - Verify primitive selections: X25519, ML-KEM-512 (Kyber-512, FIPS 203), BLAKE2s-256, ChaCha20-Poly1305, and SipHash-1-3.
+   - Verify primitive selections: X25519, ML-KEM-512 (Kyber-512, FIPS 203), BLAKE3, ChaCha20-Poly1305, and SipHash-1-3.
 2. **Post-Quantum Hybrid Key Exchange:**
    - Study [04-security-and-threat-model.md#2-post-quantum-hybrid-handshake-architecture](04-security-and-threat-model.md#2-post-quantum-hybrid-handshake-architecture) and [03-architecture.md#2-out-of-band-cryptographic-control-plane](03-architecture.md#2-out-of-band-cryptographic-control-plane).
    - Review the Noise-IKpsk2 handshake extension incorporating ML-KEM-512 to defend against Harvest-Now-Decrypt-Later (HNDL) quantum attacks.

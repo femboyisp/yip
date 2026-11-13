@@ -2373,10 +2373,10 @@ fn test_peer_manager_pq_hybrid_handshake_datagrams_fit_mtu_budget() {
         "rekey Resp with cert must stay within OBF_MTU_BUDGET, got {}",
         resp_pkt.len()
     );
-    // Msg 2 contains: 1 ptype + 768 ML-KEM ct + 32 Noise ephemeral + cert (~128) + 16 Poly1305 MAC tag
+    // Msg 2 contains: 1 ptype + 32 Noise ephemeral + cert (~164) + 16 Poly1305 MAC tag
     assert!(
-        resp_pkt.len() >= 900 && resp_pkt.len() <= 1000,
-        "rekey Resp with cert should be around 945 bytes, got {}",
+        (180..=350).contains(&resp_pkt.len()),
+        "rekey Resp with cert should be around 212 bytes, got {}",
         resp_pkt.len()
     );
 

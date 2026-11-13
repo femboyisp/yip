@@ -6,8 +6,6 @@
 //! yip-wire tag), which fail-closed on a wrong key.
 #![forbid(unsafe_code)]
 
-use blake2::digest::{Update, VariableOutput};
-use blake2::Blake2sVar;
 use siphasher::sip::SipHasher24;
 use std::hash::Hasher;
 
@@ -82,16 +80,14 @@ impl XorShift64 {
     }
 }
 
-const DOMAIN: &[u8] = b"yip-obf-v1";
+pub const OBF_KEY_CONTEXT_V2: &str = "yip-obf-v1";
 
 /// Derive the 16-byte SipHash key from the network `obf_psk` (or any keying
 /// material — the caller also uses this to derive a per-session key from hp_key).
 pub fn derive_key(psk: &[u8]) -> [u8; 16] {
-    let mut h = Blake2sVar::new(16).expect("16 is a valid blake2s output len");
-    h.update(DOMAIN);
-    h.update(psk);
+    let digest = blake3::derive_key(OBF_KEY_CONTEXT_V2, psk);
     let mut out = [0u8; 16];
-    h.finalize_variable(&mut out).expect("len ok");
+    out.copy_from_slice(&digest[0..16]);
     out
 }
 

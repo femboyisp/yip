@@ -234,10 +234,10 @@ flowchart TD
 - **Flat Open-Addressing Tables**: Replaces dynamic pointer maps with bounded flat slot tables using SplitMix64 fast hashing and backward-shift deletion with zero tombstones.
 
 ### 4. Post-Quantum Cryptography & Identity
-- **Single-RTT Hybrid Handshake**: Blends Noise_IKpsk2 (Curve25519) with NIST FIPS 203 ML-KEM-512 (Kyber) within compact datagrams strictly under the 1200-byte internet MTU floor.
+- **Single-RTT Hybrid Handshake**: Blends native zero-allocation PQNoise_IKpsk2 (Curve25519) with NIST FIPS 203 ML-KEM-512 (Kyber) within compact datagrams strictly under the 1200-byte internet MTU floor.
 - **120-Second Epoch Ratcheting**: Automated forward-secrecy key rotation with a 20-second dual-receive grace window prevents dropped packets during rekey transitions.
 - **Rigorous Memory Hygiene**: Cryptographic secrets implement explicit `Zeroize` traits to purge private key material from memory buffers immediately upon drop.
-- **Self-Certifying IPv6 Addressing**: Cryptographic BLAKE2s-120 hashing derives immutable, anti-spoofing overlay addresses in the `fd00::/8` ULA space directly from node public keys.
+- **Self-Certifying IPv6 Addressing**: Cryptographic BLAKE3 key derivation derives immutable, anti-spoofing overlay addresses in the `fd00::/8` ULA space directly from node public keys.
 
 ### 5. 4-Mode Anti-DPI Armor
 - **`raw-obf`**: SipHash-CTR keystream masking with a 64-bit SipHash-1-3 coverage authentication tag strips all fixed wire headers, leaving uniform high-entropy payload noise.
@@ -317,7 +317,7 @@ Full methodology and reproducible test harnesses are documented in [`crates/yip-
 ├───────────────────────────────────────┼───────────────────────────────────────┤
 │ ✔ Replay & Identity Spoofing          │ ✘ Subverted Host Kernels              │
 │   TAI64N monotonic freshness and      │   The daemon relies on Linux memory   │
-│   BLAKE2s cryptographic addressing    │   isolation and privileged namespaces │
+│   BLAKE3 cryptographic addressing     │   isolation and privileged namespaces │
 └───────────────────────────────────────┴───────────────────────────────────────┘
 ```
 
@@ -355,7 +355,7 @@ yip-mesh = { version = "0.1", features = ["full"] }
 
 ### Modular Feature Flags
 
-- **`crypto`** (default): AEAD ciphers (ChaCha20-Poly1305, AES-256-GCM, AES-128-GCM), Noise-IK handshakes, BLAKE2s hashing, and key derivations.
+- **`crypto`** (default): AEAD ciphers (ChaCha20-Poly1305), native zero-alloc PQNoise handshakes, BLAKE3 keyed ratchets, and key derivations.
 - **`wire`** (default): Zero-allocation framing, wire codec parsing, header obfuscation, and control frame encoding.
 - **`transport`** (default): Slotted Reed-Solomon Forward Error Correction (FEC), sliding window packet reassembly, and selective ARQ.
 - **`membership`** (default): Cryptographic node identity, self-certifying IPv6 mesh addresses, certificate verification, root sets, and anti-entropy gossip.

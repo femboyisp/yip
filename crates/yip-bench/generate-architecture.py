@@ -7,7 +7,7 @@ Generates:
   assets/architecture.svg
 
 Visualizes yip's dual-path pipeline:
-  1. Top: Control Plane (#6366f1) - BLAKE2s, CA-Gated Mesh (yip-ca), NAT Hole-Punching & Relay (yip-rendezvous)
+  1. Top: Control Plane (#6366f1) - BLAKE3, CA-Gated Mesh (yip-ca), NAT Hole-Punching & Relay (yip-rendezvous)
   2. Middle: Data Plane Pipeline (#06b6d4) - TUN/TAP (64KB GSO/GRO), SPSC Shards, ChaCha20-Poly1305, Systematic Cauchy RS-FEC (#f97316)
   3. Bottom Dual-Path:
      - Fast Path (#10b981): eBPF AF_XDP Zero-Copy (XSKMAP) + Vectorized epoll sendmmsg -> 40+ Gbps
@@ -167,7 +167,7 @@ def build_architecture_svg() -> str:
     lines.append(f'    <rect x="{m1_x:.2f}" y="{card_y:.2f}" width="{card_w:.2f}" height="{card_h:.2f}" rx="6.00" fill="{COLOR_SUB_CARD_BG}" stroke="{COLOR_CANVAS_BORDER}" stroke-width="1.00" />')
     lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 17:.2f}" font-family="{FONT_SANS}" font-size="12" font-weight="700" fill="{COLOR_TEXT_WHITE}">PQ Hybrid Handshake &amp; KDF</text>')
     lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 33:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• ML-KEM-512 (FIPS 203) + X25519</text>')
-    lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 49:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• Noise-IKpsk2 Token Sequencing</text>')
+    lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 49:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_TEXT_MUTED}">• PQNoise-IKpsk2 Token Sequencing</text>')
     lines.append(f'    <text x="{m1_x + 12:.2f}" y="{card_y + 65:.2f}" font-family="{FONT_SANS}" font-size="10.5" fill="{COLOR_CONTROL_LIGHT}">• Ephemeral Rekeying (120s Ratchet)</text>')
 
     # Module 2: Decentralized Threshold CA (yip-ca)
@@ -190,7 +190,7 @@ def build_architecture_svg() -> str:
     # Connectors: Control Plane -> Data Plane
     lines.append('  <!-- Connectors: Control to Data Plane -->')
     lines.append('  <g id="connectors-control-to-data">')
-    # Connector 1: Keys/Tokens from BLAKE2s to AEAD
+    # Connector 1: Keys/Tokens from PQNoise/BLAKE3 to AEAD
     lines.append(f'    <path d="M 192.00 182.00 L 192.00 206.00 L 644.00 206.00 L 644.00 232.00" fill="none" stroke="{COLOR_CONTROL}" stroke-width="1.40" stroke-dasharray="3,3" marker-end="url(#arrow-ctrl)" />')
     lines.append(f'    <rect x="250.00" y="198.00" width="168.00" height="16.00" rx="3.00" fill="{COLOR_CANVAS_BG}" stroke="{COLOR_CONTROL}" stroke-width="0.80" />')
     lines.append(f'    <text x="334.00" y="210.00" font-family="{FONT_MONO}" font-size="9" font-weight="600" fill="{COLOR_CONTROL_LIGHT}" text-anchor="middle">Hybrid Keys &amp; Ratchet State</text>')

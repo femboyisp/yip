@@ -31,8 +31,8 @@ impl LossReport {
         bytes.extend_from_slice(&self.delivered_count.to_be_bytes());
         bytes.extend_from_slice(&self.high_counter.to_be_bytes());
         bytes.extend_from_slice(&u16::try_from(n_missing).unwrap().to_be_bytes());
-        for i in 0..n_missing {
-            bytes.extend_from_slice(&self.missing[i].to_be_bytes());
+        for item in self.missing.iter().take(n_missing) {
+            bytes.extend_from_slice(&item.to_be_bytes());
         }
         bytes
     }
@@ -183,8 +183,8 @@ mod tests {
             "missing should be capped at MAX_NACK"
         );
         // Verify the first MAX_NACK values are correctly decoded
-        for i in 0..MAX_NACK {
-            assert_eq!(report.missing[i], u64::try_from(i).unwrap());
+        for (i, &val) in report.missing.iter().take(MAX_NACK).enumerate() {
+            assert_eq!(val, u64::try_from(i).unwrap());
         }
     }
 }

@@ -34,14 +34,14 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
-TMPDIR_TEST="$(mktemp -d /tmp/yip-iperf-compare.XXXXXX)"
-chmod 755 "$TMPDIR_TEST"
+TMPDIR_TEST="$(mktemp -d /dev/shm/yip-iperf-compare.XXXXXX 2>/dev/null || mktemp -d /tmp/yip-iperf-compare.XXXXXX)"
+chmod 777 "$TMPDIR_TEST"
 
 # ── yip ───────────────────────────────────────────────────────────────────────
 NS_YA="ipfYA"; NS_YB="ipfYB"; VYA="ipfvYA"; VYB="ipfvYB"
 VYA_IP="10.10.0.1"; VYB_IP="10.10.0.2"
 TUN_YA_IP="10.11.0.1"; TUN_YB_IP="10.11.0.2"
-YPORT_A="51850"; YPORT_B="51851"; TUN_DEV="yip0"; YIP_MTU=1184
+YPORT_A="443"; YPORT_B="443"; TUN_DEV="yip0"; YIP_MTU=1184
 PID_YA=""; PID_YB=""
 
 # ── WireGuard ─────────────────────────────────────────────────────────────────
@@ -298,12 +298,13 @@ setup_wg() {
     fi
     printf '%s' "$privA" > "$TMPDIR_TEST/wg_a"
     printf '%s' "$privB" > "$TMPDIR_TEST/wg_b"
-    chmod 600 "$TMPDIR_TEST/wg_a" "$TMPDIR_TEST/wg_b"
-    if ! ip netns exec "$NS_WA" wg set wg0 private-key "$TMPDIR_TEST/wg_a" listen-port "$WPORT_A" \
-            peer "$pubB" endpoint "${VWB_IP}:${WPORT_B}" allowed-ips "${TUN_WB_IP}/32" 2>/dev/null || \
-       ! ip netns exec "$NS_WB" wg set wg0 private-key "$TMPDIR_TEST/wg_b" listen-port "$WPORT_B" \
-            peer "$pubA" endpoint "${VWA_IP}:${WPORT_A}" allowed-ips "${TUN_WA_IP}/32" 2>/dev/null; then
-        echo "[wg] SKIP: wg set configuration failed"; WG_AVAILABLE=false; return
+    chmod 644 "$TMPDIR_TEST/wg_a" "$TMPDIR_TEST/wg_b"
+    local wg_err=""
+    if ! wg_err="$(ip netns exec "$NS_WA" wg set wg0 private-key "$TMPDIR_TEST/wg_a" listen-port "$WPORT_A" \
+            peer "$pubB" endpoint "${VWB_IP}:${WPORT_B}" allowed-ips "${TUN_WB_IP}/32" 2>&1)" || \
+       ! wg_err="$(ip netns exec "$NS_WB" wg set wg0 private-key "$TMPDIR_TEST/wg_b" listen-port "$WPORT_B" \
+            peer "$pubA" endpoint "${VWA_IP}:${WPORT_A}" allowed-ips "${TUN_WA_IP}/32" 2>&1)"; then
+        echo "[wg] SKIP: wg set configuration failed: $wg_err"; WG_AVAILABLE=false; return
     fi
     if ! ip netns exec "$NS_WA" ip addr add "${TUN_WA_IP}/24" dev wg0 2>/dev/null || \
        ! ip netns exec "$NS_WB" ip addr add "${TUN_WB_IP}/24" dev wg0 2>/dev/null || \

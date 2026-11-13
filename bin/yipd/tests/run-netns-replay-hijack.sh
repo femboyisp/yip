@@ -142,8 +142,8 @@ IP_S="10.88.0.2"
 IP_T_S="10.88.0.1"   # T's address on S's subnet
 PREFIX="24"
 
-PORT_A="51820"
-PORT_B="51820"
+PORT_A="443"
+PORT_B="443"
 RDV_PORT="51821"
 TUN_DEV="yip0"
 

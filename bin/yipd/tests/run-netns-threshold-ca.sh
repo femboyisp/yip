@@ -159,7 +159,7 @@ echo "Certificate issued successfully ($(wc -c < "$TMPDIR/node.cert") bytes)."
 
 echo "[5/6] Starting yipd with threshold-issued certificate..."
 # Dummy signed rootset trusting root_pub
-echo "$ROOT_PUB 10.99.0.254:51820" > "$TMPDIR/roots.txt"
+echo "$ROOT_PUB 10.99.0.254:443" > "$TMPDIR/roots.txt"
 # Create rootset file
 # We create a dummy rootset hex by running yip-ca
 ROOT_GENKEY="$("$YIPCA" genkey)"
@@ -173,7 +173,7 @@ xxd -p -c 10000 "$TMPDIR/node.cert" > "$TMPDIR/node.cert.hex"
 cat <<EOF > "$TMPDIR/node.conf"
 local_private=$NODE_PRIV
 local_public=$NODE_PUB
-listen=$IP_NODE:51820
+listen=$IP_NODE:443
 device=yip0
 ca_public=$ROOT_PUB
 ca_public=$ROOT_GEN_PUB

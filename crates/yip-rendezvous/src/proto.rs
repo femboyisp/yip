@@ -1,52 +1,73 @@
 //! Node-id derivation and the rendezvous wire `Message` codec.
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use blake2::digest::{Update, VariableOutput};
-use blake2::Blake2sVar;
+use subtle::ConstantTimeEq;
 use yip_membership::Record;
 
-/// Domain separation so node-id can't collide with the mesh-address derivation.
-const DOMAIN: &[u8] = b"yip-rdv-v1";
+pub const RENDEZVOUS_NODE_ID_CONTEXT_V2: &str = "yip-v2-rendezvous-node-id";
+pub const RENDEZVOUS_REG_AUTH_KEY_CONTEXT_V2: &str = "yip-v2-reg-auth-key";
 
-/// A rendezvous identity: `BLAKE2s(DOMAIN || pubkey)[..16]`. Distinct domain
-/// from `yipd`'s `node_addr` so the two derivations never coincide.
+/// A rendezvous identity: `BLAKE3-KDF(RENDEZVOUS_NODE_ID_CONTEXT_V2, pubkey)[..16]`.
+/// Distinct domain from `yipd`'s `node_addr` so the two derivations never coincide.
 pub type NodeId = [u8; 16];
 
-/// Derive a node's rendezvous id from its X25519 public key.
+/// Derive a node's rendezvous id from its X25519 public key using BLAKE3.
+pub fn derive_node_id(public_key: &[u8; 32]) -> NodeId {
+    let digest = blake3::derive_key(RENDEZVOUS_NODE_ID_CONTEXT_V2, public_key);
+    let mut node_id = [0u8; 16];
+    node_id.copy_from_slice(&digest[0..16]);
+    node_id
+}
+
+/// Derive a node's rendezvous id from its X25519 public key (alias for `derive_node_id`).
 pub fn node_id(pubkey: &[u8; 32]) -> NodeId {
-    let mut h = Blake2sVar::new(16).expect("16 is a valid blake2s output len");
-    h.update(DOMAIN);
-    h.update(pubkey);
-    let mut out = [0u8; 16];
-    h.finalize_variable(&mut out).expect("output len matches");
-    out
+    derive_node_id(pubkey)
 }
 
-const DOMAIN_REG_AUTH: &[u8] = b"yip-rendezvous-v1-reg-auth";
-
-/// Compute a 128-bit BLAKE2s-MAC for authenticated rootless rendezvous registration.
-pub fn compute_register_mac(obf_key: &[u8; 16], node: &NodeId, counter: u64) -> [u8; 16] {
-    let mut h = Blake2sVar::new(16).expect("16 is a valid blake2s output len");
-    h.update(DOMAIN_REG_AUTH);
-    h.update(obf_key);
-    h.update(node);
-    h.update(&counter.to_be_bytes());
-    let mut out = [0u8; 16];
-    h.finalize_variable(&mut out).expect("len matches");
-    out
+/// Compute a 128-bit BLAKE3 registration MAC.
+pub fn compute_register_mac(key: &[u8; 32], payload: &[u8]) -> [u8; 16] {
+    let hash = blake3::keyed_hash(key, payload);
+    let mut mac = [0u8; 16];
+    mac.copy_from_slice(&hash.as_bytes()[0..16]);
+    mac
 }
 
-/// Constant-time verification of `mac` against the expected BLAKE2s-MAC.
-pub fn verify_register_mac(
+/// Constant-time verification of `mac` against the expected BLAKE3 registration MAC.
+pub fn verify_register_mac(key: &[u8; 32], payload: &[u8], mac: &[u8; 16]) -> bool {
+    let expected = compute_register_mac(key, payload);
+    expected.ct_eq(mac).into()
+}
+
+/// 24-byte payload for registration MAC: `node(16) || counter(8)`.
+pub fn register_auth_payload(node: &NodeId, counter: u64) -> [u8; 24] {
+    let mut payload = [0u8; 24];
+    payload[0..16].copy_from_slice(node);
+    payload[16..24].copy_from_slice(&counter.to_be_bytes());
+    payload
+}
+
+/// Derive a 32-byte registration auth key from a 16-byte obfuscation key.
+pub fn derive_reg_auth_key(obf_key: &[u8; 16]) -> [u8; 32] {
+    blake3::derive_key(RENDEZVOUS_REG_AUTH_KEY_CONTEXT_V2, obf_key)
+}
+
+/// Compute a 128-bit MAC for authenticated rootless rendezvous registration.
+pub fn compute_register_auth_mac(obf_key: &[u8; 16], node: &NodeId, counter: u64) -> [u8; 16] {
+    let key = derive_reg_auth_key(obf_key);
+    let payload = register_auth_payload(node, counter);
+    compute_register_mac(&key, &payload)
+}
+
+/// Constant-time verification of `mac` against the expected registration auth MAC.
+pub fn verify_register_auth_mac(
     obf_key: &[u8; 16],
     node: &NodeId,
     counter: u64,
     mac: &[u8; 16],
 ) -> bool {
-    use subtle::ConstantTimeEq;
-
-    let expected = compute_register_mac(obf_key, node, counter);
-    expected.ct_eq(mac).into()
+    let key = derive_reg_auth_key(obf_key);
+    let payload = register_auth_payload(node, counter);
+    verify_register_mac(&key, &payload, mac)
 }
 
 /// Message-type discriminants (the only permitted `as u8` in this crate).
@@ -318,6 +339,15 @@ mod tests {
         assert_ne!(node_id(&pk), node_id(&[8u8; 32]));
     }
 
+    #[test]
+    fn test_blake3_node_id_kat() {
+        let pk = [7u8; 32];
+        let id = derive_node_id(&pk);
+        let digest = blake3::derive_key(RENDEZVOUS_NODE_ID_CONTEXT_V2, &pk);
+        assert_eq!(id, digest[0..16]);
+        assert_eq!(id, node_id(&pk));
+    }
+
     fn roundtrip(msg: Message) {
         let mut buf = Vec::new();
         encode(&msg, &mut buf);
@@ -532,28 +562,57 @@ mod tests {
 
     #[test]
     fn test_compute_register_mac_kat_and_verify() {
-        let key = [0x42u8; 16];
-        let node = node_id(&[0x11u8; 32]);
-        let counter = 12345u64;
-        let mac = compute_register_mac(&key, &node, counter);
+        let key = [0x42u8; 32];
+        let payload = b"test payload for registration mac";
+        let mac = compute_register_mac(&key, payload);
         assert_ne!(mac, [0u8; 16]);
-        assert!(verify_register_mac(&key, &node, counter, &mac));
+        let expected = blake3::keyed_hash(&key, payload);
+        assert_eq!(mac, expected.as_bytes()[0..16]);
+        assert!(verify_register_mac(&key, payload, &mac));
 
         // Tampered key
-        let bad_key = [0x43u8; 16];
-        assert!(!verify_register_mac(&bad_key, &node, counter, &mac));
+        let mut bad_key = key;
+        bad_key[0] ^= 1;
+        assert!(!verify_register_mac(&bad_key, payload, &mac));
 
-        // Tampered node
-        let bad_node = node_id(&[0x22u8; 32]);
-        assert!(!verify_register_mac(&key, &bad_node, counter, &mac));
-
-        // Tampered counter
-        assert!(!verify_register_mac(&key, &node, counter + 1, &mac));
+        // Tampered payload
+        let bad_payload = b"test payload for registration mad";
+        assert!(!verify_register_mac(&key, bad_payload, &mac));
 
         // Tampered mac byte
         let mut bad_mac = mac;
         bad_mac[0] ^= 1;
-        assert!(!verify_register_mac(&key, &node, counter, &bad_mac));
+        assert!(!verify_register_mac(&key, payload, &bad_mac));
+
+        // Also verify the auth mac helper with obf_key, node, counter
+        let obf_key = [0x42u8; 16];
+        let node = derive_node_id(&[0x11u8; 32]);
+        let counter = 12345u64;
+        let auth_mac = compute_register_auth_mac(&obf_key, &node, counter);
+        assert_ne!(auth_mac, [0u8; 16]);
+        assert!(verify_register_auth_mac(
+            &obf_key, &node, counter, &auth_mac
+        ));
+
+        let bad_obf_key = [0x43u8; 16];
+        assert!(!verify_register_auth_mac(
+            &bad_obf_key,
+            &node,
+            counter,
+            &auth_mac
+        ));
+
+        let bad_node = derive_node_id(&[0x22u8; 32]);
+        assert!(!verify_register_auth_mac(
+            &obf_key, &bad_node, counter, &auth_mac
+        ));
+
+        assert!(!verify_register_auth_mac(
+            &obf_key,
+            &node,
+            counter + 1,
+            &auth_mac
+        ));
     }
 
     #[test]

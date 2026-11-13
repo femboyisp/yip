@@ -435,8 +435,8 @@ mod tests {
         let mut client_b = connect(addr).await;
 
         // Each registers with a fresh counter to upgrade into the tunnel.
-        let mac_a = yip_rendezvous::compute_register_mac(&key, &a, 1);
-        let mac_b = yip_rendezvous::compute_register_mac(&key, &b, 1);
+        let mac_a = yip_rendezvous::compute_register_auth_mac(&key, &a, 1);
+        let mac_b = yip_rendezvous::compute_register_auth_mac(&key, &b, 1);
         client_a
             .write_all(&framed(
                 &key,

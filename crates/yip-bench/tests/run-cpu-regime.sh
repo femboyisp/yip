@@ -46,7 +46,7 @@ NS_A="yipA"; NS_B="yipB"
 VETH_A="vethA"; VETH_B="vethB"
 VETH_A_IP="10.0.0.1"; VETH_B_IP="10.0.0.2"
 TUN_A_IP="10.9.0.1"; TUN_B_IP="10.9.0.2"
-PORT_A="51820"; PORT_B="51821"
+PORT_A="443"; PORT_B="443"
 TUN_DEV="yip0"
 TUN_MTU=1380
 DUR=8                     # seconds per iperf run

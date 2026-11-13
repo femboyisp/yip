@@ -652,7 +652,7 @@ fn test_metrics_registry_cached_peer_stats_fallback_in_http_scraper() {
     // Update peer stats via MetricsRegistry::update_peer_stats
     let peer = PeerStats {
         public_key: [7u8; 32],
-        endpoint: Some("192.168.1.100:51820".parse().unwrap()),
+        endpoint: Some("192.168.1.100:443".parse().unwrap()),
         node_addr: "fd00::7".parse().unwrap(),
         state: "established".to_string(),
         last_activity_ms: 12345,

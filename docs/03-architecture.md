@@ -17,7 +17,7 @@ For automated benchmarks, performance analysis, and tuning, see [testing-and-ben
   - [Repository Crate Topology](#repository-crate-topology)
 - [2. Out-of-Band Cryptographic Control Plane](#2-out-of-band-cryptographic-control-plane)
   - [Node Identity Foundation](#node-identity-foundation)
-  - [Noise-IKpsk2 Handshake with Hybrid ML-KEM-512](#noise-ikpsk2-handshake-with-hybrid-ml-kem-512)
+  - [PQNoise-IKpsk2 Handshake with Hybrid ML-KEM-512](#pqnoise-ikpsk2-handshake-with-hybrid-ml-kem-512)
   - [Handshake Wire Message Breakdown](#handshake-wire-message-breakdown)
   - [120-Second Epoch Ratchet & Rekey Overlap Window](#120-second-epoch-ratchet--rekey-overlap-window)
   - [Topology Orchestration & Blind Relay Signaling](#topology-orchestration--blind-relay-signaling)
@@ -87,7 +87,7 @@ For automated benchmarks, performance analysis, and tuning, see [testing-and-ben
 |                           CONTROL PLANE (Out-of-Band)                            |
 |                                                                                   |
 |  - Ed25519 Node Identity & Root CA Tokens        - Out-of-Band STUN / Relay Coord |
-|  - Noise-IKpsk2 + ML-KEM-512 PQ Handshakes       - Dynamic Peer Lifecycle Events  |
+|  - PQNoise-IKpsk2 + ML-KEM-512 Handshakes        - Dynamic Peer Lifecycle Events  |
 |  - 120s Ephemeral Rekey Ratchet Scheduling       - Asynchronous State Replication |
 +-----------------------------------------------------------------------------------+
                                   |
@@ -118,7 +118,7 @@ The `yip` codebase is organized into modular Rust crates with strict interface b
 | Crate | Responsibility | Unsafe Code |
 | :--- | :--- | :--- |
 | [`crates/yip-mesh`](../crates/yip-mesh) | Primary unified SDK facade crate exposing modular feature flags (`crypto`, `wire`, `transport`, `membership`, `device`, `io`, etc.). | `#![forbid(unsafe_code)]` |
-| [`crates/yip-crypto`](../crates/yip-crypto) | Noise-IKpsk2 state machine, ML-KEM-512 post-quantum KDF, ChaCha20-Poly1305 AEAD, sliding replay window. | `#![forbid(unsafe_code)]` |
+| [`crates/yip-crypto`](../crates/yip-crypto) | Native zero-alloc PQNoise-IKpsk2 state machine, ML-KEM-512 post-quantum KDF, BLAKE3 ratchets, ChaCha20-Poly1305 AEAD, sliding replay window. | `#![forbid(unsafe_code)]` |
 | [`crates/yip-wire`](../crates/yip-wire) | Frame serialization, SipHash-1-3 coverage authentication, keyed header obfuscation. | `#![forbid(unsafe_code)]` |
 | [`crates/yip-transport`](../crates/yip-transport) | Flow classification, GF(256) Cauchy Reed-Solomon FEC, RLNC codec, thin ARQ, PLPMTU discovery. | `#![forbid(unsafe_code)]` |
 | [`crates/yip-membership`](../crates/yip-membership) | Cryptographic identity certificates, RootSets, epidemic anti-entropy gossip, and TAI64N replay freshness. | `#![forbid(unsafe_code)]` |
@@ -144,9 +144,9 @@ Every node participating in a `yip` mesh network possesses an immutable identity
 
 Nodes prove authorization via signed certificates issued by a private root CA (`yip-ca`). Certificates bind node identity keys, mesh roles, and validity epochs without requiring centralized phone-home databases.
 
-### Noise-IKpsk2 Handshake with Hybrid ML-KEM-512
+### PQNoise-IKpsk2 Handshake with Hybrid ML-KEM-512
 
-`yip` implements a post-quantum hybrid cryptographic handshake. It builds on the Noise Protocol Framework pattern **Noise-IKpsk2** (Initiator knows Responder static key beforehand, one round-trip mutual authentication, with pre-shared key slot 2) augmented with NIST FIPS 203 **ML-KEM-512** (Kyber-512):
+`yip` implements a post-quantum hybrid cryptographic handshake (`PQNoise_IKpsk2_25519_MLKEM512_ChaChaPoly_BLAKE3`). It builds on the Noise Protocol Framework pattern **Noise-IKpsk2** (Initiator knows Responder static key beforehand, one round-trip mutual authentication, with pre-shared key slot 2) augmented with NIST FIPS 203 **ML-KEM-512** (Kyber-512) and native BLAKE3 keyed XOF ratchets:
 
 ```
 Initiator (Host A)                                      Responder (Host B)
@@ -182,43 +182,38 @@ The Initiator extracts `ct` prior to decrypting Message 2's AEAD envelope, execu
 
 Handshake packets are designed to fit strictly within the MTU budget (`OBF_MTU_BUDGET = 1,200` bytes) to prevent IP fragmentation on paths with restricted MTUs:
 
-#### Message 1 (Initiator $\to$ Responder): 1,028 Bytes Total
+#### Message 1 (Initiator $\to$ Responder): 864 Bytes Base (~1,028 Bytes with Certificate)
 
 ```
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       Wire Header (4 B)                       |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                                                               |
-+                 ML-KEM-512 Encapsulation Key                  +
-|                          ek_A (800 B)                         |
-|                                                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|       Packet Type (1 B)       |                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
 |                 Noise Ephemeral Public Key e_A (32 B)         |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|       Encrypted Static Public Key s_A + CA Certificate        |
-|                  + Poly1305 AEAD Tag (144 B)                  |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-```
-
-#### Message 2 (Responder $\to$ Initiator): 948 Bytes Total
-
-```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       Wire Header (4 B)                       |
+|       Encrypted Static Public Key s_A + Poly1305 Tag (48 B)   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                                                               |
 +                   ML-KEM-512 Ciphertext                       +
 |                          ct (768 B)                           |
 |                                                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|       Encrypted Payload (Admission Cert) + Poly1305 (16+ B)   |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+#### Message 2 (Responder $\to$ Initiator): 48 Bytes Base (~212 Bytes with Certificate)
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|       Packet Type (1 B)       |                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
 |                 Noise Ephemeral Public Key e_B (32 B)         |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|            Encrypted Responder CA Certificate                 |
-|                  + Poly1305 AEAD Tag (144 B)                  |
+|       Encrypted Payload (Responder Cert) + Poly1305 (16+ B)   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
@@ -261,9 +256,9 @@ All overlay addresses reside within the RFC 4193 Unique Local Address (ULA) pref
 
 ### Derivation Algorithm & Byte-Level Layout
 
-The derivation algorithm is implemented in [`bin/yipd/src/addr.rs`](../bin/yipd/src/addr.rs). It feeds the node's 32-byte public key into a variable-length BLAKE2s digest using a domain-separation context:
+The derivation algorithm is implemented in [`bin/yipd/src/addr.rs`](../bin/yipd/src/addr.rs). It feeds the node's 32-byte public key into a BLAKE3 key derivation function using a domain-separation context:
 
-$$\text{Digest}_{120} = \text{BLAKE2s-120}(\text{Domain} = \texttt{"yip-addr-v1"}, \text{Key} = \text{PublicKey})$$
+$$\text{Digest}_{120} = \text{BLAKE3-KDF}(\text{Context} = \texttt{"yip-v2-overlay-ipv6-addr"}, \text{Key} = \text{PublicKey})[0..15]$$
 
 $$\text{IPv6 Address} = \texttt{0xfd} \mathbin{\Vert} \text{Digest}_{120}$$
 
@@ -271,10 +266,10 @@ $$\text{IPv6 Address} = \texttt{0xfd} \mathbin{\Vert} \text{Digest}_{120}$$
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|  0xfd (8 bits)|            BLAKE2s Digest [0..7]              |
+|  0xfd (8 bits)|            BLAKE3 Digest [0..7]               |
 |  (ULA Prefix) |                   (56 bits)                   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                     BLAKE2s Digest [7..15]                    |
+|                     BLAKE3 Digest [7..15]                     |
 |                            (64 bits)                          |
 |                     (Interface Identifier)                    |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -285,20 +280,16 @@ $$\text{IPv6 Address} = \texttt{0xfd} \mathbin{\Vert} \text{Digest}_{120}$$
 | Byte Range | Size | Field Name | Description |
 | :--- | :--- | :--- | :--- |
 | `0..1` | 8 bits | ULA Prefix | Constant byte `0xfd`, anchoring the address in IPv6 RFC 4193 ULA space. |
-| `1..8` | 56 bits | Mesh Subnet / Shard Routing ID | First 7 bytes of the BLAKE2s digest. Used for fast packet sharding and mesh routing. |
-| `8..16` | 64 bits | Interface Identifier (IID) | Final 8 bytes of the BLAKE2s digest, representing the node's unique host token. |
+| `1..8` | 56 bits | Mesh Subnet / Shard Routing ID | First 7 bytes of the BLAKE3 digest. Used for fast packet sharding and mesh routing. |
+| `8..16` | 64 bits | Interface Identifier (IID) | Final 8 bytes of the BLAKE3 digest, representing the node's unique host token. |
 
 ```rust
 // Verified against bin/yipd/src/addr.rs
 pub fn node_addr(pubkey: &[u8; 32]) -> Ipv6Addr {
-    let mut h = Blake2sVar::new(15).expect("15 is a valid blake2s output len");
-    h.update(b"yip-addr-v1");
-    h.update(pubkey);
-    let mut digest = [0u8; 15];
-    h.finalize_variable(&mut digest).expect("output len matches");
+    let digest = blake3::derive_key("yip-v2-overlay-ipv6-addr", pubkey);
     let mut octets = [0u8; 16];
     octets[0] = 0xfd;
-    octets[1..].copy_from_slice(&digest);
+    octets[1..16].copy_from_slice(&digest[0..15]);
     Ipv6Addr::from(octets)
 }
 ```
@@ -310,14 +301,14 @@ Self-certifying addresses eliminate entire classes of overlay network attacks:
 1. **Impossibility of IP Spoofing**: When a worker thread receives an inner decrypted IPv6 packet with source IP $S$, it verifies that:
    $$S = \text{node\_addr}(\text{SessionPublicKey})$$
    Because $\text{SessionPublicKey}$ is authenticated by the Noise handshake, an attacker cannot emit packets purporting to originate from another node's IP address. Forged source addresses fail self-certification checks and are dropped immediately at line rate.
-2. **Impossibility of Address Squatting**: An adversary cannot register or preempt another peer's address without finding a preimage for BLAKE2s.
+2. **Impossibility of Address Squatting**: An adversary cannot register or preempt another peer's address without finding a preimage for BLAKE3.
 3. **Collision Resistance**: With 120 bits of cryptographic output entropy, the birthday bound requires generating approximately $2^{60}$ distinct keypairs before encountering a single collision across the entire global mesh.
 
 ### Consistent Shard Affinity via Identity Hash
 
 In multi-threaded deployments, incoming TUN packets must be directed to the worker core owning the peer's session without inter-thread locks.
 
-Because octets `[1..9]` of the IPv6 address represent the first 8 bytes of the BLAKE2s digest, hashing these octets directly yields the identical shard index as hashing the peer's public key (see [`bin/yipd/src/sharding.rs`](../bin/yipd/src/sharding.rs)):
+Because octets `[1..9]` of the IPv6 address represent the first 8 bytes of the BLAKE3 digest, hashing these octets directly yields the identical shard index as hashing the peer's public key (see [`bin/yipd/src/sharding.rs`](../bin/yipd/src/sharding.rs)):
 
 ```rust
 pub fn shard_for_addr(addr: Ipv6Addr, num_shards: usize) -> usize {
@@ -752,7 +743,7 @@ To defeat packet replay attacks across high-speed connections, `crates/yip-crypt
 ### Blind Packet Injection & DoS Defense
 
 1. **State-Free Discard**: Forged UDP packets injected by third parties fail the 8-byte SipHash-1-3 tag check and are dropped in under 17 ns without allocating heap memory or modifying daemon state.
-2. **Amplification Prevention**: Handshake responses are strictly bounded in size (Message 2 is 948 bytes, smaller than Message 1's 1,028 bytes). Senders cannot use `yipd` nodes as reflection amplification vectors.
+2. **Amplification Prevention**: Handshake responses are strictly bounded in size (Message 2 is ~212 bytes with certificate, significantly smaller than Message 1's ~1,028 bytes). Senders cannot use `yipd` nodes as reflection amplification vectors.
 3. **Cookie / Rate Limiting**: In unauthenticated flood scenarios, nodes transition to stateless cryptographic challenge-cookie verification, requiring initiators to solve a lightweight proof before state allocations occur.
 
 ---
