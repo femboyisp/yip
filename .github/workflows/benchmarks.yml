@@ -61,8 +61,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config iproute2 iputils-ping iperf3 wireguard-tools openvpn jq
-      - name: Load wireguard kernel module
-        run: sudo modprobe wireguard 2>/dev/null || echo "[note] wireguard module unavailable"
+      - name: Load wireguard kernel module & disable restrictive AppArmor profiles
+        run: |
+          sudo modprobe wireguard 2>/dev/null || echo "[note] wireguard module unavailable"
+          sudo apparmor_parser -R /etc/apparmor.d/wg 2>/dev/null || true
+          sudo apparmor_parser -R /etc/apparmor.d/usr.bin.wg 2>/dev/null || true
+          sudo apparmor_parser -R /etc/apparmor.d/wg-quick 2>/dev/null || true
+          sudo apparmor_parser -R /etc/apparmor.d/usr.bin.wg-quick 2>/dev/null || true
       - name: Build yipd release
         run: cargo build --release -p yipd
       - name: Set up contenders
