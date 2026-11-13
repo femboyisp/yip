@@ -186,13 +186,3 @@ exclude_re = [
 ]
 
 skip_calls = ["reserve"]
-
-package = [
-    "yip-wire",
-    "yip-transport",
-    "yip-crypto",
-    "yip-obf",
-    "yip-membership",
-    "yip-rendezvous",
-    "yipd",
-]
