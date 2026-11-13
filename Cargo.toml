@@ -9,7 +9,6 @@ rust-version = "1.89.0"
 license = "AGPL-3.0-or-later"
 authors = ["FEMBOY CYBER NETWORKS LLC <security@femboy.zip>"]
 repository = "https://github.com/femboyisp/yip"
-homepage = "https://femboy.zip"
 documentation = "https://docs.rs/yip-mesh"
 keywords = ["vpn", "mesh", "fec", "cryptography", "peer-to-peer"]
 categories = ["network-programming", "cryptography"]
@@ -32,7 +31,7 @@ subtle = "2.6"
 thiserror = "2.0.9"
 
 [workspace.metadata.cargo-shear]
-ignored = ["yip-verify"]
+ignored = []
 
 [workspace.lints.clippy]
 allow_attributes = "warn"
@@ -53,5 +52,6 @@ missing_abi = "deny"
 non_ascii_idents = "forbid"
 rust_2018_idioms = { level = "deny", priority = -1 }
 single_use_lifetimes = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(kani)'] }
 unused_lifetimes = "warn"
 unused_macro_rules = "warn"

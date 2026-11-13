@@ -9,6 +9,9 @@ pub use rs_simd::{
     wasm_simd_supported,
 };
 
+#[cfg(any(test, kani))]
+pub mod rs_simd_kani;
+
 pub mod rlnc;
 pub use rlnc::{RlncDecoder, RlncEncoder};
 
@@ -28,7 +31,10 @@ pub use plpmtu::{
 };
 
 pub mod fec;
-pub use fec::{shard_for_fec_symbol, FecEncoder, FecReassembler, Symbol};
+pub use fec::{
+    hash_key, shard_for_fec_symbol, FecEncoder, FecReassembler, FecScratchArena, ObjState,
+    ObjectTable, Symbol,
+};
 
 pub mod gf256;
 

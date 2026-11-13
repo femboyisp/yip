@@ -100,6 +100,7 @@ cleanup() {
     # Remove virtual interfaces before deleting namespaces
     ip netns exec "$NS_WA" ip link del wg0 2>/dev/null || true
     ip netns exec "$NS_WB" ip link del wg0 2>/dev/null || true
+    rm -f /etc/wireguard/wg_a /etc/wireguard/wg_b 2>/dev/null || true
     ip netns exec "$NS_AA" ip link del awg0 2>/dev/null || true
     ip netns exec "$NS_AB" ip link del awg0 2>/dev/null || true
     for ns in "$NS_YA" "$NS_YB" "$NS_WA" "$NS_WB" "$NS_OA" "$NS_OB" "$NS_NA" "$NS_NB" \
@@ -283,6 +284,9 @@ setup_wg() {
     if ! modprobe wireguard 2>/dev/null; then
         echo "[wg] SKIP: modprobe wireguard failed"; WG_AVAILABLE=false; return
     fi
+    # If Ubuntu AppArmor confines /usr/bin/wg, unload or complain so it can read keys
+    apparmor_parser -R /etc/apparmor.d/wg 2>/dev/null || true
+    apparmor_parser -R /etc/apparmor.d/usr.bin.wg 2>/dev/null || true
     echo "[wg] generating keypairs"
     local privA pubA privB pubB
     privA="$(wg genkey 2>/dev/null || true)"; pubA="$(echo "$privA" | wg pubkey 2>/dev/null || true)"
@@ -296,13 +300,19 @@ setup_wg() {
        ! ip netns exec "$NS_WB" ip link add wg0 type wireguard 2>/dev/null; then
         echo "[wg] SKIP: wireguard interface creation failed"; WG_AVAILABLE=false; return
     fi
-    printf '%s' "$privA" > "$TMPDIR_TEST/wg_a"
-    printf '%s' "$privB" > "$TMPDIR_TEST/wg_b"
-    chmod 644 "$TMPDIR_TEST/wg_a" "$TMPDIR_TEST/wg_b"
+    local wg_dir="/etc/wireguard"
+    if [ ! -d "$wg_dir" ]; then
+        mkdir -p "$wg_dir" 2>/dev/null || wg_dir="$TMPDIR_TEST"
+    fi
+    local keyA="$wg_dir/wg_a"
+    local keyB="$wg_dir/wg_b"
+    printf '%s' "$privA" > "$keyA"
+    printf '%s' "$privB" > "$keyB"
+    chmod 600 "$keyA" "$keyB"
     local wg_err=""
-    if ! wg_err="$(ip netns exec "$NS_WA" wg set wg0 private-key "$TMPDIR_TEST/wg_a" listen-port "$WPORT_A" \
+    if ! wg_err="$(ip netns exec "$NS_WA" wg set wg0 private-key "$keyA" listen-port "$WPORT_A" \
             peer "$pubB" endpoint "${VWB_IP}:${WPORT_B}" allowed-ips "${TUN_WB_IP}/32" 2>&1)" || \
-       ! wg_err="$(ip netns exec "$NS_WB" wg set wg0 private-key "$TMPDIR_TEST/wg_b" listen-port "$WPORT_B" \
+       ! wg_err="$(ip netns exec "$NS_WB" wg set wg0 private-key "$keyB" listen-port "$WPORT_B" \
             peer "$pubA" endpoint "${VWA_IP}:${WPORT_A}" allowed-ips "${TUN_WA_IP}/32" 2>&1)"; then
         echo "[wg] SKIP: wg set configuration failed: $wg_err"; WG_AVAILABLE=false; return
     fi

@@ -64,25 +64,112 @@ fn source_count(object_size: u32, symbol_size: u16) -> usize {
     size.div_ceil(sym)
 }
 
-/// Split `ciphertext` into `k` source shards of `sym` bytes each (last zero-padded).
-fn split_source(ciphertext: &[u8], k: usize, sym: usize) -> Vec<Vec<u8>> {
-    let mut shards = vec![vec![0u8; sym]; k];
-    for (i, shard) in shards.iter_mut().enumerate() {
-        let start = i * sym;
-        let end = (start + sym).min(ciphertext.len());
-        if start < ciphertext.len() {
-            shard[..end - start].copy_from_slice(&ciphertext[start..end]);
+/// Default pre-allocated shard count in [`FecScratchArena`], matching the maximum
+/// GF(256) codeword symbol count (K + R <= 255).
+pub const DEFAULT_MAX_SHARDS: usize = 256;
+
+/// Default pre-allocated maximum shard length in bytes in [`FecScratchArena`],
+/// sizing each shard buffer to comfortably fit standard MTU envelopes (1500-2048 bytes).
+pub const DEFAULT_MAX_SHARD_LEN: usize = 2048;
+
+/// Reusable scratch arena for systematic and repair shard generation, eliminating
+/// heap allocations on the packet transmit hotpath once initialized/warmed.
+#[derive(Debug, Clone)]
+pub struct FecScratchArena {
+    /// Pre-allocated repair shard buffers.
+    repair_shards: Vec<Vec<u8>>,
+    /// Scratch buffer for zero-padding the last source shard when length is sub-symbol.
+    last_source_pad: Vec<u8>,
+    /// Pre-allocated symbol structs returned as a borrowed slice.
+    symbols: Vec<Symbol>,
+}
+
+impl Default for FecScratchArena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FecScratchArena {
+    /// Create a new scratch arena pre-allocated with default capacity
+    /// (256 shards of 2048 bytes each).
+    pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_MAX_SHARDS, DEFAULT_MAX_SHARD_LEN)
+    }
+
+    /// Create a new scratch arena with specified maximum shard count and shard capacity.
+    pub fn with_capacity(max_shards: usize, max_shard_len: usize) -> Self {
+        let mut repair_shards = Vec::with_capacity(max_shards);
+        let mut symbols = Vec::with_capacity(max_shards);
+        for _ in 0..max_shards {
+            repair_shards.push(vec![0u8; max_shard_len]);
+            symbols.push(Symbol {
+                object_id: 0,
+                object_size: 0,
+                payload_id: [0u8; 4],
+                data: Vec::with_capacity(max_shard_len),
+            });
+        }
+        Self {
+            repair_shards,
+            last_source_pad: vec![0u8; max_shard_len],
+            symbols,
         }
     }
-    shards
+
+    /// Ensure internal shard buffers and symbols have sufficient capacity for `required_symbols`
+    /// of length `shard_len`. Once warmed, this performs zero allocations.
+    pub fn ensure_capacity(&mut self, required_symbols: usize, shard_len: usize) {
+        if self.last_source_pad.len() < shard_len {
+            self.last_source_pad.resize(shard_len, 0);
+        }
+        if self.repair_shards.len() < required_symbols {
+            let additional = required_symbols - self.repair_shards.len();
+            for _ in 0..additional {
+                self.repair_shards.push(vec![0u8; shard_len]);
+            }
+        }
+        for shard in &mut self.repair_shards[..required_symbols] {
+            if shard.len() < shard_len {
+                shard.resize(shard_len, 0);
+            }
+        }
+        if self.symbols.len() < required_symbols {
+            let additional = required_symbols - self.symbols.len();
+            for _ in 0..additional {
+                self.symbols.push(Symbol {
+                    object_id: 0,
+                    object_size: 0,
+                    payload_id: [0u8; 4],
+                    data: Vec::with_capacity(shard_len),
+                });
+            }
+        }
+        for sym in &mut self.symbols[..required_symbols] {
+            if sym.data.capacity() < shard_len {
+                sym.data.reserve(shard_len - sym.data.capacity());
+            }
+        }
+    }
+
+    /// Returns the pre-allocated symbols slice.
+    pub fn symbols(&self) -> &[Symbol] {
+        &self.symbols
+    }
+
+    /// Returns the allocated length of the internal repair shard buffers.
+    pub fn repair_shard_capacity(&self) -> usize {
+        self.repair_shards.first().map_or(0, |s| s.len())
+    }
 }
 
 /// Encodes ciphertext frames into RS symbols, assigning monotonic object ids.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FecEncoder {
     next_object_id: u16,
     stride: u16,
     symbols_encoded: u64,
+    arena: FecScratchArena,
 }
 
 impl Default for FecEncoder {
@@ -91,14 +178,35 @@ impl Default for FecEncoder {
             next_object_id: 0,
             stride: 1,
             symbols_encoded: 0,
+            arena: FecScratchArena::default(),
         }
     }
 }
 
 impl FecEncoder {
-    /// Create an encoder starting at object id 0.
+    /// Create an encoder starting at object id 0 with a default scratch arena.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create an encoder with a custom-capacity scratch arena.
+    pub fn with_arena_capacity(max_shards: usize, max_shard_len: usize) -> Self {
+        Self {
+            next_object_id: 0,
+            stride: 1,
+            symbols_encoded: 0,
+            arena: FecScratchArena::with_capacity(max_shards, max_shard_len),
+        }
+    }
+
+    /// Access the internal scratch arena.
+    pub fn arena(&self) -> &FecScratchArena {
+        &self.arena
+    }
+
+    /// Access the internal scratch arena mutably.
+    pub fn arena_mut(&mut self) -> &mut FecScratchArena {
+        &mut self.arena
     }
 
     /// Total count of FEC symbols produced by this encoder.
@@ -112,7 +220,8 @@ impl FecEncoder {
         self.stride = if num_shards == 0 { 1 } else { num_shards };
     }
 
-    /// Encode one ciphertext frame into K source + `repair` repair symbols.
+    /// Encode one ciphertext frame into K source + `repair` repair symbols, returning
+    /// an owned `Vec<Symbol>`.
     pub fn encode(
         &mut self,
         ciphertext: &[u8],
@@ -121,7 +230,50 @@ impl FecEncoder {
     ) -> Vec<Symbol> {
         let object_id = self.next_object_id;
         self.next_object_id = self.next_object_id.wrapping_add(self.stride);
-        let syms = self.build(ciphertext, params, object_id, repair);
+        let syms = Self::build_with_arena(ciphertext, params, object_id, repair, &mut self.arena);
+        self.symbols_encoded = self.symbols_encoded.saturating_add(syms.len() as u64);
+        syms.to_vec()
+    }
+
+    /// Encode one ciphertext frame into K source + `repair` repair symbols directly using
+    /// an external [`FecScratchArena`], returning a borrowed slice of symbols with zero
+    /// heap allocations once warmed.
+    pub fn encode_with_arena<'a>(
+        &mut self,
+        ciphertext: &[u8],
+        params: crate::FlowParams,
+        repair: u32,
+        arena: &'a mut FecScratchArena,
+    ) -> &'a [Symbol] {
+        let object_id = self.next_object_id;
+        self.next_object_id = self.next_object_id.wrapping_add(self.stride);
+        let syms = Self::build_with_arena(ciphertext, params, object_id, repair, arena);
+        self.symbols_encoded = self.symbols_encoded.saturating_add(syms.len() as u64);
+        syms
+    }
+
+    /// Alias for [`Self::encode_with_arena`] to write encoded symbols into `arena`.
+    pub fn encode_into<'a>(
+        &mut self,
+        ciphertext: &[u8],
+        params: crate::FlowParams,
+        repair: u32,
+        arena: &'a mut FecScratchArena,
+    ) -> &'a [Symbol] {
+        self.encode_with_arena(ciphertext, params, repair, arena)
+    }
+
+    /// Zero-allocation encode using the encoder's internal scratch arena, returning a
+    /// borrowed slice of symbols.
+    pub fn encode_scratch(
+        &mut self,
+        ciphertext: &[u8],
+        params: crate::FlowParams,
+        repair: u32,
+    ) -> &[Symbol] {
+        let object_id = self.next_object_id;
+        self.next_object_id = self.next_object_id.wrapping_add(self.stride);
+        let syms = Self::build_with_arena(ciphertext, params, object_id, repair, &mut self.arena);
         self.symbols_encoded = self.symbols_encoded.saturating_add(syms.len() as u64);
         syms
     }
@@ -129,7 +281,7 @@ impl FecEncoder {
     /// Re-encode `ciphertext` under an EXPLICIT `object_id` (ARQ retransmit),
     /// returning all K source symbols + `extra_repair` repair symbols at indices
     /// K..K+extra_repair-1. Both `encode` and `repair_with_id` select the scheme
-    /// via `build` from `(params.arq, r)`: an ARQ (retransmit-eligible) class
+    /// via `build_with_arena` from `(params.arq, r)`: an ARQ (retransmit-eligible) class
     /// always uses Cauchy, regardless of `r`, so a retransmit batch stays
     /// scheme-compatible with the original send and a receiver that got zero
     /// original symbols can reconstruct from this batch alone.
@@ -140,28 +292,55 @@ impl FecEncoder {
         object_id: u16,
         extra_repair: u32,
     ) -> Vec<Symbol> {
-        let syms = self.build(ciphertext, params, object_id, extra_repair);
+        let syms =
+            Self::build_with_arena(ciphertext, params, object_id, extra_repair, &mut self.arena);
+        self.symbols_encoded = self.symbols_encoded.saturating_add(syms.len() as u64);
+        syms.to_vec()
+    }
+
+    /// Zero-allocation ARQ re-encode under an explicit `object_id` using an external [`FecScratchArena`].
+    pub fn repair_with_id_with_arena<'a>(
+        &mut self,
+        ciphertext: &[u8],
+        params: crate::FlowParams,
+        object_id: u16,
+        extra_repair: u32,
+        arena: &'a mut FecScratchArena,
+    ) -> &'a [Symbol] {
+        let syms = Self::build_with_arena(ciphertext, params, object_id, extra_repair, arena);
         self.symbols_encoded = self.symbols_encoded.saturating_add(syms.len() as u64);
         syms
     }
 
+    /// Alias for [`Self::repair_with_id_with_arena`].
+    pub fn repair_with_id_into<'a>(
+        &mut self,
+        ciphertext: &[u8],
+        params: crate::FlowParams,
+        object_id: u16,
+        extra_repair: u32,
+        arena: &'a mut FecScratchArena,
+    ) -> &'a [Symbol] {
+        self.repair_with_id_with_arena(ciphertext, params, object_id, extra_repair, arena)
+    }
+
     /// Shared encode: K source + R repair (R clamped to 255-K), K bounds enforced.
-    fn build(
-        &self,
+    fn build_with_arena<'a>(
         ciphertext: &[u8],
         params: crate::FlowParams,
         object_id: u16,
         repair: u32,
-    ) -> Vec<Symbol> {
+        arena: &'a mut FecScratchArena,
+    ) -> &'a [Symbol] {
         let object_size = u32::try_from(ciphertext.len()).expect("frame fits u32");
         let sym = usize::from(params.symbol_size);
         if sym == 0 {
-            return Vec::new();
+            return &[];
         }
         let k = source_count(object_size, params.symbol_size);
-        // Guard: K==0 (empty frame) or K>=255 (no GF(256) codeword room) → no symbols.
+        // Guard: K==0 (empty frame) or K>=255 (no GF(256) codeword room) -> no symbols.
         if k == 0 || k >= 255 {
-            return Vec::new();
+            return &[];
         }
         let max_repair = 255 - k;
         let r = usize::try_from(repair)
@@ -174,83 +353,137 @@ impl FecEncoder {
             rs::Scheme::Cauchy
         };
         let scheme_u8 = scheme.to_u8();
-        let mut out = Vec::with_capacity(k + r);
+
+        let total_symbols = k + r;
+        let shard_len = if k == 1 { ciphertext.len() } else { sym };
+        arena.ensure_capacity(total_symbols, shard_len);
 
         if k == 1 {
-            let source = vec![ciphertext.to_vec()];
-            out.push(Symbol {
-                object_id,
-                object_size,
-                payload_id: pack_payload_id(0, scheme_u8),
-                data: ciphertext.to_vec(),
-            });
+            let sym_slot = &mut arena.symbols[0];
+            sym_slot.object_id = object_id;
+            sym_slot.object_size = object_size;
+            sym_slot.payload_id = pack_payload_id(0, scheme_u8);
+            sym_slot.data.clear();
+            sym_slot.data.extend_from_slice(ciphertext);
+
             if r > 0 {
-                for (m, rep) in rs::encode_repair(&source, r, scheme)
-                    .into_iter()
-                    .enumerate()
-                {
+                let mut coefs = [0u8; 256];
+                for (m, rep_slot) in arena.repair_shards[..r].iter_mut().enumerate() {
+                    let rep = &mut rep_slot[..shard_len];
+                    rep.fill(0);
+                    rs::repair_row_into(scheme, 1, m, &mut coefs[..1]);
+                    rs::mul_add_row(coefs[0], ciphertext, rep);
+
                     let idx = u16::try_from(1 + m).expect("1+m < 255");
-                    out.push(Symbol {
-                        object_id,
-                        object_size,
-                        payload_id: pack_payload_id(idx, scheme_u8),
-                        data: rep,
-                    });
+                    let sym_slot = &mut arena.symbols[1 + m];
+                    sym_slot.object_id = object_id;
+                    sym_slot.object_size = object_size;
+                    sym_slot.payload_id = pack_payload_id(idx, scheme_u8);
+                    sym_slot.data.clear();
+                    sym_slot.data.extend_from_slice(rep);
                 }
             }
         } else {
-            let source = split_source(ciphertext, k, sym);
             let obj_len = usize::try_from(object_size).expect("fits usize");
             let last_source_len = obj_len - (k - 1) * sym;
-            for (i, shard) in source.iter().enumerate() {
-                let data = if i == k - 1 {
-                    shard[..last_source_len].to_vec()
+
+            for i in 0..k {
+                let slice = if i == k - 1 {
+                    &ciphertext[(k - 1) * sym..]
                 } else {
-                    shard.clone()
+                    &ciphertext[i * sym..(i + 1) * sym]
                 };
-                out.push(Symbol {
-                    object_id,
-                    object_size,
-                    payload_id: pack_payload_id(u16::try_from(i).expect("i < 255"), scheme_u8),
-                    data,
-                });
+                let sym_slot = &mut arena.symbols[i];
+                sym_slot.object_id = object_id;
+                sym_slot.object_size = object_size;
+                sym_slot.payload_id =
+                    pack_payload_id(u16::try_from(i).expect("i < 255"), scheme_u8);
+                sym_slot.data.clear();
+                sym_slot.data.extend_from_slice(slice);
             }
+
             if r > 0 {
-                for (m, rep) in rs::encode_repair(&source, r, scheme)
-                    .into_iter()
-                    .enumerate()
-                {
+                if last_source_len < sym {
+                    arena.last_source_pad[..last_source_len]
+                        .copy_from_slice(&ciphertext[(k - 1) * sym..]);
+                    arena.last_source_pad[last_source_len..sym].fill(0);
+                }
+
+                let mut coefs = [0u8; 256];
+                for (m, rep_slot) in arena.repair_shards[..r].iter_mut().enumerate() {
+                    let rep = &mut rep_slot[..sym];
+                    rep.fill(0);
+                    rs::repair_row_into(scheme, k, m, &mut coefs[..k]);
+
+                    for i in 0..k {
+                        let src_slice = if i < k - 1 {
+                            &ciphertext[i * sym..(i + 1) * sym]
+                        } else if last_source_len == sym {
+                            &ciphertext[(k - 1) * sym..]
+                        } else {
+                            &arena.last_source_pad[..sym]
+                        };
+                        rs::mul_add_row(coefs[i], src_slice, rep);
+                    }
+
                     let idx = u16::try_from(k + m).expect("k+m < 255");
-                    out.push(Symbol {
-                        object_id,
-                        object_size,
-                        payload_id: pack_payload_id(idx, scheme_u8),
-                        data: rep,
-                    });
+                    let sym_slot = &mut arena.symbols[k + m];
+                    sym_slot.object_id = object_id;
+                    sym_slot.object_size = object_size;
+                    sym_slot.payload_id = pack_payload_id(idx, scheme_u8);
+                    sym_slot.data.clear();
+                    sym_slot.data.extend_from_slice(rep);
                 }
             }
         }
-        out
+
+        &arena.symbols[..total_symbols]
     }
 }
 
-pub(crate) struct ObjState {
+pub const BUCKET_WAYS: usize = 4;
+pub const MAX_PROBE_BUCKETS: usize = 2;
+
+/// State for an object currently being received and reassembled.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObjState {
     /// Pre-allocated buffer for the assembled object.
-    payload: Vec<u8>,
+    pub payload: Vec<u8>,
     /// Bitset of received symbol indices (0..255).
-    seen_mask: [u64; 4],
+    pub seen_mask: [u64; 4],
     /// Count of received source shards (symbol_index < k).
-    source_count: usize,
+    pub source_count: usize,
     /// Total count of distinct shards received (source + repair).
-    total_count: usize,
-    k: usize,
-    shard_len: usize,
-    object_size: u32,
-    scheme: rs::Scheme,
-    done: bool,
-    expires_at_ms: u64,
+    pub total_count: usize,
+    pub k: usize,
+    pub shard_len: usize,
+    pub object_size: u32,
+    pub scheme: rs::Scheme,
+    pub done: bool,
+    pub expires_at_ms: u64,
     /// Repair shards (symbol_index >= k), stored only when packet loss occurs.
-    repair_shards: Vec<(u16, Vec<u8>)>,
+    pub repair_shards: Vec<(u16, Vec<u8>)>,
+    /// Pre-allocated repair buffers for zero-allocation reassembly under loss.
+    pub repair_pool: Vec<Vec<u8>>,
+}
+
+impl Default for ObjState {
+    fn default() -> Self {
+        Self {
+            payload: Vec::new(),
+            seen_mask: [0; 4],
+            source_count: 0,
+            total_count: 0,
+            k: 1,
+            shard_len: 0,
+            object_size: 0,
+            scheme: rs::Scheme::Pq,
+            done: false,
+            expires_at_ms: 0,
+            repair_shards: Vec::new(),
+            repair_pool: Vec::new(),
+        }
+    }
 }
 
 #[inline]
@@ -271,7 +504,7 @@ fn mark_seen(seen_mask: &mut [u64; 4], idx: u16) {
 }
 
 #[inline]
-fn hash_key(key: u64, mask: usize) -> usize {
+pub fn hash_key(key: u64, mask: usize) -> usize {
     let mut x = key;
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
@@ -279,19 +512,50 @@ fn hash_key(key: u64, mask: usize) -> usize {
     (x as usize) & mask
 }
 
-pub(crate) struct ObjectTable {
-    slots: Vec<Option<(u64, ObjState)>>,
+#[derive(Clone, Debug)]
+pub struct SlotEntry {
+    pub key: u64,
+    pub generation: u64,
+    pub state: ObjState,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Bucket {
+    pub entries: [Option<SlotEntry>; BUCKET_WAYS],
+}
+
+/// Bounded slot-map table mapping `u64` keys to `ObjState`.
+/// Uses power-of-two bounded collision buckets with generational tracking,
+/// ensuring strictly bounded O(1) eviction, lookup, and removal without
+/// backward-shift cascades and with zero dynamic heap allocations.
+#[derive(Clone, Debug)]
+pub struct ObjectTable {
+    buckets: Vec<Bucket>,
+    mask: usize,
     len: usize,
+    capacity: usize,
+    next_generation: u64,
+    eviction_cursor: usize,
 }
 
 impl ObjectTable {
+    /// Create a new circular ObjectTable bounded to `capacity` active entries.
     pub fn new(capacity: usize) -> Self {
-        let cap = (capacity.max(1) * 2).next_power_of_two().max(16);
-        let mut slots = Vec::with_capacity(cap);
-        for _ in 0..cap {
-            slots.push(None);
+        let cap = capacity.max(1);
+        let num_buckets = (cap * 2).next_power_of_two().max(16);
+        let mask = num_buckets - 1;
+        let mut buckets = Vec::with_capacity(num_buckets);
+        for _ in 0..num_buckets {
+            buckets.push(Bucket::default());
         }
-        Self { slots, len: 0 }
+        Self {
+            buckets,
+            mask,
+            len: 0,
+            capacity: cap,
+            next_generation: 1,
+            eviction_cursor: 0,
+        }
     }
 
     #[inline]
@@ -305,91 +569,132 @@ impl ObjectTable {
     }
 
     #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    #[inline]
     pub fn contains_key(&self, key: &u64) -> bool {
-        self.get(key).is_some()
+        self.find_slot(*key).is_some()
+    }
+
+    fn find_slot(&self, key: u64) -> Option<(usize, usize)> {
+        let b0 = hash_key(key, self.mask);
+        for probe in 0..MAX_PROBE_BUCKETS {
+            let b_idx = (b0 + probe) & self.mask;
+            for (way, entry) in self.buckets[b_idx].entries.iter().enumerate() {
+                if let Some(entry) = entry {
+                    if entry.key == key {
+                        return Some((b_idx, way));
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub fn find_index(&self, key: &u64) -> Option<usize> {
-        let mask = self.slots.len() - 1;
-        let mut idx = hash_key(*key, mask);
-        for _ in 0..self.slots.len() {
-            match &self.slots[idx] {
-                Some((k, _)) if *k == *key => return Some(idx),
-                Some(_) => idx = (idx + 1) & mask,
-                None => return None,
-            }
-        }
-        None
+        let (b_idx, way) = self.find_slot(*key)?;
+        Some(b_idx * BUCKET_WAYS + way)
     }
 
     pub fn get(&self, key: &u64) -> Option<&ObjState> {
-        let idx = self.find_index(key)?;
-        self.slots[idx].as_ref().map(|(_, s)| s)
+        let (b_idx, way) = self.find_slot(*key)?;
+        self.buckets[b_idx].entries[way].as_ref().map(|e| &e.state)
     }
 
     pub fn get_mut(&mut self, key: &u64) -> Option<&mut ObjState> {
-        let idx = self.find_index(key)?;
-        self.slots[idx].as_mut().map(|(_, s)| s)
+        let (b_idx, way) = self.find_slot(*key)?;
+        self.buckets[b_idx].entries[way]
+            .as_mut()
+            .map(|e| &mut e.state)
     }
 
     pub fn insert(&mut self, key: u64, state: ObjState) -> Option<ObjState> {
-        let mask = self.slots.len() - 1;
-        let mut idx = hash_key(key, mask);
-        for _ in 0..self.slots.len() {
-            match &mut self.slots[idx] {
-                Some((k, s)) if *k == key => {
-                    return Some(std::mem::replace(s, state));
-                }
-                Some(_) => idx = (idx + 1) & mask,
-                None => {
-                    self.slots[idx] = Some((key, state));
-                    self.len += 1;
-                    return None;
+        let gen = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+
+        let b0 = hash_key(key, self.mask);
+        let mut first_empty = None;
+        let mut min_gen = u64::MAX;
+        let mut oldest_candidate = None;
+
+        for probe in 0..MAX_PROBE_BUCKETS {
+            let b_idx = (b0 + probe) & self.mask;
+            for (way, slot) in self.buckets[b_idx].entries.iter_mut().enumerate() {
+                if let Some(entry) = slot {
+                    if entry.key == key {
+                        entry.generation = gen;
+                        return Some(std::mem::replace(&mut entry.state, state));
+                    }
+                    if entry.generation < min_gen {
+                        min_gen = entry.generation;
+                        oldest_candidate = Some((b_idx, way));
+                    }
+                } else if first_empty.is_none() {
+                    first_empty = Some((b_idx, way));
                 }
             }
         }
-        None
+
+        if self.len < self.capacity {
+            if let Some((b_idx, way)) = first_empty {
+                self.buckets[b_idx].entries[way] = Some(SlotEntry {
+                    key,
+                    generation: gen,
+                    state,
+                });
+                self.len += 1;
+                None
+            } else {
+                let (b_idx, way) = oldest_candidate.expect("candidate slots must be populated");
+                let old_entry = self.buckets[b_idx].entries[way].take().unwrap();
+                self.buckets[b_idx].entries[way] = Some(SlotEntry {
+                    key,
+                    generation: gen,
+                    state,
+                });
+                Some(old_entry.state)
+            }
+        } else if let Some((b_idx, way)) = oldest_candidate {
+            let old_entry = self.buckets[b_idx].entries[way].take().unwrap();
+            self.buckets[b_idx].entries[way] = Some(SlotEntry {
+                key,
+                generation: gen,
+                state,
+            });
+            Some(old_entry.state)
+        } else {
+            let mut evicted = None;
+            for step in 0..16.min(self.buckets.len()) {
+                let b_idx = (self.eviction_cursor + step) & self.mask;
+                for way in 0..BUCKET_WAYS {
+                    if let Some(entry) = self.buckets[b_idx].entries[way].take() {
+                        evicted = Some(entry.state);
+                        self.eviction_cursor = (b_idx + 1) & self.mask;
+                        break;
+                    }
+                }
+                if evicted.is_some() {
+                    break;
+                }
+            }
+            let (ins_b, ins_w) =
+                first_empty.expect("first_empty must exist when candidate slots are empty");
+            self.buckets[ins_b].entries[ins_w] = Some(SlotEntry {
+                key,
+                generation: gen,
+                state,
+            });
+            evicted
+        }
     }
 
     pub fn remove(&mut self, key: &u64) -> Option<ObjState> {
-        let mask = self.slots.len() - 1;
-        let mut idx = hash_key(*key, mask);
-        let mut found = false;
-        for _ in 0..self.slots.len() {
-            match &self.slots[idx] {
-                Some((k, _)) if *k == *key => {
-                    found = true;
-                    break;
-                }
-                Some(_) => idx = (idx + 1) & mask,
-                None => return None,
-            }
-        }
-        if !found {
-            return None;
-        }
-        let removed = self.slots[idx].take().map(|(_, s)| s);
+        let (b_idx, way) = self.find_slot(*key)?;
+        let entry = self.buckets[b_idx].entries[way].take()?;
         self.len -= 1;
-
-        // Backward-shift deletion to preserve linear probing invariants without tombstones.
-        let mut next_idx = (idx + 1) & mask;
-        for _ in 0..self.slots.len() {
-            let Some((k, _)) = self.slots[next_idx] else {
-                break;
-            };
-            let natural_idx = hash_key(k, mask);
-            let should_move = if next_idx >= idx {
-                natural_idx <= idx || natural_idx > next_idx
-            } else {
-                natural_idx <= idx && natural_idx > next_idx
-            };
-            if should_move {
-                self.slots[idx] = self.slots[next_idx].take();
-                idx = next_idx;
-            }
-            next_idx = (next_idx + 1) & mask;
-        }
-        removed
+        Some(entry.state)
     }
 }
 
@@ -398,6 +703,12 @@ impl std::ops::Index<&u64> for ObjectTable {
     fn index(&self, key: &u64) -> &Self::Output {
         self.get(key).expect("key not found in ObjectTable")
     }
+}
+
+struct ReassemblyBuffers {
+    payload: Vec<u8>,
+    repair_shards: Vec<(u16, Vec<u8>)>,
+    repair_pool: Vec<Vec<u8>>,
 }
 
 /// Reassembles RS symbols into objects, keeping multiple objects in flight
@@ -409,6 +720,9 @@ pub struct FecReassembler {
     max_objects: usize,
     recovered_count: u64,
     unrecoverable_count: u64,
+    pool_payloads: Vec<Vec<u8>>,
+    pool_repair_shards: Vec<Vec<(u16, Vec<u8>)>>,
+    pool_repair_pools: Vec<Vec<Vec<u8>>>,
 }
 
 impl FecReassembler {
@@ -423,6 +737,70 @@ impl FecReassembler {
             max_objects: max_obj,
             recovered_count: 0,
             unrecoverable_count: 0,
+            pool_payloads: Vec::with_capacity(max_obj),
+            pool_repair_shards: Vec::with_capacity(max_obj),
+            pool_repair_pools: Vec::with_capacity(max_obj),
+        }
+    }
+
+    fn recycle_state(&mut self, state: &mut ObjState) {
+        if self.pool_payloads.len() < self.max_objects && !state.payload.is_empty() {
+            let mut payload = std::mem::take(&mut state.payload);
+            payload.clear();
+            self.pool_payloads.push(payload);
+        }
+        for (_, buf) in state.repair_shards.drain(..) {
+            state.repair_pool.push(buf);
+        }
+        if self.pool_repair_shards.len() < self.max_objects {
+            let mut shards = std::mem::take(&mut state.repair_shards);
+            shards.clear();
+            self.pool_repair_shards.push(shards);
+        }
+        if self.pool_repair_pools.len() < self.max_objects && !state.repair_pool.is_empty() {
+            let mut pool = std::mem::take(&mut state.repair_pool);
+            for buf in &mut pool {
+                buf.clear();
+            }
+            self.pool_repair_pools.push(pool);
+        }
+    }
+
+    fn acquire_buffers(
+        &mut self,
+        payload_len: usize,
+        k: usize,
+        shard_len: usize,
+    ) -> ReassemblyBuffers {
+        let mut payload = self.pool_payloads.pop().unwrap_or_default();
+        if payload.capacity() < payload_len {
+            payload.reserve(payload_len - payload.capacity());
+        }
+        payload.resize(payload_len, 0);
+
+        let mut repair_shards = self.pool_repair_shards.pop().unwrap_or_default();
+        if repair_shards.capacity() < k {
+            repair_shards.reserve(k - repair_shards.capacity());
+        }
+        repair_shards.clear();
+
+        let mut repair_pool = self.pool_repair_pools.pop().unwrap_or_default();
+        if repair_pool.len() < k {
+            let additional = k - repair_pool.len();
+            for _ in 0..additional {
+                repair_pool.push(vec![0u8; shard_len]);
+            }
+        }
+        for buf in &mut repair_pool[..k] {
+            if buf.capacity() < shard_len {
+                buf.reserve(shard_len - buf.capacity());
+            }
+            buf.resize(shard_len, 0);
+        }
+        ReassemblyBuffers {
+            payload,
+            repair_shards,
+            repair_pool,
         }
     }
 
@@ -510,7 +888,9 @@ impl FecReassembler {
                         self.unrecoverable_count = self.unrecoverable_count.saturating_add(1);
                     }
                     self.order.pop_front();
-                    self.objects.remove(&oldest_id);
+                    if let Some(mut st) = self.objects.remove(&oldest_id) {
+                        self.recycle_state(&mut st);
+                    }
                     continue;
                 }
             } else {
@@ -521,21 +901,24 @@ impl FecReassembler {
         }
 
         if !self.objects.contains_key(&object_key) {
-            if self.objects.len() >= self.max_objects {
-                if let Some(oldest) = self.order.pop_front() {
-                    if let Some(st) = self.objects.remove(&oldest) {
+            if self.objects.len() >= self.max_objects || self.order.len() >= self.max_objects {
+                while let Some(oldest) = self.order.pop_front() {
+                    if let Some(mut st) = self.objects.remove(&oldest) {
                         if !st.done {
                             self.unrecoverable_count = self.unrecoverable_count.saturating_add(1);
                         }
+                        self.recycle_state(&mut st);
+                        break;
                     }
                 }
             }
             let shard_len = obj_size.min(sym_size);
             let payload_len = k.checked_mul(shard_len).unwrap_or(0);
-            self.objects.insert(
+            let bufs = self.acquire_buffers(payload_len, k, shard_len);
+            if let Some(mut displaced) = self.objects.insert(
                 object_key,
                 ObjState {
-                    payload: vec![0u8; payload_len],
+                    payload: bufs.payload,
                     seen_mask: [0; 4],
                     source_count: 0,
                     total_count: 0,
@@ -545,18 +928,30 @@ impl FecReassembler {
                     scheme,
                     done: false,
                     expires_at_ms: now_ms.saturating_add(deadline_ms),
-                    repair_shards: Vec::new(),
+                    repair_shards: bufs.repair_shards,
+                    repair_pool: bufs.repair_pool,
                 },
-            );
+            ) {
+                if !displaced.done {
+                    self.unrecoverable_count = self.unrecoverable_count.saturating_add(1);
+                }
+                self.recycle_state(&mut displaced);
+            }
             self.order.push_back(object_key);
         }
         let state = self.objects.get_mut(&object_key)?;
         if now_ms > state.expires_at_ms {
             state.done = true;
-            state.payload.clear();
-            state.payload.shrink_to_fit();
-            state.repair_shards.clear();
-            state.repair_shards.shrink_to_fit();
+            if self.pool_payloads.len() < self.max_objects && !state.payload.is_empty() {
+                let mut payload = std::mem::take(&mut state.payload);
+                payload.clear();
+                self.pool_payloads.push(payload);
+            } else {
+                state.payload.clear();
+            }
+            for (_, buf) in state.repair_shards.drain(..) {
+                state.repair_pool.push(buf);
+            }
             return None;
         }
         if state.done {
@@ -580,11 +975,16 @@ impl FecReassembler {
             let copy_len = symbol.data.len().min(state.shard_len);
             state.payload[offset..offset + copy_len].copy_from_slice(&symbol.data[..copy_len]);
         } else {
-            let mut shard_data = symbol.data.clone();
-            if shard_data.len() < state.shard_len {
-                shard_data.resize(state.shard_len, 0);
+            let mut shard_buf = state
+                .repair_pool
+                .pop()
+                .unwrap_or_else(|| vec![0u8; state.shard_len]);
+            let copy_len = symbol.data.len().min(state.shard_len);
+            shard_buf[..copy_len].copy_from_slice(&symbol.data[..copy_len]);
+            if copy_len < state.shard_len {
+                shard_buf[copy_len..state.shard_len].fill(0);
             }
-            state.repair_shards.push((symbol_index, shard_data));
+            state.repair_shards.push((symbol_index, shard_buf));
         }
 
         if state.total_count < state.k {
@@ -598,8 +998,9 @@ impl FecReassembler {
         if state.source_count == state.k {
             // All K source shards arrived: fast systematic path with no RS decode!
             let mut object = std::mem::take(&mut state.payload);
-            state.repair_shards.clear();
-            state.repair_shards.shrink_to_fit();
+            for (_, buf) in state.repair_shards.drain(..) {
+                state.repair_pool.push(buf);
+            }
             object.truncate(size);
             return Some(object);
         }
@@ -607,24 +1008,25 @@ impl FecReassembler {
         // Loss path: at least one repair shard is required.
         self.recovered_count += 1;
 
-        let repair_refs: Vec<(u16, &[u8])> = state
-            .repair_shards
-            .iter()
-            .map(|(idx, d)| (*idx, d.as_slice()))
-            .collect();
+        let mut repair_refs = [(0u16, &[][..]); 256];
+        let num_repair = state.repair_shards.len().min(256);
+        for (i, (idx, d)) in state.repair_shards[..num_repair].iter().enumerate() {
+            repair_refs[i] = (*idx, d.as_slice());
+        }
 
         rs::reconstruct_missing_sources(
             state.k,
             state.shard_len,
             &mut state.payload,
             &state.seen_mask,
-            &repair_refs,
+            &repair_refs[..num_repair],
             state.scheme,
         )?;
 
         let mut object = std::mem::take(&mut state.payload);
-        state.repair_shards.clear();
-        state.repair_shards.shrink_to_fit();
+        for (_, buf) in state.repair_shards.drain(..) {
+            state.repair_pool.push(buf);
+        }
         object.truncate(size);
         Some(object)
     }
@@ -1661,6 +2063,7 @@ mod tests {
             done: false,
             expires_at_ms: 1000,
             repair_shards: Vec::new(),
+            repair_pool: Vec::new(),
         };
 
         // Insert 64 objects (keys 100..164)
@@ -1751,11 +2154,11 @@ mod tests {
             done: false,
             expires_at_ms: 1000,
             repair_shards: Vec::new(),
+            repair_pool: Vec::new(),
         };
 
-        // Table capacity 8 yields 16 slots (mask 15).
-        // Scenario 1: k49 (slot 15), k61 (slot 15 -> 0), k3 (slot 0 -> 1).
-        // Removing 49 tests next_idx < idx (0 < 15) with natural_idx 15 moving to 15.
+        // Table capacity 8: verify correct slot lookup, removal, and remaining key accessibility
+        // across candidate probe buckets without interference between adjacent keys.
         let mut t1 = ObjectTable::new(8);
         t1.insert(49, dummy(49));
         t1.insert(61, dummy(61));
@@ -1765,8 +2168,6 @@ mod tests {
         assert_eq!(t1.get(&3).unwrap().shard_len, 3);
         assert!(t1.get(&49).is_none());
 
-        // Scenario 2: k17 (slot 14), k49 (slot 15), k3 (slot 0).
-        // Removing 17 tests next_idx < idx (0 < 14) with natural_idx 0 staying at 0.
         let mut t2 = ObjectTable::new(8);
         t2.insert(17, dummy(17));
         t2.insert(49, dummy(49));

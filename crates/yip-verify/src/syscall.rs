@@ -1,6 +1,9 @@
 //! Syscall and thread scheduling inspection for detecting blocking IO and context switches.
 
-#[cfg(target_os = "linux")]
+#[cfg(miri)]
+use libc as _;
+
+#[cfg(all(target_os = "linux", not(miri)))]
 #[inline]
 pub fn get_thread_rusage() -> libc::rusage {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
@@ -11,14 +14,14 @@ pub fn get_thread_rusage() -> libc::rusage {
     unsafe { usage.assume_init() }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(not(target_os = "linux"), miri))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FallbackRusage {
     pub ru_nvcsw: i64,
     pub ru_nivcsw: i64,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(not(target_os = "linux"), miri))]
 #[inline]
 pub fn get_thread_rusage() -> FallbackRusage {
     FallbackRusage::default()
@@ -29,10 +32,10 @@ pub fn get_thread_rusage() -> FallbackRusage {
 #[macro_export]
 macro_rules! assert_no_blocking_io {
     ($block:expr) => {{
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(miri)))]
         let usage_before = $crate::syscall::get_thread_rusage();
         let result = $block;
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(miri)))]
         {
             let usage_after = $crate::syscall::get_thread_rusage();
             assert_eq!(

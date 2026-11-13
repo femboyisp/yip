@@ -139,7 +139,7 @@ fn test_assert_no_blocking_io_passes_on_cpu_work() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(miri)))]
 #[should_panic(expected = "Voluntary context switch detected")]
 fn test_assert_no_blocking_io_panics_on_blocking_sleep() {
     assert_no_blocking_io!({
