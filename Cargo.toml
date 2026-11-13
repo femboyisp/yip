@@ -9,6 +9,7 @@ rust-version = "1.89.0"
 license = "AGPL-3.0-or-later"
 authors = ["FEMBOY CYBER NETWORKS LLC <security@femboy.zip>"]
 repository = "https://github.com/femboyisp/yip"
+homepage = "https://femboy.zip"
 documentation = "https://docs.rs/yip-mesh"
 keywords = ["vpn", "mesh", "fec", "cryptography", "peer-to-peer"]
 categories = ["network-programming", "cryptography"]
