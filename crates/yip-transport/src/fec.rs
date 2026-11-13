@@ -686,9 +686,6 @@ impl ObjectTable {
                 generation: gen,
                 state,
             });
-            if evicted.is_none() {
-                self.len += 1;
-            }
             evicted
         }
     }

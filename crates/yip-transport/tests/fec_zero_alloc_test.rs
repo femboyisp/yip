@@ -90,6 +90,16 @@ fn test_fec_encoder_encode_zero_alloc_with_arena() {
     assert_eq!(reassembler.push(oid, &syms[0], 0, 1000), None);
     let decoded = reassembler.push(oid, &syms[2], 0, 1000);
     assert_eq!(decoded.as_deref(), Some(k2_trim_data.as_slice()));
+
+    // 9. Verify custom arena encoder and repair_with_id_into
+    let mut custom_enc = FecEncoder::with_arena_capacity(8, 500);
+    assert_eq!(custom_enc.arena().symbols().len(), 8);
+    assert_eq!(custom_enc.arena().repair_shard_capacity(), 500);
+    custom_enc.arena_mut().ensure_capacity(12, 600);
+    assert_eq!(custom_enc.arena().symbols().len(), 12);
+    let repair_into = custom_enc.repair_with_id_into(&k3_data, arq_params, 100, 2, &mut arena);
+    assert_eq!(repair_into.len(), 5);
+    assert!(custom_enc.symbols_encoded() > 0);
 }
 
 #[test]

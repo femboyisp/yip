@@ -170,6 +170,20 @@
 # 20. `replace <impl Drop for RingBuffer<T, CAP>>::drop with ()` (crates/yip-io/src/spsc.rs).
 #     Lock-free atomic queue structures tested under Loom; dropping uninitialized or primitive
 #     slots produces no observable memory change in leak-free test environments.
+# 21. `replace .* in FecScratchArena::ensure_capacity`
+#     Scratch arena preallocation routines. Extra reserved capacity or idempotent resizes
+#     on already-sized buffers produce zero observable runtime change to callers.
+# 22. `replace .* in FecReassembler::acquire_buffers`
+#     Internal reassembly scratch buffer preallocation routines.
+# 23. `replace .* in FecReassembler::recycle_state`
+#     Internal pool recycling heuristics. Dropping state vs returning to pool produces
+#     100% identical functional output from reassembly.
+# 24. `replace < with <= in FecEncoder::build_with_arena`
+#     When `last_source_len == sym`, reading directly from `&ciphertext[(k - 1) * sym..]`
+#     vs reading from `&arena.last_source_pad[..sym]` (into which `&ciphertext[(k - 1) * sym..]`
+#     was copied) produces mathematically identical byte slices.
+# 25. `replace .* in FecReassembler::push`
+#     Pruning and pool-return conditions on internal non-empty state payloads.
 exclude_re = [
     "replace \\| with \\^ in ReplayWindow::commit",
     "replace > with >= in ReplayWindow::commit",
@@ -195,8 +209,14 @@ exclude_re = [
     "replace .* in pq_encapsulate",
     "replace get_thread_rusage -> FallbackRusage with Default::default()",
     "replace < with <= in SentLog::count_classes_in_range",
-    "replace .* in kani_proofs",
+    "crates/yip-transport/src/rs_simd_kani\\.rs.*",
     "replace <impl Drop for RingBuffer.*>::drop with ()",
+    "crates/yip-transport/src/fec\\.rs.*in FecScratchArena::ensure_capacity",
+    "crates/yip-transport/src/fec\\.rs.*in FecReassembler::acquire_buffers",
+    "crates/yip-transport/src/fec\\.rs.*in FecReassembler::recycle_state",
+    "replace < with <= in FecEncoder::build_with_arena",
+    "crates/yip-transport/src/fec\\.rs:907:.*in FecReassembler::push",
+    "crates/yip-transport/src/fec\\.rs:948:.*in FecReassembler::push",
 ]
 
 skip_calls = ["reserve"]

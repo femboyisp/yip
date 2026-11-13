@@ -32,7 +32,15 @@ jobs:
         run: |
           git fetch origin ${{ github.base_ref }}
           git diff origin/${{ github.base_ref }}...HEAD > pr.diff
-          cargo mutants --in-diff pr.diff --in-place --baseline=skip
+          cargo mutants \
+            --package yip-wire \
+            --package yip-transport \
+            --package yip-crypto \
+            --package yip-obf \
+            --package yip-membership \
+            --package yip-rendezvous \
+            --package yipd \
+            --in-diff pr.diff --in-place --timeout 120 -- --fail-fast
       - name: Mutation test (logic & control crates)
         if: github.event_name != 'pull_request'
         run: >
