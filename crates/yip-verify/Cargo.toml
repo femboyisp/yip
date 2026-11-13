@@ -1,0 +1,16 @@
+[package]
+name = "yip-verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Zero-allocation, bounded-ops, and syscall invariant verification harness for yip"
+publish = false
+
+[dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

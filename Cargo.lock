@@ -2519,6 +2519,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "yip-verify"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "yip-wire"
 version = "0.1.0"
 dependencies = [
