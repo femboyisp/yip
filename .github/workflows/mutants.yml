@@ -40,7 +40,7 @@ jobs:
             --package yip-membership \
             --package yip-rendezvous \
             --package yipd \
-            --in-diff pr.diff --in-place --timeout 120 -- --fail-fast
+            --in-diff pr.diff --in-place --timeout 120
       - name: Mutation test (logic & control crates)
         if: github.event_name != 'pull_request'
         run: >

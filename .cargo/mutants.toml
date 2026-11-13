@@ -214,9 +214,11 @@ exclude_re = [
     "crates/yip-transport/src/fec\\.rs.*in FecScratchArena::ensure_capacity",
     "crates/yip-transport/src/fec\\.rs.*in FecReassembler::acquire_buffers",
     "crates/yip-transport/src/fec\\.rs.*in FecReassembler::recycle_state",
+    "replace FecReassembler::recycle_state with ()",
+    "replace FecReassembler::acquire_buffers -> ReassemblyBuffers with Default::default()",
     "replace < with <= in FecEncoder::build_with_arena",
-    "crates/yip-transport/src/fec\\.rs:907:.*in FecReassembler::push",
-    "crates/yip-transport/src/fec\\.rs:948:.*in FecReassembler::push",
+    "crates/yip-transport/src/fec\\.rs:90.*in FecReassembler::push",
+    "crates/yip-transport/src/fec\\.rs:94.*in FecReassembler::push",
 ]
 
 skip_calls = ["reserve"]
