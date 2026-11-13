@@ -6,7 +6,7 @@ Documentation=https://github.com/femboyisp/yip
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/yip-rendezvous --listen-udp 0.0.0.0:51820
+ExecStart=/usr/local/bin/yip-rendezvous --listen-udp 0.0.0.0:443
 Restart=always
 RestartSec=3s
 

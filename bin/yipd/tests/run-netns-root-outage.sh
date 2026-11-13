@@ -38,7 +38,7 @@ IP_A="10.92.0.1"
 IP_B="10.92.0.2"
 IP_R="10.92.0.3"
 VETH_PREFIX="24"
-PORT="51820"
+PORT="443"
 TUN_DEV="yip0"
 NETWORK_ID="face0ff5face0ff5face0ff5face0ff5"
 

@@ -764,8 +764,8 @@ capture_relay() {
     local ip_r_b="10.81.0.1"
     local prefix="24"
 
-    local port_a="51820"
-    local port_b="51820"
+    local port_a="443"
+    local port_b="443"
     local rdv_udp_port="51821"
     local rdv_tcp_port="8443"
     local tun_dev="yip0"

@@ -60,6 +60,7 @@ fn print_daemon_usage() {
     println!("      --metrics-listen <ADDR> Prometheus/OTEL HTTP metrics listen address (e.g. 127.0.0.1:9184)");
     println!("      --genkey            Generate a fresh X25519 keypair");
     println!("      --addr <HEX-KEY>    Derive self-certifying mesh IPv6 address");
+    println!("      --node-id <HEX-KEY> Derive rendezvous node ID");
     println!("  -V, --version           Print version");
     println!("  -h, --help              Print help");
 }
@@ -951,6 +952,18 @@ fn main() -> std::io::Result<()> {
                 println!("{}", addr::node_addr(&pubkey));
                 return Ok(());
             }
+            Some("node-id") | Some("--node-id") => {
+                let hex = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "node-id requires a 64-char hex pubkey argument",
+                    )
+                })?;
+                let pubkey = hex_decode_32(&hex)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                println!("{}", hex_encode(&yip_membership::node_id(&pubkey)));
+                return Ok(());
+            }
             Some(unknown) => {
                 eprintln!("yipctl: unknown command '{unknown}'");
                 eprintln!("See 'yipctl --help' for available commands.");
@@ -1002,6 +1015,18 @@ fn main() -> std::io::Result<()> {
             let pubkey = hex_decode_32(&hex)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
             println!("{}", addr::node_addr(&pubkey));
+            Ok(())
+        }
+        Some("--node-id") => {
+            let hex = args.next().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--node-id requires a 64-char hex pubkey argument",
+                )
+            })?;
+            let pubkey = hex_decode_32(&hex)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            println!("{}", hex_encode(&yip_membership::node_id(&pubkey)));
             Ok(())
         }
         Some(arg) if arg.starts_with('-') => {

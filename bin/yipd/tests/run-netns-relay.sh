@@ -44,8 +44,8 @@ IP_B="10.71.0.2"
 IP_R_B="10.71.0.1"   # R's address on B's subnet
 PREFIX="24"
 
-PORT_A="51820"
-PORT_B="51820"
+PORT_A="443"
+PORT_B="443"
 RDV_PORT="51821"
 TUN_DEV="yip0"
 

@@ -148,7 +148,7 @@ IP_B="10.99.0.2"
 IP_S="10.99.0.3"
 IP_R="10.99.0.4"
 VETH_PREFIX="24"
-PORT="51820"
+PORT="443"
 RDV_PORT="51821"
 TUN_DEV="yip0"
 NETWORK_ID="abadcafeabadcafeabadcafeabadcafe"
@@ -472,7 +472,7 @@ def blake3_derive_key(context: str, material: bytes) -> bytes:
         ctx_bytes = context.encode("utf-8")
         flags1 = 0x01 | 0x02 | 0x08 | 0x20
         ctx_cv = blake3_compress(IV, ctx_bytes, len(ctx_bytes), 0, flags1)
-        flags2 = 0x01 | 0x02 | 0x08 | 0x40 | 0x10
+        flags2 = 0x01 | 0x02 | 0x08 | 0x40
         mat_cv = blake3_compress(ctx_cv, material, len(material), 0, flags2)
         return struct.pack("<8I", *mat_cv)
 

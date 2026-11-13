@@ -41,7 +41,7 @@ chmod 777 "$TMPDIR_TEST"
 NS_YA="ipfYA"; NS_YB="ipfYB"; VYA="ipfvYA"; VYB="ipfvYB"
 VYA_IP="10.10.0.1"; VYB_IP="10.10.0.2"
 TUN_YA_IP="10.11.0.1"; TUN_YB_IP="10.11.0.2"
-YPORT_A="51850"; YPORT_B="51851"; TUN_DEV="yip0"; YIP_MTU=1184
+YPORT_A="443"; YPORT_B="443"; TUN_DEV="yip0"; YIP_MTU=1184
 PID_YA=""; PID_YB=""
 
 # ── WireGuard ─────────────────────────────────────────────────────────────────

@@ -1010,7 +1010,7 @@ mod tests {
 
     #[test]
     fn parse_config_from_kv() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\npeer_endpoint=10.0.0.2:51820\ninitiate=true\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\npeer_endpoint=10.0.0.2:443\ninitiate=true\n\
                     local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
                     local_public=00000000000000000000000000000000000000000000000000000000000000aa\n\
                     peer_public=00000000000000000000000000000000000000000000000000000000000000bb\n";
@@ -1023,11 +1023,11 @@ mod tests {
 
     #[test]
     fn parse_config_shards_and_threads() {
-        let base = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let base = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
                     local_public=00000000000000000000000000000000000000000000000000000000000000aa\n\
                     peer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
-                    peer_endpoint=10.0.0.2:51820\n";
+                    peer_endpoint=10.0.0.2:443\n";
 
         let text_shards = format!("{base}shards=4\n");
         let c = Config::parse(&text_shards).unwrap();
@@ -1043,11 +1043,11 @@ mod tests {
 
     #[test]
     fn parse_config_valid_mtu() {
-        let base = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let base = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
                     local_public=00000000000000000000000000000000000000000000000000000000000000aa\n\
                     peer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
-                    peer_endpoint=10.0.0.2:51820\n";
+                    peer_endpoint=10.0.0.2:443\n";
 
         for m in [1400, 9000, 576] {
             let text = format!("{base}mtu={m}\n");
@@ -1061,11 +1061,11 @@ mod tests {
 
     #[test]
     fn parse_config_rejects_out_of_range_mtu() {
-        let base = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let base = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
                     local_public=00000000000000000000000000000000000000000000000000000000000000aa\n\
                     peer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
-                    peer_endpoint=10.0.0.2:51820\n";
+                    peer_endpoint=10.0.0.2:443\n";
 
         for bad in ["575", "70000"] {
             let text = format!("{base}mtu={bad}\n");
@@ -1080,7 +1080,7 @@ mod tests {
 # this is a comment
 device=yip1
 
-listen=127.0.0.1:51820
+listen=127.0.0.1:443
 peer_endpoint=127.0.0.1:51821
 initiate=false
 local_private=0000000000000000000000000000000000000000000000000000000000000001
@@ -1097,7 +1097,7 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         // `listen` absent is no longer an error — it defaults to auto-443.
         let text = "\
 device=yip0
-peer_endpoint=10.0.0.2:51820
+peer_endpoint=10.0.0.2:443
 initiate=true
 local_private=0000000000000000000000000000000000000000000000000000000000000001
 local_public=0000000000000000000000000000000000000000000000000000000000000002
@@ -1112,8 +1112,8 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
     fn parse_config_bad_hex_returns_error() {
         let text = "\
 device=yip0
-listen=0.0.0.0:51820
-peer_endpoint=10.0.0.2:51820
+listen=0.0.0.0:443
+peer_endpoint=10.0.0.2:443
 initiate=true
 local_private=zzzz0000000000000000000000000000000000000000000000000000000000ff
 local_public=00000000000000000000000000000000000000000000000000000000000000aa
@@ -1127,8 +1127,8 @@ peer_public=00000000000000000000000000000000000000000000000000000000000000bb
         // Too short — exercises the hex.len() != 64 branch in hex_to_32.
         let text = "\
 device=yip0
-listen=0.0.0.0:51820
-peer_endpoint=10.0.0.2:51820
+listen=0.0.0.0:443
+peer_endpoint=10.0.0.2:443
 initiate=true
 local_private=deadbeef
 local_public=00000000000000000000000000000000000000000000000000000000000000aa
@@ -1143,8 +1143,8 @@ peer_public=00000000000000000000000000000000000000000000000000000000000000bb
         // A line without '=' triggers the split_once error path.
         let text = "\
 device=yip0
-listen=0.0.0.0:51820
-peer_endpoint=10.0.0.2:51820
+listen=0.0.0.0:443
+peer_endpoint=10.0.0.2:443
 initiate=true
 local_private=0000000000000000000000000000000000000000000000000000000000000001
 local_public=0000000000000000000000000000000000000000000000000000000000000002
@@ -1158,7 +1158,7 @@ THISISMALFORMED
     fn parse_config_bad_peer_endpoint_returns_error() {
         let text = "\
 device=yip0
-listen=0.0.0.0:51820
+listen=0.0.0.0:443
 peer_endpoint=not_a_valid_addr
 initiate=true
 local_private=0000000000000000000000000000000000000000000000000000000000000001
@@ -1173,7 +1173,7 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         let text = "\
 device=yip0
 listen=not_valid
-peer_endpoint=10.0.0.2:51820
+peer_endpoint=10.0.0.2:443
 initiate=true
 local_private=0000000000000000000000000000000000000000000000000000000000000001
 local_public=0000000000000000000000000000000000000000000000000000000000000002
@@ -1187,8 +1187,8 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         // Unknown keys must not cause an error (forward-compat).
         let text = "\
 device=yip0
-listen=0.0.0.0:51820
-peer_endpoint=10.0.0.2:51820
+listen=0.0.0.0:443
+peer_endpoint=10.0.0.2:443
 initiate=false
 local_private=0000000000000000000000000000000000000000000000000000000000000001
 local_public=0000000000000000000000000000000000000000000000000000000000000002
@@ -1203,8 +1203,8 @@ future_key=whatever
         let text = "\
 device=yip0
 device_kind=tun
-listen=0.0.0.0:51820
-peer_endpoint=10.0.0.2:51820
+listen=0.0.0.0:443
+peer_endpoint=10.0.0.2:443
 initiate=false
 local_private=0000000000000000000000000000000000000000000000000000000000000001
 local_public=0000000000000000000000000000000000000000000000000000000000000002
@@ -1219,8 +1219,8 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         let text = "\
 device=yip0
 device_kind=tap
-listen=0.0.0.0:51820
-peer_endpoint=10.0.0.2:51820
+listen=0.0.0.0:443
+peer_endpoint=10.0.0.2:443
 initiate=false
 local_private=0000000000000000000000000000000000000000000000000000000000000001
 local_public=0000000000000000000000000000000000000000000000000000000000000002
@@ -1234,8 +1234,8 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
     fn parse_config_device_kind_defaults_to_tun_when_absent() {
         let text = "\
 device=yip0
-listen=0.0.0.0:51820
-peer_endpoint=10.0.0.2:51820
+listen=0.0.0.0:443
+peer_endpoint=10.0.0.2:443
 initiate=false
 local_private=0000000000000000000000000000000000000000000000000000000000000001
 local_public=0000000000000000000000000000000000000000000000000000000000000002
@@ -1250,8 +1250,8 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         let text = "\
 device=yip0
 device_kind=foo
-listen=0.0.0.0:51820
-peer_endpoint=10.0.0.2:51820
+listen=0.0.0.0:443
+peer_endpoint=10.0.0.2:443
 initiate=false
 local_private=0000000000000000000000000000000000000000000000000000000000000001
 local_public=0000000000000000000000000000000000000000000000000000000000000002
@@ -1266,21 +1266,18 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         // New [peer] block form:
         let text = "local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
                     local_public=000000000000000000000000000000000000000000000000000000000000aa01\n\
-                    listen=0.0.0.0:51820\ndevice=yip0\n\
-                    [peer]\npublic_key=00000000000000000000000000000000000000000000000000000000000000b1\nendpoint=10.0.0.2:51820\n\
-                    [peer]\npublic_key=00000000000000000000000000000000000000000000000000000000000000b2\nendpoint=10.0.0.3:51820\n";
+                    listen=0.0.0.0:443\ndevice=yip0\n\
+                    [peer]\npublic_key=00000000000000000000000000000000000000000000000000000000000000b1\nendpoint=10.0.0.2:443\n\
+                    [peer]\npublic_key=00000000000000000000000000000000000000000000000000000000000000b2\nendpoint=10.0.0.3:443\n";
         let cfg = Config::parse(text).expect("parses");
         assert_eq!(cfg.peers.len(), 2);
-        assert_eq!(
-            cfg.peers[0].endpoint,
-            Some("10.0.0.2:51820".parse().unwrap())
-        );
+        assert_eq!(cfg.peers[0].endpoint, Some("10.0.0.2:443".parse().unwrap()));
         assert_eq!(cfg.peers[1].public_key[31], 0xb2);
     }
 
     #[test]
     fn legacy_single_peer_becomes_one_entry() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\npeer_endpoint=10.0.0.2:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\npeer_endpoint=10.0.0.2:443\n\
                     local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
                     local_public=00000000000000000000000000000000000000000000000000000000000000aa\n\
                     peer_public=00000000000000000000000000000000000000000000000000000000000000bb\n";
@@ -1293,7 +1290,7 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
     fn parses_rendezvous_and_optional_endpoint() {
         let text = "local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
                     local_public=000000000000000000000000000000000000000000000000000000000000aa01\n\
-                    listen=0.0.0.0:51820\ndevice=yip0\nrendezvous=203.0.113.1:51821\n\
+                    listen=0.0.0.0:443\ndevice=yip0\nrendezvous=203.0.113.1:51821\n\
                     [peer]\npublic_key=00000000000000000000000000000000000000000000000000000000000000b1\n";
         let cfg = Config::parse(text).expect("parses");
         assert_eq!(
@@ -1311,14 +1308,11 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
     fn rendezvous_absent_is_none() {
         let text = "local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
                     local_public=000000000000000000000000000000000000000000000000000000000000aa01\n\
-                    listen=0.0.0.0:51820\ndevice=yip0\n\
-                    [peer]\npublic_key=00000000000000000000000000000000000000000000000000000000000000b1\nendpoint=10.0.0.2:51820\n";
+                    listen=0.0.0.0:443\ndevice=yip0\n\
+                    [peer]\npublic_key=00000000000000000000000000000000000000000000000000000000000000b1\nendpoint=10.0.0.2:443\n";
         let cfg = Config::parse(text).unwrap();
         assert_eq!(cfg.rendezvous, None);
-        assert_eq!(
-            cfg.peers[0].endpoint,
-            Some("10.0.0.2:51820".parse().unwrap())
-        );
+        assert_eq!(cfg.peers[0].endpoint, Some("10.0.0.2:443".parse().unwrap()));
     }
 
     // ── tls:// rendezvous (3c.4 Task 1) ─────────────────────────────────
@@ -1328,7 +1322,7 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         let cfg = Config::parse(
             "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
              local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-             listen=0.0.0.0:51820\ndevice=yip0\n\
+             listen=0.0.0.0:443\ndevice=yip0\n\
              obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
              rendezvous=tls://relay.example.com:443\n\
              [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
@@ -1348,7 +1342,7 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         let cfg = Config::parse(
             "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
              local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-             listen=0.0.0.0:51820\ndevice=yip0\n\
+             listen=0.0.0.0:443\ndevice=yip0\n\
              obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
              rendezvous=tls://[2001:db8::1]:443\n\
              [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
@@ -1365,7 +1359,7 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         let err = Config::parse(
             "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
              local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-             listen=0.0.0.0:51820\ndevice=yip0\n\
+             listen=0.0.0.0:443\ndevice=yip0\n\
              obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
              rendezvous=tls://[2001:db8::1:443\n\
              [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
@@ -1379,7 +1373,7 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         let err = Config::parse(
             "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
              local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-             listen=0.0.0.0:51820\ndevice=yip0\n\
+             listen=0.0.0.0:443\ndevice=yip0\n\
              rendezvous=tls://relay.example.com:443\n\
              [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
         )
@@ -1392,7 +1386,7 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         let cfg = Config::parse(
             "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
              local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-             listen=0.0.0.0:51820\ndevice=yip0\n\
+             listen=0.0.0.0:443\ndevice=yip0\n\
              rendezvous=203.0.113.9:51821\n\
              [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
         )
@@ -1408,7 +1402,7 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         let text = format!(
             "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
              local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-             listen=0.0.0.0:51820\ndevice=yip0\n\
+             listen=0.0.0.0:443\ndevice=yip0\n\
              obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
              rendezvous=reality://relay.example.test:8443?pbk={pbk}&sid=0011223344556677&sni=www.microsoft.com\n\
              [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
@@ -1442,7 +1436,7 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         let text = format!(
             "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
              local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-             listen=0.0.0.0:51820\ndevice=yip0\n\
+             listen=0.0.0.0:443\ndevice=yip0\n\
              obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
              rendezvous=reality://h.test:443?pbk={p}&sid=0011223344556677&sni=a.test&verify=off\n\
              [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
@@ -1461,7 +1455,7 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
             let text = format!(
                 "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                  local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                 listen=0.0.0.0:51820\ndevice=yip0\n\
+                 listen=0.0.0.0:443\ndevice=yip0\n\
                  obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
                  rendezvous=reality://h.test:443?pbk={p}&sid=0011223344556677&sni=a.test&verify={word}\n\
                  [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
@@ -1482,7 +1476,7 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         let text = format!(
             "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
              local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-             listen=0.0.0.0:51820\ndevice=yip0\n\
+             listen=0.0.0.0:443\ndevice=yip0\n\
              obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
              rendezvous=reality://h.test:443?pbk={p}&sid=0011223344556677&sni=a.test\n\
              [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
@@ -1500,7 +1494,7 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         let text = format!(
             "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
              local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-             listen=0.0.0.0:51820\ndevice=yip0\n\
+             listen=0.0.0.0:443\ndevice=yip0\n\
              obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
              rendezvous=reality://h.test:443?pbk={p}&sid=0011223344556677&sni=a.test&verify=bogus\n\
              [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
@@ -1515,7 +1509,7 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         let text = format!(
             "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
              local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-             listen=0.0.0.0:51820\ndevice=yip0\n\
+             listen=0.0.0.0:443\ndevice=yip0\n\
              obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
              rendezvous=reality://h.test:443?pbk={p}&sid=0011223344556677&sni=a.test&verify=on&verify=off\n\
              [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
@@ -1530,7 +1524,7 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         let text = format!(
             "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
              local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-             listen=0.0.0.0:51820\ndevice=yip0\n\
+             listen=0.0.0.0:443\ndevice=yip0\n\
              obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n\
              rendezvous=reality://[2001:db8::1]:443?pbk={pbk}&sid=0011223344556677&sni=a.test\n\
              [peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n",
@@ -1550,7 +1544,7 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         const HEAD: &str =
             "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
              local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-             listen=0.0.0.0:51820\ndevice=yip0\n";
+             listen=0.0.0.0:443\ndevice=yip0\n";
         const PEER: &str =
             "[peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n";
         let base_psk = "obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n";
@@ -1615,7 +1609,7 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         const HEAD: &str =
             "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
              local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-             listen=0.0.0.0:51820\ndevice=yip0\n";
+             listen=0.0.0.0:443\ndevice=yip0\n";
         const PEER: &str =
             "[peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n";
         let base_psk = "obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n";
@@ -1636,7 +1630,7 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         const HEAD: &str =
             "local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
              local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-             listen=0.0.0.0:51820\ndevice=yip0\n";
+             listen=0.0.0.0:443\ndevice=yip0\n";
         const PEER: &str =
             "[peer]\npublic_key=0000000000000000000000000000000000000000000000000000000000000003\n";
         let base_psk = "obf_psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n";
@@ -1674,8 +1668,8 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
     const BASE_CFG: &str = "\
 device=yip0
-listen=0.0.0.0:51820
-peer_endpoint=10.0.0.2:51820
+listen=0.0.0.0:443
+peer_endpoint=10.0.0.2:443
 local_private=0000000000000000000000000000000000000000000000000000000000000001
 local_public=0000000000000000000000000000000000000000000000000000000000000002
 peer_public=0000000000000000000000000000000000000000000000000000000000000003
@@ -1834,7 +1828,7 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
         let text = format!(
             "device=yip0\n\
-             listen=0.0.0.0:51820\n\
+             listen=0.0.0.0:443\n\
              local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
              local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
              ca_public={}\n\
@@ -1906,7 +1900,7 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
         let text = format!(
             "device=yip0\n\
-             listen=0.0.0.0:51820\n\
+             listen=0.0.0.0:443\n\
              local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
              local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
              ca_public={}\n\
@@ -1971,7 +1965,7 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
         let text = format!(
             "device=yip0\n\
-             listen=0.0.0.0:51820\n\
+             listen=0.0.0.0:443\n\
              local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
              local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
              ca_public={}\n\
@@ -1996,10 +1990,10 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
     #[test]
     fn parses_obf_psk_when_present() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     obf_psk=00000000000000000000000000000000000000000000000000000000000000ff\n";
         let cfg = Config::parse(text).unwrap();
         assert_eq!(
@@ -2014,10 +2008,10 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
     #[test]
     fn obf_psk_absent_is_none() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n";
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n";
         assert_eq!(Config::parse(text).unwrap().obf_psk, None);
     }
 
@@ -2025,10 +2019,10 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
     #[test]
     fn parses_cover_traffic_ms_when_present() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     cover_traffic_ms=250\n";
         let cfg = Config::parse(text).unwrap();
         assert_eq!(cfg.cover_traffic_ms, Some(250));
@@ -2036,19 +2030,19 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
     #[test]
     fn cover_traffic_ms_absent_is_none() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n";
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n";
         assert_eq!(Config::parse(text).unwrap().cover_traffic_ms, None);
     }
 
     #[test]
     fn cover_traffic_ms_zero_is_parse_error() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     cover_traffic_ms=0\n";
         let err = Config::parse(text).unwrap_err();
         assert!(
@@ -2059,10 +2053,10 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
     #[test]
     fn cover_traffic_ms_non_integer_is_parse_error() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     cover_traffic_ms=abc\n";
         assert!(Config::parse(text).is_err());
     }
@@ -2071,10 +2065,10 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
     #[test]
     fn parses_transport_quic_when_present() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     transport=quic\n";
         let cfg = Config::parse(text).unwrap();
         assert_eq!(cfg.transport, TransportMode::Quic);
@@ -2082,10 +2076,10 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
     #[test]
     fn transport_absent_defaults_to_raw_udp() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n";
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n";
         let cfg = Config::parse(text).unwrap();
         assert_eq!(cfg.transport, TransportMode::RawUdp);
     }
@@ -2094,10 +2088,10 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
     fn transport_raw_and_udp_aliases_parse_to_raw_udp() {
         for val in ["raw", "udp"] {
             let text = format!(
-                "device=yip0\nlisten=0.0.0.0:51820\n\
+                "device=yip0\nlisten=0.0.0.0:443\n\
                  local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                  local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                 peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                 peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                  transport={val}\n"
             );
             let cfg = Config::parse(&text).unwrap();
@@ -2107,10 +2101,10 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
     #[test]
     fn transport_unknown_value_is_parse_error() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     transport=bogus\n";
         let err = Config::parse(text).unwrap_err();
         assert!(
@@ -2121,10 +2115,10 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
     #[test]
     fn transport_quic_with_obf_psk_is_parse_error() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     transport=quic\n\
                     obf_psk=00000000000000000000000000000000000000000000000000000000000000ff\n";
         let err = Config::parse(text).unwrap_err();
@@ -2137,10 +2131,10 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
     #[test]
     fn transport_quic_with_cover_traffic_ms_is_parse_error() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     transport=quic\n\
                     cover_traffic_ms=200\n";
         let err = Config::parse(text).unwrap_err();
@@ -2153,10 +2147,10 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
     #[test]
     fn transport_quic_alone_parses_ok() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     transport=quic\n";
         let cfg = Config::parse(text).unwrap();
         assert_eq!(cfg.transport, TransportMode::Quic);
@@ -2168,10 +2162,10 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
     #[test]
     fn parses_transport_tls_with_sni() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     transport=tls\ntls_sni=www.apple.com\n";
         let cfg = Config::parse(text).unwrap();
         assert_eq!(cfg.transport, TransportMode::Tls);
@@ -2180,10 +2174,10 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
     #[test]
     fn transport_tls_default_sni_when_absent() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     transport=tls\n";
         let cfg = Config::parse(text).unwrap();
         assert_eq!(cfg.transport, TransportMode::Tls);
@@ -2192,10 +2186,10 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
     #[test]
     fn transport_tls_with_obf_psk_is_parse_error() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     transport=tls\n\
                     obf_psk=00000000000000000000000000000000000000000000000000000000000000ff\n";
         let err = Config::parse(text).unwrap_err();
@@ -2208,10 +2202,10 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
     #[test]
     fn transport_tls_with_cover_traffic_ms_is_parse_error() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     transport=tls\n\
                     cover_traffic_ms=200\n";
         let err = Config::parse(text).unwrap_err();
@@ -2224,10 +2218,10 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
     #[test]
     fn transport_tls_alone_parses_ok() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     transport=tls\n";
         let cfg = Config::parse(text).unwrap();
         assert_eq!(cfg.transport, TransportMode::Tls);
@@ -2239,16 +2233,16 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
     fn multi_peer_transport_tls_parses_cleanly() {
         let text = "\
 device=yip0
-listen=0.0.0.0:51820
+listen=0.0.0.0:443
 local_private=0000000000000000000000000000000000000000000000000000000000000001
 local_public=0000000000000000000000000000000000000000000000000000000000000002
 transport=tls
 [peer]
 public_key=0000000000000000000000000000000000000000000000000000000000000003
-endpoint=10.0.0.2:51820
+endpoint=10.0.0.2:443
 [peer]
 public_key=0000000000000000000000000000000000000000000000000000000000000004
-endpoint=10.0.0.3:51820
+endpoint=10.0.0.3:443
 ";
         let cfg = Config::parse(text).unwrap();
         assert_eq!(cfg.transport, TransportMode::Tls);
@@ -2259,7 +2253,7 @@ endpoint=10.0.0.3:51820
     fn zero_peers_without_mesh_config_is_parse_error() {
         let text = "\
 device=yip0
-listen=0.0.0.0:51820
+listen=0.0.0.0:443
 local_private=0000000000000000000000000000000000000000000000000000000000000001
 local_public=0000000000000000000000000000000000000000000000000000000000000002
 ";
@@ -2336,10 +2330,10 @@ local_public=0000000000000000000000000000000000000000000000000000000000000002
 
     #[test]
     fn parses_traffic_defense_balanced_with_defaults() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     obf_psk=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
                     traffic_defense=balanced\n";
         let cfg = Config::parse(text).unwrap();
@@ -2355,10 +2349,10 @@ local_public=0000000000000000000000000000000000000000000000000000000000000002
 
     #[test]
     fn parses_traffic_defense_granular_overrides() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     obf_psk=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
                     traffic_defense=balanced\n\
                     defense_buckets=512,1024,1420\n\
@@ -2378,10 +2372,10 @@ local_public=0000000000000000000000000000000000000000000000000000000000000002
 
     #[test]
     fn rejects_traffic_defense_without_obf_psk() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     traffic_defense=balanced\n";
         let err = Config::parse(text).unwrap_err();
         assert!(
@@ -2392,10 +2386,10 @@ local_public=0000000000000000000000000000000000000000000000000000000000000002
 
     #[test]
     fn rejects_non_ascending_defense_buckets() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     obf_psk=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
                     traffic_defense=balanced\n\
                     defense_buckets=1024,512,1420\n";
@@ -2408,10 +2402,10 @@ local_public=0000000000000000000000000000000000000000000000000000000000000002
 
     #[test]
     fn rejects_excessive_jitter_max() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     obf_psk=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
                     traffic_defense=balanced\n\
                     defense_jitter_max_ms=11\n";
@@ -2425,10 +2419,10 @@ local_public=0000000000000000000000000000000000000000000000000000000000000002
 
     #[test]
     fn rejects_traffic_defense_with_quic_or_tls() {
-        let quic_text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let quic_text = "device=yip0\nlisten=0.0.0.0:443\n\
                          local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                          local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                         peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                         peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                          transport=quic\n\
                          traffic_defense=balanced\n";
         let err_quic = Config::parse(quic_text).unwrap_err();
@@ -2439,10 +2433,10 @@ local_public=0000000000000000000000000000000000000000000000000000000000000002
             "unexpected error: {err_quic}"
         );
 
-        let tls_text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let tls_text = "device=yip0\nlisten=0.0.0.0:443\n\
                         local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                         local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                        peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                        peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                         transport=tls\n\
                         traffic_defense=balanced\n";
         let err_tls = Config::parse(tls_text).unwrap_err();
@@ -2456,10 +2450,10 @@ local_public=0000000000000000000000000000000000000000000000000000000000000002
 
     #[test]
     fn legacy_cover_traffic_ms_maps_to_defense_cover_interval() {
-        let text = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     cover_traffic_ms=250\n";
         let cfg = Config::parse(text).unwrap();
         assert_eq!(cfg.cover_traffic_ms, Some(250));
@@ -2483,10 +2477,10 @@ local_public=0000000000000000000000000000000000000000000000000000000000000002
 
     #[test]
     fn rejects_invalid_burst_or_interval_or_bucket_range() {
-        let base = "device=yip0\nlisten=0.0.0.0:51820\n\
+        let base = "device=yip0\nlisten=0.0.0.0:443\n\
                     local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
                     local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
-                    peer_endpoint=10.0.0.2:51820\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
                     obf_psk=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
                     traffic_defense=balanced\n";
 
@@ -2517,7 +2511,7 @@ local_public=0000000000000000000000000000000000000000000000000000000000000002
             "local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
                     local_public=00000000000000000000000000000000000000000000000000000000000000aa\n\
                     peer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
-                    peer_endpoint=10.0.0.2:51820\n\
+                    peer_endpoint=10.0.0.2:443\n\
                     device = \"tun0\"\nmetrics_listen = \"127.0.0.1:9184\"\n";
         let parsed = Config::parse(conf).unwrap();
         assert_eq!(
@@ -2532,7 +2526,7 @@ local_public=0000000000000000000000000000000000000000000000000000000000000002
             "local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
                     local_public=00000000000000000000000000000000000000000000000000000000000000aa\n\
                     peer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
-                    peer_endpoint=10.0.0.2:51820\n\
+                    peer_endpoint=10.0.0.2:443\n\
                     device=tun0\n";
         let parsed_none = Config::parse(base).unwrap();
         assert_eq!(parsed_none.metrics_listen, None);

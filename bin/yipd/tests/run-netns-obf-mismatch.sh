@@ -28,8 +28,8 @@ TUN_A_IP="10.9.1.1"
 TUN_B_IP="10.9.1.2"
 TUN_PREFIX="24"
 VETH_PREFIX="24"
-PORT_A="51820"
-PORT_B="51821"
+PORT_A="443"
+PORT_B="443"
 TUN_DEV="yip0"
 
 # Different obf_psk on A vs B: the handshake must never deobfuscate.
