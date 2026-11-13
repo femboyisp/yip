@@ -16,6 +16,10 @@ crossbeam-utils = "0.8.22"
 io-uring = "0.7.10"
 libc = "0.2.186"
 
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

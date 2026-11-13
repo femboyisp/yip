@@ -4,19 +4,94 @@
 //! atomic head and tail pointers to prevent false sharing across CPU cores.
 
 use crossbeam_utils::CachePadded;
-use std::cell::{Cell, UnsafeCell};
+use std::cell::Cell;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+
+#[cfg(loom)]
+mod sync {
+    pub(super) use loom::cell::UnsafeCell;
+    pub(super) use loom::sync::atomic::{AtomicUsize, Ordering};
+    pub(super) use loom::sync::Arc;
+}
+
+#[cfg(not(loom))]
+mod sync {
+    pub(super) use std::cell::UnsafeCell;
+    pub(super) use std::sync::atomic::{AtomicUsize, Ordering};
+    pub(super) use std::sync::Arc;
+}
+
+use self::sync::{AtomicUsize, Ordering};
 
 struct RingBuffer<T, const CAP: usize> {
     /// Producer sequence counter (write index).
     head: CachePadded<AtomicUsize>,
     /// Consumer sequence counter (read index).
     tail: CachePadded<AtomicUsize>,
-    /// Heap-allocated array of uninitialized slot storage.
-    slots: Box<[UnsafeCell<MaybeUninit<T>>]>,
+    /// Heap-allocated array of slot storage.
+    slots: Box<[sync::UnsafeCell<MaybeUninit<T>>]>,
+}
+
+impl<T, const CAP: usize> RingBuffer<T, CAP> {
+    #[inline]
+    unsafe fn write_slot(&self, idx: usize, item: T) {
+        #[cfg(loom)]
+        self.slots[idx].with_mut(|slot| {
+            // SAFETY: Caller guarantees that slot `idx` is unoccupied and exclusive
+            // to this producer.
+            unsafe {
+                (*slot).write(item);
+            }
+        });
+        #[cfg(not(loom))]
+        // SAFETY: Caller guarantees that slot `idx` is unoccupied and exclusive
+        // to this producer.
+        unsafe {
+            let slot = self.slots[idx].get();
+            (*slot).write(item);
+        }
+    }
+
+    #[inline]
+    unsafe fn read_slot(&self, idx: usize) -> T {
+        #[cfg(loom)]
+        {
+            self.slots[idx].with(|slot| {
+                // SAFETY: Caller guarantees that slot `idx` contains an initialized element
+                // published by the producer, and exclusive to this consumer.
+                unsafe { (*slot).assume_init_read() }
+            })
+        }
+        #[cfg(not(loom))]
+        {
+            // SAFETY: Caller guarantees that slot `idx` contains an initialized element
+            // published by the producer, and exclusive to this consumer.
+            unsafe {
+                let slot = self.slots[idx].get();
+                (*slot).assume_init_read()
+            }
+        }
+    }
+
+    #[inline]
+    unsafe fn drop_slot(&mut self, idx: usize) {
+        #[cfg(loom)]
+        self.slots[idx].with_mut(|slot| {
+            // SAFETY: Caller has exclusive &mut self access during Drop and guarantees
+            // slot `idx` contains an initialized element that has not been read.
+            unsafe {
+                (*slot).assume_init_drop();
+            }
+        });
+        #[cfg(not(loom))]
+        // SAFETY: Caller has exclusive &mut self access during Drop and guarantees
+        // slot `idx` contains an initialized element that has not been read.
+        unsafe {
+            let slot = self.slots[idx].get();
+            (*slot).assume_init_drop();
+        }
+    }
 }
 
 // SAFETY: `RingBuffer` is an SPSC queue where slot access is synchronized
@@ -40,8 +115,7 @@ impl<T, const CAP: usize> Drop for RingBuffer<T, CAP> {
                 // These items were pushed but never popped or dropped.
                 // We have exclusive &mut self access during Drop.
                 unsafe {
-                    let slot = self.slots[idx].get();
-                    (*slot).assume_init_drop();
+                    self.drop_slot(idx);
                 }
             }
         }
@@ -50,14 +124,14 @@ impl<T, const CAP: usize> Drop for RingBuffer<T, CAP> {
 
 /// Producer half of the lock-free SPSC ring buffer.
 pub struct SpscProducer<T, const CAP: usize> {
-    inner: Arc<RingBuffer<T, CAP>>,
+    inner: sync::Arc<RingBuffer<T, CAP>>,
     cached_tail: Cell<usize>,
     _not_sync: PhantomData<Cell<()>>,
 }
 
 /// Consumer half of the lock-free SPSC ring buffer.
 pub struct SpscConsumer<T, const CAP: usize> {
-    inner: Arc<RingBuffer<T, CAP>>,
+    inner: sync::Arc<RingBuffer<T, CAP>>,
     cached_head: Cell<usize>,
     _not_sync: PhantomData<Cell<()>>,
 }
@@ -86,23 +160,19 @@ pub fn spsc_pair<T, const CAP: usize>() -> (SpscProducer<T, CAP>, SpscConsumer<T
     assert!(CAP > 0, "capacity must be greater than zero");
     assert!(CAP.is_power_of_two(), "capacity must be a power of two");
 
-    let mut v: Vec<UnsafeCell<MaybeUninit<T>>> = Vec::with_capacity(CAP);
-    // SAFETY: `UnsafeCell<MaybeUninit<T>>` has the same layout and size as
-    // `MaybeUninit<T>`, for which uninitialized memory is a valid bit pattern.
-    // We set the vector length to `CAP` matching its allocated capacity.
-    unsafe {
-        v.set_len(CAP);
-    }
-    let slots = v.into_boxed_slice();
+    let slots = (0..CAP)
+        .map(|_| sync::UnsafeCell::new(MaybeUninit::uninit()))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
 
-    let inner = Arc::new(RingBuffer {
+    let inner = sync::Arc::new(RingBuffer {
         head: CachePadded::new(AtomicUsize::new(0)),
         tail: CachePadded::new(AtomicUsize::new(0)),
         slots,
     });
 
     let producer = SpscProducer {
-        inner: Arc::clone(&inner),
+        inner: sync::Arc::clone(&inner),
         cached_tail: Cell::new(0),
         _not_sync: PhantomData,
     };
@@ -114,6 +184,11 @@ pub fn spsc_pair<T, const CAP: usize>() -> (SpscProducer<T, CAP>, SpscConsumer<T
     };
 
     (producer, consumer)
+}
+
+/// Convenience alias for [`spsc_pair`].
+pub fn spsc_channel<T, const CAP: usize>() -> (SpscProducer<T, CAP>, SpscConsumer<T, CAP>) {
+    spsc_pair()
 }
 
 impl<T, const CAP: usize> SpscProducer<T, CAP> {
@@ -139,8 +214,7 @@ impl<T, const CAP: usize> SpscProducer<T, CAP> {
         //    with our Acquire load of `tail`.
         // 3. Only this producer writes to slot `idx` and advances `head`.
         unsafe {
-            let slot = self.inner.slots[idx].get();
-            (*slot).write(item);
+            self.inner.write_slot(idx, item);
         }
 
         self.inner
@@ -176,10 +250,7 @@ impl<T, const CAP: usize> SpscConsumer<T, CAP> {
         // 2. The producer wrote to slot `idx` before advancing `head` with Release ordering,
         //    which synchronizes with our Acquire load of `head`.
         // 3. Only this consumer reads slot `idx` and advances `tail`.
-        let item = unsafe {
-            let slot = self.inner.slots[idx].get();
-            (*slot).assume_init_read()
-        };
+        let item = unsafe { self.inner.read_slot(idx) };
 
         self.inner
             .tail
@@ -214,10 +285,7 @@ impl<T, const CAP: usize> SpscConsumer<T, CAP> {
             // SAFETY:
             // Slot `idx` was written by the producer before `head` was published with Release,
             // which synchronizes with our Acquire load. It has not yet been popped.
-            let item = unsafe {
-                let slot = self.inner.slots[idx].get();
-                (*slot).assume_init_read()
-            };
+            let item = unsafe { self.inner.read_slot(idx) };
             out.push(item);
         }
 

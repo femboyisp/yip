@@ -45,6 +45,8 @@ jobs:
         run: cargo test --workspace
       - name: DHAT zero-allocation hotpath gate
         run: cargo test -p yip-bench --test zero_alloc_hotpath
+      - name: Loom weak-memory SPSC verification
+        run: RUSTFLAGS="--cfg loom" cargo test --package yip-io --test loom_spsc
 
   shear:
     runs-on: ubuntu-latest
