@@ -22,6 +22,41 @@ pub struct Frame {
     pub payload: Vec<u8>,
 }
 
+/// A borrowed on-wire frame referencing the underlying datagram buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameRef<'a> {
+    /// Epoch-rotating keyed token selecting the session/decoder.
+    pub conn_tag: u64,
+    /// Which pipelined FEC object this symbol belongs to.
+    pub object_id: u16,
+    /// FEC payload identifier (Reed–Solomon codec tag + symbol index), opaque to the wire layer.
+    pub payload_id: [u8; 4],
+    /// Symbol kind / control bits (source/repair, feedback, ARQ).
+    pub flags: u8,
+    /// The borrowed ciphertext symbol payload.
+    pub payload: &'a [u8],
+}
+
+impl FrameRef<'_> {
+    /// Convert this borrowed frame into an owned [`Frame`].
+    #[must_use]
+    pub fn to_owned(&self) -> Frame {
+        Frame {
+            conn_tag: self.conn_tag,
+            object_id: self.object_id,
+            payload_id: self.payload_id,
+            flags: self.flags,
+            payload: self.payload.to_vec(),
+        }
+    }
+}
+
+impl From<FrameRef<'_>> for Frame {
+    fn from(frame: FrameRef<'_>) -> Self {
+        frame.to_owned()
+    }
+}
+
 /// Length of the logical (and protected) frame header in bytes.
 pub const HEADER_LEN: usize = 15;
 /// Length of the trailing coverage-auth tag in bytes.
@@ -112,6 +147,37 @@ impl Codec {
     pub fn new(auth_key: [u8; 16], hp_key: [u8; 16]) -> Self {
         Self { auth_key, hp_key }
     }
+
+    /// Authenticate, deprotect, and parse a datagram into a borrowed [`FrameRef`].
+    ///
+    /// Verifies authentication completely on the stack and borrows the payload slice
+    /// directly from `datagram` with zero heap allocations.
+    pub fn deframe_borrowed<'a>(&self, datagram: &'a [u8]) -> Result<FrameRef<'a>, WireError> {
+        if datagram.len() < MIN_FRAME {
+            return Err(WireError::Malformed);
+        }
+        let tag = &datagram[datagram.len() - TAG_LEN..];
+        // Recover the header by removing the keyed mask (seeded by the tag) entirely on the stack.
+        let mask = header_mask(&self.hp_key, tag);
+        let mut header = [0u8; HEADER_LEN];
+        header.copy_from_slice(&datagram[..HEADER_LEN]);
+        xor_in_place(&mut header, &mask);
+        let payload = &datagram[HEADER_LEN..datagram.len() - TAG_LEN];
+
+        // Recompute the tag over recovered-header‖payload using streaming multi-slice (zero alloc).
+        let expected = auth_tag(&self.auth_key, &header, payload);
+        if expected.ct_eq(tag).unwrap_u8() != 1 {
+            return Err(WireError::AuthFailed);
+        }
+        let (conn_tag, object_id, payload_id, flags) = read_header(&header);
+        Ok(FrameRef {
+            conn_tag,
+            object_id,
+            payload_id,
+            flags,
+            payload,
+        })
+    }
 }
 
 /// Encodes [`Frame`]s to datagrams and back. Implemented in M2.
@@ -137,30 +203,7 @@ impl WireCodec for Codec {
     }
 
     fn deframe(&self, datagram: &[u8]) -> Result<Frame, WireError> {
-        if datagram.len() < MIN_FRAME {
-            return Err(WireError::Malformed);
-        }
-        let tag = &datagram[datagram.len() - TAG_LEN..];
-        // Recover the header by removing the keyed mask (seeded by the tag) entirely on the stack.
-        let mask = header_mask(&self.hp_key, tag);
-        let mut header = [0u8; HEADER_LEN];
-        header.copy_from_slice(&datagram[..HEADER_LEN]);
-        xor_in_place(&mut header, &mask);
-        let payload = &datagram[HEADER_LEN..datagram.len() - TAG_LEN];
-
-        // Recompute the tag over recovered-header‖payload using streaming multi-slice (zero alloc).
-        let expected = auth_tag(&self.auth_key, &header, payload);
-        if expected.ct_eq(tag).unwrap_u8() != 1 {
-            return Err(WireError::AuthFailed);
-        }
-        let (conn_tag, object_id, payload_id, flags) = read_header(&header);
-        Ok(Frame {
-            conn_tag,
-            object_id,
-            payload_id,
-            flags,
-            payload: payload.to_vec(),
-        })
+        self.deframe_borrowed(datagram).map(Frame::from)
     }
 }
 
@@ -305,6 +348,29 @@ mod tests {
         let wire = codec.frame(&frame);
         assert!(wire.len() >= MIN_FRAME);
         assert_eq!(codec.deframe(&wire).unwrap(), frame);
+    }
+
+    #[test]
+    fn codec_deframe_borrowed_roundtrips() {
+        let codec = Codec::new([4u8; 16], [5u8; 16]);
+        let frame = Frame {
+            conn_tag: 0xDEAD_BEEF_0000_0001,
+            object_id: 7,
+            payload_id: [1, 2, 3, 4],
+            flags: 0b0000_0011,
+            payload: b"the quick brown fox".to_vec(),
+        };
+        let wire = codec.frame(&frame);
+        assert!(wire.len() >= MIN_FRAME);
+        let borrowed = codec
+            .deframe_borrowed(&wire)
+            .expect("borrowed deframe succeeds");
+        assert_eq!(borrowed.conn_tag, frame.conn_tag);
+        assert_eq!(borrowed.object_id, frame.object_id);
+        assert_eq!(borrowed.payload_id, frame.payload_id);
+        assert_eq!(borrowed.flags, frame.flags);
+        assert_eq!(borrowed.payload, frame.payload.as_slice());
+        assert_eq!(borrowed.to_owned(), frame);
     }
 
     #[test]

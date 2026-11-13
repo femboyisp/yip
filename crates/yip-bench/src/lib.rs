@@ -1,4 +1,6 @@
 //! Shared fixtures for the yip hot-path micro-benchmarks.
+#![forbid(unsafe_code)]
+
 use yip_crypto::{generate_keypair, Handshake, Session};
 
 /// Build an established initiator/responder session pair for sealing/opening benches.
