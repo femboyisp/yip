@@ -616,8 +616,8 @@ impl ObjectTable {
 
         for probe in 0..MAX_PROBE_BUCKETS {
             let b_idx = (b0 + probe) & self.mask;
-            for way in 0..BUCKET_WAYS {
-                if let Some(entry) = &mut self.buckets[b_idx].entries[way] {
+            for (way, slot) in self.buckets[b_idx].entries.iter_mut().enumerate() {
+                if let Some(entry) = slot {
                     if entry.key == key {
                         entry.generation = gen;
                         return Some(std::mem::replace(&mut entry.state, state));
