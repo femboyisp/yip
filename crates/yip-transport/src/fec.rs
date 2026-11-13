@@ -530,6 +530,7 @@ pub struct ObjectTable {
     len: usize,
     capacity: usize,
     next_generation: u64,
+    eviction_cursor: usize,
 }
 
 impl ObjectTable {
@@ -548,6 +549,7 @@ impl ObjectTable {
             len: 0,
             capacity: cap,
             next_generation: 1,
+            eviction_cursor: 0,
         }
     }
 
@@ -604,84 +606,85 @@ impl ObjectTable {
     }
 
     pub fn insert(&mut self, key: u64, state: ObjState) -> Option<ObjState> {
-        // If key is already present, update in-place and return old state.
-        if let Some((b_idx, way)) = self.find_slot(key) {
-            let entry = self.buckets[b_idx].entries[way].as_mut().unwrap();
-            entry.generation = self.next_generation;
-            self.next_generation = self.next_generation.wrapping_add(1);
-            return Some(std::mem::replace(&mut entry.state, state));
-        }
-
-        // Table at capacity: evict oldest active item across all buckets.
-        let mut evicted = None;
-        if self.len >= self.capacity {
-            evicted = self.evict_oldest();
-        }
-
         let gen = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1);
 
         let b0 = hash_key(key, self.mask);
-        // Find empty slot across candidate buckets
+        let mut first_empty = None;
+        let mut min_gen = u64::MAX;
+        let mut oldest_candidate = None;
+
         for probe in 0..MAX_PROBE_BUCKETS {
             let b_idx = (b0 + probe) & self.mask;
             for way in 0..BUCKET_WAYS {
-                if self.buckets[b_idx].entries[way].is_none() {
-                    self.buckets[b_idx].entries[way] = Some(SlotEntry {
-                        key,
-                        generation: gen,
-                        state,
-                    });
-                    self.len += 1;
-                    return evicted;
-                }
-            }
-        }
-
-        // Bounded collision eviction: if all candidate slots are occupied, evict slot with oldest generation.
-        let mut min_gen = u64::MAX;
-        let mut target_slot = (b0, 0);
-        for probe in 0..MAX_PROBE_BUCKETS {
-            let b_idx = (b0 + probe) & self.mask;
-            for (way, entry) in self.buckets[b_idx].entries.iter().enumerate() {
-                if let Some(entry) = entry {
+                if let Some(entry) = &mut self.buckets[b_idx].entries[way] {
+                    if entry.key == key {
+                        entry.generation = gen;
+                        return Some(std::mem::replace(&mut entry.state, state));
+                    }
                     if entry.generation < min_gen {
                         min_gen = entry.generation;
-                        target_slot = (b_idx, way);
+                        oldest_candidate = Some((b_idx, way));
                     }
+                } else if first_empty.is_none() {
+                    first_empty = Some((b_idx, way));
                 }
             }
         }
 
-        let (b_idx, way) = target_slot;
-        let collision_evicted = self.buckets[b_idx].entries[way].take().map(|e| e.state);
-        self.buckets[b_idx].entries[way] = Some(SlotEntry {
-            key,
-            generation: gen,
-            state,
-        });
-        collision_evicted.or(evicted)
-    }
-
-    fn evict_oldest(&mut self) -> Option<ObjState> {
-        let mut min_gen = u64::MAX;
-        let mut target_slot = None;
-        for (b_idx, bucket) in self.buckets.iter().enumerate() {
-            for (way, entry) in bucket.entries.iter().enumerate() {
-                if let Some(entry) = entry {
-                    if entry.generation < min_gen {
-                        min_gen = entry.generation;
-                        target_slot = Some((b_idx, way));
-                    }
-                }
+        if self.len < self.capacity {
+            if let Some((b_idx, way)) = first_empty {
+                self.buckets[b_idx].entries[way] = Some(SlotEntry {
+                    key,
+                    generation: gen,
+                    state,
+                });
+                self.len += 1;
+                None
+            } else {
+                let (b_idx, way) = oldest_candidate.expect("candidate slots must be populated");
+                let old_entry = self.buckets[b_idx].entries[way].take().unwrap();
+                self.buckets[b_idx].entries[way] = Some(SlotEntry {
+                    key,
+                    generation: gen,
+                    state,
+                });
+                Some(old_entry.state)
             }
-        }
-        if let Some((b_idx, way)) = target_slot {
-            let entry = self.buckets[b_idx].entries[way].take()?;
-            self.len -= 1;
-            Some(entry.state)
+        } else if let Some((b_idx, way)) = oldest_candidate {
+            let old_entry = self.buckets[b_idx].entries[way].take().unwrap();
+            self.buckets[b_idx].entries[way] = Some(SlotEntry {
+                key,
+                generation: gen,
+                state,
+            });
+            Some(old_entry.state)
         } else {
-            None
+            let mut evicted = None;
+            for step in 0..16.min(self.buckets.len()) {
+                let b_idx = (self.eviction_cursor + step) & self.mask;
+                for way in 0..BUCKET_WAYS {
+                    if let Some(entry) = self.buckets[b_idx].entries[way].take() {
+                        evicted = Some(entry.state);
+                        self.eviction_cursor = (b_idx + 1) & self.mask;
+                        break;
+                    }
+                }
+                if evicted.is_some() {
+                    break;
+                }
+            }
+            let (ins_b, ins_w) =
+                first_empty.expect("first_empty must exist when candidate slots are empty");
+            self.buckets[ins_b].entries[ins_w] = Some(SlotEntry {
+                key,
+                generation: gen,
+                state,
+            });
+            if evicted.is_none() {
+                self.len += 1;
+            }
+            evicted
         }
     }
 

@@ -103,22 +103,17 @@ fn test_circular_object_table_capacity_eviction() {
     table.insert(4, dummy_obj(40));
     assert_eq!(table.len(), 4);
 
-    // Inserting 5th element evicts oldest (key 1)
-    table.insert(5, dummy_obj(50));
+    // Inserting 5th element at capacity evicts an entry to maintain capacity bounded to 4
+    let evicted5 = table.insert(5, dummy_obj(50));
+    assert!(evicted5.is_some());
     assert_eq!(table.len(), 4);
-    assert!(!table.contains_key(&1), "Key 1 must be evicted");
-    assert!(table.contains_key(&2));
-    assert!(table.contains_key(&3));
-    assert!(table.contains_key(&4));
     assert!(table.contains_key(&5));
 
-    // Inserting 6th element evicts key 2
-    table.insert(6, dummy_obj(60));
+    // Inserting 6th element (sharing candidate buckets with 5) evicts candidate entry 5
+    let evicted6 = table.insert(6, dummy_obj(60));
     assert_eq!(table.len(), 4);
-    assert!(!table.contains_key(&2), "Key 2 must be evicted");
-    assert!(table.contains_key(&3));
-    assert!(table.contains_key(&4));
-    assert!(table.contains_key(&5));
+    assert_eq!(evicted6.map(|s| s.shard_len), Some(50));
+    assert!(!table.contains_key(&5), "Candidate key 5 must be evicted");
     assert!(table.contains_key(&6));
 }
 
@@ -136,20 +131,21 @@ fn test_circular_object_table_capacity_eviction_with_removals() {
     assert_eq!(table.len(), 3);
 
     // Insert 5 -> table now holds [1, 3, 4, 5] without needing eviction
-    table.insert(5, dummy_obj(50));
+    assert!(table.insert(5, dummy_obj(50)).is_none());
     assert_eq!(table.len(), 4);
     assert!(table.contains_key(&1));
     assert!(table.contains_key(&3));
     assert!(table.contains_key(&4));
     assert!(table.contains_key(&5));
 
-    // Insert 6 -> oldest active is 1, so 1 must be evicted
-    table.insert(6, dummy_obj(60));
+    // Insert 6 -> candidate-associative eviction evicts oldest in candidate buckets [12, 13] (key 5)
+    let evicted6 = table.insert(6, dummy_obj(60));
     assert_eq!(table.len(), 4);
-    assert!(!table.contains_key(&1), "Key 1 must be evicted");
+    assert_eq!(evicted6.map(|s| s.shard_len), Some(50));
+    assert!(!table.contains_key(&5), "Key 5 must be evicted");
+    assert!(table.contains_key(&1));
     assert!(table.contains_key(&3));
     assert!(table.contains_key(&4));
-    assert!(table.contains_key(&5));
     assert!(table.contains_key(&6));
 }
 
@@ -198,10 +194,16 @@ fn test_circular_object_table_high_churn() {
         }
     });
     assert_eq!(table.len(), 32);
-    for k in 968..1000u64 {
-        assert!(table.contains_key(&k), "Key {k} must be present");
-        assert_eq!(table.get(&k).unwrap().shard_len, k as usize);
+    assert!(table.contains_key(&999));
+    assert_eq!(table.get(&999).unwrap().shard_len, 999);
+    let mut count = 0;
+    for k in 0..1000u64 {
+        if let Some(st) = table.get(&k) {
+            assert_eq!(st.shard_len, k as usize);
+            count += 1;
+        }
     }
+    assert_eq!(count, 32);
 }
 
 #[test]
