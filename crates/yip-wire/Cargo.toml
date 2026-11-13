@@ -16,6 +16,9 @@ thiserror = { workspace = true }
 siphasher = "1.0.3"
 subtle = "2.6.1"
 
+[dev-dependencies]
+bolero = "0.12"
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
