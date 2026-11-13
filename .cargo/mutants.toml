@@ -189,10 +189,6 @@
 #     Because `self.next_generation` is strictly monotonic and incremented on every insertion,
 #     no two entries in `ObjectTable` can ever have identical generation values.
 #     Therefore `<` and `<=` are mathematically equivalent for every reachable table state.
-# 27. Fallback eviction cursor wrapping in `ObjectTable::insert` (crates/yip-transport/src/fec.rs ~line 674)
-#     `self.eviction_cursor = (b_idx + 1) & self.mask`.
-#     During full-capacity fallback eviction when no candidate slot exists in the probe sequence,
-#     advancing the eviction cursor is an internal circular scan optimization.
 exclude_re = [
     "replace \\| with \\^ in ReplayWindow::commit",
     "replace > with >= in ReplayWindow::commit",
@@ -229,7 +225,6 @@ exclude_re = [
     "crates/yip-transport/src/fec\\.rs:90.*in FecReassembler::push",
     "crates/yip-transport/src/fec\\.rs:94.*in FecReassembler::push",
     "replace < with <= in ObjectTable::insert",
-    "crates/yip-transport/src/fec\\.rs:674:.*in ObjectTable::insert",
 ]
 
 skip_calls = ["reserve"]
