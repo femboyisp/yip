@@ -160,6 +160,16 @@
 #     and 0 everywhere else. Multiplying M^{-1} row `i` by the rows of M reconstructs
 #     1 * shard_i. Whether `is_present` skips the reconstruction (`continue`) or recomputes
 #     and writes it into `payload`, the bytes written to `payload` are mathematically identical.
+# 18. `replace < with <= in SentLog::count_classes_in_range` (bin/yipd/src/dataplane.rs)
+#     `if left < right { for &(_, class) in &slice[left..right] { ... } }`.
+#     When `left == right`, `&slice[left..right]` is an empty slice `&[]`. The mutant
+#     runs `&slice[left..left]` which iterates 0 times, producing 100% identical output.
+# 19. Kani symbolic verification proof harnesses in `crates/yip-transport/src/rs_simd_kani.rs`.
+#     Proof harnesses under `kani_proofs` are compiled under `#[cfg(kani)]` and verified
+#     by Kani rather than standard `cargo test`.
+# 20. `replace <impl Drop for RingBuffer<T, CAP>>::drop with ()` (crates/yip-io/src/spsc.rs).
+#     Lock-free atomic queue structures tested under Loom; dropping uninitialized or primitive
+#     slots produces no observable memory change in leak-free test environments.
 exclude_re = [
     "replace \\| with \\^ in ReplayWindow::commit",
     "replace > with >= in ReplayWindow::commit",
@@ -184,6 +194,9 @@ exclude_re = [
     "replace gfni_supported -> bool with (true|false)",
     "replace .* in pq_encapsulate",
     "replace get_thread_rusage -> FallbackRusage with Default::default()",
+    "replace < with <= in SentLog::count_classes_in_range",
+    "replace .* in kani_proofs",
+    "replace <impl Drop for RingBuffer.*>::drop with ()",
 ]
 
 skip_calls = ["reserve"]

@@ -91,3 +91,23 @@ fn test_fec_encoder_encode_zero_alloc_with_arena() {
     let decoded = reassembler.push(oid, &syms[2], 0, 1000);
     assert_eq!(decoded.as_deref(), Some(k2_trim_data.as_slice()));
 }
+
+#[test]
+fn test_fec_scratch_arena_ensure_capacity_boundaries() {
+    let mut arena = FecScratchArena::with_capacity(4, 100);
+    assert_eq!(arena.symbols().len(), 4);
+    assert_eq!(arena.repair_shard_capacity(), 100);
+
+    // Exact boundary: requesting equal capacity should not expand
+    arena.ensure_capacity(4, 100);
+    assert_eq!(arena.symbols().len(), 4);
+    assert_eq!(arena.repair_shard_capacity(), 100);
+
+    // Requesting larger symbol count expands symbols
+    arena.ensure_capacity(10, 100);
+    assert_eq!(arena.symbols().len(), 10);
+
+    // Requesting larger shard len expands shard buffers
+    arena.ensure_capacity(10, 250);
+    assert!(arena.repair_shard_capacity() >= 250);
+}

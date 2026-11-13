@@ -156,6 +156,11 @@ impl FecScratchArena {
     pub fn symbols(&self) -> &[Symbol] {
         &self.symbols
     }
+
+    /// Returns the allocated length of the internal repair shard buffers.
+    pub fn repair_shard_capacity(&self) -> usize {
+        self.repair_shards.first().map_or(0, |s| s.len())
+    }
 }
 
 /// Encodes ciphertext frames into RS symbols, assigning monotonic object ids.

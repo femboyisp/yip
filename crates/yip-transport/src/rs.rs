@@ -713,4 +713,12 @@ mod tests {
             assert_eq!(&payload[offset..offset + len], src.as_slice());
         }
     }
+
+    #[test]
+    fn encode_repair_into_empty_source_leaves_repairs_unmodified() {
+        let mut rep_buf = [99u8; 8];
+        let mut repair_slices: [&mut [u8]; 1] = [&mut rep_buf];
+        encode_repair_into(&[], &mut repair_slices, Scheme::Cauchy);
+        assert_eq!(rep_buf, [99u8; 8]);
+    }
 }

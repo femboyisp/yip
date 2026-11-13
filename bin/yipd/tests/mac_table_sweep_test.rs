@@ -17,13 +17,21 @@ fn make_mac(b: u8) -> [u8; 6] {
 fn test_mac_table_expired_items_evicted_from_tail_in_ok() {
     let ttl_ms = 1_000;
     let mut table = MacTable::new(16, ttl_ms);
+    assert!(table.is_empty());
+    assert_eq!(table.len(), 0);
 
     table.learn(make_mac(1), 10, LearnOrigin::Peer, 100);
+    assert!(!table.is_empty());
     table.learn(make_mac(2), 20, LearnOrigin::Peer, 200);
     table.learn(make_mac(3), 30, LearnOrigin::Peer, 300);
     table.learn(make_mac(4), 40, LearnOrigin::Peer, 400);
     table.learn(make_mac(5), 50, LearnOrigin::Peer, 500);
     assert_eq!(table.len(), 5);
+
+    // Exact boundary test: at now_ms = 1100, age = 1000 == ttl_ms, must NOT expire
+    table.sweep(1100);
+    assert_eq!(table.len(), 5);
+    assert!(table.lookup(make_mac(1), 1100).is_some());
 
     // At now_ms = 1150:
     // mac(1): age = 1050 > 1000 -> expired
@@ -187,6 +195,10 @@ fn test_mac_table_sweep_zero_heap_allocations_when_warm() {
 #[test]
 fn test_sent_log_binary_search_monotonic_range_zero_alloc() {
     let capacity = 128;
+    let empty_log = SentLog::new(10);
+    assert!(empty_log.is_empty());
+    assert_eq!(empty_log.len(), 0);
+
     let mut log = SentLog::new(capacity);
 
     // Warm-up: populate log to trigger wrapped buffer state
@@ -198,7 +210,22 @@ fn test_sent_log_binary_search_monotonic_range_zero_alloc() {
         };
         log.insert(i, class);
     }
+    assert!(!log.is_empty());
     assert_eq!(log.len(), capacity);
+
+    // Inverted range check: start > end must return default counts immediately
+    assert_eq!(log.count_classes_in_range(150, 100), ClassCounts::default());
+
+    // Single item range check: start == end
+    let single = log.count_classes_in_range(100, 100);
+    assert_eq!(
+        single,
+        ClassCounts {
+            realtime: 0,
+            bulk: 1, // 100 % 3 == 1
+            default: 0,
+        }
+    );
 
     // Assert zero allocations on monotonic binary-search count queries
     for _ in 0..50 {

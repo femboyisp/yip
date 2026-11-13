@@ -153,4 +153,46 @@ mod tests {
         assert_eq!(counter, 99);
         assert_eq!(class, FlowClass::Bulk);
     }
+
+    #[test]
+    fn frame_ref_to_symbol_length_boundaries() {
+        let frame_empty = FrameRef {
+            conn_tag: 1,
+            object_id: 0,
+            payload_id: [0; 4],
+            flags: 0,
+            payload: &[0; 11],
+        };
+        assert!(frame_ref_to_symbol(&frame_empty).is_none());
+
+        let frame_exact_12 = FrameRef {
+            conn_tag: 1,
+            object_id: 7,
+            payload_id: [1, 2, 3, 4],
+            flags: 0,
+            payload: &[
+                0, 0, 0, 0, 0, 0, 0, 42, // counter = 42
+                0, 0, 0, 100, // object_size = 100
+            ],
+        };
+        let (sym, counter, class) = frame_ref_to_symbol(&frame_exact_12).unwrap();
+        assert_eq!(sym.object_id, 7);
+        assert_eq!(sym.object_size, 100);
+        assert!(sym.data.is_empty());
+        assert_eq!(counter, 42);
+        assert_eq!(class, FlowClass::Realtime);
+
+        let frame_default = FrameRef {
+            conn_tag: 1,
+            object_id: 8,
+            payload_id: [1, 2, 3, 4],
+            flags: 2,
+            payload: &[
+                0, 0, 0, 0, 0, 0, 0, 43, // counter = 43
+                0, 0, 0, 200, // object_size = 200
+            ],
+        };
+        let (_, _, class_def) = frame_ref_to_symbol(&frame_default).unwrap();
+        assert_eq!(class_def, FlowClass::Default);
+    }
 }
