@@ -72,6 +72,40 @@ fn test_circular_object_table_fallback_eviction() {
 }
 
 #[test]
+fn test_circular_object_table_fallback_eviction_cursor_progression() {
+    let mut table = ObjectTable::new(3);
+    // Keys 10 and 14 hash to bucket 9
+    table.insert(10, dummy_obj(10));
+    table.insert(14, dummy_obj(14));
+    // Key 2 hashes to bucket 10
+    table.insert(2, dummy_obj(2));
+    assert_eq!(table.len(), 3);
+
+    // Key 20 hashes to bucket 2 (probes 2..=5 contain 0 entries).
+    // Triggers first fallback eviction: scans from cursor 0, evicts key 10 from bucket 9.
+    // Cursor advances to (9 + 1) & 15 = 10.
+    let ev1 = table.insert(20, dummy_obj(20));
+    assert_eq!(ev1.unwrap().shard_len, 10);
+    assert_eq!(table.len(), 3);
+    assert!(!table.contains_key(&10));
+    assert!(table.contains_key(&14));
+    assert!(table.contains_key(&2));
+    assert!(table.contains_key(&20));
+
+    // Key 1 hashes to bucket 5 (probes 5..=8 contain 0 entries).
+    // Triggers second fallback eviction.
+    // Unmutated code starts scanning at cursor 10, evicting key 2 from bucket 10 and retaining key 14 in bucket 9.
+    // Mutated (* 1, - 1, or ^ mask) starts scanning at bucket 9 or 5, evicting key 14 instead.
+    let ev2 = table.insert(1, dummy_obj(1));
+    assert_eq!(ev2.unwrap().shard_len, 2);
+    assert_eq!(table.len(), 3);
+    assert!(!table.contains_key(&2));
+    assert!(table.contains_key(&14));
+    assert!(table.contains_key(&20));
+    assert!(table.contains_key(&1));
+}
+
+#[test]
 fn test_circular_object_table_removal() {
     let mut table = ObjectTable::new(8);
     table.insert(1, dummy_obj(10));
