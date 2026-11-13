@@ -9,7 +9,7 @@ pub mod dataplane;
 mod epoch;
 pub mod flow;
 pub mod handshake;
-mod mac_table;
+pub mod mac_table;
 pub mod membership;
 pub mod metrics;
 pub mod mode;

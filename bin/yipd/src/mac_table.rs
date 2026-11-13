@@ -1,22 +1,22 @@
 use std::collections::HashMap;
 
-pub(crate) const DEFAULT_MAC_TABLE_CAPACITY: usize = 4096;
-pub(crate) const DEFAULT_MAC_TABLE_TTL_MS: u64 = 300_000;
+pub const DEFAULT_MAC_TABLE_CAPACITY: usize = 4096;
+pub const DEFAULT_MAC_TABLE_TTL_MS: u64 = 300_000;
 
 /// Sentinel link value meaning "no node" (list end / empty slab).
 const NIL: usize = usize::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LearnOrigin {
+pub enum LearnOrigin {
     Peer,
     LocalTap,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MacEntry {
-    pub(crate) peer_id: u64,
-    pub(crate) last_seen_ms: u64,
-    pub(crate) origin: LearnOrigin,
+pub struct MacEntry {
+    pub peer_id: u64,
+    pub last_seen_ms: u64,
+    pub origin: LearnOrigin,
 }
 
 /// A slab node: the learned entry plus intrusive recency-list links.
@@ -42,7 +42,7 @@ struct Node {
 /// Lookups deliberately do not reorder the list: a MAC ages by the recency of
 /// frames seen *from* it (its last learn), matching L2-switch behaviour, so a
 /// destination-only host still ages out on schedule.
-pub(crate) struct MacTable {
+pub struct MacTable {
     capacity: usize,
     ttl_ms: u64,
     index: HashMap<[u8; 6], usize>,
@@ -53,25 +53,29 @@ pub(crate) struct MacTable {
 }
 
 impl MacTable {
-    pub(crate) fn new(capacity: usize, ttl_ms: u64) -> Self {
+    pub fn new(capacity: usize, ttl_ms: u64) -> Self {
         Self {
             capacity,
             ttl_ms,
             index: HashMap::with_capacity(capacity),
             nodes: Vec::with_capacity(capacity),
-            free: Vec::new(),
+            free: Vec::with_capacity(capacity),
             head: NIL,
             tail: NIL,
         }
     }
 
-    pub(crate) fn learn(
-        &mut self,
-        src_mac: [u8; 6],
-        peer_id: u64,
-        origin: LearnOrigin,
-        now_ms: u64,
-    ) {
+    #[cfg_attr(not(test), expect(dead_code, reason = "table length introspection"))]
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "table emptiness introspection"))]
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    pub fn learn(&mut self, src_mac: [u8; 6], peer_id: u64, origin: LearnOrigin, now_ms: u64) {
         if !is_learnable_source_mac(src_mac) || self.capacity == 0 {
             return;
         }
@@ -103,7 +107,7 @@ impl MacTable {
         not(test),
         expect(dead_code, reason = "consumed by multi-peer forwarding in later tasks")
     )]
-    pub(crate) fn lookup(&self, mac: [u8; 6], now_ms: u64) -> Option<MacEntry> {
+    pub fn lookup(&self, mac: [u8; 6], now_ms: u64) -> Option<MacEntry> {
         let &slot = self.index.get(&mac)?;
         let entry = self.nodes[slot].entry;
         let age = now_ms.saturating_sub(entry.last_seen_ms);
@@ -113,18 +117,16 @@ impl MacTable {
         Some(entry)
     }
 
-    pub(crate) fn sweep(&mut self, now_ms: u64) {
+    pub fn sweep(&mut self, now_ms: u64) {
         let ttl_ms = self.ttl_ms;
-        let expired: Vec<[u8; 6]> = self
-            .index
-            .iter()
-            .filter(|&(_, &slot)| {
-                now_ms.saturating_sub(self.nodes[slot].entry.last_seen_ms) > ttl_ms
-            })
-            .map(|(&mac, _)| mac)
-            .collect();
-        for mac in expired {
-            self.remove(mac);
+        while self.tail != NIL {
+            let last_seen = self.nodes[self.tail].entry.last_seen_ms;
+            if now_ms.saturating_sub(last_seen) > ttl_ms {
+                let mac = self.nodes[self.tail].mac;
+                self.remove(mac);
+            } else {
+                break;
+            }
         }
     }
 
@@ -204,7 +206,7 @@ impl MacTable {
     }
 }
 
-pub(crate) fn is_learnable_source_mac(mac: [u8; 6]) -> bool {
+pub fn is_learnable_source_mac(mac: [u8; 6]) -> bool {
     // Drop all-zeros, broadcast, and multicast/group addresses (I/G bit set).
     mac != [0u8; 6] && mac != [0xFFu8; 6] && (mac[0] & 0x01 == 0)
 }
@@ -220,10 +222,6 @@ mod tests {
     }
 
     impl MacTable {
-        fn len(&self) -> usize {
-            self.index.len()
-        }
-
         /// Walk the recency list front-to-back, asserting it is a well-formed
         /// doubly-linked list consistent with the index (no cycles, both ends
         /// terminate at `NIL`, every indexed slot is visited exactly once).
@@ -293,6 +291,7 @@ mod tests {
 
         table.sweep(1_000 + TTL_MS + 1);
         assert_eq!(table.len(), 0);
+        assert!(table.is_empty());
         table.assert_list_consistent();
     }
 

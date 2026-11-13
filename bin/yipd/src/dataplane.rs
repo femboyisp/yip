@@ -57,7 +57,7 @@ const ETHERNET_SOURCE_MAC_OFFSET: usize = 6;
 // ── SentLog ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct ClassCounts {
+pub struct ClassCounts {
     pub realtime: u32,
     pub bulk: u32,
     pub default: u32,
@@ -68,14 +68,14 @@ pub(crate) struct ClassCounts {
 /// Entries are inserted in arrival order (monotone counter sequence from the
 /// AEAD) and evicted oldest-first once `capacity` is reached.  Lookup is
 /// O(1) via the `HashMap`; eviction is O(1) via the `VecDeque`.
-pub(crate) struct SentLog {
+pub struct SentLog {
     capacity: usize,
     map: HashMap<u64, FlowClass>,
     order: VecDeque<(u64, FlowClass)>,
 }
 
 impl SentLog {
-    pub(crate) fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
             map: HashMap::with_capacity(capacity),
@@ -83,7 +83,7 @@ impl SentLog {
         }
     }
 
-    pub(crate) fn insert(&mut self, counter: u64, class: FlowClass) {
+    pub fn insert(&mut self, counter: u64, class: FlowClass) {
         if self.map.len() >= self.capacity {
             if let Some((oldest, _)) = self.order.pop_front() {
                 self.map.remove(&oldest);
@@ -93,30 +93,52 @@ impl SentLog {
         self.order.push_back((counter, class));
     }
 
-    pub(crate) fn get(&self, counter: u64) -> Option<FlowClass> {
+    pub fn get(&self, counter: u64) -> Option<FlowClass> {
         self.map.get(&counter).copied()
     }
 
     /// Number of entries in the log whose `FlowClass` matches `class`.
-    pub(crate) fn count_class(&self, class: FlowClass) -> u32 {
+    pub fn count_class(&self, class: FlowClass) -> u32 {
         u32::try_from(self.map.values().filter(|&&c| c == class).count()).unwrap_or(u32::MAX)
     }
 
-    pub(crate) fn count_classes_in_range(&self, start: u64, end: u64) -> ClassCounts {
+    pub fn count_classes_in_range(&self, start: u64, end: u64) -> ClassCounts {
         if start > end {
             return ClassCounts::default();
         }
+        let (s1, s2) = self.order.as_slices();
         let mut counts = ClassCounts::default();
-        for &(counter, class) in &self.order {
-            if counter >= start && counter <= end {
-                match class {
-                    FlowClass::Realtime => counts.realtime = counts.realtime.saturating_add(1),
-                    FlowClass::Bulk => counts.bulk = counts.bulk.saturating_add(1),
-                    FlowClass::Default => counts.default = counts.default.saturating_add(1),
+
+        let count_slice = |slice: &[(u64, FlowClass)], counts: &mut ClassCounts| {
+            if slice.is_empty() {
+                return;
+            }
+            let left = slice.partition_point(|&(c, _)| c < start);
+            let right = slice.partition_point(|&(c, _)| c <= end);
+            if left < right {
+                for &(_, class) in &slice[left..right] {
+                    match class {
+                        FlowClass::Realtime => counts.realtime = counts.realtime.saturating_add(1),
+                        FlowClass::Bulk => counts.bulk = counts.bulk.saturating_add(1),
+                        FlowClass::Default => counts.default = counts.default.saturating_add(1),
+                    }
                 }
             }
-        }
+        };
+
+        count_slice(s1, &mut counts);
+        count_slice(s2, &mut counts);
         counts
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "introspection helper"))]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    #[cfg_attr(not(test), expect(dead_code, reason = "introspection helper"))]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 }
 
@@ -1383,6 +1405,7 @@ mod tests {
     fn sent_log_count_classes_in_range_works() {
         // 1. Empty log / range
         let mut log = SentLog::new(4);
+        assert!(log.is_empty());
         assert_eq!(log.count_classes_in_range(0, 10), ClassCounts::default());
 
         // 2. Out-of-order bounds (start > end)
@@ -1443,6 +1466,71 @@ mod tests {
         );
         // Out-of-order bounds with populated log
         assert_eq!(log.count_classes_in_range(5, 2), ClassCounts::default());
+    }
+
+    #[test]
+    fn sent_log_binary_search_under_churn_with_wrapped_ring() {
+        let mut log = SentLog::new(10);
+        // Insert 25 monotonic counters (1..=25). This forces the VecDeque to wrap around its ring buffer.
+        for i in 1..=25 {
+            let class = match i % 3 {
+                0 => FlowClass::Realtime,
+                1 => FlowClass::Bulk,
+                _ => FlowClass::Default,
+            };
+            log.insert(i, class);
+        }
+        assert_eq!(log.len(), 10);
+        // Surviving counters in log are 16..=25.
+        // Check partial ranges spanning across slices:
+        let counts = log.count_classes_in_range(18, 22);
+        // 18 (%3 == 0) -> Realtime
+        // 19 (%3 == 1) -> Bulk
+        // 20 (%3 == 2) -> Default
+        // 21 (%3 == 0) -> Realtime
+        // 22 (%3 == 1) -> Bulk
+        assert_eq!(
+            counts,
+            ClassCounts {
+                realtime: 2,
+                bulk: 2,
+                default: 1,
+            }
+        );
+
+        // Entire surviving range:
+        let full = log.count_classes_in_range(16, 25);
+        assert_eq!(full.realtime + full.bulk + full.default, 10);
+
+        // Subrange below surviving:
+        assert_eq!(log.count_classes_in_range(1, 15), ClassCounts::default());
+
+        // Subrange above surviving:
+        assert_eq!(log.count_classes_in_range(26, 100), ClassCounts::default());
+
+        // Subrange overlapping lower edge:
+        let overlap_low = log.count_classes_in_range(10, 17);
+        // counters 16 (%3==1 -> Bulk) and 17 (%3==2 -> Default)
+        assert_eq!(
+            overlap_low,
+            ClassCounts {
+                realtime: 0,
+                bulk: 1,
+                default: 1,
+            }
+        );
+
+        // Subrange overlapping upper edge:
+        let overlap_high = log.count_classes_in_range(24, 30);
+        // counters 24 (%3==0 -> Realtime) and 25 (%3==1 -> Bulk)
+        assert_eq!(
+            overlap_high,
+            ClassCounts {
+                realtime: 1,
+                bulk: 1,
+                default: 0,
+            }
+        );
     }
 
     #[test]
