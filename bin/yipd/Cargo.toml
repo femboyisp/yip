@@ -47,6 +47,7 @@ ed25519-dalek = { version = "3" }
 
 [dev-dependencies]
 ed25519-dalek = { version = "3", default-features = false }
+yip-verify = { workspace = true }
 
 [lints]
 workspace = true

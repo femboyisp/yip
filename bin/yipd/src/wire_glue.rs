@@ -2,7 +2,7 @@
 //! and deriving the wire codec keys from the session channel binding.
 
 use yip_transport::{FlowClass, Symbol};
-use yip_wire::Frame;
+use yip_wire::{Frame, FrameRef};
 
 /// Derive the wire codec's (auth_key, hp_key) from the session channel binding.
 /// Both peers compute the same binding, so both derive the same keys.
@@ -52,7 +52,30 @@ pub fn symbol_to_frame(conn_tag: u64, sym: &Symbol, counter: u64, class: FlowCla
 
 /// Parse a received frame back into a `(Symbol, counter, class)`, or None if the
 /// payload is shorter than the 12-byte counter+object_size prefix.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "retained for owned Frame conversions and compatibility"
+    )
+)]
 pub fn frame_to_symbol(frame: &Frame) -> Option<(Symbol, u64, FlowClass)> {
+    if frame.payload.len() < 12 {
+        return None;
+    }
+    let counter = u64::from_be_bytes(frame.payload[0..8].try_into().ok()?);
+    let object_size = u32::from_be_bytes(frame.payload[8..12].try_into().ok()?);
+    let sym = Symbol {
+        object_id: frame.object_id,
+        object_size,
+        payload_id: frame.payload_id,
+        data: frame.payload[12..].to_vec(),
+    };
+    Some((sym, counter, flags_to_class(frame.flags)))
+}
+
+/// Parse a received borrowed frame into `(Symbol, u64, FlowClass)` without allocating intermediate buffers.
+pub fn frame_ref_to_symbol(frame: &FrameRef<'_>) -> Option<(Symbol, u64, FlowClass)> {
     if frame.payload.len() < 12 {
         return None;
     }
@@ -107,5 +130,27 @@ mod tests {
             payload: vec![0; 4],
         };
         assert!(frame_to_symbol(&frame).is_none());
+    }
+
+    #[test]
+    fn symbol_frame_ref_roundtrips_with_counter_and_class() {
+        let sym = Symbol {
+            object_id: 5,
+            object_size: 1234,
+            payload_id: [1, 2, 3, 4],
+            data: vec![9, 8, 7],
+        };
+        let frame = symbol_to_frame(42, &sym, 99, FlowClass::Bulk);
+        let frame_ref = FrameRef {
+            conn_tag: frame.conn_tag,
+            object_id: frame.object_id,
+            payload_id: frame.payload_id,
+            flags: frame.flags,
+            payload: &frame.payload,
+        };
+        let (got, counter, class) = frame_ref_to_symbol(&frame_ref).unwrap();
+        assert_eq!(got, sym);
+        assert_eq!(counter, 99);
+        assert_eq!(class, FlowClass::Bulk);
     }
 }

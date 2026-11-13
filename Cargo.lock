@@ -2878,6 +2878,7 @@ dependencies = [
  "yip-rendezvous",
  "yip-transport",
  "yip-utls",
+ "yip-verify",
  "yip-wire",
 ]
 

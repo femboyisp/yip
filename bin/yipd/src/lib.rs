@@ -22,4 +22,4 @@ mod rendezvous;
 pub mod sharding;
 mod tls;
 mod tunnel;
-mod wire_glue;
+pub mod wire_glue;

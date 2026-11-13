@@ -196,6 +196,8 @@ pub struct DataPlane {
     egress_scratch: Vec<yip_io::poll::EgressDatagram>,
     /// Reused scratch for the decoded inner packet (TUN write target).
     inner_scratch: Vec<u8>,
+    /// Reused scratch for decrypted control frames.
+    pub(crate) control_scratch: Vec<u8>,
     /// Reused scratch for ARQ retransmit datagrams (control-path sends).
     retx_scratch: Vec<yip_io::poll::EgressDatagram>,
     /// Reused scratch holding exactly one entry: the sealed feedback Control
@@ -317,6 +319,7 @@ impl DataPlane {
             plpmtu: PlpmtuController::new(),
             egress_scratch: Vec::new(),
             inner_scratch: Vec::new(),
+            control_scratch: Vec::new(),
             retx_scratch: Vec::new(),
             tick_scratch: Vec::new(),
             seal_buf: Vec::new(),
@@ -473,7 +476,7 @@ impl DataPlane {
                 let wire = &dg[1..];
 
                 // Deframe (auth + header-deprotect). On failure, drop the packet.
-                let frame = match self.codec.deframe(wire) {
+                let frame = match self.codec.deframe_borrowed(wire) {
                     Ok(f) => f,
                     Err(_) => {
                         self.counters
@@ -484,7 +487,7 @@ impl DataPlane {
                 };
 
                 // Parse the FEC symbol + counter + class out of the frame.
-                let (sym, counter, class) = match wire_glue::frame_to_symbol(&frame) {
+                let (sym, counter, class) = match wire_glue::frame_ref_to_symbol(&frame) {
                     Some(t) => t,
                     None => {
                         self.counters
@@ -510,20 +513,18 @@ impl DataPlane {
                 // The object decoded: tell the detector it was delivered.
                 self.detector.on_delivered(counter);
 
-                // Open the AEAD ciphertext.
-                let inner = match self.session.open(counter, &ciphertext) {
-                    Ok(p) => p,
-                    Err(_) => {
-                        self.counters
-                            .ingress_open_errors
-                            .fetch_add(1, Ordering::Relaxed);
-                        return Outcome::None;
-                    }
-                };
-
-                // Copy the opened inner frame into the reused scratch buffer.
+                // Open the AEAD ciphertext directly into inner_scratch.
                 self.inner_scratch.clear();
-                self.inner_scratch.extend_from_slice(&inner);
+                if self
+                    .session
+                    .open_into(counter, &ciphertext, &mut self.inner_scratch)
+                    .is_err()
+                {
+                    self.counters
+                        .ingress_open_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Outcome::None;
+                }
 
                 self.transport
                     .observe_ingress(&self.inner_scratch, self.l2, now_ms);
@@ -556,15 +557,17 @@ impl DataPlane {
                 // Decrypt the control payload FIRST — authenticate before any
                 // side-effect. A forged packet with a bogus counter must not
                 // poison the loss detector's high_counter.
-                let plaintext = match self.session.open(counter, ct) {
-                    Ok(p) => p,
-                    Err(_) => {
-                        self.counters
-                            .ingress_open_errors
-                            .fetch_add(1, Ordering::Relaxed);
-                        return Outcome::None;
-                    }
-                };
+                self.control_scratch.clear();
+                if self
+                    .session
+                    .open_into(counter, ct, &mut self.control_scratch)
+                    .is_err()
+                {
+                    self.counters
+                        .ingress_open_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Outcome::None;
+                }
 
                 // Authentication succeeded: notify the detector that we saw this
                 // control counter and that it is immediately resolved.
@@ -572,7 +575,7 @@ impl DataPlane {
                 self.detector.on_delivered(counter);
 
                 // Decode the ControlFrame.
-                let frame = match ControlFrame::decode(&plaintext) {
+                let frame = match ControlFrame::decode(&self.control_scratch) {
                     Some(f) => f,
                     None => {
                         self.counters
@@ -863,7 +866,7 @@ impl DataPlane {
 /// Derive the per-session `conn_tag` from the first 8 bytes of
 /// `auth_key || hp_key`.  Both peers compute the same keys from the Noise
 /// channel binding, so they end up with the same tag.
-pub(crate) fn conn_tag_from_keys(auth_key: &[u8; 16], hp_key: &[u8; 16]) -> u64 {
+pub fn conn_tag_from_keys(auth_key: &[u8; 16], hp_key: &[u8; 16]) -> u64 {
     let mut combined = [0u8; 32];
     combined[..16].copy_from_slice(auth_key);
     combined[16..].copy_from_slice(hp_key);
