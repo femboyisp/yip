@@ -42,7 +42,9 @@ jobs:
         env:
           YIP_SKIP_PRIVILEGED_TESTS: "1"
         run: >
-          cargo llvm-cov --workspace
-          --exclude yip-device
+          cargo llvm-cov
+          --package yip-wire --package yip-transport --package yip-crypto
+          --package yip-obf --package yip-membership --package yip-rendezvous
+          --package yipd
           --ignore-filename-regex '.*/(uring|rs_simd|tunnel|main|sharding)\.rs$'
           --fail-under-lines 90 --summary-only

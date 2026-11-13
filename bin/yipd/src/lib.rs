@@ -5,7 +5,7 @@
 mod addr;
 pub mod config;
 pub mod control;
-mod dataplane;
+pub mod dataplane;
 mod epoch;
 pub mod flow;
 pub mod handshake;

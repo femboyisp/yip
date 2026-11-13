@@ -1,6 +1,10 @@
 ---
 name: Mutation testing
 on:
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'bin/**'
   schedule:
     - cron: "0 3 * * *"
   workflow_dispatch:
@@ -13,6 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - name: Install build prerequisites (BoringSSL needs cmake + libclang)
         run: |
@@ -21,7 +27,14 @@ jobs:
       # taiki-e/install-action is not mirrored on this Forgejo instance.
       - name: Install cargo-mutants
         run: cargo install cargo-mutants --locked
+      - name: Diff-scoped mutation test on PR
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          git diff origin/${{ github.base_ref }}...HEAD > pr.diff
+          cargo mutants --in-diff pr.diff --in-place --baseline=skip
       - name: Mutation test (logic & control crates)
+        if: github.event_name != 'pull_request'
         run: >
           cargo mutants
           --package yip-wire
@@ -30,6 +43,7 @@ jobs:
           --package yip-obf
           --package yip-membership
           --package yip-rendezvous
+          --package yipd
           -- --all-targets
       - name: Upload mutants artifact
         if: always()

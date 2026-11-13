@@ -43,6 +43,8 @@ jobs:
         env:
           YIP_SKIP_PRIVILEGED_TESTS: "1"
         run: cargo test --workspace
+      - name: DHAT zero-allocation hotpath gate
+        run: cargo test -p yip-bench --test zero_alloc_hotpath
 
   shear:
     runs-on: ubuntu-latest

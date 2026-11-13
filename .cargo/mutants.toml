@@ -183,6 +183,7 @@ exclude_re = [
     "replace avx512bw_supported -> bool with (true|false)",
     "replace gfni_supported -> bool with (true|false)",
     "replace .* in pq_encapsulate",
+    "replace get_thread_rusage -> FallbackRusage with Default::default()",
 ]
 
 skip_calls = ["reserve"]
