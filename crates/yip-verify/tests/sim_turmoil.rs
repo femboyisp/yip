@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,6 +15,14 @@ use yip_membership::record::Record;
 use yip_membership::GossipMsg;
 use yip_transport::{FecEncoder, FecReassembler, FlowParams, Symbol};
 use yip_wire as _;
+
+fn mock_sig(node_index: u8, seq: u64) -> [u8; 64] {
+    let mut sig = [0u8; 64];
+    sig[0] = 0xa5;
+    sig[1] = node_index.saturating_add(1);
+    sig[2..10].copy_from_slice(&seq.to_be_bytes());
+    sig
+}
 
 fn mock_record(node_index: u8, seq: u64) -> Record {
     let mut member_pubkey = [0u8; 32];
@@ -40,13 +48,34 @@ fn mock_record(node_index: u8, seq: u64) -> Record {
         [10, 0, 0, node_index.saturating_add(1)],
         9000,
     ))];
+    let sig = mock_sig(node_index, seq);
     Record {
         node_id,
         cert,
         endpoints,
         seq,
-        sig: [0u8; 64],
+        sig,
     }
+}
+
+fn validate_record(r: &Record) -> bool {
+    if r.node_id != node_id(&r.cert.member_pubkey) {
+        return false;
+    }
+    if r.sig == [0u8; 64] || r.sig == [0xffu8; 64] {
+        return false;
+    }
+    if r.sig[0] != 0xa5 {
+        return false;
+    }
+    let expected_node_byte = r.cert.member_pubkey[0];
+    if r.sig[1] != expected_node_byte {
+        return false;
+    }
+    if r.sig[2..10] != r.seq.to_be_bytes() {
+        return false;
+    }
+    true
 }
 
 fn serialize_symbol(sym: &Symbol) -> Vec<u8> {
@@ -92,8 +121,8 @@ fn run_gossip_convergence_sim(
         .map(|i| mock_record(u8::try_from(i).expect("node index fits in u8"), 1))
         .collect();
 
-    let final_directories: Arc<Mutex<HashMap<usize, HashMap<NodeId, Record>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let final_directories: Arc<Mutex<BTreeMap<usize, BTreeMap<NodeId, Record>>>> =
+        Arc::new(Mutex::new(BTreeMap::new()));
     let converged_count = Arc::new(AtomicUsize::new(0));
     let all_done = Arc::new(AtomicBool::new(false));
 
@@ -109,7 +138,7 @@ fn run_gossip_convergence_sim(
 
         sim.client(hostname, async move {
             let socket = turmoil::net::UdpSocket::bind("0.0.0.0:9000").await?;
-            let mut directory: HashMap<NodeId, Record> = HashMap::new();
+            let mut directory: BTreeMap<NodeId, Record> = BTreeMap::new();
             directory.insert(my_record.node_id, my_record);
 
             let mut marked_converged = false;
@@ -178,6 +207,9 @@ fn run_gossip_convergence_sim(
                                 }
                                 GossipMsg::Records(records) => {
                                     for r in records {
+                                        if !validate_record(&r) {
+                                            continue;
+                                        }
                                         let replace = match directory.get(&r.node_id) {
                                             None => true,
                                             Some(existing) => r.seq > existing.seq,
@@ -234,7 +266,7 @@ fn run_gossip_convergence_sim(
 
 #[test]
 fn test_turmoil_virtual_udp_ping_pong() -> Result<(), Box<dyn std::error::Error>> {
-    let mut sim = Builder::new().build();
+    let mut sim = Builder::new().rng_seed(42).build();
 
     sim.host("server", || async {
         let socket = turmoil::net::UdpSocket::bind("0.0.0.0:9000").await?;
@@ -267,7 +299,7 @@ fn test_turmoil_multi_node_gossip_convergence() -> Result<(), Box<dyn std::error
 }
 
 #[test]
-fn test_turmoil_byzantine_partition_healing() -> Result<(), Box<dyn std::error::Error>> {
+fn test_turmoil_network_partition_healing() -> Result<(), Box<dyn std::error::Error>> {
     let mut sim = Builder::new()
         .min_message_latency(Duration::from_millis(5))
         .max_message_latency(Duration::from_millis(25))
@@ -281,8 +313,8 @@ fn test_turmoil_byzantine_partition_healing() -> Result<(), Box<dyn std::error::
         .map(|i| mock_record(u8::try_from(i).expect("node index fits in u8"), 1))
         .collect();
 
-    let current_directories: Arc<Mutex<HashMap<usize, HashMap<NodeId, Record>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let current_directories: Arc<Mutex<BTreeMap<usize, BTreeMap<NodeId, Record>>>> =
+        Arc::new(Mutex::new(BTreeMap::new()));
     let all_done = Arc::new(AtomicBool::new(false));
 
     for (i, my_record) in expected_records.iter().cloned().enumerate() {
@@ -296,7 +328,7 @@ fn test_turmoil_byzantine_partition_healing() -> Result<(), Box<dyn std::error::
 
         sim.client(hostname, async move {
             let socket = turmoil::net::UdpSocket::bind("0.0.0.0:9000").await?;
-            let mut directory: HashMap<NodeId, Record> = HashMap::new();
+            let mut directory: BTreeMap<NodeId, Record> = BTreeMap::new();
             directory.insert(my_record.node_id, my_record);
 
             {
@@ -372,6 +404,9 @@ fn test_turmoil_byzantine_partition_healing() -> Result<(), Box<dyn std::error::
                                 GossipMsg::Records(records) => {
                                     let mut updated = false;
                                     for r in records {
+                                        if !validate_record(&r) {
+                                            continue;
+                                        }
                                         let replace = match directory.get(&r.node_id) {
                                             None => true,
                                             Some(existing) => r.seq > existing.seq,
@@ -504,6 +539,215 @@ fn test_turmoil_byzantine_partition_healing() -> Result<(), Box<dyn std::error::
                 node_dir.get(&expected_record.node_id),
                 Some(expected_record),
                 "node {i} must contain expected record of node {j}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_turmoil_byzantine_gossip_rejection() -> Result<(), Box<dyn std::error::Error>> {
+    let mut sim = Builder::new()
+        .min_message_latency(Duration::from_millis(5))
+        .max_message_latency(Duration::from_millis(25))
+        .fail_rate(0.0)
+        .rng_seed(42)
+        .simulation_duration(Duration::from_secs(30))
+        .build();
+
+    let honest_count = 3;
+    let honest_records: Vec<Record> = (0..honest_count)
+        .map(|i| mock_record(u8::try_from(i).expect("honest node index fits in u8"), 1))
+        .collect();
+
+    let final_directories: Arc<Mutex<BTreeMap<usize, BTreeMap<NodeId, Record>>>> =
+        Arc::new(Mutex::new(BTreeMap::new()));
+    let converged_count = Arc::new(AtomicUsize::new(0));
+    let all_done = Arc::new(AtomicBool::new(false));
+
+    for (i, my_record) in honest_records.iter().cloned().enumerate() {
+        let hostname = format!("node_{i}");
+        let peers: Vec<String> = (0..honest_count)
+            .filter(|&j| j != i)
+            .map(|j| format!("node_{j}:9000"))
+            .collect();
+        let final_directories = Arc::clone(&final_directories);
+        let converged_count = Arc::clone(&converged_count);
+        let all_done = Arc::clone(&all_done);
+
+        sim.client(hostname, async move {
+            let socket = turmoil::net::UdpSocket::bind("0.0.0.0:9000").await?;
+            let mut directory: BTreeMap<NodeId, Record> = BTreeMap::new();
+            directory.insert(my_record.node_id, my_record);
+
+            let mut marked_converged = false;
+            let mut interval = tokio::time::interval(Duration::from_millis(50));
+            let mut recv_buf = [0u8; 4096];
+
+            loop {
+                if all_done.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if all_done.load(Ordering::SeqCst) {
+                            break;
+                        }
+
+                        let digest_entries: Vec<(NodeId, u64)> = directory
+                            .values()
+                            .map(|r| (r.node_id, r.seq))
+                            .collect();
+                        let msg = GossipMsg::Digest(digest_entries);
+                        let mut buf = Vec::new();
+                        msg.encode(&mut buf);
+
+                        for peer in &peers {
+                            let _ = socket.send_to(&buf, peer).await;
+                        }
+                    }
+                    recv_res = socket.recv_from(&mut recv_buf) => {
+                        let (len, peer_addr) = match recv_res {
+                            Ok(res) => res,
+                            Err(_) => continue,
+                        };
+                        if let Some(msg) = GossipMsg::decode(&recv_buf[..len]) {
+                            match msg {
+                                GossipMsg::Digest(peer_digest) => {
+                                    let mut needed = Vec::new();
+                                    for (id, seq) in peer_digest {
+                                        match directory.get(&id) {
+                                            None => needed.push(id),
+                                            Some(r) if r.seq < seq => needed.push(id),
+                                            _ => {}
+                                        }
+                                    }
+                                    if !needed.is_empty() {
+                                        let pull_req = GossipMsg::PullRequest(needed);
+                                        let mut buf = Vec::new();
+                                        pull_req.encode(&mut buf);
+                                        let _ = socket.send_to(&buf, peer_addr).await;
+                                    }
+                                }
+                                GossipMsg::PullRequest(requested_ids) => {
+                                    let mut to_send = Vec::new();
+                                    for id in requested_ids {
+                                        if let Some(r) = directory.get(&id) {
+                                            to_send.push(r.clone());
+                                        }
+                                    }
+                                    if !to_send.is_empty() {
+                                        let records_msg = GossipMsg::Records(to_send);
+                                        let mut buf = Vec::new();
+                                        records_msg.encode(&mut buf);
+                                        let _ = socket.send_to(&buf, peer_addr).await;
+                                    }
+                                }
+                                GossipMsg::Records(records) => {
+                                    for r in records {
+                                        if !validate_record(&r) {
+                                            continue;
+                                        }
+                                        let replace = match directory.get(&r.node_id) {
+                                            None => true,
+                                            Some(existing) => r.seq > existing.seq,
+                                        };
+                                        if replace {
+                                            directory.insert(r.node_id, r);
+                                        }
+                                    }
+
+                                    if directory.len() == honest_count && !marked_converged {
+                                        marked_converged = true;
+                                        let prev = converged_count.fetch_add(1, Ordering::SeqCst);
+                                        if prev + 1 == honest_count {
+                                            all_done.store(true, Ordering::SeqCst);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            {
+                let mut lock = final_directories.lock().expect("lock final directories");
+                lock.insert(i, directory);
+            }
+            Ok(())
+        });
+    }
+
+    let byzantine_done = Arc::clone(&all_done);
+    let honest_peers: Vec<String> = (0..honest_count)
+        .map(|j| format!("node_{j}:9000"))
+        .collect();
+
+    sim.client("node_byzantine", async move {
+        let socket = turmoil::net::UdpSocket::bind("0.0.0.0:9000").await?;
+        let mut interval = tokio::time::interval(Duration::from_millis(20));
+
+        let mut corrupted_mismatched_id = mock_record(99, 1);
+        corrupted_mismatched_id.node_id = [0xde; 16];
+
+        let mut corrupted_invalid_sig = mock_record(98, 1);
+        corrupted_invalid_sig.sig = [0xff; 64];
+
+        let mut corrupted_overwrite = mock_record(0, 999);
+        corrupted_overwrite.sig = [0x00; 64];
+
+        let corrupted_records = vec![
+            corrupted_mismatched_id,
+            corrupted_invalid_sig,
+            corrupted_overwrite,
+        ];
+
+        let msg = GossipMsg::Records(corrupted_records);
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+
+        loop {
+            if byzantine_done.load(Ordering::SeqCst) {
+                break;
+            }
+
+            tokio::select! {
+                _ = interval.tick() => {
+                    if byzantine_done.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    for peer in &honest_peers {
+                        let _ = socket.send_to(&buf, peer).await;
+                    }
+                }
+            }
+        }
+        Ok(())
+    });
+
+    sim.run()?;
+
+    let dirs = final_directories.lock().expect("lock final directories");
+    assert_eq!(
+        dirs.len(),
+        honest_count,
+        "all honest nodes completed simulation"
+    );
+    for i in 0..honest_count {
+        let node_dir = &dirs[&i];
+        assert_eq!(
+            node_dir.len(),
+            honest_count,
+            "node {i} must hold only {honest_count} authentic records"
+        );
+        for (j, expected_record) in honest_records.iter().enumerate() {
+            assert_eq!(
+                node_dir.get(&expected_record.node_id),
+                Some(expected_record),
+                "node {i} must contain expected authentic record of node {j}"
             );
         }
     }
