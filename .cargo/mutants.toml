@@ -222,7 +222,41 @@
 #     non-matching peer (which fails deobfuscation and falls through to step (a')) or yield None (which immediately
 #     falls through to step (a')). In both cases, step (a') iterates through all peers and produces identical return
 #     values, packet deliveries, and DAITA state transitions. Step (a) is purely a performance fast-path.
+# 32. Vectorized I/O header heap allocator optimization:
+#     `MmsgBatchArena::new_boxed()` allocates on the heap via `alloc_zeroed` to prevent placing 13.5 KB on the stack.
+#     Replacing with `Box::new(Default::default())` creates the struct on stack before boxing, producing an identical
+#     boxed instance with the same memory contents and layout.
+# 33. Vectorized send_run_plain loop termination equivalence:
+#     In `while sent < run.len()`, mutating `<` to `<=` causes an extra iteration when `sent == run.len()`.
+#     On that iteration, `run[sent..]` is `&[]` (empty), `send_mmsg(..., &[])` returns `0`, and `if n == 0 { break; }`
+#     immediately terminates the loop. The outcome is identical.
+# 34. Non-blocking recv_mmsg flag bitwise equivalence:
+#     `MSG_DONTWAIT` (0x40) and `MSG_WAITFORONE` (0x10000) have disjoint single-bit representations.
+#     For disjoint bits, `0x40 | 0x10000 == 0x40 ^ 0x10000 == 0x10040`.
+# 35. IPv6 pseudo-header checksum zero-addition equivalence:
+#     In `ipv6_tcp_checksum`, `sum += tcp_len_u32 >> 16`. For all standard IPv6 packets, `tcp_len <= 65535`,
+#     so `tcp_len_u32 >> 16 == 0`. `sum + 0 == sum - 0`.
+# 36. parse_ipv6_tcp length boundary fast-fail equivalence:
+#     In `if pkt.len() < 40 || (pkt[0] >> 4) != 6`, mutating `<` to `<=` or `==` rejects a 40-byte packet at line 193.
+#     In the unmutated code, a 40-byte packet passes line 193 but line 201 (`total_len < 60 || pkt.len() < total_len`)
+#     unconditionally rejects it because any IPv6 TCP packet requires 40 bytes IPv6 header + at least 20 bytes TCP header
+#     = 60 bytes minimum. For all packet lengths != 40, `len == 40` evaluates false and line 201 evaluates identically.
+# 37. Coalescer::start_singleton explicit default field assignment:
+#     In `start_singleton`, `VnetHdr { gso_type: GSO_NONE, ..VnetHdr::default() }` explicitly specifies `GSO_NONE`
+#     for documentation and readability. Since `GSO_NONE == 0` and `VirtioNetHdr::default().gso_type == 0`,
+#     omitting `gso_type` yields identical memory and struct representations.
+# 38. Coalescer TCP boundary flag bitmask equivalence:
+#     In `Coalescer::push`, `(TCP_FLAG_PSH | TCP_FLAG_FIN | TCP_FLAG_RST | TCP_FLAG_URG)` combines 4 mutually disjoint
+#     single-bit flag constants (0x01, 0x04, 0x08, 0x20). For disjoint bitmasks, bitwise OR and bitwise XOR are
+#     mathematically identical (`0x01 | 0x04 | 0x08 | 0x20 == 0x01 ^ 0x04 ^ 0x08 ^ 0x20 == 0x2D`).
 exclude_re = [
+    "replace \\| with \\^ in Coalescer::push",
+    "crates/yip-io/src/tun_offload\\.rs:193:.*in parse_ipv6_tcp",
+    "crates/yip-io/src/tun_offload\\.rs:.*delete field gso_type from struct VnetHdr expression in Coalescer::start_singleton",
+    "replace MmsgBatchArena::new_boxed -> Box<Self> with Box::new\\(Default::default\\(\\)\\)",
+    "replace < with <= in send_run_plain",
+    "replace \\| with \\^ in recv_mmsg",
+    "replace \\+= with -= in ipv6_tcp_checksum",
     "replace \\| with \\^ in ReplayWindow::commit",
     "replace > with >= in ReplayWindow::commit",
     "replace < with <= in ReplayWindow::commit",
