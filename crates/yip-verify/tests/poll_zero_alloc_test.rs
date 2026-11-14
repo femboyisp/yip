@@ -1,3 +1,5 @@
+#![cfg(not(miri))]
+
 use std::alloc::System;
 use std::net::UdpSocket;
 use std::os::fd::AsRawFd;

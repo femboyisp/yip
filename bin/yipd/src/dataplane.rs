@@ -1795,4 +1795,73 @@ mod tests {
             "retx scratch buffer must remain empty"
         );
     }
+
+    #[test]
+    fn dataplane_dispatch_trait_methods() {
+        use yip_io::poll::Dispatch;
+        let (mut a, _b) = dataplane_pair(TunnelMode::L3Tun, false);
+
+        // 1. on_tun via Dispatch trait
+        let mut out = Vec::new();
+        let inner = vec![0x11u8; 200];
+        <DataPlane as Dispatch>::on_tun(&mut a, &inner, 100, &mut out);
+        assert!(
+            !out.is_empty(),
+            "on_tun must produce at least one egress datagram"
+        );
+        assert!(!out[0].bytes.is_empty());
+
+        // 2. tick via Dispatch trait
+        <DataPlane as Dispatch>::tick(&mut a, 1000, &mut out);
+
+        // 3. recycle via Dispatch trait
+        <DataPlane as Dispatch>::recycle(&mut a, &mut out);
+        assert!(out.is_empty(), "recycle must drain the batch");
+    }
+
+    #[test]
+    fn dataplane_daita_methods() {
+        let (mut a, _b) = dataplane_pair(TunnelMode::L3Tun, false);
+        let now = std::time::Instant::now();
+
+        // Initially None
+        assert!(a.daita_engine().is_none());
+        assert!(a.daita_engine_mut().is_none());
+
+        // Call on_daita_* when engine is None -> returns empty vec
+        assert!(a.on_daita_tunnel_sent(now).is_empty());
+        assert!(a.on_daita_tunnel_recv(now).is_empty());
+        assert!(a.on_daita_normal_sent(now).is_empty());
+        assert!(a.on_daita_normal_recv(now).is_empty());
+        assert!(a.on_daita_timer(now).is_empty());
+
+        // Set Front profile
+        a.set_daita_profile(yip_obf::DaitaProfile::Front, now)
+            .unwrap();
+        assert!(a.daita_engine().is_some());
+        assert!(a.daita_engine_mut().is_some());
+        assert_eq!(
+            a.daita_engine().unwrap().profile(),
+            &yip_obf::DaitaProfile::Front
+        );
+
+        // Normal recv triggers actions on Front
+        let actions = a.on_daita_normal_recv(now);
+        assert!(
+            !actions.is_empty(),
+            "Front on_normal_recv must emit actions"
+        );
+
+        // Tunnel sent / recv
+        let _ = a.on_daita_tunnel_sent(now);
+        let _ = a.on_daita_tunnel_recv(now);
+
+        // Timer
+        let _ = a.on_daita_timer(now);
+
+        // Set Off profile resets engine to None
+        a.set_daita_profile(yip_obf::DaitaProfile::Off, now)
+            .unwrap();
+        assert!(a.daita_engine().is_none());
+    }
 }

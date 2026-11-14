@@ -3248,3 +3248,57 @@ fn test_peer_manager_xdp_status_and_mode() {
     let err = pm.set_xdp_mode("bad_mode").unwrap_err();
     assert!(err.contains("invalid xdp mode"));
 }
+
+#[test]
+fn test_peer_manager_dispatch_trait_methods() {
+    use yip_io::poll::Dispatch;
+    let mut pm = test_peer_manager();
+    let mut out = Vec::new();
+
+    // 1. on_tun via Dispatch trait
+    let pkt = vec![0x11u8; 100];
+    <PeerManager as Dispatch>::on_tun(&mut pm, &pkt, 100, &mut out);
+
+    // 2. tick via Dispatch trait
+    <PeerManager as Dispatch>::tick(&mut pm, 1000, &mut out);
+
+    // 3. recycle via Dispatch trait
+    <PeerManager as Dispatch>::recycle(&mut pm, &mut out);
+    assert!(out.is_empty(), "recycle must drain the batch");
+}
+
+#[test]
+fn test_peer_manager_daita_profile_and_engine_mut() {
+    let mut pm = test_peer_manager();
+    let dp = fake_established_dataplane(1234, "10.0.0.1:1000".parse().unwrap());
+    pm.peers[0].state =
+        PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+
+    // Test set_traffic_defense with Front profile
+    let cfg = TrafficDefenseConfig::default().with_daita_profile(yip_obf::DaitaProfile::Front);
+    pm.set_traffic_defense(cfg);
+    assert!(pm.peer_daita_engine(0).is_some());
+    assert!(pm.peer_daita_engine_mut(0).is_some());
+    assert_eq!(
+        pm.peer_daita_engine(0).unwrap().profile(),
+        &yip_obf::DaitaProfile::Front
+    );
+
+    // Mutably access daita engine
+    if let Some(engine) = pm.peer_daita_engine_mut(0) {
+        let acts = engine.on_normal_sent(std::time::Instant::now());
+        assert!(!acts.is_empty(), "Front daita engine must emit actions");
+    }
+
+    // Test set_peer_daita_profile with Regulator
+    pm.set_peer_daita_profile(0, yip_obf::DaitaProfile::Regulator);
+    assert_eq!(
+        pm.peer_daita_engine(0).unwrap().profile(),
+        &yip_obf::DaitaProfile::Regulator
+    );
+
+    // Test set_peer_daita_profile with Off resets engine
+    pm.set_peer_daita_profile(0, yip_obf::DaitaProfile::Off);
+    assert!(pm.peer_daita_engine(0).is_none());
+    assert!(pm.peer_daita_engine_mut(0).is_none());
+}

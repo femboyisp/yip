@@ -474,6 +474,26 @@ mod tests {
     }
 
     #[test]
+    fn xorshift_rngcore_trait_methods() {
+        use rand_core::RngCore;
+        let mut r = XorShift64::from_seed(42);
+        let u32_val = r.next_u32();
+        assert_ne!(u32_val, 0);
+        assert_ne!(u32_val, 1);
+
+        let u64_val = r.next_u64();
+        assert_ne!(u64_val, 0);
+        assert_ne!(u64_val, 1);
+
+        let mut buf = [0u8; 32];
+        r.fill_bytes(&mut buf);
+        assert!(
+            buf.iter().any(|&b| b != 0),
+            "fill_bytes fills non-zero bytes"
+        );
+    }
+
+    #[test]
     fn obfuscate_into_roundtrips_with_deobfuscate() {
         let key = derive_key(b"test-secret-key");
         let mut buf = Vec::new();

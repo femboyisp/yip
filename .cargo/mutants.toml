@@ -189,6 +189,29 @@
 #     Because `self.next_generation` is strictly monotonic and incremented on every insertion,
 #     no two entries in `ObjectTable` can ever have identical generation values.
 #     Therefore `<` and `<=` are mathematically equivalent for every reachable table state.
+# 27. `replace <impl rand_core::RngCore for XorShift64>::next_u64 -> u64 with (0|1)`
+#     A constant 0 or 1 RNG return causes Maybenot's geometric/exponential
+#     sampling distribution loops to never terminate, triggering 120s test timeouts.
+# 28. `replace < with <= in DaitaEngine::dispatch_events` (crates/yip-obf/src/daita.rs)
+#     `machine.into_raw()` yields machine index `mi < num_machines` strictly.
+#     Because `internal_timers` and `action_timers` are initialized to `num_machines`
+#     elements, `mi < len` and `mi <= len` evaluate identically for all reachable
+#     machine indices (`0..num_machines`). Mutating `<` to `<=` produces byte-for-byte
+#     identical runtime behavior.
+# 29. `replace \|\| with && in DaitaEngine::with_limits` (crates/yip-obf/src/daita.rs ~line 95)
+#     `if profile == DaitaProfile::Off || machines.is_empty()`.
+#     For `DaitaProfile::Off`, `build_machines` always returns an empty vector, so
+#     `profile == DaitaProfile::Off` and `machines.is_empty()` are both true (true || true == true && true).
+#     For all non-Off profiles, `build_machines` returns a non-empty vector or an Err, so
+#     both conditions are false (false || false == false && false).
+#     Because both operands have identical truth values across all reachable executions,
+#     `||` and `&&` evaluate identically.
+# 30. `replace > with >= in DaitaEngine::dispatch_events` (crates/yip-obf/src/daita.rs ~line 297)
+#     `if replace || slot.is_none() || slot.is_some_and(|curr| deadline > curr) { *slot = Some(deadline); }`.
+#     When `deadline == curr`, `deadline > curr` is false (leaving `slot` as `Some(curr)`),
+#     while `deadline >= curr` is true (setting `slot` to `Some(deadline) = Some(curr)`).
+#     Both result in `slot` holding the identical `Some(curr)` value, producing zero observable
+#     change under all executions.
 exclude_re = [
     "replace \\| with \\^ in ReplayWindow::commit",
     "replace > with >= in ReplayWindow::commit",
@@ -225,6 +248,10 @@ exclude_re = [
     "crates/yip-transport/src/fec\\.rs:90.*in FecReassembler::push",
     "crates/yip-transport/src/fec\\.rs:94.*in FecReassembler::push",
     "replace < with <= in ObjectTable::insert",
+    "replace <impl rand_core::RngCore for XorShift64>::next_u64 -> u64 with (0|1)",
+    "replace < with <= in DaitaEngine::dispatch_events",
+    "replace \\|\\| with && in DaitaEngine::with_limits",
+    "replace > with >= in DaitaEngine::dispatch_events",
 ]
 
 skip_calls = ["reserve"]

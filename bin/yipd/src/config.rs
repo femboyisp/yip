@@ -2489,6 +2489,16 @@ local_public=0000000000000000000000000000000000000000000000000000000000000002
         assert_eq!(def.cover_interval_ms, None);
         assert_eq!(def.cover_burst_max, 1);
         assert_eq!(def.jitter_max_ms, 0);
+        assert_eq!(def.daita_profile, yip_obf::DaitaProfile::Off);
+    }
+
+    #[test]
+    fn test_traffic_defense_config_with_daita_profile() {
+        let def = TrafficDefenseConfig::default().with_daita_profile(yip_obf::DaitaProfile::Front);
+        assert_eq!(def.daita_profile, yip_obf::DaitaProfile::Front);
+
+        let def_reg = def.with_daita_profile(yip_obf::DaitaProfile::Regulator);
+        assert_eq!(def_reg.daita_profile, yip_obf::DaitaProfile::Regulator);
     }
 
     #[test]
