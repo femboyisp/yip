@@ -1,8 +1,7 @@
 # Roadmap
 
 Where yip is and where it's going. Honest about status — nothing here is checked off unless
-it's merged with tests. Dates are deliberately absent; this is a pre-1.0 project with one
-maintainer.
+it's merged with tests. Dates are deliberately absent; work is shipped as it is completed and rigorously verified.
 
 ## Done (merged, with integration tests on both I/O drivers)
 

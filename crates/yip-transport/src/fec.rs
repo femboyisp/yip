@@ -1413,6 +1413,64 @@ mod tests {
     }
 
     #[test]
+    fn k10_r2_cauchy_recovers_two_burst_losses() {
+        let params = FlowClass::Bulk.params(); // arq=true -> Cauchy scheme for R=2
+        let ct: Vec<u8> = (0..12000u32)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect(); // K=10 (1200-byte symbols)
+        let mut enc = FecEncoder::new();
+        let syms = enc.encode(&ct, params, 2); // K=10, R=2, 12 symbols total
+        assert_eq!(syms.len(), 12);
+        assert!(syms
+            .iter()
+            .all(|s| s.payload_id[3] == crate::rs::SCHEME_CAUCHY));
+
+        let mut re = FecReassembler::new(params.symbol_size, 64);
+        let mut out = None;
+        // Drop source symbols 3 and 7 (two erasures in the 10-packet block)
+        for (i, s) in syms.iter().enumerate() {
+            if i == 3 || i == 7 {
+                continue;
+            }
+            out = out.or(re.push(u64::from(s.object_id), s, 0, 1000));
+        }
+        assert_eq!(
+            out.as_deref(),
+            Some(ct.as_slice()),
+            "Cauchy R=2 must recover 2 dropped packets"
+        );
+    }
+
+    #[test]
+    fn k10_r3_cauchy_recovers_three_severe_burst_losses() {
+        let params = FlowClass::Default.params(); // arq=true -> Cauchy scheme
+        let ct: Vec<u8> = (0..12000u32)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect(); // K=10
+        let mut enc = FecEncoder::new();
+        let syms = enc.encode(&ct, params, 3); // K=10, R=3, 13 symbols total
+        assert_eq!(syms.len(), 13);
+        assert!(syms
+            .iter()
+            .all(|s| s.payload_id[3] == crate::rs::SCHEME_CAUCHY));
+
+        let mut re = FecReassembler::new(params.symbol_size, 64);
+        let mut out = None;
+        // Drop 3 source symbols (0, 4, 9)
+        for (i, s) in syms.iter().enumerate() {
+            if i == 0 || i == 4 || i == 9 {
+                continue;
+            }
+            out = out.or(re.push(u64::from(s.object_id), s, 0, 1000));
+        }
+        assert_eq!(
+            out.as_deref(),
+            Some(ct.as_slice()),
+            "Cauchy R=3 must recover 3 dropped packets"
+        );
+    }
+
+    #[test]
     fn reassembler_rejects_pq_repair_index_out_of_range() {
         let params = FlowClass::Default.params();
         let ct = vec![0x33u8; 2400]; // K=2

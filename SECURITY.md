@@ -1,8 +1,7 @@
 # Security Policy
 
-yip is a VPN — its whole job is security — but it is **pre-1.0 software with one maintainer
-and no external audit**. Treat it accordingly. If you rely on it in a threat-model where
-compromise is dangerous, read the honest accounting below first.
+yip is a VPN — its whole job is security. Treat it accordingly. If you rely on it
+in a threat-model where compromise is dangerous, read the honest accounting below first.
 
 ## Reporting a vulnerability
 
@@ -19,8 +18,8 @@ rather stay anonymous. There is no bounty program.
 
 | Version | Supported |
 | :--- | :--- |
-| 0.1.x | :white_check_mark: |
-| < 0.1.0 | :x: |
+| 0.1.x | Yes |
+| < 0.1.0 | No |
 
 Fixes land on `main` and are tagged for release.
 

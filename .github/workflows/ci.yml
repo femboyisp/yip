@@ -26,6 +26,23 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  changelog:
+    name: Enforce CHANGELOG update
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify CHANGELOG.md was updated
+        run: |
+          if git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -q '^CHANGELOG.md$'; then
+            echo "CHANGELOG.md was updated in this pull request."
+          else
+            echo "Error: CHANGELOG.md must be updated for every pull request introducing changes."
+            exit 1
+          fi
+
   build-test:
     runs-on: ubuntu-latest
     steps:

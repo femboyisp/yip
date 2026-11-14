@@ -1,7 +1,7 @@
 # Contributing to yip
 
 Contributions are welcome — code, review, testing, docs, and real-world deployment reports.
-yip is pre-1.0 and moves fast; the bar is high on correctness and honesty, relaxed on
+yip moves fast; the bar is high on correctness and honesty, relaxed on
 everything else. Be kind, be rigorous, have fun.
 
 ## Getting set up
