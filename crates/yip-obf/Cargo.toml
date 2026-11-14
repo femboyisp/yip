@@ -18,6 +18,7 @@ getrandom = "0.4"
 maybenot = "2.2.2"
 maybenot-machines = "1.0.1"
 rand_core = "0.9"
+enum-map = "2.7"
 
 [dev-dependencies]
 enum-map = "2.7"

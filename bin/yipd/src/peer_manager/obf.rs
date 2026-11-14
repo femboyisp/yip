@@ -641,4 +641,87 @@ mod tests {
             "packet masked with next epoch candidate key must deobfuscate on roamed endpoint"
         );
     }
+
+    #[test]
+    fn deobf_ingress_daita_tracking_normal_vs_control() {
+        use std::time::Instant;
+        use yip_obf::{DaitaEngine, DaitaProfile};
+
+        let peer_ep: SocketAddr = "10.0.0.50:5050".parse().unwrap();
+        let peer = peer_cfg(50, "10.0.0.50:5050");
+        let mut pm = PeerManager::new(
+            [51u8; 32],
+            [52u8; 32],
+            &[peer],
+            TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
+        let key = [0x55u8; 16];
+        let dp = fake_established_dataplane(5555, peer_ep);
+        pm.peers[0].state =
+            PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+        pm.peers[0].session_obf_key = Some(key);
+
+        let ctl_plain = [1, 2, 3];
+        let ctl_dg = yip_obf::obfuscate(&key, PacketType::Control as u8, &ctl_plain, 0).unwrap();
+        let data_plain = [4, 5, 6];
+        let data_dg = yip_obf::obfuscate(&key, PacketType::Data as u8, &data_plain, 0).unwrap();
+
+        // 1. Direct endpoint: Control must not trigger on_normal_recv; Data must trigger it.
+        pm.peers[0].daita_engine =
+            Some(DaitaEngine::new(DaitaProfile::Front, Instant::now()).unwrap());
+        let out_ctl = pm.deobf_ingress(peer_ep, &ctl_dg);
+        assert!(out_ctl.is_some());
+        assert!(
+            pm.peers[0]
+                .daita_engine
+                .as_ref()
+                .unwrap()
+                .next_timer_deadline()
+                .is_none(),
+            "Control datagram must not transition Front DAITA machine"
+        );
+
+        let out_data = pm.deobf_ingress(peer_ep, &data_dg);
+        assert!(out_data.is_some());
+        assert!(
+            pm.peers[0]
+                .daita_engine
+                .as_ref()
+                .unwrap()
+                .next_timer_deadline()
+                .is_some(),
+            "Data datagram must transition Front DAITA machine"
+        );
+
+        // 2. Roamed endpoint: Control must not trigger on_normal_recv; Data must trigger it.
+        let roamed_ep: SocketAddr = "198.51.100.77:7070".parse().unwrap();
+        pm.peers[0].daita_engine =
+            Some(DaitaEngine::new(DaitaProfile::Front, Instant::now()).unwrap());
+        let out_roamed_ctl = pm.deobf_ingress(roamed_ep, &ctl_dg);
+        assert!(out_roamed_ctl.is_some());
+        assert!(
+            pm.peers[0]
+                .daita_engine
+                .as_ref()
+                .unwrap()
+                .next_timer_deadline()
+                .is_none(),
+            "Roamed Control datagram must not transition Front DAITA machine"
+        );
+
+        let out_roamed_data = pm.deobf_ingress(roamed_ep, &data_dg);
+        assert!(out_roamed_data.is_some());
+        assert!(
+            pm.peers[0]
+                .daita_engine
+                .as_ref()
+                .unwrap()
+                .next_timer_deadline()
+                .is_some(),
+            "Roamed Data datagram must transition Front DAITA machine"
+        );
+    }
 }

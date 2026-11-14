@@ -3268,6 +3268,19 @@ fn test_peer_manager_dispatch_trait_methods() {
     );
     assert!(!out[0].bytes.is_empty());
 
+    // 1b. Call on_tun with pre-existing elements in out to test metric calculation (added = out.len() - start_len)
+    let init_symbols = pm.metrics().snapshot(&[]).fec.symbols_tx;
+    let start_len = out.len();
+    assert!(start_len > 0);
+    <PeerManager as Dispatch>::on_tun(&mut pm, &pkt, 100, &mut out);
+    let added = out.len() - start_len;
+    let new_symbols = pm.metrics().snapshot(&[]).fec.symbols_tx;
+    assert_eq!(
+        new_symbols - init_symbols,
+        added as u64,
+        "fec.symbols_tx must record out.len() - start_len"
+    );
+
     // 2. queue scheduled egress to test next_timeout_ms and tick
     let deliver_after = 142u64;
     let ep = "10.0.0.1:1000".parse().unwrap();
@@ -3390,4 +3403,142 @@ fn test_peer_manager_daita_profile_and_engine_mut() {
     pm.set_peer_daita_profile(0, yip_obf::DaitaProfile::Off);
     assert!(pm.peer_daita_engine(0).is_none());
     assert!(pm.peer_daita_engine_mut(0).is_none());
+}
+
+#[test]
+fn test_peer_manager_handle_daita_egress_actions() {
+    use std::time::{Duration, Instant};
+    use yip_obf::DaitaEngine;
+
+    let pkt = dummy_tun_pkt();
+
+    // Determine baseline datagram count produced by on_tun_into without DAITA
+    let base_len = {
+        let mut pm = test_peer_manager();
+        let dp = fake_established_dataplane(1234, "10.0.0.1:1000".parse().unwrap());
+        pm.peers[0].state =
+            PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+        let mut out = Vec::new();
+        pm.on_tun_into(&pkt, 100, &mut out);
+        out.len()
+    };
+    assert!(base_len > 0);
+
+    // 1. SendPadding action pushes decoy datagram into out
+    {
+        let mut pm = test_peer_manager();
+        let dp = fake_established_dataplane(1234, "10.0.0.1:1000".parse().unwrap());
+        pm.peers[0].state =
+            PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+        pm.peers[0].daita_engine = Some(DaitaEngine::new_test_padding_on_tunnel_sent(
+            Duration::ZERO,
+            Instant::now(),
+        ));
+
+        let mut out = Vec::new();
+        pm.on_tun_into(&pkt, 100, &mut out);
+        assert_eq!(
+            out.len(),
+            base_len + 1,
+            "handle_daita_egress_actions must append padding datagram alongside data packet"
+        );
+        assert_eq!(out[base_len].bytes[0], yip_obf::JUNK_TYPE);
+    }
+
+    // 2. BlockOutgoing action with positive duration drains out and schedules egress
+    {
+        let mut pm = test_peer_manager();
+        let dp = fake_established_dataplane(1234, "10.0.0.1:1000".parse().unwrap());
+        pm.peers[0].state =
+            PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+        pm.peers[0].daita_engine = Some(DaitaEngine::new_test_blocking_engine(
+            Duration::from_millis(50),
+            Instant::now(),
+        ));
+
+        let mut out = Vec::new();
+        pm.on_tun_into(&pkt, 100, &mut out);
+        assert!(
+            out.is_empty(),
+            "BlockOutgoing with duration > 0 must drain outgoing datagrams for scheduled release"
+        );
+        assert_eq!(
+            pm.next_timeout_ms(100),
+            Some(50),
+            "next_timeout_ms must reflect scheduled release delay"
+        );
+    }
+
+    // 3. BlockOutgoing action with zero duration does not drain out
+    {
+        let mut pm = test_peer_manager();
+        let dp = fake_established_dataplane(1234, "10.0.0.1:1000".parse().unwrap());
+        pm.peers[0].state =
+            PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+        pm.peers[0].daita_engine = Some(DaitaEngine::new_test_blocking_engine(
+            Duration::ZERO,
+            Instant::now(),
+        ));
+
+        let mut out = Vec::new();
+        pm.on_tun_into(&pkt, 100, &mut out);
+        assert_eq!(
+            out.len(),
+            base_len,
+            "BlockOutgoing with duration == 0 must not drain outgoing datagrams"
+        );
+    }
+}
+
+#[test]
+fn test_peer_manager_tick_daita_timer_actions() {
+    use std::time::{Duration, Instant};
+    use yip_obf::DaitaEngine;
+
+    let pkt = dummy_tun_pkt();
+
+    // 1. Established peer with expired DAITA timer emits padding via tick
+    {
+        let mut pm = test_peer_manager();
+        let dp = fake_established_dataplane(1234, "10.0.0.1:1000".parse().unwrap());
+        pm.peers[0].state =
+            PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+        pm.peers[0].daita_engine = Some(DaitaEngine::new_test_padding_on_timer(
+            Duration::from_millis(1),
+            Duration::ZERO,
+            Instant::now(),
+        ));
+
+        let mut out = Vec::new();
+        pm.on_tun_into(&pkt, 100, &mut out);
+
+        std::thread::sleep(Duration::from_millis(5));
+
+        let tick_out = pm.tick(105);
+        assert!(
+            tick_out
+                .as_ref()
+                .is_some_and(|dgs| dgs.iter().any(|d| d.bytes[0] == yip_obf::JUNK_TYPE)),
+            "tick on Established peer with expired DAITA timer must emit padding datagram"
+        );
+    }
+
+    // 2. Idle (non-Established) peer must NOT emit DAITA padding on tick
+    {
+        let mut pm = test_peer_manager();
+        pm.peers[0].state = PeerState::Idle;
+        pm.peers[0].daita_engine = Some(DaitaEngine::new_test_padding_on_timer(
+            Duration::from_millis(1),
+            Duration::ZERO,
+            Instant::now(),
+        ));
+
+        std::thread::sleep(Duration::from_millis(5));
+
+        let tick_out = pm.tick(105);
+        assert!(
+            tick_out.is_none() || tick_out.as_ref().unwrap().is_empty(),
+            "tick on non-Established peer must not emit DAITA padding"
+        );
+    }
 }

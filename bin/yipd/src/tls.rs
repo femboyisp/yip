@@ -352,23 +352,11 @@ pub(crate) fn write_all_tls(
 /// manager borrow (mirrors `quic.rs`'s `owned_out`).
 fn owned_out(
     out: DispatchOut<'_>,
-    mut pkts: Vec<EgressDatagram>,
+    pkts: Vec<EgressDatagram>,
 ) -> (Option<Vec<u8>>, Vec<EgressDatagram>) {
     match out {
-        DispatchOut::None => (None, pkts),
-        DispatchOut::Tun(inner) => (Some(inner.to_vec()), pkts),
-        DispatchOut::Udp(dgs) => {
-            if pkts.is_empty() && !dgs.is_empty() {
-                pkts.extend(dgs.iter().cloned());
-            }
-            (None, pkts)
-        }
-        DispatchOut::Both(inner, dgs) => {
-            if pkts.is_empty() && !dgs.is_empty() {
-                pkts.extend(dgs.iter().cloned());
-            }
-            (Some(inner.to_vec()), pkts)
-        }
+        DispatchOut::None | DispatchOut::Udp(_) => (None, pkts),
+        DispatchOut::Tun(inner) | DispatchOut::Both(inner, _) => (Some(inner.to_vec()), pkts),
     }
 }
 
@@ -2130,5 +2118,103 @@ mod tests {
         let mut buf = [0u8; 128];
         let res = stream_remote.ssl_read(&mut buf);
         assert!(res.is_err(), "remote must receive no data while connecting");
+    }
+
+    #[test]
+    fn test_owned_out_all_variants() {
+        let dummy = EgressDatagram {
+            dst: "127.0.0.1:9000".parse().unwrap(),
+            bytes: vec![1, 2, 3],
+            fate: 0,
+        };
+
+        // DispatchOut::None
+        let (tun, pkts) = owned_out(DispatchOut::None, Vec::new());
+        assert!(tun.is_none());
+        assert!(pkts.is_empty());
+        let (tun, pkts) = owned_out(DispatchOut::None, vec![dummy.clone()]);
+        assert!(tun.is_none());
+        assert_eq!(pkts.len(), 1);
+
+        // DispatchOut::Udp
+        let (tun, pkts) = owned_out(DispatchOut::Udp(&[]), Vec::new());
+        assert!(tun.is_none());
+        assert!(pkts.is_empty());
+        let (tun, pkts) = owned_out(DispatchOut::Udp(&[]), vec![dummy.clone()]);
+        assert!(tun.is_none());
+        assert_eq!(pkts.len(), 1);
+
+        // DispatchOut::Tun
+        let payload = b"inner_tun_data";
+        let (tun, pkts) = owned_out(DispatchOut::Tun(payload), Vec::new());
+        assert_eq!(tun.as_deref(), Some(payload.as_slice()));
+        assert!(pkts.is_empty());
+        let (tun, pkts) = owned_out(DispatchOut::Tun(payload), vec![dummy.clone()]);
+        assert_eq!(tun.as_deref(), Some(payload.as_slice()));
+        assert_eq!(pkts.len(), 1);
+
+        // DispatchOut::Both
+        let (tun, pkts) = owned_out(DispatchOut::Both(payload, &[]), Vec::new());
+        assert_eq!(tun.as_deref(), Some(payload.as_slice()));
+        assert!(pkts.is_empty());
+        let (tun, pkts) = owned_out(DispatchOut::Both(payload, &[]), vec![dummy.clone()]);
+        assert_eq!(tun.as_deref(), Some(payload.as_slice()));
+        assert_eq!(pkts.len(), 1);
+    }
+
+    #[test]
+    fn test_peer_manager_tls_dispatch_impl() {
+        use crate::peer_manager::testutil::{dummy_tun_pkt, established_pm_pair};
+
+        let (mut pm_a, mut pm_b, ep_a, _ep_b, _kp_a, kp_b) = established_pm_pair(1_000_000);
+
+        // 1. TlsDispatch::is_peer_established
+        assert!(<PeerManager as TlsDispatch>::is_peer_established(
+            &pm_a,
+            &kp_b.public
+        ));
+        assert!(!<PeerManager as TlsDispatch>::is_peer_established(
+            &pm_a,
+            &[0xff; 32]
+        ));
+
+        // 2. TlsDispatch::on_tun
+        let pkt = dummy_tun_pkt();
+        let egress = <PeerManager as TlsDispatch>::on_tun(&mut pm_a, &pkt, 100);
+        assert!(
+            !egress.is_empty(),
+            "TlsDispatch::on_tun must return egress datagrams"
+        );
+        assert!(!egress[0].bytes.is_empty());
+
+        // 3. TlsDispatch::on_udp
+        // Send the egress packet from A to B via TlsDispatch::on_udp
+        let mut recovered = None;
+        for dg in egress {
+            let (tun, _) = <PeerManager as TlsDispatch>::on_udp(&mut pm_b, ep_a, &dg.bytes, 100);
+            if let Some(inner) = tun {
+                recovered = Some(inner);
+                break;
+            }
+        }
+        assert_eq!(
+            recovered.as_deref(),
+            Some(pkt.as_slice()),
+            "TlsDispatch::on_udp must decrypt TUN payload for established peer"
+        );
+
+        // 4. TlsDispatch::tick
+        let scheduled_dg = EgressDatagram {
+            dst: ep_a,
+            bytes: vec![0x77; 64],
+            fate: 0,
+        };
+        let mut sink = Vec::new();
+        pm_b.queue_scheduled_egress(scheduled_dg, 200, &mut sink);
+        let tick_egress = <PeerManager as TlsDispatch>::tick(&mut pm_b, 250);
+        assert!(
+            tick_egress.iter().any(|d| d.bytes == vec![0x77; 64]),
+            "TlsDispatch::tick must drain scheduled datagrams"
+        );
     }
 }

@@ -123,6 +123,215 @@ impl DaitaEngine {
         self.framework.is_some()
     }
 
+    /// Test helper creating a machine that emits `SendPadding` upon tunnel sent.
+    #[doc(hidden)]
+    pub fn new_test_padding_on_tunnel_sent(timeout: Duration, now: Instant) -> Self {
+        use enum_map::enum_map;
+        use maybenot::action::Action;
+        use maybenot::dist::{Dist, DistType};
+        use maybenot::event::Event;
+        use maybenot::state::{State, Trans};
+
+        let micros = timeout.as_micros() as f64;
+        let dist = Dist {
+            dist: DistType::Uniform {
+                low: 0.0,
+                high: 0.0,
+            },
+            start: micros,
+            max: 0.0,
+        };
+
+        // State 0: on TunnelSent -> State 1 (emits SendPadding)
+        let s0 = State::new(enum_map! {
+            Event::TunnelSent => vec![Trans(1, 1.0)],
+            _ => vec![],
+        });
+
+        let mut s1 = State::new(enum_map! {
+            _ => vec![],
+        });
+        s1.action = Some(Action::SendPadding {
+            bypass: true,
+            replace: false,
+            timeout: dist,
+            limit: None,
+        });
+
+        let machine =
+            Machine::new(10_000, 1.0, 10_000_000, 1.0, vec![s0, s1]).expect("valid machine");
+        let machines = vec![machine];
+        let num_machines = machines.len();
+        let fw = Framework::new(
+            machines,
+            DEFAULT_MAX_PADDING_FRAC,
+            DEFAULT_MAX_BLOCKING_FRAC,
+            now,
+            XorShift64::from_seed(42),
+        )
+        .expect("framework inits");
+        Self {
+            profile: DaitaProfile::Custom(vec![]),
+            framework: Some(fw),
+            internal_timers: vec![None; num_machines],
+            action_timers: vec![None; num_machines],
+            blocking_until: None,
+            last_padding_machine: None,
+            max_padding_frac: DEFAULT_MAX_PADDING_FRAC,
+            max_blocking_frac: DEFAULT_MAX_BLOCKING_FRAC,
+        }
+    }
+
+    /// Test helper creating a machine that sets an internal timer on tunnel sent,
+    /// and emits `SendPadding` upon TimerEnd.
+    #[doc(hidden)]
+    pub fn new_test_padding_on_timer(
+        timer_delay: Duration,
+        padding_timeout: Duration,
+        now: Instant,
+    ) -> Self {
+        use enum_map::enum_map;
+        use maybenot::action::Action;
+        use maybenot::dist::{Dist, DistType};
+        use maybenot::event::Event;
+        use maybenot::state::{State, Trans};
+
+        let timer_micros = timer_delay.as_micros() as f64;
+        let padding_micros = padding_timeout.as_micros() as f64;
+
+        // State 0: on TunnelSent -> State 1 (sets internal timer)
+        let s0 = State::new(enum_map! {
+            Event::TunnelSent => vec![Trans(1, 1.0)],
+            _ => vec![],
+        });
+
+        // State 1: sets internal timer of timer_delay, on TimerEnd -> State 2
+        let mut s1 = State::new(enum_map! {
+            Event::TimerEnd => vec![Trans(2, 1.0)],
+            _ => vec![],
+        });
+        s1.action = Some(Action::UpdateTimer {
+            replace: true,
+            duration: Dist {
+                dist: DistType::Uniform {
+                    low: 0.0,
+                    high: 0.0,
+                },
+                start: timer_micros,
+                max: 0.0,
+            },
+            limit: None,
+        });
+
+        // State 2: emits SendPadding
+        let mut s2 = State::new(enum_map! {
+            _ => vec![],
+        });
+        s2.action = Some(Action::SendPadding {
+            bypass: true,
+            replace: false,
+            timeout: Dist {
+                dist: DistType::Uniform {
+                    low: 0.0,
+                    high: 0.0,
+                },
+                start: padding_micros,
+                max: 0.0,
+            },
+            limit: None,
+        });
+
+        let machine =
+            Machine::new(10_000, 1.0, 10_000_000, 1.0, vec![s0, s1, s2]).expect("valid machine");
+        let machines = vec![machine];
+        let num_machines = machines.len();
+        let fw = Framework::new(
+            machines,
+            DEFAULT_MAX_PADDING_FRAC,
+            DEFAULT_MAX_BLOCKING_FRAC,
+            now,
+            XorShift64::from_seed(42),
+        )
+        .expect("framework inits");
+        Self {
+            profile: DaitaProfile::Custom(vec![]),
+            framework: Some(fw),
+            internal_timers: vec![None; num_machines],
+            action_timers: vec![None; num_machines],
+            blocking_until: None,
+            last_padding_machine: None,
+            max_padding_frac: DEFAULT_MAX_PADDING_FRAC,
+            max_blocking_frac: DEFAULT_MAX_BLOCKING_FRAC,
+        }
+    }
+
+    /// Test helper creating a machine that emits `BlockOutgoing` upon normal/tunnel sent.
+    #[doc(hidden)]
+    pub fn new_test_blocking_engine(duration: Duration, now: Instant) -> Self {
+        use enum_map::enum_map;
+        use maybenot::action::Action;
+        use maybenot::dist::{Dist, DistType};
+        use maybenot::event::Event;
+        use maybenot::state::{State, Trans};
+
+        let dur_micros = duration.as_micros() as f64;
+        let dist = Dist {
+            dist: DistType::Uniform {
+                low: 0.0,
+                high: 0.0,
+            },
+            start: dur_micros,
+            max: 0.0,
+        };
+
+        // State 0: on TunnelSent -> State 1 (emits BlockOutgoing)
+        let s0 = State::new(enum_map! {
+            Event::TunnelSent => vec![Trans(1, 1.0)],
+            _ => vec![],
+        });
+
+        let mut s1 = State::new(enum_map! {
+            _ => vec![],
+        });
+        s1.action = Some(Action::BlockOutgoing {
+            bypass: true,
+            replace: true,
+            timeout: Dist {
+                dist: DistType::Uniform {
+                    low: 0.0,
+                    high: 0.0,
+                },
+                start: 0.0,
+                max: 0.0,
+            },
+            duration: dist,
+            limit: None,
+        });
+
+        let machine =
+            Machine::new(10_000, 1.0, 10_000_000, 1.0, vec![s0, s1]).expect("valid machine");
+        let machines = vec![machine];
+        let num_machines = machines.len();
+        let fw = Framework::new(
+            machines,
+            DEFAULT_MAX_PADDING_FRAC,
+            DEFAULT_MAX_BLOCKING_FRAC,
+            now,
+            XorShift64::from_seed(42),
+        )
+        .expect("framework inits");
+        Self {
+            profile: DaitaProfile::Custom(vec![]),
+            framework: Some(fw),
+            internal_timers: vec![None; num_machines],
+            action_timers: vec![None; num_machines],
+            blocking_until: None,
+            last_padding_machine: None,
+            max_padding_frac: DEFAULT_MAX_PADDING_FRAC,
+            max_blocking_frac: DEFAULT_MAX_BLOCKING_FRAC,
+        }
+    }
+
     /// Maximum fraction of padding traffic allowed.
     pub fn max_padding_frac(&self) -> f64 {
         self.max_padding_frac

@@ -212,6 +212,16 @@
 #     while `deadline >= curr` is true (setting `slot` to `Some(deadline) = Some(curr)`).
 #     Both result in `slot` holding the identical `Some(curr)` value, producing zero observable
 #     change under all executions.
+#
+# 31. `replace (&& with || | == with !=) in PeerManager::deobf_ingress` (bin/yipd/src/peer_manager/obf.rs ~line 48)
+#     `let peer_idx = self.peers.iter().position(|p| p.endpoint == Some(src) && matches!(p.state, PeerState::Established(_)));`
+#     Step (a) is an O(1) single-peer trial matching `src` to `endpoint`. If step (a) yields None or fails
+#     deobfuscation, execution immediately falls through to step (a') roaming fallback: `for idx in 0..self.peers.len()`,
+#     which executes the byte-for-byte identical deobfuscation and candidate-key trial logic on all established peers.
+#     Any mutation to step (a)'s predicate (mutating `&&` to `||` or `==` to `!=`) causes step (a) to either select a
+#     non-matching peer (which fails deobfuscation and falls through to step (a')) or yield None (which immediately
+#     falls through to step (a')). In both cases, step (a') iterates through all peers and produces identical return
+#     values, packet deliveries, and DAITA state transitions. Step (a) is purely a performance fast-path.
 exclude_re = [
     "replace \\| with \\^ in ReplayWindow::commit",
     "replace > with >= in ReplayWindow::commit",
@@ -252,6 +262,7 @@ exclude_re = [
     "replace < with <= in DaitaEngine::dispatch_events",
     "replace \\|\\| with && in DaitaEngine::with_limits",
     "replace > with >= in DaitaEngine::dispatch_events",
+    "bin/yipd/src/peer_manager/obf\\.rs:48:.*in PeerManager::deobf_ingress",
 ]
 
 skip_calls = ["reserve"]

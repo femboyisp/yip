@@ -128,7 +128,7 @@ pub(super) fn resp_bytes(out: &DispatchOut<'_>) -> Vec<Vec<u8>> {
 
 /// A minimal IPv4 packet, enough to drive `on_tun` (single-peer fallback
 /// routes it to the sole peer regardless of contents).
-pub(super) fn dummy_tun_pkt() -> Vec<u8> {
+pub(crate) fn dummy_tun_pkt() -> Vec<u8> {
     vec![0x45u8; 40]
 }
 
@@ -237,7 +237,7 @@ pub(super) fn has_relayed_handshake_init(out: Option<&[EgressDatagram]>) -> bool
 /// handshake (A initiates) so both land `Established` on the SAME
 /// session, with `rekey_interval_ms` set to `interval_ms` on both.
 /// Returns `(pm_a, pm_b, ep_a, ep_b, kp_a, kp_b)`.
-pub(super) fn established_pm_pair(
+pub(crate) fn established_pm_pair(
     interval_ms: u64,
 ) -> (
     PeerManager,
