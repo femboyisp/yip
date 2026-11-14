@@ -155,7 +155,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use yip_io::af_xdp::{
     FillRing, UmemPool, UmemPoolConfig, UmemSlab, XskBindMode, XskDesc, XskSocket, UMEM_RING_SIZE,
 };
-use yip_io::poll::Dispatch;
 
 use crate::config::Config;
 

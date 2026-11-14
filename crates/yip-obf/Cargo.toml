@@ -15,6 +15,12 @@ description = "Anti-DPI packet length quantization (DAITA) and SipHash-CTR wire 
 blake3 = { workspace = true }
 siphasher = "1.0.3"
 getrandom = "0.4"
+maybenot = "2.2.2"
+maybenot-machines = "1.0.1"
+rand_core = "0.9"
+
+[dev-dependencies]
+enum-map = "2.7"
 
 [package.metadata.docs.rs]
 all-features = true

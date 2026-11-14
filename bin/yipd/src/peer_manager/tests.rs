@@ -2493,6 +2493,7 @@ fn obf_egress_quantizes_to_discrete_buckets() {
         cover_interval_ms: Some(500),
         cover_burst_max: 2,
         jitter_max_ms: 2,
+        daita_profile: yip_obf::DaitaProfile::Off,
     });
 
     let allowed_buckets = [256, 512, 1024, 1420];
@@ -2532,6 +2533,7 @@ fn handshake_quantizes_to_bucket() {
         cover_interval_ms: Some(500),
         cover_burst_max: 2,
         jitter_max_ms: 2,
+        daita_profile: yip_obf::DaitaProfile::Off,
     });
 
     // HandshakeInit (1025B) -> quantizes to 1420B
@@ -2568,6 +2570,7 @@ fn decoy_burst_emits_multiple_bucket_sized_packets() {
         cover_interval_ms: Some(20),
         cover_burst_max: 3,
         jitter_max_ms: 4,
+        daita_profile: yip_obf::DaitaProfile::Off,
     });
     let dp = fake_established_dataplane(TAG, peer_ep);
     let sess = [0xBBu8; 16];
@@ -2622,6 +2625,7 @@ fn stochastic_cover_cadence_jitters_interval() {
         cover_interval_ms: Some(base_iv),
         cover_burst_max: 2,
         jitter_max_ms: 2,
+        daita_profile: yip_obf::DaitaProfile::Off,
     });
     let dp = fake_established_dataplane(TAG, peer_ep);
     let sess = [0xCCu8; 16];
@@ -2680,6 +2684,7 @@ fn obf_off_retains_legacy_padding_behavior() {
         cover_interval_ms: None,
         cover_burst_max: 1,
         jitter_max_ms: 0,
+        daita_profile: yip_obf::DaitaProfile::Off,
     });
 
     let payload = vec![PacketType::Data as u8; 50];
@@ -2703,6 +2708,7 @@ fn micro_jitter_delays_packet_until_scheduled_time() {
         cover_interval_ms: Some(500),
         cover_burst_max: 2,
         jitter_max_ms: 4,
+        daita_profile: yip_obf::DaitaProfile::Off,
     });
 
     let now_ms = 100u64;
@@ -2780,6 +2786,7 @@ fn micro_jitter_queue_overrun_flushes_oldest_without_loss() {
         cover_interval_ms: Some(500),
         cover_burst_max: 2,
         jitter_max_ms: 10,
+        daita_profile: yip_obf::DaitaProfile::Off,
     });
 
     let total_packets = super::MAX_JITTER_QUEUE + 50;
@@ -2837,6 +2844,7 @@ fn zero_jitter_bypasses_queue() {
         cover_interval_ms: Some(500),
         cover_burst_max: 2,
         jitter_max_ms: 0,
+        daita_profile: yip_obf::DaitaProfile::Off,
     });
 
     for _ in 0..10 {
@@ -3239,4 +3247,147 @@ fn test_peer_manager_xdp_status_and_mode() {
     // Set invalid mode fails
     let err = pm.set_xdp_mode("bad_mode").unwrap_err();
     assert!(err.contains("invalid xdp mode"));
+}
+
+#[test]
+fn test_peer_manager_dispatch_trait_methods() {
+    use yip_io::poll::Dispatch;
+    let mut pm = test_peer_manager();
+    let dp = fake_established_dataplane(1234, "10.0.0.1:1000".parse().unwrap());
+    pm.peers[0].state =
+        PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+
+    let mut out = Vec::new();
+
+    // 1. on_tun via Dispatch trait
+    let pkt = dummy_tun_pkt();
+    <PeerManager as Dispatch>::on_tun(&mut pm, &pkt, 100, &mut out);
+    assert!(
+        !out.is_empty(),
+        "on_tun must produce at least one egress datagram"
+    );
+    assert!(!out[0].bytes.is_empty());
+
+    // 2. queue scheduled egress to test next_timeout_ms and tick
+    let deliver_after = 142u64;
+    let ep = "10.0.0.1:1000".parse().unwrap();
+    let scheduled_dg = EgressDatagram {
+        fate: 0,
+        dst: ep,
+        bytes: vec![0x99; 32],
+    };
+    pm.queue_scheduled_egress(scheduled_dg, deliver_after, &mut out);
+
+    // 3. next_timeout_ms via Dispatch trait
+    let timeout = <PeerManager as Dispatch>::next_timeout_ms(&pm, 100);
+    assert_eq!(
+        timeout,
+        Some(42),
+        "next_timeout_ms must report remaining delay until scheduled egress"
+    );
+
+    // 4. tick via Dispatch trait
+    out.clear();
+    <PeerManager as Dispatch>::tick(&mut pm, 142, &mut out);
+    assert!(
+        !out.is_empty(),
+        "tick must drain scheduled egress at due timestamp"
+    );
+
+    // 5. recycle via Dispatch trait
+    <PeerManager as Dispatch>::recycle(&mut pm, &mut out);
+    assert!(out.is_empty(), "recycle must drain the batch");
+}
+
+#[test]
+fn test_queue_scheduled_overrun_pop() {
+    let mut queue = std::collections::VecDeque::new();
+    let mut out = Vec::new();
+    let ep: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+    let dg = EgressDatagram {
+        fate: 0,
+        dst: ep,
+        bytes: vec![1, 2, 3],
+    };
+
+    // Fill queue to MAX_JITTER_QUEUE (1024 elements)
+    for i in 0..super::MAX_JITTER_QUEUE {
+        queue.push_back(super::ScheduledDatagram {
+            deliver_after_ms: i as u64,
+            datagram: EgressDatagram {
+                fate: 0,
+                dst: ep,
+                bytes: vec![(i & 0xFF) as u8],
+            },
+        });
+    }
+    assert_eq!(queue.len(), super::MAX_JITTER_QUEUE);
+
+    // When queue is full (len == MAX_JITTER_QUEUE):
+    // >= condition: 1024 >= 1024 is true -> pops oldest (bytes [0]) into out.
+    // Mutated < condition: 1024 < 1024 is false -> does NOT pop.
+    super::PeerManager::queue_scheduled(&mut queue, dg, 999_999, &mut out);
+    assert_eq!(out.len(), 1, "must pop oldest datagram on overrun");
+    assert_eq!(out[0].bytes, vec![0]);
+    assert_eq!(queue.len(), super::MAX_JITTER_QUEUE);
+
+    // Under capacity (< MAX_JITTER_QUEUE):
+    let mut small_queue = std::collections::VecDeque::new();
+    let mut small_out = Vec::new();
+    for i in 0..5 {
+        small_queue.push_back(super::ScheduledDatagram {
+            deliver_after_ms: i as u64,
+            datagram: EgressDatagram {
+                fate: 0,
+                dst: ep,
+                bytes: vec![i as u8],
+            },
+        });
+    }
+    let dg2 = EgressDatagram {
+        fate: 0,
+        dst: ep,
+        bytes: vec![99],
+    };
+    // >= condition: 5 >= 1024 is false -> small_out remains empty.
+    // Mutated < condition: 5 < 1024 is true -> would pop!
+    super::PeerManager::queue_scheduled(&mut small_queue, dg2, 10, &mut small_out);
+    assert!(small_out.is_empty(), "must not pop when under capacity");
+    assert_eq!(small_queue.len(), 6);
+}
+
+#[test]
+fn test_peer_manager_daita_profile_and_engine_mut() {
+    let mut pm = test_peer_manager();
+    let dp = fake_established_dataplane(1234, "10.0.0.1:1000".parse().unwrap());
+    pm.peers[0].state =
+        PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+
+    // Test set_traffic_defense with Front profile
+    let cfg = TrafficDefenseConfig::default().with_daita_profile(yip_obf::DaitaProfile::Front);
+    pm.set_traffic_defense(cfg);
+    assert!(pm.peer_daita_engine(0).is_some());
+    assert!(pm.peer_daita_engine_mut(0).is_some());
+    assert_eq!(
+        pm.peer_daita_engine(0).unwrap().profile(),
+        &yip_obf::DaitaProfile::Front
+    );
+
+    // Mutably access daita engine
+    if let Some(engine) = pm.peer_daita_engine_mut(0) {
+        let acts = engine.on_normal_sent(std::time::Instant::now());
+        assert!(!acts.is_empty(), "Front daita engine must emit actions");
+    }
+
+    // Test set_peer_daita_profile with Regulator
+    pm.set_peer_daita_profile(0, yip_obf::DaitaProfile::Regulator);
+    assert_eq!(
+        pm.peer_daita_engine(0).unwrap().profile(),
+        &yip_obf::DaitaProfile::Regulator
+    );
+
+    // Test set_peer_daita_profile with Off resets engine
+    pm.set_peer_daita_profile(0, yip_obf::DaitaProfile::Off);
+    assert!(pm.peer_daita_engine(0).is_none());
+    assert!(pm.peer_daita_engine_mut(0).is_none());
 }

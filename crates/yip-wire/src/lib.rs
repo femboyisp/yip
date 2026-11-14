@@ -64,14 +64,31 @@ pub const TAG_LEN: usize = 8;
 /// Smallest valid frame: header + tag, empty payload.
 pub const MIN_FRAME: usize = HEADER_LEN + TAG_LEN;
 
-/// Serialize the logical header (big-endian, fixed layout).
-fn write_header(frame: &Frame) -> [u8; HEADER_LEN] {
+/// Serialize the logical header fields (big-endian, fixed layout).
+#[inline]
+fn write_header_fields(
+    conn_tag: u64,
+    object_id: u16,
+    payload_id: [u8; 4],
+    flags: u8,
+) -> [u8; HEADER_LEN] {
     let mut out = [0u8; HEADER_LEN];
-    out[0..8].copy_from_slice(&frame.conn_tag.to_be_bytes());
-    out[8..10].copy_from_slice(&frame.object_id.to_be_bytes());
-    out[10..14].copy_from_slice(&frame.payload_id);
-    out[14] = frame.flags;
+    out[0..8].copy_from_slice(&conn_tag.to_be_bytes());
+    out[8..10].copy_from_slice(&object_id.to_be_bytes());
+    out[10..14].copy_from_slice(&payload_id);
+    out[14] = flags;
     out
+}
+
+/// Serialize the logical header (big-endian, fixed layout).
+#[inline]
+fn write_header(frame: &Frame) -> [u8; HEADER_LEN] {
+    write_header_fields(
+        frame.conn_tag,
+        frame.object_id,
+        frame.payload_id,
+        frame.flags,
+    )
 }
 
 /// Parse the logical header fields back out.
@@ -178,6 +195,39 @@ impl Codec {
             payload,
         })
     }
+
+    /// Serialize and header-protect a borrowed [`FrameRef`] into `out`.
+    pub fn frame_ref_into(&self, frame: &FrameRef<'_>, out: &mut Vec<u8>) {
+        let header = write_header_fields(
+            frame.conn_tag,
+            frame.object_id,
+            frame.payload_id,
+            frame.flags,
+        );
+        let tag = auth_tag(&self.auth_key, &header, frame.payload);
+        let mask = header_mask(&self.hp_key, &tag);
+
+        let start = out.len();
+        out.reserve(HEADER_LEN + frame.payload.len() + TAG_LEN);
+        out.extend_from_slice(&header);
+        xor_in_place(&mut out[start..start + HEADER_LEN], &mask);
+        out.extend_from_slice(frame.payload);
+        out.extend_from_slice(&tag);
+    }
+
+    /// Serialize and header-protect an owned [`Frame`] into `out`.
+    pub fn frame_into(&self, frame: &Frame, out: &mut Vec<u8>) {
+        let header = write_header(frame);
+        let tag = auth_tag(&self.auth_key, &header, &frame.payload);
+        let mask = header_mask(&self.hp_key, &tag);
+
+        let start = out.len();
+        out.reserve(HEADER_LEN + frame.payload.len() + TAG_LEN);
+        out.extend_from_slice(&header);
+        xor_in_place(&mut out[start..start + HEADER_LEN], &mask);
+        out.extend_from_slice(&frame.payload);
+        out.extend_from_slice(&tag);
+    }
 }
 
 /// Encodes [`Frame`]s to datagrams and back. Implemented in M2.
@@ -190,15 +240,8 @@ pub trait WireCodec {
 
 impl WireCodec for Codec {
     fn frame(&self, frame: &Frame) -> Vec<u8> {
-        let header = write_header(frame);
-        let tag = auth_tag(&self.auth_key, &header, &frame.payload);
-        let mask = header_mask(&self.hp_key, &tag);
-
         let mut out = Vec::with_capacity(HEADER_LEN + frame.payload.len() + TAG_LEN);
-        out.extend_from_slice(&header);
-        xor_in_place(&mut out[..HEADER_LEN], &mask);
-        out.extend_from_slice(&frame.payload);
-        out.extend_from_slice(&tag);
+        self.frame_into(frame, &mut out);
         out
     }
 
@@ -431,5 +474,29 @@ mod tests {
         assert_eq!(object_id, frame.object_id);
         assert_eq!(payload_id, frame.payload_id);
         assert_eq!(flags, frame.flags);
+    }
+
+    #[test]
+    fn test_codec_frame_ref_into() {
+        let codec = Codec::new([7u8; 16], [8u8; 16]);
+        let payload = b"stream data payload";
+        let frame_ref = FrameRef {
+            conn_tag: 0xCAFE_BABE_1234_5678,
+            object_id: 42,
+            payload_id: [1, 3, 5, 7],
+            flags: 0x05,
+            payload,
+        };
+        let mut out = vec![0xEEu8; 32];
+        codec.frame_ref_into(&frame_ref, &mut out);
+        assert!(out.len() > 32);
+        let deframed = codec
+            .deframe(&out[32..])
+            .expect("deframe frame_ref_into output");
+        assert_eq!(deframed.conn_tag, frame_ref.conn_tag);
+        assert_eq!(deframed.object_id, frame_ref.object_id);
+        assert_eq!(deframed.payload_id, frame_ref.payload_id);
+        assert_eq!(deframed.flags, frame_ref.flags);
+        assert_eq!(deframed.payload, payload);
     }
 }
