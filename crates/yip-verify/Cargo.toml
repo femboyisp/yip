@@ -12,5 +12,13 @@ publish = false
 [dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+turmoil = "0.7"
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
+yip-membership = { workspace = true }
+yip-transport = { workspace = true }
+yip-crypto = { workspace = true }
+yip-wire = { workspace = true }
+
 [lints]
 workspace = true
