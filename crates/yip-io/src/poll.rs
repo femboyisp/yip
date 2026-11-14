@@ -148,7 +148,7 @@ fn drain_udp(
     coalescer: &mut crate::tun_offload::Coalescer,
 ) -> io::Result<()> {
     loop {
-        let n = recv_mmsg(udp_fd, bufs, lens, srcs)?;
+        let n = recv_mmsg(udp_fd, bufs, lens, srcs, &mut gso.rx_arena)?;
         if n == 0 {
             break; // socket drained
         }
@@ -305,6 +305,56 @@ pub fn drain_tun(
     Ok(())
 }
 
+/// Pre-allocated vectorized I/O arena for `sendmmsg` and `recvmmsg`.
+///
+/// Holds the OS-level header structures (`mmsghdr`, `iovec`, `sockaddr_storage`,
+/// and `socklen_t`) for up to [`MAX_DATAGRAM_BATCH`] datagrams. Pre-allocating and
+/// boxing this arena once at initialization eliminates allocating and zeroing
+/// ~13.5 KB on the stack on every I/O burst.
+#[repr(C)]
+pub struct MmsgBatchArena {
+    pub msgs: [libc::mmsghdr; MAX_DATAGRAM_BATCH],
+    pub iovecs: [libc::iovec; MAX_DATAGRAM_BATCH],
+    pub storages: [libc::sockaddr_storage; MAX_DATAGRAM_BATCH],
+    pub addrlens: [libc::socklen_t; MAX_DATAGRAM_BATCH],
+}
+
+impl MmsgBatchArena {
+    /// Creates a zeroed `MmsgBatchArena` on the stack.
+    ///
+    /// For hot-path event loops, prefer [`MmsgBatchArena::new_boxed`] to avoid
+    /// allocating ~13.5 KB on the stack even during startup.
+    pub fn new() -> Self {
+        // SAFETY: `MmsgBatchArena` consists entirely of plain-old-data structs
+        // (`libc::mmsghdr`, `libc::iovec`, `libc::sockaddr_storage`, `libc::socklen_t`)
+        // where an all-zero byte pattern is a valid representation.
+        unsafe { std::mem::zeroed() }
+    }
+
+    /// Allocates an `MmsgBatchArena` directly on the heap wrapped in a [`Box`].
+    ///
+    /// This bypasses stack allocation completely during creation.
+    pub fn new_boxed() -> Box<Self> {
+        let layout = std::alloc::Layout::new::<Self>();
+        // SAFETY: `MmsgBatchArena` consists of plain-old-data structs for which
+        // zeroed memory is valid. Allocating via `alloc_zeroed` guarantees zeroed
+        // memory without creating a large stack temporary.
+        unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<Self>();
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            Box::from_raw(ptr)
+        }
+    }
+}
+
+impl Default for MmsgBatchArena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Reusable scratch + latched capability for GSO sends on the poll path.
 pub struct GsoScratch {
     /// Latched to `false` the first time a GSO send reports the feature
@@ -313,6 +363,10 @@ pub struct GsoScratch {
     pub runs: Vec<crate::gso::GsoRun>,
     pub payload: Vec<u8>,
     pub recycle: Vec<EgressDatagram>,
+    /// Pre-allocated arena for vectorized TX headers (`sendmmsg`).
+    pub tx_arena: Box<MmsgBatchArena>,
+    /// Pre-allocated arena for vectorized RX headers (`recvmmsg`).
+    pub rx_arena: Box<MmsgBatchArena>,
 }
 
 impl GsoScratch {
@@ -322,6 +376,8 @@ impl GsoScratch {
             runs: Vec::with_capacity(MAX_DATAGRAM_BATCH),
             payload: Vec::with_capacity(MAX_WIRE_DATAGRAM * crate::gso::MAX_GSO_SEGMENTS_PER_SEND),
             recycle: Vec::with_capacity(MAX_DATAGRAM_BATCH),
+            tx_arena: MmsgBatchArena::new_boxed(),
+            rx_arena: MmsgBatchArena::new_boxed(),
         }
     }
 }
@@ -335,10 +391,14 @@ impl Default for GsoScratch {
 /// Plain-send `run` via `send_mmsg` (looping partial sends). A momentarily-full
 /// send buffer drops the remainder of the run (same acceptable single-burst loss
 /// as the old per-datagram send).
-fn send_run_plain(udp_fd: RawFd, run: &[EgressDatagram]) -> io::Result<()> {
+fn send_run_plain(
+    udp_fd: RawFd,
+    run: &[EgressDatagram],
+    arena: &mut MmsgBatchArena,
+) -> io::Result<()> {
     let mut sent = 0;
     while sent < run.len() {
-        let n = send_mmsg(udp_fd, &run[sent..])?;
+        let n = send_mmsg(udp_fd, &run[sent..], arena)?;
         if n == 0 {
             break;
         }
@@ -361,13 +421,14 @@ pub fn flush_tx(
         return Ok(());
     }
     let outcome = if !gso.enabled {
-        send_run_plain(udp_fd, tx)
+        send_run_plain(udp_fd, tx, &mut gso.tx_arena)
     } else {
         crate::gso::partition_fate_safe(tx, MAX_DATAGRAM_BATCH, &mut gso.runs);
         let GsoScratch {
             ref mut enabled,
             ref runs,
             ref mut payload,
+            ref mut tx_arena,
             ..
         } = *gso;
         let mut res = Ok(());
@@ -379,7 +440,9 @@ pub fn flush_tx(
                     Ok(false) => {
                         *enabled = false; // latch: GSO unsupported here
                         for &i in &run.members {
-                            if let Err(e) = send_run_plain(udp_fd, std::slice::from_ref(&tx[i])) {
+                            if let Err(e) =
+                                send_run_plain(udp_fd, std::slice::from_ref(&tx[i]), tx_arena)
+                            {
                                 res = Err(e);
                                 break;
                             }
@@ -389,7 +452,7 @@ pub fn flush_tx(
                 }
             } else {
                 for &i in &run.members {
-                    if let Err(e) = send_run_plain(udp_fd, std::slice::from_ref(&tx[i])) {
+                    if let Err(e) = send_run_plain(udp_fd, std::slice::from_ref(&tx[i]), tx_arena) {
                         res = Err(e);
                         break;
                     }
@@ -431,46 +494,51 @@ fn send_to_tun(tun_fd: RawFd, buf: &[u8]) {
 /// Send up to `datagrams.len().min(MAX_DATAGRAM_BATCH)` datagrams in one
 /// `sendmmsg(2)`, each to its own [`EgressDatagram::dst`]. Returns the count the
 /// kernel accepted (may be fewer; the caller loops the remainder).
-fn send_mmsg(udp_fd: RawFd, datagrams: &[EgressDatagram]) -> io::Result<usize> {
+pub fn send_mmsg(
+    udp_fd: RawFd,
+    datagrams: &[EgressDatagram],
+    arena: &mut MmsgBatchArena,
+) -> io::Result<usize> {
     if datagrams.is_empty() {
         return Ok(0);
     }
     let count = datagrams.len().min(MAX_DATAGRAM_BATCH);
 
-    // Parallel per-datagram arrays; all live on this stack frame until sendmmsg
-    // returns, so the pointers stored in `msgs` stay valid across the syscall.
-    // SAFETY: `sockaddr_storage` is plain-old-data; an all-zero value is a valid
-    // (unspecified) initial state that we fully overwrite per datagram below.
-    let mut storages: [libc::sockaddr_storage; MAX_DATAGRAM_BATCH] = unsafe { std::mem::zeroed() };
-    let mut addrlens = [0 as libc::socklen_t; MAX_DATAGRAM_BATCH];
-    let mut iovecs = [libc::iovec {
-        iov_base: std::ptr::null_mut(),
-        iov_len: 0,
-    }; MAX_DATAGRAM_BATCH];
-    let mut msgs = [crate::empty_mmsghdr(); MAX_DATAGRAM_BATCH];
-
     for (i, dg) in datagrams[..count].iter().enumerate() {
         let (storage, addr_len) = std_to_sockaddr(dg.dst);
-        storages[i] = storage;
-        addrlens[i] = addr_len;
-        // SAFETY: cast a shared slice to *mut c_void for the iovec ABI; sendmmsg
-        // only reads through iov_base. `dg.bytes` outlives the syscall (borrowed
-        // for this fn).
-        iovecs[i].iov_base = dg.bytes.as_ptr().cast_mut().cast::<libc::c_void>();
-        iovecs[i].iov_len = dg.bytes.len();
-        msgs[i].msg_hdr.msg_iov = &raw mut iovecs[i];
-        msgs[i].msg_hdr.msg_iovlen = 1;
-        msgs[i].msg_hdr.msg_name = std::ptr::from_mut(&mut storages[i]).cast::<libc::c_void>();
-        msgs[i].msg_hdr.msg_namelen = addrlens[i];
+        arena.storages[i] = storage;
+        arena.addrlens[i] = addr_len;
+        // SAFETY: Cast a shared slice pointer to `*mut c_void` as required by the
+        // `libc::iovec` ABI. `sendmmsg(2)` only reads through `iov_base`.
+        // Pointer provenance: `dg.bytes` belongs to `datagrams`, which is borrowed
+        // for the duration of this function call.
+        // Lifetime invariant: `datagrams` and its underlying payload buffers remain
+        // valid and unmodified until `libc::sendmmsg` returns synchronously.
+        arena.iovecs[i].iov_base = dg.bytes.as_ptr().cast_mut().cast::<libc::c_void>();
+        arena.iovecs[i].iov_len = dg.bytes.len();
+        // SAFETY: `arena.iovecs[i]` and `arena.storages[i]` belong to `arena`, which is
+        // borrowed `&mut` for this function call and outlives the synchronous syscall.
+        // `msg_iov` points to the corresponding element in `arena.iovecs`, and `msg_name`
+        // points to `arena.storages[i]`. No pointer aliasing between distinct batch indices.
+        arena.msgs[i].msg_hdr.msg_iov = &raw mut arena.iovecs[i];
+        arena.msgs[i].msg_hdr.msg_iovlen = 1;
+        arena.msgs[i].msg_hdr.msg_name =
+            std::ptr::from_mut(&mut arena.storages[i]).cast::<libc::c_void>();
+        arena.msgs[i].msg_hdr.msg_namelen = arena.addrlens[i];
+        arena.msgs[i].msg_hdr.msg_control = std::ptr::null_mut();
+        arena.msgs[i].msg_hdr.msg_controllen = 0;
+        arena.msgs[i].msg_hdr.msg_flags = 0;
+        arena.msgs[i].msg_len = 0;
     }
 
-    // SAFETY: `msgs[..count]` is fully initialised; each msg_iov/msg_name points
-    // into `iovecs`/`storages` on this frame, valid until sendmmsg returns.
-    // MSG_NOSIGNAL suppresses SIGPIPE on a closed peer.
+    // SAFETY: `arena.msgs[..count]` is fully initialised; each msg_iov and msg_name
+    // points to disjoint elements in `arena.iovecs` and `arena.storages` within `arena`.
+    // Both `arena` and `datagrams` outlive the synchronous `libc::sendmmsg` syscall.
+    // MSG_NOSIGNAL suppresses SIGPIPE on a closed peer socket.
     let ret = unsafe {
         libc::sendmmsg(
             udp_fd,
-            msgs.as_mut_ptr(),
+            arena.msgs.as_mut_ptr(),
             u32::try_from(count).expect("count ≤ 64 fits u32"),
             libc::MSG_NOSIGNAL as crate::MsgFlags,
         )
@@ -598,11 +666,12 @@ fn send_gso_indexed(
 /// queued datagrams in one syscall, writing each datagram's byte count into
 /// `lens` and source address into `srcs`. Returns the count received (0 if the
 /// socket is momentarily empty). Requires a non-blocking `udp_fd`.
-fn recv_mmsg(
+pub fn recv_mmsg(
     udp_fd: RawFd,
     bufs: &mut [[u8; MAX_WIRE_DATAGRAM]],
     lens: &mut [usize],
     srcs: &mut [SocketAddr],
+    arena: &mut MmsgBatchArena,
 ) -> io::Result<usize> {
     let count = bufs
         .len()
@@ -612,37 +681,44 @@ fn recv_mmsg(
     if count == 0 {
         return Ok(0);
     }
-    // SAFETY: all-zero sockaddr_storage is a valid initial out-buffer that
-    // recvmmsg fills; we read it back only for the datagrams it reports received.
-    let mut storages: [libc::sockaddr_storage; MAX_DATAGRAM_BATCH] = unsafe { std::mem::zeroed() };
-    let addrlens = [libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>())
-        .expect("size fits socklen_t"); MAX_DATAGRAM_BATCH];
-    let mut iovecs = [libc::iovec {
-        iov_base: std::ptr::null_mut(),
-        iov_len: 0,
-    }; MAX_DATAGRAM_BATCH];
-    let mut msgs = [crate::empty_mmsghdr(); MAX_DATAGRAM_BATCH];
+    let default_socklen = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>())
+        .expect("size fits socklen_t");
 
-    for i in 0..count {
-        // SAFETY: each iov_base/msg_name points to a distinct element of
-        // `bufs`/`storages` on this frame — no aliasing — valid until recvmmsg returns.
-        iovecs[i].iov_base = bufs[i].as_mut_ptr().cast::<libc::c_void>();
-        iovecs[i].iov_len = MAX_WIRE_DATAGRAM;
-        msgs[i].msg_hdr.msg_iov = &raw mut iovecs[i];
-        msgs[i].msg_hdr.msg_iovlen = 1;
-        msgs[i].msg_hdr.msg_name = std::ptr::from_mut(&mut storages[i]).cast::<libc::c_void>();
-        msgs[i].msg_hdr.msg_namelen = addrlens[i];
+    for (i, buf) in bufs[..count].iter_mut().enumerate() {
+        arena.addrlens[i] = default_socklen;
+        // SAFETY: Pointer provenance: `buf` is a unique mutable slice element from
+        // the caller-provided `bufs` array; each index `i` points to disjoint memory.
+        // Lifetime invariant: `bufs` and `arena` are borrowed `&mut` for the duration of
+        // this call and remain valid and pinned in memory across `libc::recvmmsg`.
+        arena.iovecs[i].iov_base = buf.as_mut_ptr().cast::<libc::c_void>();
+        arena.iovecs[i].iov_len = MAX_WIRE_DATAGRAM;
+        arena.msgs[i].msg_hdr.msg_iov = &raw mut arena.iovecs[i];
+        arena.msgs[i].msg_hdr.msg_iovlen = 1;
+        arena.msgs[i].msg_hdr.msg_name =
+            std::ptr::from_mut(&mut arena.storages[i]).cast::<libc::c_void>();
+        arena.msgs[i].msg_hdr.msg_namelen = arena.addrlens[i];
+        arena.msgs[i].msg_hdr.msg_control = std::ptr::null_mut();
+        arena.msgs[i].msg_hdr.msg_controllen = 0;
+        arena.msgs[i].msg_hdr.msg_flags = 0;
+        arena.msgs[i].msg_len = 0;
     }
 
-    // SAFETY: `msgs[..count]` fully initialised; msg_iov/msg_name point into
-    // distinct `bufs`/`storages` elements. MSG_DONTWAIT: non-blocking (the fd is
-    // epoll-ready); null timeout. On empty socket, returns EWOULDBLOCK → Ok(0).
+    #[cfg(target_os = "linux")]
+    let flags = (libc::MSG_DONTWAIT | libc::MSG_WAITFORONE) as crate::MsgFlags;
+    #[cfg(not(target_os = "linux"))]
+    let flags = libc::MSG_DONTWAIT as crate::MsgFlags;
+
+    // SAFETY: `arena.msgs[..count]` is fully initialised; msg_iov and msg_name point to
+    // distinct disjoint buffers in `bufs` and `arena.storages`.
+    // MSG_DONTWAIT guarantees non-blocking execution; on Linux, MSG_WAITFORONE ensures
+    // the kernel harvests the available queue burst without blocking past the first datagram.
+    // Timeout pointer is null for non-blocking poll-driven operation.
     let ret = unsafe {
         libc::recvmmsg(
             udp_fd,
-            msgs.as_mut_ptr(),
+            arena.msgs.as_mut_ptr(),
             u32::try_from(count).expect("count ≤ 64 fits u32"),
-            libc::MSG_DONTWAIT as crate::MsgFlags,
+            flags,
             std::ptr::null_mut(),
         )
     };
@@ -656,9 +732,9 @@ fn recv_mmsg(
     }
     let received = usize::try_from(ret).expect("non-negative recvmmsg return fits usize");
     for i in 0..received {
-        lens[i] = usize::try_from(msgs[i].msg_len).expect("msg_len fits usize");
+        lens[i] = usize::try_from(arena.msgs[i].msg_len).expect("msg_len fits usize");
         // recvmmsg writes the actual namelen back into each msg_hdr.
-        srcs[i] = sockaddr_to_std(&storages[i], msgs[i].msg_hdr.msg_namelen)
+        srcs[i] = sockaddr_to_std(&arena.storages[i], arena.msgs[i].msg_hdr.msg_namelen)
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
     }
     Ok(received)
@@ -1117,9 +1193,10 @@ mod tests {
                 bytes: b"to-a-2".to_vec(),
             },
         ];
+        let mut arena = MmsgBatchArena::new_boxed();
         let mut sent = 0;
         while sent < batch.len() {
-            sent += send_mmsg(tx.as_raw_fd(), &batch[sent..]).unwrap();
+            sent += send_mmsg(tx.as_raw_fd(), &batch[sent..], &mut arena).unwrap();
         }
         assert_eq!(sent, 3);
 
@@ -1149,7 +1226,8 @@ mod tests {
         let mut bufs = [[0u8; MAX_WIRE_DATAGRAM]; 4];
         let mut lens = [0usize; 4];
         let mut srcs = [std::net::SocketAddr::from(([0, 0, 0, 0], 0)); 4];
-        let n = recv_mmsg(rx.as_raw_fd(), &mut bufs, &mut lens, &mut srcs).unwrap();
+        let mut arena = MmsgBatchArena::new_boxed();
+        let n = recv_mmsg(rx.as_raw_fd(), &mut bufs, &mut lens, &mut srcs, &mut arena).unwrap();
         assert_eq!(n, 2);
         assert_eq!(&bufs[0][..lens[0]], b"hello");
         assert_eq!(&bufs[1][..lens[1]], b"world!!");
@@ -1164,8 +1242,9 @@ mod tests {
         let mut bufs = [[0u8; MAX_WIRE_DATAGRAM]; 4];
         let mut lens = [0usize; 4];
         let mut srcs = [std::net::SocketAddr::from(([0, 0, 0, 0], 0)); 4];
+        let mut arena = MmsgBatchArena::new_boxed();
         assert_eq!(
-            recv_mmsg(rx.as_raw_fd(), &mut bufs, &mut lens, &mut srcs).unwrap(),
+            recv_mmsg(rx.as_raw_fd(), &mut bufs, &mut lens, &mut srcs, &mut arena).unwrap(),
             0
         );
     }
@@ -1242,6 +1321,222 @@ mod tests {
         assert_eq!(
             count, 4,
             "all four datagrams must arrive (GSO or plain fallback)"
+        );
+    }
+
+    #[test]
+    fn send_mmsg_with_reused_arena_bursts_and_empty_batches() {
+        use std::net::UdpSocket;
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dst = rx.local_addr().unwrap();
+
+        let mut arena = MmsgBatchArena::new_boxed();
+
+        // 1. Zero-sized batch returns Ok(0)
+        let empty: [EgressDatagram; 0] = [];
+        let n0 = send_mmsg(tx.as_raw_fd(), &empty, &mut arena).unwrap();
+        assert_eq!(n0, 0);
+
+        // 2. Initial burst of 3 datagrams
+        let burst1 = [
+            EgressDatagram {
+                fate: 1,
+                dst,
+                bytes: b"batch-1-msg-1".to_vec(),
+            },
+            EgressDatagram {
+                fate: 2,
+                dst,
+                bytes: b"batch-1-msg-2-extended".to_vec(),
+            },
+            EgressDatagram {
+                fate: 3,
+                dst,
+                bytes: b"batch-1-msg-3".to_vec(),
+            },
+        ];
+        let mut sent = 0;
+        while sent < burst1.len() {
+            sent += send_mmsg(tx.as_raw_fd(), &burst1[sent..], &mut arena).unwrap();
+        }
+        assert_eq!(sent, 3);
+
+        // Receive burst 1
+        let mut buf = [0u8; 128];
+        for expected in &[
+            b"batch-1-msg-1".as_slice(),
+            b"batch-1-msg-2-extended".as_slice(),
+            b"batch-1-msg-3".as_slice(),
+        ] {
+            let (n, _) = rx.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..n], *expected);
+        }
+
+        // 3. Reused arena with a partial / smaller burst of 1 datagram
+        let burst2 = [EgressDatagram {
+            fate: 4,
+            dst,
+            bytes: b"batch-2-single".to_vec(),
+        }];
+        let n2 = send_mmsg(tx.as_raw_fd(), &burst2, &mut arena).unwrap();
+        assert_eq!(n2, 1);
+
+        let (n, _) = rx.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"batch-2-single");
+
+        // 4. Zero-sized batch on reused arena
+        assert_eq!(send_mmsg(tx.as_raw_fd(), &empty, &mut arena).unwrap(), 0);
+
+        // 5. Subsequent larger burst on the same reused arena
+        let burst3: Vec<EgressDatagram> = (0..8)
+            .map(|i| EgressDatagram {
+                fate: i as u16,
+                dst,
+                bytes: format!("batch-3-item-{}", i).into_bytes(),
+            })
+            .collect();
+        let mut sent = 0;
+        while sent < burst3.len() {
+            sent += send_mmsg(tx.as_raw_fd(), &burst3[sent..], &mut arena).unwrap();
+        }
+        assert_eq!(sent, 8);
+
+        for i in 0..8 {
+            let (n, _) = rx.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..n], format!("batch-3-item-{}", i).as_bytes());
+        }
+    }
+
+    #[test]
+    fn recv_mmsg_with_reused_arena_repeated_bursts_and_partial_batches() {
+        use std::net::UdpSocket;
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        let tx_addr = tx.local_addr().unwrap();
+
+        let mut arena = MmsgBatchArena::new_boxed();
+        let mut bufs = [[0u8; MAX_WIRE_DATAGRAM]; 8];
+        let mut lens = [0usize; 8];
+        let mut srcs = [std::net::SocketAddr::from(([0, 0, 0, 0], 0)); 8];
+
+        // 1. Empty socket returns 0
+        let n0 = recv_mmsg(rx.as_raw_fd(), &mut bufs, &mut lens, &mut srcs, &mut arena).unwrap();
+        assert_eq!(n0, 0);
+
+        // 2. First burst of 3 datagrams
+        tx.send_to(b"burst-one-msg-1", rx_addr).unwrap();
+        tx.send_to(b"burst-one-msg-2", rx_addr).unwrap();
+        tx.send_to(b"burst-one-msg-3", rx_addr).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let n1 = recv_mmsg(rx.as_raw_fd(), &mut bufs, &mut lens, &mut srcs, &mut arena).unwrap();
+        assert_eq!(n1, 3);
+        assert_eq!(&bufs[0][..lens[0]], b"burst-one-msg-1");
+        assert_eq!(&bufs[1][..lens[1]], b"burst-one-msg-2");
+        assert_eq!(&bufs[2][..lens[2]], b"burst-one-msg-3");
+        assert_eq!(srcs[0], tx_addr);
+        assert_eq!(srcs[1], tx_addr);
+        assert_eq!(srcs[2], tx_addr);
+
+        // 3. Empty socket immediately after drain returns 0 on reused arena
+        let n_empty =
+            recv_mmsg(rx.as_raw_fd(), &mut bufs, &mut lens, &mut srcs, &mut arena).unwrap();
+        assert_eq!(n_empty, 0);
+
+        // 4. Partial burst: smaller than previous (1 datagram).
+        // Verifies no stale cross-contamination from slot 1 or 2 of previous burst.
+        tx.send_to(b"burst-two-single", rx_addr).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let n2 = recv_mmsg(rx.as_raw_fd(), &mut bufs, &mut lens, &mut srcs, &mut arena).unwrap();
+        assert_eq!(n2, 1);
+        assert_eq!(&bufs[0][..lens[0]], b"burst-two-single");
+        assert_eq!(srcs[0], tx_addr);
+
+        // 5. Larger burst of 5 datagrams of various lengths
+        let payloads = [
+            b"payload-alpha".as_slice(),
+            b"p-beta".as_slice(),
+            b"payload-gamma-longer-data-string".as_slice(),
+            b"delta".as_slice(),
+            b"epsilon-test-end".as_slice(),
+        ];
+        for p in &payloads {
+            tx.send_to(p, rx_addr).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let n3 = recv_mmsg(rx.as_raw_fd(), &mut bufs, &mut lens, &mut srcs, &mut arena).unwrap();
+        assert_eq!(n3, 5);
+        for i in 0..5 {
+            assert_eq!(&bufs[i][..lens[i]], payloads[i]);
+            assert_eq!(srcs[i], tx_addr);
+        }
+    }
+
+    #[test]
+    fn mmsg_batch_arena_pointer_integrity_across_bursts() {
+        use std::net::UdpSocket;
+        let mut arena = MmsgBatchArena::new_boxed();
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dst = sock.local_addr().unwrap();
+
+        let batch = [
+            EgressDatagram {
+                fate: 0,
+                dst,
+                bytes: b"test1".to_vec(),
+            },
+            EgressDatagram {
+                fate: 0,
+                dst,
+                bytes: b"test2".to_vec(),
+            },
+        ];
+
+        for _ in 0..5 {
+            send_mmsg(sock.as_raw_fd(), &batch, &mut arena).unwrap();
+
+            // Check that pointers within arena point to its own internal structs
+            for i in 0..2 {
+                let iov_ptr = arena.msgs[i].msg_hdr.msg_iov;
+                let expected_iov_ptr = &raw mut arena.iovecs[i];
+                assert_eq!(iov_ptr, expected_iov_ptr);
+
+                let name_ptr = arena.msgs[i].msg_hdr.msg_name;
+                let expected_name_ptr =
+                    std::ptr::from_mut(&mut arena.storages[i]).cast::<libc::c_void>();
+                assert_eq!(name_ptr, expected_name_ptr);
+            }
+        }
+    }
+
+    #[test]
+    fn flush_tx_when_gso_disabled_skips_gso_partitioning() {
+        let mut gso = GsoScratch::new();
+        gso.enabled = false;
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dst = sock.local_addr().unwrap();
+        let mut tx = vec![
+            EgressDatagram {
+                fate: 0,
+                dst,
+                bytes: vec![1, 2, 3],
+            },
+            EgressDatagram {
+                fate: 1,
+                dst,
+                bytes: vec![4, 5, 6],
+            },
+        ];
+        flush_tx(sock.as_raw_fd(), &mut tx, &mut gso).unwrap();
+        assert!(
+            gso.runs.is_empty(),
+            "gso.runs must not be populated when GSO is disabled"
         );
     }
 }
