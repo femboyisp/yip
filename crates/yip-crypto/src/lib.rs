@@ -66,14 +66,33 @@ pub const PQ_DECAPS_KEY_LEN: usize = 1632;
 pub struct PqEncapsKey(pub [u8; PQ_ENCAPS_KEY_LEN]);
 
 /// An ML-KEM-512 private decapsulation key wrapped in zeroizing memory.
-pub struct PqDecapsKey(pub(crate) Box<ml_kem_512::DecapsulationKey>);
+pub struct PqDecapsKey(pub(crate) Option<Box<ml_kem_512::DecapsulationKey>>);
+
+impl Drop for PqDecapsKey {
+    fn drop(&mut self) {
+        if let Some(inner) = self.0.take() {
+            drop(inner);
+        }
+    }
+}
+
+impl zeroize::Zeroize for PqDecapsKey {
+    fn zeroize(&mut self) {
+        if let Some(inner) = self.0.take() {
+            drop(inner);
+        }
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for PqDecapsKey {}
 
 impl PqDecapsKey {
     /// Export the 1632-byte expanded ML-KEM-512 decapsulation key bytes.
     #[expect(deprecated)]
     pub fn to_bytes(&self) -> [u8; PQ_DECAPS_KEY_LEN] {
         use ml_kem::ExpandedKeyEncoding;
-        let arr = self.0.to_expanded_bytes();
+        let dk = self.0.as_ref().expect("PqDecapsKey uninitialized");
+        let arr = dk.to_expanded_bytes();
         let mut out = [0u8; PQ_DECAPS_KEY_LEN];
         out.copy_from_slice(arr.as_slice());
         out
@@ -86,7 +105,7 @@ impl PqDecapsKey {
         let arr = ml_kem::array::Array::from(*bytes);
         let dk = ml_kem_512::DecapsulationKey::from_expanded_bytes(&arr)
             .map_err(|_| CryptoError::Handshake)?;
-        Ok(Self(Box::new(dk)))
+        Ok(Self(Some(Box::new(dk))))
     }
 }
 
@@ -106,7 +125,7 @@ pub fn generate_pq_keypair() -> (PqEncapsKey, PqDecapsKey) {
     let ek_bytes = ek.to_bytes();
     let mut ek_arr = [0u8; PQ_ENCAPS_KEY_LEN];
     ek_arr.copy_from_slice(ek_bytes.as_slice());
-    (PqEncapsKey(ek_arr), PqDecapsKey(Box::new(dk)))
+    (PqEncapsKey(ek_arr), PqDecapsKey(Some(Box::new(dk))))
 }
 
 /// Generate an ML-KEM-512 keypair from a 64-byte seed.
@@ -117,7 +136,7 @@ pub fn generate_pq_keypair_from_seed(seed: &[u8; 64]) -> (PqEncapsKey, PqDecapsK
     let ek_bytes = ek.to_bytes();
     let mut ek_arr = [0u8; PQ_ENCAPS_KEY_LEN];
     ek_arr.copy_from_slice(ek_bytes.as_slice());
-    (PqEncapsKey(ek_arr), PqDecapsKey(Box::new(dk)))
+    (PqEncapsKey(ek_arr), PqDecapsKey(Some(Box::new(dk))))
 }
 
 /// Encapsulate a shared secret toward `ek` using a deterministic 32-byte seed `m`,
@@ -171,7 +190,8 @@ pub fn pq_decapsulate(
     ct: &PqCiphertext,
 ) -> Result<Zeroizing<[u8; PQ_SHARED_SECRET_LEN]>, CryptoError> {
     let ct_arr = Array::from(ct.0);
-    let ss = Zeroizing::new(dk.0.decapsulate(&ct_arr));
+    let dk_box = dk.0.as_ref().ok_or(CryptoError::Handshake)?;
+    let ss = Zeroizing::new(dk_box.decapsulate(&ct_arr));
     let mut ss_arr = Zeroizing::new([0u8; PQ_SHARED_SECRET_LEN]);
     ss_arr.copy_from_slice(ss.as_slice());
     Ok(ss_arr)
