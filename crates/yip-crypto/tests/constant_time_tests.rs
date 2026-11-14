@@ -148,9 +148,10 @@ fn test_negative_control_variable_time_rejected() {
         let input = &inputs[i];
 
         let t0 = Instant::now();
-        let res = variable_time_cmp(black_box(&secret), black_box(input));
+        for _ in 0..50 {
+            black_box(variable_time_cmp(black_box(&secret), black_box(input)));
+        }
         let dur = t0.elapsed().as_nanos() as f64;
-        black_box(res);
 
         if is_random {
             w1.update(dur);
@@ -197,11 +198,14 @@ fn test_constant_time_authentication_tags_16_bytes() {
         let input = &inputs[i];
 
         let t0 = Instant::now();
-        let res = black_box(&secret)
-            .as_slice()
-            .ct_eq(black_box(input).as_slice());
+        for _ in 0..50 {
+            black_box(
+                black_box(&secret)
+                    .as_slice()
+                    .ct_eq(black_box(input).as_slice()),
+            );
+        }
         let dur = t0.elapsed().as_nanos() as f64;
-        black_box(res);
 
         if is_random {
             w1.update(dur);
@@ -247,11 +251,14 @@ fn test_constant_time_shared_secrets_32_bytes() {
         let input = &inputs[i];
 
         let t0 = Instant::now();
-        let res = black_box(&secret)
-            .as_slice()
-            .ct_eq(black_box(input).as_slice());
+        for _ in 0..50 {
+            black_box(
+                black_box(&secret)
+                    .as_slice()
+                    .ct_eq(black_box(input).as_slice()),
+            );
+        }
         let dur = t0.elapsed().as_nanos() as f64;
-        black_box(res);
 
         if is_random {
             w1.update(dur);

@@ -1160,4 +1160,13 @@ mod tests {
 
         assert!(!b.check_replay(1));
     }
+
+    #[test]
+    fn pq_decaps_key_zeroize_clears_state() {
+        let (_, mut dk) = generate_pq_keypair();
+        assert!(dk.0.is_some());
+        use zeroize::Zeroize;
+        dk.zeroize();
+        assert!(dk.0.is_none());
+    }
 }
