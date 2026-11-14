@@ -293,41 +293,6 @@ impl DataPlane {
         }
     }
 
-    /// Notify DAITA engine that a packet was sent over the tunnel wire.
-    pub fn on_daita_tunnel_sent(&mut self, now: std::time::Instant) -> Vec<yip_obf::DaitaAction> {
-        self.daita_engine
-            .as_mut()
-            .map_or_else(Vec::new, |e| e.on_tunnel_sent(now))
-    }
-
-    /// Notify DAITA engine that a packet was received over the tunnel wire.
-    pub fn on_daita_tunnel_recv(&mut self, now: std::time::Instant) -> Vec<yip_obf::DaitaAction> {
-        self.daita_engine
-            .as_mut()
-            .map_or_else(Vec::new, |e| e.on_tunnel_recv(now))
-    }
-
-    /// Notify DAITA engine that a normal data packet was queued for sending.
-    pub fn on_daita_normal_sent(&mut self, now: std::time::Instant) -> Vec<yip_obf::DaitaAction> {
-        self.daita_engine
-            .as_mut()
-            .map_or_else(Vec::new, |e| e.on_normal_sent(now))
-    }
-
-    /// Notify DAITA engine that a normal data packet was received.
-    pub fn on_daita_normal_recv(&mut self, now: std::time::Instant) -> Vec<yip_obf::DaitaAction> {
-        self.daita_engine
-            .as_mut()
-            .map_or_else(Vec::new, |e| e.on_normal_recv(now))
-    }
-
-    /// Trigger timer checks on the DAITA engine.
-    pub fn on_daita_timer(&mut self, now: std::time::Instant) -> Vec<yip_obf::DaitaAction> {
-        self.daita_engine
-            .as_mut()
-            .map_or_else(Vec::new, |e| e.on_timer(now))
-    }
-
     /// Access the underlying AEAD session.
     #[expect(dead_code, reason = "helper for inspecting session")]
     pub fn session(&self) -> &yip_crypto::Session {
@@ -1812,7 +1777,12 @@ mod tests {
         assert!(!out[0].bytes.is_empty());
 
         // 2. tick via Dispatch trait
-        <DataPlane as Dispatch>::tick(&mut a, 1000, &mut out);
+        out.clear();
+        <DataPlane as Dispatch>::tick(&mut a, 30_000, &mut out);
+        assert!(
+            !out.is_empty(),
+            "tick must produce keepalive egress datagram"
+        );
 
         // 3. recycle via Dispatch trait
         <DataPlane as Dispatch>::recycle(&mut a, &mut out);
@@ -1828,13 +1798,6 @@ mod tests {
         assert!(a.daita_engine().is_none());
         assert!(a.daita_engine_mut().is_none());
 
-        // Call on_daita_* when engine is None -> returns empty vec
-        assert!(a.on_daita_tunnel_sent(now).is_empty());
-        assert!(a.on_daita_tunnel_recv(now).is_empty());
-        assert!(a.on_daita_normal_sent(now).is_empty());
-        assert!(a.on_daita_normal_recv(now).is_empty());
-        assert!(a.on_daita_timer(now).is_empty());
-
         // Set Front profile
         a.set_daita_profile(yip_obf::DaitaProfile::Front, now)
             .unwrap();
@@ -1845,19 +1808,12 @@ mod tests {
             &yip_obf::DaitaProfile::Front
         );
 
-        // Normal recv triggers actions on Front
-        let actions = a.on_daita_normal_recv(now);
+        // Normal recv triggers actions on Front via daita_engine_mut()
+        let actions = a.daita_engine_mut().unwrap().on_normal_recv(now);
         assert!(
             !actions.is_empty(),
             "Front on_normal_recv must emit actions"
         );
-
-        // Tunnel sent / recv
-        let _ = a.on_daita_tunnel_sent(now);
-        let _ = a.on_daita_tunnel_recv(now);
-
-        // Timer
-        let _ = a.on_daita_timer(now);
 
         // Set Off profile resets engine to None
         a.set_daita_profile(yip_obf::DaitaProfile::Off, now)

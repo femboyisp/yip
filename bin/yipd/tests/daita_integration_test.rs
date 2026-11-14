@@ -239,7 +239,7 @@ fn test_daita_dataplane_integration() {
     assert!(dp.daita_engine().unwrap().is_active());
 
     // Trigger normal sent event
-    let actions = dp.on_daita_normal_sent(now);
+    let actions = dp.daita_engine_mut().unwrap().on_normal_sent(now);
     assert!(
         !actions.is_empty(),
         "Front defense emits actions on normal packet"
@@ -248,8 +248,8 @@ fn test_daita_dataplane_integration() {
 
     // Advance timer
     let future = now + Duration::from_millis(500);
-    let _ = dp.on_daita_timer(future);
-    let _ = dp.on_daita_tunnel_sent(future);
-    let _ = dp.on_daita_tunnel_recv(future);
-    let _ = dp.on_daita_normal_recv(future);
+    let _ = dp.daita_engine_mut().unwrap().on_timer(future);
+    let _ = dp.daita_engine_mut().unwrap().on_tunnel_sent(future);
+    let _ = dp.daita_engine_mut().unwrap().on_tunnel_recv(future);
+    let _ = dp.daita_engine_mut().unwrap().on_normal_recv(future);
 }

@@ -3253,18 +3253,107 @@ fn test_peer_manager_xdp_status_and_mode() {
 fn test_peer_manager_dispatch_trait_methods() {
     use yip_io::poll::Dispatch;
     let mut pm = test_peer_manager();
+    let dp = fake_established_dataplane(1234, "10.0.0.1:1000".parse().unwrap());
+    pm.peers[0].state =
+        PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+
     let mut out = Vec::new();
 
     // 1. on_tun via Dispatch trait
-    let pkt = vec![0x11u8; 100];
+    let pkt = dummy_tun_pkt();
     <PeerManager as Dispatch>::on_tun(&mut pm, &pkt, 100, &mut out);
+    assert!(
+        !out.is_empty(),
+        "on_tun must produce at least one egress datagram"
+    );
+    assert!(!out[0].bytes.is_empty());
 
-    // 2. tick via Dispatch trait
-    <PeerManager as Dispatch>::tick(&mut pm, 1000, &mut out);
+    // 2. queue scheduled egress to test next_timeout_ms and tick
+    let deliver_after = 142u64;
+    let ep = "10.0.0.1:1000".parse().unwrap();
+    let scheduled_dg = EgressDatagram {
+        fate: 0,
+        dst: ep,
+        bytes: vec![0x99; 32],
+    };
+    pm.queue_scheduled_egress(scheduled_dg, deliver_after, &mut out);
 
-    // 3. recycle via Dispatch trait
+    // 3. next_timeout_ms via Dispatch trait
+    let timeout = <PeerManager as Dispatch>::next_timeout_ms(&pm, 100);
+    assert_eq!(
+        timeout,
+        Some(42),
+        "next_timeout_ms must report remaining delay until scheduled egress"
+    );
+
+    // 4. tick via Dispatch trait
+    out.clear();
+    <PeerManager as Dispatch>::tick(&mut pm, 142, &mut out);
+    assert!(
+        !out.is_empty(),
+        "tick must drain scheduled egress at due timestamp"
+    );
+
+    // 5. recycle via Dispatch trait
     <PeerManager as Dispatch>::recycle(&mut pm, &mut out);
     assert!(out.is_empty(), "recycle must drain the batch");
+}
+
+#[test]
+fn test_queue_scheduled_overrun_pop() {
+    let mut queue = std::collections::VecDeque::new();
+    let mut out = Vec::new();
+    let ep: SocketAddr = "10.0.0.1:1000".parse().unwrap();
+    let dg = EgressDatagram {
+        fate: 0,
+        dst: ep,
+        bytes: vec![1, 2, 3],
+    };
+
+    // Fill queue to MAX_JITTER_QUEUE (1024 elements)
+    for i in 0..super::MAX_JITTER_QUEUE {
+        queue.push_back(super::ScheduledDatagram {
+            deliver_after_ms: i as u64,
+            datagram: EgressDatagram {
+                fate: 0,
+                dst: ep,
+                bytes: vec![(i & 0xFF) as u8],
+            },
+        });
+    }
+    assert_eq!(queue.len(), super::MAX_JITTER_QUEUE);
+
+    // When queue is full (len == MAX_JITTER_QUEUE):
+    // >= condition: 1024 >= 1024 is true -> pops oldest (bytes [0]) into out.
+    // Mutated < condition: 1024 < 1024 is false -> does NOT pop.
+    super::PeerManager::queue_scheduled(&mut queue, dg, 999_999, &mut out);
+    assert_eq!(out.len(), 1, "must pop oldest datagram on overrun");
+    assert_eq!(out[0].bytes, vec![0]);
+    assert_eq!(queue.len(), super::MAX_JITTER_QUEUE);
+
+    // Under capacity (< MAX_JITTER_QUEUE):
+    let mut small_queue = std::collections::VecDeque::new();
+    let mut small_out = Vec::new();
+    for i in 0..5 {
+        small_queue.push_back(super::ScheduledDatagram {
+            deliver_after_ms: i as u64,
+            datagram: EgressDatagram {
+                fate: 0,
+                dst: ep,
+                bytes: vec![i as u8],
+            },
+        });
+    }
+    let dg2 = EgressDatagram {
+        fate: 0,
+        dst: ep,
+        bytes: vec![99],
+    };
+    // >= condition: 5 >= 1024 is false -> small_out remains empty.
+    // Mutated < condition: 5 < 1024 is true -> would pop!
+    super::PeerManager::queue_scheduled(&mut small_queue, dg2, 10, &mut small_out);
+    assert!(small_out.is_empty(), "must not pop when under capacity");
+    assert_eq!(small_queue.len(), 6);
 }
 
 #[test]

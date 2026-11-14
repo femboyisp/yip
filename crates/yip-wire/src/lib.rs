@@ -475,4 +475,28 @@ mod tests {
         assert_eq!(payload_id, frame.payload_id);
         assert_eq!(flags, frame.flags);
     }
+
+    #[test]
+    fn test_codec_frame_ref_into() {
+        let codec = Codec::new([7u8; 16], [8u8; 16]);
+        let payload = b"stream data payload";
+        let frame_ref = FrameRef {
+            conn_tag: 0xCAFE_BABE_1234_5678,
+            object_id: 42,
+            payload_id: [1, 3, 5, 7],
+            flags: 0x05,
+            payload,
+        };
+        let mut out = vec![0xEEu8; 32];
+        codec.frame_ref_into(&frame_ref, &mut out);
+        assert!(out.len() > 32);
+        let deframed = codec
+            .deframe(&out[32..])
+            .expect("deframe frame_ref_into output");
+        assert_eq!(deframed.conn_tag, frame_ref.conn_tag);
+        assert_eq!(deframed.object_id, frame_ref.object_id);
+        assert_eq!(deframed.payload_id, frame_ref.payload_id);
+        assert_eq!(deframed.flags, frame_ref.flags);
+        assert_eq!(deframed.payload, payload);
+    }
 }

@@ -594,4 +594,18 @@ mod tests {
         assert_ne!(rx.fec_unrecoverable_count(), 0);
         assert_ne!(rx.fec_unrecoverable_count(), 1);
     }
+
+    #[test]
+    fn test_transport_encode_scratch() {
+        let mut t = Transport::new(vec![], 1200);
+        let ciphertext = vec![0x33u8; 2500];
+        let inner = vec![0x44u8; 64];
+        let (class, syms) = t.encode_scratch(&ciphertext, &inner, false, 100);
+        assert_eq!(class, FlowClass::Default);
+        assert!(!syms.is_empty(), "encode_scratch must produce symbols");
+        assert!(syms.len() >= 3);
+        for s in syms {
+            assert!(!s.data.is_empty(), "symbol data must not be empty");
+        }
+    }
 }
