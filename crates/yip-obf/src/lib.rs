@@ -28,6 +28,7 @@ pub const JUNK_TYPE: u8 = 6;
 /// Seeded once from the OS RNG; thereafter pure userspace (no syscall per
 /// draw). NOT for any security decision — junk bytes are keystream-masked by
 /// `obfuscate`, so their content is irrelevant to indistinguishability.
+#[derive(Debug, Clone)]
 pub struct XorShift64 {
     state: u64,
 }
@@ -79,6 +80,23 @@ impl XorShift64 {
         }
     }
 }
+
+impl rand_core::RngCore for XorShift64 {
+    fn next_u32(&mut self) -> u32 {
+        self.next_u64() as u32
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.next_u64()
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        self.fill(dest);
+    }
+}
+
+pub mod daita;
+pub use daita::{DaitaAction, DaitaEngine, DaitaError, DaitaProfile};
 
 pub const OBF_KEY_CONTEXT_V2: &str = "yip-obf-v1";
 

@@ -270,6 +270,7 @@ impl DaitaPreset {
                 cover_interval_ms: None,
                 cover_burst_max: 1,
                 jitter_max_ms: 0,
+                daita_profile: yip_obf::DaitaProfile::Off,
             },
             DaitaPreset::Low | DaitaPreset::Balanced => crate::config::TrafficDefenseConfig {
                 preset: yip_obf::TrafficDefensePreset::Balanced,
@@ -277,6 +278,7 @@ impl DaitaPreset {
                 cover_interval_ms: Some(500),
                 cover_burst_max: 2,
                 jitter_max_ms: 2,
+                daita_profile: yip_obf::DaitaProfile::Balanced,
             },
             DaitaPreset::Max | DaitaPreset::Paranoid => crate::config::TrafficDefenseConfig {
                 preset: yip_obf::TrafficDefensePreset::Paranoid,
@@ -284,6 +286,7 @@ impl DaitaPreset {
                 cover_interval_ms: Some(150),
                 cover_burst_max: 4,
                 jitter_max_ms: 4,
+                daita_profile: yip_obf::DaitaProfile::Paranoid,
             },
             DaitaPreset::Custom => crate::config::TrafficDefenseConfig {
                 preset: yip_obf::TrafficDefensePreset::Balanced,
@@ -291,6 +294,7 @@ impl DaitaPreset {
                 cover_interval_ms: Some(500),
                 cover_burst_max: 2,
                 jitter_max_ms: 2,
+                daita_profile: yip_obf::DaitaProfile::Front,
             },
         }
     }

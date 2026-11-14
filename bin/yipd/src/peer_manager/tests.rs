@@ -2493,6 +2493,7 @@ fn obf_egress_quantizes_to_discrete_buckets() {
         cover_interval_ms: Some(500),
         cover_burst_max: 2,
         jitter_max_ms: 2,
+        daita_profile: yip_obf::DaitaProfile::Off,
     });
 
     let allowed_buckets = [256, 512, 1024, 1420];
@@ -2532,6 +2533,7 @@ fn handshake_quantizes_to_bucket() {
         cover_interval_ms: Some(500),
         cover_burst_max: 2,
         jitter_max_ms: 2,
+        daita_profile: yip_obf::DaitaProfile::Off,
     });
 
     // HandshakeInit (1025B) -> quantizes to 1420B
@@ -2568,6 +2570,7 @@ fn decoy_burst_emits_multiple_bucket_sized_packets() {
         cover_interval_ms: Some(20),
         cover_burst_max: 3,
         jitter_max_ms: 4,
+        daita_profile: yip_obf::DaitaProfile::Off,
     });
     let dp = fake_established_dataplane(TAG, peer_ep);
     let sess = [0xBBu8; 16];
@@ -2622,6 +2625,7 @@ fn stochastic_cover_cadence_jitters_interval() {
         cover_interval_ms: Some(base_iv),
         cover_burst_max: 2,
         jitter_max_ms: 2,
+        daita_profile: yip_obf::DaitaProfile::Off,
     });
     let dp = fake_established_dataplane(TAG, peer_ep);
     let sess = [0xCCu8; 16];
@@ -2680,6 +2684,7 @@ fn obf_off_retains_legacy_padding_behavior() {
         cover_interval_ms: None,
         cover_burst_max: 1,
         jitter_max_ms: 0,
+        daita_profile: yip_obf::DaitaProfile::Off,
     });
 
     let payload = vec![PacketType::Data as u8; 50];
@@ -2703,6 +2708,7 @@ fn micro_jitter_delays_packet_until_scheduled_time() {
         cover_interval_ms: Some(500),
         cover_burst_max: 2,
         jitter_max_ms: 4,
+        daita_profile: yip_obf::DaitaProfile::Off,
     });
 
     let now_ms = 100u64;
@@ -2780,6 +2786,7 @@ fn micro_jitter_queue_overrun_flushes_oldest_without_loss() {
         cover_interval_ms: Some(500),
         cover_burst_max: 2,
         jitter_max_ms: 10,
+        daita_profile: yip_obf::DaitaProfile::Off,
     });
 
     let total_packets = super::MAX_JITTER_QUEUE + 50;
@@ -2837,6 +2844,7 @@ fn zero_jitter_bypasses_queue() {
         cover_interval_ms: Some(500),
         cover_burst_max: 2,
         jitter_max_ms: 0,
+        daita_profile: yip_obf::DaitaProfile::Off,
     });
 
     for _ in 0..10 {

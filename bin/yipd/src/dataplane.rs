@@ -211,11 +211,17 @@ pub struct DataPlane {
     arq_retx_count: u64,
     /// In-band PLPMTUD state machine.
     pub plpmtu: PlpmtuController,
+    /// Optional DAITA probabilistic state machine engine for traffic analysis defense.
+    pub daita_engine: Option<yip_obf::DaitaEngine>,
 
     // ── reused per-call scratch buffers ──────────────────────────────────────
     /// Reused per-call scratch: each element holds one framed egress datagram
     /// tagged with its FEC object id (fate group) for GSO-safe coalescing.
     egress_scratch: Vec<yip_io::poll::EgressDatagram>,
+    /// Pool of recycled egress datagrams retained for zero-allocation dispatch.
+    egress_pool: Vec<yip_io::poll::EgressDatagram>,
+    /// Pool of reusable byte buffers for ARQ retx buffering.
+    retx_buf_pool: Vec<Vec<u8>>,
     /// Reused scratch for the decoded inner packet (TUN write target).
     inner_scratch: Vec<u8>,
     /// Reused scratch for decrypted control frames.
@@ -231,6 +237,8 @@ pub struct DataPlane {
     /// this only amortizes across calls that don't hit the retx path (still
     /// cleared+refilled every call otherwise).
     seal_buf: Vec<u8>,
+    /// Reused scratch for wire frame construction in `on_tun_into`.
+    wire_payload_scratch: Vec<u8>,
 }
 
 impl DataPlane {
@@ -257,6 +265,67 @@ impl DataPlane {
     /// 16-byte data-plane obfuscation key, if obfuscation is enabled.
     pub fn obf_key(&self) -> Option<[u8; 16]> {
         self.obf_key
+    }
+
+    /// Returns a reference to the optional DAITA engine.
+    pub fn daita_engine(&self) -> Option<&yip_obf::DaitaEngine> {
+        self.daita_engine.as_ref()
+    }
+
+    /// Returns a mutable reference to the optional DAITA engine.
+    pub fn daita_engine_mut(&mut self) -> Option<&mut yip_obf::DaitaEngine> {
+        self.daita_engine.as_mut()
+    }
+
+    /// Configure the DAITA profile for this session.
+    pub fn set_daita_profile(
+        &mut self,
+        profile: yip_obf::DaitaProfile,
+        now: std::time::Instant,
+    ) -> Result<(), yip_obf::DaitaError> {
+        if profile == yip_obf::DaitaProfile::Off {
+            self.daita_engine = None;
+            Ok(())
+        } else {
+            let engine = yip_obf::DaitaEngine::new(profile, now)?;
+            self.daita_engine = Some(engine);
+            Ok(())
+        }
+    }
+
+    /// Notify DAITA engine that a packet was sent over the tunnel wire.
+    pub fn on_daita_tunnel_sent(&mut self, now: std::time::Instant) -> Vec<yip_obf::DaitaAction> {
+        self.daita_engine
+            .as_mut()
+            .map_or_else(Vec::new, |e| e.on_tunnel_sent(now))
+    }
+
+    /// Notify DAITA engine that a packet was received over the tunnel wire.
+    pub fn on_daita_tunnel_recv(&mut self, now: std::time::Instant) -> Vec<yip_obf::DaitaAction> {
+        self.daita_engine
+            .as_mut()
+            .map_or_else(Vec::new, |e| e.on_tunnel_recv(now))
+    }
+
+    /// Notify DAITA engine that a normal data packet was queued for sending.
+    pub fn on_daita_normal_sent(&mut self, now: std::time::Instant) -> Vec<yip_obf::DaitaAction> {
+        self.daita_engine
+            .as_mut()
+            .map_or_else(Vec::new, |e| e.on_normal_sent(now))
+    }
+
+    /// Notify DAITA engine that a normal data packet was received.
+    pub fn on_daita_normal_recv(&mut self, now: std::time::Instant) -> Vec<yip_obf::DaitaAction> {
+        self.daita_engine
+            .as_mut()
+            .map_or_else(Vec::new, |e| e.on_normal_recv(now))
+    }
+
+    /// Trigger timer checks on the DAITA engine.
+    pub fn on_daita_timer(&mut self, now: std::time::Instant) -> Vec<yip_obf::DaitaAction> {
+        self.daita_engine
+            .as_mut()
+            .map_or_else(Vec::new, |e| e.on_timer(now))
     }
 
     /// Access the underlying AEAD session.
@@ -339,12 +408,16 @@ impl DataPlane {
             feedback_interval_ms: FEEDBACK_INTERVAL_MS,
             arq_retx_count: 0,
             plpmtu: PlpmtuController::new(),
+            daita_engine: None,
             egress_scratch: Vec::new(),
+            egress_pool: Vec::new(),
+            retx_buf_pool: Vec::new(),
             inner_scratch: Vec::new(),
             control_scratch: Vec::new(),
             retx_scratch: Vec::new(),
             tick_scratch: Vec::new(),
             seal_buf: Vec::new(),
+            wire_payload_scratch: Vec::new(),
         }
     }
 
@@ -409,9 +482,14 @@ impl DataPlane {
     ///
     /// Returns an empty slice if the AEAD seal step fails (which is only
     /// possible after counter exhaustion — practically impossible in testing).
-    pub fn on_tun_packet(&mut self, inner: &[u8], now_ms: u64) -> &[yip_io::poll::EgressDatagram] {
-        self.egress_scratch.clear();
-
+    /// Seal `inner`, FEC-encode, and write framed datagrams directly into `out`.
+    /// Performs zero heap allocations during steady-state dispatch.
+    pub fn on_tun_into(
+        &mut self,
+        inner: &[u8],
+        now_ms: u64,
+        out: &mut Vec<yip_io::poll::EgressDatagram>,
+    ) {
         if self.l2 {
             if let Some(src_mac) = source_mac_from_ethernet_frame(inner) {
                 self.mac_table
@@ -422,55 +500,79 @@ impl DataPlane {
         // ── 1. Seal (no-alloc: writes into the reused `seal_buf`) ──────────────
         let counter = match self.session.seal_into(inner, &mut self.seal_buf) {
             Ok(c) => c,
-            Err(_) => return &self.egress_scratch,
+            Err(_) => return,
         };
 
-        // ── 2. FEC-encode ─────────────────────────────────────────────────────
-        let (class, symbols) = self
-            .transport
-            .encode(&self.seal_buf, inner, self.l2, now_ms);
+        // ── 2. FEC-encode (zero-allocation encode using transport arena) ──────
+        let (class, symbols) =
+            self.transport
+                .encode_scratch(&self.seal_buf, inner, self.l2, now_ms);
 
         // ── 3. Auxiliary bookkeeping ──────────────────────────────────────────
         self.sent_log.insert(counter, class);
 
-        if let Some(oid) = symbols.first().map(|s| s.object_id) {
-            // Move (not clone) the sealed ciphertext into the retx buffer:
-            // `seal_buf` is about to be cleared and refilled on the next call
-            // anyway, so retx taking ownership here costs no extra copy.
-            self.retx.put(
-                counter,
-                std::mem::take(&mut self.seal_buf),
-                class,
-                oid,
-                now_ms,
-            );
+        if class.params().arq {
+            if let Some(oid) = symbols.first().map(|s| s.object_id) {
+                let mut buf = self
+                    .retx_buf_pool
+                    .pop()
+                    .unwrap_or_else(|| Vec::with_capacity(self.seal_buf.len()));
+                buf.clear();
+                buf.extend_from_slice(&self.seal_buf);
+                self.retx.put(counter, buf, class, oid, now_ms);
+            }
         }
 
-        // ── 4. Frame each symbol into the reused scratch ──────────────────────
-        let n_syms = symbols.len();
+        // ── 4. Frame each symbol into caller's out buffer ────────────────────
         let peer_addr = self.peer_addr;
-        if self.egress_scratch.len() < n_syms {
-            self.egress_scratch
-                .resize_with(n_syms, || yip_io::poll::EgressDatagram {
-                    fate: 0,
+        for sym in symbols {
+            let mut dg = self
+                .egress_pool
+                .pop()
+                .unwrap_or_else(|| yip_io::poll::EgressDatagram {
+                    fate: sym.object_id,
                     dst: peer_addr,
-                    bytes: Vec::new(),
+                    bytes: Vec::with_capacity(1500),
                 });
+            dg.fate = sym.object_id;
+            dg.dst = peer_addr;
+            dg.bytes.clear();
+            dg.bytes.push(PacketType::Data as u8);
+            let frame = wire_glue::symbol_to_frame_into(
+                self.conn_tag,
+                sym,
+                counter,
+                class,
+                &mut self.wire_payload_scratch,
+            );
+            self.codec.frame_ref_into(&frame, &mut dg.bytes);
+            out.push(dg);
         }
+    }
 
-        for (slot, sym) in self.egress_scratch[..n_syms].iter_mut().zip(symbols.iter()) {
-            let frame = wire_glue::symbol_to_frame(self.conn_tag, sym, counter, class);
-            let dg = self.codec.frame(&frame);
-            // `fate` = the RaptorQ object id: all symbols of one object (source +
-            // its repair) share it, so a GSO driver keeps them in separate skbs.
-            slot.fate = sym.object_id;
-            slot.dst = peer_addr;
-            slot.bytes.clear();
-            slot.bytes.push(PacketType::Data as u8);
-            slot.bytes.extend_from_slice(&dg);
+    /// Recycle flushed datagram buffers back into the pool to preserve capacities.
+    pub fn recycle(&mut self, batch: &mut Vec<yip_io::poll::EgressDatagram>) {
+        for mut dg in batch.drain(..) {
+            dg.bytes.clear();
+            self.egress_pool.push(dg);
         }
+    }
 
-        &self.egress_scratch[..n_syms]
+    /// Seal `inner`, FEC-encode, frame each symbol, and return the resulting
+    /// egress datagrams as a borrow of an internal reused scratch buffer.
+    ///
+    /// Each returned datagram starts with `PacketType::Data as u8`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an empty slice if the AEAD seal step fails (which is only
+    /// possible after counter exhaustion — practically impossible in testing).
+    pub fn on_tun_packet(&mut self, inner: &[u8], now_ms: u64) -> &[yip_io::poll::EgressDatagram] {
+        let mut out = std::mem::take(&mut self.egress_scratch);
+        self.recycle(&mut out);
+        self.on_tun_into(inner, now_ms, &mut out);
+        self.egress_scratch = out;
+        &self.egress_scratch
     }
 
     /// Process one received UDP datagram and return what the caller must do.
@@ -933,22 +1035,101 @@ impl yip_io::poll::Dispatch for DataPlane {
         _src: SocketAddr,
         dg: &[u8],
         now_ms: u64,
+        out: &mut Vec<yip_io::poll::EgressDatagram>,
     ) -> yip_io::poll::DispatchOut<'_> {
         match self.on_udp_datagram(dg, now_ms) {
             Outcome::None => yip_io::poll::DispatchOut::None,
             Outcome::TunWrite(buf) => yip_io::poll::DispatchOut::Tun(buf),
-            Outcome::Send(pkts) => yip_io::poll::DispatchOut::Udp(pkts),
-            Outcome::TunWriteThenSend(buf, pkts) => yip_io::poll::DispatchOut::Both(buf, pkts),
+            Outcome::Send(pkts) => {
+                out.extend(pkts.iter().cloned());
+                yip_io::poll::DispatchOut::Udp(&[])
+            }
+            Outcome::TunWriteThenSend(buf, pkts) => {
+                out.extend(pkts.iter().cloned());
+                yip_io::poll::DispatchOut::Both(buf, &[])
+            }
         }
     }
 
-    fn on_tun(&mut self, inner: &[u8], now_ms: u64) -> &[yip_io::poll::EgressDatagram] {
-        self.on_tun_packet(inner, now_ms)
+    fn on_tun(&mut self, inner: &[u8], now_ms: u64, out: &mut Vec<yip_io::poll::EgressDatagram>) {
+        self.on_tun_into(inner, now_ms, out);
     }
 
-    fn tick(&mut self, now_ms: u64) -> Option<&[yip_io::poll::EgressDatagram]> {
-        self.tick(now_ms)
+    fn tick(&mut self, now_ms: u64, out: &mut Vec<yip_io::poll::EgressDatagram>) {
+        if let Some(pkts) = self.tick(now_ms) {
+            out.extend(pkts.iter().cloned());
+        }
     }
+
+    fn recycle(&mut self, batch: &mut Vec<yip_io::poll::EgressDatagram>) {
+        self.recycle(batch);
+    }
+}
+
+/// Build two [`DataPlane`]s whose sessions can talk to each other, by
+/// running a full in-process Noise-IK handshake.
+#[cfg_attr(not(test), expect(dead_code, reason = "integration test helper"))]
+pub fn test_dataplane_pair(mode: crate::mode::TunnelMode, obf_on: bool) -> (DataPlane, DataPlane) {
+    let resp_kp = yip_crypto::generate_keypair();
+    let init_kp = yip_crypto::generate_keypair();
+
+    // Run the handshake in-process (no sockets needed).
+    let mut ini = yip_crypto::Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
+    let mut res = yip_crypto::Handshake::responder(&resp_kp.private).unwrap();
+
+    let m1 = ini.write_message(&[]).unwrap();
+    let _ = res.read_message(&m1).unwrap();
+    let m2 = res.write_message(&[]).unwrap();
+    let _ = ini.read_message(&m2).unwrap();
+
+    assert!(ini.is_finished() && res.is_finished());
+
+    // Both channel bindings are identical (verified in yip-crypto tests).
+    let cb_i = ini.channel_binding();
+    let cb_r = res.channel_binding();
+    assert_eq!(cb_i, cb_r);
+
+    let (auth_key, hp_key) = crate::wire_glue::derive_wire_keys(&cb_i);
+    let (ini_send_k, ini_recv_k) = ini.raw_split_keys();
+    let (res_send_k, res_recv_k) = res.raw_split_keys();
+
+    // Build Established structs directly (mirrors what handshake.rs does).
+    let est_i = crate::handshake::Established {
+        session: ini.into_session().unwrap(),
+        auth_key,
+        hp_key,
+        raw_send_key: ini_send_k,
+        raw_recv_key: ini_recv_k,
+    };
+    let est_r = crate::handshake::Established {
+        session: res.into_session().unwrap(),
+        auth_key,
+        hp_key,
+        raw_send_key: res_send_k,
+        raw_recv_key: res_recv_k,
+    };
+
+    // Both peers derive the same conn_tag from the same keys.
+    let conn_tag = conn_tag_from_keys(&auth_key, &hp_key);
+
+    (
+        DataPlane::new(
+            est_i,
+            conn_tag,
+            mode,
+            "203.0.113.2:51820".parse().unwrap(),
+            obf_on,
+            1200,
+        ),
+        DataPlane::new(
+            est_r,
+            conn_tag,
+            mode,
+            "203.0.113.1:51820".parse().unwrap(),
+            obf_on,
+            1200,
+        ),
+    )
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -975,66 +1156,7 @@ mod tests {
     /// most tests want `false` (the byte-identical, obf-off invariant); the
     /// feedback-jitter tests (3b Task 5) pass `true`.
     fn dataplane_pair(mode: TunnelMode, obf_on: bool) -> (DataPlane, DataPlane) {
-        let resp_kp = generate_keypair();
-        let init_kp = generate_keypair();
-
-        // Run the handshake in-process (no sockets needed).
-        let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
-        let mut res = Handshake::responder(&resp_kp.private).unwrap();
-
-        let m1 = ini.write_message(&[]).unwrap();
-        let _ = res.read_message(&m1).unwrap();
-        let m2 = res.write_message(&[]).unwrap();
-        let _ = ini.read_message(&m2).unwrap();
-
-        assert!(ini.is_finished() && res.is_finished());
-
-        // Both channel bindings are identical (verified in yip-crypto tests).
-        let cb_i = ini.channel_binding();
-        let cb_r = res.channel_binding();
-        assert_eq!(cb_i, cb_r);
-
-        let (auth_key, hp_key) = derive_wire_keys(&cb_i);
-        let (ini_send_k, ini_recv_k) = ini.raw_split_keys();
-        let (res_send_k, res_recv_k) = res.raw_split_keys();
-
-        // Build Established structs directly (mirrors what handshake.rs does).
-        let est_i = Established {
-            session: ini.into_session().unwrap(),
-            auth_key,
-            hp_key,
-            raw_send_key: ini_send_k,
-            raw_recv_key: ini_recv_k,
-        };
-        let est_r = Established {
-            session: res.into_session().unwrap(),
-            auth_key,
-            hp_key,
-            raw_send_key: res_send_k,
-            raw_recv_key: res_recv_k,
-        };
-
-        // Both peers derive the same conn_tag from the same keys.
-        let conn_tag = conn_tag_from_keys(&auth_key, &hp_key);
-
-        (
-            DataPlane::new(
-                est_i,
-                conn_tag,
-                mode,
-                TEST_ADDR_B.parse().unwrap(),
-                obf_on,
-                1200,
-            ),
-            DataPlane::new(
-                est_r,
-                conn_tag,
-                mode,
-                TEST_ADDR_A.parse().unwrap(),
-                obf_on,
-                1200,
-            ),
-        )
+        test_dataplane_pair(mode, obf_on)
     }
 
     /// Full round-trip: A encodes a TUN packet, B decodes it via `on_udp_datagram`,

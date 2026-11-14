@@ -350,12 +350,25 @@ pub(crate) fn write_all_tls(
 
 /// Take a `PeerManager` UDP outcome as owned data, decoupling it from the
 /// manager borrow (mirrors `quic.rs`'s `owned_out`).
-fn owned_out(out: DispatchOut<'_>) -> (Option<Vec<u8>>, Vec<EgressDatagram>) {
+fn owned_out(
+    out: DispatchOut<'_>,
+    mut pkts: Vec<EgressDatagram>,
+) -> (Option<Vec<u8>>, Vec<EgressDatagram>) {
     match out {
-        DispatchOut::None => (None, Vec::new()),
-        DispatchOut::Tun(inner) => (Some(inner.to_vec()), Vec::new()),
-        DispatchOut::Udp(dgs) => (None, dgs.to_vec()),
-        DispatchOut::Both(inner, dgs) => (Some(inner.to_vec()), dgs.to_vec()),
+        DispatchOut::None => (None, pkts),
+        DispatchOut::Tun(inner) => (Some(inner.to_vec()), pkts),
+        DispatchOut::Udp(dgs) => {
+            if pkts.is_empty() && !dgs.is_empty() {
+                pkts.extend(dgs.iter().cloned());
+            }
+            (None, pkts)
+        }
+        DispatchOut::Both(inner, dgs) => {
+            if pkts.is_empty() && !dgs.is_empty() {
+                pkts.extend(dgs.iter().cloned());
+            }
+            (Some(inner.to_vec()), pkts)
+        }
     }
 }
 
@@ -726,17 +739,21 @@ impl TlsDispatch for PeerManager {
         dg: &[u8],
         now_ms: u64,
     ) -> (Option<Vec<u8>>, Vec<EgressDatagram>) {
-        owned_out(Dispatch::on_udp(self, src, dg, now_ms))
+        let mut out = Vec::new();
+        let disp = Dispatch::on_udp(self, src, dg, now_ms, &mut out);
+        owned_out(disp, out)
     }
 
     fn on_tun(&mut self, inner: &[u8], now_ms: u64) -> Vec<EgressDatagram> {
-        Dispatch::on_tun(self, inner, now_ms).to_vec()
+        let mut out = Vec::new();
+        Dispatch::on_tun(self, inner, now_ms, &mut out);
+        out
     }
 
     fn tick(&mut self, now_ms: u64) -> Vec<EgressDatagram> {
-        Dispatch::tick(self, now_ms)
-            .map(|s| s.to_vec())
-            .unwrap_or_default()
+        let mut out = Vec::new();
+        Dispatch::tick(self, now_ms, &mut out);
+        out
     }
 
     fn is_peer_established(&self, pubkey: &[u8; 32]) -> bool {

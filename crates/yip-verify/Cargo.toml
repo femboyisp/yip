@@ -19,6 +19,8 @@ yip-membership = { workspace = true }
 yip-transport = { workspace = true }
 yip-crypto = { workspace = true }
 yip-wire = { workspace = true }
+yip-io = { workspace = true }
+yipd = { path = "../../bin/yipd" }
 
 [lints]
 workspace = true

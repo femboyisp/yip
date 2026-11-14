@@ -105,6 +105,7 @@ pub struct TrafficDefenseConfig {
     pub cover_interval_ms: Option<u64>,
     pub cover_burst_max: u64,
     pub jitter_max_ms: u64,
+    pub daita_profile: yip_obf::DaitaProfile,
 }
 
 impl Default for TrafficDefenseConfig {
@@ -115,7 +116,15 @@ impl Default for TrafficDefenseConfig {
             cover_interval_ms: None,
             cover_burst_max: 1,
             jitter_max_ms: 0,
+            daita_profile: yip_obf::DaitaProfile::Off,
         }
+    }
+}
+
+impl TrafficDefenseConfig {
+    pub fn with_daita_profile(mut self, profile: yip_obf::DaitaProfile) -> Self {
+        self.daita_profile = profile;
+        self
     }
 }
 
@@ -857,12 +866,19 @@ impl Config {
         let jitter_max_ms =
             raw_defense_jitter_max_ms.unwrap_or_else(|| preset.default_jitter_max_ms());
 
+        let daita_profile = match preset {
+            yip_obf::TrafficDefensePreset::Off => yip_obf::DaitaProfile::Off,
+            yip_obf::TrafficDefensePreset::Balanced => yip_obf::DaitaProfile::Balanced,
+            yip_obf::TrafficDefensePreset::Paranoid => yip_obf::DaitaProfile::Paranoid,
+        };
+
         let traffic_defense = TrafficDefenseConfig {
             preset,
             buckets,
             cover_interval_ms,
             cover_burst_max,
             jitter_max_ms,
+            daita_profile,
         };
 
         if defense_enabled {

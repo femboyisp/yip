@@ -40,7 +40,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use boring::ssl::SslStream;
 
 use yip_io::epoll::{read_fd, write_fd, Epoll};
-use yip_io::poll::{Dispatch, DispatchOut, EgressDatagram};
+use yip_io::poll::{DispatchOut, EgressDatagram};
 use yip_rendezvous::{encode, Message, NodeId};
 
 use crate::peer_manager::PeerManager;

@@ -190,6 +190,24 @@ impl Transport {
         (class, syms)
     }
 
+    /// Zero-allocation encode using the transport encoder's internal scratch arena.
+    pub fn encode_scratch(
+        &mut self,
+        ciphertext: &[u8],
+        inner: &[u8],
+        l2: bool,
+        now_ms: u64,
+    ) -> (FlowClass, &[Symbol]) {
+        let class = self.classifier.classify(inner, l2, now_ms);
+        let params = self.params_for(class);
+        let source = u32::try_from(ciphertext.len().div_ceil(usize::from(params.symbol_size)))
+            .unwrap_or(u32::MAX)
+            .max(1);
+        let repair = self.controllers[class_index(class)].repair_count(source);
+        let syms = self.encoder.encode_scratch(ciphertext, params, repair);
+        (class, syms)
+    }
+
     /// Feed a received symbol for `class`; returns the frame when its object decodes.
     pub fn decode(
         &mut self,

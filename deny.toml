@@ -3,6 +3,8 @@ yanked = "deny"
 ignore = [
     # atomic-polyfill is unmaintained, pulled in transitively by frost-core -> postcard -> heapless
     "RUSTSEC-2023-0089",
+    # bincode is unmaintained, pulled in transitively by maybenot (DAITA)
+    "RUSTSEC-2025-0141",
 ]
 
 [licenses]
