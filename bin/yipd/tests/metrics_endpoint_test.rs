@@ -8,7 +8,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use yip_io::poll::Dispatch;
 use yipd::config::PeerConfig;
 use yipd::control::{client_query, run_cli_metrics, ControlCmd, ControlHandle, ControlResponse};
 use yipd::metrics::MetricsHttpServer;

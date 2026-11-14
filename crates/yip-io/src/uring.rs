@@ -884,7 +884,8 @@ impl UringDriver {
         datagram: &[u8],
         now_ms: u64,
     ) {
-        match d.on_udp(src, datagram, now_ms) {
+        let mut udp_pkts = Vec::new();
+        match d.on_udp(src, datagram, now_ms, &mut udp_pkts) {
             DispatchOut::None => {}
             DispatchOut::Tun(inner) => {
                 if let Err(e) = self.queue_tun_write(inner) {
@@ -896,14 +897,8 @@ impl UringDriver {
                 }
             }
             DispatchOut::Udp(pkts) => {
-                // `allow_gso=false`: control/ARQ-retransmit traffic is never
-                // GSO-coalesced, matching pre-addressing behavior exactly.
-                if let Err(e) = self.queue_udp_batch_tagged(pkts, false) {
-                    self.dropped_sends += 1;
-                    eprintln!(
-                        "uring: drop udp send batch: {e} (dropped_sends={})",
-                        self.dropped_sends
-                    );
+                if udp_pkts.is_empty() && !pkts.is_empty() {
+                    udp_pkts.extend(pkts.iter().cloned());
                 }
             }
             DispatchOut::Both(inner, pkts) => {
@@ -914,22 +909,30 @@ impl UringDriver {
                         self.dropped_sends
                     );
                 }
-                if let Err(e) = self.queue_udp_batch_tagged(pkts, false) {
-                    self.dropped_sends += 1;
-                    eprintln!(
-                        "uring: drop udp send batch: {e} (dropped_sends={})",
-                        self.dropped_sends
-                    );
+                if udp_pkts.is_empty() && !pkts.is_empty() {
+                    udp_pkts.extend(pkts.iter().cloned());
                 }
             }
         }
+        if !udp_pkts.is_empty() {
+            // `allow_gso=false`: control/ARQ-retransmit traffic is never
+            // GSO-coalesced, matching pre-addressing behavior exactly.
+            if let Err(e) = self.queue_udp_batch_tagged(&udp_pkts, false) {
+                self.dropped_sends += 1;
+                eprintln!(
+                    "uring: drop udp send batch: {e} (dropped_sends={})",
+                    self.dropped_sends
+                );
+            }
+        }
+        d.recycle(&mut udp_pkts);
     }
 
     fn handle_dispatch_tun(&mut self, d: &mut impl Dispatch, frame: &[u8], now_ms: u64) {
         // Stage this object's symbols; GSO batching across objects happens in
         // `flush_pending_gso` at the end of `poll_once`. Flush early if the
         // staging buffer fills mid-drain.
-        self.pending_gso.extend_from_slice(d.on_tun(frame, now_ms));
+        d.on_tun(frame, now_ms, &mut self.pending_gso);
         if self.pending_gso.len() >= MAX_PENDING_GSO_DATAGRAMS {
             self.flush_pending_gso();
         }
@@ -1192,13 +1195,14 @@ impl UringDriver {
         // Flush TUN-egress datagrams staged this pass in fate-safe GSO batches.
         self.flush_pending_gso();
 
-        if let Some(pkts) = d.tick(now_ms) {
-            for pkt in pkts {
-                if let Err(e) = self.queue_udp_send(pkt) {
-                    eprintln!("uring: drop tick packet: {e}");
-                }
+        let mut tick_pkts = Vec::new();
+        d.tick(now_ms, &mut tick_pkts);
+        for pkt in &tick_pkts {
+            if let Err(e) = self.queue_udp_send(pkt) {
+                eprintln!("uring: drop tick packet: {e}");
             }
         }
+        d.recycle(&mut tick_pkts);
 
         // SQEs queued above (re-armed recvs, tick sends) are flushed by the
         // `submit()` at the top of the next `poll_once`, before the next wait.
@@ -1270,35 +1274,33 @@ mod tests {
 
     static URING_SERIAL: Mutex<()> = Mutex::new(());
 
-    struct EchoDispatch {
-        scratch: Vec<EgressDatagram>,
-    }
+    struct EchoDispatch;
 
     impl EchoDispatch {
         fn new() -> Self {
-            Self {
-                scratch: Vec::new(),
-            }
+            Self
         }
     }
 
     impl Dispatch for EchoDispatch {
-        fn on_udp(&mut self, src: SocketAddr, dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
-            self.scratch = vec![EgressDatagram {
+        fn on_udp(
+            &mut self,
+            src: SocketAddr,
+            dg: &[u8],
+            _now_ms: u64,
+            out: &mut Vec<EgressDatagram>,
+        ) -> DispatchOut<'_> {
+            out.push(EgressDatagram {
                 fate: 0,
                 dst: src,
                 bytes: dg.to_vec(),
-            }];
-            DispatchOut::Udp(&self.scratch)
+            });
+            DispatchOut::Udp(&[])
         }
 
-        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[EgressDatagram] {
-            &[]
-        }
+        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64, _out: &mut Vec<EgressDatagram>) {}
 
-        fn tick(&mut self, _now_ms: u64) -> Option<&[EgressDatagram]> {
-            None
-        }
+        fn tick(&mut self, _now_ms: u64, _out: &mut Vec<EgressDatagram>) {}
     }
 
     /// Counts `tick` invocations; produces no I/O. Used to prove the idle wait
@@ -1308,17 +1310,20 @@ mod tests {
     }
 
     impl Dispatch for TickCountDispatch {
-        fn on_udp(&mut self, _src: SocketAddr, _dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
+        fn on_udp(
+            &mut self,
+            _src: SocketAddr,
+            _dg: &[u8],
+            _now_ms: u64,
+            _out: &mut Vec<EgressDatagram>,
+        ) -> DispatchOut<'_> {
             DispatchOut::None
         }
 
-        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[EgressDatagram] {
-            &[]
-        }
+        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64, _out: &mut Vec<EgressDatagram>) {}
 
-        fn tick(&mut self, _now_ms: u64) -> Option<&[EgressDatagram]> {
+        fn tick(&mut self, _now_ms: u64, _out: &mut Vec<EgressDatagram>) {
             self.ticks += 1;
-            None
         }
     }
 
@@ -1327,40 +1332,38 @@ mod tests {
     /// NEVER coalesce these — losing them together would defeat FEC.
     struct GsoDispatch {
         dst: SocketAddr,
-        scratch: Vec<EgressDatagram>,
     }
 
     impl GsoDispatch {
         fn new(dst: SocketAddr) -> Self {
-            Self {
-                dst,
-                scratch: Vec::new(),
-            }
+            Self { dst }
         }
     }
 
     impl Dispatch for GsoDispatch {
-        fn on_udp(&mut self, _src: SocketAddr, _dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
+        fn on_udp(
+            &mut self,
+            _src: SocketAddr,
+            _dg: &[u8],
+            _now_ms: u64,
+            _out: &mut Vec<EgressDatagram>,
+        ) -> DispatchOut<'_> {
             DispatchOut::None
         }
 
-        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[EgressDatagram] {
-            self.scratch.clear();
+        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64, out: &mut Vec<EgressDatagram>) {
             for i in 0_u8..5_u8 {
                 let mut datagram = vec![b'a'; 64];
                 datagram[0] = b'0' + i;
-                self.scratch.push(EgressDatagram {
+                out.push(EgressDatagram {
                     fate: 7,
                     dst: self.dst,
                     bytes: datagram,
                 });
             }
-            &self.scratch
         }
 
-        fn tick(&mut self, _now_ms: u64) -> Option<&[EgressDatagram]> {
-            None
-        }
+        fn tick(&mut self, _now_ms: u64, _out: &mut Vec<EgressDatagram>) {}
     }
 
     /// Returns `datagram_count` same-length datagrams each tagged with a DISTINCT
@@ -1369,7 +1372,6 @@ mod tests {
     /// symbol, recoverable from its repair in a different skb).
     struct GsoLargeBatchDispatch {
         dst: SocketAddr,
-        scratch: Vec<EgressDatagram>,
         datagram_count: usize,
         datagram_size: usize,
     }
@@ -1378,7 +1380,6 @@ mod tests {
         fn new(dst: SocketAddr, datagram_count: usize, datagram_size: usize) -> Self {
             Self {
                 dst,
-                scratch: Vec::new(),
                 datagram_count,
                 datagram_size,
             }
@@ -1386,27 +1387,29 @@ mod tests {
     }
 
     impl Dispatch for GsoLargeBatchDispatch {
-        fn on_udp(&mut self, _src: SocketAddr, _dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
+        fn on_udp(
+            &mut self,
+            _src: SocketAddr,
+            _dg: &[u8],
+            _now_ms: u64,
+            _out: &mut Vec<EgressDatagram>,
+        ) -> DispatchOut<'_> {
             DispatchOut::None
         }
 
-        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[EgressDatagram] {
-            self.scratch.clear();
+        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64, out: &mut Vec<EgressDatagram>) {
             for i in 0..self.datagram_count {
                 let mut datagram = vec![b'z'; self.datagram_size];
                 datagram[0] = u8::try_from(i % 251).expect("modulo bound fits u8");
-                self.scratch.push(EgressDatagram {
+                out.push(EgressDatagram {
                     fate: u16::try_from(i).expect("datagram_count fits u16"),
                     dst: self.dst,
                     bytes: datagram,
                 });
             }
-            &self.scratch
         }
 
-        fn tick(&mut self, _now_ms: u64) -> Option<&[EgressDatagram]> {
-            None
-        }
+        fn tick(&mut self, _now_ms: u64, _out: &mut Vec<EgressDatagram>) {}
     }
 
     fn make_pipe() -> io::Result<(RawFd, RawFd)> {

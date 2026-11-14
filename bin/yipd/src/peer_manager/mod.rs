@@ -342,6 +342,7 @@ struct Peer {
     rx_packets: u64,
     rtt_ms: Option<u32>,
     transport_name: Option<String>,
+    daita_engine: Option<yip_obf::DaitaEngine>,
 }
 
 /// Multi-peer router/demuxer + lazy in-loop handshake driver.
@@ -608,6 +609,7 @@ impl PeerManager {
                 rx_packets: 0,
                 rtt_ms: None,
                 transport_name: None,
+                daita_engine: None,
             });
         }
         let mut mgr = Self {
@@ -728,6 +730,7 @@ impl PeerManager {
             rx_packets: 0,
             rtt_ms: None,
             transport_name: None,
+            daita_engine: None,
         });
     }
 
@@ -761,7 +764,44 @@ impl PeerManager {
 
     /// Store traffic defense (DAITA packet length quantization and decoy bursts) configuration.
     pub fn set_traffic_defense(&mut self, cfg: TrafficDefenseConfig) {
+        let profile = cfg.daita_profile.clone();
         self.traffic_defense = cfg;
+        let now = std::time::Instant::now();
+        for peer in &mut self.peers {
+            if matches!(peer.state, PeerState::Established(_)) {
+                if profile == yip_obf::DaitaProfile::Off {
+                    peer.daita_engine = None;
+                } else {
+                    peer.daita_engine = yip_obf::DaitaEngine::new(profile.clone(), now).ok();
+                }
+            }
+        }
+    }
+
+    /// Configure the DAITA profile for a specific peer.
+    pub fn set_peer_daita_profile(&mut self, peer_idx: usize, profile: yip_obf::DaitaProfile) {
+        if let Some(peer) = self.peers.get_mut(peer_idx) {
+            if profile == yip_obf::DaitaProfile::Off {
+                peer.daita_engine = None;
+            } else {
+                peer.daita_engine =
+                    yip_obf::DaitaEngine::new(profile, std::time::Instant::now()).ok();
+            }
+        }
+    }
+
+    /// Access a peer's DAITA engine, if present.
+    pub fn peer_daita_engine(&self, peer_idx: usize) -> Option<&yip_obf::DaitaEngine> {
+        self.peers
+            .get(peer_idx)
+            .and_then(|p| p.daita_engine.as_ref())
+    }
+
+    /// Access a peer's DAITA engine mutably, if present.
+    pub fn peer_daita_engine_mut(&mut self, peer_idx: usize) -> Option<&mut yip_obf::DaitaEngine> {
+        self.peers
+            .get_mut(peer_idx)
+            .and_then(|p| p.daita_engine.as_mut())
     }
 
     /// Return the active traffic defense configuration, telemetry counters, and padding overhead ratio.
@@ -1293,32 +1333,40 @@ impl PeerManager {
 
     /// Insert a micro-jitter delayed datagram in sorted `deliver_after_ms` order,
     /// popping and immediately dispatching the oldest item on overrun (`len >= MAX_JITTER_QUEUE`).
-    pub(super) fn queue_scheduled_egress(
-        &mut self,
+    pub(super) fn queue_scheduled(
+        scheduled_egress: &mut VecDeque<ScheduledDatagram>,
         dg: EgressDatagram,
         deliver_after_ms: u64,
         out: &mut Vec<EgressDatagram>,
     ) {
-        if self.scheduled_egress.len() >= MAX_JITTER_QUEUE {
-            if let Some(oldest) = self.scheduled_egress.pop_front() {
+        if scheduled_egress.len() >= MAX_JITTER_QUEUE {
+            if let Some(oldest) = scheduled_egress.pop_front() {
                 out.push(oldest.datagram);
             }
         }
-        let idx = match self
-            .scheduled_egress
+        let idx = match scheduled_egress
             .iter()
             .rposition(|s| s.deliver_after_ms <= deliver_after_ms)
         {
             Some(pos) => pos + 1,
             None => 0,
         };
-        self.scheduled_egress.insert(
+        scheduled_egress.insert(
             idx,
             ScheduledDatagram {
                 deliver_after_ms,
                 datagram: dg,
             },
         );
+    }
+
+    pub(super) fn queue_scheduled_egress(
+        &mut self,
+        dg: EgressDatagram,
+        deliver_after_ms: u64,
+        out: &mut Vec<EgressDatagram>,
+    ) {
+        Self::queue_scheduled(&mut self.scheduled_egress, dg, deliver_after_ms, out);
     }
 
     /// Attach a UNIX domain control socket handle and device metadata.
@@ -1511,6 +1559,14 @@ impl PeerManager {
                 endpoint,
             });
         }
+        if self.traffic_defense.daita_profile != yip_obf::DaitaProfile::Off {
+            let engine = yip_obf::DaitaEngine::new(
+                self.traffic_defense.daita_profile.clone(),
+                std::time::Instant::now(),
+            )
+            .ok();
+            self.peers[idx].daita_engine = engine;
+        }
     }
 
     /// Returns true if the peer with public key `pubkey` has an Established session.
@@ -1692,6 +1748,7 @@ impl PeerManager {
             rx_packets: 0,
             rtt_ms: None,
             transport_name: transport,
+            daita_engine: None,
         });
         self.metrics.update_peer_stats(self.list_peers());
         Ok(())
@@ -1862,12 +1919,54 @@ impl PeerManager {
 }
 
 impl Dispatch for PeerManager {
+    fn on_udp(
+        &mut self,
+        src: SocketAddr,
+        dg: &[u8],
+        now_ms: u64,
+        out: &mut Vec<EgressDatagram>,
+    ) -> DispatchOut<'_> {
+        let disp = self.on_udp(src, dg, now_ms);
+        match disp {
+            DispatchOut::None => DispatchOut::None,
+            DispatchOut::Tun(inner) => DispatchOut::Tun(inner),
+            DispatchOut::Udp(pkts) => {
+                out.extend(pkts.iter().cloned());
+                DispatchOut::Udp(&[])
+            }
+            DispatchOut::Both(inner, pkts) => {
+                out.extend(pkts.iter().cloned());
+                DispatchOut::Both(inner, &[])
+            }
+        }
+    }
+
+    fn on_tun(&mut self, inner: &[u8], now_ms: u64, out: &mut Vec<EgressDatagram>) {
+        self.on_tun_into(inner, now_ms, out);
+    }
+
+    fn tick(&mut self, now_ms: u64, out: &mut Vec<EgressDatagram>) {
+        if let Some(pkts) = self.tick(now_ms) {
+            out.extend(pkts.iter().cloned());
+        }
+    }
+
+    fn recycle(&mut self, batch: &mut Vec<EgressDatagram>) {
+        self.recycle(batch);
+    }
+
+    fn next_timeout_ms(&self, now_ms: u64) -> Option<u64> {
+        self.next_scheduled_egress_delay_ms(now_ms)
+    }
+}
+
+impl PeerManager {
     /// UDP ingress. Obfuscation off ⇒ the plaintext 2a/2b/2c demux, verbatim.
     /// Obfuscation on ⇒ recover the real datagram — rendezvous-server
     /// datagrams via the network `obf_key` + `RDV_TYPE`, everything else by
     /// source + trial-unmask — run the SAME demux on it, then wrap the
     /// egress it produces.
-    fn on_udp(&mut self, src: SocketAddr, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
+    pub fn on_udp(&mut self, src: SocketAddr, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
         if self.obf_key.is_none() {
             if self.scheduled_egress.is_empty() {
                 return self.on_udp_dispatch(src, dg, now_ms);
@@ -1919,36 +2018,36 @@ impl Dispatch for PeerManager {
         self.finish_wrapped(tun, udp, now_ms)
     }
 
-    fn on_tun(&mut self, inner: &[u8], now_ms: u64) -> &[EgressDatagram] {
+    /// Seal `inner`, FEC-encode, and write framed datagrams directly into `out`.
+    /// Zero-copy ownership transfer avoids cloning and intermediate buffers.
+    pub fn on_tun_into(&mut self, inner: &[u8], now_ms: u64, out: &mut Vec<EgressDatagram>) {
         if self.traffic_defense.jitter_max_ms == 0 && self.scheduled_egress.is_empty() {
             if self.obf_key.is_none() {
-                return self.on_tun_dispatch(inner, now_ms);
+                self.on_tun_dispatch_into(inner, now_ms, out);
+                return;
             }
-            let mut scratch = std::mem::take(&mut self.egress);
-            {
-                let dispatched = self.on_tun_dispatch(inner, now_ms);
-                copy_into_reusable_egress(&mut scratch, dispatched);
-            }
-            self.obf_egress(&mut scratch);
-            self.egress = scratch;
-            return &self.egress;
+            self.on_tun_dispatch_into(inner, now_ms, out);
+            self.obf_egress(out);
+            return;
         }
 
-        let mut scratch = std::mem::take(&mut self.egress);
-        {
-            let dispatched = self.on_tun_dispatch(inner, now_ms);
-            copy_into_reusable_egress(&mut scratch, dispatched);
-        }
+        self.on_tun_dispatch_into(inner, now_ms, out);
         if self.obf_key.is_some() {
-            self.obf_egress_with_jitter(&mut scratch, now_ms);
+            self.obf_egress_with_jitter(out, now_ms);
         } else {
-            self.jitter_unobfuscated_egress(&mut scratch, now_ms);
+            self.jitter_unobfuscated_egress(out, now_ms);
         }
-        self.egress = scratch;
+    }
+
+    pub fn on_tun(&mut self, inner: &[u8], now_ms: u64) -> &[EgressDatagram] {
+        let mut out = std::mem::take(&mut self.egress);
+        out.clear();
+        self.on_tun_into(inner, now_ms, &mut out);
+        self.egress = out;
         &self.egress
     }
 
-    fn tick(&mut self, now_ms: u64) -> Option<&[EgressDatagram]> {
+    pub fn tick(&mut self, now_ms: u64) -> Option<&[EgressDatagram]> {
         let _ = self.tick_dispatch(now_ms);
         if self.obf_key.is_some() {
             let mut tick_egress = std::mem::take(&mut self.tick_egress);
@@ -1969,12 +2068,17 @@ impl Dispatch for PeerManager {
         }
     }
 
-    fn next_timeout_ms(&self, now_ms: u64) -> Option<u64> {
-        self.next_scheduled_egress_delay_ms(now_ms)
+    pub fn recycle(&mut self, batch: &mut Vec<EgressDatagram>) {
+        for p in &mut self.peers {
+            if let PeerState::Established(epochs) = &mut p.state {
+                epochs.current_mut().recycle(batch);
+                if batch.is_empty() {
+                    return;
+                }
+            }
+        }
+        batch.clear();
     }
-}
-
-impl PeerManager {
     fn on_udp_dispatch(&mut self, src: SocketAddr, dg: &[u8], now_ms: u64) -> DispatchOut<'_> {
         if dg.is_empty() {
             self.metrics.record_drop(1);
@@ -2002,13 +2106,84 @@ impl PeerManager {
         }
     }
 
-    fn on_tun_dispatch(&mut self, inner: &[u8], now_ms: u64) -> &[EgressDatagram] {
+    fn handle_daita_egress_actions(
+        &mut self,
+        idx: usize,
+        start_len: usize,
+        now_ms: u64,
+        out: &mut Vec<EgressDatagram>,
+    ) {
+        let Some(mut engine) = self.peers[idx].daita_engine.take() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let _ = engine.on_normal_sent(now);
+        let actions = engine.on_tunnel_sent(now);
+        let peer_ep = self.peers[idx].endpoint;
+
+        for act in actions {
+            match act {
+                yip_obf::DaitaAction::SendPadding { timeout } => {
+                    if let Some(dst) = peer_ep {
+                        let junk = self.build_junk();
+                        if timeout.is_zero() {
+                            out.push(EgressDatagram {
+                                dst,
+                                bytes: junk,
+                                fate: 0,
+                            });
+                        } else {
+                            let key = self.obf_key_for_egress(dst, yip_obf::JUNK_TYPE);
+                            if let Some(k) = key {
+                                if let Some(masked) =
+                                    yip_obf::obfuscate(&k, yip_obf::JUNK_TYPE, &junk[1..], 0)
+                                {
+                                    let deliver_after_ms =
+                                        now_ms.saturating_add(timeout.as_millis().max(1) as u64);
+                                    let dg = EgressDatagram {
+                                        dst,
+                                        bytes: masked,
+                                        fate: 0,
+                                    };
+                                    self.queue_scheduled_egress(dg, deliver_after_ms, out);
+                                }
+                            }
+                        }
+                        let _ = engine.on_padding_sent(now);
+                        let _ = engine.on_tunnel_sent(now);
+                    }
+                }
+                yip_obf::DaitaAction::BlockOutgoing {
+                    timeout: _,
+                    duration,
+                } => {
+                    if duration > std::time::Duration::ZERO {
+                        let delay_ms = duration.as_millis().max(1) as u64;
+                        let deliver_after_ms = now_ms.saturating_add(delay_ms);
+                        let mut delayed = Vec::new();
+                        for dg in out.drain(start_len..) {
+                            delayed.push(dg);
+                        }
+                        if self.obf_key.is_some() {
+                            self.obf_egress(&mut delayed);
+                        }
+                        for dg in delayed {
+                            self.queue_scheduled_egress(dg, deliver_after_ms, out);
+                        }
+                    }
+                }
+            }
+        }
+        self.peers[idx].daita_engine = Some(engine);
+    }
+
+    fn on_tun_dispatch_into(&mut self, inner: &[u8], now_ms: u64, out: &mut Vec<EgressDatagram>) {
         if let Some(dst) = crate::control::extract_ip_dst(inner) {
             if self.split_tunnel.should_bypass(dst) {
                 self.split_tunnel.record_bypassed(inner.len() as u64);
                 self.metrics
                     .record_split_tunnel_bypass(inner.len() as u64, 1);
-                return &[];
+                return;
             }
         }
         self.split_tunnel.record_routed(inner.len() as u64);
@@ -2037,13 +2212,13 @@ impl PeerManager {
                             Some(i) => i,
                             None => {
                                 self.metrics.record_drop(1);
-                                return &[];
+                                return;
                             }
                         }
                     }
                     None => {
                         self.metrics.record_drop(1);
-                        return &[];
+                        return;
                     }
                 }
             }
@@ -2073,30 +2248,35 @@ impl PeerManager {
                 let PeerState::Established(epochs) = &mut self.peers[idx].state else {
                     unreachable!("just matched Established above");
                 };
-                let out = epochs.current_mut().on_tun_packet(inner, now_ms);
-                self.metrics.record_fec_tx(out.len() as u64);
-                return out;
+                let start_len = out.len();
+                epochs.current_mut().on_tun_into(inner, now_ms, out);
+                let added = out.len() - start_len;
+                self.metrics.record_fec_tx(added as u64);
+                self.handle_daita_egress_actions(idx, start_len, now_ms, out);
+                return;
             }
+            let start_len = out.len();
             let owned: Vec<Vec<u8>> = {
                 let PeerState::Established(epochs) = &mut self.peers[idx].state else {
                     unreachable!("just matched Established above");
                 };
-                let out = epochs.current_mut().on_tun_packet(inner, now_ms);
-                self.metrics.record_fec_tx(out.len() as u64);
-                out.iter().map(|d| d.bytes.clone()).collect()
+                let mut tmp = Vec::new();
+                epochs.current_mut().on_tun_into(inner, now_ms, &mut tmp);
+                self.metrics.record_fec_tx(tmp.len() as u64);
+                tmp.into_iter().map(|d| d.bytes).collect()
             };
-            self.egress.clear();
             for b in owned {
                 if let Some(d) = self.relay_wrap(idx, b) {
-                    self.egress.push(d);
+                    out.push(d);
                 }
             }
-            return &self.egress;
+            self.handle_daita_egress_actions(idx, start_len, now_ms, out);
+            return;
         }
 
         if matches!(self.peers[idx].state, PeerState::Handshaking(_)) {
             Self::push_pending(&mut self.peers[idx].pending_tun, inner);
-            return &[];
+            return;
         }
 
         // Idle: buffer this packet and decide how to bring the peer up.
@@ -2122,13 +2302,8 @@ impl PeerManager {
             PathAction::NeedLookup => self.maybe_lookup(idx, now_ms).map(|d| vec![d]),
             PathAction::Idle | PathAction::Failed => None,
         };
-        match dgs {
-            Some(dgs) => {
-                self.egress.clear();
-                self.egress.extend(dgs);
-                &self.egress
-            }
-            None => &[],
+        if let Some(dgs) = dgs {
+            out.extend(dgs);
         }
     }
 
@@ -2429,6 +2604,60 @@ impl PeerManager {
             }
         }
 
+        // ── DAITA state machine timers ───────────────────────────────────────
+        let now_instant = std::time::Instant::now();
+        for i in 0..self.peers.len() {
+            if !matches!(self.peers[i].state, PeerState::Established(_)) {
+                continue;
+            }
+            let Some(endpoint) = self.peers[i].endpoint else {
+                continue;
+            };
+            let Some(mut engine) = self.peers[i].daita_engine.take() else {
+                continue;
+            };
+            let actions = engine.on_timer(now_instant);
+            for act in actions {
+                match act {
+                    yip_obf::DaitaAction::SendPadding { timeout } => {
+                        let junk = self.build_junk();
+                        if timeout.is_zero() {
+                            self.tick_egress.push(EgressDatagram {
+                                fate: 0,
+                                dst: endpoint,
+                                bytes: junk,
+                            });
+                        } else {
+                            let key = self.obf_key_for_egress(endpoint, yip_obf::JUNK_TYPE);
+                            if let Some(k) = key {
+                                if let Some(masked) =
+                                    yip_obf::obfuscate(&k, yip_obf::JUNK_TYPE, &junk[1..], 0)
+                                {
+                                    let deliver_after_ms =
+                                        now_ms.saturating_add(timeout.as_millis().max(1) as u64);
+                                    let dg = EgressDatagram {
+                                        dst: endpoint,
+                                        bytes: masked,
+                                        fate: 0,
+                                    };
+                                    Self::queue_scheduled(
+                                        &mut self.scheduled_egress,
+                                        dg,
+                                        deliver_after_ms,
+                                        &mut self.tick_egress,
+                                    );
+                                }
+                            }
+                        }
+                        let _ = engine.on_padding_sent(now_instant);
+                        let _ = engine.on_tunnel_sent(now_instant);
+                    }
+                    yip_obf::DaitaAction::BlockOutgoing { .. } => {}
+                }
+            }
+            self.peers[i].daita_engine = Some(engine);
+        }
+
         // ── #41 cert-liveness sweep: drop any Established mesh peer whose cert has
         // expired / been revoked (roots exempt), so a revoked member loses its
         // session within a rekey interval rather than at process restart. Throttled
@@ -2531,6 +2760,7 @@ fn reassemble(ptype: u8, body: &[u8]) -> Vec<u8> {
     v
 }
 
+#[cfg(test)]
 pub(super) fn copy_into_reusable_egress(target: &mut Vec<EgressDatagram>, src: &[EgressDatagram]) {
     target.truncate(src.len());
     for (i, s) in src.iter().enumerate() {

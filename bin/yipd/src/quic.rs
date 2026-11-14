@@ -64,7 +64,7 @@ use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime
 use rustls::{DigitallySignedStruct, SignatureScheme};
 
 use yip_io::epoll::{read_fd, write_fd, Epoll};
-use yip_io::poll::{Dispatch, DispatchOut};
+use yip_io::poll::DispatchOut;
 use yip_io::MAX_WIRE_DATAGRAM;
 
 use crate::peer_manager::PeerManager;

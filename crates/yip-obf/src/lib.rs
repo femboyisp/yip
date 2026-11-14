@@ -28,6 +28,7 @@ pub const JUNK_TYPE: u8 = 6;
 /// Seeded once from the OS RNG; thereafter pure userspace (no syscall per
 /// draw). NOT for any security decision — junk bytes are keystream-masked by
 /// `obfuscate`, so their content is irrelevant to indistinguishability.
+#[derive(Debug, Clone)]
 pub struct XorShift64 {
     state: u64,
 }
@@ -79,6 +80,23 @@ impl XorShift64 {
         }
     }
 }
+
+impl rand_core::RngCore for XorShift64 {
+    fn next_u32(&mut self) -> u32 {
+        self.next_u64() as u32
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.next_u64()
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        self.fill(dest);
+    }
+}
+
+pub mod daita;
+pub use daita::{DaitaAction, DaitaEngine, DaitaError, DaitaProfile};
 
 pub const OBF_KEY_CONTEXT_V2: &str = "yip-obf-v1";
 
@@ -453,6 +471,26 @@ mod tests {
         let v3 = r.next_u64();
         r2.fill(&mut single);
         assert_eq!(single[0], v3.to_le_bytes()[0]);
+    }
+
+    #[test]
+    fn xorshift_rngcore_trait_methods() {
+        use rand_core::RngCore;
+        let mut r = XorShift64::from_seed(42);
+        let u32_val = r.next_u32();
+        assert_ne!(u32_val, 0);
+        assert_ne!(u32_val, 1);
+
+        let u64_val = r.next_u64();
+        assert_ne!(u64_val, 0);
+        assert_ne!(u64_val, 1);
+
+        let mut buf = [0u8; 32];
+        r.fill_bytes(&mut buf);
+        assert!(
+            buf.iter().any(|&b| b != 0),
+            "fill_bytes fills non-zero bytes"
+        );
     }
 
     #[test]

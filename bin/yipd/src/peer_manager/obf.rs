@@ -40,29 +40,41 @@ impl PeerManager {
     /// A wrong key yields `None` or a garbage `(ptype, body)`; the type-set
     /// filters and, ultimately, the inner Noise/AEAD/frame verify make every
     /// mismatch a safe drop — never a mis-dispatch with side effects.
-    pub(super) fn deobf_ingress(&self, src: SocketAddr, dg: &[u8]) -> Option<Vec<u8>> {
+    pub(super) fn deobf_ingress(&mut self, src: SocketAddr, dg: &[u8]) -> Option<Vec<u8>> {
         // (a) established peer whose endpoint matches src → session candidate keys.
-        if let Some(peer) = self
+        let peer_idx = self
             .peers
             .iter()
-            .find(|p| p.endpoint == Some(src) && matches!(p.state, PeerState::Established(_)))
-        {
-            if let PeerState::Established(ref epochs) = peer.state {
+            .position(|p| p.endpoint == Some(src) && matches!(p.state, PeerState::Established(_)));
+        if let Some(idx) = peer_idx {
+            if let PeerState::Established(ref epochs) = self.peers[idx].state {
                 let mut keys = epochs.candidate_obf_keys();
                 if keys.is_empty() {
-                    if let Some(k) = peer.session_obf_key {
+                    if let Some(k) = self.peers[idx].session_obf_key {
                         keys.push(k);
                     }
                 }
                 for key in keys {
                     if let Some((ptype, body)) = yip_obf::deobfuscate(&key, dg) {
                         if ptype == yip_obf::JUNK_TYPE {
+                            if let Some(engine) = &mut self.peers[idx].daita_engine {
+                                let now = std::time::Instant::now();
+                                let _ = engine.on_tunnel_recv(now);
+                                let _ = engine.on_padding_recv(now);
+                            }
                             return None; // idle-cover decoy: inert, dropped, no fall-through
                         }
                         if ptype == PacketType::Data as u8
                             || ptype == PacketType::Control as u8
                             || ptype == PacketType::Gossip as u8
                         {
+                            if let Some(engine) = &mut self.peers[idx].daita_engine {
+                                let now = std::time::Instant::now();
+                                let _ = engine.on_tunnel_recv(now);
+                                if ptype == PacketType::Data as u8 {
+                                    let _ = engine.on_normal_recv(now);
+                                }
+                            }
                             return Some(reassemble(ptype, &body));
                         }
                     }
@@ -73,30 +85,36 @@ impl PeerManager {
         // roamed Established peer's Data/Control/Gossip under its candidate session keys.
         // Trial each Established peer's candidate keys; a wrong key yields None or a
         // garbage type that the type-set + the downstream inner Noise/AEAD verify
-        // drop safely. NOTE: `deobfuscate` is an unauthenticated keystream XOR, so
-        // a wrong key CAN spuriously produce a Data/Control/Gossip type here — the
-        // authenticated gate is downstream (`inbound_open`/`route_data`), unlike
-        // `handle_data_or_control`'s plaintext loop which is itself AEAD-gated. A
-        // genuine roamed datagram is therefore dropped with tiny probability when
-        // an interfering peer's trial false-positives; FEC/ARQ absorb it, and the
-        // endpoint self-heals on the next datagram that reaches (a).
-        for p in &self.peers {
-            if let PeerState::Established(ref epochs) = p.state {
+        // drop safely.
+        for idx in 0..self.peers.len() {
+            if let PeerState::Established(ref epochs) = self.peers[idx].state {
                 let mut keys = epochs.candidate_obf_keys();
                 if keys.is_empty() {
-                    if let Some(k) = p.session_obf_key {
+                    if let Some(k) = self.peers[idx].session_obf_key {
                         keys.push(k);
                     }
                 }
                 for key in keys {
                     if let Some((ptype, body)) = yip_obf::deobfuscate(&key, dg) {
                         if ptype == yip_obf::JUNK_TYPE {
+                            if let Some(engine) = &mut self.peers[idx].daita_engine {
+                                let now = std::time::Instant::now();
+                                let _ = engine.on_tunnel_recv(now);
+                                let _ = engine.on_padding_recv(now);
+                            }
                             return None;
                         }
                         if ptype == PacketType::Data as u8
                             || ptype == PacketType::Control as u8
                             || ptype == PacketType::Gossip as u8
                         {
+                            if let Some(engine) = &mut self.peers[idx].daita_engine {
+                                let now = std::time::Instant::now();
+                                let _ = engine.on_tunnel_recv(now);
+                                if ptype == PacketType::Data as u8 {
+                                    let _ = engine.on_normal_recv(now);
+                                }
+                            }
                             return Some(reassemble(ptype, &body));
                         }
                     }
@@ -145,7 +163,7 @@ impl PeerManager {
     /// `dst`. Falls back to the network key when no session key is found (e.g. a
     /// gossip digest to a not-yet-`Established` root) so wrapping never silently
     /// drops a datagram.
-    fn obf_key_for_egress(&self, dst: SocketAddr, ptype: u8) -> Option<[u8; 16]> {
+    pub fn obf_key_for_egress(&self, dst: SocketAddr, ptype: u8) -> Option<[u8; 16]> {
         if ptype == PacketType::HandshakeInit as u8 || ptype == PacketType::HandshakeResp as u8 {
             return self.obf_key;
         }
@@ -402,7 +420,7 @@ mod tests {
     /// session key and finds this one.
     #[test]
     fn deobf_finds_roamed_peer_session_key_by_trial() {
-        let (pm, sess, plaintext) = established_obf_peer_with_data();
+        let (mut pm, sess, plaintext) = established_obf_peer_with_data();
         let obf = yip_obf::obfuscate(&sess, PacketType::Data as u8, &plaintext[1..], 0)
             .expect("small test body fits u16");
         let roamed: SocketAddr = "198.51.100.231:41111".parse().unwrap();
@@ -425,7 +443,7 @@ mod tests {
     /// keys, not the (b) network key — is dropped, never mis-dispatched.
     #[test]
     fn deobf_trial_does_not_accept_foreign_datagram() {
-        let (pm, _sess, _plaintext) = established_obf_peer_with_data();
+        let (mut pm, _sess, _plaintext) = established_obf_peer_with_data();
         let garbage = vec![0xABu8; 64];
         let src: SocketAddr = "203.0.113.9:9".parse().unwrap();
         assert!(
@@ -621,6 +639,89 @@ mod tests {
             out_roamed.as_deref(),
             Some(plain.as_slice()),
             "packet masked with next epoch candidate key must deobfuscate on roamed endpoint"
+        );
+    }
+
+    #[test]
+    fn deobf_ingress_daita_tracking_normal_vs_control() {
+        use std::time::Instant;
+        use yip_obf::{DaitaEngine, DaitaProfile};
+
+        let peer_ep: SocketAddr = "10.0.0.50:5050".parse().unwrap();
+        let peer = peer_cfg(50, "10.0.0.50:5050");
+        let mut pm = PeerManager::new(
+            [51u8; 32],
+            [52u8; 32],
+            &[peer],
+            TunnelMode::L3Tun,
+            None,
+            None,
+            false,
+        );
+        let key = [0x55u8; 16];
+        let dp = fake_established_dataplane(5555, peer_ep);
+        pm.peers[0].state =
+            PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+        pm.peers[0].session_obf_key = Some(key);
+
+        let ctl_plain = [1, 2, 3];
+        let ctl_dg = yip_obf::obfuscate(&key, PacketType::Control as u8, &ctl_plain, 0).unwrap();
+        let data_plain = [4, 5, 6];
+        let data_dg = yip_obf::obfuscate(&key, PacketType::Data as u8, &data_plain, 0).unwrap();
+
+        // 1. Direct endpoint: Control must not trigger on_normal_recv; Data must trigger it.
+        pm.peers[0].daita_engine =
+            Some(DaitaEngine::new(DaitaProfile::Front, Instant::now()).unwrap());
+        let out_ctl = pm.deobf_ingress(peer_ep, &ctl_dg);
+        assert!(out_ctl.is_some());
+        assert!(
+            pm.peers[0]
+                .daita_engine
+                .as_ref()
+                .unwrap()
+                .next_timer_deadline()
+                .is_none(),
+            "Control datagram must not transition Front DAITA machine"
+        );
+
+        let out_data = pm.deobf_ingress(peer_ep, &data_dg);
+        assert!(out_data.is_some());
+        assert!(
+            pm.peers[0]
+                .daita_engine
+                .as_ref()
+                .unwrap()
+                .next_timer_deadline()
+                .is_some(),
+            "Data datagram must transition Front DAITA machine"
+        );
+
+        // 2. Roamed endpoint: Control must not trigger on_normal_recv; Data must trigger it.
+        let roamed_ep: SocketAddr = "198.51.100.77:7070".parse().unwrap();
+        pm.peers[0].daita_engine =
+            Some(DaitaEngine::new(DaitaProfile::Front, Instant::now()).unwrap());
+        let out_roamed_ctl = pm.deobf_ingress(roamed_ep, &ctl_dg);
+        assert!(out_roamed_ctl.is_some());
+        assert!(
+            pm.peers[0]
+                .daita_engine
+                .as_ref()
+                .unwrap()
+                .next_timer_deadline()
+                .is_none(),
+            "Roamed Control datagram must not transition Front DAITA machine"
+        );
+
+        let out_roamed_data = pm.deobf_ingress(roamed_ep, &data_dg);
+        assert!(out_roamed_data.is_some());
+        assert!(
+            pm.peers[0]
+                .daita_engine
+                .as_ref()
+                .unwrap()
+                .next_timer_deadline()
+                .is_some(),
+            "Roamed Data datagram must transition Front DAITA machine"
         );
     }
 }

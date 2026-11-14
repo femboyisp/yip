@@ -50,6 +50,28 @@ pub fn symbol_to_frame(conn_tag: u64, sym: &Symbol, counter: u64, class: FlowCla
     }
 }
 
+/// Build a borrowed wire frame for one FEC symbol using caller-owned `payload_scratch`.
+pub fn symbol_to_frame_into<'a>(
+    conn_tag: u64,
+    sym: &Symbol,
+    counter: u64,
+    class: FlowClass,
+    payload_scratch: &'a mut Vec<u8>,
+) -> FrameRef<'a> {
+    payload_scratch.clear();
+    payload_scratch.reserve(12 + sym.data.len());
+    payload_scratch.extend_from_slice(&counter.to_be_bytes());
+    payload_scratch.extend_from_slice(&sym.object_size.to_be_bytes());
+    payload_scratch.extend_from_slice(&sym.data);
+    FrameRef {
+        conn_tag,
+        object_id: sym.object_id,
+        payload_id: sym.payload_id,
+        flags: class_to_flags(class),
+        payload: payload_scratch.as_slice(),
+    }
+}
+
 /// Parse a received frame back into a `(Symbol, counter, class)`, or None if the
 /// payload is shorter than the 12-byte counter+object_size prefix.
 #[cfg_attr(

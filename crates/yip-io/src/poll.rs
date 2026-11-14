@@ -35,18 +35,28 @@ const GSO_CONTROL_SPACE: usize = 64;
 pub trait Dispatch {
     /// Called when a UDP datagram arrives, with the address it came from.
     /// Returns what [`run_poll`] must forward (to TUN, back to UDP, both, or
-    /// nothing).
-    fn on_udp(&mut self, src: SocketAddr, dg: &[u8], now_ms: u64) -> DispatchOut<'_>;
+    /// nothing). Datagrams to emit on UDP are appended directly to `out`.
+    fn on_udp(
+        &mut self,
+        src: SocketAddr,
+        dg: &[u8],
+        now_ms: u64,
+        out: &mut Vec<EgressDatagram>,
+    ) -> DispatchOut<'_>;
 
-    /// Called when a TUN frame arrives.  Returns egress datagrams to send on
-    /// the UDP socket (may be empty), each tagged with its FEC fate group and
-    /// destination so a GSO-capable driver can coalesce safely (see
-    /// [`EgressDatagram`]).
-    fn on_tun(&mut self, inner: &[u8], now_ms: u64) -> &[EgressDatagram];
+    /// Called when a TUN frame arrives. Egress datagrams to send on the UDP
+    /// socket are appended directly to `out` (zero-copy), each tagged with its
+    /// FEC fate group and destination so a GSO-capable driver can coalesce safely
+    /// (see [`EgressDatagram`]).
+    fn on_tun(&mut self, inner: &[u8], now_ms: u64, out: &mut Vec<EgressDatagram>);
 
-    /// Called at least every 10 ms.  Returns addressed feedback/keepalive
-    /// datagrams (usually 0 or 1) that should be sent on the UDP socket.
-    fn tick(&mut self, now_ms: u64) -> Option<&[EgressDatagram]>;
+    /// Called at least every 10 ms. Addressed feedback/keepalive datagrams to
+    /// send on the UDP socket are appended directly to `out` (zero-copy).
+    fn tick(&mut self, now_ms: u64, out: &mut Vec<EgressDatagram>);
+
+    /// Optional hook allowing `Dispatch` to recycle datagram buffers that were
+    /// sent by `flush_tx`.
+    fn recycle(&mut self, _batch: &mut Vec<EgressDatagram>) {}
 
     /// Optional next timeout hint in milliseconds from `now_ms`.
     /// When provided, [`run_poll`] clamps its epoll wait timeout to
@@ -144,17 +154,42 @@ fn drain_udp(
         }
         for i in 0..n {
             let dg = &bufs[i][..lens[i]];
-            match d.on_udp(srcs[i], dg, now_ms) {
+            match d.on_udp(srcs[i], dg, now_ms, tx) {
                 DispatchOut::None => {}
                 DispatchOut::Tun(inner) => write_to_tun(tun_fd, inner, vnet_hdr, coalescer),
-                DispatchOut::Udp(pkts) => tx.extend(pkts.iter().cloned()),
+                DispatchOut::Udp(pkts) => {
+                    for s in pkts {
+                        let mut slot = gso.recycle.pop().unwrap_or_else(|| EgressDatagram {
+                            fate: s.fate,
+                            dst: s.dst,
+                            bytes: Vec::with_capacity(crate::MAX_WIRE_DATAGRAM),
+                        });
+                        slot.fate = s.fate;
+                        slot.dst = s.dst;
+                        slot.bytes.clear();
+                        slot.bytes.extend_from_slice(&s.bytes);
+                        tx.push(slot);
+                    }
+                }
                 DispatchOut::Both(inner, pkts) => {
                     write_to_tun(tun_fd, inner, vnet_hdr, coalescer);
-                    tx.extend(pkts.iter().cloned());
+                    for s in pkts {
+                        let mut slot = gso.recycle.pop().unwrap_or_else(|| EgressDatagram {
+                            fate: s.fate,
+                            dst: s.dst,
+                            bytes: Vec::with_capacity(crate::MAX_WIRE_DATAGRAM),
+                        });
+                        slot.fate = s.fate;
+                        slot.dst = s.dst;
+                        slot.bytes.clear();
+                        slot.bytes.extend_from_slice(&s.bytes);
+                        tx.push(slot);
+                    }
                 }
             }
         }
         flush_tx(udp_fd, tx, gso)?; // send any UDP replies for this recv burst
+        d.recycle(&mut gso.recycle);
         if n < MAX_DATAGRAM_BATCH {
             break; // partial batch → socket drained
         }
@@ -205,7 +240,7 @@ fn write_to_tun(
               explicitly rather than bundled into a struct, to keep the hot-path buffers' \
               aliasing/lifetimes obvious"
 )]
-fn drain_tun(
+pub fn drain_tun(
     tun_fd: RawFd,
     udp_fd: RawFd,
     d: &mut impl Dispatch,
@@ -239,49 +274,61 @@ fn drain_tun(
         if vnet_hdr {
             if crate::tun_offload::split_gro(&buf[..n], split_out, split_offs) {
                 for &(s, l) in split_offs.iter() {
-                    tx.extend(d.on_tun(&split_out[s..s + l], now_ms).iter().cloned());
+                    d.on_tun(&split_out[s..s + l], now_ms, tx);
                     if tx.len() >= MAX_DATAGRAM_BATCH {
                         flush_tx(udp_fd, tx, gso)?;
+                        d.recycle(&mut gso.recycle);
                     }
                 }
             } else if let Some(body) = buf.get(crate::tun_offload::VNET_HDR_LEN..n) {
                 // Unparseable vnet_hdr framing (e.g. GSO_NONE with a non-IPv4/TCP
                 // body, or any other read that isn't a segmentable TCP run):
                 // feed the frame body as a single packet, same as the plain path.
-                tx.extend(d.on_tun(body, now_ms).iter().cloned());
+                d.on_tun(body, now_ms, tx);
                 if tx.len() >= MAX_DATAGRAM_BATCH {
                     flush_tx(udp_fd, tx, gso)?;
+                    d.recycle(&mut gso.recycle);
                 }
             }
             // else: read shorter than the vnet_hdr prefix itself — drop it.
         } else {
             let inner = &buf[..n];
-            tx.extend(d.on_tun(inner, now_ms).iter().cloned());
+            d.on_tun(inner, now_ms, tx);
             if tx.len() >= MAX_DATAGRAM_BATCH {
                 flush_tx(udp_fd, tx, gso)?;
+                d.recycle(&mut gso.recycle);
             }
         }
     }
     flush_tx(udp_fd, tx, gso)?; // send the burst's remaining egress
+    d.recycle(&mut gso.recycle);
     Ok(())
 }
 
 /// Reusable scratch + latched capability for GSO sends on the poll path.
-struct GsoScratch {
+pub struct GsoScratch {
     /// Latched to `false` the first time a GSO send reports the feature
     /// unsupported (`EIO`/`EINVAL`); thereafter `flush_tx` uses plain sends only.
-    enabled: bool,
-    runs: Vec<crate::gso::GsoRun>,
-    payload: Vec<u8>,
+    pub enabled: bool,
+    pub runs: Vec<crate::gso::GsoRun>,
+    pub payload: Vec<u8>,
+    pub recycle: Vec<EgressDatagram>,
 }
 
 impl GsoScratch {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             enabled: true,
             runs: Vec::with_capacity(MAX_DATAGRAM_BATCH),
             payload: Vec::with_capacity(MAX_WIRE_DATAGRAM * crate::gso::MAX_GSO_SEGMENTS_PER_SEND),
+            recycle: Vec::with_capacity(MAX_DATAGRAM_BATCH),
         }
+    }
+}
+
+impl Default for GsoScratch {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -300,59 +347,67 @@ fn send_run_plain(udp_fd: RawFd, run: &[EgressDatagram]) -> io::Result<()> {
     Ok(())
 }
 
-/// Send everything queued in `tx`, then clear it. With GSO enabled, partitions
-/// `tx` into fate-safe runs and sends each run of ≥2 as one `UDP_SEGMENT` send
-/// (falling back to plain sends for singletons and, after latching GSO off, on
-/// any "unsupported" result). Wire-identical to plain `send_mmsg`; the datagram
-/// bytes, sizes, count, and destinations on the wire are unchanged.
-fn flush_tx(udp_fd: RawFd, tx: &mut Vec<EgressDatagram>, gso: &mut GsoScratch) -> io::Result<()> {
-    if !gso.enabled {
-        let r = send_run_plain(udp_fd, tx);
-        tx.clear();
-        return r;
+/// Send everything queued in `tx`, then drain into `gso.recycle` (preserving datagram
+/// buffer capacity). With GSO enabled, partitions `tx` into fate-safe runs and sends
+/// each run of >=2 as one `UDP_SEGMENT` send (falling back to plain sends for singletons
+/// and, after latching GSO off, on any "unsupported" result). Wire-identical to plain
+/// `send_mmsg`; the datagram bytes, sizes, count, and destinations on the wire are unchanged.
+pub fn flush_tx(
+    udp_fd: RawFd,
+    tx: &mut Vec<EgressDatagram>,
+    gso: &mut GsoScratch,
+) -> io::Result<()> {
+    if tx.is_empty() {
+        return Ok(());
     }
-    crate::gso::partition_fate_safe(tx, MAX_DATAGRAM_BATCH, &mut gso.runs);
-    // Detach the runs scratch so we can borrow `gso.payload`/`gso.enabled` mutably
-    // while iterating (the runs hold only indices into `tx`); restore it after.
-    let runs = std::mem::take(&mut gso.runs);
-    let mut outcome = Ok(());
-    for run in &runs {
-        if gso.enabled && run.members.len() >= 2 && run.segment_size > 0 {
-            let dst = tx[run.members[0]].dst;
-            match send_gso_indexed(
-                udp_fd,
-                tx,
-                &run.members,
-                run.segment_size,
-                dst,
-                &mut gso.payload,
-            ) {
-                Ok(true) => {}
-                Ok(false) => {
-                    gso.enabled = false; // latch: GSO unsupported here
-                    for &i in &run.members {
-                        if let Err(e) = send_run_plain(udp_fd, std::slice::from_ref(&tx[i])) {
-                            outcome = Err(e);
-                            break;
+    let outcome = if !gso.enabled {
+        send_run_plain(udp_fd, tx)
+    } else {
+        crate::gso::partition_fate_safe(tx, MAX_DATAGRAM_BATCH, &mut gso.runs);
+        let GsoScratch {
+            ref mut enabled,
+            ref runs,
+            ref mut payload,
+            ..
+        } = *gso;
+        let mut res = Ok(());
+        for run in runs {
+            if *enabled && run.members.len() >= 2 && run.segment_size > 0 {
+                let dst = tx[run.members[0]].dst;
+                match send_gso_indexed(udp_fd, tx, &run.members, run.segment_size, dst, payload) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        *enabled = false; // latch: GSO unsupported here
+                        for &i in &run.members {
+                            if let Err(e) = send_run_plain(udp_fd, std::slice::from_ref(&tx[i])) {
+                                res = Err(e);
+                                break;
+                            }
                         }
                     }
+                    Err(e) => res = Err(e),
                 }
-                Err(e) => outcome = Err(e),
+            } else {
+                for &i in &run.members {
+                    if let Err(e) = send_run_plain(udp_fd, std::slice::from_ref(&tx[i])) {
+                        res = Err(e);
+                        break;
+                    }
+                }
             }
-        } else {
-            for &i in &run.members {
-                if let Err(e) = send_run_plain(udp_fd, std::slice::from_ref(&tx[i])) {
-                    outcome = Err(e);
-                    break;
-                }
+            if res.is_err() {
+                break;
             }
         }
-        if outcome.is_err() {
-            break;
-        }
+        res
+    };
+
+    // Retain datagram buffer capacity in `gso.recycle` so subsequent packets do not reallocate heap buffers
+    for mut dg in tx.drain(..) {
+        dg.bytes.clear();
+        gso.recycle.push(dg);
     }
-    gso.runs = runs; // restore the reusable scratch allocation
-    tx.clear();
+
     outcome
 }
 
@@ -777,13 +832,15 @@ pub fn run_poll<D: Dispatch>(
         }
 
         // Always tick — even on timeout with no events.
-        if let Some(pkts) = d.tick(now_ms) {
-            tx_batch.extend(pkts.iter().cloned());
+        let prev_len = tx_batch.len();
+        d.tick(now_ms, &mut tx_batch);
+        if tx_batch.len() > prev_len {
             if let Err(e) = flush_tx(udp_fd, &mut tx_batch, &mut gso) {
                 // SAFETY: `epoll_fd` is valid.
                 unsafe { libc::close(epoll_fd) };
                 return Err(e);
             }
+            d.recycle(&mut gso.recycle);
         }
     }
 }
@@ -813,19 +870,21 @@ mod tests {
     }
 
     impl Dispatch for CountDispatch {
-        fn on_udp(&mut self, _src: SocketAddr, dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
+        fn on_udp(
+            &mut self,
+            _src: SocketAddr,
+            dg: &[u8],
+            _now_ms: u64,
+            _out: &mut Vec<EgressDatagram>,
+        ) -> DispatchOut<'_> {
             self.received.push(dg.to_vec());
             self.call_count += 1;
             DispatchOut::None
         }
 
-        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[EgressDatagram] {
-            &[]
-        }
+        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64, _out: &mut Vec<EgressDatagram>) {}
 
-        fn tick(&mut self, _now_ms: u64) -> Option<&[EgressDatagram]> {
-            None
-        }
+        fn tick(&mut self, _now_ms: u64, _out: &mut Vec<EgressDatagram>) {}
     }
 
     /// Verify that `drain_udp` reads a datagram from a ready UDP socket and
@@ -936,39 +995,37 @@ mod tests {
     /// This exercises the forwarding arm and `flush_tx`/`send_mmsg` end-to-end
     /// via `drain_udp`.
     struct ForwardDispatch {
-        /// Payload to send back.  Cloned once per `on_udp` call.
+        /// Payload to send back. Cloned once per `on_udp` call.
         reply: Vec<u8>,
-        /// Scratch storage so the `&[EgressDatagram]` returned by `on_udp`
-        /// lives long enough (it borrows `self`).
-        scratch: Vec<EgressDatagram>,
     }
 
     impl ForwardDispatch {
         fn new(reply: impl Into<Vec<u8>>) -> Self {
             Self {
                 reply: reply.into(),
-                scratch: Vec::new(),
             }
         }
     }
 
     impl Dispatch for ForwardDispatch {
-        fn on_udp(&mut self, src: SocketAddr, _dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
-            self.scratch = vec![EgressDatagram {
+        fn on_udp(
+            &mut self,
+            src: SocketAddr,
+            _dg: &[u8],
+            _now_ms: u64,
+            out: &mut Vec<EgressDatagram>,
+        ) -> DispatchOut<'_> {
+            out.push(EgressDatagram {
                 fate: 0,
                 dst: src,
                 bytes: self.reply.clone(),
-            }];
-            DispatchOut::Udp(&self.scratch)
+            });
+            DispatchOut::None
         }
 
-        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[EgressDatagram] {
-            &[]
-        }
+        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64, _out: &mut Vec<EgressDatagram>) {}
 
-        fn tick(&mut self, _now_ms: u64) -> Option<&[EgressDatagram]> {
-            None
-        }
+        fn tick(&mut self, _now_ms: u64, _out: &mut Vec<EgressDatagram>) {}
     }
 
     /// Verify that `drain_udp` honours `DispatchOut::Udp`: a datagram arriving

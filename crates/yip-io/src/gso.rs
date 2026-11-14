@@ -48,7 +48,7 @@ pub(crate) fn max_gso_run_len(segment_size: u16, hard_cap: usize) -> usize {
 /// One fate-safe run: indices into the partitioned slice, plus the common
 /// segment size (the shared byte length, or 0 for a non-coalescable singleton).
 /// A run with `members.len() >= 2` is GSO-coalescable; length 1 sends plain.
-pub(crate) struct GsoRun {
+pub struct GsoRun {
     pub segment_size: u16,
     pub members: Vec<usize>,
 }
@@ -60,7 +60,80 @@ pub(crate) struct GsoRun {
 /// the next pass. A zero-length or > `u16` datagram forms its own `segment_size 0`
 /// singleton. Reuses `out` (cleared first). Exactly one run is emitted per pass,
 /// so the loop always makes progress and terminates.
-pub(crate) fn partition_fate_safe(dgs: &[EgressDatagram], hard_cap: usize, out: &mut Vec<GsoRun>) {
+pub fn partition_fate_safe(dgs: &[EgressDatagram], hard_cap: usize, out: &mut Vec<GsoRun>) {
+    if dgs.is_empty() {
+        out.clear();
+        return;
+    }
+
+    if dgs.len() <= 64 {
+        let mut remaining_mask: u64 = if dgs.len() == 64 {
+            !0
+        } else {
+            (1u64 << dgs.len()) - 1
+        };
+
+        let mut run_idx = 0;
+        while remaining_mask != 0 {
+            let head_idx = remaining_mask.trailing_zeros() as usize;
+            remaining_mask &= !(1u64 << head_idx);
+            let head = &dgs[head_idx];
+
+            let seg = match u16::try_from(head.bytes.len()).ok().filter(|&l| l > 0) {
+                Some(s) => s,
+                None => {
+                    // Cannot be a GSO segment (empty or > u16): emit as a singleton.
+                    if run_idx < out.len() {
+                        out[run_idx].segment_size = 0;
+                        out[run_idx].members.clear();
+                        out[run_idx].members.push(head_idx);
+                    } else {
+                        out.push(GsoRun {
+                            segment_size: 0,
+                            members: vec![head_idx],
+                        });
+                    }
+                    run_idx += 1;
+                    continue;
+                }
+            };
+
+            let cap = max_gso_run_len(seg, hard_cap);
+            if run_idx < out.len() {
+                out[run_idx].segment_size = seg;
+                out[run_idx].members.clear();
+                out[run_idx].members.push(head_idx);
+            } else {
+                let mut members = Vec::with_capacity(cap);
+                members.push(head_idx);
+                out.push(GsoRun {
+                    segment_size: seg,
+                    members,
+                });
+            }
+
+            for i in (head_idx + 1)..dgs.len() {
+                if (remaining_mask & (1u64 << i)) == 0 {
+                    continue;
+                }
+                let d = &dgs[i];
+                let members = &out[run_idx].members;
+                let admit = d.dst == head.dst
+                    && d.bytes.len() == head.bytes.len()
+                    && members.iter().all(|&k| dgs[k].fate != d.fate)
+                    && members.len() < cap;
+                if admit {
+                    remaining_mask &= !(1u64 << i);
+                    out[run_idx].members.push(i);
+                }
+            }
+            run_idx += 1;
+        }
+        out.truncate(run_idx);
+        return;
+    }
+
+    // Fallback for batches > 64:
     out.clear();
     let mut remaining: Vec<usize> = (0..dgs.len()).collect();
     while !remaining.is_empty() {
@@ -68,7 +141,6 @@ pub(crate) fn partition_fate_safe(dgs: &[EgressDatagram], hard_cap: usize, out: 
         let head = &dgs[head_idx];
         match u16::try_from(head.bytes.len()).ok().filter(|&l| l > 0) {
             None => {
-                // Cannot be a GSO segment (empty or > u16): emit as a singleton.
                 out.push(GsoRun {
                     segment_size: 0,
                     members: vec![head_idx],

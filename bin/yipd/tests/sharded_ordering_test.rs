@@ -210,16 +210,18 @@ fn test_af_xdp_zero_copy_rx_ring_processing_simulation() {
         received_packets: Vec<Vec<u8>>,
     }
     impl Dispatch for MockDispatch {
-        fn on_udp(&mut self, _src: SocketAddr, dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
+        fn on_udp(
+            &mut self,
+            _src: SocketAddr,
+            dg: &[u8],
+            _now_ms: u64,
+            _out: &mut Vec<EgressDatagram>,
+        ) -> DispatchOut<'_> {
             self.received_packets.push(dg.to_vec());
             DispatchOut::None
         }
-        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64) -> &[EgressDatagram] {
-            &[]
-        }
-        fn tick(&mut self, _now_ms: u64) -> Option<&[EgressDatagram]> {
-            None
-        }
+        fn on_tun(&mut self, _inner: &[u8], _now_ms: u64, _out: &mut Vec<EgressDatagram>) {}
+        fn tick(&mut self, _now_ms: u64, _out: &mut Vec<EgressDatagram>) {}
     }
 
     let mut mock = MockDispatch {
@@ -232,9 +234,10 @@ fn test_af_xdp_zero_copy_rx_ring_processing_simulation() {
     let n = xsk_sock.rx_ring_mut().consume_batch(&mut drained_descs);
     assert_eq!(n, 1);
 
+    let mut egress_batch = Vec::new();
     for desc in &drained_descs[..n] {
         let payload = umem.chunk_slice(desc.addr, desc.len as usize);
-        let _ = mock.on_udp(dummy_src, payload, 0);
+        let _ = mock.on_udp(dummy_src, payload, 0, &mut egress_batch);
         // Replenish chunk address back to fill ring
         assert!(fill_ring.produce(desc.addr));
     }

@@ -2,7 +2,6 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use yip_io::poll::Dispatch;
 
 #[test]
 fn control_socket_tick_integration() {
