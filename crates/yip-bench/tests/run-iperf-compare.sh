@@ -20,10 +20,15 @@ if ! command -v iperf3 >/dev/null 2>&1; then
     exit 0
 fi
 
-# Disable IPv6 DAD in current namespace
+# Disable IPv6 DAD and configure high-BDP socket buffers in current namespace
 sysctl -qw net.ipv6.conf.all.accept_dad=0 \
     net.ipv6.conf.default.accept_dad=0 \
-    net.ipv6.conf.lo.accept_dad=0 2>/dev/null || true
+    net.ipv6.conf.lo.accept_dad=0 \
+    net.core.rmem_max=67108864 \
+    net.core.wmem_max=67108864 \
+    net.ipv4.tcp_rmem="4096 87380 67108864" \
+    net.ipv4.tcp_wmem="4096 65536 67108864" \
+    net.ipv4.tcp_reordering=20 2>/dev/null || true
 
 # ── binary ────────────────────────────────────────────────────────────────────
 if [ $# -ge 1 ] && [ -n "${1:-}" ]; then
@@ -139,13 +144,21 @@ make_pair() {
     ip netns add "$nsR"; ip netns add "$nsS"
     for ns in "$nsR" "$nsS"; do
         ip netns exec "$ns" sysctl -qw net.ipv6.conf.all.accept_dad=0 \
-            net.ipv6.conf.default.accept_dad=0 net.ipv6.conf.lo.accept_dad=0 2>/dev/null || true
+            net.ipv6.conf.default.accept_dad=0 \
+            net.ipv6.conf.lo.accept_dad=0 \
+            net.core.rmem_max=67108864 \
+            net.core.wmem_max=67108864 \
+            net.ipv4.tcp_rmem="4096 87380 67108864" \
+            net.ipv4.tcp_wmem="4096 65536 67108864" \
+            net.ipv4.tcp_reordering=20 2>/dev/null || true
     done
     ip link add "$vR" type veth peer name "$vS"
     ip link set "$vR" netns "$nsR"; ip link set "$vS" netns "$nsS"
     ip netns exec "$nsR" ip addr add "$ipR/24" dev "$vR"
+    ip netns exec "$nsR" ip link set dev "$vR" txqueuelen 10000 2>/dev/null || true
     ip netns exec "$nsR" ip link set "$vR" up; ip netns exec "$nsR" ip link set lo up
     ip netns exec "$nsS" ip addr add "$ipS/24" dev "$vS"
+    ip netns exec "$nsS" ip link set dev "$vS" txqueuelen 10000 2>/dev/null || true
     ip netns exec "$nsS" ip link set "$vS" up; ip netns exec "$nsS" ip link set lo up
 }
 
@@ -157,8 +170,8 @@ apply_netem() {
         ip netns exec "$nsS" tc qdisc del dev "$vS" root 2>/dev/null || true
         return
     fi
-    ip netns exec "$nsR" tc qdisc replace dev "$vR" root netem loss "${loss}%" delay 5ms
-    ip netns exec "$nsS" tc qdisc replace dev "$vS" root netem loss "${loss}%" delay 5ms
+    ip netns exec "$nsR" tc qdisc replace dev "$vR" root netem loss "${loss}%" delay 5ms limit 50000
+    ip netns exec "$nsS" tc qdisc replace dev "$vS" root netem loss "${loss}%" delay 5ms limit 50000
 }
 
 # ── helper: ping a tunnel IP from a netns; echo "<loss%> <avg_rtt_ms>" ─────────
@@ -315,17 +328,22 @@ calc_ram_efficiency() {
     }'
 }
 
+TCP_CC="${TCP_CC:-cubic}"
+IPERF_STREAMS="${IPERF_STREAMS:-1}"
+
 # ── helper: iperf3 TCP Mbit/s; server in <ns_srv> bound to <srv_ip>, client in
 #    <ns_cli> -> <srv_ip>.  echo "<mbps>" ───────────────────────────────────────
 measure_iperf() {
     local ns_srv="$1" srv_ip="$2" ns_cli="$3" v6_flag="" srv_pid mbps
+    local TCP_CC="${TCP_CC:-cubic}"
+    local IPERF_STREAMS="${IPERF_STREAMS:-1}"
     if [[ "$srv_ip" == *:* ]]; then
         v6_flag="-6"
     fi
     ip netns exec "$ns_srv" iperf3 -s -1 -B "$srv_ip" $v6_flag >/dev/null 2>&1 &
     srv_pid=$!
     sleep 0.5
-    mbps="$(ip netns exec "$ns_cli" iperf3 -c "$srv_ip" $v6_flag --connect-timeout 3000 -t 8 2>/dev/null \
+    mbps="$(ip netns exec "$ns_cli" iperf3 -c "$srv_ip" $v6_flag -C "$TCP_CC" -P "$IPERF_STREAMS" --connect-timeout 3000 -t 8 2>/dev/null \
         | grep -i receiver | grep -oP '[0-9.]+ (Mbits|Gbits)/sec' | tail -1 || echo "")"
     kill "$srv_pid" 2>/dev/null || true
     if echo "$mbps" | grep -qi 'Gbits'; then
@@ -507,8 +525,12 @@ setup_wg() {
     if ! ip netns exec "$NS_WA" ip addr add "${TUN_WA_IP}/24" dev wg0 2>/dev/null || \
        ! ip netns exec "$NS_WB" ip addr add "${TUN_WB_IP}/24" dev wg0 2>/dev/null || \
        ! ip netns exec "$NS_WA" ip -6 addr add "${TUN_WA_IP6}/64" dev wg0 nodad 2>/dev/null || \
-       ! ip netns exec "$NS_WB" ip -6 addr add "${TUN_WB_IP6}/64" dev wg0 nodad 2>/dev/null || \
-       ! ip netns exec "$NS_WA" ip link set wg0 up 2>/dev/null || \
+       ! ip netns exec "$NS_WB" ip -6 addr add "${TUN_WB_IP6}/64" dev wg0 nodad 2>/dev/null; then
+        echo "[wg] SKIP: interface setup failed"; WG_AVAILABLE=false; return
+    fi
+    ip netns exec "$NS_WA" ip link set dev wg0 txqueuelen 10000 2>/dev/null || true
+    ip netns exec "$NS_WB" ip link set dev wg0 txqueuelen 10000 2>/dev/null || true
+    if ! ip netns exec "$NS_WA" ip link set wg0 up 2>/dev/null || \
        ! ip netns exec "$NS_WB" ip link set wg0 up 2>/dev/null; then
         echo "[wg] SKIP: interface setup failed"; WG_AVAILABLE=false; return
     fi
@@ -627,6 +649,8 @@ EOF
        ! ip netns exec "$NS_AB" awg setconf awg0 "$CFG_AB" 2>/dev/null; then
         echo "[awg] SKIP: awg setconf failed"; AWG_AVAILABLE=false; return
     fi
+    ip netns exec "$NS_AA" ip link set dev awg0 txqueuelen 10000 2>/dev/null || true
+    ip netns exec "$NS_AB" ip link set dev awg0 txqueuelen 10000 2>/dev/null || true
     if ! ip netns exec "$NS_AA" ip link set awg0 up 2>/dev/null || \
        ! ip netns exec "$NS_AB" ip link set awg0 up 2>/dev/null; then
         echo "[awg] SKIP: ip link set up failed"; AWG_AVAILABLE=false; return
@@ -687,6 +711,8 @@ setup_ovpn() {
             && ip netns exec "$NS_OB" ip link show tun0 >/dev/null 2>&1 && break
         sleep 0.25
     done
+    ip netns exec "$NS_OA" ip link set dev tun0 txqueuelen 10000 2>/dev/null || true
+    ip netns exec "$NS_OB" ip link set dev tun0 txqueuelen 10000 2>/dev/null || true
     ip netns exec "$NS_OA" ip -6 addr add "${TUN_OA_IP6}/64" dev tun0 nodad 2>/dev/null || true
     ip netns exec "$NS_OB" ip -6 addr add "${TUN_OB_IP6}/64" dev tun0 nodad 2>/dev/null || true
     sleep 1
@@ -725,6 +751,8 @@ setup_n2n() {
             && ip netns exec "$NS_NB" ip link show n2n0 >/dev/null 2>&1 && break
         sleep 0.25
     done
+    ip netns exec "$NS_NA" ip link set dev n2n0 txqueuelen 10000 2>/dev/null || true
+    ip netns exec "$NS_NB" ip link set dev n2n0 txqueuelen 10000 2>/dev/null || true
     ip netns exec "$NS_NA" ip -6 addr add "${OVL_NA_IP6}/64" dev n2n0 nodad 2>/dev/null || true
     ip netns exec "$NS_NB" ip -6 addr add "${OVL_NB_IP6}/64" dev n2n0 nodad 2>/dev/null || true
     sleep 2
@@ -785,6 +813,8 @@ setup_zerotier() {
     local zt_a_if zt_b_if
     zt_a_if="$(ip netns exec "$NS_ZA" ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^zt' | head -1 || true)"
     zt_b_if="$(ip netns exec "$NS_ZB" ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^zt' | head -1 || true)"
+    [ -n "$zt_a_if" ] && ip netns exec "$NS_ZA" ip link set dev "$zt_a_if" txqueuelen 10000 2>/dev/null || true
+    [ -n "$zt_b_if" ] && ip netns exec "$NS_ZB" ip link set dev "$zt_b_if" txqueuelen 10000 2>/dev/null || true
     [ -n "$zt_a_if" ] && ip netns exec "$NS_ZA" ip -6 addr add "${TUN_ZA_IP6}/64" dev "$zt_a_if" nodad 2>/dev/null || true
     [ -n "$zt_b_if" ] && ip netns exec "$NS_ZB" ip -6 addr add "${TUN_ZB_IP6}/64" dev "$zt_b_if" nodad 2>/dev/null || true
     echo "[zerotier] network up"
@@ -843,6 +873,8 @@ EOF
     if [ "$found" = false ]; then
         echo "[tailscale] SKIP: tailscale tunnel activation timed out"; TS_AVAILABLE=false; return
     fi
+    ip netns exec "$NS_TA" ip link set dev tailscale0 txqueuelen 10000 2>/dev/null || true
+    ip netns exec "$NS_TB" ip link set dev tailscale0 txqueuelen 10000 2>/dev/null || true
     ip netns exec "$NS_TA" ip -6 addr add "${TUN_TA_IP6}/64" dev tailscale0 nodad 2>/dev/null || true
     ip netns exec "$NS_TB" ip -6 addr add "${TUN_TB_IP6}/64" dev tailscale0 nodad 2>/dev/null || true
     echo "[tailscale] tunnel up"
@@ -858,6 +890,8 @@ setup_netbird() {
     fi
     echo "[netbird] creating namespaces and veth pair"
     make_pair "$NS_BA" "$NS_BB" "$VBA" "$VBB" "$VBA_IP" "$VBB_IP"
+    ip netns exec "$NS_BA" ip link set dev wt0 txqueuelen 10000 2>/dev/null || true
+    ip netns exec "$NS_BB" ip link set dev wt0 txqueuelen 10000 2>/dev/null || true
     echo "[netbird] SKIP: local management service not running"; NB_AVAILABLE=false
 }
 setup_netbird
@@ -871,7 +905,8 @@ echo ""
 echo "=========================================================="
 echo "  iperf3 TCP & UDP throughput + ping latency/loss under netem"
 echo "  dual-stack IPv4 & IPv6 with CPU telemetry from /proc/stat"
-echo "  ping -c ${PING_COUNT} -i ${PING_INTERVAL}; iperf3 -t 8; netem: loss X% delay 5ms (symmetric)"
+echo "  ping -c ${PING_COUNT} -i ${PING_INTERVAL}; iperf3 -t 8; netem: loss X% delay 5ms (symmetric) limit 50000"
+echo "  TCP cc: ${TCP_CC}, streams: ${IPERF_STREAMS}"
 echo "  UDP rate: ${UDP_RATE:-10G}, len: ${UDP_LEN:-1400}"
 echo "=========================================================="
 
