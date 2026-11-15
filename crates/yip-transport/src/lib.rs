@@ -30,6 +30,12 @@ pub use plpmtu::{
     PLPMTU_LADDER, PROBE_INTERVAL_MS,
 };
 
+pub mod pmtu;
+pub use pmtu::{
+    clamp_tcp_mss, clamp_tcp_mss_for_mtu, is_tcp_syn, max_mss_for_mtu, maybe_clamp_tcp_syn,
+    update_csum_16, PmtuManager, UnderlayTier,
+};
+
 pub mod fec;
 pub use fec::{
     hash_key, shard_for_fec_symbol, FecEncoder, FecReassembler, FecScratchArena, ObjState,

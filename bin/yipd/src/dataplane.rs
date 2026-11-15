@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use yip_transport::{
-    ControlFrame, FlowClass, LossDetector, PlpmtuController, RetxBuffer, Transport,
+    ControlFrame, FlowClass, LossDetector, PlpmtuController, PmtuManager, RetxBuffer, Transport,
 };
 use yip_wire::{Codec, WireCodec as _};
 
@@ -211,6 +211,8 @@ pub struct DataPlane {
     arq_retx_count: u64,
     /// In-band PLPMTUD state machine.
     pub plpmtu: PlpmtuController,
+    /// Dynamic underlay path MTU and TCP MSS clamping manager.
+    pub pmtu: PmtuManager,
     /// Optional DAITA probabilistic state machine engine for traffic analysis defense.
     pub daita_engine: Option<yip_obf::DaitaEngine>,
 
@@ -239,6 +241,8 @@ pub struct DataPlane {
     seal_buf: Vec<u8>,
     /// Reused scratch for wire frame construction in `on_tun_into`.
     wire_payload_scratch: Vec<u8>,
+    /// Reused scratch for TCP SYN MSS clamping on the egress tunnel dispatch hotpath.
+    syn_clamp_buf: Vec<u8>,
 }
 
 impl DataPlane {
@@ -373,6 +377,7 @@ impl DataPlane {
             feedback_interval_ms: FEEDBACK_INTERVAL_MS,
             arq_retx_count: 0,
             plpmtu: PlpmtuController::new(),
+            pmtu: PmtuManager::new(),
             daita_engine: None,
             egress_scratch: Vec::new(),
             egress_pool: Vec::new(),
@@ -383,6 +388,7 @@ impl DataPlane {
             tick_scratch: Vec::new(),
             seal_buf: Vec::new(),
             wire_payload_scratch: Vec::new(),
+            syn_clamp_buf: Vec::new(),
         }
     }
 
@@ -404,6 +410,7 @@ impl DataPlane {
         if self.peer_addr != addr {
             let floor = self.plpmtu.reset_to_floor();
             self.transport.set_symbol_size(floor);
+            self.pmtu.on_blackhole_detected();
         }
         self.peer_addr = addr;
     }
@@ -462,8 +469,14 @@ impl DataPlane {
             }
         }
 
+        let effective_inner = if !self.l2 {
+            self.pmtu.clamp_syn(inner, &mut self.syn_clamp_buf)
+        } else {
+            inner
+        };
+
         // ── 1. Seal (no-alloc: writes into the reused `seal_buf`) ──────────────
-        let counter = match self.session.seal_into(inner, &mut self.seal_buf) {
+        let counter = match self.session.seal_into(effective_inner, &mut self.seal_buf) {
             Ok(c) => c,
             Err(_) => return,
         };
@@ -471,7 +484,7 @@ impl DataPlane {
         // ── 2. FEC-encode (zero-allocation encode using transport arena) ──────
         let (class, symbols) =
             self.transport
-                .encode_scratch(&self.seal_buf, inner, self.l2, now_ms);
+                .encode_scratch(&self.seal_buf, effective_inner, self.l2, now_ms);
 
         // ── 3. Auxiliary bookkeeping ──────────────────────────────────────────
         self.sent_log.insert(counter, class);
@@ -746,6 +759,7 @@ impl DataPlane {
                         if severe_default || severe_bulk {
                             if let Some(floor) = self.plpmtu.on_blackhole() {
                                 self.transport.set_symbol_size(floor);
+                                self.pmtu.on_blackhole_detected();
                             }
                         }
 
@@ -840,6 +854,7 @@ impl DataPlane {
                     } => {
                         if let Some(new_sym) = self.plpmtu.on_ack(probe_id, accepted_symbol_size) {
                             self.transport.set_symbol_size(new_sym);
+                            self.pmtu.on_probe_confirmed(new_sym);
                         }
                         Outcome::None
                     }
@@ -1480,12 +1495,56 @@ mod tests {
         assert_eq!(a.transport.symbol_size(), 1320);
         assert_eq!(a.plpmtu.current_symbol_size(), 1320);
 
-        // Roaming to new address resets to floor 1120
+        // Roaming to new address resets to floor 1120 and TUN MTU to 1184
         let new_addr: SocketAddr = "203.0.113.99:51820".parse().unwrap();
         a.set_peer_addr(new_addr);
         assert_eq!(a.peer_addr, new_addr);
         assert_eq!(a.transport.symbol_size(), 1120);
         assert_eq!(a.plpmtu.current_symbol_size(), 1120);
+        assert_eq!(a.pmtu.tun_mtu(), 1184);
+    }
+
+    #[test]
+    fn test_dataplane_on_tun_into_clamps_tcp_syn_mss() {
+        let (mut a, mut b) = dataplane_pair(TunnelMode::L3Tun, false);
+        let mut out = Vec::new();
+
+        // Craft IPv4 TCP SYN with MSS 1460
+        let mut syn = vec![0u8; 44];
+        syn[0] = 0x45;
+        syn[2..4].copy_from_slice(&(44u16).to_be_bytes());
+        syn[8] = 64;
+        syn[9] = 6; // TCP
+        syn[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        syn[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        syn[20..22].copy_from_slice(&(12345u16).to_be_bytes());
+        syn[22..24].copy_from_slice(&(80u16).to_be_bytes());
+        syn[32] = 0x60; // 24B TCP
+        syn[33] = 0x02; // SYN
+        syn[40] = 2; // MSS
+        syn[41] = 4;
+        syn[42..44].copy_from_slice(&(1460u16).to_be_bytes());
+
+        // Baseline MTU is 1420 -> max IPv4 MSS = 1420 - 40 = 1380
+        a.on_tun_into(&syn, 100, &mut out);
+        assert!(!out.is_empty());
+
+        // Deliver datagrams to peer B and verify decrypted packet has clamped MSS = 1380
+        let mut decrypted_syn = None;
+        for dg in out.drain(..) {
+            if let Outcome::TunWrite(payload) = b.on_udp_datagram(&dg.bytes, 100) {
+                decrypted_syn = Some(payload.to_vec());
+                break;
+            }
+        }
+
+        let frame = decrypted_syn.expect("peer B must decrypt and reassemble SYN frame");
+        assert_eq!(frame.len(), 44);
+        let clamped_mss = u16::from_be_bytes([frame[42], frame[43]]);
+        assert_eq!(
+            clamped_mss, 1380,
+            "MSS option must be clamped from 1460 down to 1380"
+        );
     }
 
     #[test]
@@ -1679,8 +1738,8 @@ mod tests {
 
         let ratio_after_loss = a.bulk_repair_ratio();
         assert!(
-            (ratio_after_loss - 0.25).abs() < 1e-4,
-            "windowed loss fraction 0.20 jumps bulk ratio to 0.25; got {ratio_after_loss}"
+            (ratio_after_loss - 0.35).abs() < 1e-4,
+            "windowed loss fraction 0.20 triggers severe-loss scaling with velocity boost to 0.35; got {ratio_after_loss}"
         );
 
         // Window 3: consecutive report with clean traffic
@@ -1703,8 +1762,8 @@ mod tests {
 
         let ratio_after_clean2 = a.bulk_repair_ratio();
         assert!(
-            (ratio_after_clean2 - (0.25 * 0.9)).abs() < 1e-4,
-            "consecutive clean report decays bulk ratio from 0.25 to 0.225; got {ratio_after_clean2}"
+            (ratio_after_clean2 - (0.35 * 0.95)).abs() < 1e-4,
+            "consecutive clean report decays bulk ratio from 0.35 down toward target; got {ratio_after_clean2}"
         );
 
         // Duplicate / out-of-order high_counter fallback test:

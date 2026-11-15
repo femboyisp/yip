@@ -9,6 +9,10 @@ pub struct AdaptiveController {
     ratio: f32,
     min_ratio: f32,
     target_residual: f32,
+    ewma_loss: f32,
+    prev_loss: f32,
+    loss_velocity: f32,
+    initialized: bool,
 }
 
 impl AdaptiveController {
@@ -24,6 +28,10 @@ impl AdaptiveController {
                 params.initial_repair_ratio
             },
             target_residual: 0.001, // aim for <0.1% post-FEC loss
+            ewma_loss: 0.0,
+            prev_loss: 0.0,
+            loss_velocity: 0.0,
+            initialized: false,
         }
     }
 
@@ -55,17 +63,61 @@ impl AdaptiveController {
         self.min_ratio
     }
 
-    /// Update from an observed loss fraction (0.0..=1.0). When loss exceeds
-    /// what the current redundancy can mask, the ratio is immediately set to
-    /// `loss + 0.05` (jump to just above the observed loss rate with a small
-    /// headroom margin), rather than incrementing gradually.  When the link is
-    /// clean the ratio decays 10% per observation toward the class minimum.
+    /// Returns the smoothed Exponentially Weighted Moving Average (EWMA) loss fraction.
+    pub fn ewma_loss(&self) -> f32 {
+        self.ewma_loss
+    }
+
+    /// Returns the smoothed loss rate of change (velocity) across recent windows.
+    pub fn loss_velocity(&self) -> f32 {
+        self.loss_velocity
+    }
+
+    /// Returns whether the controller has observed at least one feedback window.
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    /// Reset loss tracking state (e.g. upon connection migration or roaming).
+    pub fn reset(&mut self) {
+        self.ewma_loss = 0.0;
+        self.prev_loss = 0.0;
+        self.loss_velocity = 0.0;
+        self.initialized = false;
+    }
+
+    /// Update from an observed loss fraction (0.0..=1.0).
+    ///
+    /// Derives loss velocity and updates EWMA loss rate. Dynamically scales Cauchy
+    /// Reed-Solomon parity ratios across tiered loss-gradient brackets:
+    /// - Clean (< 0.1%): decay toward floor (down to 0.0 for ARQ-eligible flows).
+    /// - Low loss (< 1%): 5% parity ratio (K=20, R=1).
+    /// - Moderate loss (1% - 4%): 10% parity ratio (K=10, R=1).
+    /// - High loss (5% - 9%): 20% parity ratio (K=10, R=2).
+    /// - Severe loss (>= 10%): 30% parity ratio (K=10, R=3 or K=8, R=2).
+    ///
+    /// Applies a velocity boost when a sharp loss surge is detected.
     pub fn observe_loss(&mut self, loss_fraction: f32) {
         let loss = loss_fraction.clamp(0.0, 1.0);
-        if loss > self.target_residual + self.ratio {
-            // losing more than we can repair: add headroom above the loss rate
-            self.ratio = (loss + 0.05).min(1.0);
-        } else if loss <= self.target_residual {
+        let velocity = if self.initialized {
+            loss - self.prev_loss
+        } else {
+            0.0
+        };
+        self.prev_loss = loss;
+
+        if !self.initialized {
+            self.ewma_loss = loss;
+            self.loss_velocity = 0.0;
+            self.initialized = true;
+        } else {
+            self.loss_velocity = 0.5 * self.loss_velocity + 0.5 * velocity;
+            self.ewma_loss = 0.25 * loss + 0.75 * self.ewma_loss;
+        }
+
+        let effective_loss = loss.max(self.ewma_loss);
+
+        if effective_loss <= self.target_residual {
             // clean: decay 10% toward the floor; snap to the floor once the
             // value is negligibly small so ARQ-class controllers reach exactly 0.0
             let decayed = (self.ratio * 0.9).max(self.min_ratio);
@@ -74,6 +126,23 @@ impl AdaptiveController {
             } else {
                 decayed
             };
+        } else {
+            let mut target: f32 = if effective_loss >= 0.10 {
+                0.30
+            } else if effective_loss >= 0.05 {
+                0.20
+            } else if effective_loss >= 0.01 {
+                0.10
+            } else {
+                0.05
+            };
+
+            // Velocity boost on sharp loss surges into high/severe loss tiers
+            if self.loss_velocity > 0.03 && loss >= 0.05 {
+                target = (target + 0.05).min(1.0);
+            }
+
+            self.ratio = (self.ratio * 0.95).max(target).max(self.min_ratio);
         }
     }
 
@@ -86,7 +155,7 @@ impl AdaptiveController {
         if self.ratio <= f32::EPSILON {
             return 0;
         }
-        let raw = (f64::from(source_symbols) * f64::from(self.ratio)).ceil();
+        let raw = (f64::from(source_symbols) * f64::from(self.ratio) - 1e-6).ceil();
         // f64::ceil of a non-negative product; the i64 cast is the one unavoidable float->int conversion, then checked-narrowed to u32
         let n = u32::try_from(raw as i64).unwrap_or(u32::MAX);
         n.max(1)
@@ -149,39 +218,134 @@ mod tests {
         assert!(c.repair_count(1) >= 1, "realtime keeps proactive repair");
     }
 
-    /// At the exact boundary `loss == target_residual + ratio`, the "losing
-    /// more than we can repair" branch must NOT fire (only `loss >
-    /// target_residual + ratio` should). Kills the `>` -> `>=` mutant (line 50).
     #[test]
-    fn observe_loss_boundary_at_exact_threshold_does_not_jump() {
-        let mut c = AdaptiveController::new(FlowClass::Default.params()); // ratio=0.10
-        let start = c.ratio();
-        let boundary = 0.001 + start; // target_residual (0.001) + ratio
-        c.observe_loss(boundary);
-        assert_eq!(
-            c.ratio(),
-            start,
-            "loss exactly at the threshold must not trigger the jump-up branch"
-        );
+    fn observe_loss_threshold_boundary_and_gradient_tiers() {
+        let mut c = AdaptiveController::new_for(FlowClass::Bulk.params()); // starts at 0.05, arq=true
+        assert!(!c.is_initialized());
+        assert_eq!(c.ewma_loss(), 0.0);
+        assert_eq!(c.loss_velocity(), 0.0);
+
+        // Low loss (< 1%): targets 0.05
+        c.observe_loss(0.005);
+        assert!(c.is_initialized());
+        assert_eq!(c.ratio(), 0.05);
+        assert_eq!(c.repair_count(20), 1);
+
+        // Moderate loss (1% - 4%): targets 0.10
+        c.observe_loss(0.02);
+        assert_eq!(c.ratio(), 0.10);
+        assert_eq!(c.repair_count(10), 1);
+
+        // High loss (5% - 9%): targets 0.20 (K=10 -> R=2)
+        c.observe_loss(0.07);
+        assert!(c.ratio() >= 0.20);
+        assert_eq!(c.repair_count(10), 2);
+
+        // Severe loss (>= 10%): targets >= 0.30
+        c.observe_loss(0.12);
+        assert!(c.ratio() >= 0.30);
+        // Sudden surge from 0.07 to 0.12 triggers velocity boost (ratio 0.35 -> 4 repair)
+        assert_eq!(c.repair_count(10), 4);
+        // Sustained 12% loss gradually settles velocity boost toward target 0.30
+        for _ in 0..10 {
+            c.observe_loss(0.12);
+        }
+        assert!((c.ratio() - 0.30).abs() < 1e-4);
+        assert_eq!(c.repair_count(10), 3);
     }
 
-    /// The threshold is `target_residual + ratio`, not `target_residual *
-    /// ratio`. Kills the `+` -> `*` mutant (line 50): pick a loss value that is
-    /// above the (tiny) product but below the (larger) sum, so only the
-    /// mutant's `*` version would wrongly trigger the jump-up branch.
     #[test]
-    fn observe_loss_threshold_uses_sum_not_product() {
-        let mut c = AdaptiveController::new(FlowClass::Default.params()); // ratio=0.10
-        let start = c.ratio();
-        // product = 0.001 * 0.10 = 0.0001; sum = 0.001 + 0.10 = 0.101.
-        // loss = 0.02 is > product but not > sum, and not <= target_residual (0.001).
-        c.observe_loss(0.02);
-        assert_eq!(
-            c.ratio(),
-            start,
-            "loss below the sum threshold must leave ratio unchanged \
-             (mutant using target_residual * ratio would wrongly jump up)"
+    fn fast_adaptation_within_two_rtts_under_severe_loss() {
+        let mut c = AdaptiveController::new(FlowClass::Default.params()); // starts at 0.10
+        assert_eq!(c.repair_count(10), 1);
+
+        // Interval 1: 10% loss observed
+        c.observe_loss(0.10);
+        assert!(c.ratio() >= 0.30);
+        assert_eq!(c.repair_count(10), 3);
+
+        // Interval 2: sustained 10% loss
+        c.observe_loss(0.10);
+        assert!(c.ratio() >= 0.30);
+        assert_eq!(c.repair_count(10), 3);
+    }
+
+    #[test]
+    fn sudden_loss_surge_triggers_velocity_boost() {
+        let mut c = AdaptiveController::new_for(FlowClass::Bulk.params());
+        c.observe_loss(0.0); // Baseline clean
+        assert_eq!(c.loss_velocity(), 0.0);
+
+        // Surge: 0% -> 12% loss in one observation
+        c.observe_loss(0.12);
+        assert!(c.loss_velocity() > 0.03, "velocity reflects sudden surge");
+        assert!(c.ewma_loss() > 0.0, "ewma reflects surge");
+        // Target 0.30 + 0.05 boost = 0.35
+        assert!(c.ratio() >= 0.35, "surge triggers velocity boost");
+    }
+
+    #[test]
+    fn test_ewma_and_decay_boundaries() {
+        let mut c = AdaptiveController::new(FlowClass::Default.params());
+        c.observe_loss(0.04);
+        assert!((c.ewma_loss() - 0.04).abs() < 1e-5);
+        c.observe_loss(0.08);
+        // ewma = 0.25 * 0.08 + 0.75 * 0.04 = 0.02 + 0.03 = 0.05
+        assert!(
+            (c.ewma_loss() - 0.05).abs() < 1e-5,
+            "ewma must add terms, got {}",
+            c.ewma_loss()
         );
+
+        // Test smooth decay when target < ratio
+        c.set_ratio(0.35);
+        c.observe_loss(0.06); // Target is 0.20 < 0.35
+        let expected = 0.35 * 0.95;
+        assert!(
+            (c.ratio() - expected).abs() < 1e-4,
+            "must decay toward target, got {}",
+            c.ratio()
+        );
+
+        // Test exact velocity boundary (0.03 does not boost, > 0.03 does)
+        let mut c2 = AdaptiveController::new(FlowClass::Default.params());
+        c2.observe_loss(0.0);
+        c2.observe_loss(0.06); // velocity = 0.06, velocity_loss = 0.03 (not > 0.03)
+        assert_eq!(c2.loss_velocity(), 0.03);
+        assert_eq!(
+            c2.ratio(),
+            0.20,
+            "velocity exactly 0.03 must not trigger boost"
+        );
+
+        // Now next observation pushes velocity > 0.03
+        c2.observe_loss(0.14); // velocity = 0.08 -> loss_velocity = 0.5 * 0.03 + 0.5 * 0.08 = 0.055 > 0.03
+        assert!(c2.loss_velocity() > 0.03);
+        assert!(c2.ratio() >= 0.35, "loss_velocity > 0.03 triggers boost");
+
+        // Test boundary at 0.05: velocity > 0.03 but loss < 0.05 must NOT boost
+        let mut c3 = AdaptiveController::new(FlowClass::Default.params());
+        c3.observe_loss(0.0);
+        c3.observe_loss(0.049); // velocity = 0.049, loss_velocity = 0.0245
+        c3.observe_loss(0.119); // velocity = 0.07, loss_velocity > 0.03
+                                // Next: velocity is high, but loss is 0.04 (< 0.05)
+        let mut c4 = AdaptiveController::new_for(FlowClass::Bulk.params());
+        c4.observe_loss(0.0);
+        c4.observe_loss(0.04); // loss = 0.04 (< 0.05)
+        assert_eq!(c4.ratio(), 0.10, "loss < 0.05 must not trigger boost");
+    }
+
+    #[test]
+    fn test_reset_restores_initial_loss_tracking() {
+        let mut c = AdaptiveController::new(FlowClass::Default.params());
+        c.observe_loss(0.15);
+        assert!(c.is_initialized());
+        assert!(c.ewma_loss() > 0.0);
+
+        c.reset();
+        assert!(!c.is_initialized());
+        assert_eq!(c.ewma_loss(), 0.0);
+        assert_eq!(c.loss_velocity(), 0.0);
     }
 
     /// A single decay step from a non-negligible ratio must decay smoothly

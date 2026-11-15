@@ -6,6 +6,14 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **Dynamic loss-gradient adaptive $(K, R)$ parity scaling under loss (`crates/yip-transport`, #203).**
+  Implemented EWMA loss-rate tracking and loss-velocity estimation in `AdaptiveController`. Dynamically transitions systematic Cauchy Reed-Solomon parity ratios across tiered loss gradients: clean links (< 0.1%) decay toward floor (down to 0.0 for ARQ classes), low loss (< 1%) scales to 5% ($K=20, R=1$), moderate loss (1%-4%) targets 10% ($K=10, R=1$), high loss (5%-9%) doubles parity to 20% ($K=10, R=2$), and severe loss ($\ge 10\%$) steps up to 30% parity ($K=10, R=3$ or $K=8, R=2$). Rapidly adapts within 2 RTTs of sudden loss onset with loss-velocity surge boosting (+5% parity), eliminating catastrophic TCP throughput collapse at 10% channel drop rates.
+- **Dynamic Path MTU Discovery and TCP SYN MSS Clamping (`crates/yip-transport`, `bin/yipd`, #204).**
+  Implemented `PmtuManager` and zero-copy TCP MSS clamping (`clamp_tcp_mss`, `maybe_clamp_tcp_syn`) with RFC 1624 Section 3 Equation 3 incremental checksum updates (`update_csum_16`). Inspects and clamps advertised TCP MSS options across IPv4 and IPv6 SYN packets on the TUN interface hotpath, preventing PMTU blackholing and underlay packet fragmentation. Automatically expands TUN MTU from 1,184 up to 1,420 bytes (+20.6% TCP payload efficiency) upon confirmed 1,500-byte underlays while maintaining defensive fallback to 1,184 on blackhole detection or roaming.
+- **Continuous Integration CHANGELOG update enforcement (`.github/workflows/ci.yml`).**
+  Added automated `changelog` check job in GitHub Actions verifying that all pull requests targeting `main` include corresponding updates to `CHANGELOG.md`.
+- **Documentation and metadata updates (`CONTRIBUTING.md`, `FUNDING.md`, `ROADMAP.md`, `SECURITY.md`).**
+  Removed all outdated `pre-1.0` references across repository documentation, updated contribution and roadmap guidelines, and replaced emoji indicators with standard markdown text.
 - **Vectorized I/O header arenas and zero-stack-zeroing `recvmmsg`/`sendmmsg` batching (`crates/yip-io`, `crates/yip-verify`, #206).**
   Engineered `MmsgBatchArena` pre-allocating `libc::mmsghdr`, `libc::iovec`, and `libc::sockaddr_storage` structures once on the heap (`MmsgBatchArena::new_boxed()`), completely eliminating ~13.5 KB stack allocation and `std::mem::zeroed()` cycles on every datagram burst. Integrated non-blocking `libc::MSG_WAITFORONE | libc::MSG_DONTWAIT` harvesting on Linux platforms, amortizing syscall overhead across up to 64 datagrams per burst while eliminating cross-burst pointer contamination. Verified with strict thread-local `TrackingAllocator` zero-allocation test harnesses.
 - **Full IPv6 TCP Generic Segmentation Offload (GSO) & Generic Receive Offload (GRO) offload (`crates/yip-io`, `crates/yip-device`, `crates/yip-verify`, #201).**

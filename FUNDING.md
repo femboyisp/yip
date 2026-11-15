@@ -1,6 +1,6 @@
 # Funding yip
 
-yip is free software (AGPL-3.0-or-later), pre-1.0, and independent. It isn't for sale and
+yip is free software (AGPL-3.0-or-later) and independent. It isn't for sale and
 it isn't chasing anyone's approval — but building it takes real time, and if yip is useful to
 you, support keeps that time flowing. Every avenue below is optional and no-strings. Fund it
 however suits you; the code stays open either way.
