@@ -86,14 +86,18 @@ setup_zerotier() {
         log "ZeroTier is already installed ($(which zerotier-one))"
         return
     fi
-    if command -v apt-get >/dev/null 2>&1; then
-        curl -s 'https://raw.githubusercontent.com/zerotier/ZeroTierOne/master/doc/contact%40zerotier.com.gpg' | gpg --dearmor -o /usr/share/keyrings/zerotierone-archive-keyring.gpg 2>/dev/null || true
-        apt-get update && apt-get install -y zerotier-one || warn "apt-get install zerotier-one failed"
-    elif command -v curl >/dev/null 2>&1; then
+    if command -v curl >/dev/null 2>&1; then
         curl -s https://install.zerotier.com | bash || warn "ZeroTier quick install script failed"
+    elif command -v apt-get >/dev/null 2>&1; then
+        local release
+        release="$(lsb_release -cs 2>/dev/null || echo 'jammy')"
+        curl -s 'https://raw.githubusercontent.com/zerotier/ZeroTierOne/master/doc/contact%40zerotier.com.gpg' | gpg --dearmor -o /usr/share/keyrings/zerotierone-archive-keyring.gpg 2>/dev/null || true
+        echo "deb [signed-by=/usr/share/keyrings/zerotierone-archive-keyring.gpg] http://download.zerotier.com/debian/$release $release main" > /etc/apt/sources.list.d/zerotier.list 2>/dev/null || true
+        apt-get update && apt-get install -y zerotier-one || warn "apt-get install zerotier-one failed"
     else
         warn "Package manager or curl not found; please install zerotier-one manually."
     fi
+    log "ZeroTier setup step complete."
 }
 
 setup_n2n() {
