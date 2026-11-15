@@ -252,6 +252,7 @@ pub struct DataPlane {
     tun_drained: Vec<Vec<u8>>,
     tun_drained_count: usize,
     tick_tun_drained: Vec<Vec<u8>>,
+    tick_tun_drained_count: usize,
 }
 
 impl DataPlane {
@@ -401,7 +402,8 @@ impl DataPlane {
             reorder_buffer: yip_transport::reorder::ReorderBuffer::default(),
             tun_drained: (0..32).map(|_| Vec::with_capacity(2048)).collect(),
             tun_drained_count: 0,
-            tick_tun_drained: Vec::with_capacity(32),
+            tick_tun_drained: (0..32).map(|_| Vec::with_capacity(2048)).collect(),
+            tick_tun_drained_count: 0,
         }
     }
 
@@ -909,9 +911,17 @@ impl DataPlane {
     /// feedback packet was built (the caller must send it to the peer).
     /// Returns `None` if no feedback interval has elapsed.
     pub fn tick(&mut self, now_ms: u64) -> Option<&[yip_io::poll::EgressDatagram]> {
+        self.tick_tun_drained_count = 0;
         let tick_drained = &mut self.tick_tun_drained;
+        let tick_drained_count = &mut self.tick_tun_drained_count;
         self.reorder_buffer.poll_timeouts(now_ms, |pkt| {
-            tick_drained.push(pkt.to_vec());
+            if *tick_drained_count < tick_drained.len() {
+                tick_drained[*tick_drained_count].clear();
+                tick_drained[*tick_drained_count].extend_from_slice(pkt);
+            } else {
+                tick_drained.push(pkt.to_vec());
+            }
+            *tick_drained_count += 1;
         });
 
         if now_ms.saturating_sub(self.last_sweep_ms) >= MAC_SWEEP_INTERVAL_MS {
@@ -1004,7 +1014,10 @@ impl DataPlane {
 
     /// Drain any pending packets (e.g. flushed due to expired reorder deadlines).
     pub fn drain_tun(&mut self, out: &mut Vec<Vec<u8>>) {
-        out.append(&mut self.tick_tun_drained);
+        for pkt in &self.tick_tun_drained[..self.tick_tun_drained_count] {
+            out.push(pkt.clone());
+        }
+        self.tick_tun_drained_count = 0;
     }
 }
 

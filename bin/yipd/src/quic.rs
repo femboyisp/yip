@@ -673,6 +673,7 @@ pub fn run_quic(
     // the inner yip handshake builds any DataPlane (received frames — which
     // trigger the inner handshake — are processed after this point each loop).
     let mut symbol_set = false;
+    let mut tun_batch = Vec::new();
 
     loop {
         let now = Instant::now();
@@ -738,6 +739,10 @@ pub fn run_quic(
         let ticked = manager.tick(now_ms).map(|dgs| dgs.to_vec());
         if let Some(egress) = ticked {
             send_egress(&mut qe, &egress, now, &mut out);
+        }
+        manager.drain_tun(&mut tun_batch);
+        for inner in tun_batch.drain(..) {
+            write_tun(tun_fd, &inner);
         }
 
         // 7. Flush any transmits the sends/handshake progression produced.

@@ -772,6 +772,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                 let start = std::time::Instant::now();
                 let mut cached_now_ms: u64 = 0;
                 let mut spsc_batch = Vec::new();
+                let mut tun_batch = Vec::new();
 
                 loop {
                     if SHUTDOWN.load(Ordering::Relaxed) {
@@ -1184,6 +1185,10 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                         egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
                                     let _ = batch_sock.sendmmsg_batch(&egress_batch);
                                 }
+                            }
+                            manager.drain_tun(&mut tun_batch);
+                            for inner in tun_batch.drain(..) {
+                                write_tun(tun_fd, &inner, vnet_len > 0);
                             }
                             if shard_id == 0 {
                                 for epoch in manager.drain_new_epochs() {

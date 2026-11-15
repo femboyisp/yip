@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::alloc::System;
 use std::net::SocketAddr;
 use yip_crypto::{generate_keypair, Handshake};
