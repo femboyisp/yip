@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # setup-contenders.sh — Turnkey helper to install or build optional benchmark contenders:
-#   AmneziaWG, ZeroTier, Tailscale (with Headscale coordinator), and NetBird.
+#   wireguard-go, AmneziaWG, ZeroTier, Tailscale (with Headscale coordinator), and NetBird.
 #
 # Usage:
 #   sudo ./setup-contenders.sh --all
+#   sudo ./setup-contenders.sh --wireguard-go
 #   sudo ./setup-contenders.sh --amneziawg
 #   sudo ./setup-contenders.sh --zerotier
 #   sudo ./setup-contenders.sh --tailscale
@@ -31,6 +32,8 @@ check_status() {
     log "Checking contender tool availability:"
     printf "  %-12s : " "WireGuard"
     command -v wg >/dev/null 2>&1 && echo "INSTALLED ($(which wg))" || echo "MISSING"
+    printf "  %-12s : " "WireGuard-Go"
+    command -v wireguard-go >/dev/null 2>&1 && echo "INSTALLED ($(which wireguard-go))" || echo "MISSING"
     printf "  %-12s : " "OpenVPN"
     command -v openvpn >/dev/null 2>&1 && echo "INSTALLED ($(which openvpn))" || echo "MISSING"
     printf "  %-12s : " "n2n"
@@ -43,6 +46,16 @@ check_status() {
     (command -v tailscaled >/dev/null 2>&1 && command -v headscale >/dev/null 2>&1) && echo "INSTALLED" || echo "MISSING"
     printf "  %-12s : " "NetBird"
     command -v netbird >/dev/null 2>&1 && echo "INSTALLED ($(which netbird))" || echo "MISSING"
+}
+
+setup_wireguard_go() {
+    log "Building wireguard-go..."
+    if ! command -v go >/dev/null 2>&1; then err "Go toolchain required to build wireguard-go"; fi
+    GOBIN="$TARGET_BIN_DIR" go install golang.zx2c4.com/wireguard@latest || warn "wireguard-go compile failed"
+    if [ -f "$TARGET_BIN_DIR/wireguard" ] && [ ! -f "$TARGET_BIN_DIR/wireguard-go" ]; then
+        ln -sf "$TARGET_BIN_DIR/wireguard" "$TARGET_BIN_DIR/wireguard-go" 2>/dev/null || cp -f "$TARGET_BIN_DIR/wireguard" "$TARGET_BIN_DIR/wireguard-go" 2>/dev/null || true
+    fi
+    log "wireguard-go setup step complete."
 }
 
 setup_amneziawg() {
@@ -111,10 +124,14 @@ fi
 while [ $# -gt 0 ]; do
     case "$1" in
         --all)
+            setup_wireguard_go
             setup_amneziawg
             setup_zerotier
             setup_tailscale
             setup_netbird
+            ;;
+        --wireguard-go)
+            setup_wireguard_go
             ;;
         --amneziawg)
             setup_amneziawg
@@ -133,7 +150,7 @@ while [ $# -gt 0 ]; do
             ;;
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 [--all | --amneziawg | --zerotier | --tailscale | --netbird | --check]"
+            echo "Usage: $0 [--all | --wireguard-go | --amneziawg | --zerotier | --tailscale | --netbird | --check]"
             exit 1
             ;;
     esac

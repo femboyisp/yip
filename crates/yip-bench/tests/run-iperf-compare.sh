@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run-iperf-compare.sh — iperf3 TCP & UDP throughput + ping latency/loss under netem,
 # across contemporary tunnels and mesh overlays in dual-stack IPv4 and IPv6:
-#   yip, WireGuard, AmneziaWG, OpenVPN, n2n, ZeroTier, Tailscale, NetBird.
+#   yip, WireGuard, WireGuard-Go, AmneziaWG, OpenVPN, n2n, ZeroTier, Tailscale, NetBird.
 #
 # Each contender is set up in its OWN dedicated netns pair; at each loss rate
 # (0 5 10 %, symmetric delay 5ms) we run:
@@ -63,6 +63,15 @@ TUN_WA_IP6="fd00:13::1"; TUN_WB_IP6="fd00:13::2"
 WPORT_A="51860"; WPORT_B="51861"
 WG_AVAILABLE=true
 
+# ── WireGuard-Go ──────────────────────────────────────────────────────────────
+NS_GGA="ipfGGA"; NS_GGB="ipfGGB"; VGGA="ipfvGGA"; VGGB="ipfvGGB"
+VGGA_IP="10.26.0.1"; VGGB_IP="10.26.0.2"
+TUN_GGA_IP="10.27.0.1"; TUN_GGB_IP="10.27.0.2"
+TUN_GGA_IP6="fd00:27::1"; TUN_GGB_IP6="fd00:27::2"
+GGPORT_A="51880"; GGPORT_B="51881"
+WGGO_AVAILABLE=true
+PID_GGA=""; PID_GGB=""
+
 # ── OpenVPN ───────────────────────────────────────────────────────────────────
 NS_OA="ipfOA"; NS_OB="ipfOB"; VOA="ipfvOA"; VOB="ipfvOB"
 VOA_IP="10.14.0.1"; VOB_IP="10.14.0.2"
@@ -120,16 +129,26 @@ cleanup() {
     fi
     [ -n "$PID_YA" ] && kill "$PID_YA" 2>/dev/null || true
     [ -n "$PID_YB" ] && kill "$PID_YB" 2>/dev/null || true
+    [ -n "$PID_GGA" ] && kill "$PID_GGA" 2>/dev/null || true
+    [ -n "$PID_GGB" ] && kill "$PID_GGB" 2>/dev/null || true
     sleep 0.2
     [ -n "$PID_YA" ] && kill -9 "$PID_YA" 2>/dev/null || true
     [ -n "$PID_YB" ] && kill -9 "$PID_YB" 2>/dev/null || true
+    [ -n "$PID_GGA" ] && kill -9 "$PID_GGA" 2>/dev/null || true
+    [ -n "$PID_GGB" ] && kill -9 "$PID_GGB" 2>/dev/null || true
     # Remove virtual interfaces before deleting namespaces
     ip netns exec "$NS_WA" ip link del wg0 2>/dev/null || true
     ip netns exec "$NS_WB" ip link del wg0 2>/dev/null || true
     rm -f /etc/wireguard/wg_a /etc/wireguard/wg_b 2>/dev/null || true
+    ip netns exec "$NS_GGA" ip link del wggo0 2>/dev/null || true
+    ip netns exec "$NS_GGB" ip link del wggo0 2>/dev/null || true
+    rm -rf "/etc/netns/$NS_GGA" "/etc/netns/$NS_GGB" /etc/wireguard-run 2>/dev/null || true
+    if [ -L /run/wireguard ]; then
+        rm -f /run/wireguard 2>/dev/null || true
+    fi
     ip netns exec "$NS_AA" ip link del awg0 2>/dev/null || true
     ip netns exec "$NS_AB" ip link del awg0 2>/dev/null || true
-    for ns in "$NS_YA" "$NS_YB" "$NS_WA" "$NS_WB" "$NS_OA" "$NS_OB" "$NS_NA" "$NS_NB" \
+    for ns in "$NS_YA" "$NS_YB" "$NS_WA" "$NS_WB" "$NS_GGA" "$NS_GGB" "$NS_OA" "$NS_OB" "$NS_NA" "$NS_NB" \
               "$NS_AA" "$NS_AB" "$NS_ZA" "$NS_ZB" "$NS_TA" "$NS_TB" "$NS_BA" "$NS_BB"; do
         ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
         ip netns del "$ns" 2>/dev/null || true
@@ -546,6 +565,105 @@ setup_wg() {
 setup_wg
 
 # ══════════════════════════════════════════════════════════════════════════════
+# WireGuard-Go setup
+# ══════════════════════════════════════════════════════════════════════════════
+setup_wireguard_go() {
+    local wggo_bin="wireguard-go"
+    if ! command -v "$wggo_bin" >/dev/null 2>&1; then
+        if command -v wireguard >/dev/null 2>&1; then
+            wggo_bin="wireguard"
+        else
+            echo "[wggo] SKIP: 'wireguard-go' command not found"; WGGO_AVAILABLE=false; return
+        fi
+    fi
+    if ! command -v wg >/dev/null 2>&1; then
+        echo "[wggo] SKIP: 'wg' command not found"; WGGO_AVAILABLE=false; return
+    fi
+    apparmor_parser -R /etc/apparmor.d/wg 2>/dev/null || true
+    apparmor_parser -R /etc/apparmor.d/usr.bin.wg 2>/dev/null || true
+    echo "[wggo] generating keypairs"
+    local privA pubA privB pubB
+    privA="$(wg genkey 2>/dev/null || true)"; pubA="$(echo "$privA" | wg pubkey 2>/dev/null || true)"
+    privB="$(wg genkey 2>/dev/null || true)"; pubB="$(echo "$privB" | wg pubkey 2>/dev/null || true)"
+    if [ -z "$privA" ] || [ -z "$privB" ]; then
+        echo "[wggo] SKIP: key generation failed"; WGGO_AVAILABLE=false; return
+    fi
+
+    # Set up per-namespace UAPI directory so wireguard-go instances do not collide
+    mkdir -p /etc/wireguard-run
+    mkdir -p "/etc/netns/$NS_GGA/wireguard-run" "/etc/netns/$NS_GGB/wireguard-run"
+    if [ ! -L /run/wireguard ]; then
+        rm -rf /run/wireguard 2>/dev/null || true
+        ln -sf /etc/wireguard-run /run/wireguard
+    fi
+
+    echo "[wggo] creating namespaces and veth pair"
+    make_pair "$NS_GGA" "$NS_GGB" "$VGGA" "$VGGB" "$VGGA_IP" "$VGGB_IP"
+
+    echo "[wggo] launching wireguard-go daemons"
+    ip netns exec "$NS_GGA" "$wggo_bin" wggo0 >"$TMPDIR_TEST/wggo-a.log" 2>&1 &
+    PID_GGA=$!
+    ip netns exec "$NS_GGB" "$wggo_bin" wggo0 >"$TMPDIR_TEST/wggo-b.log" 2>&1 &
+    PID_GGB=$!
+
+    local wggo_up=false
+    for i in $(seq 1 20); do
+        if ip netns exec "$NS_GGA" ip link show wggo0 >/dev/null 2>&1 && \
+           ip netns exec "$NS_GGB" ip link show wggo0 >/dev/null 2>&1; then
+            wggo_up=true
+            break
+        fi
+        sleep 0.25
+    done
+    if [ "$wggo_up" = false ]; then
+        echo "[wggo] SKIP: wggo0 interface creation failed or timed out"
+        tail -5 "$TMPDIR_TEST/wggo-a.log" "$TMPDIR_TEST/wggo-b.log" 2>/dev/null || true
+        WGGO_AVAILABLE=false; return
+    fi
+
+    local keyA="$TMPDIR_TEST/wggo_a"
+    local keyB="$TMPDIR_TEST/wggo_b"
+    printf '%s' "$privA" > "$keyA"
+    printf '%s' "$privB" > "$keyB"
+    chmod 600 "$keyA" "$keyB"
+
+    local wg_err=""
+    if ! wg_err="$(ip netns exec "$NS_GGA" wg set wggo0 private-key "$keyA" listen-port "$GGPORT_A" \
+            peer "$pubB" endpoint "${VGGB_IP}:${GGPORT_B}" allowed-ips "${TUN_GGB_IP}/32,fd00:27::/64" 2>&1)" || \
+       ! wg_err="$(ip netns exec "$NS_GGB" wg set wggo0 private-key "$keyB" listen-port "$GGPORT_B" \
+            peer "$pubA" endpoint "${VGGA_IP}:${GGPORT_A}" allowed-ips "${TUN_GGA_IP}/32,fd00:27::/64" 2>&1)"; then
+        echo "[wggo] SKIP: wg set configuration failed: $wg_err"; WGGO_AVAILABLE=false; return
+    fi
+
+    if ! ip netns exec "$NS_GGA" ip addr add "${TUN_GGA_IP}/24" dev wggo0 2>/dev/null || \
+       ! ip netns exec "$NS_GGB" ip addr add "${TUN_GGB_IP}/24" dev wggo0 2>/dev/null || \
+       ! ip netns exec "$NS_GGA" ip -6 addr add "${TUN_GGA_IP6}/64" dev wggo0 nodad 2>/dev/null || \
+       ! ip netns exec "$NS_GGB" ip -6 addr add "${TUN_GGB_IP6}/64" dev wggo0 nodad 2>/dev/null; then
+        echo "[wggo] SKIP: interface setup failed"; WGGO_AVAILABLE=false; return
+    fi
+
+    ip netns exec "$NS_GGA" ip link set dev wggo0 txqueuelen 10000 2>/dev/null || true
+    ip netns exec "$NS_GGB" ip link set dev wggo0 txqueuelen 10000 2>/dev/null || true
+    ip netns exec "$NS_GGA" ip link set dev wggo0 mtu 1420 2>/dev/null || true
+    ip netns exec "$NS_GGB" ip link set dev wggo0 mtu 1420 2>/dev/null || true
+
+    if ! ip netns exec "$NS_GGA" ip link set wggo0 up 2>/dev/null || \
+       ! ip netns exec "$NS_GGB" ip link set wggo0 up 2>/dev/null; then
+        echo "[wggo] SKIP: interface set up failed"; WGGO_AVAILABLE=false; return
+    fi
+
+    sleep 0.5
+    if ! ip netns exec "$NS_GGB" ping -c 3 -W 5 "$TUN_GGA_IP" >/dev/null 2>&1; then
+        echo "[wggo] SKIP: baseline IPv4 ping failed"; WGGO_AVAILABLE=false; return
+    fi
+    if ! ip netns exec "$NS_GGB" ping -6 -c 3 -W 5 "$TUN_GGA_IP6" >/dev/null 2>&1; then
+        echo "[wggo] SKIP: baseline IPv6 ping failed"; WGGO_AVAILABLE=false; return
+    fi
+    echo "[wggo] tunnel up"
+}
+setup_wireguard_go
+
+# ══════════════════════════════════════════════════════════════════════════════
 # AmneziaWG setup (kernel module or amneziawg-go)
 # ══════════════════════════════════════════════════════════════════════════════
 setup_awg() {
@@ -915,6 +1033,7 @@ for LOSS in $LOSS_RATES; do
     echo "[netem] loss=${LOSS}% delay=5ms on all active pairs"
     apply_netem "$NS_YA" "$NS_YB" "$VYA" "$VYB" "$LOSS"
     [ "$WG_AVAILABLE"   = true ] && apply_netem "$NS_WA" "$NS_WB" "$VWA" "$VWB" "$LOSS"
+    [ "$WGGO_AVAILABLE" = true ] && apply_netem "$NS_GGA" "$NS_GGB" "$VGGA" "$VGGB" "$LOSS"
     [ "$AWG_AVAILABLE"  = true ] && apply_netem "$NS_AA" "$NS_AB" "$VAA" "$VAB" "$LOSS"
     [ "$OVPN_AVAILABLE" = true ] && apply_netem "$NS_OA" "$NS_OB" "$VOA" "$VOB" "$LOSS"
     [ "$N2N_AVAILABLE"  = true ] && apply_netem "$NS_NA" "$NS_NB" "$VNA" "$VNB" "$LOSS"
@@ -954,6 +1073,25 @@ for LOSS in $LOSS_RATES; do
         W6_RAM="$(get_ns_ram_mb "$NS_WA")"
         W6_RAM_EFF="$(calc_ram_efficiency "$W6_RAM" "$W6_UDP_MBPS")"
         echo "[wg] [ipv6] ping_loss=${W6_LOSS}% rtt=${W6_RTT}ms tcp=${W6_TCP}Mbit/s udp=${W6_UDP_MBPS}Mbit/s udp_loss=${W6_UDP_LOSS}% cpu=${W6_CPU}% eff=${W6_EFF} ram=${W6_RAM}MB ram_eff=${W6_RAM_EFF}"
+    fi
+
+    # WireGuard-Go (IPv4 & IPv6)
+    GG_LOSS="N/A"; GG_RTT="N/A"; GG_TCP="N/A"; GG_UDP_MBPS="N/A"; GG_UDP_LOSS="N/A"; GG_CPU="N/A"; GG_EFF="N/A"; GG_RAM="N/A"; GG_RAM_EFF="N/A"
+    GG6_LOSS="N/A"; GG6_RTT="N/A"; GG6_TCP="N/A"; GG6_UDP_MBPS="N/A"; GG6_UDP_LOSS="N/A"; GG6_CPU="N/A"; GG6_EFF="N/A"; GG6_RAM="N/A"; GG6_RAM_EFF="N/A"
+    if [ "$WGGO_AVAILABLE" = true ]; then
+        read -r GG_LOSS GG_RTT <<< "$(measure_ping "$NS_GGB" "$TUN_GGA_IP")"
+        GG_TCP="$(measure_iperf "$NS_GGA" "$TUN_GGA_IP" "$NS_GGB")"
+        read -r GG_UDP_MBPS GG_UDP_LOSS GG_CPU GG_EFF <<< "$(measure_iperf_udp "$NS_GGA" "$TUN_GGA_IP" "$NS_GGB")"
+        GG_RAM="$(get_ns_ram_mb "$NS_GGA")"
+        GG_RAM_EFF="$(calc_ram_efficiency "$GG_RAM" "$GG_UDP_MBPS")"
+        echo "[wggo] [ipv4] ping_loss=${GG_LOSS}% rtt=${GG_RTT}ms tcp=${GG_TCP}Mbit/s udp=${GG_UDP_MBPS}Mbit/s udp_loss=${GG_UDP_LOSS}% cpu=${GG_CPU}% eff=${GG_EFF} ram=${GG_RAM}MB ram_eff=${GG_RAM_EFF}"
+
+        read -r GG6_LOSS GG6_RTT <<< "$(measure_ping "$NS_GGB" "$TUN_GGA_IP6")"
+        GG6_TCP="$(measure_iperf "$NS_GGA" "$TUN_GGA_IP6" "$NS_GGB")"
+        read -r GG6_UDP_MBPS GG6_UDP_LOSS GG6_CPU GG6_EFF <<< "$(measure_iperf_udp "$NS_GGA" "$TUN_GGA_IP6" "$NS_GGB")"
+        GG6_RAM="$(get_ns_ram_mb "$NS_GGA")"
+        GG6_RAM_EFF="$(calc_ram_efficiency "$GG6_RAM" "$GG6_UDP_MBPS")"
+        echo "[wggo] [ipv6] ping_loss=${GG6_LOSS}% rtt=${GG6_RTT}ms tcp=${GG6_TCP}Mbit/s udp=${GG6_UDP_MBPS}Mbit/s udp_loss=${GG6_UDP_LOSS}% cpu=${GG6_CPU}% eff=${GG6_EFF} ram=${GG6_RAM}MB ram_eff=${GG6_RAM_EFF}"
     fi
 
     # AmneziaWG (IPv4 & IPv6)
@@ -1078,34 +1216,37 @@ for LOSS in $LOSS_RATES; do
 
     echo ""
     echo "  --- IPv4 loss=${LOSS}% ---"
-    echo "  | contender | eff_loss% | rtt_ms | tcp_Mbit/s | udp_Mbit/s | udp_loss% | cpu% | cpu_eff(%/Gbps) | ram_MB | ram_eff(MB/Gbps) |"
-    echo "  |-----------|-----------|--------|------------|------------|-----------|------|-----------------|--------|------------------|"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "$YIP_LABEL" "$Y_LOSS" "$Y_RTT" "$Y_TCP" "$Y_UDP_MBPS" "$Y_UDP_LOSS" "$Y_CPU" "$Y_EFF" "$Y_RAM" "$Y_RAM_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "wireguard" "$W_LOSS" "$W_RTT" "$W_TCP" "$W_UDP_MBPS" "$W_UDP_LOSS" "$W_CPU" "$W_EFF" "$W_RAM" "$W_RAM_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "amneziawg" "$A_LOSS" "$A_RTT" "$A_TCP" "$A_UDP_MBPS" "$A_UDP_LOSS" "$A_CPU" "$A_EFF" "$A_RAM" "$A_RAM_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "openvpn"   "$O_LOSS" "$O_RTT" "$O_TCP" "$O_UDP_MBPS" "$O_UDP_LOSS" "$O_CPU" "$O_EFF" "$O_RAM" "$O_RAM_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "n2n"       "$N_LOSS" "$N_RTT" "$N_TCP" "$N_UDP_MBPS" "$N_UDP_LOSS" "$N_CPU" "$N_EFF" "$N_RAM" "$N_RAM_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "zerotier"  "$Z_LOSS" "$Z_RTT" "$Z_TCP" "$Z_UDP_MBPS" "$Z_UDP_LOSS" "$Z_CPU" "$Z_EFF" "$Z_RAM" "$Z_RAM_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "tailscale" "$T_LOSS" "$T_RTT" "$T_TCP" "$T_UDP_MBPS" "$T_UDP_LOSS" "$T_CPU" "$T_EFF" "$T_RAM" "$T_RAM_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "netbird"   "$B_LOSS" "$B_RTT" "$B_TCP" "$B_UDP_MBPS" "$B_UDP_LOSS" "$B_CPU" "$B_EFF" "$B_RAM" "$B_RAM_EFF"
+    echo "  | contender    | eff_loss% | rtt_ms | tcp_Mbit/s | udp_Mbit/s | udp_loss% | cpu% | cpu_eff(%/Gbps) | ram_MB | ram_eff(MB/Gbps) |"
+    echo "  |--------------|-----------|--------|------------|------------|-----------|------|-----------------|--------|------------------|"
+    printf "  | %-12s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "$YIP_LABEL" "$Y_LOSS" "$Y_RTT" "$Y_TCP" "$Y_UDP_MBPS" "$Y_UDP_LOSS" "$Y_CPU" "$Y_EFF" "$Y_RAM" "$Y_RAM_EFF"
+    printf "  | %-12s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "wireguard" "$W_LOSS" "$W_RTT" "$W_TCP" "$W_UDP_MBPS" "$W_UDP_LOSS" "$W_CPU" "$W_EFF" "$W_RAM" "$W_RAM_EFF"
+    printf "  | %-12s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "wireguard-go" "$GG_LOSS" "$GG_RTT" "$GG_TCP" "$GG_UDP_MBPS" "$GG_UDP_LOSS" "$GG_CPU" "$GG_EFF" "$GG_RAM" "$GG_RAM_EFF"
+    printf "  | %-12s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "amneziawg" "$A_LOSS" "$A_RTT" "$A_TCP" "$A_UDP_MBPS" "$A_UDP_LOSS" "$A_CPU" "$A_EFF" "$A_RAM" "$A_RAM_EFF"
+    printf "  | %-12s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "openvpn"   "$O_LOSS" "$O_RTT" "$O_TCP" "$O_UDP_MBPS" "$O_UDP_LOSS" "$O_CPU" "$O_EFF" "$O_RAM" "$O_RAM_EFF"
+    printf "  | %-12s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "n2n"       "$N_LOSS" "$N_RTT" "$N_TCP" "$N_UDP_MBPS" "$N_UDP_LOSS" "$N_CPU" "$N_EFF" "$N_RAM" "$N_RAM_EFF"
+    printf "  | %-12s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "zerotier"  "$Z_LOSS" "$Z_RTT" "$Z_TCP" "$Z_UDP_MBPS" "$Z_UDP_LOSS" "$Z_CPU" "$Z_EFF" "$Z_RAM" "$Z_RAM_EFF"
+    printf "  | %-12s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "tailscale" "$T_LOSS" "$T_RTT" "$T_TCP" "$T_UDP_MBPS" "$T_UDP_LOSS" "$T_CPU" "$T_EFF" "$T_RAM" "$T_RAM_EFF"
+    printf "  | %-12s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "netbird"   "$B_LOSS" "$B_RTT" "$B_TCP" "$B_UDP_MBPS" "$B_UDP_LOSS" "$B_CPU" "$B_EFF" "$B_RAM" "$B_RAM_EFF"
 
     echo ""
     echo "  --- IPv6 loss=${LOSS}% ---"
-    echo "  | contender | eff_loss% | rtt_ms | tcp_Mbit/s | udp_Mbit/s | udp_loss% | cpu% | cpu_eff(%/Gbps) | ram_MB | ram_eff(MB/Gbps) |"
-    echo "  |-----------|-----------|--------|------------|------------|-----------|------|-----------------|--------|------------------|"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "$YIP_LABEL" "$Y6_LOSS" "$Y6_RTT" "$Y6_TCP" "$Y6_UDP_MBPS" "$Y6_UDP_LOSS" "$Y6_CPU" "$Y6_EFF" "$Y6_RAM" "$Y6_RAM_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "wireguard" "$W6_LOSS" "$W6_RTT" "$W6_TCP" "$W6_UDP_MBPS" "$W6_UDP_LOSS" "$W6_CPU" "$W6_EFF" "$W6_RAM" "$W6_RAM_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "amneziawg" "$A6_LOSS" "$A6_RTT" "$A6_TCP" "$A6_UDP_MBPS" "$A6_UDP_LOSS" "$A6_CPU" "$A6_EFF" "$A6_RAM" "$A6_RAM_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "openvpn"   "$O6_LOSS" "$O6_RTT" "$O6_TCP" "$O6_UDP_MBPS" "$O6_UDP_LOSS" "$O6_CPU" "$O6_EFF" "$O6_RAM" "$O6_RAM_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "n2n"       "$N6_LOSS" "$N6_RTT" "$N6_TCP" "$N6_UDP_MBPS" "$N6_UDP_LOSS" "$N6_CPU" "$N6_EFF" "$N6_RAM" "$N6_RAM_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "zerotier"  "$Z6_LOSS" "$Z6_RTT" "$Z6_TCP" "$Z6_UDP_MBPS" "$Z6_UDP_LOSS" "$Z6_CPU" "$Z6_EFF" "$Z6_RAM" "$Z6_RAM_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "tailscale" "$T6_LOSS" "$T6_RTT" "$T6_TCP" "$T6_UDP_MBPS" "$T6_UDP_LOSS" "$T6_CPU" "$T6_EFF" "$T6_RAM" "$T6_RAM_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "netbird"   "$B6_LOSS" "$B6_RTT" "$B6_TCP" "$B6_UDP_MBPS" "$B6_UDP_LOSS" "$B6_CPU" "$B6_EFF" "$B6_RAM" "$B6_RAM_EFF"
+    echo "  | contender    | eff_loss% | rtt_ms | tcp_Mbit/s | udp_Mbit/s | udp_loss% | cpu% | cpu_eff(%/Gbps) | ram_MB | ram_eff(MB/Gbps) |"
+    echo "  |--------------|-----------|--------|------------|------------|-----------|------|-----------------|--------|------------------|"
+    printf "  | %-12s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "$YIP_LABEL" "$Y6_LOSS" "$Y6_RTT" "$Y6_TCP" "$Y6_UDP_MBPS" "$Y6_UDP_LOSS" "$Y6_CPU" "$Y6_EFF" "$Y6_RAM" "$Y6_RAM_EFF"
+    printf "  | %-12s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "wireguard" "$W6_LOSS" "$W6_RTT" "$W6_TCP" "$W6_UDP_MBPS" "$W6_UDP_LOSS" "$W6_CPU" "$W6_EFF" "$W6_RAM" "$W6_RAM_EFF"
+    printf "  | %-12s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "wireguard-go" "$GG6_LOSS" "$GG6_RTT" "$GG6_TCP" "$GG6_UDP_MBPS" "$GG6_UDP_LOSS" "$GG6_CPU" "$GG6_EFF" "$GG6_RAM" "$GG6_RAM_EFF"
+    printf "  | %-12s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "amneziawg" "$A6_LOSS" "$A6_RTT" "$A6_TCP" "$A6_UDP_MBPS" "$A6_UDP_LOSS" "$A6_CPU" "$A6_EFF" "$A6_RAM" "$A6_RAM_EFF"
+    printf "  | %-12s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "openvpn"   "$O6_LOSS" "$O6_RTT" "$O6_TCP" "$O6_UDP_MBPS" "$O6_UDP_LOSS" "$O6_CPU" "$O6_EFF" "$O6_RAM" "$O6_RAM_EFF"
+    printf "  | %-12s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "n2n"       "$N6_LOSS" "$N6_RTT" "$N6_TCP" "$N6_UDP_MBPS" "$N6_UDP_LOSS" "$N6_CPU" "$N6_EFF" "$N6_RAM" "$N6_RAM_EFF"
+    printf "  | %-12s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "zerotier"  "$Z6_LOSS" "$Z6_RTT" "$Z6_TCP" "$Z6_UDP_MBPS" "$Z6_UDP_LOSS" "$Z6_CPU" "$Z6_EFF" "$Z6_RAM" "$Z6_RAM_EFF"
+    printf "  | %-12s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "tailscale" "$T6_LOSS" "$T6_RTT" "$T6_TCP" "$T6_UDP_MBPS" "$T6_UDP_LOSS" "$T6_CPU" "$T6_EFF" "$T6_RAM" "$T6_RAM_EFF"
+    printf "  | %-12s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "netbird"   "$B6_LOSS" "$B6_RTT" "$B6_TCP" "$B6_UDP_MBPS" "$B6_UDP_LOSS" "$B6_CPU" "$B6_EFF" "$B6_RAM" "$B6_RAM_EFF"
 done
 
 echo ""
 echo "[done] iperf compare sweep complete"
 [ "$WG_AVAILABLE"   = false ] && echo "[note] WireGuard skipped (module/CLI absent)"
+[ "$WGGO_AVAILABLE" = false ] && echo "[note] WireGuard-Go skipped (binary absent or setup failed)"
 [ "$AWG_AVAILABLE"  = false ] && echo "[note] AmneziaWG skipped (module/CLI absent)"
 [ "$OVPN_AVAILABLE" = false ] && echo "[note] OpenVPN skipped (binary absent or setup failed)"
 [ "$N2N_AVAILABLE"  = false ] && echo "[note] n2n skipped (binary absent or setup failed)"
