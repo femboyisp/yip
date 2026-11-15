@@ -96,22 +96,69 @@ setup_zerotier() {
     fi
 }
 
+setup_n2n() {
+    log "Installing n2n (edge & supernode)..."
+    if command -v edge >/dev/null 2>&1 && command -v supernode >/dev/null 2>&1; then
+        log "n2n is already installed ($(which edge))"
+        return
+    fi
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update && apt-get install -y n2n || warn "apt-get install n2n failed"
+    else
+        warn "Package manager not found; please install n2n manually."
+    fi
+    log "n2n setup step complete."
+}
+
 setup_tailscale() {
     log "Setting up Tailscale & Headscale..."
-    if ! command -v go >/dev/null 2>&1; then err "Go toolchain required to build Tailscale & Headscale"; fi
-    log "Compiling tailscale & tailscaled..."
-    GOBIN="$TARGET_BIN_DIR" go install tailscale.com/cmd/tailscale@latest || warn "tailscale build failed"
-    GOBIN="$TARGET_BIN_DIR" go install tailscale.com/cmd/tailscaled@latest || warn "tailscaled build failed"
-    log "Compiling headscale (local air-gapped coordinator)..."
-    GOBIN="$TARGET_BIN_DIR" go install github.com/juanfont/headscale/cmd/headscale@latest || warn "headscale build failed"
+    if ! command -v tailscaled >/dev/null 2>&1; then
+        log "Fetching prebuilt tailscale & tailscaled..."
+        local ts_tmp; ts_tmp="$(mktemp -d /tmp/tailscale.XXXXXX)"
+        if curl -fsSL https://pkgs.tailscale.com/stable/tailscale_latest_amd64.tgz | tar -xz -C "$ts_tmp" 2>/dev/null; then
+            install -m 755 "$ts_tmp"/tailscale_*/tailscale "$TARGET_BIN_DIR/tailscale" 2>/dev/null || true
+            install -m 755 "$ts_tmp"/tailscale_*/tailscaled "$TARGET_BIN_DIR/tailscaled" 2>/dev/null || true
+        fi
+        rm -rf "$ts_tmp"
+    fi
+    if ! command -v headscale >/dev/null 2>&1; then
+        log "Fetching prebuilt headscale coordinator..."
+        local hs_url; hs_url="$(curl -s https://api.github.com/repos/juanfont/headscale/releases/latest | grep "browser_download_url.*linux_amd64\"" | head -1 | cut -d '"' -f 4 || true)"
+        if [ -n "$hs_url" ]; then
+            curl -fsSL -o "$TARGET_BIN_DIR/headscale" "$hs_url" 2>/dev/null && chmod 755 "$TARGET_BIN_DIR/headscale" || warn "headscale fetch failed"
+        fi
+    fi
+    if ! command -v tailscaled >/dev/null 2>&1 && command -v go >/dev/null 2>&1; then
+        log "Compiling tailscale & tailscaled via Go toolchain..."
+        GOBIN="$TARGET_BIN_DIR" go install tailscale.com/cmd/tailscale@latest || warn "tailscale build failed"
+        GOBIN="$TARGET_BIN_DIR" go install tailscale.com/cmd/tailscaled@latest || warn "tailscaled build failed"
+    fi
+    if ! command -v headscale >/dev/null 2>&1 && command -v go >/dev/null 2>&1; then
+        log "Compiling headscale via Go toolchain..."
+        GOBIN="$TARGET_BIN_DIR" go install github.com/juanfont/headscale/cmd/headscale@latest || warn "headscale build failed"
+    fi
     log "Tailscale / Headscale setup step complete."
 }
 
 setup_netbird() {
     log "Setting up NetBird..."
-    if ! command -v go >/dev/null 2>&1; then err "Go toolchain required to build NetBird"; fi
-    log "Compiling netbird..."
-    GOBIN="$TARGET_BIN_DIR" go install github.com/netbirdio/netbird@latest || warn "netbird build failed"
+    if command -v netbird >/dev/null 2>&1; then
+        log "NetBird is already installed ($(which netbird))"
+        return
+    fi
+    log "Fetching prebuilt netbird binary..."
+    local nb_url; nb_url="$(curl -s https://api.github.com/repos/netbirdio/netbird/releases/latest | grep "browser_download_url.*netbird_.*linux_amd64.tar.gz\"" | head -1 | cut -d '"' -f 4 || true)"
+    if [ -n "$nb_url" ]; then
+        local nb_tmp; nb_tmp="$(mktemp -d /tmp/netbird.XXXXXX)"
+        if curl -fsSL "$nb_url" 2>/dev/null | tar -xz -C "$nb_tmp" 2>/dev/null; then
+            install -m 755 "$nb_tmp/netbird" "$TARGET_BIN_DIR/netbird" 2>/dev/null || true
+        fi
+        rm -rf "$nb_tmp"
+    fi
+    if ! command -v netbird >/dev/null 2>&1 && command -v go >/dev/null 2>&1; then
+        log "Compiling netbird via Go toolchain..."
+        GOBIN="$TARGET_BIN_DIR" go install github.com/netbirdio/netbird@latest || warn "netbird build failed"
+    fi
     log "NetBird setup step complete."
 }
 
@@ -126,6 +173,7 @@ while [ $# -gt 0 ]; do
         --all)
             setup_wireguard_go
             setup_amneziawg
+            setup_n2n
             setup_zerotier
             setup_tailscale
             setup_netbird
@@ -135,6 +183,9 @@ while [ $# -gt 0 ]; do
             ;;
         --amneziawg)
             setup_amneziawg
+            ;;
+        --n2n)
+            setup_n2n
             ;;
         --zerotier)
             setup_zerotier
@@ -150,7 +201,7 @@ while [ $# -gt 0 ]; do
             ;;
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 [--all | --wireguard-go | --amneziawg | --zerotier | --tailscale | --netbird | --check]"
+            echo "Usage: $0 [--all | --wireguard-go | --amneziawg | --n2n | --zerotier | --tailscale | --netbird | --check]"
             exit 1
             ;;
     esac
