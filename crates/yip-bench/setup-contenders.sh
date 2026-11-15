@@ -87,29 +87,61 @@ setup_zerotier() {
         return
     fi
     if command -v curl >/dev/null 2>&1; then
-        curl -s https://install.zerotier.com | bash || warn "ZeroTier quick install script failed"
-    elif command -v apt-get >/dev/null 2>&1; then
+        curl -s https://install.zerotier.com | bash 2>/dev/null || warn "ZeroTier quick install script failed"
+    fi
+    if ! command -v zerotier-one >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
         local release
-        release="$(lsb_release -cs 2>/dev/null || echo 'jammy')"
-        curl -s 'https://raw.githubusercontent.com/zerotier/ZeroTierOne/master/doc/contact%40zerotier.com.gpg' | gpg --dearmor -o /usr/share/keyrings/zerotierone-archive-keyring.gpg 2>/dev/null || true
+        release="$(lsb_release -cs 2>/dev/null || echo 'noble')"
+        curl -fsSL 'https://raw.githubusercontent.com/zerotier/ZeroTierOne/master/doc/contact%40zerotier.com.gpg' | gpg --dearmor -o /usr/share/keyrings/zerotierone-archive-keyring.gpg 2>/dev/null || true
         echo "deb [signed-by=/usr/share/keyrings/zerotierone-archive-keyring.gpg] http://download.zerotier.com/debian/$release $release main" > /etc/apt/sources.list.d/zerotier.list 2>/dev/null || true
         apt-get update && apt-get install -y zerotier-one || warn "apt-get install zerotier-one failed"
-    else
-        warn "Package manager or curl not found; please install zerotier-one manually."
+    fi
+    if ! command -v zerotier-one >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && command -v ar >/dev/null 2>&1; then
+        log "Extracting prebuilt ZeroTier binary from debian pool..."
+        local zt_tmp; zt_tmp="$(mktemp -d /tmp/zt_deb.XXXXXX)"
+        local zt_deb="zerotier-one_1.16.2_amd64.deb"
+        if curl -fsSL -o "$zt_tmp/$zt_deb" "http://download.zerotier.com/debian/noble/pool/main/z/zerotier-one/$zt_deb" 2>/dev/null; then
+            (cd "$zt_tmp" && ar -x "$zt_deb" && tar -xf data.tar.* 2>/dev/null)
+            if [ -x "$zt_tmp/usr/sbin/zerotier-one" ]; then
+                install -m 755 "$zt_tmp/usr/sbin/zerotier-one" "$TARGET_BIN_DIR/zerotier-one" 2>/dev/null || true
+                ln -sf "$TARGET_BIN_DIR/zerotier-one" "$TARGET_BIN_DIR/zerotier-cli" 2>/dev/null || true
+                ln -sf "$TARGET_BIN_DIR/zerotier-one" "$TARGET_BIN_DIR/zerotier-idtool" 2>/dev/null || true
+            fi
+        fi
+        rm -rf "$zt_tmp"
     fi
     log "ZeroTier setup step complete."
 }
 
 setup_n2n() {
-    log "Installing n2n (edge & supernode)..."
+    log "Installing n2n (edge & supernode version 3+)..."
+    local need_install=true
     if command -v edge >/dev/null 2>&1 && command -v supernode >/dev/null 2>&1; then
-        log "n2n is already installed ($(which edge))"
-        return
+        local ver
+        ver="$(edge -h 2>&1 | grep -iE 'v\.[0-9]+|version [0-9]+' | head -1 || true)"
+        if [[ "$ver" == *"v.3"* ]] || [[ "$ver" == *"v.4"* ]] || [[ "$ver" == *"version 3"* ]]; then
+            log "n2n version 3+ is already installed ($ver at $(which edge))"
+            need_install=false
+        else
+            warn "Found legacy n2n ($ver); upgrading to n2n version 3+..."
+        fi
     fi
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get update && apt-get install -y n2n || warn "apt-get install n2n failed"
-    else
-        warn "Package manager not found; please install n2n manually."
+    if [ "$need_install" = true ]; then
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update && apt-get install -y n2n || true
+        fi
+        local cur_ver=""
+        if command -v edge >/dev/null 2>&1; then
+            cur_ver="$(edge -h 2>&1 | grep -iE 'v\.[0-9]+|version [0-9]+' | head -1 || true)"
+        fi
+        if [[ "$cur_ver" != *"v.3"* ]] && [[ "$cur_ver" != *"v.4"* ]] && [[ "$cur_ver" != *"version 3"* ]]; then
+            log "Building latest n2n v3 from source..."
+            local n2n_tmp; n2n_tmp="$(mktemp -d /tmp/build-n2n.XXXXXX)"
+            if git clone --depth 1 https://github.com/ntop/n2n.git "$n2n_tmp" 2>/dev/null; then
+                (cd "$n2n_tmp" && ./autogen.sh && ./configure && make -j"$(nproc 2>/dev/null || echo 2)" && install -m 755 edge "$TARGET_BIN_DIR/edge" && install -m 755 supernode "$TARGET_BIN_DIR/supernode") || warn "Building n2n from source failed"
+            fi
+            rm -rf "$n2n_tmp"
+        fi
     fi
     log "n2n setup step complete."
 }
@@ -127,9 +159,11 @@ setup_tailscale() {
     fi
     if ! command -v headscale >/dev/null 2>&1; then
         log "Fetching prebuilt headscale coordinator..."
-        local hs_url; hs_url="$(curl -s https://api.github.com/repos/juanfont/headscale/releases/latest | grep "browser_download_url.*linux_amd64\"" | head -1 | cut -d '"' -f 4 || true)"
-        if [ -n "$hs_url" ]; then
-            curl -fsSL -o "$TARGET_BIN_DIR/headscale" "$hs_url" 2>/dev/null && chmod 755 "$TARGET_BIN_DIR/headscale" || warn "headscale fetch failed"
+        local hs_tag hs_url
+        hs_tag="$(curl -sIL https://github.com/juanfont/headscale/releases/latest | grep -i location | tr -d '\r' | awk -F'/' '{print $NF}' || true)"
+        if [ -n "$hs_tag" ]; then
+            hs_url="https://github.com/juanfont/headscale/releases/download/${hs_tag}/headscale_${hs_tag#v}_linux_amd64"
+            curl -fsSL -o "$TARGET_BIN_DIR/headscale" "$hs_url" 2>/dev/null && chmod 755 "$TARGET_BIN_DIR/headscale" || warn "headscale direct fetch failed"
         fi
     fi
     if ! command -v tailscaled >/dev/null 2>&1 && command -v go >/dev/null 2>&1; then
@@ -151,17 +185,27 @@ setup_netbird() {
         return
     fi
     log "Fetching prebuilt netbird binary..."
-    local nb_url; nb_url="$(curl -s https://api.github.com/repos/netbirdio/netbird/releases/latest | grep "browser_download_url.*netbird_.*linux_amd64.tar.gz\"" | head -1 | cut -d '"' -f 4 || true)"
-    if [ -n "$nb_url" ]; then
+    local nb_tag nb_ver nb_url
+    nb_tag="$(curl -sIL https://github.com/netbirdio/netbird/releases/latest | grep -i location | tr -d '\r' | awk -F'/' '{print $NF}' || true)"
+    if [ -n "$nb_tag" ]; then
+        nb_ver="${nb_tag#v}"
+        nb_url="https://github.com/netbirdio/netbird/releases/download/${nb_tag}/netbird_${nb_ver}_linux_amd64.tar.gz"
         local nb_tmp; nb_tmp="$(mktemp -d /tmp/netbird.XXXXXX)"
         if curl -fsSL "$nb_url" 2>/dev/null | tar -xz -C "$nb_tmp" 2>/dev/null; then
             install -m 755 "$nb_tmp/netbird" "$TARGET_BIN_DIR/netbird" 2>/dev/null || true
         fi
         rm -rf "$nb_tmp"
     fi
+    if ! command -v netbird >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
+        log "Attempting official NetBird install script..."
+        curl -fsSL https://pkgs.netbird.io/install.sh 2>/dev/null | sh 2>/dev/null || warn "NetBird official install script failed"
+    fi
     if ! command -v netbird >/dev/null 2>&1 && command -v go >/dev/null 2>&1; then
-        log "Compiling netbird via Go toolchain..."
-        GOBIN="$TARGET_BIN_DIR" go install github.com/netbirdio/netbird@latest || warn "netbird build failed"
+        log "Compiling netbird client via Go toolchain..."
+        GOBIN="$TARGET_BIN_DIR" go install github.com/netbirdio/netbird/client@latest || warn "netbird build failed"
+        if [ -f "$TARGET_BIN_DIR/client" ] && [ ! -f "$TARGET_BIN_DIR/netbird" ]; then
+            ln -sf "$TARGET_BIN_DIR/client" "$TARGET_BIN_DIR/netbird" 2>/dev/null || cp -f "$TARGET_BIN_DIR/client" "$TARGET_BIN_DIR/netbird" 2>/dev/null || true
+        fi
     fi
     log "NetBird setup step complete."
 }

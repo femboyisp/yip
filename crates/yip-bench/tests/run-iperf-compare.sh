@@ -94,6 +94,7 @@ TUN_AA_IP="10.19.0.1"; TUN_AB_IP="10.19.0.2"
 TUN_AA_IP6="fd00:19::1"; TUN_AB_IP6="fd00:19::2"
 APORT_A="51870"; APORT_B="51871"
 AWG_AVAILABLE=true
+PID_AA=""; PID_AB=""
 
 # ── ZeroTier ──────────────────────────────────────────────────────────────────
 NS_ZA="ipfZA"; NS_ZB="ipfZB"; VZA="ipfvZA"; VZB="ipfvZB"
@@ -131,11 +132,15 @@ cleanup() {
     [ -n "$PID_YB" ] && kill "$PID_YB" 2>/dev/null || true
     [ -n "$PID_GGA" ] && kill "$PID_GGA" 2>/dev/null || true
     [ -n "$PID_GGB" ] && kill "$PID_GGB" 2>/dev/null || true
+    [ -n "$PID_AA" ] && kill "$PID_AA" 2>/dev/null || true
+    [ -n "$PID_AB" ] && kill "$PID_AB" 2>/dev/null || true
     sleep 0.2
     [ -n "$PID_YA" ] && kill -9 "$PID_YA" 2>/dev/null || true
     [ -n "$PID_YB" ] && kill -9 "$PID_YB" 2>/dev/null || true
     [ -n "$PID_GGA" ] && kill -9 "$PID_GGA" 2>/dev/null || true
     [ -n "$PID_GGB" ] && kill -9 "$PID_GGB" 2>/dev/null || true
+    [ -n "$PID_AA" ] && kill -9 "$PID_AA" 2>/dev/null || true
+    [ -n "$PID_AB" ] && kill -9 "$PID_AB" 2>/dev/null || true
     # Remove virtual interfaces before deleting namespaces
     ip netns exec "$NS_WA" ip link del wg0 2>/dev/null || true
     ip netns exec "$NS_WB" ip link del wg0 2>/dev/null || true
@@ -148,6 +153,13 @@ cleanup() {
     fi
     ip netns exec "$NS_AA" ip link del awg0 2>/dev/null || true
     ip netns exec "$NS_AB" ip link del awg0 2>/dev/null || true
+    rm -rf "/etc/netns/$NS_AA" "/etc/netns/$NS_AB" /etc/amneziawg-run 2>/dev/null || true
+    if [ -L /run/amneziawg ]; then
+        rm -f /run/amneziawg 2>/dev/null || true
+    fi
+    if [ -L /var/run/amneziawg ]; then
+        rm -f /var/run/amneziawg 2>/dev/null || true
+    fi
     for ns in "$NS_YA" "$NS_YB" "$NS_WA" "$NS_WB" "$NS_GGA" "$NS_GGB" "$NS_OA" "$NS_OB" "$NS_NA" "$NS_NB" \
               "$NS_AA" "$NS_AB" "$NS_ZA" "$NS_ZB" "$NS_TA" "$NS_TB" "$NS_BA" "$NS_BB"; do
         ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
@@ -708,8 +720,20 @@ setup_awg() {
     echo "[awg] creating namespaces and veth pair"
     make_pair "$NS_AA" "$NS_AB" "$VAA" "$VAB" "$VAA_IP" "$VAB_IP"
     if [ "$use_go" = true ]; then
-        ip netns exec "$NS_AA" amneziawg-go awg0 >"$TMPDIR_TEST/awg-go-a.log" 2>&1 &
-        ip netns exec "$NS_AB" amneziawg-go awg0 >"$TMPDIR_TEST/awg-go-b.log" 2>&1 &
+        mkdir -p /etc/amneziawg-run
+        mkdir -p "/etc/netns/$NS_AA/amneziawg-run" "/etc/netns/$NS_AB/amneziawg-run"
+        if [ ! -L /run/amneziawg ]; then
+            rm -rf /run/amneziawg 2>/dev/null || true
+            ln -sf /etc/amneziawg-run /run/amneziawg
+        fi
+        if [ ! -L /var/run/amneziawg ]; then
+            rm -rf /var/run/amneziawg 2>/dev/null || true
+            ln -sf /etc/amneziawg-run /var/run/amneziawg
+        fi
+        ip netns exec "$NS_AA" amneziawg-go -f awg0 >"$TMPDIR_TEST/awg-go-a.log" 2>&1 &
+        PID_AA=$!
+        ip netns exec "$NS_AB" amneziawg-go -f awg0 >"$TMPDIR_TEST/awg-go-b.log" 2>&1 &
+        PID_AB=$!
         sleep 0.5
     else
         if ! ip netns exec "$NS_AA" ip link add awg0 type amneziawg 2>/dev/null || \
@@ -852,8 +876,15 @@ setup_ovpn() {
     ip netns exec "$NS_OB" ip link set dev tun0 txqueuelen 10000 2>/dev/null || true
     ip netns exec "$NS_OA" ip -6 addr add "${TUN_OA_IP6}/64" dev tun0 nodad 2>/dev/null || true
     ip netns exec "$NS_OB" ip -6 addr add "${TUN_OB_IP6}/64" dev tun0 nodad 2>/dev/null || true
-    sleep 1
-    if ! ip netns exec "$NS_OB" ping -c 3 -W 5 "$TUN_OA_IP" >/dev/null 2>&1; then
+    local ovpn_up=false
+    for i in $(seq 1 20); do
+        if ip netns exec "$NS_OB" ping -c 1 -W 1 "$TUN_OA_IP" >/dev/null 2>&1; then
+            ovpn_up=true
+            break
+        fi
+        sleep 0.5
+    done
+    if [ "$ovpn_up" = false ]; then
         echo "[ovpn] SKIP: baseline IPv4 ping failed"
         tail -5 "$TMPDIR_TEST/ovpn-a.log" "$TMPDIR_TEST/ovpn-b.log" 2>/dev/null || true
         OVPN_AVAILABLE=false; return
@@ -878,9 +909,9 @@ setup_n2n() {
     make_pair "$NS_NA" "$NS_NB" "$VNA" "$VNB" "$VNA_IP" "$VNB_IP"
     ip netns exec "$NS_NA" supernode -p "$N2N_PORT" -f >"$TMPDIR_TEST/n2-sn.log" 2>&1 &
     sleep 0.5
-    ip netns exec "$NS_NA" edge -c bench -k benchkey -a "$OVL_NA_IP" -l "$VNA_IP":"$N2N_PORT" \
+    ip netns exec "$NS_NA" edge -c bench -k benchkey -a "${OVL_NA_IP}/24" -l "$VNA_IP":"$N2N_PORT" \
         -d n2n0 -f >"$TMPDIR_TEST/n2-eA.log" 2>&1 &
-    ip netns exec "$NS_NB" edge -c bench -k benchkey -a "$OVL_NB_IP" -l "$VNA_IP":"$N2N_PORT" \
+    ip netns exec "$NS_NB" edge -c bench -k benchkey -a "${OVL_NB_IP}/24" -l "$VNA_IP":"$N2N_PORT" \
         -d n2n0 -f >"$TMPDIR_TEST/n2-eB.log" 2>&1 &
     local i
     for i in $(seq 1 60); do
@@ -892,8 +923,15 @@ setup_n2n() {
     ip netns exec "$NS_NB" ip link set dev n2n0 txqueuelen 10000 2>/dev/null || true
     ip netns exec "$NS_NA" ip -6 addr add "${OVL_NA_IP6}/64" dev n2n0 nodad 2>/dev/null || true
     ip netns exec "$NS_NB" ip -6 addr add "${OVL_NB_IP6}/64" dev n2n0 nodad 2>/dev/null || true
-    sleep 2
-    if ! ip netns exec "$NS_NB" ping -c 3 -W 5 "$OVL_NA_IP" >/dev/null 2>&1; then
+    local n2n_up=false
+    for i in $(seq 1 20); do
+        if ip netns exec "$NS_NB" ping -c 1 -W 1 "$OVL_NA_IP" >/dev/null 2>&1; then
+            n2n_up=true
+            break
+        fi
+        sleep 0.5
+    done
+    if [ "$n2n_up" = false ]; then
         echo "[n2n] SKIP: baseline overlay IPv4 ping failed"
         tail -5 "$TMPDIR_TEST/n2-sn.log" "$TMPDIR_TEST/n2-eA.log" "$TMPDIR_TEST/n2-eB.log" 2>/dev/null || true
         N2N_AVAILABLE=false; return
@@ -913,21 +951,60 @@ setup_zerotier() {
     make_pair "$NS_ZA" "$NS_ZB" "$VZA" "$VZB" "$VZA_IP" "$VZB_IP"
     local zt_dir_a="$TMPDIR_TEST/zt_a"; local zt_dir_b="$TMPDIR_TEST/zt_b"
     mkdir -p "$zt_dir_a" "$zt_dir_b"
+
+    if command -v zerotier-idtool >/dev/null 2>&1; then
+        zerotier-idtool generate "$zt_dir_a/identity.secret" "$zt_dir_a/identity.public" >/dev/null 2>&1 || true
+        zerotier-idtool generate "$zt_dir_b/identity.secret" "$zt_dir_b/identity.public" >/dev/null 2>&1 || true
+        local node_a node_b
+        node_a="$(zerotier-idtool getpublic "$zt_dir_a/identity.secret" 2>/dev/null | cut -d: -f1 || true)"
+        node_b="$(zerotier-idtool getpublic "$zt_dir_b/identity.secret" 2>/dev/null | cut -d: -f1 || true)"
+        if [ -n "$node_a" ] && [ -n "$node_b" ]; then
+            (cd "$zt_dir_a" && zerotier-idtool initmoon identity.public > moon.json 2>/dev/null || true)
+            if [ -f "$zt_dir_a/moon.json" ]; then
+                python3 -c "
+import json
+with open('$zt_dir_a/moon.json', 'r') as f:
+    d = json.load(f)
+d['roots'][0]['stableEndpoints'] = ['$VZA_IP/9993']
+with open('$zt_dir_a/moon.json', 'w') as f:
+    json.dump(d, f)
+" 2>/dev/null || true
+                (cd "$zt_dir_a" && zerotier-idtool genmoon moon.json >/dev/null 2>&1 || true)
+                mkdir -p "$zt_dir_a/moons.d" "$zt_dir_b/moons.d"
+                cp "$zt_dir_a"/*.moon "$zt_dir_a/moons.d/" 2>/dev/null || true
+                cp "$zt_dir_a"/*.moon "$zt_dir_b/moons.d/" 2>/dev/null || true
+            fi
+        fi
+    fi
+
     ip netns exec "$NS_ZA" zerotier-one "$zt_dir_a" >"$TMPDIR_TEST/zt-a.log" 2>&1 &
     ip netns exec "$NS_ZB" zerotier-one "$zt_dir_b" >"$TMPDIR_TEST/zt-b.log" 2>&1 &
-    local i token_a="" node_a=""
-    for i in $(seq 1 30); do
+    local i token_a="" node_a="" node_b=""
+    for i in $(seq 1 40); do
         if [ -f "$zt_dir_a/authtoken.secret" ] && [ -f "$zt_dir_b/authtoken.secret" ]; then
             token_a="$(cat "$zt_dir_a/authtoken.secret")"
             break
         fi
-        sleep 0.2
+        sleep 0.25
     done
     if [ -z "$token_a" ]; then
         echo "[zerotier] SKIP: daemon failed to initialize"; ZT_AVAILABLE=false; return
     fi
-    node_a="$(ip netns exec "$NS_ZA" zerotier-cli -D"$zt_dir_a" info 2>/dev/null | awk '{print $3}' || true)"
-    if [ -z "$node_a" ]; then
+    for i in $(seq 1 40); do
+        node_a="$(ip netns exec "$NS_ZA" zerotier-cli -D"$zt_dir_a" info 2>/dev/null | awk '$1=="200" && $3!="OFFLINE" && length($3)>=10 {print $3}' || true)"
+        if [ -n "$node_a" ]; then
+            break
+        fi
+        sleep 0.25
+    done
+    for i in $(seq 1 40); do
+        node_b="$(ip netns exec "$NS_ZB" zerotier-cli -D"$zt_dir_b" info 2>/dev/null | awk '$1=="200" && $3!="OFFLINE" && length($3)>=10 {print $3}' || true)"
+        if [ -n "$node_b" ]; then
+            break
+        fi
+        sleep 0.25
+    done
+    if [ -z "$node_a" ] || [ -z "$node_b" ]; then
         echo "[zerotier] SKIP: failed to get node identity"; ZT_AVAILABLE=false; return
     fi
     local net_id="${node_a}ffffff"
@@ -936,6 +1013,9 @@ setup_zerotier() {
         "http://127.0.0.1:9993/controller/network/${net_id}" >/dev/null 2>&1 || true
     ip netns exec "$NS_ZA" zerotier-cli -D"$zt_dir_a" join "$net_id" >/dev/null 2>&1 || true
     ip netns exec "$NS_ZB" zerotier-cli -D"$zt_dir_b" join "$net_id" >/dev/null 2>&1 || true
+    sleep 0.5
+    ip netns exec "$NS_ZA" curl -s -H "X-ZT1-Auth: $token_a" -X POST -d '{"authorized": true}' "http://127.0.0.1:9993/controller/network/${net_id}/member/${node_a}" >/dev/null 2>&1 || true
+    ip netns exec "$NS_ZA" curl -s -H "X-ZT1-Auth: $token_a" -X POST -d '{"authorized": true}' "http://127.0.0.1:9993/controller/network/${net_id}/member/${node_b}" >/dev/null 2>&1 || true
     local found=false
     for i in $(seq 1 40); do
         if ip netns exec "$NS_ZA" ip -o -4 addr show 2>/dev/null | grep -q "10.21." && \
@@ -954,6 +1034,22 @@ setup_zerotier() {
     [ -n "$zt_b_if" ] && ip netns exec "$NS_ZB" ip link set dev "$zt_b_if" txqueuelen 10000 2>/dev/null || true
     [ -n "$zt_a_if" ] && ip netns exec "$NS_ZA" ip -6 addr add "${TUN_ZA_IP6}/64" dev "$zt_a_if" nodad 2>/dev/null || true
     [ -n "$zt_b_if" ] && ip netns exec "$NS_ZB" ip -6 addr add "${TUN_ZB_IP6}/64" dev "$zt_b_if" nodad 2>/dev/null || true
+    local zt_dyn_a zt_dyn_b
+    zt_dyn_a="$(ip netns exec "$NS_ZA" ip -o -4 addr show dev "$zt_a_if" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)"
+    zt_dyn_b="$(ip netns exec "$NS_ZB" ip -o -4 addr show dev "$zt_b_if" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)"
+    [ -n "$zt_dyn_a" ] && TUN_ZA_IP="$zt_dyn_a"
+    [ -n "$zt_dyn_b" ] && TUN_ZB_IP="$zt_dyn_b"
+    local zt_up=false
+    for i in $(seq 1 20); do
+        if ip netns exec "$NS_ZB" ping -c 1 -W 1 "$TUN_ZA_IP" >/dev/null 2>&1; then
+            zt_up=true
+            break
+        fi
+        sleep 0.5
+    done
+    if [ "$zt_up" = false ]; then
+        echo "[zerotier] SKIP: overlay ping failed"; ZT_AVAILABLE=false; return
+    fi
     echo "[zerotier] network up"
 }
 setup_zerotier
@@ -969,36 +1065,69 @@ setup_tailscale() {
     make_pair "$NS_TA" "$NS_TB" "$VTA" "$VTB" "$VTA_IP" "$VTB_IP"
     local hs_dir="$TMPDIR_TEST/headscale"
     mkdir -p "$hs_dir"
+    cat > "$hs_dir/derp.yaml" <<EOF
+regions:
+  900:
+    regionid: 900
+    regioncode: bench
+    regionname: LocalBench
+    nodes:
+      - name: 900a
+        regionid: 900
+        hostname: 127.0.0.1
+        stunonly: true
+        stunport: 3478
+EOF
     cat > "$hs_dir/config.yaml" <<EOF
 server_url: http://${VTA_IP}:8080
 listen_addr: ${VTA_IP}:8080
-ip_prefixes:
-  - 10.23.0.0/24
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
 derp:
   server:
     enabled: false
+  paths:
+    - $hs_dir/derp.yaml
 database:
   type: sqlite
   sqlite:
     path: $hs_dir/db.sqlite
 dns:
   magic_dns: false
+  nameservers:
+    global:
+      - 1.1.1.1
+noise:
+  private_key_path: $hs_dir/noise_private.key
+unix_socket: $hs_dir/headscale.sock
 EOF
     ip netns exec "$NS_TA" headscale serve -c "$hs_dir/config.yaml" >"$TMPDIR_TEST/headscale.log" 2>&1 &
-    sleep 1
+    local i
+    for i in $(seq 1 30); do
+        if [ -S "$hs_dir/headscale.sock" ]; then
+            break
+        fi
+        sleep 0.2
+    done
     ip netns exec "$NS_TA" headscale users create bench -c "$hs_dir/config.yaml" >/dev/null 2>&1 || true
     local auth_key
-    auth_key="$(ip netns exec "$NS_TA" headscale preauthkeys create -u bench --reusable --expiration 1h -c "$hs_dir/config.yaml" 2>/dev/null || true)"
+    auth_key="$(ip netns exec "$NS_TA" headscale preauthkeys create -u 1 --reusable --expiration 1h -c "$hs_dir/config.yaml" 2>/dev/null | grep -oE '[a-f0-9]{48,}|hskey-[a-zA-Z0-9_-]+' | head -1 || true)"
     if [ -z "$auth_key" ]; then
-        echo "[tailscale] SKIP: headscale preauthkey creation failed"; TS_AVAILABLE=false; return
+        auth_key="$(ip netns exec "$NS_TA" headscale preauthkeys create --user bench --reusable --expiration 1h -c "$hs_dir/config.yaml" 2>/dev/null | grep -oE '[a-f0-9]{48,}|hskey-[a-zA-Z0-9_-]+' | head -1 || true)"
+    fi
+    if [ -z "$auth_key" ]; then
+        echo "[tailscale] SKIP: headscale preauthkey creation failed"
+        tail -5 "$TMPDIR_TEST/headscale.log" 2>/dev/null || true
+        TS_AVAILABLE=false; return
     fi
     local ts_dir_a="$TMPDIR_TEST/ts_a"; local ts_dir_b="$TMPDIR_TEST/ts_b"
     mkdir -p "$ts_dir_a" "$ts_dir_b"
     ip netns exec "$NS_TA" tailscaled --state="$ts_dir_a/tailscaled.state" --socket="$ts_dir_a/tailscaled.sock" --tun=tailscale0 >"$TMPDIR_TEST/ts-a.log" 2>&1 &
     ip netns exec "$NS_TB" tailscaled --state="$ts_dir_b/tailscaled.state" --socket="$ts_dir_b/tailscaled.sock" --tun=tailscale0 >"$TMPDIR_TEST/ts-b.log" 2>&1 &
     sleep 1
-    ip netns exec "$NS_TA" tailscale --socket="$ts_dir_a/tailscaled.sock" up --login-server="http://${VTA_IP}:8080" --auth-key="$auth_key" >/dev/null 2>&1 || true
-    ip netns exec "$NS_TB" tailscale --socket="$ts_dir_b/tailscaled.sock" up --login-server="http://${VTA_IP}:8080" --auth-key="$auth_key" >/dev/null 2>&1 || true
+    ip netns exec "$NS_TA" tailscale --socket="$ts_dir_a/tailscaled.sock" up --login-server="http://${VTA_IP}:8080" --auth-key="$auth_key" --accept-dns=false --accept-routes=false >/dev/null 2>&1 || true
+    ip netns exec "$NS_TB" tailscale --socket="$ts_dir_b/tailscaled.sock" up --login-server="http://${VTA_IP}:8080" --auth-key="$auth_key" --accept-dns=false --accept-routes=false >/dev/null 2>&1 || true
     local found=false
     for i in $(seq 1 40); do
         if ip netns exec "$NS_TA" ip -o -4 addr show tailscale0 >/dev/null 2>&1 && \
@@ -1014,6 +1143,26 @@ EOF
     ip netns exec "$NS_TB" ip link set dev tailscale0 txqueuelen 10000 2>/dev/null || true
     ip netns exec "$NS_TA" ip -6 addr add "${TUN_TA_IP6}/64" dev tailscale0 nodad 2>/dev/null || true
     ip netns exec "$NS_TB" ip -6 addr add "${TUN_TB_IP6}/64" dev tailscale0 nodad 2>/dev/null || true
+    local ts_dyn_a ts_dyn_b ts_dyn6_a ts_dyn6_b
+    ts_dyn_a="$(ip netns exec "$NS_TA" ip -o -4 addr show tailscale0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)"
+    ts_dyn_b="$(ip netns exec "$NS_TB" ip -o -4 addr show tailscale0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)"
+    [ -n "$ts_dyn_a" ] && TUN_TA_IP="$ts_dyn_a"
+    [ -n "$ts_dyn_b" ] && TUN_TB_IP="$ts_dyn_b"
+    ts_dyn6_a="$(ip netns exec "$NS_TA" ip -o -6 addr show tailscale0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -v '^fe80' | head -1 || true)"
+    ts_dyn6_b="$(ip netns exec "$NS_TB" ip -o -6 addr show tailscale0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -v '^fe80' | head -1 || true)"
+    [ -n "$ts_dyn6_a" ] && TUN_TA_IP6="$ts_dyn6_a"
+    [ -n "$ts_dyn6_b" ] && TUN_TB_IP6="$ts_dyn6_b"
+    local ts_up=false
+    for i in $(seq 1 20); do
+        if ip netns exec "$NS_TB" ping -c 1 -W 1 "$TUN_TA_IP" >/dev/null 2>&1; then
+            ts_up=true
+            break
+        fi
+        sleep 0.5
+    done
+    if [ "$ts_up" = false ]; then
+        echo "[tailscale] SKIP: baseline ping failed"; TS_AVAILABLE=false; return
+    fi
     echo "[tailscale] tunnel up"
 }
 setup_tailscale
@@ -1025,11 +1174,32 @@ setup_netbird() {
     if ! command -v netbird >/dev/null 2>&1; then
         echo "[netbird] SKIP: 'netbird' not found"; NB_AVAILABLE=false; return
     fi
+    if [ -z "${NETBIRD_MGMT_URL:-}" ] || [ -z "${NETBIRD_SETUP_KEY:-}" ]; then
+        echo "[netbird] SKIP: NETBIRD_MGMT_URL / NETBIRD_SETUP_KEY not configured (management coordinator required)"; NB_AVAILABLE=false; return
+    fi
     echo "[netbird] creating namespaces and veth pair"
     make_pair "$NS_BA" "$NS_BB" "$VBA" "$VBB" "$VBA_IP" "$VBB_IP"
+    local nb_dir_a="$TMPDIR_TEST/nb_a"; local nb_dir_b="$TMPDIR_TEST/nb_b"
+    mkdir -p "$nb_dir_a" "$nb_dir_b"
+    ip netns exec "$NS_BA" netbird service run --config "$nb_dir_a/config.json" --log-file "$TMPDIR_TEST/nb-a.log" >/dev/null 2>&1 &
+    ip netns exec "$NS_BB" netbird service run --config "$nb_dir_b/config.json" --log-file "$TMPDIR_TEST/nb-b.log" >/dev/null 2>&1 &
+    sleep 1
+    ip netns exec "$NS_BA" netbird up --config "$nb_dir_a/config.json" --management-url "$NETBIRD_MGMT_URL" --setup-key "$NETBIRD_SETUP_KEY" >/dev/null 2>&1 || true
+    ip netns exec "$NS_BB" netbird up --config "$nb_dir_b/config.json" --management-url "$NETBIRD_MGMT_URL" --setup-key "$NETBIRD_SETUP_KEY" >/dev/null 2>&1 || true
+    local found=false
+    for i in $(seq 1 40); do
+        if ip netns exec "$NS_BA" ip link show wt0 >/dev/null 2>&1 && \
+           ip netns exec "$NS_BB" ip link show wt0 >/dev/null 2>&1; then
+            found=true; break
+        fi
+        sleep 0.5
+    done
+    if [ "$found" = false ]; then
+        echo "[netbird] SKIP: wt0 interface creation timed out"; NB_AVAILABLE=false; return
+    fi
     ip netns exec "$NS_BA" ip link set dev wt0 txqueuelen 10000 2>/dev/null || true
     ip netns exec "$NS_BB" ip link set dev wt0 txqueuelen 10000 2>/dev/null || true
-    echo "[netbird] SKIP: local management service not running"; NB_AVAILABLE=false
+    echo "[netbird] tunnel up"
 }
 setup_netbird
 
