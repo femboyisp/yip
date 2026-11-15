@@ -47,7 +47,7 @@ NS_YA="ipfYA"; NS_YB="ipfYB"; VYA="ipfvYA"; VYB="ipfvYB"
 VYA_IP="10.10.0.1"; VYB_IP="10.10.0.2"
 TUN_YA_IP="10.11.0.1"; TUN_YB_IP="10.11.0.2"
 TUN_YA_IP6="fd00:11::1"; TUN_YB_IP6="fd00:11::2"
-YPORT_A="443"; YPORT_B="443"; TUN_DEV="yip0"; YIP_MTU="${YIP_MTU:-1400}"
+YPORT_A="443"; YPORT_B="443"; TUN_DEV="yip0"; YIP_MTU="${YIP_MTU:-1420}"; YIP_SHARDS="${YIP_SHARDS:-1}"
 PID_YA=""; PID_YB=""
 
 # ── WireGuard ─────────────────────────────────────────────────────────────────
@@ -105,6 +105,14 @@ NB_AVAILABLE=true
 # ── cleanup ───────────────────────────────────────────────────────────────────
 cleanup() {
     echo "[cleanup] killing daemons and removing namespaces"
+    if [ -f "${LOG_A:-}" ] && [ -s "${LOG_A:-}" ]; then
+        echo "=== yipA log ==="
+        tail -n 50 "$LOG_A" || true
+    fi
+    if [ -f "${LOG_B:-}" ] && [ -s "${LOG_B:-}" ]; then
+        echo "=== yipB log ==="
+        tail -n 50 "$LOG_B" || true
+    fi
     [ -n "$PID_YA" ] && kill "$PID_YA" 2>/dev/null || true
     [ -n "$PID_YB" ] && kill "$PID_YB" 2>/dev/null || true
     sleep 0.2
@@ -265,6 +273,48 @@ calc_cpu_efficiency() {
     }'
 }
 
+# ── RAM telemetry helper ──────────────────────────────────────────────────────
+# Returns peak resident memory (MB) for processes inside namespace $1, excluding test harnesses
+get_ns_ram_mb() {
+    local ns="$1"
+    local pids max_kb=0
+    pids="$(ip netns pids "$ns" 2>/dev/null || true)"
+    for pid in $pids; do
+        local comm
+        comm="$(cat /proc/$pid/comm 2>/dev/null || true)"
+        if [ "$comm" = "iperf3" ] || [ "$comm" = "ping" ] || [ "$comm" = "bash" ]; then
+            continue
+        fi
+        local hwm_kb
+        hwm_kb="$(grep -i VmHWM /proc/$pid/status 2>/dev/null | awk '{print $2}' || true)"
+        if [ -z "$hwm_kb" ]; then
+            hwm_kb="$(grep -i VmRSS /proc/$pid/status 2>/dev/null | awk '{print $2}' || true)"
+        fi
+        if [ -n "$hwm_kb" ] && [ "$hwm_kb" -gt "$max_kb" ] 2>/dev/null; then
+            max_kb="$hwm_kb"
+        fi
+    done
+    if [ "$max_kb" -gt 0 ]; then
+        awk -v kb="$max_kb" 'BEGIN {printf "%.1f", kb / 1024.0}'
+    else
+        echo "N/A"
+    fi
+}
+
+calc_ram_efficiency() {
+    local ram_mb="$1" mbps="$2"
+    awk -v ram="$ram_mb" -v m="$mbps" '
+    BEGIN {
+        if (ram == "N/A" || m == "N/A" || (m + 0) <= 0) {
+            printf "N/A\n"
+        } else {
+            gbps = (m + 0) / 1000.0
+            eff = (ram + 0) / gbps
+            printf "%.1f\n", eff
+        }
+    }'
+}
+
 # ── helper: iperf3 TCP Mbit/s; server in <ns_srv> bound to <srv_ip>, client in
 #    <ns_cli> -> <srv_ip>.  echo "<mbps>" ───────────────────────────────────────
 measure_iperf() {
@@ -356,6 +406,7 @@ listen=${VYA_IP}:${YPORT_A}
 peer_endpoint=${VYB_IP}:${YPORT_B}
 device=${TUN_DEV}
 initiate=false
+shards=${YIP_SHARDS}
 EOF
 cat > "$CFG_B" <<EOF
 local_private=${PRIV_B}
@@ -365,6 +416,7 @@ listen=${VYB_IP}:${YPORT_B}
 peer_endpoint=${VYA_IP}:${YPORT_A}
 device=${TUN_DEV}
 initiate=true
+shards=${YIP_SHARDS}
 EOF
 
 echo "[yip] creating namespaces and veth pair"
@@ -393,6 +445,8 @@ while true; do
 done
 ip netns exec "$NS_YA" ip link set "$TUN_DEV" mtu "$YIP_MTU"
 ip netns exec "$NS_YB" ip link set "$TUN_DEV" mtu "$YIP_MTU"
+ip netns exec "$NS_YA" ip link set dev "$TUN_DEV" txqueuelen 10000
+ip netns exec "$NS_YB" ip link set dev "$TUN_DEV" txqueuelen 10000
 ip netns exec "$NS_YA" ip link set "$TUN_DEV" up
 ip netns exec "$NS_YB" ip link set "$TUN_DEV" up
 ip netns exec "$NS_YA" ip addr add "${TUN_YA_IP}/24" dev "$TUN_DEV"
@@ -811,7 +865,7 @@ setup_netbird
 # ══════════════════════════════════════════════════════════════════════════════
 # Sweep
 # ══════════════════════════════════════════════════════════════════════════════
-LOSS_RATES="0 5 10"
+LOSS_RATES="${LOSS_RATES:-0 5 10}"
 
 echo ""
 echo "=========================================================="
@@ -837,144 +891,181 @@ for LOSS in $LOSS_RATES; do
     read -r Y_LOSS Y_RTT <<< "$(measure_ping "$NS_YB" "$TUN_YA_IP")"
     Y_TCP="$(measure_iperf "$NS_YA" "$TUN_YA_IP" "$NS_YB")"
     read -r Y_UDP_MBPS Y_UDP_LOSS Y_CPU Y_EFF <<< "$(measure_iperf_udp "$NS_YA" "$TUN_YA_IP" "$NS_YB")"
-    echo "[yip] [ipv4] ping_loss=${Y_LOSS}% rtt=${Y_RTT}ms tcp=${Y_TCP}Mbit/s udp=${Y_UDP_MBPS}Mbit/s udp_loss=${Y_UDP_LOSS}% cpu=${Y_CPU}% eff=${Y_EFF}"
+    Y_RAM="$(get_ns_ram_mb "$NS_YA")"
+    Y_RAM_EFF="$(calc_ram_efficiency "$Y_RAM" "$Y_UDP_MBPS")"
+    echo "[yip] [ipv4] ping_loss=${Y_LOSS}% rtt=${Y_RTT}ms tcp=${Y_TCP}Mbit/s udp=${Y_UDP_MBPS}Mbit/s udp_loss=${Y_UDP_LOSS}% cpu=${Y_CPU}% eff=${Y_EFF} ram=${Y_RAM}MB ram_eff=${Y_RAM_EFF}"
 
     read -r Y6_LOSS Y6_RTT <<< "$(measure_ping "$NS_YB" "$TUN_YA_IP6")"
     Y6_TCP="$(measure_iperf "$NS_YA" "$TUN_YA_IP6" "$NS_YB")"
     read -r Y6_UDP_MBPS Y6_UDP_LOSS Y6_CPU Y6_EFF <<< "$(measure_iperf_udp "$NS_YA" "$TUN_YA_IP6" "$NS_YB")"
-    echo "[yip] [ipv6] ping_loss=${Y6_LOSS}% rtt=${Y6_RTT}ms tcp=${Y6_TCP}Mbit/s udp=${Y6_UDP_MBPS}Mbit/s udp_loss=${Y6_UDP_LOSS}% cpu=${Y6_CPU}% eff=${Y6_EFF}"
+    Y6_RAM="$(get_ns_ram_mb "$NS_YA")"
+    Y6_RAM_EFF="$(calc_ram_efficiency "$Y6_RAM" "$Y6_UDP_MBPS")"
+    echo "[yip] [ipv6] ping_loss=${Y6_LOSS}% rtt=${Y6_RTT}ms tcp=${Y6_TCP}Mbit/s udp=${Y6_UDP_MBPS}Mbit/s udp_loss=${Y6_UDP_LOSS}% cpu=${Y6_CPU}% eff=${Y6_EFF} ram=${Y6_RAM}MB ram_eff=${Y6_RAM_EFF}"
 
     # WireGuard (IPv4 & IPv6)
-    W_LOSS="N/A"; W_RTT="N/A"; W_TCP="N/A"; W_UDP_MBPS="N/A"; W_UDP_LOSS="N/A"; W_CPU="N/A"; W_EFF="N/A"
-    W6_LOSS="N/A"; W6_RTT="N/A"; W6_TCP="N/A"; W6_UDP_MBPS="N/A"; W6_UDP_LOSS="N/A"; W6_CPU="N/A"; W6_EFF="N/A"
+    W_LOSS="N/A"; W_RTT="N/A"; W_TCP="N/A"; W_UDP_MBPS="N/A"; W_UDP_LOSS="N/A"; W_CPU="N/A"; W_EFF="N/A"; W_RAM="N/A"; W_RAM_EFF="N/A"
+    W6_LOSS="N/A"; W6_RTT="N/A"; W6_TCP="N/A"; W6_UDP_MBPS="N/A"; W6_UDP_LOSS="N/A"; W6_CPU="N/A"; W6_EFF="N/A"; W6_RAM="N/A"; W6_RAM_EFF="N/A"
     if [ "$WG_AVAILABLE" = true ]; then
         read -r W_LOSS W_RTT <<< "$(measure_ping "$NS_WB" "$TUN_WA_IP")"
         W_TCP="$(measure_iperf "$NS_WA" "$TUN_WA_IP" "$NS_WB")"
         read -r W_UDP_MBPS W_UDP_LOSS W_CPU W_EFF <<< "$(measure_iperf_udp "$NS_WA" "$TUN_WA_IP" "$NS_WB")"
-        echo "[wg] [ipv4] ping_loss=${W_LOSS}% rtt=${W_RTT}ms tcp=${W_TCP}Mbit/s udp=${W_UDP_MBPS}Mbit/s udp_loss=${W_UDP_LOSS}% cpu=${W_CPU}% eff=${W_EFF}"
+        W_RAM="$(get_ns_ram_mb "$NS_WA")"
+        W_RAM_EFF="$(calc_ram_efficiency "$W_RAM" "$W_UDP_MBPS")"
+        echo "[wg] [ipv4] ping_loss=${W_LOSS}% rtt=${W_RTT}ms tcp=${W_TCP}Mbit/s udp=${W_UDP_MBPS}Mbit/s udp_loss=${W_UDP_LOSS}% cpu=${W_CPU}% eff=${W_EFF} ram=${W_RAM}MB ram_eff=${W_RAM_EFF}"
 
         read -r W6_LOSS W6_RTT <<< "$(measure_ping "$NS_WB" "$TUN_WA_IP6")"
         W6_TCP="$(measure_iperf "$NS_WA" "$TUN_WA_IP6" "$NS_WB")"
         read -r W6_UDP_MBPS W6_UDP_LOSS W6_CPU W6_EFF <<< "$(measure_iperf_udp "$NS_WA" "$TUN_WA_IP6" "$NS_WB")"
-        echo "[wg] [ipv6] ping_loss=${W6_LOSS}% rtt=${W6_RTT}ms tcp=${W6_TCP}Mbit/s udp=${W6_UDP_MBPS}Mbit/s udp_loss=${W6_UDP_LOSS}% cpu=${W6_CPU}% eff=${W6_EFF}"
+        W6_RAM="$(get_ns_ram_mb "$NS_WA")"
+        W6_RAM_EFF="$(calc_ram_efficiency "$W6_RAM" "$W6_UDP_MBPS")"
+        echo "[wg] [ipv6] ping_loss=${W6_LOSS}% rtt=${W6_RTT}ms tcp=${W6_TCP}Mbit/s udp=${W6_UDP_MBPS}Mbit/s udp_loss=${W6_UDP_LOSS}% cpu=${W6_CPU}% eff=${W6_EFF} ram=${W6_RAM}MB ram_eff=${W6_RAM_EFF}"
     fi
 
     # AmneziaWG (IPv4 & IPv6)
-    A_LOSS="N/A"; A_RTT="N/A"; A_TCP="N/A"; A_UDP_MBPS="N/A"; A_UDP_LOSS="N/A"; A_CPU="N/A"; A_EFF="N/A"
-    A6_LOSS="N/A"; A6_RTT="N/A"; A6_TCP="N/A"; A6_UDP_MBPS="N/A"; A6_UDP_LOSS="N/A"; A6_CPU="N/A"; A6_EFF="N/A"
+    A_LOSS="N/A"; A_RTT="N/A"; A_TCP="N/A"; A_UDP_MBPS="N/A"; A_UDP_LOSS="N/A"; A_CPU="N/A"; A_EFF="N/A"; A_RAM="N/A"; A_RAM_EFF="N/A"
+    A6_LOSS="N/A"; A6_RTT="N/A"; A6_TCP="N/A"; A6_UDP_MBPS="N/A"; A6_UDP_LOSS="N/A"; A6_CPU="N/A"; A6_EFF="N/A"; A6_RAM="N/A"; A6_RAM_EFF="N/A"
     if [ "$AWG_AVAILABLE" = true ]; then
         read -r A_LOSS A_RTT <<< "$(measure_ping "$NS_AB" "$TUN_AA_IP")"
         A_TCP="$(measure_iperf "$NS_AA" "$TUN_AA_IP" "$NS_AB")"
         read -r A_UDP_MBPS A_UDP_LOSS A_CPU A_EFF <<< "$(measure_iperf_udp "$NS_AA" "$TUN_AA_IP" "$NS_AB")"
-        echo "[awg] [ipv4] ping_loss=${A_LOSS}% rtt=${A_RTT}ms tcp=${A_TCP}Mbit/s udp=${A_UDP_MBPS}Mbit/s udp_loss=${A_UDP_LOSS}% cpu=${A_CPU}% eff=${A_EFF}"
+        A_RAM="$(get_ns_ram_mb "$NS_AA")"
+        A_RAM_EFF="$(calc_ram_efficiency "$A_RAM" "$A_UDP_MBPS")"
+        echo "[awg] [ipv4] ping_loss=${A_LOSS}% rtt=${A_RTT}ms tcp=${A_TCP}Mbit/s udp=${A_UDP_MBPS}Mbit/s udp_loss=${A_UDP_LOSS}% cpu=${A_CPU}% eff=${A_EFF} ram=${A_RAM}MB ram_eff=${A_RAM_EFF}"
 
         read -r A6_LOSS A6_RTT <<< "$(measure_ping "$NS_AB" "$TUN_AA_IP6")"
         A6_TCP="$(measure_iperf "$NS_AA" "$TUN_AA_IP6" "$NS_AB")"
         read -r A6_UDP_MBPS A6_UDP_LOSS A6_CPU A6_EFF <<< "$(measure_iperf_udp "$NS_AA" "$TUN_AA_IP6" "$NS_AB")"
-        echo "[awg] [ipv6] ping_loss=${A6_LOSS}% rtt=${A6_RTT}ms tcp=${A6_TCP}Mbit/s udp=${A6_UDP_MBPS}Mbit/s udp_loss=${A6_UDP_LOSS}% cpu=${A6_CPU}% eff=${A6_EFF}"
+        A6_RAM="$(get_ns_ram_mb "$NS_AA")"
+        A6_RAM_EFF="$(calc_ram_efficiency "$A6_RAM" "$A6_UDP_MBPS")"
+        echo "[awg] [ipv6] ping_loss=${A6_LOSS}% rtt=${A6_RTT}ms tcp=${A6_TCP}Mbit/s udp=${A6_UDP_MBPS}Mbit/s udp_loss=${A6_UDP_LOSS}% cpu=${A6_CPU}% eff=${A6_EFF} ram=${A6_RAM}MB ram_eff=${A6_RAM_EFF}"
     fi
 
     # OpenVPN (IPv4 & IPv6)
-    O_LOSS="N/A"; O_RTT="N/A"; O_TCP="N/A"; O_UDP_MBPS="N/A"; O_UDP_LOSS="N/A"; O_CPU="N/A"; O_EFF="N/A"
-    O6_LOSS="N/A"; O6_RTT="N/A"; O6_TCP="N/A"; O6_UDP_MBPS="N/A"; O6_UDP_LOSS="N/A"; O6_CPU="N/A"; O6_EFF="N/A"
+    O_LOSS="N/A"; O_RTT="N/A"; O_TCP="N/A"; O_UDP_MBPS="N/A"; O_UDP_LOSS="N/A"; O_CPU="N/A"; O_EFF="N/A"; O_RAM="N/A"; O_RAM_EFF="N/A"
+    O6_LOSS="N/A"; O6_RTT="N/A"; O6_TCP="N/A"; O6_UDP_MBPS="N/A"; O6_UDP_LOSS="N/A"; O6_CPU="N/A"; O6_EFF="N/A"; O6_RAM="N/A"; O6_RAM_EFF="N/A"
     if [ "$OVPN_AVAILABLE" = true ]; then
         read -r O_LOSS O_RTT <<< "$(measure_ping "$NS_OB" "$TUN_OA_IP")"
         O_TCP="$(measure_iperf "$NS_OA" "$TUN_OA_IP" "$NS_OB")"
         read -r O_UDP_MBPS O_UDP_LOSS O_CPU O_EFF <<< "$(measure_iperf_udp "$NS_OA" "$TUN_OA_IP" "$NS_OB")"
-        echo "[ovpn] [ipv4] ping_loss=${O_LOSS}% rtt=${O_RTT}ms tcp=${O_TCP}Mbit/s udp=${O_UDP_MBPS}Mbit/s udp_loss=${O_UDP_LOSS}% cpu=${O_CPU}% eff=${O_EFF}"
+        O_RAM="$(get_ns_ram_mb "$NS_OA")"
+        O_RAM_EFF="$(calc_ram_efficiency "$O_RAM" "$O_UDP_MBPS")"
+        echo "[ovpn] [ipv4] ping_loss=${O_LOSS}% rtt=${O_RTT}ms tcp=${O_TCP}Mbit/s udp=${O_UDP_MBPS}Mbit/s udp_loss=${O_UDP_LOSS}% cpu=${O_CPU}% eff=${O_EFF} ram=${O_RAM}MB ram_eff=${O_RAM_EFF}"
 
         read -r O6_LOSS O6_RTT <<< "$(measure_ping "$NS_OB" "$TUN_OA_IP6")"
         O6_TCP="$(measure_iperf "$NS_OA" "$TUN_OA_IP6" "$NS_OB")"
         read -r O6_UDP_MBPS O6_UDP_LOSS O6_CPU O6_EFF <<< "$(measure_iperf_udp "$NS_OA" "$TUN_OA_IP6" "$NS_OB")"
-        echo "[ovpn] [ipv6] ping_loss=${O6_LOSS}% rtt=${O6_RTT}ms tcp=${O6_TCP}Mbit/s udp=${O6_UDP_MBPS}Mbit/s udp_loss=${O6_UDP_LOSS}% cpu=${O6_CPU}% eff=${O6_EFF}"
+        O6_RAM="$(get_ns_ram_mb "$NS_OA")"
+        O6_RAM_EFF="$(calc_ram_efficiency "$O6_RAM" "$O6_UDP_MBPS")"
+        echo "[ovpn] [ipv6] ping_loss=${O6_LOSS}% rtt=${O6_RTT}ms tcp=${O6_TCP}Mbit/s udp=${O6_UDP_MBPS}Mbit/s udp_loss=${O6_UDP_LOSS}% cpu=${O6_CPU}% eff=${O6_EFF} ram=${O6_RAM}MB ram_eff=${O6_RAM_EFF}"
     fi
 
     # n2n (IPv4 & IPv6)
-    N_LOSS="N/A"; N_RTT="N/A"; N_TCP="N/A"; N_UDP_MBPS="N/A"; N_UDP_LOSS="N/A"; N_CPU="N/A"; N_EFF="N/A"
-    N6_LOSS="N/A"; N6_RTT="N/A"; N6_TCP="N/A"; N6_UDP_MBPS="N/A"; N6_UDP_LOSS="N/A"; N6_CPU="N/A"; N6_EFF="N/A"
+    N_LOSS="N/A"; N_RTT="N/A"; N_TCP="N/A"; N_UDP_MBPS="N/A"; N_UDP_LOSS="N/A"; N_CPU="N/A"; N_EFF="N/A"; N_RAM="N/A"; N_RAM_EFF="N/A"
+    N6_LOSS="N/A"; N6_RTT="N/A"; N6_TCP="N/A"; N6_UDP_MBPS="N/A"; N6_UDP_LOSS="N/A"; N6_CPU="N/A"; N6_EFF="N/A"; N6_RAM="N/A"; N6_RAM_EFF="N/A"
     if [ "$N2N_AVAILABLE" = true ]; then
         read -r N_LOSS N_RTT <<< "$(measure_ping "$NS_NB" "$OVL_NA_IP")"
         N_TCP="$(measure_iperf "$NS_NA" "$OVL_NA_IP" "$NS_NB")"
         read -r N_UDP_MBPS N_UDP_LOSS N_CPU N_EFF <<< "$(measure_iperf_udp "$NS_NA" "$OVL_NA_IP" "$NS_NB")"
-        echo "[n2n] [ipv4] ping_loss=${N_LOSS}% rtt=${N_RTT}ms tcp=${N_TCP}Mbit/s udp=${N_UDP_MBPS}Mbit/s udp_loss=${N_UDP_LOSS}% cpu=${N_CPU}% eff=${N_EFF}"
+        N_RAM="$(get_ns_ram_mb "$NS_NA")"
+        N_RAM_EFF="$(calc_ram_efficiency "$N_RAM" "$N_UDP_MBPS")"
+        echo "[n2n] [ipv4] ping_loss=${N_LOSS}% rtt=${N_RTT}ms tcp=${N_TCP}Mbit/s udp=${N_UDP_MBPS}Mbit/s udp_loss=${N_UDP_LOSS}% cpu=${N_CPU}% eff=${N_EFF} ram=${N_RAM}MB ram_eff=${N_RAM_EFF}"
 
         read -r N6_LOSS N6_RTT <<< "$(measure_ping "$NS_NB" "$OVL_NA_IP6")"
         N6_TCP="$(measure_iperf "$NS_NA" "$OVL_NA_IP6" "$NS_NB")"
         read -r N6_UDP_MBPS N6_UDP_LOSS N6_CPU N6_EFF <<< "$(measure_iperf_udp "$NS_NA" "$OVL_NA_IP6" "$NS_NB")"
-        echo "[n2n] [ipv6] ping_loss=${N6_LOSS}% rtt=${N6_RTT}ms tcp=${N6_TCP}Mbit/s udp=${N6_UDP_MBPS}Mbit/s udp_loss=${N6_UDP_LOSS}% cpu=${N6_CPU}% eff=${N6_EFF}"
+        N6_RAM="$(get_ns_ram_mb "$NS_NA")"
+        N6_RAM_EFF="$(calc_ram_efficiency "$N6_RAM" "$N6_UDP_MBPS")"
+        echo "[n2n] [ipv6] ping_loss=${N6_LOSS}% rtt=${N6_RTT}ms tcp=${N6_TCP}Mbit/s udp=${N6_UDP_MBPS}Mbit/s udp_loss=${N6_UDP_LOSS}% cpu=${N6_CPU}% eff=${N6_EFF} ram=${N6_RAM}MB ram_eff=${N6_RAM_EFF}"
     fi
 
     # ZeroTier (IPv4 & IPv6)
-    Z_LOSS="N/A"; Z_RTT="N/A"; Z_TCP="N/A"; Z_UDP_MBPS="N/A"; Z_UDP_LOSS="N/A"; Z_CPU="N/A"; Z_EFF="N/A"
-    Z6_LOSS="N/A"; Z6_RTT="N/A"; Z6_TCP="N/A"; Z6_UDP_MBPS="N/A"; Z6_UDP_LOSS="N/A"; Z6_CPU="N/A"; Z6_EFF="N/A"
+    Z_LOSS="N/A"; Z_RTT="N/A"; Z_TCP="N/A"; Z_UDP_MBPS="N/A"; Z_UDP_LOSS="N/A"; Z_CPU="N/A"; Z_EFF="N/A"; Z_RAM="N/A"; Z_RAM_EFF="N/A"
+    Z6_LOSS="N/A"; Z6_RTT="N/A"; Z6_TCP="N/A"; Z6_UDP_MBPS="N/A"; Z6_UDP_LOSS="N/A"; Z6_CPU="N/A"; Z6_EFF="N/A"; Z6_RAM="N/A"; Z6_RAM_EFF="N/A"
     if [ "$ZT_AVAILABLE" = true ]; then
         read -r Z_LOSS Z_RTT <<< "$(measure_ping "$NS_ZB" "$TUN_ZA_IP")"
         Z_TCP="$(measure_iperf "$NS_ZA" "$TUN_ZA_IP" "$NS_ZB")"
         read -r Z_UDP_MBPS Z_UDP_LOSS Z_CPU Z_EFF <<< "$(measure_iperf_udp "$NS_ZA" "$TUN_ZA_IP" "$NS_ZB")"
-        echo "[zerotier] [ipv4] ping_loss=${Z_LOSS}% rtt=${Z_RTT}ms tcp=${Z_TCP}Mbit/s udp=${Z_UDP_MBPS}Mbit/s udp_loss=${Z_UDP_LOSS}% cpu=${Z_CPU}% eff=${Z_EFF}"
+        Z_RAM="$(get_ns_ram_mb "$NS_ZA")"
+        Z_RAM_EFF="$(calc_ram_efficiency "$Z_RAM" "$Z_UDP_MBPS")"
+        echo "[zerotier] [ipv4] ping_loss=${Z_LOSS}% rtt=${Z_RTT}ms tcp=${Z_TCP}Mbit/s udp=${Z_UDP_MBPS}Mbit/s udp_loss=${Z_UDP_LOSS}% cpu=${Z_CPU}% eff=${Z_EFF} ram=${Z_RAM}MB ram_eff=${Z_RAM_EFF}"
 
         read -r Z6_LOSS Z6_RTT <<< "$(measure_ping "$NS_ZB" "$TUN_ZA_IP6")"
         Z6_TCP="$(measure_iperf "$NS_ZA" "$TUN_ZA_IP6" "$NS_ZB")"
         read -r Z6_UDP_MBPS Z6_UDP_LOSS Z6_CPU Z6_EFF <<< "$(measure_iperf_udp "$NS_ZA" "$TUN_ZA_IP6" "$NS_ZB")"
-        echo "[zerotier] [ipv6] ping_loss=${Z6_LOSS}% rtt=${Z6_RTT}ms tcp=${Z6_TCP}Mbit/s udp=${Z6_UDP_MBPS}Mbit/s udp_loss=${Z6_UDP_LOSS}% cpu=${Z6_CPU}% eff=${Z6_EFF}"
+        Z6_RAM="$(get_ns_ram_mb "$NS_ZA")"
+        Z6_RAM_EFF="$(calc_ram_efficiency "$Z6_RAM" "$Z6_UDP_MBPS")"
+        echo "[zerotier] [ipv6] ping_loss=${Z6_LOSS}% rtt=${Z6_RTT}ms tcp=${Z6_TCP}Mbit/s udp=${Z6_UDP_MBPS}Mbit/s udp_loss=${Z6_UDP_LOSS}% cpu=${Z6_CPU}% eff=${Z6_EFF} ram=${Z6_RAM}MB ram_eff=${Z6_RAM_EFF}"
     fi
 
     # Tailscale (IPv4 & IPv6)
-    T_LOSS="N/A"; T_RTT="N/A"; T_TCP="N/A"; T_UDP_MBPS="N/A"; T_UDP_LOSS="N/A"; T_CPU="N/A"; T_EFF="N/A"
-    T6_LOSS="N/A"; T6_RTT="N/A"; T6_TCP="N/A"; T6_UDP_MBPS="N/A"; T6_UDP_LOSS="N/A"; T6_CPU="N/A"; T6_EFF="N/A"
+    T_LOSS="N/A"; T_RTT="N/A"; T_TCP="N/A"; T_UDP_MBPS="N/A"; T_UDP_LOSS="N/A"; T_CPU="N/A"; T_EFF="N/A"; T_RAM="N/A"; T_RAM_EFF="N/A"
+    T6_LOSS="N/A"; T6_RTT="N/A"; T6_TCP="N/A"; T6_UDP_MBPS="N/A"; T6_UDP_LOSS="N/A"; T6_CPU="N/A"; T6_EFF="N/A"; T6_RAM="N/A"; T6_RAM_EFF="N/A"
     if [ "$TS_AVAILABLE" = true ]; then
         read -r T_LOSS T_RTT <<< "$(measure_ping "$NS_TB" "$TUN_TA_IP")"
         T_TCP="$(measure_iperf "$NS_TA" "$TUN_TA_IP" "$NS_TB")"
         read -r T_UDP_MBPS T_UDP_LOSS T_CPU T_EFF <<< "$(measure_iperf_udp "$NS_TA" "$TUN_TA_IP" "$NS_TB")"
-        echo "[tailscale] [ipv4] ping_loss=${T_LOSS}% rtt=${T_RTT}ms tcp=${T_TCP}Mbit/s udp=${T_UDP_MBPS}Mbit/s udp_loss=${T_UDP_LOSS}% cpu=${T_CPU}% eff=${T_EFF}"
+        T_RAM="$(get_ns_ram_mb "$NS_TA")"
+        T_RAM_EFF="$(calc_ram_efficiency "$T_RAM" "$T_UDP_MBPS")"
+        echo "[tailscale] [ipv4] ping_loss=${T_LOSS}% rtt=${T_RTT}ms tcp=${T_TCP}Mbit/s udp=${T_UDP_MBPS}Mbit/s udp_loss=${T_UDP_LOSS}% cpu=${T_CPU}% eff=${T_EFF} ram=${T_RAM}MB ram_eff=${T_RAM_EFF}"
 
         read -r T6_LOSS T6_RTT <<< "$(measure_ping "$NS_TB" "$TUN_TA_IP6")"
         T6_TCP="$(measure_iperf "$NS_TA" "$TUN_TA_IP6" "$NS_TB")"
         read -r T6_UDP_MBPS T6_UDP_LOSS T6_CPU T6_EFF <<< "$(measure_iperf_udp "$NS_TA" "$TUN_TA_IP6" "$NS_TB")"
-        echo "[tailscale] [ipv6] ping_loss=${T6_LOSS}% rtt=${T6_RTT}ms tcp=${T6_TCP}Mbit/s udp=${T6_UDP_MBPS}Mbit/s udp_loss=${T6_UDP_LOSS}% cpu=${T6_CPU}% eff=${T6_EFF}"
+        T6_RAM="$(get_ns_ram_mb "$NS_TA")"
+        T6_RAM_EFF="$(calc_ram_efficiency "$T6_RAM" "$T6_UDP_MBPS")"
+        echo "[tailscale] [ipv6] ping_loss=${T6_LOSS}% rtt=${T6_RTT}ms tcp=${T6_TCP}Mbit/s udp=${T6_UDP_MBPS}Mbit/s udp_loss=${T6_UDP_LOSS}% cpu=${T6_CPU}% eff=${T6_EFF} ram=${T6_RAM}MB ram_eff=${T6_RAM_EFF}"
     fi
 
     # NetBird (IPv4 & IPv6)
-    B_LOSS="N/A"; B_RTT="N/A"; B_TCP="N/A"; B_UDP_MBPS="N/A"; B_UDP_LOSS="N/A"; B_CPU="N/A"; B_EFF="N/A"
-    B6_LOSS="N/A"; B6_RTT="N/A"; B6_TCP="N/A"; B6_UDP_MBPS="N/A"; B6_UDP_LOSS="N/A"; B6_CPU="N/A"; B6_EFF="N/A"
+    B_LOSS="N/A"; B_RTT="N/A"; B_TCP="N/A"; B_UDP_MBPS="N/A"; B_UDP_LOSS="N/A"; B_CPU="N/A"; B_EFF="N/A"; B_RAM="N/A"; B_RAM_EFF="N/A"
+    B6_LOSS="N/A"; B6_RTT="N/A"; B6_TCP="N/A"; B6_UDP_MBPS="N/A"; B6_UDP_LOSS="N/A"; B6_CPU="N/A"; B6_EFF="N/A"; B6_RAM="N/A"; B6_RAM_EFF="N/A"
     if [ "$NB_AVAILABLE" = true ]; then
         read -r B_LOSS B_RTT <<< "$(measure_ping "$NS_BB" "$TUN_BA_IP")"
         B_TCP="$(measure_iperf "$NS_BA" "$TUN_BA_IP" "$NS_BB")"
         read -r B_UDP_MBPS B_UDP_LOSS B_CPU B_EFF <<< "$(measure_iperf_udp "$NS_BA" "$TUN_BA_IP" "$NS_BB")"
-        echo "[netbird] [ipv4] ping_loss=${B_LOSS}% rtt=${B_RTT}ms tcp=${B_TCP}Mbit/s udp=${B_UDP_MBPS}Mbit/s udp_loss=${B_UDP_LOSS}% cpu=${B_CPU}% eff=${B_EFF}"
+        B_RAM="$(get_ns_ram_mb "$NS_BA")"
+        B_RAM_EFF="$(calc_ram_efficiency "$B_RAM" "$B_UDP_MBPS")"
+        echo "[netbird] [ipv4] ping_loss=${B_LOSS}% rtt=${B_RTT}ms tcp=${B_TCP}Mbit/s udp=${B_UDP_MBPS}Mbit/s udp_loss=${B_UDP_LOSS}% cpu=${B_CPU}% eff=${B_EFF} ram=${B_RAM}MB ram_eff=${B_RAM_EFF}"
 
         read -r B6_LOSS B6_RTT <<< "$(measure_ping "$NS_BB" "$TUN_BA_IP6")"
         B6_TCP="$(measure_iperf "$NS_BA" "$TUN_BA_IP6" "$NS_BB")"
         read -r B6_UDP_MBPS B6_UDP_LOSS B6_CPU B6_EFF <<< "$(measure_iperf_udp "$NS_BA" "$TUN_BA_IP6" "$NS_BB")"
-        echo "[netbird] [ipv6] ping_loss=${B6_LOSS}% rtt=${B6_RTT}ms tcp=${B6_TCP}Mbit/s udp=${B6_UDP_MBPS}Mbit/s udp_loss=${B6_UDP_LOSS}% cpu=${B6_CPU}% eff=${B6_EFF}"
+        B6_RAM="$(get_ns_ram_mb "$NS_BA")"
+        B6_RAM_EFF="$(calc_ram_efficiency "$B6_RAM" "$B6_UDP_MBPS")"
+        echo "[netbird] [ipv6] ping_loss=${B6_LOSS}% rtt=${B6_RTT}ms tcp=${B6_TCP}Mbit/s udp=${B6_UDP_MBPS}Mbit/s udp_loss=${B6_UDP_LOSS}% cpu=${B6_CPU}% eff=${B6_EFF} ram=${B6_RAM}MB ram_eff=${B6_RAM_EFF}"
     fi
 
     # ── emit per-loss-rate tables ─────────────────────────────────────────────
+    YIP_LABEL="yip"
+    if [ "$YIP_SHARDS" -gt 1 ] 2>/dev/null; then
+        YIP_LABEL="yip(s=$YIP_SHARDS)"
+    fi
+
     echo ""
     echo "  --- IPv4 loss=${LOSS}% ---"
-    echo "  | contender | eff_loss% | rtt_ms | tcp_Mbit/s | udp_Mbit/s | udp_loss% | cpu% | cpu_eff(%/Gbps) |"
-    echo "  |-----------|-----------|--------|------------|------------|-----------|------|-----------------|"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s |\n" "yip"       "$Y_LOSS" "$Y_RTT" "$Y_TCP" "$Y_UDP_MBPS" "$Y_UDP_LOSS" "$Y_CPU" "$Y_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s |\n" "wireguard" "$W_LOSS" "$W_RTT" "$W_TCP" "$W_UDP_MBPS" "$W_UDP_LOSS" "$W_CPU" "$W_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s |\n" "amneziawg" "$A_LOSS" "$A_RTT" "$A_TCP" "$A_UDP_MBPS" "$A_UDP_LOSS" "$A_CPU" "$A_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s |\n" "openvpn"   "$O_LOSS" "$O_RTT" "$O_TCP" "$O_UDP_MBPS" "$O_UDP_LOSS" "$O_CPU" "$O_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s |\n" "n2n"       "$N_LOSS" "$N_RTT" "$N_TCP" "$N_UDP_MBPS" "$N_UDP_LOSS" "$N_CPU" "$N_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s |\n" "zerotier"  "$Z_LOSS" "$Z_RTT" "$Z_TCP" "$Z_UDP_MBPS" "$Z_UDP_LOSS" "$Z_CPU" "$Z_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s |\n" "tailscale" "$T_LOSS" "$T_RTT" "$T_TCP" "$T_UDP_MBPS" "$T_UDP_LOSS" "$T_CPU" "$T_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s |\n" "netbird"   "$B_LOSS" "$B_RTT" "$B_TCP" "$B_UDP_MBPS" "$B_UDP_LOSS" "$B_CPU" "$B_EFF"
+    echo "  | contender | eff_loss% | rtt_ms | tcp_Mbit/s | udp_Mbit/s | udp_loss% | cpu% | cpu_eff(%/Gbps) | ram_MB | ram_eff(MB/Gbps) |"
+    echo "  |-----------|-----------|--------|------------|------------|-----------|------|-----------------|--------|------------------|"
+    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "$YIP_LABEL" "$Y_LOSS" "$Y_RTT" "$Y_TCP" "$Y_UDP_MBPS" "$Y_UDP_LOSS" "$Y_CPU" "$Y_EFF" "$Y_RAM" "$Y_RAM_EFF"
+    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "wireguard" "$W_LOSS" "$W_RTT" "$W_TCP" "$W_UDP_MBPS" "$W_UDP_LOSS" "$W_CPU" "$W_EFF" "$W_RAM" "$W_RAM_EFF"
+    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "amneziawg" "$A_LOSS" "$A_RTT" "$A_TCP" "$A_UDP_MBPS" "$A_UDP_LOSS" "$A_CPU" "$A_EFF" "$A_RAM" "$A_RAM_EFF"
+    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "openvpn"   "$O_LOSS" "$O_RTT" "$O_TCP" "$O_UDP_MBPS" "$O_UDP_LOSS" "$O_CPU" "$O_EFF" "$O_RAM" "$O_RAM_EFF"
+    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "n2n"       "$N_LOSS" "$N_RTT" "$N_TCP" "$N_UDP_MBPS" "$N_UDP_LOSS" "$N_CPU" "$N_EFF" "$N_RAM" "$N_RAM_EFF"
+    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "zerotier"  "$Z_LOSS" "$Z_RTT" "$Z_TCP" "$Z_UDP_MBPS" "$Z_UDP_LOSS" "$Z_CPU" "$Z_EFF" "$Z_RAM" "$Z_RAM_EFF"
+    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "tailscale" "$T_LOSS" "$T_RTT" "$T_TCP" "$T_UDP_MBPS" "$T_UDP_LOSS" "$T_CPU" "$T_EFF" "$T_RAM" "$T_RAM_EFF"
+    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "netbird"   "$B_LOSS" "$B_RTT" "$B_TCP" "$B_UDP_MBPS" "$B_UDP_LOSS" "$B_CPU" "$B_EFF" "$B_RAM" "$B_RAM_EFF"
 
     echo ""
     echo "  --- IPv6 loss=${LOSS}% ---"
-    echo "  | contender | eff_loss% | rtt_ms | tcp_Mbit/s | udp_Mbit/s | udp_loss% | cpu% | cpu_eff(%/Gbps) |"
-    echo "  |-----------|-----------|--------|------------|------------|-----------|------|-----------------|"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s |\n" "yip"       "$Y6_LOSS" "$Y6_RTT" "$Y6_TCP" "$Y6_UDP_MBPS" "$Y6_UDP_LOSS" "$Y6_CPU" "$Y6_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s |\n" "wireguard" "$W6_LOSS" "$W6_RTT" "$W6_TCP" "$W6_UDP_MBPS" "$W6_UDP_LOSS" "$W6_CPU" "$W6_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s |\n" "amneziawg" "$A6_LOSS" "$A6_RTT" "$A6_TCP" "$A6_UDP_MBPS" "$A6_UDP_LOSS" "$A6_CPU" "$A6_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s |\n" "openvpn"   "$O6_LOSS" "$O6_RTT" "$O6_TCP" "$O6_UDP_MBPS" "$O6_UDP_LOSS" "$O6_CPU" "$O6_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s |\n" "n2n"       "$N6_LOSS" "$N6_RTT" "$N6_TCP" "$N6_UDP_MBPS" "$N6_UDP_LOSS" "$N6_CPU" "$N6_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s |\n" "zerotier"  "$Z6_LOSS" "$Z6_RTT" "$Z6_TCP" "$Z6_UDP_MBPS" "$Z6_UDP_LOSS" "$Z6_CPU" "$Z6_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s |\n" "tailscale" "$T6_LOSS" "$T6_RTT" "$T6_TCP" "$T6_UDP_MBPS" "$T6_UDP_LOSS" "$T6_CPU" "$T6_EFF"
-    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s |\n" "netbird"   "$B6_LOSS" "$B6_RTT" "$B6_TCP" "$B6_UDP_MBPS" "$B6_UDP_LOSS" "$B6_CPU" "$B6_EFF"
+    echo "  | contender | eff_loss% | rtt_ms | tcp_Mbit/s | udp_Mbit/s | udp_loss% | cpu% | cpu_eff(%/Gbps) | ram_MB | ram_eff(MB/Gbps) |"
+    echo "  |-----------|-----------|--------|------------|------------|-----------|------|-----------------|--------|------------------|"
+    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "$YIP_LABEL" "$Y6_LOSS" "$Y6_RTT" "$Y6_TCP" "$Y6_UDP_MBPS" "$Y6_UDP_LOSS" "$Y6_CPU" "$Y6_EFF" "$Y6_RAM" "$Y6_RAM_EFF"
+    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "wireguard" "$W6_LOSS" "$W6_RTT" "$W6_TCP" "$W6_UDP_MBPS" "$W6_UDP_LOSS" "$W6_CPU" "$W6_EFF" "$W6_RAM" "$W6_RAM_EFF"
+    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "amneziawg" "$A6_LOSS" "$A6_RTT" "$A6_TCP" "$A6_UDP_MBPS" "$A6_UDP_LOSS" "$A6_CPU" "$A6_EFF" "$A6_RAM" "$A6_RAM_EFF"
+    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "openvpn"   "$O6_LOSS" "$O6_RTT" "$O6_TCP" "$O6_UDP_MBPS" "$O6_UDP_LOSS" "$O6_CPU" "$O6_EFF" "$O6_RAM" "$O6_RAM_EFF"
+    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "n2n"       "$N6_LOSS" "$N6_RTT" "$N6_TCP" "$N6_UDP_MBPS" "$N6_UDP_LOSS" "$N6_CPU" "$N6_EFF" "$N6_RAM" "$N6_RAM_EFF"
+    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "zerotier"  "$Z6_LOSS" "$Z6_RTT" "$Z6_TCP" "$Z6_UDP_MBPS" "$Z6_UDP_LOSS" "$Z6_CPU" "$Z6_EFF" "$Z6_RAM" "$Z6_RAM_EFF"
+    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "tailscale" "$T6_LOSS" "$T6_RTT" "$T6_TCP" "$T6_UDP_MBPS" "$T6_UDP_LOSS" "$T6_CPU" "$T6_EFF" "$T6_RAM" "$T6_RAM_EFF"
+    printf "  | %-9s | %-9s | %-6s | %-10s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "netbird"   "$B6_LOSS" "$B6_RTT" "$B6_TCP" "$B6_UDP_MBPS" "$B6_UDP_LOSS" "$B6_CPU" "$B6_EFF" "$B6_RAM" "$B6_RAM_EFF"
 done
 
 echo ""

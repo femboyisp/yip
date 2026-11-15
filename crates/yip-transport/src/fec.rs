@@ -791,7 +791,7 @@ impl FecReassembler {
                 repair_pool.push(vec![0u8; shard_len]);
             }
         }
-        for buf in &mut repair_pool[..k] {
+        for buf in &mut repair_pool {
             if buf.capacity() < shard_len {
                 buf.reserve(shard_len - buf.capacity());
             }
@@ -979,6 +979,9 @@ impl FecReassembler {
                 .repair_pool
                 .pop()
                 .unwrap_or_else(|| vec![0u8; state.shard_len]);
+            if shard_buf.len() < state.shard_len {
+                shard_buf.resize(state.shard_len, 0);
+            }
             let copy_len = symbol.data.len().min(state.shard_len);
             shard_buf[..copy_len].copy_from_slice(&symbol.data[..copy_len]);
             if copy_len < state.shard_len {
@@ -2328,5 +2331,35 @@ mod tests {
         assert_eq!(enc.symbols_encoded(), 5);
         assert_ne!(enc.symbols_encoded(), 0);
         assert_ne!(enc.symbols_encoded(), 1);
+    }
+
+    #[test]
+    fn test_recycled_repair_pool_buffer_length_regression() {
+        let params = FlowClass::Bulk.params();
+        let mut enc = FecEncoder::new();
+
+        // Object 1: K=4 (requiring 4 repair pool slots)
+        let ct1 = vec![0x42u8; 4800];
+        let syms1 = enc.encode(&ct1, params, 2); // K=4, M=2
+
+        let mut re = FecReassembler::new(1200, 4);
+
+        // Receive with 1 loss: 3 source symbols + 1 repair symbol
+        assert!(re.push(1, &syms1[0], 0, 100_000).is_none());
+        assert!(re.push(1, &syms1[1], 0, 100_000).is_none());
+        assert!(re.push(1, &syms1[2], 0, 100_000).is_none());
+        // syms1[4] is repair shard (symbol_index = 4 >= k)
+        let recovered1 = re.push(1, &syms1[4], 0, 100_000);
+        assert!(recovered1.is_some());
+
+        // Object 1 is completed. Evict or let it be recycled by pushing other objects.
+        // Now Object 2 has K=1 (ct2 = 500 bytes)
+        let ct2 = vec![0x99u8; 500];
+        let syms2 = enc.encode(&ct2, params, 1); // K=1, M=1
+                                                 // Object 2 receives ONLY the repair shard (syms2[1], symbol_index = 1 >= k)
+                                                 // This forces popping from the recycled repair_pool where buffers had len == 0.
+        let recovered2 = re.push(2, &syms2[1], 10, 100_000);
+        assert!(recovered2.is_some());
+        assert_eq!(recovered2.unwrap(), ct2);
     }
 }

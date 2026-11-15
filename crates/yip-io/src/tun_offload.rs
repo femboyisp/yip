@@ -335,22 +335,58 @@ pub(crate) fn parse_ipv6_udp(pkt: &[u8]) -> Option<Ipv6Udp<'_>> {
     parse_ipv6_udp_opt(pkt, false)
 }
 
-pub(crate) fn ipv4_checksum(hdr: &mut [u8]) {
-    hdr[10] = 0;
-    hdr[11] = 0;
+/// Accumulate 16-bit words in network-byte-order across `data` into a 32-bit sum.
+/// Any trailing odd byte is treated as `byte << 8` per RFC 768 / RFC 1071.
+#[inline]
+pub(crate) fn sum_16(data: &[u8]) -> u32 {
     let mut sum: u32 = 0;
-    for c in hdr.chunks(2) {
-        let word = if c.len() == 2 {
-            u16::from_be_bytes([c[0], c[1]])
-        } else {
-            u16::from(c[0]) << 8
-        };
-        sum += u32::from(word);
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += u32::from(u16::from_be_bytes([data[i], data[i + 1]]));
+        i += 2;
     }
+    if i < data.len() {
+        sum += u32::from(u16::from(data[i]) << 8);
+    }
+    sum
+}
+
+/// Fold a 32-bit accumulated sum down to 16 bits and invert (one's complement).
+#[inline]
+pub(crate) fn fold_csum(mut sum: u32) -> u16 {
     while (sum >> 16) != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
-    let ck = !u16::try_from(sum & 0xFFFF).expect("folded sum fits u16");
+    !u16::try_from(sum & 0xFFFF).expect("folded sum fits u16")
+}
+
+/// Precompute the invariant word sum of an IPv4 header (excluding `total_len`,
+/// `ip_id`, and `checksum`), allowing O(1) checksum computation across GSO slices.
+#[inline]
+pub(crate) fn ipv4_base_sum(hdr: &[u8]) -> u32 {
+    let mut sum: u32 = 0;
+    sum += u32::from(u16::from_be_bytes([hdr[0], hdr[1]]));
+    sum += u32::from(u16::from_be_bytes([hdr[6], hdr[7]]));
+    sum += u32::from(u16::from_be_bytes([hdr[8], hdr[9]]));
+    sum += u32::from(u16::from_be_bytes([hdr[12], hdr[13]]));
+    sum += u32::from(u16::from_be_bytes([hdr[14], hdr[15]]));
+    sum += u32::from(u16::from_be_bytes([hdr[16], hdr[17]]));
+    sum += u32::from(u16::from_be_bytes([hdr[18], hdr[19]]));
+    sum += sum_16(&hdr[20..]);
+    sum
+}
+
+/// Compute the IPv4 header checksum from a precomputed base sum, total length, and IP-ID.
+#[inline]
+pub(crate) fn ipv4_checksum_with_base(base_sum: u32, total_len: u16, ip_id: u16) -> u16 {
+    fold_csum(base_sum + u32::from(total_len) + u32::from(ip_id))
+}
+
+pub(crate) fn ipv4_checksum(hdr: &mut [u8]) {
+    hdr[10] = 0;
+    hdr[11] = 0;
+    let sum = sum_16(hdr);
+    let ck = fold_csum(sum);
     hdr[10..12].copy_from_slice(&ck.to_be_bytes());
 }
 
@@ -368,18 +404,8 @@ pub(crate) fn tcp_checksum(pkt: &mut [u8], ip_hdr_len: usize) {
     }
     sum += u32::from(6u16);
     sum += u32::try_from(tcp_len).expect("tcp_len fits u32") & 0xFFFF;
-    for c in pkt[tcp_off..total].chunks(2) {
-        let w = if c.len() == 2 {
-            u16::from_be_bytes([c[0], c[1]])
-        } else {
-            u16::from(c[0]) << 8
-        };
-        sum += u32::from(w);
-    }
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    let ck = !u16::try_from(sum & 0xFFFF).expect("folded fits u16");
+    sum += sum_16(&pkt[tcp_off..total]);
+    let ck = fold_csum(sum);
     pkt[tcp_off + 16..tcp_off + 18].copy_from_slice(&ck.to_be_bytes());
 }
 
@@ -402,21 +428,18 @@ pub(crate) fn ipv6_tcp_checksum(pkt: &mut [u8]) {
     sum += tcp_len_u32 >> 16;
     sum += tcp_len_u32 & 0xFFFF;
     sum += u32::from(6u16);
-    for c in pkt[tcp_off..total].chunks(2) {
-        let w = if c.len() == 2 {
-            u16::from_be_bytes([c[0], c[1]])
-        } else {
-            u16::from(c[0]) << 8
-        };
-        sum += u32::from(w);
-    }
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    let ck = !u16::try_from(sum & 0xFFFF).expect("folded fits u16");
+    sum += sum_16(&pkt[tcp_off..total]);
+    let ck = fold_csum(sum);
     pkt[tcp_off + 16..tcp_off + 18].copy_from_slice(&ck.to_be_bytes());
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "kept for tests and reference checksum verification"
+    )
+)]
 pub(crate) fn udp_checksum(pkt: &mut [u8], ip_hdr_len: usize) {
     if pkt.len() < ip_hdr_len + 8 {
         return;
@@ -434,24 +457,21 @@ pub(crate) fn udp_checksum(pkt: &mut [u8], ip_hdr_len: usize) {
     }
     sum += u32::from(17u16);
     sum += u32::try_from(udp_len).expect("udp_len fits u32") & 0xFFFF;
-    for c in pkt[udp_off..total].chunks(2) {
-        let w = if c.len() == 2 {
-            u16::from_be_bytes([c[0], c[1]])
-        } else {
-            u16::from(c[0]) << 8
-        };
-        sum += u32::from(w);
-    }
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    let mut ck = !u16::try_from(sum & 0xFFFF).expect("folded fits u16");
+    sum += sum_16(&pkt[udp_off..total]);
+    let mut ck = fold_csum(sum);
     if ck == 0 {
         ck = 0xFFFF;
     }
     pkt[udp_off + 6..udp_off + 8].copy_from_slice(&ck.to_be_bytes());
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "kept for tests and reference checksum verification"
+    )
+)]
 pub(crate) fn ipv6_udp_checksum(pkt: &mut [u8]) {
     if pkt.len() < 48 {
         return;
@@ -471,18 +491,8 @@ pub(crate) fn ipv6_udp_checksum(pkt: &mut [u8]) {
     sum += udp_len_u32 >> 16;
     sum += udp_len_u32 & 0xFFFF;
     sum += u32::from(17u16);
-    for c in pkt[udp_off..total].chunks(2) {
-        let w = if c.len() == 2 {
-            u16::from_be_bytes([c[0], c[1]])
-        } else {
-            u16::from(c[0]) << 8
-        };
-        sum += u32::from(w);
-    }
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    let mut ck = !u16::try_from(sum & 0xFFFF).expect("folded fits u16");
+    sum += sum_16(&pkt[udp_off..total]);
+    let mut ck = fold_csum(sum);
     if ck == 0 {
         ck = 0xFFFF;
     }
@@ -490,8 +500,8 @@ pub(crate) fn ipv6_udp_checksum(pkt: &mut [u8]) {
 }
 
 /// Compute the uncomplemented 16-bit one's-complement pseudo-header checksum sum
-/// over IPv4/IPv6 source, destination, protocol 17 (UDP), and upper-layer UDP length.
-pub(crate) fn udp_pseudo_header_checksum(key: &FlowKey, udp_len: u16) -> u16 {
+/// over IPv4/IPv6 source, destination, protocol number (`proto`), and upper-layer length (`l4_len`).
+pub(crate) fn pseudo_header_checksum(key: &FlowKey, proto: u8, l4_len: u32) -> u16 {
     let mut sum: u32 = 0;
     match key {
         FlowKey::V4 { src, dst, .. } => {
@@ -499,8 +509,8 @@ pub(crate) fn udp_pseudo_header_checksum(key: &FlowKey, udp_len: u16) -> u16 {
             sum += u32::from(u16::from_be_bytes([src[2], src[3]]));
             sum += u32::from(u16::from_be_bytes([dst[0], dst[1]]));
             sum += u32::from(u16::from_be_bytes([dst[2], dst[3]]));
-            sum += 17u32;
-            sum += u32::from(udp_len);
+            sum += u32::from(proto);
+            sum += l4_len;
         }
         FlowKey::V6 { src, dst, .. } => {
             for i in (0..16).step_by(2) {
@@ -509,16 +519,23 @@ pub(crate) fn udp_pseudo_header_checksum(key: &FlowKey, udp_len: u16) -> u16 {
             for i in (0..16).step_by(2) {
                 sum += u32::from(u16::from_be_bytes([dst[i], dst[i + 1]]));
             }
-            let len32 = u32::from(udp_len);
-            sum += len32 >> 16;
-            sum += len32 & 0xFFFF;
-            sum += 17u32;
+            sum += l4_len >> 16;
+            sum += l4_len & 0xFFFF;
+            sum += u32::from(proto);
         }
     }
     while (sum >> 16) != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     u16::try_from(sum & 0xFFFF).expect("folded sum fits u16")
+}
+
+pub(crate) fn udp_pseudo_header_checksum(key: &FlowKey, udp_len: u16) -> u16 {
+    pseudo_header_checksum(key, 17, u32::from(udp_len))
+}
+
+pub(crate) fn tcp_pseudo_header_checksum(key: &FlowKey, tcp_len: u32) -> u16 {
+    pseudo_header_checksum(key, 6, tcp_len)
 }
 
 enum ParsedTcp<'a> {
@@ -753,6 +770,7 @@ pub fn split_gro(frame: &[u8], out: &mut Vec<u8>, offsets: &mut Vec<(usize, usiz
         let payload = &body[x.payload_off..x.payload_off + x.payload_len];
         let mut seq = x.seq;
         let mut ip_id = u16::from_be_bytes([body[4], body[5]]);
+        let base_sum = ipv4_base_sum(&body[..x.ip_hdr_len]);
         let mut off = 0usize;
         while off < payload.len() {
             let n = seg.min(payload.len() - off);
@@ -765,7 +783,8 @@ pub fn split_gro(frame: &[u8], out: &mut Vec<u8>, offsets: &mut Vec<(usize, usiz
             s[2..4].copy_from_slice(&total.to_be_bytes());
             s[4..6].copy_from_slice(&ip_id.to_be_bytes());
             s[x.ip_hdr_len + 4..x.ip_hdr_len + 8].copy_from_slice(&seq.to_be_bytes());
-            ipv4_checksum(&mut s[..x.ip_hdr_len]);
+            let ip_ck = ipv4_checksum_with_base(base_sum, total, ip_id);
+            s[10..12].copy_from_slice(&ip_ck.to_be_bytes());
             tcp_checksum(s, x.ip_hdr_len);
             offsets.push((start, hdr + n));
             seq = seq.wrapping_add(u32::try_from(n).expect("n fits u32"));
@@ -815,20 +834,40 @@ pub fn split_gro(frame: &[u8], out: &mut Vec<u8>, offsets: &mut Vec<(usize, usiz
                 let hdr = x.payload_off;
                 let payload = &body[x.payload_off..x.payload_off + x.payload_len];
                 let mut ip_id = u16::from_be_bytes([body[4], body[5]]);
+                let base_sum = ipv4_base_sum(&body[..x.ip_hdr_len]);
+                // Precalculate invariant pseudo-header + UDP header sum
+                let sport = u16::from_be_bytes([body[x.ip_hdr_len], body[x.ip_hdr_len + 1]]);
+                let dport = u16::from_be_bytes([body[x.ip_hdr_len + 2], body[x.ip_hdr_len + 3]]);
+                let mut pseudo_base: u32 = 0;
+                for i in (12..20).step_by(2) {
+                    pseudo_base += u32::from(u16::from_be_bytes([body[i], body[i + 1]]));
+                }
+                pseudo_base += 17u32 + u32::from(sport) + u32::from(dport);
+
                 let mut off = 0usize;
                 while off < payload.len() {
                     let n = seg.min(payload.len() - off);
+                    let payload_chunk = &payload[off..off + n];
                     let start = out.len();
                     out.extend_from_slice(&body[..hdr]);
-                    out.extend_from_slice(&payload[off..off + n]);
+                    out.extend_from_slice(payload_chunk);
                     let s = &mut out[start..start + hdr + n];
                     let total = u16::try_from(hdr + n).expect("segment fits u16");
                     s[2..4].copy_from_slice(&total.to_be_bytes());
                     s[4..6].copy_from_slice(&ip_id.to_be_bytes());
                     let udp_len = u16::try_from(8 + n).expect("udp len fits u16");
                     s[x.ip_hdr_len + 4..x.ip_hdr_len + 6].copy_from_slice(&udp_len.to_be_bytes());
-                    ipv4_checksum(&mut s[..x.ip_hdr_len]);
-                    udp_checksum(s, x.ip_hdr_len);
+                    let ip_ck = ipv4_checksum_with_base(base_sum, total, ip_id);
+                    s[10..12].copy_from_slice(&ip_ck.to_be_bytes());
+
+                    // Fast UDP checksum: pseudo_base + 2 * udp_len + sum_16(payload_chunk)
+                    let udp_csum_raw = pseudo_base + 2 * u32::from(udp_len) + sum_16(payload_chunk);
+                    let mut udp_ck = fold_csum(udp_csum_raw);
+                    if udp_ck == 0 {
+                        udp_ck = 0xFFFF;
+                    }
+                    s[x.ip_hdr_len + 6..x.ip_hdr_len + 8].copy_from_slice(&udp_ck.to_be_bytes());
+
                     offsets.push((start, hdr + n));
                     ip_id = ip_id.wrapping_add(1);
                     off += n;
@@ -845,17 +884,34 @@ pub fn split_gro(frame: &[u8], out: &mut Vec<u8>, offsets: &mut Vec<(usize, usiz
                 }
                 let hdr = x.payload_off;
                 let payload = &body[x.payload_off..x.payload_off + x.payload_len];
+                let sport = u16::from_be_bytes([body[40], body[41]]);
+                let dport = u16::from_be_bytes([body[42], body[43]]);
+                let mut pseudo_base: u32 = 0;
+                for i in (8..40).step_by(2) {
+                    pseudo_base += u32::from(u16::from_be_bytes([body[i], body[i + 1]]));
+                }
+                pseudo_base += 17u32 + u32::from(sport) + u32::from(dport);
+
                 let mut off = 0usize;
                 while off < payload.len() {
                     let n = seg.min(payload.len() - off);
+                    let payload_chunk = &payload[off..off + n];
                     let start = out.len();
                     out.extend_from_slice(&body[..hdr]);
-                    out.extend_from_slice(&payload[off..off + n]);
+                    out.extend_from_slice(payload_chunk);
                     let s = &mut out[start..start + hdr + n];
-                    let ipv6_payload_len = u16::try_from(8 + n).expect("segment fits u16");
-                    s[4..6].copy_from_slice(&ipv6_payload_len.to_be_bytes());
-                    s[44..46].copy_from_slice(&ipv6_payload_len.to_be_bytes());
-                    ipv6_udp_checksum(s);
+                    let udp_len = u16::try_from(8 + n).expect("segment fits u16");
+                    s[4..6].copy_from_slice(&udp_len.to_be_bytes());
+                    s[44..46].copy_from_slice(&udp_len.to_be_bytes());
+
+                    // Fast IPv6 UDP checksum: pseudo_base + 2 * udp_len + sum_16(payload_chunk)
+                    let udp_csum_raw = pseudo_base + 2 * u32::from(udp_len) + sum_16(payload_chunk);
+                    let mut udp_ck = fold_csum(udp_csum_raw);
+                    if udp_ck == 0 {
+                        udp_ck = 0xFFFF;
+                    }
+                    s[46..48].copy_from_slice(&udp_ck.to_be_bytes());
+
                     offsets.push((start, hdr + n));
                     off += n;
                 }
@@ -927,37 +983,48 @@ impl Coalescer {
         }
         match self.kind {
             PendingKind::Tcp => {
-                let ip = VNET_HDR_LEN;
-                let l3_len = self.pending.len() - VNET_HDR_LEN;
-                match self.key {
-                    FlowKey::V4 { .. } => {
-                        let total = u16::try_from(l3_len).unwrap_or(u16::MAX);
-                        self.pending[ip + 2..ip + 4].copy_from_slice(&total.to_be_bytes());
-                        ipv4_checksum(&mut self.pending[ip..ip + self.ip_hdr_len]);
-                        let h = VnetHdr {
-                            flags: F_NEEDS_CSUM,
-                            gso_type: GSO_TCPV4,
-                            hdr_len: u16::try_from(self.l3_hdr_len).unwrap_or(0),
-                            gso_size: self.gso_size,
-                            csum_start: u16::try_from(self.ip_hdr_len).unwrap_or(0),
-                            csum_offset: 16,
-                        };
-                        write_vnet_hdr(&h, &mut self.pending[..VNET_HDR_LEN]);
-                    }
-                    FlowKey::V6 { .. } => {
-                        let ipv6_payload_len =
-                            u16::try_from(l3_len.saturating_sub(40)).unwrap_or(u16::MAX);
-                        self.pending[ip + 4..ip + 6]
-                            .copy_from_slice(&ipv6_payload_len.to_be_bytes());
-                        let h = VnetHdr {
-                            flags: F_NEEDS_CSUM,
-                            gso_type: GSO_TCPV6,
-                            hdr_len: u16::try_from(self.l3_hdr_len).unwrap_or(0),
-                            gso_size: self.gso_size,
-                            csum_start: 40,
-                            csum_offset: 16,
-                        };
-                        write_vnet_hdr(&h, &mut self.pending[..VNET_HDR_LEN]);
+                if self.segs == 1 {
+                    let h = VnetHdr::default();
+                    write_vnet_hdr(&h, &mut self.pending[..VNET_HDR_LEN]);
+                } else {
+                    let ip = VNET_HDR_LEN;
+                    let l3_len = self.pending.len() - VNET_HDR_LEN;
+                    let tcp_len =
+                        u32::try_from(l3_len.saturating_sub(self.ip_hdr_len)).unwrap_or(u32::MAX);
+                    let csum = tcp_pseudo_header_checksum(&self.key, tcp_len);
+                    let tcp_off = ip + self.ip_hdr_len;
+                    self.pending[tcp_off + 16..tcp_off + 18].copy_from_slice(&csum.to_be_bytes());
+
+                    match self.key {
+                        FlowKey::V4 { .. } => {
+                            let total = u16::try_from(l3_len).unwrap_or(u16::MAX);
+                            self.pending[ip + 2..ip + 4].copy_from_slice(&total.to_be_bytes());
+                            ipv4_checksum(&mut self.pending[ip..ip + self.ip_hdr_len]);
+                            let h = VnetHdr {
+                                flags: F_NEEDS_CSUM,
+                                gso_type: GSO_TCPV4,
+                                hdr_len: u16::try_from(self.l3_hdr_len).unwrap_or(0),
+                                gso_size: self.gso_size,
+                                csum_start: u16::try_from(self.ip_hdr_len).unwrap_or(0),
+                                csum_offset: 16,
+                            };
+                            write_vnet_hdr(&h, &mut self.pending[..VNET_HDR_LEN]);
+                        }
+                        FlowKey::V6 { .. } => {
+                            let ipv6_payload_len =
+                                u16::try_from(l3_len.saturating_sub(40)).unwrap_or(u16::MAX);
+                            self.pending[ip + 4..ip + 6]
+                                .copy_from_slice(&ipv6_payload_len.to_be_bytes());
+                            let h = VnetHdr {
+                                flags: F_NEEDS_CSUM,
+                                gso_type: GSO_TCPV6,
+                                hdr_len: u16::try_from(self.l3_hdr_len).unwrap_or(0),
+                                gso_size: self.gso_size,
+                                csum_start: 40,
+                                csum_offset: 16,
+                            };
+                            write_vnet_hdr(&h, &mut self.pending[..VNET_HDR_LEN]);
+                        }
                     }
                 }
             }
@@ -965,10 +1032,7 @@ impl Coalescer {
                 let ip = VNET_HDR_LEN;
                 let l3_len = self.pending.len() - VNET_HDR_LEN;
                 if self.segs == 1 {
-                    let h = VnetHdr {
-                        gso_type: GSO_NONE,
-                        ..VnetHdr::default()
-                    };
+                    let h = VnetHdr::default();
                     write_vnet_hdr(&h, &mut self.pending[..VNET_HDR_LEN]);
                 } else {
                     let udp_len =
@@ -1076,6 +1140,9 @@ impl Coalescer {
     }
 
     pub fn push(&mut self, pkt: &[u8]) -> Option<&[u8]> {
+        if pkt.is_empty() {
+            return None;
+        }
         let parsed = parse_ip_packet(pkt);
         // Can this packet extend the current pending run?
         if self.has_pending && !self.sealed {
@@ -1631,6 +1698,43 @@ mod tests {
         assert_eq!(&out[offs[0].0..offs[0].0 + offs[0].1], &pkt[..]);
     }
 
+    fn verify_ipv4_tcp_checksum(pkt: &[u8]) -> bool {
+        if pkt.len() < 40 {
+            return false;
+        }
+        let ip_hdr_len = usize::from(pkt[0] & 0x0F) * 4;
+        if pkt.len() < ip_hdr_len + 20 {
+            return false;
+        }
+        let tcp_len = pkt.len() - ip_hdr_len;
+        let mut sum: u32 = 0;
+        for i in (12..20).step_by(2) {
+            sum += u32::from(u16::from_be_bytes([pkt[i], pkt[i + 1]]));
+        }
+        sum += u32::from(6u16);
+        sum += u32::try_from(tcp_len).expect("tcp_len fits u32") & 0xFFFF;
+        sum += sum_16(&pkt[ip_hdr_len..]);
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        (sum & 0xFFFF) == 0xFFFF
+    }
+
+    #[test]
+    fn tcp_checksum_calculation_and_verification() {
+        let mut pkt = mk_tcp(
+            [192, 168, 1, 1],
+            [192, 168, 1, 2],
+            8080,
+            443,
+            100,
+            0x10,
+            b"test tcp payload 1234",
+        );
+        tcp_checksum(&mut pkt, 20);
+        assert!(verify_ipv4_tcp_checksum(&pkt));
+    }
+
     #[test]
     fn split_gro_segments_and_checksums() {
         // one super-frame: gso_size=100, 250 bytes payload → segments of 100,100,50.
@@ -1677,6 +1781,10 @@ mod tests {
             assert_eq!(
                 u16::try_from((sum & 0xFFFF) + (sum >> 16)).expect("folded sum fits u16"),
                 0xFFFF
+            );
+            assert!(
+                verify_ipv4_tcp_checksum(seg),
+                "TCP segment checksum must be valid"
             );
         }
         let _ = &mut big;
@@ -2109,17 +2217,104 @@ mod tests {
 
     #[test]
     fn flushes_on_ip_version_change() {
-        let v4_a = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 0, 0, &[0xAA; 100]);
+        let v4_a1 = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 0, 0, &[0xAA; 100]);
+        let v4_a2 = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 100, 0, &[0xAA; 100]);
         let src_v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         let dst_v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
-        let v6_a = mk_ipv6_tcp(src_v6, dst_v6, 9, 80, 0, 0, &[0xBB; 100]);
-        let v4_b = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 100, 0, &[0xCC; 100]);
+        let v6_a1 = mk_ipv6_tcp(src_v6, dst_v6, 9, 80, 0, 0, &[0xBB; 100]);
+        let v6_a2 = mk_ipv6_tcp(src_v6, dst_v6, 9, 80, 100, 0, &[0xBB; 100]);
+        let v4_b1 = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 200, 0, &[0xCC; 100]);
+        let v4_b2 = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 300, 0, &[0xCC; 100]);
 
-        let out = run_coalescer(&[v4_a, v6_a, v4_b]);
+        let out = run_coalescer(&[v4_a1, v4_a2, v6_a1, v6_a2, v4_b1, v4_b2]);
         assert_eq!(out.len(), 3, "IPv4 and IPv6 flows must never coalesce");
         assert_eq!(read_vnet_hdr(&out[0]).unwrap().gso_type, GSO_TCPV4);
         assert_eq!(read_vnet_hdr(&out[1]).unwrap().gso_type, GSO_TCPV6);
         assert_eq!(read_vnet_hdr(&out[2]).unwrap().gso_type, GSO_TCPV4);
+    }
+
+    #[test]
+    fn test_coalescer_tcp_single_segment_emitted_as_gso_none_with_intact_checksum() {
+        let p_v4 = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 0, 0, &[0x42; 500]);
+        let out_v4 = run_coalescer(std::slice::from_ref(&p_v4));
+        assert_eq!(out_v4.len(), 1);
+        let h_v4 = read_vnet_hdr(&out_v4[0]).unwrap();
+        assert_eq!(h_v4.gso_type, GSO_NONE);
+        assert_eq!(h_v4.gso_size, 0);
+        assert_eq!(h_v4.flags, 0);
+        assert_eq!(&out_v4[0][VNET_HDR_LEN..], &p_v4[..]);
+
+        let src_v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst_v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let p_v6 = mk_ipv6_tcp(src_v6, dst_v6, 9, 80, 0, 0, &[0x99; 500]);
+        let out_v6 = run_coalescer(std::slice::from_ref(&p_v6));
+        assert_eq!(out_v6.len(), 1);
+        let h_v6 = read_vnet_hdr(&out_v6[0]).unwrap();
+        assert_eq!(h_v6.gso_type, GSO_NONE);
+        assert_eq!(h_v6.gso_size, 0);
+        assert_eq!(h_v6.flags, 0);
+        assert_eq!(&out_v6[0][VNET_HDR_LEN..], &p_v6[..]);
+    }
+
+    #[test]
+    fn test_coalescer_tcp_pseudo_header_checksum_seeding() {
+        let p0 = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 0, 0, &[0xAA; 500]);
+        let p1 = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 500, 0, &[0xBB; 500]);
+        let out = run_coalescer(&[p0, p1]);
+        assert_eq!(out.len(), 1);
+        let h = read_vnet_hdr(&out[0]).unwrap();
+        assert_eq!(h.gso_type, GSO_TCPV4);
+        assert_eq!(h.flags, F_NEEDS_CSUM);
+        let body = &out[0][VNET_HDR_LEN..];
+        let sum: u32 = body[..20]
+            .chunks(2)
+            .map(|c| u32::from(u16::from_be_bytes([c[0], c[1]])))
+            .sum();
+        let folded = u16::try_from((sum & 0xFFFF) + (sum >> 16)).expect("folded sum fits u16");
+        assert_eq!(folded, 0xFFFF);
+
+        let tcp_len = 20 + 1000;
+        let expected_pseudo = tcp_pseudo_header_checksum(
+            &FlowKey::V4 {
+                src: [10, 0, 0, 1],
+                dst: [10, 0, 0, 2],
+                sport: 9,
+                dport: 80,
+            },
+            tcp_len,
+        );
+        let seeded = u16::from_be_bytes([body[20 + 16], body[20 + 17]]);
+        assert_eq!(seeded, expected_pseudo);
+    }
+
+    #[test]
+    fn test_pseudo_header_checksum_known_vectors() {
+        let v4_key = FlowKey::V4 {
+            src: [10, 0, 0, 1],
+            dst: [10, 0, 0, 2],
+            sport: 9,
+            dport: 80,
+        };
+        assert_eq!(pseudo_header_checksum(&v4_key, 6, 1000), 0x17f1);
+        assert_eq!(tcp_pseudo_header_checksum(&v4_key, 1000), 0x17f1);
+
+        let src_v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst_v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let v6_key = FlowKey::V6 {
+            src: src_v6,
+            dst: dst_v6,
+            sport: 9,
+            dport: 80,
+        };
+        assert_eq!(pseudo_header_checksum(&v6_key, 6, 70000), 0x6cec);
+        assert_eq!(tcp_pseudo_header_checksum(&v6_key, 70000), 0x6cec);
+    }
+
+    #[test]
+    fn test_coalescer_push_empty_slice_returns_none() {
+        let mut c = Coalescer::new(false);
+        assert!(c.push(&[]).is_none());
+        assert!(c.flush().is_none());
     }
 
     #[test]
@@ -2269,6 +2464,41 @@ mod tests {
         );
     }
 
+    fn verify_ipv6_udp_checksum(pkt: &[u8]) -> bool {
+        if pkt.len() < 48 {
+            return false;
+        }
+        let udp_len = pkt.len() - 40;
+        let mut sum: u32 = 0;
+        for i in (8..40).step_by(2) {
+            sum += u32::from(u16::from_be_bytes([pkt[i], pkt[i + 1]]));
+        }
+        let udp_len_u32 = u32::try_from(udp_len).unwrap();
+        sum += udp_len_u32 >> 16;
+        sum += udp_len_u32 & 0xFFFF;
+        sum += u32::from(17u16);
+        sum += sum_16(&pkt[40..]);
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        (sum & 0xFFFF) == 0xFFFF
+    }
+
+    #[test]
+    fn ipv6_udp_checksum_calculation_and_verification() {
+        let src = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let mut pkt = mk_ipv6_udp(src, dst, 5001, 5002, b"verifiable payload 1234567890");
+        assert!(verify_ipv6_udp_checksum(&pkt));
+
+        pkt[46] = 0;
+        pkt[47] = 0;
+        ipv6_udp_checksum(&mut pkt);
+        assert!(verify_ipv6_udp_checksum(&pkt));
+        let ck = u16::from_be_bytes([pkt[46], pkt[47]]);
+        assert_ne!(ck, 0);
+    }
+
     #[test]
     fn udp_checksum_rfc768_zero_becomes_ffff() {
         // Construct IPv4 UDP packet where pseudo-header + UDP data sum folds to 0xFFFF,
@@ -2308,5 +2538,67 @@ mod tests {
             csum, 0xFFFF,
             "RFC 768: 0x0000 checksum must be converted to 0xFFFF"
         );
+    }
+
+    #[test]
+    fn ipv4_base_sum_and_incremental_checksum_matches_full_checksum() {
+        let mut hdr = [0u8; 20];
+        hdr[0] = 0x45;
+        hdr[1] = 0x00;
+        hdr[6] = 0x40; // DF
+        hdr[7] = 0x00;
+        hdr[8] = 64; // TTL
+        hdr[9] = 17; // proto UDP
+        hdr[12..16].copy_from_slice(&[192, 168, 1, 100]);
+        hdr[16..20].copy_from_slice(&[10, 0, 0, 1]);
+
+        let base_sum = ipv4_base_sum(&hdr);
+
+        // Test over various total_len and ip_id pairs
+        for total_len in [28u16, 576, 1420, 1500, 65535] {
+            for ip_id in [0u16, 1, 0x1234, 0x8000, 0xFFFF] {
+                let fast_ck = ipv4_checksum_with_base(base_sum, total_len, ip_id);
+
+                let mut full_hdr = hdr;
+                full_hdr[2..4].copy_from_slice(&total_len.to_be_bytes());
+                full_hdr[4..6].copy_from_slice(&ip_id.to_be_bytes());
+                ipv4_checksum(&mut full_hdr);
+                let full_ck = u16::from_be_bytes([full_hdr[10], full_hdr[11]]);
+
+                assert_eq!(
+                    fast_ck, full_ck,
+                    "fast base_sum checksum must match full ipv4_checksum for len={total_len}, id={ip_id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ipv4_base_sum_with_options_matches_full_checksum() {
+        // 24-byte header (IHL = 6: 20 bytes standard + 4 bytes NOP options)
+        let mut hdr = [0u8; 24];
+        hdr[0] = 0x46;
+        hdr[1] = 0x00;
+        hdr[6] = 0x40;
+        hdr[7] = 0x00;
+        hdr[8] = 64;
+        hdr[9] = 6; // TCP
+        hdr[12..16].copy_from_slice(&[172, 16, 0, 1]);
+        hdr[16..20].copy_from_slice(&[172, 16, 0, 2]);
+        hdr[20..24].copy_from_slice(&[1, 1, 1, 1]); // NOP options
+
+        let base_sum = ipv4_base_sum(&hdr);
+
+        let total_len = 1440u16;
+        let ip_id = 0xabcd;
+        let fast_ck = ipv4_checksum_with_base(base_sum, total_len, ip_id);
+
+        let mut full_hdr = hdr;
+        full_hdr[2..4].copy_from_slice(&total_len.to_be_bytes());
+        full_hdr[4..6].copy_from_slice(&ip_id.to_be_bytes());
+        ipv4_checksum(&mut full_hdr);
+        let full_ck = u16::from_be_bytes([full_hdr[10], full_hdr[11]]);
+
+        assert_eq!(fast_ck, full_ck);
     }
 }
