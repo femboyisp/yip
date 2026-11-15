@@ -105,6 +105,14 @@ NB_AVAILABLE=true
 # ── cleanup ───────────────────────────────────────────────────────────────────
 cleanup() {
     echo "[cleanup] killing daemons and removing namespaces"
+    if [ -f "${LOG_A:-}" ] && [ -s "${LOG_A:-}" ]; then
+        echo "=== yipA log ==="
+        tail -n 50 "$LOG_A" || true
+    fi
+    if [ -f "${LOG_B:-}" ] && [ -s "${LOG_B:-}" ]; then
+        echo "=== yipB log ==="
+        tail -n 50 "$LOG_B" || true
+    fi
     [ -n "$PID_YA" ] && kill "$PID_YA" 2>/dev/null || true
     [ -n "$PID_YB" ] && kill "$PID_YB" 2>/dev/null || true
     sleep 0.2
@@ -289,7 +297,7 @@ get_ns_ram_mb() {
     if [ "$max_kb" -gt 0 ]; then
         awk -v kb="$max_kb" 'BEGIN {printf "%.1f", kb / 1024.0}'
     else
-        echo "0.0"
+        echo "N/A"
     fi
 }
 
@@ -857,7 +865,7 @@ setup_netbird
 # ══════════════════════════════════════════════════════════════════════════════
 # Sweep
 # ══════════════════════════════════════════════════════════════════════════════
-LOSS_RATES="0 5 10"
+LOSS_RATES="${LOSS_RATES:-0 5 10}"
 
 echo ""
 echo "=========================================================="

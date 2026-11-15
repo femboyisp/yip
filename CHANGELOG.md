@@ -5,6 +5,12 @@ All notable changes to this project are documented here, following
 
 ## [Unreleased]
 
+### Fixed
+- **Recycled FEC Repair Buffer Length Regression (`crates/yip-transport`).**
+  Fixed a panic in `FecReassembler` (`range end index out of range for slice of length 0`) during high packet loss reassembly. Previously, `recycle_state` cleared inner repair buffer lengths to zero (`buf.clear()`), but `acquire_buffers` only resized up to `k` buffers when retrieving pooled vectors. If a subsequent object had smaller $K$ or popped from the tail of the pool, unresized zero-length buffers were popped into `repair_shards`, causing slice indexing panics on incoming repair symbols. All pooled repair buffers are now resized upon acquisition, and individual popped buffers are defensive-resized to `shard_len` before payload copies.
+- **Kernel-Module RAM Telemetry Representation (`crates/yip-bench`).**
+  Configured `get_ns_ram_mb` in `run-iperf-compare.sh` to output `N/A` for network namespaces lacking userspace daemon processes (such as in-tree Linux WireGuard), accurately reflecting that kernel module memory cannot be queried via userspace process RSS instead of misleadingly displaying `0.0 MB`.
+
 ### Added
 - **Optimized IPv4 Header Checksum Updates & Vectorized Word Accumulation (`crates/yip-io`, #232).**
   Optimized IPv4 header and L4 UDP checksum recalculations in `split_gro` to close the throughput gap with IPv6. Implemented `ipv4_base_sum` precomputing the invariant sum of header words once per superpacket, enabling O(1) segment checksum evaluation (`ipv4_checksum_with_base`) across GSO slices without repetitive full-header rescanning. Replaced byte-chunking iterators (`chunks(2)`) with direct 16-bit word accumulations (`sum_16`, `fold_csum`) and streamlined UDP pseudo-header summation to eliminate redundant buffer zeroing and memory reads on the packet slicing hot path.
