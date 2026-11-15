@@ -45,7 +45,7 @@ check_status() {
     printf "  %-12s : " "Tailscale"
     (command -v tailscaled >/dev/null 2>&1 && command -v headscale >/dev/null 2>&1) && echo "INSTALLED" || echo "MISSING"
     printf "  %-12s : " "NetBird"
-    command -v netbird >/dev/null 2>&1 && echo "INSTALLED ($(which netbird))" || echo "MISSING"
+    (command -v netbird >/dev/null 2>&1 && command -v netbird-mgmt >/dev/null 2>&1 && command -v netbird-signal >/dev/null 2>&1) && echo "INSTALLED ($(which netbird))" || (command -v netbird >/dev/null 2>&1 && echo "CLIENT-ONLY ($(which netbird))" || echo "MISSING")
 }
 
 setup_wireguard_go() {
@@ -179,22 +179,20 @@ setup_tailscale() {
 }
 
 setup_netbird() {
-    log "Setting up NetBird..."
-    if command -v netbird >/dev/null 2>&1; then
-        log "NetBird is already installed ($(which netbird))"
-        return
-    fi
-    log "Fetching prebuilt netbird binary..."
-    local nb_tag nb_ver nb_url
-    nb_tag="$(curl -sIL https://github.com/netbirdio/netbird/releases/latest | grep -i location | tr -d '\r' | awk -F'/' '{print $NF}' || true)"
-    if [ -n "$nb_tag" ]; then
-        nb_ver="${nb_tag#v}"
-        nb_url="https://github.com/netbirdio/netbird/releases/download/${nb_tag}/netbird_${nb_ver}_linux_amd64.tar.gz"
-        local nb_tmp; nb_tmp="$(mktemp -d /tmp/netbird.XXXXXX)"
-        if curl -fsSL "$nb_url" 2>/dev/null | tar -xz -C "$nb_tmp" 2>/dev/null; then
-            install -m 755 "$nb_tmp/netbird" "$TARGET_BIN_DIR/netbird" 2>/dev/null || true
+    log "Setting up NetBird (client, management, signal)..."
+    if ! command -v netbird >/dev/null 2>&1; then
+        log "Fetching prebuilt netbird client..."
+        local nb_tag nb_ver nb_url
+        nb_tag="$(curl -sIL https://github.com/netbirdio/netbird/releases/latest | grep -i location | tr -d '\r' | awk -F'/' '{print $NF}' || true)"
+        if [ -n "$nb_tag" ]; then
+            nb_ver="${nb_tag#v}"
+            nb_url="https://github.com/netbirdio/netbird/releases/download/${nb_tag}/netbird_${nb_ver}_linux_amd64.tar.gz"
+            local nb_tmp; nb_tmp="$(mktemp -d /tmp/netbird.XXXXXX)"
+            if curl -fsSL "$nb_url" 2>/dev/null | tar -xz -C "$nb_tmp" 2>/dev/null; then
+                install -m 755 "$nb_tmp/netbird" "$TARGET_BIN_DIR/netbird" 2>/dev/null || true
+            fi
+            rm -rf "$nb_tmp"
         fi
-        rm -rf "$nb_tmp"
     fi
     if ! command -v netbird >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
         log "Attempting official NetBird install script..."
@@ -206,6 +204,35 @@ setup_netbird() {
         if [ -f "$TARGET_BIN_DIR/client" ] && [ ! -f "$TARGET_BIN_DIR/netbird" ]; then
             ln -sf "$TARGET_BIN_DIR/client" "$TARGET_BIN_DIR/netbird" 2>/dev/null || cp -f "$TARGET_BIN_DIR/client" "$TARGET_BIN_DIR/netbird" 2>/dev/null || true
         fi
+    fi
+
+    # Management and signal daemons for isolated local benchmarking
+    if (! command -v netbird-mgmt >/dev/null 2>&1 || ! command -v netbird-signal >/dev/null 2>&1) && command -v docker >/dev/null 2>&1; then
+        log "Extracting netbird-mgmt and netbird-signal from official container images..."
+        docker pull netbirdio/management:latest >/dev/null 2>&1 || true
+        local cid_mgmt; cid_mgmt="$(docker create netbirdio/management:latest 2>/dev/null || true)"
+        if [ -n "$cid_mgmt" ]; then
+            docker cp "$cid_mgmt:/go/bin/netbird-mgmt" "$TARGET_BIN_DIR/netbird-mgmt" 2>/dev/null || true
+            chmod 755 "$TARGET_BIN_DIR/netbird-mgmt" 2>/dev/null || true
+            docker rm -f "$cid_mgmt" >/dev/null 2>&1 || true
+        fi
+        docker pull netbirdio/signal:latest >/dev/null 2>&1 || true
+        local cid_sig; cid_sig="$(docker create netbirdio/signal:latest 2>/dev/null || true)"
+        if [ -n "$cid_sig" ]; then
+            docker cp "$cid_sig:/go/bin/netbird-signal" "$TARGET_BIN_DIR/netbird-signal" 2>/dev/null || true
+            chmod 755 "$TARGET_BIN_DIR/netbird-signal" 2>/dev/null || true
+            docker rm -f "$cid_sig" >/dev/null 2>&1 || true
+        fi
+    fi
+
+    # Geolocation databases for management daemon in offline/isolated network namespaces
+    local geo_dir="/usr/local/share/netbird-geo"
+    if [ ! -f "$geo_dir/GeoLite2-City_20261013.mmdb" ] || [ ! -f "$geo_dir/geonames_20261013.db" ]; then
+        mkdir -p "$geo_dir" 2>/dev/null || true
+        curl -fsSL -o "$geo_dir/GeoLite2-City_20261013.mmdb.tar.gz" "https://pkgs.netbird.io/geolocation-dbs/GeoLite2-City/download?suffix=tar.gz" 2>/dev/null && \
+            tar -xzf "$geo_dir/GeoLite2-City_20261013.mmdb.tar.gz" -C "$geo_dir" 2>/dev/null && rm -f "$geo_dir"/*.tar.gz || true
+        curl -fsSL -o "$geo_dir/geonames_20261013.db.tar.gz" "https://pkgs.netbird.io/geolocation-dbs/geonames/download?suffix=tar.gz" 2>/dev/null && \
+            tar -xzf "$geo_dir/geonames_20261013.db.tar.gz" -C "$geo_dir" 2>/dev/null && rm -f "$geo_dir"/*.tar.gz || true
     fi
     log "NetBird setup step complete."
 }

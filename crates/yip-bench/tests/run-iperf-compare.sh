@@ -36,8 +36,10 @@ if [ $# -ge 1 ] && [ -n "${1:-}" ]; then
 else
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-    echo "[build] running cargo build --release -p yipd --quiet in $WORKSPACE_ROOT"
-    cargo build --release -p yipd --quiet --manifest-path "$WORKSPACE_ROOT/Cargo.toml"
+    if [ ! -x "$WORKSPACE_ROOT/target/release/yipd" ]; then
+        echo "[build] running cargo build --release -p yipd --quiet in $WORKSPACE_ROOT"
+        cargo build --release -p yipd --quiet --manifest-path "$WORKSPACE_ROOT/Cargo.toml"
+    fi
     YIPD="$WORKSPACE_ROOT/target/release/yipd"
 fi
 
@@ -46,6 +48,19 @@ WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 TMPDIR_TEST="$(mktemp -d /dev/shm/yip-iperf-compare.XXXXXX 2>/dev/null || mktemp -d /tmp/yip-iperf-compare.XXXXXX)"
 chmod 777 "$TMPDIR_TEST"
+
+contender_wanted() {
+    local name="$1"
+    if [ -z "${CONTENDERS:-}" ]; then
+        return 0
+    fi
+    for c in $CONTENDERS; do
+        if [ "$c" = "$name" ] || [ "$c" = "all" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
 
 # ── yip ───────────────────────────────────────────────────────────────────────
 NS_YA="ipfYA"; NS_YB="ipfYB"; VYA="ipfvYA"; VYB="ipfvYB"
@@ -475,6 +490,7 @@ peer_endpoint=${VYB_IP}:${YPORT_B}
 device=${TUN_DEV}
 initiate=false
 shards=${YIP_SHARDS}
+mtu=${YIP_MTU}
 EOF
 cat > "$CFG_B" <<EOF
 local_private=${PRIV_B}
@@ -485,6 +501,7 @@ peer_endpoint=${VYA_IP}:${YPORT_A}
 device=${TUN_DEV}
 initiate=true
 shards=${YIP_SHARDS}
+mtu=${YIP_MTU}
 EOF
 
 echo "[yip] creating namespaces and veth pair"
@@ -511,8 +528,7 @@ while true; do
     fi
     sleep 0.25
 done
-ip netns exec "$NS_YA" ip link set "$TUN_DEV" mtu "$YIP_MTU"
-ip netns exec "$NS_YB" ip link set "$TUN_DEV" mtu "$YIP_MTU"
+# yipd configures its own device MTU via config 'mtu=' on interface creation
 ip netns exec "$NS_YA" ip link set dev "$TUN_DEV" txqueuelen 10000
 ip netns exec "$NS_YB" ip link set dev "$TUN_DEV" txqueuelen 10000
 ip netns exec "$NS_YA" ip link set "$TUN_DEV" up
@@ -534,6 +550,7 @@ ip netns exec "$NS_YB" ping -6 -c 3 -W 5 "$TUN_YA_IP6" >/dev/null || {
 # WireGuard setup
 # ══════════════════════════════════════════════════════════════════════════════
 setup_wg() {
+    if ! contender_wanted "wireguard" && ! contender_wanted "wg"; then WG_AVAILABLE=false; return; fi
     if ! command -v wg >/dev/null 2>&1; then
         echo "[wg] SKIP: 'wg' command not found"; WG_AVAILABLE=false; return
     fi
@@ -599,6 +616,7 @@ setup_wg
 # WireGuard-Go setup
 # ══════════════════════════════════════════════════════════════════════════════
 setup_wireguard_go() {
+    if ! contender_wanted "wireguard-go" && ! contender_wanted "wggo"; then WGGO_AVAILABLE=false; return; fi
     local wggo_bin="wireguard-go"
     if ! command -v "$wggo_bin" >/dev/null 2>&1; then
         if command -v wireguard >/dev/null 2>&1; then
@@ -698,6 +716,7 @@ setup_wireguard_go
 # AmneziaWG setup (kernel module or amneziawg-go)
 # ══════════════════════════════════════════════════════════════════════════════
 setup_awg() {
+    if ! contender_wanted "amneziawg" && ! contender_wanted "awg"; then AWG_AVAILABLE=false; return; fi
     if ! command -v awg >/dev/null 2>&1; then
         echo "[awg] SKIP: 'awg' command not found"; AWG_AVAILABLE=false; return
     fi
@@ -831,6 +850,7 @@ setup_awg
 # OpenVPN setup (peer-fingerprint, UDP, AES-256-GCM)
 # ══════════════════════════════════════════════════════════════════════════════
 setup_ovpn() {
+    if ! contender_wanted "openvpn" && ! contender_wanted "ovpn"; then OVPN_AVAILABLE=false; return; fi
     if ! command -v openvpn >/dev/null 2>&1; then
         echo "[ovpn] SKIP: 'openvpn' not found"; OVPN_AVAILABLE=false; return
     fi
@@ -902,37 +922,41 @@ setup_ovpn
 # n2n setup (supernode + 2 edges; TAP L2 overlay, also carries L3)
 # ══════════════════════════════════════════════════════════════════════════════
 setup_n2n() {
+    if ! contender_wanted "n2n"; then N2N_AVAILABLE=false; return; fi
     if ! command -v supernode >/dev/null 2>&1 || ! command -v edge >/dev/null 2>&1; then
         echo "[n2n] SKIP: 'supernode'/'edge' not found"; N2N_AVAILABLE=false; return
     fi
     echo "[n2n] creating namespaces and veth pair"
     make_pair "$NS_NA" "$NS_NB" "$VNA" "$VNB" "$VNA_IP" "$VNB_IP"
-    ip netns exec "$NS_NA" supernode -p "$N2N_PORT" -f >"$TMPDIR_TEST/n2-sn.log" 2>&1 &
+    ip netns exec "$NS_NA" supernode -p "$N2N_PORT" -f -M >"$TMPDIR_TEST/n2-sn.log" 2>&1 &
     sleep 0.5
     ip netns exec "$NS_NA" edge -c bench -k benchkey -a "${OVL_NA_IP}/24" -l "$VNA_IP":"$N2N_PORT" \
-        -d n2n0 -f >"$TMPDIR_TEST/n2-eA.log" 2>&1 &
+        -d n2n0 -f -r -E >"$TMPDIR_TEST/n2-eA.log" 2>&1 &
     ip netns exec "$NS_NB" edge -c bench -k benchkey -a "${OVL_NB_IP}/24" -l "$VNA_IP":"$N2N_PORT" \
-        -d n2n0 -f >"$TMPDIR_TEST/n2-eB.log" 2>&1 &
+        -d n2n0 -f -r -E >"$TMPDIR_TEST/n2-eB.log" 2>&1 &
     local i
     for i in $(seq 1 60); do
         ip netns exec "$NS_NA" ip link show n2n0 >/dev/null 2>&1 \
             && ip netns exec "$NS_NB" ip link show n2n0 >/dev/null 2>&1 && break
         sleep 0.25
     done
+    ip netns exec "$NS_NA" sysctl -w net.ipv6.conf.n2n0.disable_ipv6=0 >/dev/null 2>&1 || true
+    ip netns exec "$NS_NB" sysctl -w net.ipv6.conf.n2n0.disable_ipv6=0 >/dev/null 2>&1 || true
     ip netns exec "$NS_NA" ip link set dev n2n0 txqueuelen 10000 2>/dev/null || true
     ip netns exec "$NS_NB" ip link set dev n2n0 txqueuelen 10000 2>/dev/null || true
     ip netns exec "$NS_NA" ip -6 addr add "${OVL_NA_IP6}/64" dev n2n0 nodad 2>/dev/null || true
     ip netns exec "$NS_NB" ip -6 addr add "${OVL_NB_IP6}/64" dev n2n0 nodad 2>/dev/null || true
     local n2n_up=false
-    for i in $(seq 1 20); do
-        if ip netns exec "$NS_NB" ping -c 1 -W 1 "$OVL_NA_IP" >/dev/null 2>&1; then
+    for i in $(seq 1 30); do
+        if ip netns exec "$NS_NB" ping -c 1 -W 1 "$OVL_NA_IP" >/dev/null 2>&1 && \
+           ip netns exec "$NS_NB" ping -6 -c 1 -W 1 "$OVL_NA_IP6" >/dev/null 2>&1; then
             n2n_up=true
             break
         fi
         sleep 0.5
     done
     if [ "$n2n_up" = false ]; then
-        echo "[n2n] SKIP: baseline overlay IPv4 ping failed"
+        echo "[n2n] SKIP: baseline overlay IPv4/IPv6 ping failed"
         tail -5 "$TMPDIR_TEST/n2-sn.log" "$TMPDIR_TEST/n2-eA.log" "$TMPDIR_TEST/n2-eB.log" 2>/dev/null || true
         N2N_AVAILABLE=false; return
     fi
@@ -944,6 +968,7 @@ setup_n2n
 # ZeroTier setup (local netns controller)
 # ══════════════════════════════════════════════════════════════════════════════
 setup_zerotier() {
+    if ! contender_wanted "zerotier" && ! contender_wanted "zt"; then ZT_AVAILABLE=false; return; fi
     if ! command -v zerotier-one >/dev/null 2>&1; then
         echo "[zerotier] SKIP: 'zerotier-one' not found"; ZT_AVAILABLE=false; return
     fi
@@ -1058,6 +1083,7 @@ setup_zerotier
 # Tailscale setup (local headscale coordinator)
 # ══════════════════════════════════════════════════════════════════════════════
 setup_tailscale() {
+    if ! contender_wanted "tailscale" && ! contender_wanted "ts"; then TS_AVAILABLE=false; return; fi
     if ! command -v tailscaled >/dev/null 2>&1 || ! command -v headscale >/dev/null 2>&1; then
         echo "[tailscale] SKIP: 'tailscaled' or 'headscale' not found"; TS_AVAILABLE=false; return
     fi
@@ -1129,9 +1155,13 @@ EOF
     ip netns exec "$NS_TA" tailscale --socket="$ts_dir_a/tailscaled.sock" up --login-server="http://${VTA_IP}:8080" --auth-key="$auth_key" --accept-dns=false --accept-routes=false >/dev/null 2>&1 || true
     ip netns exec "$NS_TB" tailscale --socket="$ts_dir_b/tailscaled.sock" up --login-server="http://${VTA_IP}:8080" --auth-key="$auth_key" --accept-dns=false --accept-routes=false >/dev/null 2>&1 || true
     local found=false
+    local ts_dyn_a="" ts_dyn_b="" ts_dyn6_a="" ts_dyn6_b=""
     for i in $(seq 1 40); do
-        if ip netns exec "$NS_TA" ip -o -4 addr show tailscale0 >/dev/null 2>&1 && \
-           ip netns exec "$NS_TB" ip -o -4 addr show tailscale0 >/dev/null 2>&1; then
+        ts_dyn_a="$(ip netns exec "$NS_TA" tailscale --socket="$ts_dir_a/tailscaled.sock" ip -4 2>/dev/null | head -1 || true)"
+        ts_dyn_b="$(ip netns exec "$NS_TB" tailscale --socket="$ts_dir_b/tailscaled.sock" ip -4 2>/dev/null | head -1 || true)"
+        ts_dyn6_a="$(ip netns exec "$NS_TA" tailscale --socket="$ts_dir_a/tailscaled.sock" ip -6 2>/dev/null | grep -v '^fe80' | head -1 || true)"
+        ts_dyn6_b="$(ip netns exec "$NS_TB" tailscale --socket="$ts_dir_b/tailscaled.sock" ip -6 2>/dev/null | grep -v '^fe80' | head -1 || true)"
+        if [ -n "$ts_dyn_a" ] && [ -n "$ts_dyn_b" ] && [ -n "$ts_dyn6_a" ] && [ -n "$ts_dyn6_b" ]; then
             found=true; break
         fi
         sleep 0.5
@@ -1139,22 +1169,16 @@ EOF
     if [ "$found" = false ]; then
         echo "[tailscale] SKIP: tailscale tunnel activation timed out"; TS_AVAILABLE=false; return
     fi
+    TUN_TA_IP="$ts_dyn_a"
+    TUN_TB_IP="$ts_dyn_b"
+    TUN_TA_IP6="$ts_dyn6_a"
+    TUN_TB_IP6="$ts_dyn6_b"
     ip netns exec "$NS_TA" ip link set dev tailscale0 txqueuelen 10000 2>/dev/null || true
     ip netns exec "$NS_TB" ip link set dev tailscale0 txqueuelen 10000 2>/dev/null || true
-    ip netns exec "$NS_TA" ip -6 addr add "${TUN_TA_IP6}/64" dev tailscale0 nodad 2>/dev/null || true
-    ip netns exec "$NS_TB" ip -6 addr add "${TUN_TB_IP6}/64" dev tailscale0 nodad 2>/dev/null || true
-    local ts_dyn_a ts_dyn_b ts_dyn6_a ts_dyn6_b
-    ts_dyn_a="$(ip netns exec "$NS_TA" ip -o -4 addr show tailscale0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)"
-    ts_dyn_b="$(ip netns exec "$NS_TB" ip -o -4 addr show tailscale0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)"
-    [ -n "$ts_dyn_a" ] && TUN_TA_IP="$ts_dyn_a"
-    [ -n "$ts_dyn_b" ] && TUN_TB_IP="$ts_dyn_b"
-    ts_dyn6_a="$(ip netns exec "$NS_TA" ip -o -6 addr show tailscale0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -v '^fe80' | head -1 || true)"
-    ts_dyn6_b="$(ip netns exec "$NS_TB" ip -o -6 addr show tailscale0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -v '^fe80' | head -1 || true)"
-    [ -n "$ts_dyn6_a" ] && TUN_TA_IP6="$ts_dyn6_a"
-    [ -n "$ts_dyn6_b" ] && TUN_TB_IP6="$ts_dyn6_b"
     local ts_up=false
     for i in $(seq 1 20); do
-        if ip netns exec "$NS_TB" ping -c 1 -W 1 "$TUN_TA_IP" >/dev/null 2>&1; then
+        if ip netns exec "$NS_TB" ping -c 1 -W 1 "$TUN_TA_IP" >/dev/null 2>&1 && \
+           ip netns exec "$NS_TB" ping -6 -c 1 -W 1 "$TUN_TA_IP6" >/dev/null 2>&1; then
             ts_up=true
             break
         fi
@@ -1171,21 +1195,85 @@ setup_tailscale
 # NetBird setup (management coordinator)
 # ══════════════════════════════════════════════════════════════════════════════
 setup_netbird() {
+    if ! contender_wanted "netbird" && ! contender_wanted "nb"; then NB_AVAILABLE=false; return; fi
     if ! command -v netbird >/dev/null 2>&1; then
         echo "[netbird] SKIP: 'netbird' not found"; NB_AVAILABLE=false; return
     fi
-    if [ -z "${NETBIRD_MGMT_URL:-}" ] || [ -z "${NETBIRD_SETUP_KEY:-}" ]; then
-        echo "[netbird] SKIP: NETBIRD_MGMT_URL / NETBIRD_SETUP_KEY not configured (management coordinator required)"; NB_AVAILABLE=false; return
-    fi
+    local mgmt_url="${NETBIRD_MGMT_URL:-}"
+    local setup_key="${NETBIRD_SETUP_KEY:-}"
+
     echo "[netbird] creating namespaces and veth pair"
     make_pair "$NS_BA" "$NS_BB" "$VBA" "$VBB" "$VBA_IP" "$VBB_IP"
+
+    if [ -z "$mgmt_url" ] || [ -z "$setup_key" ]; then
+        if ! command -v netbird-mgmt >/dev/null 2>&1 || ! command -v netbird-signal >/dev/null 2>&1; then
+            echo "[netbird] SKIP: 'netbird-mgmt' or 'netbird-signal' not found (run setup-contenders.sh --netbird)"; NB_AVAILABLE=false; return
+        fi
+        local nb_dir="$TMPDIR_TEST/nb_coord"
+        mkdir -p "$nb_dir/data"
+        if [ -d /usr/local/share/netbird-geo ]; then
+            cp -s /usr/local/share/netbird-geo/* "$nb_dir/data/" 2>/dev/null || true
+        fi
+        cat > "$nb_dir/management.json" <<EOF
+{
+  "Signal": {
+    "Proto": "http",
+    "URI": "${VBA_IP}:10000"
+  },
+  "EmbeddedIdP": {
+    "Enabled": true,
+    "Issuer": "http://${VBA_IP}:8080"
+  },
+  "Datadir": "$nb_dir/data"
+}
+EOF
+        ip netns exec "$NS_BA" netbird-signal run --port 10000 --log-file "$TMPDIR_TEST/nb-signal.log" >/dev/null 2>&1 &
+        local pid_sig=$!
+        ip netns exec "$NS_BA" netbird-mgmt management --config "$nb_dir/management.json" --datadir "$nb_dir/data" --port 8080 --metrics-port 9099 --log-file "$TMPDIR_TEST/nb-mgmt.log" >/dev/null 2>&1 &
+        local pid_mgmt=$!
+        for i in $(seq 1 40); do
+            if [ -f "$nb_dir/data/store.db" ]; then
+                break
+            fi
+            sleep 0.2
+        done
+        if [ ! -f "$nb_dir/data/store.db" ]; then
+            echo "[netbird] SKIP: store.db initialization timed out"; NB_AVAILABLE=false; return
+        fi
+        kill $pid_mgmt 2>/dev/null || true
+        wait $pid_mgmt 2>/dev/null || true
+        sqlite3 "$nb_dir/data/store.db" <<'SQL'
+INSERT INTO accounts (id, created_by, created_at, domain, domain_category, is_domain_primary_account, network_identifier, network_net, network_net_v6, settings_peer_login_expiration_enabled, settings_groups_propagation_enabled, settings_lazy_connection_enabled)
+VALUES ('acc_bench', 'usr_bench', datetime('now'), 'netbird.selfhosted', 'private', 1, 'net_bench', '{"IP":"100.64.0.0","Mask":"//8AAA=="}', '{"IP":"fd00:4e42::","Mask":"//////////8AAAAAAAAAAA=="}', 0, 1, 0);
+
+INSERT INTO users (id, account_id, role, is_service_user, non_deletable, created_at, issued)
+VALUES ('usr_bench', 'acc_bench', 'owner', 0, 1, datetime('now'), 'api');
+
+INSERT INTO "groups" (id, account_id, public_id, name, issued)
+VALUES ('grp_all', 'acc_bench', 'grp_all_pub', 'All', 'api');
+
+INSERT INTO policies (id, public_id, account_id, name, description, enabled)
+VALUES ('pol_bench', 'pol_bench_pub', 'acc_bench', 'Default mesh', 'Full connectivity for All group', 1);
+
+INSERT INTO policy_rules (id, policy_id, name, description, enabled, action, destinations, sources, bidirectional, protocol)
+VALUES ('rule_bench', 'pol_bench', 'Rule 1', 'Allow all between All', 1, 'accept', '["grp_all"]', '["grp_all"]', 1, 'all');
+
+INSERT INTO setup_keys (id, account_id, key, key_secret, name, type, created_at, expires_at, revoked, usage_limit, ephemeral, auto_groups)
+VALUES ('key_bench', 'acc_bench', 'mewqgKYulb4neyT85tvUyw1QzCAhxDjA9+5h7WeAysw=', 'A1B2C****', 'Bench Key', 'reusable', datetime('now'), datetime('now', '+10 years'), 0, 0, 0, '["grp_all"]');
+SQL
+        ip netns exec "$NS_BA" netbird-mgmt management --config "$nb_dir/management.json" --datadir "$nb_dir/data" --port 8080 --metrics-port 9099 --log-file "$TMPDIR_TEST/nb-mgmt.log" >/dev/null 2>&1 &
+        sleep 2
+        mgmt_url="http://${VBA_IP}:8080"
+        setup_key="A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
+    fi
+
     local nb_dir_a="$TMPDIR_TEST/nb_a"; local nb_dir_b="$TMPDIR_TEST/nb_b"
     mkdir -p "$nb_dir_a" "$nb_dir_b"
-    ip netns exec "$NS_BA" netbird service run --config "$nb_dir_a/config.json" --log-file "$TMPDIR_TEST/nb-a.log" >/dev/null 2>&1 &
-    ip netns exec "$NS_BB" netbird service run --config "$nb_dir_b/config.json" --log-file "$TMPDIR_TEST/nb-b.log" >/dev/null 2>&1 &
+    ip netns exec "$NS_BA" netbird service run --config "$nb_dir_a/config.json" --daemon-addr "unix://$nb_dir_a/daemon.sock" --log-file "$TMPDIR_TEST/nb-a.log" >/dev/null 2>&1 &
+    ip netns exec "$NS_BB" netbird service run --config "$nb_dir_b/config.json" --daemon-addr "unix://$nb_dir_b/daemon.sock" --log-file "$TMPDIR_TEST/nb-b.log" >/dev/null 2>&1 &
     sleep 1
-    ip netns exec "$NS_BA" netbird up --config "$nb_dir_a/config.json" --management-url "$NETBIRD_MGMT_URL" --setup-key "$NETBIRD_SETUP_KEY" >/dev/null 2>&1 || true
-    ip netns exec "$NS_BB" netbird up --config "$nb_dir_b/config.json" --management-url "$NETBIRD_MGMT_URL" --setup-key "$NETBIRD_SETUP_KEY" >/dev/null 2>&1 || true
+    ip netns exec "$NS_BA" netbird up --daemon-addr "unix://$nb_dir_a/daemon.sock" --management-url "$mgmt_url" --setup-key "$setup_key" --disable-dns --disable-firewall >/dev/null 2>&1 || true
+    ip netns exec "$NS_BB" netbird up --daemon-addr "unix://$nb_dir_b/daemon.sock" --management-url "$mgmt_url" --setup-key "$setup_key" --disable-dns --disable-firewall >/dev/null 2>&1 || true
     local found=false
     for i in $(seq 1 40); do
         if ip netns exec "$NS_BA" ip link show wt0 >/dev/null 2>&1 && \
@@ -1195,10 +1283,44 @@ setup_netbird() {
         sleep 0.5
     done
     if [ "$found" = false ]; then
-        echo "[netbird] SKIP: wt0 interface creation timed out"; NB_AVAILABLE=false; return
+        echo "[netbird] SKIP: wt0 interface creation timed out"
+        tail -15 "$TMPDIR_TEST/nb-mgmt.log" "$TMPDIR_TEST/nb-a.log" "$TMPDIR_TEST/nb-b.log" 2>/dev/null || true
+        NB_AVAILABLE=false; return
+    fi
+    local nb_dyn_a="" nb_dyn_b="" nb_dyn6_a="" nb_dyn6_b=""
+    for i in $(seq 1 40); do
+        nb_dyn_a="$(ip netns exec "$NS_BA" ip -o -4 addr show wt0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)"
+        nb_dyn_b="$(ip netns exec "$NS_BB" ip -o -4 addr show wt0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)"
+        nb_dyn6_a="$(ip netns exec "$NS_BA" ip -o -6 addr show wt0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -v '^fe80' | head -1 || true)"
+        nb_dyn6_b="$(ip netns exec "$NS_BB" ip -o -6 addr show wt0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -v '^fe80' | head -1 || true)"
+        if [ -n "$nb_dyn_a" ] && [ -n "$nb_dyn_b" ]; then
+            TUN_BA_IP="$nb_dyn_a"
+            TUN_BB_IP="$nb_dyn_b"
+            if [ -n "$nb_dyn6_a" ] && [ -n "$nb_dyn6_b" ]; then
+                TUN_BA_IP6="$nb_dyn6_a"
+                TUN_BB_IP6="$nb_dyn6_b"
+                break
+            fi
+        fi
+        sleep 0.5
+    done
+    if [ -n "$nb_dyn6_a" ] && [ -n "$nb_dyn6_b" ]; then
+        TUN_BA_IP6="$nb_dyn6_a"
+        TUN_BB_IP6="$nb_dyn6_b"
     fi
     ip netns exec "$NS_BA" ip link set dev wt0 txqueuelen 10000 2>/dev/null || true
     ip netns exec "$NS_BB" ip link set dev wt0 txqueuelen 10000 2>/dev/null || true
+    local nb_up=false
+    for i in $(seq 1 30); do
+        if ip netns exec "$NS_BB" ping -c 1 -W 1 "$TUN_BA_IP" >/dev/null 2>&1; then
+            nb_up=true
+            break
+        fi
+        sleep 0.5
+    done
+    if [ "$nb_up" = false ]; then
+        echo "[netbird] SKIP: baseline ping failed"; NB_AVAILABLE=false; return
+    fi
     echo "[netbird] tunnel up"
 }
 setup_netbird

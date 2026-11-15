@@ -14,16 +14,20 @@ All notable changes to this project are documented here, following
   Added automated installation and evaluation of userspace Go WireGuard (`wireguard-go`) in `setup-contenders.sh` (`--wireguard-go`) and `run-iperf-compare.sh`. Measures dual-stack IPv4/IPv6 throughput, loss, latency, CPU utilization, and peak resident memory (`get_ns_ram_mb`), enabling direct userspace-to-userspace comparisons against YIP. Added Go module build caching in `benchmarks.yml` to accelerate CI benchmarking runs.
 
 ### Fixed
-- **Benchmark Contender Setup, Host Isolation, and Mesh Mesh Protocol Provisioning (`crates/yip-bench`, #221, #237, #238).**
+- **Benchmark Contender Setup, Host Isolation, and Mesh Protocol Provisioning (`crates/yip-bench`, #221, #237, #238).**
   Fixed runtime configuration and provisioning issues across benchmark contenders in `crates/yip-bench/setup-contenders.sh` and `crates/yip-bench/tests/run-iperf-compare.sh`:
   - Added `--accept-dns=false --accept-routes=false` to Tailscale namespace activation, isolating network namespace DNS configuration from host systemd-resolved and preventing host network connectivity loss during benchmark runs.
-  - Added n2n version 3+ verification (`v.3+`) with automated source compilation fallback (`git clone https://github.com/ntop/n2n.git`) when system package repositories provide legacy v2.
+  - Added n2n version 3+ verification (`v.3+`) with automated source compilation fallback (`git clone https://github.com/ntop/n2n.git`) when system package repositories provide legacy v2. Fixed IPv6 NDP neighbor discovery drops on n2n by passing `-r` (community packet forwarding) and `-E` (accept multicast MAC addresses) to `edge` and `-M` (disable MAC/IP spoofing checks) to `supernode`.
+  - Resolved dynamic IPv6 addresses for Tailscale via `tailscale --socket=... ip -6`, querying Headscale-assigned overlay IPv6 addresses and enabling full line-rate dual-stack IPv4/IPv6 routing.
   - Implemented standalone ZeroTier moon generation via `zerotier-idtool initmoon`/`genmoon` with local veth `stableEndpoints`, enabling isolated network namespace operation without internet connectivity to global planet roots, along with deb archive binary extraction for non-Debian distributions.
+  - Provisioned local standalone NetBird management coordinator (`netbird-mgmt`) and WebRTC signal daemon (`netbird-signal`) with SQLite schema initialization, enabling fully autonomous offline dual-stack network namespace evaluation.
   - Replaced static overlay IP assumptions with dynamic IP resolution for mesh contenders (Tailscale `tailscale0` CGNAT addresses and ZeroTier assigned addresses).
   - Added bounded polling retry loops for OpenVPN TLS handshake completion and n2n edge supernode registration before baseline ping checks.
   - Corrected NetBird Go package import path to `github.com/netbirdio/netbird/client@latest` and resolved GitHub release tarball URLs via HTTP redirect headers to bypass unauthenticated API rate limits.
   - Configured per-namespace UAPI directory symlinks (`/run/amneziawg`, `/var/run/amneziawg` -> `/etc/netns/$NS/amneziawg-run`) and launched `amneziawg-go` in foreground mode (`-f`) with tracked process cleanup, preventing socket collision and daemon termination.
   - Updated Headscale coordinator setup for v0.29+ compatibility, provisioning `noise.private_key_path`, `prefixes.v4/v6`, local DERP region definitions, `unix_socket` paths, and integer user ID lookup (`-u 1`) with backward-compatible `--user` fallback.
+  - Replaced manual shell MTU mutations with autonomous daemon MTU configuration (`mtu=${YIP_MTU}` in `CFG_A`/`CFG_B`), synchronizing TUN device MTU, PLPMTU discovery, and TCP SYN MSS clamping directly within `yipd`.
+  - Added selective contender filtering via `CONTENDERS="<name1> <name2>"` in `run-iperf-compare.sh` to allow targeted sweeps without running all nine contenders.
 - **TCP Retransmission Delivery in Ingress Micro-Reorder Buffer (`crates/yip-transport`, #234).**
   Fixed TCP goodput collapse where high-throughput streams dropped from ~1.5 Gbps to ~90-118 Mbps under packet jitter. Previously, incoming TCP packets with sequence ranges prior to or equal to `flow.expected_seq` were discarded without calling `emit(packet)`. When slot capacity evictions or deadline flushes advanced `expected_seq`, subsequent retransmissions for missing or dropped segments were discarded, preventing the kernel TCP stack from receiving retransmitted data and stalling the congestion window. All duplicate and retransmitted TCP segments are now emitted to the TUN interface so the OS TCP stack receives SACKs, duplicate ACKs, and repair segments promptly.
 - **TCP Retransmit Loss Telemetry & JSON Benchmarking (`crates/yip-bench`, #237).**
@@ -454,7 +458,7 @@ All notable changes to this project are documented here, following
   LLC. The AGPL network-use clause (§13) means anyone running a modified `yip` as a
   network service must offer their users the corresponding source — privacy
   infrastructure stays open. (Closes #53.)
-- README rewritten with the project identity ("🦊 what does the fox say? — nothing a
+- README rewritten with the project identity ("what does the fox say? — nothing a
   DPI firewall can hear") and a "Silicon Slopes Paradox" section on Utah SB 73 and
   the EFF's coverage; corrected the lingering "RaptorQ" references to Reed–Solomon
   across README, `CLAUDE.md`, and `yip-transport`/`yip-wire` doc comments (the codec
