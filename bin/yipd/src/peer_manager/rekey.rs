@@ -60,6 +60,9 @@ impl PeerManager {
         epochs: &mut crate::epoch::EpochSet,
         now_ms: u64,
     ) {
+        if self.num_shards > 1 && self.shard_id != 0 {
+            return;
+        }
         if epochs.rekey.is_none() {
             // Glare tiebreak: reuse the EXACT static-key-order comparison
             // `handle_handshake_init`/`relayed_handshake_init` use to decide

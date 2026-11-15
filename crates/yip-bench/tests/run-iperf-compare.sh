@@ -386,11 +386,16 @@ measure_iperf() {
     if [[ "$srv_ip" == *:* ]]; then
         v6_flag="-6"
     fi
+    ip netns exec "$ns_srv" killall -9 iperf3 2>/dev/null || true
+    ip netns exec "$ns_cli" killall -9 iperf3 2>/dev/null || true
     ip netns exec "$ns_srv" iperf3 -s -1 -B "$srv_ip" $v6_flag >/dev/null 2>&1 &
     srv_pid=$!
     sleep 0.5
-    out="$(ip netns exec "$ns_cli" iperf3 -c "$srv_ip" $v6_flag -C "$TCP_CC" -P "$IPERF_STREAMS" --connect-timeout 3000 -t 8 -J 2>/dev/null || true)"
-    kill "$srv_pid" 2>/dev/null || true
+    out="$(timeout 15 ip netns exec "$ns_cli" iperf3 -c "$srv_ip" $v6_flag -C "$TCP_CC" -P "$IPERF_STREAMS" --connect-timeout 3000 -t 8 -J 2>/dev/null || true)"
+    kill -9 "$srv_pid" 2>/dev/null || true
+    wait "$srv_pid" 2>/dev/null || true
+    ip netns exec "$ns_srv" killall -9 iperf3 2>/dev/null || true
+    ip netns exec "$ns_cli" killall -9 iperf3 2>/dev/null || true
 
     if [ -n "$out" ]; then
         if command -v jq >/dev/null 2>&1; then
@@ -428,14 +433,19 @@ measure_iperf_udp() {
     if [[ "$srv_ip" == *:* ]]; then
         v6_flag="-6"
     fi
+    ip netns exec "$ns_srv" killall -9 iperf3 2>/dev/null || true
+    ip netns exec "$ns_cli" killall -9 iperf3 2>/dev/null || true
     ip netns exec "$ns_srv" iperf3 -s -1 -B "$srv_ip" $v6_flag >/dev/null 2>&1 &
     srv_pid=$!
     sleep 0.5
     sample_cpu_start
-    out="$(ip netns exec "$ns_cli" iperf3 -c "$srv_ip" $v6_flag -u \
+    out="$(timeout 15 ip netns exec "$ns_cli" iperf3 -c "$srv_ip" $v6_flag -u \
         -b "${UDP_RATE:-10G}" -l "${UDP_LEN:-1400}" --connect-timeout 3000 -t 8 -J 2>/dev/null || true)"
     read -r cpu_pct _ <<< "$(sample_cpu_end)"
-    kill "$srv_pid" 2>/dev/null || true
+    kill -9 "$srv_pid" 2>/dev/null || true
+    wait "$srv_pid" 2>/dev/null || true
+    ip netns exec "$ns_srv" killall -9 iperf3 2>/dev/null || true
+    ip netns exec "$ns_cli" killall -9 iperf3 2>/dev/null || true
 
     if [ -n "$out" ]; then
         if command -v jq >/dev/null 2>&1; then
@@ -944,14 +954,17 @@ setup_n2n() {
     ip netns exec "$NS_NB" sysctl -w net.ipv6.conf.n2n0.disable_ipv6=0 >/dev/null 2>&1 || true
     ip netns exec "$NS_NA" ip link set dev n2n0 txqueuelen 10000 2>/dev/null || true
     ip netns exec "$NS_NB" ip link set dev n2n0 txqueuelen 10000 2>/dev/null || true
+    ip netns exec "$NS_NA" ip link set dev n2n0 up 2>/dev/null || true
+    ip netns exec "$NS_NB" ip link set dev n2n0 up 2>/dev/null || true
     ip netns exec "$NS_NA" ip -6 addr add "${OVL_NA_IP6}/64" dev n2n0 nodad 2>/dev/null || true
     ip netns exec "$NS_NB" ip -6 addr add "${OVL_NB_IP6}/64" dev n2n0 nodad 2>/dev/null || true
     local n2n_up=false
-    for i in $(seq 1 30); do
-        if ip netns exec "$NS_NB" ping -c 1 -W 1 "$OVL_NA_IP" >/dev/null 2>&1 && \
-           ip netns exec "$NS_NB" ping -6 -c 1 -W 1 "$OVL_NA_IP6" >/dev/null 2>&1; then
-            n2n_up=true
-            break
+    for i in $(seq 1 40); do
+        if ip netns exec "$NS_NB" ping -c 1 -W 1 "$OVL_NA_IP" >/dev/null 2>&1; then
+            if ip netns exec "$NS_NB" ping -6 -c 1 -W 1 "$OVL_NA_IP6" >/dev/null 2>&1; then
+                n2n_up=true
+                break
+            fi
         fi
         sleep 0.5
     done
@@ -1271,9 +1284,18 @@ SQL
     mkdir -p "$nb_dir_a" "$nb_dir_b"
     ip netns exec "$NS_BA" netbird service run --config "$nb_dir_a/config.json" --daemon-addr "unix://$nb_dir_a/daemon.sock" --log-file "$TMPDIR_TEST/nb-a.log" >/dev/null 2>&1 &
     ip netns exec "$NS_BB" netbird service run --config "$nb_dir_b/config.json" --daemon-addr "unix://$nb_dir_b/daemon.sock" --log-file "$TMPDIR_TEST/nb-b.log" >/dev/null 2>&1 &
-    sleep 1
-    ip netns exec "$NS_BA" netbird up --daemon-addr "unix://$nb_dir_a/daemon.sock" --management-url "$mgmt_url" --setup-key "$setup_key" --disable-dns --disable-firewall >/dev/null 2>&1 || true
-    ip netns exec "$NS_BB" netbird up --daemon-addr "unix://$nb_dir_b/daemon.sock" --management-url "$mgmt_url" --setup-key "$setup_key" --disable-dns --disable-firewall >/dev/null 2>&1 || true
+    for i in $(seq 1 40); do
+        if [ -S "$nb_dir_a/daemon.sock" ] && [ -S "$nb_dir_b/daemon.sock" ]; then
+            break
+        fi
+        sleep 0.25
+    done
+    for i in $(seq 1 10); do
+        ip netns exec "$NS_BA" netbird up --daemon-addr "unix://$nb_dir_a/daemon.sock" --management-url "$mgmt_url" --setup-key "$setup_key" --disable-dns --disable-firewall >/dev/null 2>&1 && break || sleep 0.5
+    done
+    for i in $(seq 1 10); do
+        ip netns exec "$NS_BB" netbird up --daemon-addr "unix://$nb_dir_b/daemon.sock" --management-url "$mgmt_url" --setup-key "$setup_key" --disable-dns --disable-firewall >/dev/null 2>&1 && break || sleep 0.5
+    done
     local found=false
     for i in $(seq 1 40); do
         if ip netns exec "$NS_BA" ip link show wt0 >/dev/null 2>&1 && \
@@ -1521,7 +1543,9 @@ for LOSS in $LOSS_RATES; do
 
     # ── emit per-loss-rate tables ─────────────────────────────────────────────
     YIP_LABEL="yip"
-    if [ "$YIP_SHARDS" -gt 1 ] 2>/dev/null; then
+    if [ "$YIP_SHARDS" = "auto" ]; then
+        YIP_LABEL="yip(auto)"
+    elif [ "$YIP_SHARDS" -gt 1 ] 2>/dev/null; then
         YIP_LABEL="yip(s=$YIP_SHARDS)"
     fi
 

@@ -2318,6 +2318,11 @@ impl PeerManager {
 
         // Idle: buffer this packet and decide how to bring the peer up.
         Self::push_pending(&mut self.peers[idx].pending_tun, inner);
+        if self.num_shards > 1 && self.shard_id != 0 {
+            // Non-zero worker shards in multi-core sharding do not initiate handshakes;
+            // Shard 0 owns all control plane negotiations.
+            return;
+        }
         // With no rendezvous configured, behave exactly as 2a: probe the
         // configured endpoint if there is one (else the peer is unreachable and
         // the packet stays buffered). With a rendezvous configured, ask the
@@ -2346,6 +2351,49 @@ impl PeerManager {
 
     fn tick_dispatch(&mut self, now_ms: u64) -> Option<&[EgressDatagram]> {
         self.tick_egress.clear();
+
+        // In multi-core sharded mode, non-zero worker shards ONLY drive DataPlane
+        // session ticks (ARQ feedback / cover) for established sessions. Handshake initiation,
+        // path state machine escalation, rekey scheduling, and registration refresh are
+        // strictly owned by Shard 0 to prevent multi-shard handshake glare and epoch collisions.
+        if self.num_shards > 1 && self.shard_id != 0 {
+            for i in 0..self.peers.len() {
+                let relay = self.peers[i].relay;
+                let old_state = std::mem::replace(&mut self.peers[i].state, PeerState::Idle);
+                let new_state = match old_state {
+                    PeerState::Established(mut epochs) => {
+                        epochs.retire_previous_if_due(now_ms);
+                        if let Some(pkts) = epochs.current_mut().tick(now_ms) {
+                            if relay {
+                                let owned: Vec<Vec<u8>> =
+                                    pkts.iter().map(|d| d.bytes.clone()).collect();
+                                for b in owned {
+                                    if let Some(d) = self.relay_wrap(i, b) {
+                                        self.tick_egress.push(d);
+                                    }
+                                }
+                            } else {
+                                for d in pkts {
+                                    self.tick_egress.push(EgressDatagram {
+                                        fate: d.fate,
+                                        dst: d.dst,
+                                        bytes: d.bytes.clone(),
+                                    });
+                                }
+                            }
+                        }
+                        PeerState::Established(epochs)
+                    }
+                    other => other,
+                };
+                self.peers[i].state = new_state;
+            }
+            return if self.tick_egress.is_empty() {
+                None
+            } else {
+                Some(&self.tick_egress)
+            };
+        }
 
         if now_ms.saturating_sub(self.last_metrics_update_ms) >= 500
             || self.last_metrics_update_ms == 0
