@@ -1227,14 +1227,14 @@ pub fn run_uring<D: Dispatch>(udp_fd: RawFd, tun_fd: RawFd, d: &mut D) -> io::Re
         Ok(driver) => driver,
         Err(e) => {
             eprintln!("uring: init failed ({e}); falling back to PollDriver");
-            return crate::poll::run_poll(udp_fd, tun_fd, false, d);
+            return crate::poll::run_poll(udp_fd, tun_fd, false, false, d);
         }
     };
     loop {
         if let Err(e) = driver.poll_once(d) {
             eprintln!("uring: fatal driver error ({e}); falling back to PollDriver");
             drop(driver);
-            return crate::poll::run_poll(udp_fd, tun_fd, false, d);
+            return crate::poll::run_poll(udp_fd, tun_fd, false, false, d);
         }
     }
 }

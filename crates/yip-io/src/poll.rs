@@ -756,10 +756,14 @@ pub fn recv_mmsg(
 /// `IFF_VNET_HDR` + kernel GSO/GRO offload (`TunTap::vnet_hdr_len().is_some()`
 /// — see `yip-device`); passing `true` for a plain fd corrupts every TUN
 /// read/write with a bogus `virtio_net_hdr` prefix.
+/// `has_uso` indicates whether the TUN device was configured with `TUN_F_USO`
+/// (UDP segmentation offload). When false, the coalescer emits UDP datagrams
+/// as uncoalesced singletons (GSO_NONE).
 pub fn run_poll<D: Dispatch>(
     udp_fd: RawFd,
     tun_fd: RawFd,
     vnet_hdr: bool,
+    has_uso: bool,
     d: &mut D,
 ) -> io::Result<()> {
     set_nonblocking(udp_fd)?;
@@ -819,7 +823,7 @@ pub fn run_poll<D: Dispatch>(
     // into individual MTU packets. `tun_buf` is sized to hold a whole GSO
     // super-frame (`VNET_HDR_LEN + MAX_GSO_PAYLOAD`) when offload is active,
     // or `MAX_WIRE_DATAGRAM` — identical to today's stack buffer — otherwise.
-    let mut coalescer = crate::tun_offload::Coalescer::new();
+    let mut coalescer = crate::tun_offload::Coalescer::new(has_uso);
     let mut split_out: Vec<u8> = Vec::new();
     let mut split_offs: Vec<(usize, usize)> = Vec::new();
     let mut tun_buf = vec![
@@ -993,7 +997,7 @@ mod tests {
         let mut srcs = [std::net::SocketAddr::from(([0, 0, 0, 0], 0)); MAX_DATAGRAM_BATCH];
         let mut tx = Vec::new();
         let mut gso = GsoScratch::new();
-        let mut coalescer = crate::tun_offload::Coalescer::new();
+        let mut coalescer = crate::tun_offload::Coalescer::new(false);
         drain_udp(
             b.as_raw_fd(),
             null_fd,
@@ -1038,7 +1042,7 @@ mod tests {
         let mut srcs = [std::net::SocketAddr::from(([0, 0, 0, 0], 0)); MAX_DATAGRAM_BATCH];
         let mut tx = Vec::new();
         let mut gso = GsoScratch::new();
-        let mut coalescer = crate::tun_offload::Coalescer::new();
+        let mut coalescer = crate::tun_offload::Coalescer::new(false);
         drain_udp(
             b.as_raw_fd(),
             null_fd,
@@ -1138,7 +1142,7 @@ mod tests {
         let mut srcs = [std::net::SocketAddr::from(([0, 0, 0, 0], 0)); MAX_DATAGRAM_BATCH];
         let mut tx = Vec::new();
         let mut gso = GsoScratch::new();
-        let mut coalescer = crate::tun_offload::Coalescer::new();
+        let mut coalescer = crate::tun_offload::Coalescer::new(false);
         drain_udp(
             b.as_raw_fd(),
             null_fd,

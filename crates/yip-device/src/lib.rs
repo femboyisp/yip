@@ -26,9 +26,11 @@ const TUNSETOFFLOAD: libc::c_ulong = 0x4004_54d0;
 pub const TUNSETVNETHDRSZ: libc::c_ulong = 0x4004_54d8;
 /// Alias for `TUNSETVNETHDRSZ`.
 pub const TUNSETVNETHDR: libc::c_ulong = TUNSETVNETHDRSZ;
-const TUN_F_CSUM: libc::c_uint = 0x01;
-const TUN_F_TSO4: libc::c_uint = 0x02;
-const TUN_F_TSO6: libc::c_uint = 0x04;
+pub const TUN_F_CSUM: libc::c_uint = 0x01;
+pub const TUN_F_TSO4: libc::c_uint = 0x02;
+pub const TUN_F_TSO6: libc::c_uint = 0x04;
+pub const TUN_F_USO4: libc::c_uint = 0x20;
+pub const TUN_F_USO6: libc::c_uint = 0x40;
 
 /// Length (bytes) of the `virtio_net_hdr` prefix on every TUN read/write when
 /// [`TunTap::vnet_hdr_len`] is `Some`. Kept as its own constant (rather than
@@ -66,25 +68,51 @@ fn decode_ifname(buf: &[u8; libc::IFNAMSIZ]) -> Result<String, DeviceError> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OffloadMode {
-    Full,
+pub enum OffloadMode {
+    /// Full TCP and UDP GSO/GRO offload (Linux 6.2+).
+    FullUso,
+    /// TCP-only GSO/GRO offload (Linux 3.x - 6.1).
+    FullTso,
+    /// L4 Checksum offload only.
     CsumOnly,
 }
 
+impl OffloadMode {
+    #[inline]
+    pub fn has_uso(&self) -> bool {
+        matches!(self, Self::FullUso)
+    }
+}
+
 fn negotiate_offload(fd: std::os::fd::RawFd) -> Option<OffloadMode> {
+    // 1. Try FullUso: CSUM | TSO4 | TSO6 | USO4 | USO6 (Linux 6.2+)
     // SAFETY: `fd` is a valid open /dev/net/tun fd on which TUNSETIFF (with IFF_VNET_HDR)
     // just succeeded. TUNSETOFFLOAD takes its flags as an integer argument passed by value.
-    let full = unsafe {
+    let full_uso = unsafe {
+        libc::ioctl(
+            fd,
+            TUNSETOFFLOAD as IoctlReq,
+            libc::c_ulong::from(TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6 | TUN_F_USO4 | TUN_F_USO6),
+        )
+    };
+    if full_uso == 0 {
+        return Some(OffloadMode::FullUso);
+    }
+
+    // 2. Fall back to FullTso: CSUM | TSO4 | TSO6 (Linux 3.x - 6.1)
+    // SAFETY: same rationale as the previous TUNSETOFFLOAD call.
+    let full_tso = unsafe {
         libc::ioctl(
             fd,
             TUNSETOFFLOAD as IoctlReq,
             libc::c_ulong::from(TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6),
         )
     };
-    if full == 0 {
-        return Some(OffloadMode::Full);
+    if full_tso == 0 {
+        return Some(OffloadMode::FullTso);
     }
 
+    // 3. Fall back to CsumOnly: CSUM
     // SAFETY: same rationale as the previous TUNSETOFFLOAD call.
     let csum_only = unsafe {
         libc::ioctl(
@@ -102,7 +130,10 @@ fn negotiate_offload(fd: std::os::fd::RawFd) -> Option<OffloadMode> {
 
 fn apply_offload(fd: std::os::fd::RawFd, mode: OffloadMode) -> Result<(), DeviceError> {
     let flags = match mode {
-        OffloadMode::Full => libc::c_ulong::from(TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6),
+        OffloadMode::FullUso => {
+            libc::c_ulong::from(TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6 | TUN_F_USO4 | TUN_F_USO6)
+        }
+        OffloadMode::FullTso => libc::c_ulong::from(TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6),
         OffloadMode::CsumOnly => libc::c_ulong::from(TUN_F_CSUM),
     };
     // SAFETY: `fd` is a valid open /dev/net/tun fd. TUNSETOFFLOAD takes its flags as an integer passed by value.
@@ -234,6 +265,8 @@ pub struct TunTap {
     /// `Some(VNET_HDR_LEN)` iff `IFF_VNET_HDR` framing + kernel GSO/GRO
     /// offload are both active on this fd; `None` for a plain device.
     vnet_hdr_len: Option<usize>,
+    /// The negotiated kernel offload mode (`Some`), or `None` if plain device.
+    offload_mode: Option<OffloadMode>,
 }
 
 impl TunTap {
@@ -351,7 +384,7 @@ impl TunTap {
             )
         };
 
-        if let Some(_mode) = negotiate_offload(file.as_raw_fd()) {
+        if let Some(mode) = negotiate_offload(file.as_raw_fd()) {
             bring_up(&req.name)?;
             let actual_name = decode_ifname(&req.name)?;
             return Ok(Some(TunTap {
@@ -359,6 +392,7 @@ impl TunTap {
                 kind,
                 name: actual_name,
                 vnet_hdr_len: Some(VNET_HDR_LEN),
+                offload_mode: Some(mode),
             }));
         }
 
@@ -402,6 +436,7 @@ impl TunTap {
             kind,
             name: actual_name,
             vnet_hdr_len: None,
+            offload_mode: None,
         })
     }
 
@@ -454,6 +489,7 @@ impl TunTap {
             kind,
             name: actual_name.clone(),
             vnet_hdr_len: Some(VNET_HDR_LEN),
+            offload_mode: Some(offload_mode),
         };
         q0.set_nonblocking()?;
 
@@ -495,6 +531,7 @@ impl TunTap {
                 kind,
                 name: actual_name.clone(),
                 vnet_hdr_len: Some(VNET_HDR_LEN),
+                offload_mode: Some(offload_mode),
             };
             q.set_nonblocking()?;
             queues.push(q);
@@ -537,6 +574,7 @@ impl TunTap {
             kind,
             name: actual_name.clone(),
             vnet_hdr_len: None,
+            offload_mode: None,
         };
         q0.set_nonblocking()?;
 
@@ -566,6 +604,7 @@ impl TunTap {
                 kind,
                 name: actual_name.clone(),
                 vnet_hdr_len: None,
+                offload_mode: None,
             };
             q.set_nonblocking()?;
             queues.push(q);
@@ -584,6 +623,18 @@ impl TunTap {
     /// (see [`TunTap::create`]'s `want_vnet_hdr` parameter).
     pub fn vnet_hdr_len(&self) -> Option<usize> {
         self.vnet_hdr_len
+    }
+
+    /// Return the negotiated kernel offload mode, or `None` if running without offload.
+    #[inline]
+    pub fn offload_mode(&self) -> Option<OffloadMode> {
+        self.offload_mode
+    }
+
+    /// Whether UDP Generic Segmentation Offload (`GSO_UDP_L4` / `USO`) was negotiated.
+    #[inline]
+    pub fn has_uso(&self) -> bool {
+        self.offload_mode.is_some_and(|m| m.has_uso())
     }
 
     /// Return the raw file descriptor for this TUN/TAP device.
@@ -805,6 +856,7 @@ mod tests {
             kind: DeviceKind::Tun,
             name: "x".repeat(libc::IFNAMSIZ),
             vnet_hdr_len: None,
+            offload_mode: None,
         };
         assert!(matches!(dev.set_mtu(1500), Err(DeviceError::NameTooLong)));
     }
@@ -824,6 +876,7 @@ mod tests {
             kind: DeviceKind::Tun,
             name: "nonexistent0".to_owned(),
             vnet_hdr_len: None,
+            offload_mode: None,
         };
         assert!(matches!(dev.set_mtu(1500), Err(DeviceError::Io(_))));
     }
