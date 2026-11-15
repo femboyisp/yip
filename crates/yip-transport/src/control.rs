@@ -142,12 +142,7 @@ impl AdaptiveController {
                 target = (target + 0.05).min(1.0);
             }
 
-            if target > self.ratio {
-                self.ratio = target.max(self.min_ratio);
-            } else {
-                let decayed = (self.ratio * 0.95).max(target).max(self.min_ratio);
-                self.ratio = decayed;
-            }
+            self.ratio = (self.ratio * 0.95).max(target).max(self.min_ratio);
         }
     }
 

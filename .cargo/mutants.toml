@@ -249,12 +249,15 @@
 #     In `Coalescer::push`, `(TCP_FLAG_PSH | TCP_FLAG_FIN | TCP_FLAG_RST | TCP_FLAG_URG)` combines 4 mutually disjoint
 #     single-bit flag constants (0x01, 0x04, 0x08, 0x20). For disjoint bitmasks, bitwise OR and bitwise XOR are
 #     mathematically identical (`0x01 | 0x04 | 0x08 | 0x20 == 0x01 ^ 0x04 ^ 0x08 ^ 0x20 == 0x2D`).
-# 39. AdaptiveController target boundary equality equivalence:
-#     In `observe_loss`, when `target == self.ratio`, the `if target > self.ratio` branch assigns `self.ratio = target`,
-#     while the `else` branch evaluates `(self.ratio * 0.95).max(target)` which also yields `target` since `0.95 * ratio < ratio`.
-#     Mutating `>` to `>=` produces identical state assignments for all inputs.
+# 39. clamp_tcp_mss boundary condition equivalences:
+#     - `data_offset < 20`: when `data_offset == 20`, options range `tcp_start + 20 .. tcp_start + data_offset` is
+#       empty (0 bytes). The options loop runs 0 iterations and returns `false`. Mutating `< 20` to `<= 20` or `== 20`
+#       evaluates to `false` at line 81 instead of line 125, producing identical `false` return value and zero state modification.
+#     - `opt_idx >= opt_end`: `opt_idx` begins at `opt_start <= opt_end` and increments strictly by `1` or `len <= remaining`,
+#       so `opt_idx` is never strictly greater than `opt_end`. Mutating `>=` to `==` is mathematically identical.
 exclude_re = [
-    "crates/yip-transport/src/control\\.rs:.*replace > with >= in AdaptiveController::observe_loss",
+    "crates/yip-transport/src/pmtu\\.rs:.*replace < with (<=|==) in clamp_tcp_mss",
+    "crates/yip-transport/src/pmtu\\.rs:.*replace >= with == in clamp_tcp_mss",
     "replace \\| with \\^ in Coalescer::push",
     "crates/yip-io/src/tun_offload\\.rs:193:.*in parse_ipv6_tcp",
     "crates/yip-io/src/tun_offload\\.rs:.*delete field gso_type from struct VnetHdr expression in Coalescer::start_singleton",

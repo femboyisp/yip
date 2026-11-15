@@ -55,59 +55,30 @@ pub fn is_tcp_syn(pkt: &[u8]) -> bool {
 ///
 /// Returns `true` if the packet was modified, `false` otherwise.
 pub fn clamp_tcp_mss(pkt: &mut [u8], max_mss: u16) -> bool {
-    if pkt.is_empty() {
+    if !is_tcp_syn(pkt) {
         return false;
     }
 
     let version = pkt[0] >> 4;
     let (tcp_start, tcp_end) = if version == 4 {
-        if pkt.len() <= /* ~ changed by cargo-mutants ~ */ 20 {
-            return false;
-        }
         let ihl = usize::from(pkt[0] & 0x0F) * 4;
-        if ihl < 20 || pkt.len() < ihl {
-            return false;
-        }
-        if pkt[9] != 6 {
-            // Not TCP
-            return false;
-        }
         let total_len = usize::from(u16::from_be_bytes([pkt[2], pkt[3]]));
-        if pkt.len() < total_len || total_len < ihl + 20 {
+        if pkt.len() < total_len {
             return false;
         }
         (ihl, total_len)
-    } else if version == 6 {
-        if pkt.len() < 40 {
-            return false;
-        }
-        if pkt[6] != 6 {
-            // Not TCP
-            return false;
-        }
+    } else {
         let payload_len = usize::from(u16::from_be_bytes([pkt[4], pkt[5]]));
         let total_len = 40 + payload_len;
-        if pkt.len() < total_len || payload_len < 20 {
+        if pkt.len() < total_len {
             return false;
         }
         (40, total_len)
-    } else {
-        return false;
     };
 
-    let tcp_len = tcp_end - tcp_start;
-    if tcp_len < 20 {
-        return false;
-    }
-
+    let tcp_len = tcp_end.saturating_sub(tcp_start);
     let data_offset = usize::from(pkt[tcp_start + 12] >> 4) * 4;
     if data_offset < 20 || data_offset > tcp_len {
-        return false;
-    }
-
-    // Flags byte is at tcp_start + 13. Check if SYN bit (0x02) is set.
-    let flags = pkt[tcp_start + 13];
-    if (flags & 0x02) == 0 {
         return false;
     }
 
@@ -115,8 +86,12 @@ pub fn clamp_tcp_mss(pkt: &mut [u8], max_mss: u16) -> bool {
     let opt_end = tcp_start + data_offset;
     let mut opt_idx = opt_start;
     let mut clamped = false;
+    let max_iterations = opt_end.saturating_sub(opt_idx).min(40);
 
-    while opt_idx < opt_end {
+    for _ in 0..max_iterations {
+        if opt_idx >= opt_end {
+            break;
+        }
         let kind = pkt[opt_idx];
         if kind == 0 {
             // End of options list
@@ -125,11 +100,12 @@ pub fn clamp_tcp_mss(pkt: &mut [u8], max_mss: u16) -> bool {
             // NOP padding
             opt_idx += 1;
         } else {
-            if opt_idx + 1 >= opt_end {
+            let remaining = opt_end - opt_idx;
+            if remaining < 2 {
                 break;
             }
             let len = usize::from(pkt[opt_idx + 1]);
-            if len < 2 || opt_idx + len > opt_end {
+            if len < 2 || len > remaining {
                 break;
             }
             if kind == 2 && len == 4 {
@@ -400,6 +376,13 @@ mod tests {
         assert!(clamped);
         assert_eq!(u16::from_be_bytes([pkt[62], pkt[63]]), 1360);
 
+        // IPv6 SYN with trailing buffer padding (pkt.len() > total_len)
+        let mut padded_v6 = pkt.clone();
+        padded_v6.resize(80, 0); // pkt.len() = 80 > total_len = 64
+        padded_v6[62..64].copy_from_slice(&(1440u16).to_be_bytes());
+        assert!(clamp_tcp_mss_for_mtu(&mut padded_v6, 1420));
+        assert_eq!(u16::from_be_bytes([padded_v6[62], padded_v6[63]]), 1360);
+
         // IPv6 non-SYN packet must return false
         pkt[53] = 0x10; // ACK only
         assert!(!is_tcp_syn(&pkt));
@@ -408,10 +391,19 @@ mod tests {
     #[test]
     fn test_is_tcp_syn_ipv4_options_and_truncation() {
         // IPv4 with IHL = 6 (24B IPv4 header) but total length only 42B (< 24 + 20 = 44B)
+        // Set SYN bit at offset 24 + 13 = 37 to ensure mutant (+ replaced with -) is caught.
         let mut short_pkt = vec![0u8; 42];
         short_pkt[0] = 0x46; // IHL = 6 (24B)
         short_pkt[9] = 6; // TCP
+        short_pkt[37] = 0x02; // SYN bit
         assert!(!is_tcp_syn(&short_pkt));
+
+        // IPv4 with invalid IHL = 4 (16B < 20B) with SYN bit at 16 + 13 = 29
+        let mut bad_ihl = vec![0u8; 40];
+        bad_ihl[0] = 0x44; // IHL = 4 (16B)
+        bad_ihl[9] = 6; // TCP
+        bad_ihl[29] = 0x02; // SYN bit
+        assert!(!is_tcp_syn(&bad_ihl));
 
         // IPv4 with IHL = 6 and full TCP header with SYN
         let mut full_pkt = vec![0u8; 48];
@@ -521,17 +513,52 @@ mod tests {
         pkt[43] = 1;
         assert!(!clamp_tcp_mss(&mut pkt, 1300));
 
+        // Corrupted option with len < 2 followed by a subsequent MSS option:
+        // Unmutated code must break immediately and NOT process subsequent options.
+        // A mutant replacing `||` with `&&` would continue and clamp the subsequent MSS.
+        let mut pkt_corrupt_len = craft_ipv4_tcp_syn(1460);
+        pkt_corrupt_len.resize(52, 0);
+        pkt_corrupt_len[2..4].copy_from_slice(&(52u16).to_be_bytes());
+        pkt_corrupt_len[32] = 0x80; // 32B TCP -> opt_end is 52
+        pkt_corrupt_len[40] = 3; // Window Scale
+        pkt_corrupt_len[41] = 1; // Corrupted len = 1 (< 2)
+        pkt_corrupt_len[42] = 2; // Followed by MSS
+        pkt_corrupt_len[43] = 4;
+        pkt_corrupt_len[44..46].copy_from_slice(&(1460u16).to_be_bytes());
+        assert!(!clamp_tcp_mss(&mut pkt_corrupt_len, 1380));
+
         // Option with len overflowing opt_end
         pkt[43] = 20;
         assert!(!clamp_tcp_mss(&mut pkt, 1300));
 
         // Truncated option header at boundary: opt_idx + 1 >= opt_end
-        pkt[42] = 2;
-        pkt[32] = 0x60; // 24B TCP -> opt_end is 44
-        pkt[43] = 4; // But opt_end ends at 44 so opt_idx+1 >= opt_end
-        pkt.truncate(44);
-        pkt[2..4].copy_from_slice(&(44u16).to_be_bytes());
-        assert!(!clamp_tcp_mss(&mut pkt, 1300));
+        // Place Kind=2 at opt_end - 1 with NO space for length byte.
+        // Also put a fake MSS option right after opt_end to catch mutants that fail to break!
+        let mut truncated_opt = craft_ipv4_tcp_syn(1460);
+        truncated_opt.resize(48, 0);
+        truncated_opt[2..4].copy_from_slice(&(48u16).to_be_bytes());
+        truncated_opt[32] = 0x60; // 24B TCP -> opt_end is 44
+        truncated_opt[40] = 1; // NOP
+        truncated_opt[41] = 1; // NOP
+        truncated_opt[42] = 1; // NOP
+        truncated_opt[43] = 2; // Kind = 2 (MSS) at opt_end - 1 (offset 43)
+        truncated_opt[44] = 4; // Fake length byte at opt_end
+        truncated_opt[45..47].copy_from_slice(&(1460u16).to_be_bytes()); // Fake MSS past opt_end
+        assert!(!clamp_tcp_mss(&mut truncated_opt, 1380));
+
+        // Length < 2 boundary: test len = 2 does not break when followed by MSS
+        let mut pkt_len2 = craft_ipv4_tcp_syn(1460);
+        pkt_len2.resize(52, 0);
+        pkt_len2[2..4].copy_from_slice(&(52u16).to_be_bytes());
+        pkt_len2[32] = 0x80; // 32B TCP -> opt_end is 52
+        pkt_len2[40] = 4; // Option kind 4 (SACK permitted)
+        pkt_len2[41] = 2; // len = 2 (valid length for kind 4)
+        pkt_len2[42] = 2; // Kind = 2 (MSS)
+        pkt_len2[43] = 4; // Len = 4
+        pkt_len2[44..46].copy_from_slice(&(1460u16).to_be_bytes());
+        pkt_len2[46] = 0; // End of options
+        assert!(clamp_tcp_mss(&mut pkt_len2, 1380));
+        assert_eq!(u16::from_be_bytes([pkt_len2[44], pkt_len2[45]]), 1380);
 
         // Multi-option: Kind 3 (Window Scale, len 3) + NOP + MSS
         let mut pkt2 = craft_ipv4_tcp_syn(1460);
@@ -571,28 +598,46 @@ mod tests {
         short_ihl.truncate(24);
         assert!(!clamp_tcp_mss(&mut short_ihl, 1380));
 
-        // IPv4 pkt.len() < total_len
+        // IPv4 pkt.len() < total_len (boundary: pkt.len() == total_len - 1)
         let mut short_total = craft_ipv4_tcp_syn(1460);
-        short_total[2..4].copy_from_slice(&(60u16).to_be_bytes());
+        short_total[2..4].copy_from_slice(&(45u16).to_be_bytes()); // total_len = 45 > 44
         assert!(!clamp_tcp_mss(&mut short_total, 1380));
 
-        // IPv4 total_len < ihl + 20
+        // IPv4 total_len < ihl + 20 (boundary: total_len = 39 < 40)
         let mut short_ip_tcp = craft_ipv4_tcp_syn(1460);
-        short_ip_tcp[2..4].copy_from_slice(&(35u16).to_be_bytes());
+        short_ip_tcp[2..4].copy_from_slice(&(39u16).to_be_bytes());
         assert!(!clamp_tcp_mss(&mut short_ip_tcp, 1380));
 
-        // IPv6 payload_len < 20
-        let mut bad_v6 = vec![0u8; 60];
+        // IPv4 total_len == ihl + 20 (boundary: exactly 40B, valid but no options)
+        let mut no_opt_tcp = craft_ipv4_tcp_syn(1460);
+        no_opt_tcp.truncate(40);
+        no_opt_tcp[2..4].copy_from_slice(&(40u16).to_be_bytes());
+        no_opt_tcp[32] = 0x50; // 20B TCP
+        assert!(!clamp_tcp_mss(&mut no_opt_tcp, 1380));
+
+        // IPv6 payload_len < 20 (boundary: payload_len = 19 < 20)
+        let mut bad_v6 = vec![0u8; 64];
         bad_v6[0] = 0x60;
         bad_v6[6] = 6;
-        bad_v6[4..6].copy_from_slice(&(15u16).to_be_bytes());
+        bad_v6[4..6].copy_from_slice(&(19u16).to_be_bytes());
+        bad_v6[40 + 13] = 0x02; // SYN
         assert!(!clamp_tcp_mss(&mut bad_v6, 1380));
 
-        // IPv6 pkt.len() < 40 + payload_len
-        let mut short_v6 = vec![0u8; 50];
+        // IPv6 payload_len == 20 (boundary: valid 20B TCP header, no options)
+        let mut no_opt_v6 = vec![0u8; 60];
+        no_opt_v6[0] = 0x60;
+        no_opt_v6[6] = 6;
+        no_opt_v6[4..6].copy_from_slice(&(20u16).to_be_bytes());
+        no_opt_v6[40 + 12] = 0x50; // 20B TCP
+        no_opt_v6[40 + 13] = 0x02; // SYN
+        assert!(!clamp_tcp_mss(&mut no_opt_v6, 1380));
+
+        // IPv6 pkt.len() < 40 + payload_len (boundary: pkt.len() == total_len - 1)
+        let mut short_v6 = vec![0u8; 63];
         short_v6[0] = 0x60;
         short_v6[6] = 6;
-        short_v6[4..6].copy_from_slice(&(30u16).to_be_bytes());
+        short_v6[4..6].copy_from_slice(&(24u16).to_be_bytes()); // total_len = 64 > 63
+        short_v6[40 + 13] = 0x02; // SYN
         assert!(!clamp_tcp_mss(&mut short_v6, 1380));
 
         // TCP data_offset < 20
@@ -603,6 +648,7 @@ mod tests {
         // TCP data_offset > tcp_len
         let mut over_offset = craft_ipv4_tcp_syn(1460);
         over_offset[32] = 0x80; // 32B > 24B tcp_len
+        assert!(!clamp_tcp_mss(&mut over_offset, 1380));
         assert!(!clamp_tcp_mss(&mut over_offset, 1380));
     }
 }
