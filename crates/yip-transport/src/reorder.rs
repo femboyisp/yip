@@ -33,6 +33,8 @@ const EMPTY_FLOW_KEY: FlowKey = FlowKey {
 pub struct ReorderSlot {
     /// Starting TCP sequence number of the buffered packet.
     pub seq: u32,
+    /// TCP sequence length (payload len + SYN/FIN) for sequence tracking.
+    pub seg_len: u32,
     /// Total packet length stored in `data`.
     pub len: u16,
     /// Whether this slot currently holds a valid packet.
@@ -45,6 +47,7 @@ impl ReorderSlot {
     pub const fn new() -> Self {
         Self {
             seq: 0,
+            seg_len: 0,
             len: 0,
             valid: false,
             data: [0u8; MAX_SLOT_PACKET_LEN],
@@ -248,16 +251,6 @@ fn parse_tcp(packet: &[u8], l2: bool) -> Option<ParsedTcp> {
     })
 }
 
-fn extract_seg_len(packet: &[u8]) -> u32 {
-    if let Some(parsed) = parse_tcp(packet, false) {
-        parsed.seg_len
-    } else if let Some(parsed) = parse_tcp(packet, true) {
-        parsed.seg_len
-    } else {
-        1
-    }
-}
-
 fn drain_contiguous_slots<F>(flow: &mut FlowReorderState, emit: &mut F)
 where
     F: FnMut(&[u8]),
@@ -268,7 +261,7 @@ where
         .position(|slot| slot.valid && slot.seq == flow.expected_seq)
     {
         let slot = &mut flow.slots[idx];
-        let seg_len = extract_seg_len(&slot.data[..slot.len as usize]);
+        let seg_len = slot.seg_len;
         emit(&slot.data[..slot.len as usize]);
         flow.expected_seq = slot.seq.wrapping_add(seg_len);
         slot.valid = false;
@@ -332,7 +325,7 @@ impl ReorderBuffer {
         let mut flushed = 0;
         for &idx in &indices[..count] {
             let slot = &mut flow.slots[idx];
-            let seg_len = extract_seg_len(&slot.data[..slot.len as usize]);
+            let seg_len = slot.seg_len;
             emit(&slot.data[..slot.len as usize]);
             let slot_end = slot.seq.wrapping_add(seg_len);
             if seq_after(slot_end, flow.expected_seq) {
@@ -489,6 +482,7 @@ impl ReorderBuffer {
                     if packet.len() <= MAX_SLOT_PACKET_LEN {
                         let slot = &mut flow.slots[0];
                         slot.seq = parsed.seq;
+                        slot.seg_len = parsed.seg_len;
                         slot.len = packet.len() as u16;
                         slot.valid = true;
                         slot.data[..packet.len()].copy_from_slice(packet);
@@ -518,6 +512,7 @@ impl ReorderBuffer {
                 for slot in flow.slots.iter_mut() {
                     if !slot.valid {
                         slot.seq = parsed.seq;
+                        slot.seg_len = parsed.seg_len;
                         slot.len = packet.len() as u16;
                         slot.valid = true;
                         slot.data[..packet.len()].copy_from_slice(packet);
