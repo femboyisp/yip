@@ -213,6 +213,9 @@ fn write_to_tun(
     vnet_hdr: bool,
     coalescer: &mut crate::tun_offload::Coalescer,
 ) {
+    if inner.is_empty() {
+        return;
+    }
     if vnet_hdr {
         if let Some(frame) = coalescer.push(inner) {
             send_to_tun(tun_fd, frame);
@@ -480,6 +483,9 @@ pub fn flush_tx(
 /// tear down the tunnel.
 #[inline]
 fn send_to_tun(tun_fd: RawFd, buf: &[u8]) {
+    if buf.is_empty() {
+        return;
+    }
     // SAFETY: `buf` is a valid slice and `tun_fd` is a valid TUN fd.
     // `write` writes at most `buf.len()` bytes from `buf`; partial writes
     // are unusual on TUN devices (atomic for MTU-sized frames) but we do
@@ -1542,5 +1548,55 @@ mod tests {
             gso.runs.is_empty(),
             "gso.runs must not be populated when GSO is disabled"
         );
+    }
+
+    #[test]
+    fn write_to_tun_and_send_to_tun_pipe() {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is a valid 2-element integer buffer passed to `pipe`.
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "pipe creation succeeds");
+        let (rd, wr) = (fds[0], fds[1]);
+        // SAFETY: `rd` is a valid open file descriptor returned by `libc::pipe`.
+        unsafe {
+            let flags = libc::fcntl(rd, libc::F_GETFL);
+            libc::fcntl(rd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        // 1. send_to_tun with empty slice writes nothing
+        send_to_tun(wr, &[]);
+        let mut buf = [0u8; 64];
+        // SAFETY: `rd` is open and `buf` is a valid mutable slice.
+        let n = unsafe { libc::read(rd, buf.as_mut_ptr().cast(), buf.len()) };
+        assert!(n < 0, "read on nonblocking empty pipe should fail");
+
+        // 2. send_to_tun with data writes data
+        let payload = b"hello tun test";
+        send_to_tun(wr, payload);
+        // SAFETY: `rd` is open and `buf` is a valid mutable slice.
+        let n = unsafe { libc::read(rd, buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(n, payload.len() as isize);
+        assert_eq!(&buf[..payload.len()], payload);
+
+        // 3. write_to_tun with empty slice writes nothing
+        let mut coalescer = crate::tun_offload::Coalescer::new(false);
+        write_to_tun(wr, &[], false, &mut coalescer);
+        // SAFETY: `rd` is open and `buf` is a valid mutable slice.
+        let n = unsafe { libc::read(rd, buf.as_mut_ptr().cast(), buf.len()) };
+        assert!(n < 0);
+
+        // 4. write_to_tun with data (vnet_hdr = false) writes directly
+        let direct = b"direct packet";
+        write_to_tun(wr, direct, false, &mut coalescer);
+        // SAFETY: `rd` is open and `buf` is a valid mutable slice.
+        let n = unsafe { libc::read(rd, buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(n, direct.len() as isize);
+        assert_eq!(&buf[..direct.len()], direct);
+
+        // SAFETY: `rd` and `wr` are valid open file descriptors.
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
     }
 }

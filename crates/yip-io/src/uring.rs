@@ -551,6 +551,9 @@ impl UringDriver {
     }
 
     fn queue_tun_write(&mut self, frame: &[u8]) -> io::Result<()> {
+        if frame.is_empty() {
+            return Ok(());
+        }
         let slot_id = self.alloc_in_flight_slot_copy(frame, MAX_WIRE_DATAGRAM)?;
         self.send_kind[slot_id] = Some(SendKind::Tun);
         let (ptr, len_u32) = {
@@ -2020,6 +2023,48 @@ mod tests {
         );
 
         // SAFETY: these fds came from `pipe2` and are still open here.
+        unsafe {
+            libc::close(tun_rd);
+            libc::close(tun_wr);
+        }
+        drop(driver);
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    #[test]
+    fn uring_queue_tun_write_allocates_slot_and_empty_frame_noop() {
+        let _guard = URING_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sock = UdpSocket::bind("127.0.0.1:0").expect("bind idle udp");
+        let (tun_rd, tun_wr) = make_pipe().expect("make tun placeholder pipe");
+        let mut driver = match UringDriver::new(sock.as_raw_fd(), tun_rd) {
+            Ok(driver) => driver,
+            Err(_) => {
+                eprintln!(
+                    "SKIP uring_queue_tun_write_allocates_slot_and_empty_frame_noop: io_uring unavailable"
+                );
+                // SAFETY: `tun_rd` and `tun_wr` are open pipe file descriptors.
+                unsafe {
+                    libc::close(tun_rd);
+                    libc::close(tun_wr);
+                }
+                return;
+            }
+        };
+
+        assert_eq!(driver.in_flight_used_count(), 0);
+        // Empty frame is a no-op and does not allocate any in-flight slot
+        driver.queue_tun_write(&[]).expect("queue empty tun write");
+        assert_eq!(driver.in_flight_used_count(), 0);
+
+        // Non-empty frame allocates an in-flight slot
+        driver
+            .queue_tun_write(b"tun test packet")
+            .expect("queue non-empty tun write");
+        assert_eq!(driver.in_flight_used_count(), 1);
+
+        // SAFETY: `tun_rd` and `tun_wr` are open pipe file descriptors.
         unsafe {
             libc::close(tun_rd);
             libc::close(tun_wr);

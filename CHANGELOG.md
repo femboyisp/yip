@@ -6,6 +6,8 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Fixed
+- **Single-Segment TCP Packet GSO Type & Checksum Seeding in Coalescer (`crates/yip-io`).**
+  Fixed `EINVAL (os error 22)` on TUN device writes during iperf benchmarking caused by uncoalesced single TCP packets being emitted with GSO metadata. When `Coalescer` flushes an uncoalesced single TCP segment (`self.segs == 1`), it now emits `gso_type: GSO_NONE` with flags zeroed and leaves the original valid wire checksum byte-for-byte intact, matching the behavior of `PendingKind::Udp`. For multi-segment coalesced TCP runs (`self.segs > 1`), seeded the uncomplemented pseudo-header checksum (`tcp_pseudo_header_checksum`) at the TCP checksum field as required by virtio-net `F_NEEDS_CSUM`, and guarded `push`, `write_to_tun`, `send_to_tun`, and `queue_tun_write` against empty slices.
 - **Recycled FEC Repair Buffer Length Regression (`crates/yip-transport`).**
   Fixed a panic in `FecReassembler` (`range end index out of range for slice of length 0`) during high packet loss reassembly. Previously, `recycle_state` cleared inner repair buffer lengths to zero (`buf.clear()`), but `acquire_buffers` only resized up to `k` buffers when retrieving pooled vectors. If a subsequent object had smaller $K$ or popped from the tail of the pool, unresized zero-length buffers were popped into `repair_shards`, causing slice indexing panics on incoming repair symbols. All pooled repair buffers are now resized upon acquisition, and individual popped buffers are defensive-resized to `shard_len` before payload copies.
 - **Kernel-Module RAM Telemetry Representation (`crates/yip-bench`).**

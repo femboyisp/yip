@@ -500,8 +500,8 @@ pub(crate) fn ipv6_udp_checksum(pkt: &mut [u8]) {
 }
 
 /// Compute the uncomplemented 16-bit one's-complement pseudo-header checksum sum
-/// over IPv4/IPv6 source, destination, protocol 17 (UDP), and upper-layer UDP length.
-pub(crate) fn udp_pseudo_header_checksum(key: &FlowKey, udp_len: u16) -> u16 {
+/// over IPv4/IPv6 source, destination, protocol number (`proto`), and upper-layer length (`l4_len`).
+pub(crate) fn pseudo_header_checksum(key: &FlowKey, proto: u8, l4_len: u32) -> u16 {
     let mut sum: u32 = 0;
     match key {
         FlowKey::V4 { src, dst, .. } => {
@@ -509,8 +509,8 @@ pub(crate) fn udp_pseudo_header_checksum(key: &FlowKey, udp_len: u16) -> u16 {
             sum += u32::from(u16::from_be_bytes([src[2], src[3]]));
             sum += u32::from(u16::from_be_bytes([dst[0], dst[1]]));
             sum += u32::from(u16::from_be_bytes([dst[2], dst[3]]));
-            sum += 17u32;
-            sum += u32::from(udp_len);
+            sum += u32::from(proto);
+            sum += l4_len;
         }
         FlowKey::V6 { src, dst, .. } => {
             for i in (0..16).step_by(2) {
@@ -519,16 +519,23 @@ pub(crate) fn udp_pseudo_header_checksum(key: &FlowKey, udp_len: u16) -> u16 {
             for i in (0..16).step_by(2) {
                 sum += u32::from(u16::from_be_bytes([dst[i], dst[i + 1]]));
             }
-            let len32 = u32::from(udp_len);
-            sum += len32 >> 16;
-            sum += len32 & 0xFFFF;
-            sum += 17u32;
+            sum += l4_len >> 16;
+            sum += l4_len & 0xFFFF;
+            sum += u32::from(proto);
         }
     }
     while (sum >> 16) != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     u16::try_from(sum & 0xFFFF).expect("folded sum fits u16")
+}
+
+pub(crate) fn udp_pseudo_header_checksum(key: &FlowKey, udp_len: u16) -> u16 {
+    pseudo_header_checksum(key, 17, u32::from(udp_len))
+}
+
+pub(crate) fn tcp_pseudo_header_checksum(key: &FlowKey, tcp_len: u32) -> u16 {
+    pseudo_header_checksum(key, 6, tcp_len)
 }
 
 enum ParsedTcp<'a> {
@@ -976,37 +983,48 @@ impl Coalescer {
         }
         match self.kind {
             PendingKind::Tcp => {
-                let ip = VNET_HDR_LEN;
-                let l3_len = self.pending.len() - VNET_HDR_LEN;
-                match self.key {
-                    FlowKey::V4 { .. } => {
-                        let total = u16::try_from(l3_len).unwrap_or(u16::MAX);
-                        self.pending[ip + 2..ip + 4].copy_from_slice(&total.to_be_bytes());
-                        ipv4_checksum(&mut self.pending[ip..ip + self.ip_hdr_len]);
-                        let h = VnetHdr {
-                            flags: F_NEEDS_CSUM,
-                            gso_type: GSO_TCPV4,
-                            hdr_len: u16::try_from(self.l3_hdr_len).unwrap_or(0),
-                            gso_size: self.gso_size,
-                            csum_start: u16::try_from(self.ip_hdr_len).unwrap_or(0),
-                            csum_offset: 16,
-                        };
-                        write_vnet_hdr(&h, &mut self.pending[..VNET_HDR_LEN]);
-                    }
-                    FlowKey::V6 { .. } => {
-                        let ipv6_payload_len =
-                            u16::try_from(l3_len.saturating_sub(40)).unwrap_or(u16::MAX);
-                        self.pending[ip + 4..ip + 6]
-                            .copy_from_slice(&ipv6_payload_len.to_be_bytes());
-                        let h = VnetHdr {
-                            flags: F_NEEDS_CSUM,
-                            gso_type: GSO_TCPV6,
-                            hdr_len: u16::try_from(self.l3_hdr_len).unwrap_or(0),
-                            gso_size: self.gso_size,
-                            csum_start: 40,
-                            csum_offset: 16,
-                        };
-                        write_vnet_hdr(&h, &mut self.pending[..VNET_HDR_LEN]);
+                if self.segs == 1 {
+                    let h = VnetHdr::default();
+                    write_vnet_hdr(&h, &mut self.pending[..VNET_HDR_LEN]);
+                } else {
+                    let ip = VNET_HDR_LEN;
+                    let l3_len = self.pending.len() - VNET_HDR_LEN;
+                    let tcp_len =
+                        u32::try_from(l3_len.saturating_sub(self.ip_hdr_len)).unwrap_or(u32::MAX);
+                    let csum = tcp_pseudo_header_checksum(&self.key, tcp_len);
+                    let tcp_off = ip + self.ip_hdr_len;
+                    self.pending[tcp_off + 16..tcp_off + 18].copy_from_slice(&csum.to_be_bytes());
+
+                    match self.key {
+                        FlowKey::V4 { .. } => {
+                            let total = u16::try_from(l3_len).unwrap_or(u16::MAX);
+                            self.pending[ip + 2..ip + 4].copy_from_slice(&total.to_be_bytes());
+                            ipv4_checksum(&mut self.pending[ip..ip + self.ip_hdr_len]);
+                            let h = VnetHdr {
+                                flags: F_NEEDS_CSUM,
+                                gso_type: GSO_TCPV4,
+                                hdr_len: u16::try_from(self.l3_hdr_len).unwrap_or(0),
+                                gso_size: self.gso_size,
+                                csum_start: u16::try_from(self.ip_hdr_len).unwrap_or(0),
+                                csum_offset: 16,
+                            };
+                            write_vnet_hdr(&h, &mut self.pending[..VNET_HDR_LEN]);
+                        }
+                        FlowKey::V6 { .. } => {
+                            let ipv6_payload_len =
+                                u16::try_from(l3_len.saturating_sub(40)).unwrap_or(u16::MAX);
+                            self.pending[ip + 4..ip + 6]
+                                .copy_from_slice(&ipv6_payload_len.to_be_bytes());
+                            let h = VnetHdr {
+                                flags: F_NEEDS_CSUM,
+                                gso_type: GSO_TCPV6,
+                                hdr_len: u16::try_from(self.l3_hdr_len).unwrap_or(0),
+                                gso_size: self.gso_size,
+                                csum_start: 40,
+                                csum_offset: 16,
+                            };
+                            write_vnet_hdr(&h, &mut self.pending[..VNET_HDR_LEN]);
+                        }
                     }
                 }
             }
@@ -1014,10 +1032,7 @@ impl Coalescer {
                 let ip = VNET_HDR_LEN;
                 let l3_len = self.pending.len() - VNET_HDR_LEN;
                 if self.segs == 1 {
-                    let h = VnetHdr {
-                        gso_type: GSO_NONE,
-                        ..VnetHdr::default()
-                    };
+                    let h = VnetHdr::default();
                     write_vnet_hdr(&h, &mut self.pending[..VNET_HDR_LEN]);
                 } else {
                     let udp_len =
@@ -1125,6 +1140,9 @@ impl Coalescer {
     }
 
     pub fn push(&mut self, pkt: &[u8]) -> Option<&[u8]> {
+        if pkt.is_empty() {
+            return None;
+        }
         let parsed = parse_ip_packet(pkt);
         // Can this packet extend the current pending run?
         if self.has_pending && !self.sealed {
@@ -2199,17 +2217,104 @@ mod tests {
 
     #[test]
     fn flushes_on_ip_version_change() {
-        let v4_a = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 0, 0, &[0xAA; 100]);
+        let v4_a1 = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 0, 0, &[0xAA; 100]);
+        let v4_a2 = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 100, 0, &[0xAA; 100]);
         let src_v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         let dst_v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
-        let v6_a = mk_ipv6_tcp(src_v6, dst_v6, 9, 80, 0, 0, &[0xBB; 100]);
-        let v4_b = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 100, 0, &[0xCC; 100]);
+        let v6_a1 = mk_ipv6_tcp(src_v6, dst_v6, 9, 80, 0, 0, &[0xBB; 100]);
+        let v6_a2 = mk_ipv6_tcp(src_v6, dst_v6, 9, 80, 100, 0, &[0xBB; 100]);
+        let v4_b1 = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 200, 0, &[0xCC; 100]);
+        let v4_b2 = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 300, 0, &[0xCC; 100]);
 
-        let out = run_coalescer(&[v4_a, v6_a, v4_b]);
+        let out = run_coalescer(&[v4_a1, v4_a2, v6_a1, v6_a2, v4_b1, v4_b2]);
         assert_eq!(out.len(), 3, "IPv4 and IPv6 flows must never coalesce");
         assert_eq!(read_vnet_hdr(&out[0]).unwrap().gso_type, GSO_TCPV4);
         assert_eq!(read_vnet_hdr(&out[1]).unwrap().gso_type, GSO_TCPV6);
         assert_eq!(read_vnet_hdr(&out[2]).unwrap().gso_type, GSO_TCPV4);
+    }
+
+    #[test]
+    fn test_coalescer_tcp_single_segment_emitted_as_gso_none_with_intact_checksum() {
+        let p_v4 = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 0, 0, &[0x42; 500]);
+        let out_v4 = run_coalescer(std::slice::from_ref(&p_v4));
+        assert_eq!(out_v4.len(), 1);
+        let h_v4 = read_vnet_hdr(&out_v4[0]).unwrap();
+        assert_eq!(h_v4.gso_type, GSO_NONE);
+        assert_eq!(h_v4.gso_size, 0);
+        assert_eq!(h_v4.flags, 0);
+        assert_eq!(&out_v4[0][VNET_HDR_LEN..], &p_v4[..]);
+
+        let src_v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst_v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let p_v6 = mk_ipv6_tcp(src_v6, dst_v6, 9, 80, 0, 0, &[0x99; 500]);
+        let out_v6 = run_coalescer(std::slice::from_ref(&p_v6));
+        assert_eq!(out_v6.len(), 1);
+        let h_v6 = read_vnet_hdr(&out_v6[0]).unwrap();
+        assert_eq!(h_v6.gso_type, GSO_NONE);
+        assert_eq!(h_v6.gso_size, 0);
+        assert_eq!(h_v6.flags, 0);
+        assert_eq!(&out_v6[0][VNET_HDR_LEN..], &p_v6[..]);
+    }
+
+    #[test]
+    fn test_coalescer_tcp_pseudo_header_checksum_seeding() {
+        let p0 = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 0, 0, &[0xAA; 500]);
+        let p1 = mk_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, 500, 0, &[0xBB; 500]);
+        let out = run_coalescer(&[p0, p1]);
+        assert_eq!(out.len(), 1);
+        let h = read_vnet_hdr(&out[0]).unwrap();
+        assert_eq!(h.gso_type, GSO_TCPV4);
+        assert_eq!(h.flags, F_NEEDS_CSUM);
+        let body = &out[0][VNET_HDR_LEN..];
+        let sum: u32 = body[..20]
+            .chunks(2)
+            .map(|c| u32::from(u16::from_be_bytes([c[0], c[1]])))
+            .sum();
+        let folded = u16::try_from((sum & 0xFFFF) + (sum >> 16)).expect("folded sum fits u16");
+        assert_eq!(folded, 0xFFFF);
+
+        let tcp_len = 20 + 1000;
+        let expected_pseudo = tcp_pseudo_header_checksum(
+            &FlowKey::V4 {
+                src: [10, 0, 0, 1],
+                dst: [10, 0, 0, 2],
+                sport: 9,
+                dport: 80,
+            },
+            tcp_len,
+        );
+        let seeded = u16::from_be_bytes([body[20 + 16], body[20 + 17]]);
+        assert_eq!(seeded, expected_pseudo);
+    }
+
+    #[test]
+    fn test_pseudo_header_checksum_known_vectors() {
+        let v4_key = FlowKey::V4 {
+            src: [10, 0, 0, 1],
+            dst: [10, 0, 0, 2],
+            sport: 9,
+            dport: 80,
+        };
+        assert_eq!(pseudo_header_checksum(&v4_key, 6, 1000), 0x17f1);
+        assert_eq!(tcp_pseudo_header_checksum(&v4_key, 1000), 0x17f1);
+
+        let src_v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst_v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let v6_key = FlowKey::V6 {
+            src: src_v6,
+            dst: dst_v6,
+            sport: 9,
+            dport: 80,
+        };
+        assert_eq!(pseudo_header_checksum(&v6_key, 6, 70000), 0x6cec);
+        assert_eq!(tcp_pseudo_header_checksum(&v6_key, 70000), 0x6cec);
+    }
+
+    #[test]
+    fn test_coalescer_push_empty_slice_returns_none() {
+        let mut c = Coalescer::new(false);
+        assert!(c.push(&[]).is_none());
+        assert!(c.flush().is_none());
     }
 
     #[test]
