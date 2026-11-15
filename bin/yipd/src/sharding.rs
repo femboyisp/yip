@@ -443,34 +443,25 @@ pub(crate) fn select_egress_socket<'a>(
     chosen
 }
 
-fn write_tun(
-    tun_fd: std::os::fd::RawFd,
-    inner: &[u8],
-    vnet_hdr: bool,
-    coalescer: &mut yip_io::tun_offload::Coalescer,
-) {
+fn write_tun(tun_fd: std::os::fd::RawFd, inner: &[u8], vnet_hdr: bool) {
     if vnet_hdr {
-        if let Some(frame) = coalescer.push(inner) {
-            if let Err(e) = yip_io::epoll::write_fd(tun_fd, frame) {
+        if inner.len() <= yip_io::MAX_WIRE_DATAGRAM {
+            let mut buf = [0u8; yip_device::VNET_HDR_LEN + yip_io::MAX_WIRE_DATAGRAM];
+            let end = yip_device::VNET_HDR_LEN + inner.len();
+            buf[yip_device::VNET_HDR_LEN..end].copy_from_slice(inner);
+            if let Err(e) = yip_io::epoll::write_fd(tun_fd, &buf[..end]) {
+                eprintln!("sharded: tun write error: {e}");
+            }
+        } else {
+            let mut buf = Vec::with_capacity(yip_device::VNET_HDR_LEN + inner.len());
+            buf.extend_from_slice(&[0u8; yip_device::VNET_HDR_LEN]);
+            buf.extend_from_slice(inner);
+            if let Err(e) = yip_io::epoll::write_fd(tun_fd, &buf) {
                 eprintln!("sharded: tun write error: {e}");
             }
         }
     } else if let Err(e) = yip_io::epoll::write_fd(tun_fd, inner) {
         eprintln!("sharded: tun write error: {e}");
-    }
-}
-
-fn flush_tun(
-    tun_fd: std::os::fd::RawFd,
-    vnet_hdr: bool,
-    coalescer: &mut yip_io::tun_offload::Coalescer,
-) {
-    if vnet_hdr {
-        if let Some(frame) = coalescer.flush() {
-            if let Err(e) = yip_io::epoll::write_fd(tun_fd, frame) {
-                eprintln!("sharded: tun write error: {e}");
-            }
-        }
     }
 }
 
@@ -734,8 +725,6 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                     };
                 let poller = yip_io::epoll::Epoll::new(sock_fd, tun_fd)?;
                 let vnet_len = tun_dev.vnet_hdr_len().unwrap_or(0);
-                let has_uso = tun_dev.has_uso();
-                let mut coalescer = yip_io::tun_offload::Coalescer::new(has_uso);
                 let is_tap = cfg.device_kind == crate::mode::TunnelMode::L2Tap;
                 let egress_pool: Vec<std::net::UdpSocket> = if std::env::var_os("YIP_EGRESS_POOL").is_some() {
                     let egress_bind = if cfg.listen.is_ipv6() {
@@ -876,7 +865,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                             let (tun_out, egress) =
                                                 owned_out(manager.on_udp(dg.src, payload, cached_now_ms));
                                             if let Some(inner) = tun_out {
-                                                write_tun(tun_fd, &inner, vnet_len > 0, &mut coalescer);
+                                                write_tun(tun_fd, &inner, vnet_len > 0);
                                             }
                                             if !egress.is_empty() {
                                                 let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
@@ -945,7 +934,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                             let (tun_out, egress) =
                                                 owned_out(manager.on_udp(cfg.listen, payload, cached_now_ms));
                                             if let Some(inner) = tun_out {
-                                                write_tun(tun_fd, &inner, vnet_len > 0, &mut coalescer);
+                                                write_tun(tun_fd, &inner, vnet_len > 0);
                                             }
                                             if !egress.is_empty() {
                                                 let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
@@ -969,7 +958,6 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                 }
                             }
                         }
-                        flush_tun(tun_fd, vnet_len > 0, &mut coalescer);
                     }
 
                     // 2. Drain local TUN queue fd
@@ -1128,7 +1116,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                     let (tun_out, egress) =
                                         owned_out(manager.on_udp(*src, bytes, cached_now_ms));
                                     if let Some(inner) = tun_out {
-                                        write_tun(tun_fd, &inner, vnet_len > 0, &mut coalescer);
+                                        write_tun(tun_fd, &inner, vnet_len > 0);
                                     }
                                     if !egress.is_empty() {
                                         let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
@@ -1149,7 +1137,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                     let (tun_out, egress) =
                                         owned_out(manager.on_udp(*src, bytes, cached_now_ms));
                                     if let Some(inner) = tun_out {
-                                        write_tun(tun_fd, &inner, vnet_len > 0, &mut coalescer);
+                                        write_tun(tun_fd, &inner, vnet_len > 0);
                                     }
                                     if !egress.is_empty() {
                                         let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
@@ -1168,7 +1156,6 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                 }
                             }
                         }
-                        flush_tun(tun_fd, vnet_len > 0, &mut coalescer);
                     }
 
                     if packets_this_iter > 0 {
