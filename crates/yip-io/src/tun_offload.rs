@@ -235,31 +235,10 @@ pub(crate) fn parse_ipv6_tcp(pkt: &[u8]) -> Option<Ipv6Tcp<'_>> {
 
 pub(crate) struct Ipv4Udp<'a> {
     pub ip_hdr_len: usize,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read by parse_ipv4_udp_extracts_fields and upcoming Coalescer task"
-        )
-    )]
     pub total_len: usize,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read by parse_ipv4_udp_extracts_fields and upcoming Coalescer task"
-        )
-    )]
     pub key: FlowKey,
     pub payload_off: usize,
     pub payload_len: usize,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read by parse_ipv4_udp_extracts_fields and upcoming Coalescer task"
-        )
-    )]
     pub bytes: &'a [u8],
 }
 
@@ -303,39 +282,11 @@ pub(crate) fn parse_ipv4_udp(pkt: &[u8]) -> Option<Ipv4Udp<'_>> {
 }
 
 pub(crate) struct Ipv6Udp<'a> {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read by parse_ipv6_udp_extracts_fields and upcoming Coalescer task"
-        )
-    )]
     pub ip_hdr_len: usize,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read by parse_ipv6_udp_extracts_fields and upcoming Coalescer task"
-        )
-    )]
     pub total_len: usize,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read by parse_ipv6_udp_extracts_fields and upcoming Coalescer task"
-        )
-    )]
     pub key: FlowKey,
     pub payload_off: usize,
     pub payload_len: usize,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read by parse_ipv6_udp_extracts_fields and upcoming Coalescer task"
-        )
-    )]
     pub bytes: &'a [u8],
 }
 
@@ -533,6 +484,38 @@ pub(crate) fn ipv6_udp_checksum(pkt: &mut [u8]) {
     pkt[udp_off + 6..udp_off + 8].copy_from_slice(&ck.to_be_bytes());
 }
 
+/// Compute the uncomplemented 16-bit one's-complement pseudo-header checksum sum
+/// over IPv4/IPv6 source, destination, protocol 17 (UDP), and upper-layer UDP length.
+pub(crate) fn udp_pseudo_header_checksum(key: &FlowKey, udp_len: u16) -> u16 {
+    let mut sum: u32 = 0;
+    match key {
+        FlowKey::V4 { src, dst, .. } => {
+            sum += u32::from(u16::from_be_bytes([src[0], src[1]]));
+            sum += u32::from(u16::from_be_bytes([src[2], src[3]]));
+            sum += u32::from(u16::from_be_bytes([dst[0], dst[1]]));
+            sum += u32::from(u16::from_be_bytes([dst[2], dst[3]]));
+            sum += 17u32;
+            sum += u32::from(udp_len);
+        }
+        FlowKey::V6 { src, dst, .. } => {
+            for i in (0..16).step_by(2) {
+                sum += u32::from(u16::from_be_bytes([src[i], src[i + 1]]));
+            }
+            for i in (0..16).step_by(2) {
+                sum += u32::from(u16::from_be_bytes([dst[i], dst[i + 1]]));
+            }
+            let len32 = u32::from(udp_len);
+            sum += len32 >> 16;
+            sum += len32 & 0xFFFF;
+            sum += 17u32;
+        }
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    u16::try_from(sum & 0xFFFF).expect("folded sum fits u16")
+}
+
 enum ParsedTcp<'a> {
     V4(Ipv4Tcp<'a>),
     V6(Ipv6Tcp<'a>),
@@ -604,13 +587,91 @@ impl<'a> ParsedTcp<'a> {
     }
 }
 
-fn parse_ip_tcp(pkt: &[u8]) -> Option<ParsedTcp<'_>> {
+enum ParsedUdp<'a> {
+    V4(Ipv4Udp<'a>),
+    V6(Ipv6Udp<'a>),
+}
+
+impl<'a> ParsedUdp<'a> {
+    #[inline]
+    fn key(&self) -> FlowKey {
+        match self {
+            Self::V4(x) => x.key,
+            Self::V6(x) => x.key,
+        }
+    }
+
+    #[inline]
+    fn ip_hdr_len(&self) -> usize {
+        match self {
+            Self::V4(x) => x.ip_hdr_len,
+            Self::V6(x) => x.ip_hdr_len,
+        }
+    }
+
+    #[inline]
+    fn payload_off(&self) -> usize {
+        match self {
+            Self::V4(x) => x.payload_off,
+            Self::V6(x) => x.payload_off,
+        }
+    }
+
+    #[inline]
+    fn payload_len(&self) -> usize {
+        match self {
+            Self::V4(x) => x.payload_len,
+            Self::V6(x) => x.payload_len,
+        }
+    }
+
+    #[inline]
+    fn total_len(&self) -> usize {
+        match self {
+            Self::V4(x) => x.total_len,
+            Self::V6(x) => x.total_len,
+        }
+    }
+
+    #[inline]
+    fn bytes(&self) -> &'a [u8] {
+        match self {
+            Self::V4(x) => x.bytes,
+            Self::V6(x) => x.bytes,
+        }
+    }
+}
+
+enum ParsedPacket<'a> {
+    Tcp(ParsedTcp<'a>),
+    Udp(ParsedUdp<'a>),
+}
+
+fn parse_ip_packet(pkt: &[u8]) -> Option<ParsedPacket<'_>> {
     if pkt.is_empty() {
         return None;
     }
     match pkt[0] >> 4 {
-        4 => parse_ipv4_tcp(pkt).map(ParsedTcp::V4),
-        6 => parse_ipv6_tcp(pkt).map(ParsedTcp::V6),
+        4 => {
+            if pkt.len() < 20 {
+                return None;
+            }
+            match pkt[9] {
+                6 => parse_ipv4_tcp(pkt).map(|x| ParsedPacket::Tcp(ParsedTcp::V4(x))),
+                17 => parse_ipv4_udp(pkt).map(|x| ParsedPacket::Udp(ParsedUdp::V4(x))),
+                _ => None,
+            }
+        }
+        6 => {
+            if pkt.len() < 40 {
+                return None;
+            }
+            match pkt[6] {
+                6 => parse_ipv6_tcp(pkt).map(|x| ParsedPacket::Tcp(ParsedTcp::V6(x))),
+                17 => parse_ipv6_udp(pkt).map(|x| ParsedPacket::Udp(ParsedUdp::V6(x))),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -802,18 +863,26 @@ pub fn split_gro(frame: &[u8], out: &mut Vec<u8>, offsets: &mut Vec<(usize, usiz
 
 pub const MAX_GSO_SEGMENTS: usize = 64;
 pub const MAX_GSO_PAYLOAD: usize = 65_535;
+pub const MAX_UDP_GSO_PAYLOAD: usize = 65_507;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingKind {
+    Singleton,
+    Tcp,
+    Udp,
+}
 
 pub struct Coalescer {
-    pending: Vec<u8>, // [vnet_hdr | ip+tcp hdr | payloads]; empty ⇒ nothing pending
+    pending: Vec<u8>, // [vnet_hdr | ip+l4 hdr | payloads]; empty => nothing pending
     out: Vec<u8>,     // holds a flushed frame for the returned borrow
     has_pending: bool,
-    is_tcp_run: bool, // false ⇒ pending is a GSO_NONE singleton
-    sealed: bool,     // pending cannot be extended (PSH/FIN/non-TCP/no-payload)
+    kind: PendingKind,
+    sealed: bool, // pending cannot be extended (boundary flags/sealed/max limits)
     key: FlowKey,
     next_seq: u32,
     gso_size: u16,
     ip_hdr_len: usize,
-    l3_hdr_len: usize, // ip_hdr_len + tcp_hdr_len (payload offset within the L3 packet)
+    l3_hdr_len: usize, // ip_hdr_len + l4_hdr_len (payload offset within the L3 packet)
     segs: usize,
 }
 
@@ -825,7 +894,7 @@ impl Coalescer {
             pending: Vec::with_capacity(MAX_GSO_PAYLOAD + 256),
             out: Vec::with_capacity(MAX_GSO_PAYLOAD + 256),
             has_pending: false,
-            is_tcp_run: false,
+            kind: PendingKind::Singleton,
             sealed: false,
             key: FlowKey::default(),
             next_seq: 0,
@@ -840,39 +909,84 @@ impl Coalescer {
         if !self.has_pending {
             return;
         }
-        if self.is_tcp_run {
-            let ip = VNET_HDR_LEN;
-            let l3_len = self.pending.len() - VNET_HDR_LEN;
-            match self.key {
-                FlowKey::V4 { .. } => {
-                    let total = u16::try_from(l3_len).unwrap_or(u16::MAX);
-                    self.pending[ip + 2..ip + 4].copy_from_slice(&total.to_be_bytes());
-                    ipv4_checksum(&mut self.pending[ip..ip + self.ip_hdr_len]);
-                    let h = VnetHdr {
-                        flags: F_NEEDS_CSUM,
-                        gso_type: GSO_TCPV4,
-                        hdr_len: u16::try_from(self.l3_hdr_len).unwrap_or(0),
-                        gso_size: self.gso_size,
-                        csum_start: u16::try_from(self.ip_hdr_len).unwrap_or(0),
-                        csum_offset: 16,
-                    };
-                    write_vnet_hdr(&h, &mut self.pending[..VNET_HDR_LEN]);
-                }
-                FlowKey::V6 { .. } => {
-                    let ipv6_payload_len =
-                        u16::try_from(l3_len.saturating_sub(40)).unwrap_or(u16::MAX);
-                    self.pending[ip + 4..ip + 6].copy_from_slice(&ipv6_payload_len.to_be_bytes());
-                    let h = VnetHdr {
-                        flags: F_NEEDS_CSUM,
-                        gso_type: GSO_TCPV6,
-                        hdr_len: u16::try_from(self.l3_hdr_len).unwrap_or(0),
-                        gso_size: self.gso_size,
-                        csum_start: 40,
-                        csum_offset: 16,
-                    };
-                    write_vnet_hdr(&h, &mut self.pending[..VNET_HDR_LEN]);
+        match self.kind {
+            PendingKind::Tcp => {
+                let ip = VNET_HDR_LEN;
+                let l3_len = self.pending.len() - VNET_HDR_LEN;
+                match self.key {
+                    FlowKey::V4 { .. } => {
+                        let total = u16::try_from(l3_len).unwrap_or(u16::MAX);
+                        self.pending[ip + 2..ip + 4].copy_from_slice(&total.to_be_bytes());
+                        ipv4_checksum(&mut self.pending[ip..ip + self.ip_hdr_len]);
+                        let h = VnetHdr {
+                            flags: F_NEEDS_CSUM,
+                            gso_type: GSO_TCPV4,
+                            hdr_len: u16::try_from(self.l3_hdr_len).unwrap_or(0),
+                            gso_size: self.gso_size,
+                            csum_start: u16::try_from(self.ip_hdr_len).unwrap_or(0),
+                            csum_offset: 16,
+                        };
+                        write_vnet_hdr(&h, &mut self.pending[..VNET_HDR_LEN]);
+                    }
+                    FlowKey::V6 { .. } => {
+                        let ipv6_payload_len =
+                            u16::try_from(l3_len.saturating_sub(40)).unwrap_or(u16::MAX);
+                        self.pending[ip + 4..ip + 6]
+                            .copy_from_slice(&ipv6_payload_len.to_be_bytes());
+                        let h = VnetHdr {
+                            flags: F_NEEDS_CSUM,
+                            gso_type: GSO_TCPV6,
+                            hdr_len: u16::try_from(self.l3_hdr_len).unwrap_or(0),
+                            gso_size: self.gso_size,
+                            csum_start: 40,
+                            csum_offset: 16,
+                        };
+                        write_vnet_hdr(&h, &mut self.pending[..VNET_HDR_LEN]);
+                    }
                 }
             }
+            PendingKind::Udp => {
+                let ip = VNET_HDR_LEN;
+                let l3_len = self.pending.len() - VNET_HDR_LEN;
+                let udp_len = u16::try_from(l3_len - self.ip_hdr_len).expect("udp_len fits u16");
+                let csum = udp_pseudo_header_checksum(&self.key, udp_len);
+                let udp_off = ip + self.ip_hdr_len;
+                self.pending[udp_off + 4..udp_off + 6].copy_from_slice(&udp_len.to_be_bytes());
+                self.pending[udp_off + 6..udp_off + 8].copy_from_slice(&csum.to_be_bytes());
+
+                match self.key {
+                    FlowKey::V4 { .. } => {
+                        let total = u16::try_from(l3_len).unwrap_or(u16::MAX);
+                        self.pending[ip + 2..ip + 4].copy_from_slice(&total.to_be_bytes());
+                        ipv4_checksum(&mut self.pending[ip..ip + self.ip_hdr_len]);
+                        let h = VnetHdr {
+                            flags: F_NEEDS_CSUM,
+                            gso_type: GSO_UDP_L4,
+                            hdr_len: u16::try_from(self.l3_hdr_len).unwrap_or(0),
+                            gso_size: self.gso_size,
+                            csum_start: u16::try_from(self.ip_hdr_len).unwrap_or(0),
+                            csum_offset: 6,
+                        };
+                        write_vnet_hdr(&h, &mut self.pending[..VNET_HDR_LEN]);
+                    }
+                    FlowKey::V6 { .. } => {
+                        let ipv6_payload_len =
+                            u16::try_from(l3_len.saturating_sub(40)).unwrap_or(u16::MAX);
+                        self.pending[ip + 4..ip + 6]
+                            .copy_from_slice(&ipv6_payload_len.to_be_bytes());
+                        let h = VnetHdr {
+                            flags: F_NEEDS_CSUM,
+                            gso_type: GSO_UDP_L4,
+                            hdr_len: u16::try_from(self.l3_hdr_len).unwrap_or(0),
+                            gso_size: self.gso_size,
+                            csum_start: 40,
+                            csum_offset: 6,
+                        };
+                        write_vnet_hdr(&h, &mut self.pending[..VNET_HDR_LEN]);
+                    }
+                }
+            }
+            PendingKind::Singleton => {}
         }
     }
 
@@ -893,7 +1007,7 @@ impl Coalescer {
         self.pending.resize(VNET_HDR_LEN, 0);
         self.pending.extend_from_slice(&x.bytes()[..x.total_len()]); // full first L3 packet
         self.has_pending = true;
-        self.is_tcp_run = true;
+        self.kind = PendingKind::Tcp;
         self.sealed = sealed;
         self.key = x.key();
         self.ip_hdr_len = x.ip_hdr_len();
@@ -902,6 +1016,21 @@ impl Coalescer {
         self.next_seq = x
             .seq()
             .wrapping_add(u32::try_from(x.payload_len()).unwrap_or(0));
+        self.segs = 1;
+    }
+
+    fn start_udp_run(&mut self, x: &ParsedUdp<'_>, sealed: bool) {
+        self.pending.clear();
+        self.pending.resize(VNET_HDR_LEN, 0);
+        self.pending.extend_from_slice(&x.bytes()[..x.total_len()]); // full first L3 packet
+        self.has_pending = true;
+        self.kind = PendingKind::Udp;
+        self.sealed = sealed;
+        self.key = x.key();
+        self.ip_hdr_len = x.ip_hdr_len();
+        self.l3_hdr_len = x.payload_off();
+        self.gso_size = u16::try_from(x.payload_len()).unwrap_or(0);
+        self.next_seq = 0;
         self.segs = 1;
     }
 
@@ -917,34 +1046,67 @@ impl Coalescer {
         );
         self.pending.extend_from_slice(pkt);
         self.has_pending = true;
-        self.is_tcp_run = false;
+        self.kind = PendingKind::Singleton;
         self.sealed = true;
     }
 
     pub fn push(&mut self, pkt: &[u8]) -> Option<&[u8]> {
-        let parsed = parse_ip_tcp(pkt);
-        // Can this packet extend the current (open, tcp) pending run?
-        if self.has_pending && self.is_tcp_run && !self.sealed {
-            if let Some(x) = &parsed {
-                let cont = x.payload_len() > 0
-                    && (x.flags() & (TCP_FLAG_PSH | TCP_FLAG_FIN | TCP_FLAG_RST | TCP_FLAG_URG))
-                        == 0
-                    && x.key() == self.key
-                    && x.seq() == self.next_seq
-                    && x.payload_off() == self.l3_hdr_len
-                    && self.segs < MAX_GSO_SEGMENTS
-                    && (self.pending.len() - VNET_HDR_LEN - self.l3_hdr_len) + x.payload_len()
-                        <= MAX_GSO_PAYLOAD;
-                if cont {
-                    self.pending.extend_from_slice(
-                        &x.bytes()[x.payload_off()..x.payload_off() + x.payload_len()],
-                    );
-                    self.next_seq = self
-                        .next_seq
-                        .wrapping_add(u32::try_from(x.payload_len()).unwrap_or(0));
-                    self.segs += 1;
-                    return None;
+        let parsed = parse_ip_packet(pkt);
+        // Can this packet extend the current pending run?
+        if self.has_pending && !self.sealed {
+            match self.kind {
+                PendingKind::Tcp => {
+                    if let Some(ParsedPacket::Tcp(x)) = &parsed {
+                        let cont = x.payload_len() > 0
+                            && (x.flags()
+                                & (TCP_FLAG_PSH | TCP_FLAG_FIN | TCP_FLAG_RST | TCP_FLAG_URG))
+                                == 0
+                            && x.key() == self.key
+                            && x.seq() == self.next_seq
+                            && x.payload_off() == self.l3_hdr_len
+                            && self.segs < MAX_GSO_SEGMENTS
+                            && (self.pending.len() - VNET_HDR_LEN - self.l3_hdr_len)
+                                + x.payload_len()
+                                <= MAX_GSO_PAYLOAD;
+                        if cont {
+                            self.pending.extend_from_slice(
+                                &x.bytes()[x.payload_off()..x.payload_off() + x.payload_len()],
+                            );
+                            self.next_seq = self
+                                .next_seq
+                                .wrapping_add(u32::try_from(x.payload_len()).unwrap_or(0));
+                            self.segs += 1;
+                            return None;
+                        }
+                    }
                 }
+                PendingKind::Udp => {
+                    if let Some(ParsedPacket::Udp(x)) = &parsed {
+                        let gso_size = usize::from(self.gso_size);
+                        let cur_payload = self.pending.len() - VNET_HDR_LEN - self.l3_hdr_len;
+                        let cont = x.payload_len() > 0
+                            && x.key() == self.key
+                            && x.payload_off() == self.l3_hdr_len
+                            && self.segs < MAX_GSO_SEGMENTS
+                            && cur_payload + x.payload_len() <= MAX_UDP_GSO_PAYLOAD
+                            && x.payload_len() <= gso_size;
+                        if cont {
+                            self.pending.extend_from_slice(
+                                &x.bytes()[x.payload_off()..x.payload_off() + x.payload_len()],
+                            );
+                            self.segs += 1;
+                            if x.payload_len() < gso_size
+                                || self.segs >= MAX_GSO_SEGMENTS
+                                || (self.pending.len() - VNET_HDR_LEN - self.l3_hdr_len)
+                                    >= MAX_UDP_GSO_PAYLOAD
+                            {
+                                self.sealed = true;
+                            }
+                            return None;
+                        }
+                    }
+                }
+                PendingKind::Singleton => {}
             }
         }
         // Cannot extend: flush the pending run (if any), then start a new one from `pkt`.
@@ -956,10 +1118,13 @@ impl Coalescer {
             self.has_pending = false;
         }
         match &parsed {
-            Some(x) if x.payload_len() > 0 => {
+            Some(ParsedPacket::Tcp(x)) if x.payload_len() > 0 => {
                 let sealed =
                     (x.flags() & (TCP_FLAG_PSH | TCP_FLAG_FIN | TCP_FLAG_RST | TCP_FLAG_URG)) != 0;
                 self.start_tcp_run(x, sealed);
+            }
+            Some(ParsedPacket::Udp(x)) if x.payload_len() > 0 => {
+                self.start_udp_run(x, false);
             }
             _ => self.start_singleton(pkt),
         }
