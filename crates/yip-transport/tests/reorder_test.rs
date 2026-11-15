@@ -388,11 +388,16 @@ fn test_duplicate_and_overlapping_packets() {
     rb.process(&p1, false, 100, |p| emitted.push(p.to_vec()));
     assert_eq!(emitted.len(), 1);
 
-    // Exact duplicate packet (seq 1000, len 100, expected 1100) -> dropped
+    // Exact duplicate packet (seq 1000, len 100, expected 1100) -> emitted to TUN for TCP D-SACK/ACK
     emitted.clear();
     let o_dup = rb.process(&p1, false, 101, |p| emitted.push(p.to_vec()));
     assert_eq!(o_dup, ReorderOutcome::Duplicate);
-    assert!(emitted.is_empty(), "exact duplicate must be dropped");
+    assert_eq!(
+        emitted.len(),
+        1,
+        "exact duplicate / retransmission must be emitted to TUN for DUPACK/D-SACK"
+    );
+    assert_eq!(emitted[0], p1);
 
     // Overlapping retransmission (seq 1050, len 100 -> ends at 1150 > expected 1100)
     emitted.clear();

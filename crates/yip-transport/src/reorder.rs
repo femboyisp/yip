@@ -464,7 +464,6 @@ impl ReorderBuffer {
             drain_contiguous_slots(flow, &mut emit);
             return ReorderOutcome::InOrder;
         }
-
         // Out-of-order gap in the future
         if seq_after(parsed.seq, flow.expected_seq) {
             let deadline_expired = flow.deadline_ms != 0 && now_ms >= flow.deadline_ms;
@@ -495,9 +494,9 @@ impl ReorderBuffer {
                         return ReorderOutcome::Flushed;
                     }
                 } else {
+                    emit(packet);
                     let seq_end = parsed.seq.wrapping_add(parsed.seg_len);
                     if seq_after(seq_end, flow.expected_seq) {
-                        emit(packet);
                         flow.expected_seq = seq_end;
                     }
                     return ReorderOutcome::Flushed;
@@ -535,16 +534,16 @@ impl ReorderBuffer {
             }
         }
 
-        // Old / duplicate packet (seq_before(parsed.seq, flow.expected_seq))
+        // Retransmitted / duplicate / old packet (seq_before(parsed.seq, flow.expected_seq) or exact match)
+        emit(packet);
         if seq_before(parsed.seq, flow.expected_seq) {
             let seq_end = parsed.seq.wrapping_add(parsed.seg_len);
-            if seq_leq(seq_end, flow.expected_seq) {
-                return ReorderOutcome::Duplicate;
+            if seq_after(seq_end, flow.expected_seq) {
+                flow.expected_seq = seq_end;
+                drain_contiguous_slots(flow, &mut emit);
+                return ReorderOutcome::InOrder;
             }
-            emit(packet);
-            flow.expected_seq = seq_end;
-            drain_contiguous_slots(flow, &mut emit);
-            return ReorderOutcome::InOrder;
+            return ReorderOutcome::Duplicate;
         }
 
         ReorderOutcome::Duplicate
