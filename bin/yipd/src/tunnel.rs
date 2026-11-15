@@ -474,3 +474,23 @@ pub(crate) fn assign_mesh_address(device: &str, local_addr: std::net::Ipv6Addr) 
         Err(e) => eprintln!("yipd: could not run ip to add mesh route {prefix_arg}: {e}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tunnel_run_fails_on_invalid_device_name() {
+        let config_text = r#"
+local_private=0101010101010101010101010101010101010101010101010101010101010101
+local_public=0202020202020202020202020202020202020202020202020202020202020202
+peer_public=0303030303030303030303030303030303030303030303030303030303030303
+peer_endpoint=127.0.0.1:51820
+listen=127.0.0.1:51821
+device=interface_name_that_is_way_too_long_for_linux_ifnamsiz
+"#;
+        let config = Config::parse(config_text).expect("valid config syntax");
+        let res = run(config);
+        assert!(res.is_err(), "tunnel run must return Err on invalid device");
+    }
+}
