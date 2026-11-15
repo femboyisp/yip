@@ -1,5 +1,5 @@
 use yip_io::tun_offload::{
-    read_vnet_hdr, split_gro, Coalescer, F_NEEDS_CSUM, GSO_UDP_L4, MAX_GSO_SEGMENTS,
+    read_vnet_hdr, split_gro, Coalescer, F_NEEDS_CSUM, GSO_NONE, GSO_UDP_L4, MAX_GSO_SEGMENTS,
     MAX_UDP_GSO_PAYLOAD, VNET_HDR_LEN,
 };
 
@@ -128,7 +128,7 @@ fn mk_ipv6_udp(src: [u8; 16], dst: [u8; 16], sport: u16, dport: u16, payload: &[
 
 #[test]
 fn test_coalescer_aggregates_ipv4_udp_datagrams_with_trailing_short_segment() {
-    let mut coalescer = Coalescer::new();
+    let mut coalescer = Coalescer::new(true);
 
     let src = [192, 168, 1, 10];
     let dst = [192, 168, 1, 20];
@@ -170,7 +170,7 @@ fn test_coalescer_aggregates_ipv4_udp_datagrams_with_trailing_short_segment() {
 
 #[test]
 fn test_coalescer_trailing_short_segment_flushes_on_next_push() {
-    let mut coalescer = Coalescer::new();
+    let mut coalescer = Coalescer::new(true);
 
     let src = [10, 0, 0, 1];
     let dst = [10, 0, 0, 2];
@@ -191,14 +191,16 @@ fn test_coalescer_trailing_short_segment_flushes_on_next_push() {
 
     let flushed2 = coalescer.flush().expect("must flush p3");
     let hdr2 = read_vnet_hdr(flushed2).expect("valid vnet hdr");
-    assert_eq!(hdr2.gso_type, GSO_UDP_L4);
-    assert_eq!(hdr2.gso_size, 1200);
+    assert_eq!(hdr2.gso_type, GSO_NONE);
+    assert_eq!(hdr2.gso_size, 0);
+    assert_eq!(hdr2.flags, 0);
     assert_eq!(flushed2.len(), VNET_HDR_LEN + 28 + 1200);
+    assert_eq!(&flushed2[VNET_HDR_LEN..], &p3[..]);
 }
 
 #[test]
 fn test_coalescer_aggregates_ipv6_udp_datagrams_with_trailing_short_segment() {
-    let mut coalescer = Coalescer::new();
+    let mut coalescer = Coalescer::new(true);
 
     let src = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
     let dst = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
@@ -234,7 +236,7 @@ fn test_coalescer_aggregates_ipv6_udp_datagrams_with_trailing_short_segment() {
 
 #[test]
 fn test_coalescer_udp_flushes_on_flow_mismatch() {
-    let mut coalescer = Coalescer::new();
+    let mut coalescer = Coalescer::new(true);
 
     let src = [10, 0, 0, 1];
     let dst = [10, 0, 0, 2];
@@ -244,19 +246,24 @@ fn test_coalescer_udp_flushes_on_flow_mismatch() {
     assert!(coalescer.push(&p1).is_none());
     let flushed = coalescer.push(&p2).expect("mismatch flushes p1");
     let hdr = read_vnet_hdr(flushed).expect("hdr");
-    assert_eq!(hdr.gso_type, GSO_UDP_L4);
-    assert_eq!(hdr.gso_size, 500);
+    assert_eq!(hdr.gso_type, GSO_NONE);
+    assert_eq!(hdr.gso_size, 0);
+    assert_eq!(hdr.flags, 0);
     assert_eq!(flushed.len(), VNET_HDR_LEN + 28 + 500);
+    assert_eq!(&flushed[VNET_HDR_LEN..], &p1[..]);
 
     let flushed2 = coalescer.flush().expect("flushes p2");
-    assert_eq!(read_vnet_hdr(flushed2).unwrap().gso_type, GSO_UDP_L4);
-    assert_eq!(read_vnet_hdr(flushed2).unwrap().gso_size, 500);
+    let hdr2 = read_vnet_hdr(flushed2).expect("hdr");
+    assert_eq!(hdr2.gso_type, GSO_NONE);
+    assert_eq!(hdr2.gso_size, 0);
+    assert_eq!(hdr2.flags, 0);
     assert_eq!(flushed2.len(), VNET_HDR_LEN + 28 + 500);
+    assert_eq!(&flushed2[VNET_HDR_LEN..], &p2[..]);
 }
 
 #[test]
 fn test_coalescer_udp_flushes_on_larger_payload() {
-    let mut coalescer = Coalescer::new();
+    let mut coalescer = Coalescer::new(true);
 
     let src = [10, 0, 0, 1];
     let dst = [10, 0, 0, 2];
@@ -265,19 +272,25 @@ fn test_coalescer_udp_flushes_on_larger_payload() {
 
     assert!(coalescer.push(&p1).is_none());
     let flushed = coalescer.push(&p2).expect("larger payload cannot append");
-    assert_eq!(read_vnet_hdr(flushed).unwrap().gso_type, GSO_UDP_L4);
-    assert_eq!(read_vnet_hdr(flushed).unwrap().gso_size, 1000);
+    let hdr = read_vnet_hdr(flushed).expect("hdr");
+    assert_eq!(hdr.gso_type, GSO_NONE);
+    assert_eq!(hdr.gso_size, 0);
+    assert_eq!(hdr.flags, 0);
     assert_eq!(flushed.len(), VNET_HDR_LEN + 28 + 1000);
+    assert_eq!(&flushed[VNET_HDR_LEN..], &p1[..]);
 
     let flushed2 = coalescer.flush().expect("flushes p2");
-    assert_eq!(read_vnet_hdr(flushed2).unwrap().gso_type, GSO_UDP_L4);
-    assert_eq!(read_vnet_hdr(flushed2).unwrap().gso_size, 1200);
+    let hdr2 = read_vnet_hdr(flushed2).expect("hdr");
+    assert_eq!(hdr2.gso_type, GSO_NONE);
+    assert_eq!(hdr2.gso_size, 0);
+    assert_eq!(hdr2.flags, 0);
     assert_eq!(flushed2.len(), VNET_HDR_LEN + 28 + 1200);
+    assert_eq!(&flushed2[VNET_HDR_LEN..], &p2[..]);
 }
 
 #[test]
 fn test_coalescer_udp_max_segment_cap_64() {
-    let mut coalescer = Coalescer::new();
+    let mut coalescer = Coalescer::new(true);
 
     let src = [10, 0, 0, 1];
     let dst = [10, 0, 0, 2];
@@ -294,15 +307,18 @@ fn test_coalescer_udp_max_segment_cap_64() {
     assert_eq!(flushed.len(), VNET_HDR_LEN + 28 + (64 * 100));
 
     let flushed2 = coalescer.flush().expect("flushes 65th");
-    assert_eq!(read_vnet_hdr(flushed2).unwrap().gso_type, GSO_UDP_L4);
-    assert_eq!(read_vnet_hdr(flushed2).unwrap().gso_size, 100);
+    let hdr2 = read_vnet_hdr(flushed2).expect("hdr");
+    assert_eq!(hdr2.gso_type, GSO_NONE);
+    assert_eq!(hdr2.gso_size, 0);
+    assert_eq!(hdr2.flags, 0);
     assert_eq!(flushed2.len(), VNET_HDR_LEN + 28 + 100);
+    assert_eq!(&flushed2[VNET_HDR_LEN..], &p[..]);
 }
 
 #[test]
 fn test_coalescer_udp_payload_cap_65507() {
     assert_eq!(MAX_UDP_GSO_PAYLOAD, 65_507);
-    let mut coalescer = Coalescer::new();
+    let mut coalescer = Coalescer::new(true);
 
     let src = [10, 0, 0, 1];
     let dst = [10, 0, 0, 2];
@@ -328,7 +344,7 @@ fn test_coalescer_udp_payload_cap_65507() {
 
 #[test]
 fn test_coalescer_udp_zero_payload_is_singleton() {
-    let mut coalescer = Coalescer::new();
+    let mut coalescer = Coalescer::new(true);
     let src = [10, 0, 0, 1];
     let dst = [10, 0, 0, 2];
     let p_zero = mk_ipv4_udp(src, dst, 5000, 6000, &[]);
@@ -342,7 +358,7 @@ fn test_coalescer_udp_zero_payload_is_singleton() {
 
 #[test]
 fn test_coalescer_udp_pseudo_header_checksum_seeding() {
-    let mut coalescer = Coalescer::new();
+    let mut coalescer = Coalescer::new(true);
     let src = [192, 168, 1, 10];
     let dst = [192, 168, 1, 20];
     let p1 = mk_ipv4_udp(src, dst, 443, 5000, &[0xAA; 1400]);
@@ -379,7 +395,7 @@ fn test_coalescer_udp_pseudo_header_checksum_seeding() {
 
 #[test]
 fn test_coalescer_udp_roundtrip_with_split_gro() {
-    let mut coalescer = Coalescer::new();
+    let mut coalescer = Coalescer::new(true);
 
     let src = [192, 168, 2, 1];
     let dst = [192, 168, 2, 2];
@@ -408,4 +424,74 @@ fn test_coalescer_udp_roundtrip_with_split_gro() {
     assert_eq!(&seg1[28..], &[0x11; 1400]);
     assert_eq!(&seg2[28..], &[0x22; 1400]);
     assert_eq!(&seg3[28..], &[0x33; 500]);
+}
+
+#[test]
+fn test_coalescer_udp_has_uso_false_emits_gso_none_and_never_coalesces() {
+    let mut coalescer = Coalescer::new(false);
+
+    let src = [10, 1, 2, 3];
+    let dst = [10, 4, 5, 6];
+    let sport = 9999;
+    let dport = 8888;
+
+    let p1 = mk_ipv4_udp(src, dst, sport, dport, &[0xAA; 1000]);
+    let p2 = mk_ipv4_udp(src, dst, sport, dport, &[0xBB; 1000]);
+    let p3 = mk_ipv4_udp(src, dst, sport, dport, &[0xCC; 1000]);
+
+    // When has_uso == false, each packet is handled as a singleton
+    assert!(coalescer.push(&p1).is_none());
+
+    let flushed1 = coalescer.push(&p2).expect("p2 must flush singleton p1");
+    let hdr1 = read_vnet_hdr(flushed1).expect("hdr1");
+    assert_eq!(hdr1.gso_type, GSO_NONE);
+    assert_eq!(hdr1.gso_size, 0);
+    assert_eq!(hdr1.flags, 0);
+    assert_eq!(&flushed1[VNET_HDR_LEN..], &p1[..]);
+
+    let flushed2 = coalescer.push(&p3).expect("p3 must flush singleton p2");
+    let hdr2 = read_vnet_hdr(flushed2).expect("hdr2");
+    assert_eq!(hdr2.gso_type, GSO_NONE);
+    assert_eq!(hdr2.gso_size, 0);
+    assert_eq!(hdr2.flags, 0);
+    assert_eq!(&flushed2[VNET_HDR_LEN..], &p2[..]);
+
+    let flushed3 = coalescer.flush().expect("flush must emit singleton p3");
+    let hdr3 = read_vnet_hdr(flushed3).expect("hdr3");
+    assert_eq!(hdr3.gso_type, GSO_NONE);
+    assert_eq!(hdr3.gso_size, 0);
+    assert_eq!(hdr3.flags, 0);
+    assert_eq!(&flushed3[VNET_HDR_LEN..], &p3[..]);
+}
+
+#[test]
+fn test_coalescer_udp_single_datagram_emitted_as_gso_none_with_intact_checksum() {
+    // Both IPv4 and IPv6 single datagrams with has_uso == true
+    let mut coalescer = Coalescer::new(true);
+
+    let src_v4 = [172, 16, 0, 1];
+    let dst_v4 = [172, 16, 0, 2];
+    let p_v4 = mk_ipv4_udp(src_v4, dst_v4, 1234, 5678, &[0x42; 800]);
+
+    assert!(coalescer.push(&p_v4).is_none());
+    let flushed_v4 = coalescer.flush().expect("flushes singleton v4");
+    let hdr_v4 = read_vnet_hdr(flushed_v4).expect("hdr_v4");
+    assert_eq!(hdr_v4.gso_type, GSO_NONE);
+    assert_eq!(hdr_v4.gso_size, 0);
+    assert_eq!(hdr_v4.flags, 0);
+    // Entire packet byte-for-byte intact, including checksum:
+    assert_eq!(&flushed_v4[VNET_HDR_LEN..], &p_v4[..]);
+
+    let src_v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let dst_v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    let p_v6 = mk_ipv6_udp(src_v6, dst_v6, 4321, 8765, &[0x99; 1100]);
+
+    assert!(coalescer.push(&p_v6).is_none());
+    let flushed_v6 = coalescer.flush().expect("flushes singleton v6");
+    let hdr_v6 = read_vnet_hdr(flushed_v6).expect("hdr_v6");
+    assert_eq!(hdr_v6.gso_type, GSO_NONE);
+    assert_eq!(hdr_v6.gso_size, 0);
+    assert_eq!(hdr_v6.flags, 0);
+    // Entire packet byte-for-byte intact, including checksum:
+    assert_eq!(&flushed_v6[VNET_HDR_LEN..], &p_v6[..]);
 }

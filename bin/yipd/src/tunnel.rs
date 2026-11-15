@@ -404,7 +404,13 @@ pub fn run(config: Config) -> io::Result<()> {
     if use_uring {
         yip_io::uring::run_uring(udp_fd, tun_fd, &mut manager)
     } else {
-        yip_io::poll::run_poll(udp_fd, tun_fd, tun.vnet_hdr_len().is_some(), &mut manager)
+        yip_io::poll::run_poll(
+            udp_fd,
+            tun_fd,
+            tun.vnet_hdr_len().is_some(),
+            tun.has_uso(),
+            &mut manager,
+        )
     }
 }
 

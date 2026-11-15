@@ -293,7 +293,7 @@ fn test_split_gro_slices_ipv6_udp_superpacket() {
 }
 
 #[test]
-fn test_split_gro_rejects_ipv6_zero_checksum() {
+fn test_split_gro_rejects_ipv6_zero_checksum_without_f_needs_csum() {
     let mut out = Vec::new();
     let mut offsets = Vec::new();
 
@@ -319,7 +319,7 @@ fn test_split_gro_rejects_ipv6_zero_checksum() {
 
     let mut frame = vec![0u8; VNET_HDR_LEN + pkt.len()];
     let hdr = VirtioNetHdr {
-        flags: F_NEEDS_CSUM,
+        flags: 0,
         gso_type: GSO_UDP_L4,
         hdr_len: 48,
         gso_size: 500,
@@ -331,6 +331,54 @@ fn test_split_gro_rejects_ipv6_zero_checksum() {
 
     assert!(
         !split_gro(&frame, &mut out, &mut offsets),
-        "split_gro must reject IPv6 UDP superpacket with zero checksum"
+        "split_gro must reject IPv6 UDP superpacket with zero checksum when F_NEEDS_CSUM is absent"
     );
+}
+
+#[test]
+fn test_split_gro_allows_ipv6_zero_checksum_with_f_needs_csum() {
+    let mut out = Vec::new();
+    let mut offsets = Vec::new();
+
+    let ip_hdr_len = 40;
+    let udp_hdr_len = 8;
+    let payload = vec![0xEFu8; 1000];
+    let udp_len = (udp_hdr_len + payload.len()) as u16;
+    let total_len = ip_hdr_len + udp_hdr_len + payload.len();
+    let mut pkt = vec![0u8; total_len];
+    pkt[0] = 0x60;
+    pkt[4..6].copy_from_slice(&udp_len.to_be_bytes());
+    pkt[6] = 17;
+    pkt[7] = 64;
+    pkt[8..24].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    pkt[24..40].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+
+    pkt[40..42].copy_from_slice(&6000u16.to_be_bytes());
+    pkt[42..44].copy_from_slice(&6001u16.to_be_bytes());
+    pkt[44..46].copy_from_slice(&udp_len.to_be_bytes());
+    // Zero checksum on IPv6 UDP allowed when F_NEEDS_CSUM is set
+    pkt[46..48].copy_from_slice(&0u16.to_be_bytes());
+    pkt[48..].copy_from_slice(&payload);
+
+    let mut frame = vec![0u8; VNET_HDR_LEN + pkt.len()];
+    let hdr = VirtioNetHdr {
+        flags: F_NEEDS_CSUM,
+        gso_type: GSO_UDP_L4,
+        hdr_len: 48,
+        gso_size: 500,
+        csum_start: 40,
+        csum_offset: 6,
+    };
+    write_vnet_hdr(&hdr, &mut frame);
+    frame[VNET_HDR_LEN..].copy_from_slice(&pkt);
+
+    assert!(
+        split_gro(&frame, &mut out, &mut offsets),
+        "split_gro must allow IPv6 UDP superpacket with zero checksum when F_NEEDS_CSUM is set"
+    );
+    assert_eq!(offsets.len(), 2);
+    let seg0 = &out[offsets[0].0..offsets[0].0 + offsets[0].1];
+    let seg1 = &out[offsets[1].0..offsets[1].0 + offsets[1].1];
+    assert!(verify_ipv6_udp_checksum(seg0));
+    assert!(verify_ipv6_udp_checksum(seg1));
 }

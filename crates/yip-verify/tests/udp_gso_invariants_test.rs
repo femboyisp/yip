@@ -3,7 +3,7 @@
 use std::alloc::System;
 
 use yip_io::tun_offload::{
-    read_vnet_hdr, split_gro, Coalescer, F_NEEDS_CSUM, GSO_UDP_L4, MAX_GSO_SEGMENTS,
+    read_vnet_hdr, split_gro, Coalescer, F_NEEDS_CSUM, GSO_NONE, GSO_UDP_L4, MAX_GSO_SEGMENTS,
     MAX_UDP_GSO_PAYLOAD, VNET_HDR_LEN,
 };
 use yip_verify::{assert_no_alloc, TrackingAllocator};
@@ -208,7 +208,7 @@ fn make_ipv6_udp(src: [u8; 16], dst: [u8; 16], sport: u16, dport: u16, payload: 
 
 #[test]
 fn test_udp_gso_ipv4_algebraic_identity_varying_payload_sizes_and_trailing() {
-    let mut coalescer = Coalescer::new();
+    let mut coalescer = Coalescer::new(true);
     let mut out = Vec::new();
     let mut offsets = Vec::new();
 
@@ -261,12 +261,16 @@ fn test_udp_gso_ipv4_algebraic_identity_varying_payload_sizes_and_trailing() {
         let flushed = coalescer.flush().expect("burst must flush superpacket");
         let vnet_hdr = read_vnet_hdr(flushed).expect("valid vnet header");
 
-        if original_packets.len() > 1 || trailing_size == 0 {
+        if original_packets.len() > 1 {
             assert_eq!(vnet_hdr.gso_type, GSO_UDP_L4);
             assert_eq!(vnet_hdr.gso_size, gso_size as u16);
             assert_eq!(vnet_hdr.flags, F_NEEDS_CSUM);
             assert_eq!(vnet_hdr.csum_start, 20);
             assert_eq!(vnet_hdr.csum_offset, 6);
+        } else {
+            assert_eq!(vnet_hdr.gso_type, GSO_NONE);
+            assert_eq!(vnet_hdr.gso_size, 0);
+            assert_eq!(vnet_hdr.flags, 0);
         }
 
         let split_ok = split_gro(flushed, &mut out, &mut offsets);
@@ -322,7 +326,7 @@ fn test_udp_gso_ipv4_algebraic_identity_varying_payload_sizes_and_trailing() {
 
 #[test]
 fn test_udp_gso_ipv6_algebraic_identity_varying_payload_sizes_and_trailing() {
-    let mut coalescer = Coalescer::new();
+    let mut coalescer = Coalescer::new(true);
     let mut out = Vec::new();
     let mut offsets = Vec::new();
 
@@ -426,7 +430,7 @@ fn test_udp_gso_ipv6_algebraic_identity_varying_payload_sizes_and_trailing() {
 
 #[test]
 fn test_udp_gso_max_segment_limit_64() {
-    let mut coalescer = Coalescer::new();
+    let mut coalescer = Coalescer::new(true);
     let mut out = Vec::new();
     let mut offsets = Vec::new();
 
@@ -498,16 +502,17 @@ fn test_udp_gso_max_segment_limit_64() {
     );
 
     let flushed_remaining = coalescer.flush().expect("flushes remaining 65th segment");
-    assert_eq!(
-        read_vnet_hdr(flushed_remaining).expect("hdr").gso_type,
-        GSO_UDP_L4
-    );
+    let hdr_remaining = read_vnet_hdr(flushed_remaining).expect("hdr");
+    assert_eq!(hdr_remaining.gso_type, GSO_NONE);
+    assert_eq!(hdr_remaining.gso_size, 0);
+    assert_eq!(hdr_remaining.flags, 0);
     assert_eq!(flushed_remaining.len(), VNET_HDR_LEN + 28 + seg_payload_len);
+    assert_eq!(&flushed_remaining[VNET_HDR_LEN..], &p65[..]);
 }
 
 #[test]
 fn test_udp_gso_steady_state_zero_allocation_hotpath() {
-    let mut coalescer = Coalescer::new();
+    let mut coalescer = Coalescer::new(true);
     let mut out = Vec::with_capacity(MAX_UDP_GSO_PAYLOAD + 256);
     let mut offsets = Vec::with_capacity(MAX_GSO_SEGMENTS + 16);
 

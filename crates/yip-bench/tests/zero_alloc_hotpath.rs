@@ -156,7 +156,7 @@ fn test_zero_alloc_hotpath_framing() {
         make_ipv4_udp(src, dst, sport, dport, 0x1003, &[0xDD; 600]),
     ];
 
-    let mut coalescer = Coalescer::new();
+    let mut coalescer = Coalescer::new(true);
     let mut out = Vec::with_capacity(70_000);
     let mut offsets = Vec::with_capacity(128);
 
