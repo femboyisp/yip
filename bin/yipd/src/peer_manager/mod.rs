@@ -430,6 +430,7 @@ pub struct PeerManager {
     /// borrow-checker limitation around retrying a `&mut self`-returning
     /// call across loop iterations.
     tun_scratch: Vec<u8>,
+    tun_batch_scratch: Vec<Vec<u8>>,
     /// The network-wide anti-DPI obfuscation key = `yip_obf::derive_key(&obf_psk)`,
     /// or `None` when obfuscation is disabled. When `None`, the `Dispatch`
     /// methods take the exact 2a/2b/2c plaintext path (byte-identical — no
@@ -631,6 +632,7 @@ impl PeerManager {
             tick_egress: Vec::new(),
             obf_scratch: Vec::new(),
             tun_scratch: Vec::new(),
+            tun_batch_scratch: Vec::new(),
             obf_key: None,
             junk_rng: yip_obf::XorShift64::from_getrandom(),
             cover_traffic_ms: None,
@@ -1895,6 +1897,7 @@ impl PeerManager {
     fn finish_wrapped(
         &mut self,
         tun: Option<Vec<u8>>,
+        tun_batch: Option<Vec<Vec<u8>>>,
         mut udp: Vec<EgressDatagram>,
         now_ms: u64,
     ) -> DispatchOut<'_> {
@@ -1903,17 +1906,34 @@ impl PeerManager {
             self.drain_scheduled_egress(now_ms, &mut udp);
         }
         self.egress = udp;
-        match (tun, self.egress.is_empty()) {
-            (Some(t), true) => {
+        match (tun, tun_batch, self.egress.is_empty()) {
+            (Some(t), _, true) => {
                 self.tun_scratch = t;
                 DispatchOut::Tun(&self.tun_scratch)
             }
-            (Some(t), false) => {
+            (Some(t), _, false) => {
                 self.tun_scratch = t;
                 DispatchOut::Both(&self.tun_scratch, &self.egress)
             }
-            (None, false) => DispatchOut::Udp(&self.egress),
-            (None, true) => DispatchOut::None,
+            (_, Some(b), true) => {
+                self.tun_batch_scratch = b;
+                DispatchOut::TunBatch(&self.tun_batch_scratch)
+            }
+            (_, Some(b), false) => {
+                self.tun_batch_scratch = b;
+                DispatchOut::TunBatchThenUdp(&self.tun_batch_scratch, &self.egress)
+            }
+            (None, None, false) => DispatchOut::Udp(&self.egress),
+            (None, None, true) => DispatchOut::None,
+        }
+    }
+
+    /// Drain any pending decoded packets across all peers' active epochs into `out`.
+    pub fn drain_tun(&mut self, out: &mut Vec<Vec<u8>>) {
+        for peer in &mut self.peers {
+            if let PeerState::Established(epochs) = &mut peer.state {
+                epochs.drain_tun(out);
+            }
         }
     }
 }
@@ -1938,6 +1958,11 @@ impl Dispatch for PeerManager {
                 out.extend(pkts.iter().cloned());
                 DispatchOut::Both(inner, &[])
             }
+            DispatchOut::TunBatch(batch) => DispatchOut::TunBatch(batch),
+            DispatchOut::TunBatchThenUdp(batch, pkts) => {
+                out.extend(pkts.iter().cloned());
+                DispatchOut::TunBatchThenUdp(batch, &[])
+            }
         }
     }
 
@@ -1949,6 +1974,10 @@ impl Dispatch for PeerManager {
         if let Some(pkts) = self.tick(now_ms) {
             out.extend(pkts.iter().cloned());
         }
+    }
+
+    fn drain_tun(&mut self, out: &mut Vec<Vec<u8>>) {
+        self.drain_tun(out);
     }
 
     fn recycle(&mut self, batch: &mut Vec<EgressDatagram>) {
@@ -1971,20 +2000,28 @@ impl PeerManager {
             if self.scheduled_egress.is_empty() {
                 return self.on_udp_dispatch(src, dg, now_ms);
             }
-            let (tun, mut udp) = own_dispatch(self.on_udp_dispatch(src, dg, now_ms));
+            let (tun, tun_batch, mut udp) = own_dispatch(self.on_udp_dispatch(src, dg, now_ms));
             self.drain_scheduled_egress(now_ms, &mut udp);
             self.egress = udp;
-            return match (tun, self.egress.is_empty()) {
-                (Some(t), true) => {
+            return match (tun, tun_batch, self.egress.is_empty()) {
+                (Some(t), _, true) => {
                     self.tun_scratch = t;
                     DispatchOut::Tun(&self.tun_scratch)
                 }
-                (Some(t), false) => {
+                (Some(t), _, false) => {
                     self.tun_scratch = t;
                     DispatchOut::Both(&self.tun_scratch, &self.egress)
                 }
-                (None, false) => DispatchOut::Udp(&self.egress),
-                (None, true) => DispatchOut::None,
+                (_, Some(b), true) => {
+                    self.tun_batch_scratch = b;
+                    DispatchOut::TunBatch(&self.tun_batch_scratch)
+                }
+                (_, Some(b), false) => {
+                    self.tun_batch_scratch = b;
+                    DispatchOut::TunBatchThenUdp(&self.tun_batch_scratch, &self.egress)
+                }
+                (None, None, false) => DispatchOut::Udp(&self.egress),
+                (None, None, true) => DispatchOut::None,
             };
         }
         if dg.is_empty() {
@@ -2007,15 +2044,15 @@ impl PeerManager {
             if ptype != yip_obf::RDV_TYPE {
                 return DispatchOut::None;
             }
-            let (tun, udp) = own_dispatch(self.on_rdv(&body, now_ms));
-            return self.finish_wrapped(tun, udp, now_ms);
+            let (tun, tun_batch, udp) = own_dispatch(self.on_rdv(&body, now_ms));
+            return self.finish_wrapped(tun, tun_batch, udp, now_ms);
         }
         let Some(plain) = self.deobf_ingress(src, dg) else {
             self.metrics.record_drop(1);
             return DispatchOut::None;
         };
-        let (tun, udp) = own_dispatch(self.on_udp_dispatch(src, &plain, now_ms));
-        self.finish_wrapped(tun, udp, now_ms)
+        let (tun, tun_batch, udp) = own_dispatch(self.on_udp_dispatch(src, &plain, now_ms));
+        self.finish_wrapped(tun, tun_batch, udp, now_ms)
     }
 
     /// Seal `inner`, FEC-encode, and write framed datagrams directly into `out`.
@@ -2779,16 +2816,20 @@ pub(super) fn copy_into_reusable_egress(target: &mut Vec<EgressDatagram>, src: &
     }
 }
 
+type OwnedDispatchParts = (Option<Vec<u8>>, Option<Vec<Vec<u8>>>, Vec<EgressDatagram>);
+
 /// Decompose a borrowed [`DispatchOut`] into owned `(tun, udp)` parts so the
 /// `self` borrow it holds can end before the egress is wrapped and re-returned.
 /// Mirrors the clone-to-owned pattern already used by `relayed_data` /
 /// `handle_data_or_control` where borrows would otherwise fight.
-fn own_dispatch(out: DispatchOut<'_>) -> (Option<Vec<u8>>, Vec<EgressDatagram>) {
+fn own_dispatch(out: DispatchOut<'_>) -> OwnedDispatchParts {
     match out {
-        DispatchOut::None => (None, Vec::new()),
-        DispatchOut::Tun(b) => (Some(b.to_vec()), Vec::new()),
-        DispatchOut::Udp(e) => (None, e.to_vec()),
-        DispatchOut::Both(b, e) => (Some(b.to_vec()), e.to_vec()),
+        DispatchOut::None => (None, None, Vec::new()),
+        DispatchOut::Tun(b) => (Some(b.to_vec()), None, Vec::new()),
+        DispatchOut::Udp(e) => (None, None, e.to_vec()),
+        DispatchOut::Both(b, e) => (Some(b.to_vec()), None, e.to_vec()),
+        DispatchOut::TunBatch(b) => (None, Some(b.to_vec()), Vec::new()),
+        DispatchOut::TunBatchThenUdp(b, e) => (None, Some(b.to_vec()), e.to_vec()),
     }
 }
 

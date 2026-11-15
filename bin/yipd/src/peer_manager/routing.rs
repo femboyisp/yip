@@ -231,6 +231,23 @@ impl PeerManager {
                 self.egress = dgs;
                 DispatchOut::Both(&self.tun_scratch, &self.egress)
             }
+            crate::epoch::EpochInbound::TunBatch(batch) => {
+                let total_bytes: u64 = batch.iter().map(|b| b.len() as u64).sum();
+                self.peers[idx].rx_bytes += total_bytes;
+                self.peers[idx].rx_packets += batch.len() as u64;
+                self.metrics.record_rx(total_bytes, batch.len() as u64);
+                self.tun_batch_scratch = batch;
+                DispatchOut::TunBatch(&self.tun_batch_scratch)
+            }
+            crate::epoch::EpochInbound::TunBatchThenSend(batch, dgs) => {
+                let total_bytes: u64 = batch.iter().map(|b| b.len() as u64).sum();
+                self.peers[idx].rx_bytes += total_bytes;
+                self.peers[idx].rx_packets += batch.len() as u64;
+                self.metrics.record_rx(total_bytes, batch.len() as u64);
+                self.tun_batch_scratch = batch;
+                self.egress = dgs;
+                DispatchOut::TunBatchThenUdp(&self.tun_batch_scratch, &self.egress)
+            }
         }
     }
 
@@ -290,9 +307,17 @@ impl PeerManager {
                 let burst_diff = epochs.fec_unrecoverable_count().saturating_sub(prev_burst);
                 let h = match opened {
                     crate::epoch::EpochInbound::None => None,
-                    crate::epoch::EpochInbound::Tun(buf) => Some((Some(buf), Vec::new())),
-                    crate::epoch::EpochInbound::Send(dgs) => Some((None, dgs)),
-                    crate::epoch::EpochInbound::TunThenSend(buf, dgs) => Some((Some(buf), dgs)),
+                    crate::epoch::EpochInbound::Tun(buf) => Some((Some(buf), None, Vec::new())),
+                    crate::epoch::EpochInbound::Send(dgs) => Some((None, None, dgs)),
+                    crate::epoch::EpochInbound::TunThenSend(buf, dgs) => {
+                        Some((Some(buf), None, dgs))
+                    }
+                    crate::epoch::EpochInbound::TunBatch(batch) => {
+                        Some((None, Some(batch), Vec::new()))
+                    }
+                    crate::epoch::EpochInbound::TunBatchThenSend(batch, dgs) => {
+                        Some((None, Some(batch), dgs))
+                    }
                 };
                 (h, rec_diff, burst_diff, promoted_epoch)
             };
@@ -307,7 +332,7 @@ impl PeerManager {
             if burst_diff > 0 {
                 self.metrics.record_fec_burst_drop(burst_diff);
             }
-            let Some((tun, udp)) = hit else {
+            let Some((tun, tun_batch, udp)) = hit else {
                 continue;
             };
             if let Some(ref t) = tun {
@@ -315,26 +340,41 @@ impl PeerManager {
                 self.peers[idx].rx_packets += 1;
                 self.metrics.record_rx(t.len() as u64, 1);
             }
+            if let Some(ref b) = tun_batch {
+                let total_bytes: u64 = b.iter().map(|pkt| pkt.len() as u64).sum();
+                self.peers[idx].rx_bytes += total_bytes;
+                self.peers[idx].rx_packets += b.len() as u64;
+                self.metrics.record_rx(total_bytes, b.len() as u64);
+            }
             // Authenticated + non-replayed (M2 roaming) — safe to roam.
             self.relearn_endpoint(idx, src);
             // `udp` already carries each datagram's real `dst`/`fate` (see
             // `EpochInbound`); no reconstruction from `self.peers[idx].endpoint`
             // needed (that placeholder is wrong for relay-established peers).
-            return match (tun, udp.is_empty()) {
-                (Some(t), true) => {
+            return match (tun, tun_batch, udp.is_empty()) {
+                (Some(t), _, true) => {
                     self.tun_scratch = t;
                     DispatchOut::Tun(&self.tun_scratch)
                 }
-                (Some(t), false) => {
+                (Some(t), _, false) => {
                     self.tun_scratch = t;
                     self.egress = udp;
                     DispatchOut::Both(&self.tun_scratch, &self.egress)
                 }
-                (None, false) => {
+                (_, Some(b), true) => {
+                    self.tun_batch_scratch = b;
+                    DispatchOut::TunBatch(&self.tun_batch_scratch)
+                }
+                (_, Some(b), false) => {
+                    self.tun_batch_scratch = b;
+                    self.egress = udp;
+                    DispatchOut::TunBatchThenUdp(&self.tun_batch_scratch, &self.egress)
+                }
+                (None, None, false) => {
                     self.egress = udp;
                     DispatchOut::Udp(&self.egress)
                 }
-                (None, true) => DispatchOut::None,
+                (None, None, true) => DispatchOut::None,
             };
         }
         self.metrics.record_drop(1);

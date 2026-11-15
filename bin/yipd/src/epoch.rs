@@ -48,6 +48,8 @@ pub enum EpochInbound {
     Tun(Vec<u8>),
     Send(Vec<EgressDatagram>),
     TunThenSend(Vec<u8>, Vec<EgressDatagram>),
+    TunBatch(Vec<Vec<u8>>),
+    TunBatchThenSend(Vec<Vec<u8>>, Vec<EgressDatagram>),
 }
 
 /// The responder's unconfirmed rekey epoch (§ `EpochSet::install_next`).
@@ -227,6 +229,21 @@ impl EpochSet {
             Outcome::TunWriteThenSend(b, pkts) => {
                 EpochInbound::TunThenSend(b.to_vec(), pkts.to_vec())
             }
+            Outcome::TunWriteBatch(batch) => EpochInbound::TunBatch(batch.to_vec()),
+            Outcome::TunWriteBatchThenSend(batch, pkts) => {
+                EpochInbound::TunBatchThenSend(batch.to_vec(), pkts.to_vec())
+            }
+        }
+    }
+
+    /// Drain any pending decoded packets across active epochs into `out`.
+    pub fn drain_tun(&mut self, out: &mut Vec<Vec<u8>>) {
+        self.current.drain_tun(out);
+        if let Some(ref mut next) = self.next {
+            next.dp.drain_tun(out);
+        }
+        if let Some(ref mut prev) = self.previous {
+            prev.drain_tun(out);
         }
     }
 

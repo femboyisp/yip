@@ -916,6 +916,31 @@ impl UringDriver {
                     udp_pkts.extend(pkts.iter().cloned());
                 }
             }
+            DispatchOut::TunBatch(batch) => {
+                for pkt in batch {
+                    if let Err(e) = self.queue_tun_write(pkt) {
+                        self.dropped_sends += 1;
+                        eprintln!(
+                            "uring: drop tun write: {e} (dropped_sends={})",
+                            self.dropped_sends
+                        );
+                    }
+                }
+            }
+            DispatchOut::TunBatchThenUdp(batch, pkts) => {
+                for pkt in batch {
+                    if let Err(e) = self.queue_tun_write(pkt) {
+                        self.dropped_sends += 1;
+                        eprintln!(
+                            "uring: drop tun write: {e} (dropped_sends={})",
+                            self.dropped_sends
+                        );
+                    }
+                }
+                if udp_pkts.is_empty() && !pkts.is_empty() {
+                    udp_pkts.extend(pkts.iter().cloned());
+                }
+            }
         }
         if !udp_pkts.is_empty() {
             // `allow_gso=false`: control/ARQ-retransmit traffic is never
@@ -1206,6 +1231,14 @@ impl UringDriver {
             }
         }
         d.recycle(&mut tick_pkts);
+
+        let mut tun_batch = Vec::new();
+        d.drain_tun(&mut tun_batch);
+        for pkt in &tun_batch {
+            if let Err(e) = self.queue_tun_write(pkt) {
+                eprintln!("uring: drop drained tun packet: {e}");
+            }
+        }
 
         // SQEs queued above (re-armed recvs, tick sends) are flushed by the
         // `submit()` at the top of the next `poll_once`, before the next wait.

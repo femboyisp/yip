@@ -126,6 +126,18 @@ fn test_daita_end_to_end_traffic_and_decoy_dropping() {
                     data_count += 1;
                     all_received_tun.push(tun_pkt.to_vec());
                 }
+                DispatchOut::TunBatch(batch) => {
+                    for pkt in batch {
+                        data_count += 1;
+                        all_received_tun.push(pkt.clone());
+                    }
+                }
+                DispatchOut::TunBatchThenUdp(batch, _) => {
+                    for pkt in batch {
+                        data_count += 1;
+                        all_received_tun.push(pkt.clone());
+                    }
+                }
                 DispatchOut::None => {
                     // Receiver silently dropped junk/decoy datagrams
                     junk_count += 1;
@@ -194,6 +206,10 @@ fn test_daita_receiver_drops_injected_junk_datagram() {
         if let DispatchOut::Tun(p) | DispatchOut::Both(p, _) = out {
             assert_eq!(p, &payload[..]);
             delivered = true;
+        } else if let DispatchOut::TunBatch(b) | DispatchOut::TunBatchThenUdp(b, _) = out {
+            if b.iter().any(|pkt| pkt == &payload[..]) {
+                delivered = true;
+            }
         }
     }
     assert!(

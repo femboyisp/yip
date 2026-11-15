@@ -64,6 +64,9 @@ pub trait Dispatch {
     fn next_timeout_ms(&self, _now_ms: u64) -> Option<u64> {
         None
     }
+
+    /// Drain pending decoded packets destined for TUN (e.g. from expired reorder deadlines).
+    fn drain_tun(&mut self, _out: &mut Vec<Vec<u8>>) {}
 }
 
 /// One egress datagram: its destination, plus the FEC "fate group" it
@@ -102,6 +105,10 @@ pub enum DispatchOut<'a> {
     Udp(&'a [EgressDatagram]),
     /// Write to TUN *and* send datagrams.
     Both(&'a [u8], &'a [EgressDatagram]),
+    /// Write a contiguous batch of decoded inner packets to TUN.
+    TunBatch(&'a [Vec<u8>]),
+    /// Write a contiguous batch of packets to TUN *and* send datagrams on UDP.
+    TunBatchThenUdp(&'a [Vec<u8>], &'a [EgressDatagram]),
 }
 
 // ── internal helpers ──────────────────────────────────────────────────────────
@@ -173,6 +180,28 @@ fn drain_udp(
                 }
                 DispatchOut::Both(inner, pkts) => {
                     write_to_tun(tun_fd, inner, vnet_hdr, coalescer);
+                    for s in pkts {
+                        let mut slot = gso.recycle.pop().unwrap_or_else(|| EgressDatagram {
+                            fate: s.fate,
+                            dst: s.dst,
+                            bytes: Vec::with_capacity(crate::MAX_WIRE_DATAGRAM),
+                        });
+                        slot.fate = s.fate;
+                        slot.dst = s.dst;
+                        slot.bytes.clear();
+                        slot.bytes.extend_from_slice(&s.bytes);
+                        tx.push(slot);
+                    }
+                }
+                DispatchOut::TunBatch(batch) => {
+                    for pkt in batch {
+                        write_to_tun(tun_fd, pkt, vnet_hdr, coalescer);
+                    }
+                }
+                DispatchOut::TunBatchThenUdp(batch, pkts) => {
+                    for pkt in batch {
+                        write_to_tun(tun_fd, pkt, vnet_hdr, coalescer);
+                    }
                     for s in pkts {
                         let mut slot = gso.recycle.pop().unwrap_or_else(|| EgressDatagram {
                             fate: s.fate,
@@ -821,6 +850,7 @@ pub fn run_poll<D: Dispatch>(
     let mut rx_lens = [0usize; MAX_DATAGRAM_BATCH];
     let mut rx_srcs = [SocketAddr::from(([0, 0, 0, 0], 0)); MAX_DATAGRAM_BATCH];
     let mut tx_batch: Vec<EgressDatagram> = Vec::with_capacity(MAX_DATAGRAM_BATCH);
+    let mut tun_batch: Vec<Vec<u8>> = Vec::new();
     let mut gso = GsoScratch::new();
 
     // TUN-offload state (active only when `vnet_hdr`): `coalescer` merges
@@ -927,6 +957,16 @@ pub fn run_poll<D: Dispatch>(
                 return Err(e);
             }
             d.recycle(&mut gso.recycle);
+        }
+
+        d.drain_tun(&mut tun_batch);
+        for pkt in tun_batch.drain(..) {
+            write_to_tun(tun_fd, &pkt, vnet_hdr, &mut coalescer);
+        }
+        if vnet_hdr {
+            if let Some(frame) = coalescer.flush() {
+                send_to_tun(tun_fd, frame);
+            }
         }
     }
 }

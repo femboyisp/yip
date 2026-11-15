@@ -357,6 +357,9 @@ fn owned_out(
     match out {
         DispatchOut::None | DispatchOut::Udp(_) => (None, pkts),
         DispatchOut::Tun(inner) | DispatchOut::Both(inner, _) => (Some(inner.to_vec()), pkts),
+        DispatchOut::TunBatch(batch) | DispatchOut::TunBatchThenUdp(batch, _) => {
+            (batch.first().cloned(), pkts)
+        }
     }
 }
 
