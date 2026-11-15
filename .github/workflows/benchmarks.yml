@@ -68,6 +68,11 @@ jobs:
           sudo apparmor_parser -R /etc/apparmor.d/usr.bin.wg 2>/dev/null || true
           sudo apparmor_parser -R /etc/apparmor.d/wg-quick 2>/dev/null || true
           sudo apparmor_parser -R /etc/apparmor.d/usr.bin.wg-quick 2>/dev/null || true
+      - name: Configure kernel sysctls for IPv6 and netem
+        run: |
+          sudo sysctl -w net.ipv6.conf.all.accept_dad=0
+          sudo sysctl -w net.ipv6.conf.default.accept_dad=0
+          sudo sysctl -w net.ipv6.conf.all.forwarding=1
       - name: Build yipd release
         run: cargo build --release -p yipd
       - name: Set up contenders
@@ -83,7 +88,7 @@ jobs:
         if: always()
         run: |
           if [ -f iperf-results.txt ]; then
-            echo "### Comparative iperf3 Netem Benchmark (TCP & UDP under loss)" >> $GITHUB_STEP_SUMMARY
+            echo "### Comparative iperf3 Netem Benchmark (Dual-Stack IPv4 & IPv6 with CPU Telemetry)" >> $GITHUB_STEP_SUMMARY
             echo '```text' >> $GITHUB_STEP_SUMMARY
             cat iperf-results.txt >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
