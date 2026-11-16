@@ -257,6 +257,31 @@ fn write_to_tun(
 /// Drain pending TUN frames, accumulating each frame's egress datagrams into `tx`
 /// and flushing them with `send_mmsg` (chunked at the batch cap).
 ///
+struct TunEmitter<'a, D: Dispatch> {
+    d: &'a mut D,
+    tx: &'a mut Vec<EgressDatagram>,
+    gso: &'a mut GsoScratch,
+    udp_fd: RawFd,
+    now_ms: u64,
+    err: Option<io::Error>,
+}
+
+impl<D: Dispatch> TunEmitter<'_, D> {
+    #[inline]
+    fn emit(&mut self, pkt: &[u8]) {
+        if self.err.is_some() {
+            return;
+        }
+        self.d.on_tun(pkt, self.now_ms, self.tx);
+        if self.tx.len() >= MAX_DATAGRAM_BATCH {
+            if let Err(e) = flush_tx(self.udp_fd, self.tx, self.gso) {
+                self.err = Some(e);
+            }
+            self.d.recycle(&mut self.gso.recycle);
+        }
+    }
+}
+
 /// When `vnet_hdr` is set (kernel GSO/GRO offload active on the TUN fd), each
 /// read may be a kernel-GRO'd super-frame prefixed with a `virtio_net_hdr`;
 /// `split_gro` splits it into `split_out`/`split_offs` and each resulting MTU
@@ -284,54 +309,69 @@ pub fn drain_tun(
     split_out: &mut Vec<u8>,
     split_offs: &mut Vec<(usize, usize)>,
 ) -> io::Result<()> {
-    loop {
-        // SAFETY: `buf` is a valid caller-owned buffer; `tun_fd` is a valid
-        // non-blocking TUN fd. TUN is not a socket, so we `read` rather than `recv`.
-        let n = unsafe { libc::read(tun_fd, buf.as_mut_ptr().cast(), buf.len()) };
-        if n < 0 {
-            let e = io::Error::last_os_error();
-            let raw = e.raw_os_error().unwrap_or(0);
-            if raw == libc::EWOULDBLOCK || raw == libc::EAGAIN {
+    let mut ack_compressor = crate::ack_coalesce::AckCompressor::new();
+
+    {
+        let mut emitter = TunEmitter {
+            d,
+            tx,
+            gso,
+            udp_fd,
+            now_ms,
+            err: None,
+        };
+
+        loop {
+            // SAFETY: `buf` is a valid caller-owned buffer; `tun_fd` is a valid
+            // non-blocking TUN fd. TUN is not a socket, so we `read` rather than `recv`.
+            let n = unsafe { libc::read(tun_fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                let raw = e.raw_os_error().unwrap_or(0);
+                if raw == libc::EWOULDBLOCK || raw == libc::EAGAIN {
+                    break;
+                }
+                if raw == libc::EINTR {
+                    continue;
+                }
+                return Err(e);
+            }
+            if n == 0 {
                 break;
             }
-            if raw == libc::EINTR {
-                continue;
+            let n = usize::try_from(n).expect("non-negative read return fits usize");
+            if vnet_hdr {
+                if crate::tun_offload::split_gro(&buf[..n], split_out, split_offs) {
+                    for &(s, l) in split_offs.iter() {
+                        ack_compressor.push(&split_out[s..s + l], |pkt| emitter.emit(pkt));
+                        if emitter.err.is_some() {
+                            break;
+                        }
+                    }
+                } else if let Some(body) = buf.get(crate::tun_offload::VNET_HDR_LEN..n) {
+                    // Unparseable vnet_hdr framing (e.g. GSO_NONE with a non-IPv4/TCP
+                    // body, or any other read that isn't a segmentable TCP run):
+                    // feed the frame body as a single packet, same as the plain path.
+                    ack_compressor.push(body, |pkt| emitter.emit(pkt));
+                }
+                // else: read shorter than the vnet_hdr prefix itself — drop it.
+            } else {
+                let inner = &buf[..n];
+                ack_compressor.push(inner, |pkt| emitter.emit(pkt));
             }
+
+            if emitter.err.is_some() {
+                break;
+            }
+        }
+
+        ack_compressor.flush(|pkt| emitter.emit(pkt));
+
+        if let Some(e) = emitter.err {
             return Err(e);
         }
-        if n == 0 {
-            break;
-        }
-        let n = usize::try_from(n).expect("non-negative read return fits usize");
-        if vnet_hdr {
-            if crate::tun_offload::split_gro(&buf[..n], split_out, split_offs) {
-                for &(s, l) in split_offs.iter() {
-                    d.on_tun(&split_out[s..s + l], now_ms, tx);
-                    if tx.len() >= MAX_DATAGRAM_BATCH {
-                        flush_tx(udp_fd, tx, gso)?;
-                        d.recycle(&mut gso.recycle);
-                    }
-                }
-            } else if let Some(body) = buf.get(crate::tun_offload::VNET_HDR_LEN..n) {
-                // Unparseable vnet_hdr framing (e.g. GSO_NONE with a non-IPv4/TCP
-                // body, or any other read that isn't a segmentable TCP run):
-                // feed the frame body as a single packet, same as the plain path.
-                d.on_tun(body, now_ms, tx);
-                if tx.len() >= MAX_DATAGRAM_BATCH {
-                    flush_tx(udp_fd, tx, gso)?;
-                    d.recycle(&mut gso.recycle);
-                }
-            }
-            // else: read shorter than the vnet_hdr prefix itself — drop it.
-        } else {
-            let inner = &buf[..n];
-            d.on_tun(inner, now_ms, tx);
-            if tx.len() >= MAX_DATAGRAM_BATCH {
-                flush_tx(udp_fd, tx, gso)?;
-                d.recycle(&mut gso.recycle);
-            }
-        }
     }
+
     flush_tx(udp_fd, tx, gso)?; // send the burst's remaining egress
     d.recycle(&mut gso.recycle);
     Ok(())

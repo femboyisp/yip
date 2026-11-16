@@ -20,6 +20,9 @@ pub const MAX_SLOT_PACKET_LEN: usize = 2048;
 /// Standard IEEE 802.3 Ethernet frame header length in bytes.
 pub const ETHERNET_HEADER_LEN: usize = 14;
 
+/// Default micro-reorder eviction deadline in milliseconds for typical network paths.
+pub const DEFAULT_REORDER_DEADLINE_MS: u64 = 10;
+
 const EMPTY_FLOW_KEY: FlowKey = FlowKey {
     src: [0u8; 16],
     dst: [0u8; 16],
@@ -290,9 +293,21 @@ impl ReorderBuffer {
             .try_into()
             .unwrap_or_else(|_| panic!("size mismatch"));
         Self {
-            micro_deadline_ms,
+            micro_deadline_ms: micro_deadline_ms.max(1),
             flows,
         }
+    }
+
+    /// Return the active micro-reorder eviction deadline in milliseconds.
+    #[inline]
+    pub fn deadline_ms(&self) -> u64 {
+        self.micro_deadline_ms
+    }
+
+    /// Dynamically update the micro-reorder eviction deadline in milliseconds.
+    #[inline]
+    pub fn set_deadline_ms(&mut self, deadline_ms: u64) {
+        self.micro_deadline_ms = deadline_ms.max(1);
     }
 
     fn flush_flow_slots<F>(&mut self, flow_idx: usize, emit: &mut F) -> usize
@@ -571,6 +586,6 @@ impl ReorderBuffer {
 
 impl Default for ReorderBuffer {
     fn default() -> Self {
-        Self::new(2)
+        Self::new(DEFAULT_REORDER_DEADLINE_MS)
     }
 }

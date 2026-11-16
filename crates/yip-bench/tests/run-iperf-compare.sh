@@ -416,7 +416,7 @@ measure_iperf() {
             fi
             sleep 0.05
         done
-        out="$(timeout 45 ip netns exec "$ns_cli" iperf3 -c "$srv_ip" $v6_flag -C "$TCP_CC" -P "$streams" --connect-timeout 20000 -t 8 -J 2>/dev/null || true)"
+        out="$(timeout 45 ip netns exec "$ns_cli" iperf3 -c "$srv_ip" $v6_flag -C "$TCP_CC" -P "$streams" --connect-timeout 20000 -t "${IPERF_DURATION:-8}" -J 2>/dev/null || true)"
         kill -9 "$srv_pid" 2>/dev/null || true
         wait "$srv_pid" 2>/dev/null || true
         ip netns exec "$ns_srv" killall -9 iperf3 2>/dev/null || true
@@ -481,7 +481,7 @@ measure_iperf_udp() {
         done
         sample_cpu_start
         out="$(timeout 45 ip netns exec "$ns_cli" iperf3 -c "$srv_ip" $v6_flag -u \
-            -b "${UDP_RATE:-10G}" -l "${UDP_LEN:-1400}" --connect-timeout 20000 -t 8 -J 2>/dev/null || true)"
+            -b "${UDP_RATE:-10G}" -l "${UDP_LEN:-1400}" --connect-timeout 20000 -t "${IPERF_DURATION:-8}" -J 2>/dev/null || true)"
         read -r cpu_pct _ <<< "$(sample_cpu_end)"
         kill -9 "$srv_pid" 2>/dev/null || true
         wait "$srv_pid" 2>/dev/null || true
@@ -1477,6 +1477,7 @@ for LOSS in $LOSS_RATES; do
     Y_RAM="$(get_ns_ram_mb "$NS_YA")"
     Y_RAM_EFF="$(calc_ram_efficiency "$Y_RAM" "$Y_UDP_MBPS")"
     echo "[yip] [ipv4] ping_loss=${Y_LOSS}% rtt=${Y_RTT}ms tcp=${Y_TCP}Mbit/s tcp_loss=${Y_TCP_LOSS}% udp=${Y_UDP_MBPS}Mbit/s udp_loss=${Y_UDP_LOSS}% cpu=${Y_CPU}% eff=${Y_EFF} ram=${Y_RAM}MB ram_eff=${Y_RAM_EFF}"
+    sleep 0.5
 
     read -r Y6_LOSS Y6_RTT <<< "$(measure_ping "$NS_YB" "$TUN_YA_IP6")"
     read -r Y6_TCP Y6_TCP_LOSS <<< "$(measure_iperf "$NS_YA" "$TUN_YA_IP6" "$NS_YB")"
@@ -1484,6 +1485,7 @@ for LOSS in $LOSS_RATES; do
     Y6_RAM="$(get_ns_ram_mb "$NS_YA")"
     Y6_RAM_EFF="$(calc_ram_efficiency "$Y6_RAM" "$Y6_UDP_MBPS")"
     echo "[yip] [ipv6] ping_loss=${Y6_LOSS}% rtt=${Y6_RTT}ms tcp=${Y6_TCP}Mbit/s tcp_loss=${Y6_TCP_LOSS}% udp=${Y6_UDP_MBPS}Mbit/s udp_loss=${Y6_UDP_LOSS}% cpu=${Y6_CPU}% eff=${Y6_EFF} ram=${Y6_RAM}MB ram_eff=${Y6_RAM_EFF}"
+    sleep 0.5
 
     if [ "$Y_TCP" = "0.0" ] || [ "$Y_TCP" = "N/A" ] || \
        [ "$Y6_TCP" = "0.0" ] || [ "$Y6_TCP" = "N/A" ] || \

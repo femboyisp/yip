@@ -787,6 +787,19 @@ impl DataPlane {
                         let frac_default =
                             observe_class(FlowClass::Default, missing_default, sent_default);
 
+                        // If the overall underlay channel experiences packet loss, ensure Bulk traffic
+                        // is proactively aware of the channel loss floor rather than starting at zero.
+                        let total_sent = sent_rt + sent_bulk + sent_default;
+                        let total_missing = missing_rt + missing_bulk + missing_default;
+                        if total_sent > 0 || total_missing > 0 {
+                            let channel_loss =
+                                fraction_f32(total_missing, total_sent.max(total_missing).max(1));
+                            if channel_loss > 0.0 {
+                                let effective_bulk = frac_bulk.unwrap_or(0.0).max(channel_loss);
+                                self.transport.observe_loss(FlowClass::Bulk, effective_bulk);
+                            }
+                        }
+
                         // Blackhole loss detection: severe loss across default or bulk triggers fast fallback.
                         let severe_default =
                             frac_default.is_some_and(|f| f >= 0.8) && sent_default >= 3;
