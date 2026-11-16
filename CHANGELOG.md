@@ -6,6 +6,8 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **BLAKE3 Hardware SIMD Acceleration (`Cargo.toml`, #244).**
+  Activated dynamic hardware SIMD vectorization (AVX-512, AVX2, SSE4.1, and NEON) for `blake3` across the workspace by enabling standard library runtime feature detection (`std`) and `neon` SIMD targets alongside `zeroize`. Accelerates PQ-Noise key derivation ratchets, ephemeral token MACs, session authentication keys, and overlay IPv6 address hashing across x86_64 and aarch64 platforms while maintaining zero-allocation hot paths.
 - **Phase 2: Multi-Queue Underlay Dispatch, Socket Buffer Expansion & Lock-Free Sharding (`crates/yip-io`, `bin/yipd`, #205, #240, #241).**
   - Expanded socket buffer sizing via privileged `SO_RCVBUFFORCE` / `SO_SNDBUFFORCE` with graceful fallback to standard `SO_RCVBUF` / `SO_SNDBUF` up to 16 MiB, eliminating socket drop bottlenecks during high-throughput bursts.
   - Quadrupled ARQ retention horizon in `DataPlane` (`SENT_LOG_CAPACITY` and `RETX_BUFFER_MAX` to 65,536 entries), ensuring NACKs within the retransmission feedback loop locate packets without eviction.

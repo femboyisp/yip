@@ -26,7 +26,7 @@ yip-utls = { version = "0.1.0", path = "crates/yip-utls" }
 yip-verify = { version = "0.1.0", path = "crates/yip-verify" }
 yip-ca = { version = "0.1.0", path = "bin/yip-ca" }
 
-blake3 = { version = "1.8", default-features = false, features = ["zeroize"] }
+blake3 = { version = "1.8", features = ["zeroize", "neon"] }
 subtle = "2.6"
 thiserror = "2.0.9"
 
