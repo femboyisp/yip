@@ -35,8 +35,8 @@ pub struct DataPlaneCounters {
 // ── constants (wired into DataPlane::new; tunnel.rs keeps its own copies until
 //    Task 3 replaces the two-thread loop with this DataPlane) ─────────────────
 
-const SENT_LOG_CAPACITY: usize = 4096;
-const RETX_BUFFER_MAX: usize = 16_384;
+const SENT_LOG_CAPACITY: usize = 65_536;
+const RETX_BUFFER_MAX: usize = 65_536;
 const RETX_BUFFER_TTL_MS: u64 = 2000;
 const RETX_EXTRA_REPAIR: u32 = 4;
 

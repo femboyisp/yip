@@ -434,7 +434,7 @@ pub(crate) fn select_egress_socket<'a>(
     };
 
     let flow_hash = crate::flow::FlowTuple::extract(ip_pkt)
-        .map(|f| f.flow_hash())
+        .map(|f| f.symmetric_flow_hash())
         .unwrap_or(0);
     let chosen = &pool[(flow_hash as usize) % pool.len()];
     if let Ok(chosen_local) = chosen.local_addr() {
@@ -445,20 +445,18 @@ pub(crate) fn select_egress_socket<'a>(
     chosen
 }
 
-fn write_tun(tun_fd: std::os::fd::RawFd, inner: &[u8], vnet_hdr: bool) {
+fn write_tun(
+    tun_fd: std::os::fd::RawFd,
+    inner: &[u8],
+    vnet_hdr: bool,
+    coalescer: &mut yip_io::tun_offload::Coalescer,
+) {
+    if inner.is_empty() {
+        return;
+    }
     if vnet_hdr {
-        if inner.len() <= yip_io::MAX_WIRE_DATAGRAM {
-            let mut buf = [0u8; yip_device::VNET_HDR_LEN + yip_io::MAX_WIRE_DATAGRAM];
-            let end = yip_device::VNET_HDR_LEN + inner.len();
-            buf[yip_device::VNET_HDR_LEN..end].copy_from_slice(inner);
-            if let Err(e) = yip_io::epoll::write_fd(tun_fd, &buf[..end]) {
-                eprintln!("sharded: tun write error: {e}");
-            }
-        } else {
-            let mut buf = Vec::with_capacity(yip_device::VNET_HDR_LEN + inner.len());
-            buf.extend_from_slice(&[0u8; yip_device::VNET_HDR_LEN]);
-            buf.extend_from_slice(inner);
-            if let Err(e) = yip_io::epoll::write_fd(tun_fd, &buf) {
+        if let Some(frame) = coalescer.push(inner) {
+            if let Err(e) = yip_io::epoll::write_fd(tun_fd, frame) {
                 eprintln!("sharded: tun write error: {e}");
             }
         }
@@ -734,10 +732,12 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                     } else {
                         std::net::SocketAddr::from(([0u8; 4], 0))
                     };
-                    crate::port::bind_udp_egress_pool(egress_bind, 64).unwrap_or_default()
+                    let pool_size = (num_shards * 16).clamp(32, 64);
+                    crate::port::bind_udp_egress_pool(egress_bind, pool_size).unwrap_or_default()
                 } else {
                     Vec::new()
                 };
+                let mut coalescer = yip_io::tun_offload::Coalescer::new(tun_dev.has_uso());
                 let mut coalesced_timer = CoalescedTimer::new();
                 let (min_spin_us, max_spin_us) = if let Some(fixed) = std::env::var("YIP_BUSY_POLL_US")
                     .ok()
@@ -868,7 +868,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                             let (tun_out, egress) =
                                                 owned_out(manager.on_udp(dg.src, payload, cached_now_ms));
                                             for inner in &tun_out {
-                                                write_tun(tun_fd, inner, vnet_len > 0);
+                                                write_tun(tun_fd, inner, vnet_len > 0, &mut coalescer);
                                             }
                                             if !egress.is_empty() {
                                                 let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
@@ -889,6 +889,11 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                                     Err(e) => return Err(e),
+                                }
+                            }
+                            if vnet_len > 0 {
+                                if let Some(frame) = coalescer.flush() {
+                                    let _ = yip_io::epoll::write_fd(tun_fd, frame);
                                 }
                             }
                         } else if let Some(ref mut s) = slab {
@@ -937,7 +942,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                             let (tun_out, egress) =
                                                 owned_out(manager.on_udp(cfg.listen, payload, cached_now_ms));
                                             for inner in &tun_out {
-                                                write_tun(tun_fd, inner, vnet_len > 0);
+                                                write_tun(tun_fd, inner, vnet_len > 0, &mut coalescer);
                                             }
                                             if !egress.is_empty() {
                                                 let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
@@ -960,6 +965,11 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                     }
                                 }
                             }
+                            if vnet_len > 0 {
+                                if let Some(frame) = coalescer.flush() {
+                                    let _ = yip_io::epoll::write_fd(tun_fd, frame);
+                                }
+                            }
                         }
                     }
 
@@ -975,51 +985,41 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                                             tx_chans: &[Option<
                                             yip_io::spsc::SpscProducer<OutboundPacket, 2048>,
                                         >]| {
-                                            if mgr.is_tun_target_established(pkt) {
-                                                let egress = mgr.on_tun(pkt, cached_now_ms);
-                                                for dg in egress {
-                                                    let is_data = dg.bytes.first()
-                                                        == Some(&(crate::handshake::PacketType::Data as u8));
-                                                    let send_sock = if is_data {
-                                                        select_egress_socket(
-                                                            &sock,
-                                                            &egress_pool,
-                                                            pkt,
-                                                            is_tap,
-                                                            dg.dst,
-                                                        )
-                                                    } else {
-                                                        &sock
-                                                    };
-                                                    let _ = send_sock.send_to(&dg.bytes, dg.dst);
-                                                }
-                                            } else if shard_id == 0 {
-                                                let egress = mgr.on_tun(pkt, cached_now_ms);
-                                                for dg in egress {
-                                                    let is_data = dg.bytes.first()
-                                                        == Some(&(crate::handshake::PacketType::Data as u8));
-                                                    let send_sock = if is_data {
-                                                        select_egress_socket(
-                                                            &sock,
-                                                            &egress_pool,
-                                                            pkt,
-                                                            is_tap,
-                                                            dg.dst,
-                                                        )
-                                                    } else {
-                                                        &sock
-                                                    };
-                                                    let _ = send_sock.send_to(&dg.bytes, dg.dst);
-                                                }
-                                                for epoch in mgr.drain_new_epochs() {
-                                                    for k in 1..num_shards {
-                                                        if let Some(Some(ref tx)) = tx_chans.get(k) {
-                                                            let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
+                                            if !mgr.is_tun_target_established(pkt) {
+                                                if shard_id == 0 {
+                                                    let egress = mgr.on_tun(pkt, cached_now_ms);
+                                                    for dg in egress {
+                                                        let _ = sock.send_to(&dg.bytes, dg.dst);
+                                                    }
+                                                    for epoch in mgr.drain_new_epochs() {
+                                                        for k in 1..num_shards {
+                                                            if let Some(Some(ref tx)) = tx_chans.get(k) {
+                                                                let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
+                                                            }
                                                         }
                                                     }
+                                                } else if let Some(Some(ref tx)) = tx_chans.first() {
+                                                    let _ = tx.push(ShardMsg::Packet(pkt.to_vec()));
                                                 }
-                                            } else if let Some(Some(ref tx)) = tx_chans.first() {
-                                                let _ = tx.push(ShardMsg::Packet(pkt.to_vec()));
+                                                return;
+                                            }
+
+                                            let egress = mgr.on_tun(pkt, cached_now_ms);
+                                            for dg in egress {
+                                                let is_data = dg.bytes.first()
+                                                    == Some(&(crate::handshake::PacketType::Data as u8));
+                                                let send_sock = if is_data {
+                                                    select_egress_socket(
+                                                        &sock,
+                                                        &egress_pool,
+                                                        pkt,
+                                                        is_tap,
+                                                        dg.dst,
+                                                    )
+                                                } else {
+                                                    &sock
+                                                };
+                                                let _ = send_sock.send_to(&dg.bytes, dg.dst);
                                             }
                                         };
 
@@ -1119,7 +1119,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                     let (tun_out, egress) =
                                         owned_out(manager.on_udp(*src, bytes, cached_now_ms));
                                     for inner in &tun_out {
-                                        write_tun(tun_fd, inner, vnet_len > 0);
+                                        write_tun(tun_fd, inner, vnet_len > 0, &mut coalescer);
                                     }
                                     if !egress.is_empty() {
                                         let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
@@ -1140,7 +1140,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                     let (tun_out, egress) =
                                         owned_out(manager.on_udp(*src, bytes, cached_now_ms));
                                     for inner in &tun_out {
-                                        write_tun(tun_fd, inner, vnet_len > 0);
+                                        write_tun(tun_fd, inner, vnet_len > 0, &mut coalescer);
                                     }
                                     if !egress.is_empty() {
                                         let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
@@ -1157,6 +1157,11 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                         }
                                     }
                                 }
+                            }
+                        }
+                        if vnet_len > 0 {
+                            if let Some(frame) = coalescer.flush() {
+                                let _ = yip_io::epoll::write_fd(tun_fd, frame);
                             }
                         }
                     }
@@ -1188,7 +1193,12 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                             }
                             manager.drain_tun(&mut tun_batch);
                             for inner in tun_batch.drain(..) {
-                                write_tun(tun_fd, &inner, vnet_len > 0);
+                                write_tun(tun_fd, &inner, vnet_len > 0, &mut coalescer);
+                            }
+                            if vnet_len > 0 {
+                                if let Some(frame) = coalescer.flush() {
+                                    let _ = yip_io::epoll::write_fd(tun_fd, frame);
+                                }
                             }
                             if shard_id == 0 {
                                 for epoch in manager.drain_new_epochs() {
