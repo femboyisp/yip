@@ -325,7 +325,7 @@ impl FecEncoder {
     }
 
     /// Shared encode: K source + R repair (R clamped to 255-K), K bounds enforced.
-    fn build_with_arena<'a>(
+    pub fn build_with_arena<'a>(
         ciphertext: &[u8],
         params: crate::FlowParams,
         object_id: u16,

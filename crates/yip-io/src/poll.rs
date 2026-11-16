@@ -67,6 +67,19 @@ pub trait Dispatch {
 
     /// Drain pending decoded packets destined for TUN (e.g. from expired reorder deadlines).
     fn drain_tun(&mut self, _out: &mut Vec<Vec<u8>>) {}
+
+    /// Flush any pending decoded packets destined for TUN (waiting for in-flight decryption).
+    fn flush_tun(&mut self, out: &mut Vec<Vec<u8>>) {
+        self.drain_tun(out);
+    }
+
+    /// Drain pending encrypted datagrams destined for UDP egress before flush_tx (non-blocking).
+    fn drain_egress(&mut self, _out: &mut Vec<EgressDatagram>) {}
+
+    /// Flush any pending encrypted datagrams destined for UDP egress (waiting for in-flight encryption).
+    fn flush_egress(&mut self, out: &mut Vec<EgressDatagram>) {
+        self.drain_egress(out);
+    }
 }
 
 /// One egress datagram: its destination, plus the FEC "fate group" it
@@ -153,6 +166,7 @@ fn drain_udp(
     gso: &mut GsoScratch,
     vnet_hdr: bool,
     coalescer: &mut crate::tun_offload::Coalescer,
+    tun_batch: &mut Vec<Vec<u8>>,
 ) -> io::Result<()> {
     loop {
         let n = recv_mmsg(udp_fd, bufs, lens, srcs, &mut gso.rx_arena)?;
@@ -217,6 +231,10 @@ fn drain_udp(
                 }
             }
         }
+        d.flush_tun(tun_batch);
+        for pkt in tun_batch.drain(..) {
+            write_to_tun(tun_fd, &pkt, vnet_hdr, coalescer);
+        }
         flush_tx(udp_fd, tx, gso)?; // send any UDP replies for this recv burst
         d.recycle(&mut gso.recycle);
         if n < MAX_DATAGRAM_BATCH {
@@ -273,6 +291,7 @@ impl<D: Dispatch> TunEmitter<'_, D> {
             return;
         }
         self.d.on_tun(pkt, self.now_ms, self.tx);
+        self.d.drain_egress(self.tx);
         if self.tx.len() >= MAX_DATAGRAM_BATCH {
             if let Err(e) = flush_tx(self.udp_fd, self.tx, self.gso) {
                 self.err = Some(e);
@@ -372,6 +391,7 @@ pub fn drain_tun(
         }
     }
 
+    d.flush_egress(tx);
     flush_tx(udp_fd, tx, gso)?; // send the burst's remaining egress
     d.recycle(&mut gso.recycle);
     Ok(())
@@ -962,6 +982,7 @@ pub fn run_poll<D: Dispatch>(
                     &mut gso,
                     vnet_hdr,
                     &mut coalescer,
+                    &mut tun_batch,
                 ) {
                     // SAFETY: `epoll_fd` is valid.
                     unsafe { libc::close(epoll_fd) };
@@ -1084,6 +1105,7 @@ mod tests {
         let mut tx = Vec::new();
         let mut gso = GsoScratch::new();
         let mut coalescer = crate::tun_offload::Coalescer::new(false);
+        let mut tun_batch = Vec::new();
         drain_udp(
             b.as_raw_fd(),
             null_fd,
@@ -1096,6 +1118,7 @@ mod tests {
             &mut gso,
             false,
             &mut coalescer,
+            &mut tun_batch,
         )
         .unwrap();
 
@@ -1129,6 +1152,7 @@ mod tests {
         let mut tx = Vec::new();
         let mut gso = GsoScratch::new();
         let mut coalescer = crate::tun_offload::Coalescer::new(false);
+        let mut tun_batch = Vec::new();
         drain_udp(
             b.as_raw_fd(),
             null_fd,
@@ -1141,6 +1165,7 @@ mod tests {
             &mut gso,
             false,
             &mut coalescer,
+            &mut tun_batch,
         )
         .unwrap();
 
@@ -1229,6 +1254,7 @@ mod tests {
         let mut tx = Vec::new();
         let mut gso = GsoScratch::new();
         let mut coalescer = crate::tun_offload::Coalescer::new(false);
+        let mut tun_batch = Vec::new();
         drain_udp(
             b.as_raw_fd(),
             null_fd,
@@ -1241,6 +1267,7 @@ mod tests {
             &mut gso,
             false,
             &mut coalescer,
+            &mut tun_batch,
         )
         .unwrap();
 

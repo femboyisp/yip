@@ -514,6 +514,10 @@ pub struct PeerManager {
     metrics: std::sync::Arc<crate::metrics::MetricsRegistry>,
     /// Monotonic timestamp in milliseconds of the last cached metrics peer stats update.
     last_metrics_update_ms: u64,
+    /// Dedicated parallel worker pool for ChaCha20-Poly1305 encryption/decryption (#243).
+    pub(crate) crypto_pool: Option<crate::crypto_pool::CryptoWorkerPool>,
+    tx_crypto_seq: u64,
+    rx_crypto_seq: u64,
 }
 
 /// Dynamic DAITA traffic analysis defense runtime metrics.
@@ -663,6 +667,9 @@ impl PeerManager {
             xdp_state: crate::control::XdpState::default(),
             metrics: std::sync::Arc::new(crate::metrics::MetricsRegistry::new()),
             last_metrics_update_ms: 0,
+            crypto_pool: None,
+            tx_crypto_seq: 0,
+            rx_crypto_seq: 0,
         };
 
         // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
@@ -750,6 +757,46 @@ impl PeerManager {
     /// argument since no handshake can complete before the loop starts.
     pub fn set_obf_psk(&mut self, obf_psk: Option<[u8; 32]>) {
         self.obf_key = obf_psk.map(|p| yip_obf::derive_key(&p));
+    }
+
+    /// Configure parallel worker threads for ChaCha20-Poly1305 encryption/decryption (#243).
+    pub fn set_crypto_workers(&mut self, workers: usize) {
+        if workers > 0 {
+            let mut pool = crate::crypto_pool::CryptoWorkerPool::new(workers);
+            for (idx, p) in self.peers.iter().enumerate() {
+                if let PeerState::Established(ref epochs) = p.state {
+                    let dp = epochs.current();
+                    let send_cipher = std::sync::Arc::new(
+                        yip_crypto::session::ChaCha20Poly1305Cipher::new(*dp.raw_send_key()),
+                    );
+                    let recv_cipher = std::sync::Arc::new(
+                        yip_crypto::session::ChaCha20Poly1305Cipher::new(*dp.raw_recv_key()),
+                    );
+                    let codec = std::sync::Arc::new(dp.codec());
+                    pool.register_session(idx, send_cipher, recv_cipher, codec);
+                }
+            }
+            self.crypto_pool = Some(pool);
+        } else {
+            self.crypto_pool = None;
+        }
+    }
+
+    /// Register or update symmetric ciphers and wire codec with the crypto worker pool.
+    pub fn register_crypto_peer(&mut self, peer_idx: usize) {
+        if let Some(ref mut pool) = self.crypto_pool {
+            if let PeerState::Established(ref epochs) = self.peers[peer_idx].state {
+                let dp = epochs.current();
+                let send_cipher = std::sync::Arc::new(
+                    yip_crypto::session::ChaCha20Poly1305Cipher::new(*dp.raw_send_key()),
+                );
+                let recv_cipher = std::sync::Arc::new(
+                    yip_crypto::session::ChaCha20Poly1305Cipher::new(*dp.raw_recv_key()),
+                );
+                let codec = std::sync::Arc::new(dp.codec());
+                pool.register_session(peer_idx, send_cipher, recv_cipher, codec);
+            }
+        }
     }
 
     /// Enable (or disable) opt-in idle cover traffic (3b Task 4) from the
@@ -1569,6 +1616,7 @@ impl PeerManager {
             .ok();
             self.peers[idx].daita_engine = engine;
         }
+        self.register_crypto_peer(idx);
     }
 
     /// Returns true if the peer with public key `pubkey` has an Established session.
@@ -1928,8 +1976,39 @@ impl PeerManager {
         }
     }
 
-    /// Drain any pending decoded packets across all peers' active epochs into `out`.
+    /// Drain any pending decoded packets across all peers' active epochs into `out` (non-blocking).
     pub fn drain_tun(&mut self, out: &mut Vec<Vec<u8>>) {
+        if let Some(ref mut pool) = self.crypto_pool {
+            pool.inbound.drain_completed(|item| {
+                if !item.plaintext.is_empty() {
+                    out.push(item.plaintext);
+                }
+            });
+        }
+        for peer in &mut self.peers {
+            if let PeerState::Established(epochs) = &mut peer.state {
+                epochs.drain_tun(out);
+            }
+        }
+    }
+
+    /// Flush completed decrypted packets into `out`, waiting for all in-flight tasks.
+    pub fn flush_tun(&mut self, out: &mut Vec<Vec<u8>>) {
+        if let Some(ref mut pool) = self.crypto_pool {
+            while self.rx_crypto_seq > pool.inbound.next_expected_seq() {
+                let drained = pool.inbound.drain_completed(|item| {
+                    if !item.plaintext.is_empty() {
+                        out.push(item.plaintext);
+                    }
+                });
+                if self.rx_crypto_seq == pool.inbound.next_expected_seq() {
+                    break;
+                }
+                if drained == 0 {
+                    std::hint::spin_loop();
+                }
+            }
+        }
         for peer in &mut self.peers {
             if let PeerState::Established(epochs) = &mut peer.state {
                 epochs.drain_tun(out);
@@ -1971,6 +2050,7 @@ impl Dispatch for PeerManager {
     }
 
     fn tick(&mut self, now_ms: u64, out: &mut Vec<EgressDatagram>) {
+        self.flush_egress(out);
         if let Some(pkts) = self.tick(now_ms) {
             out.extend(pkts.iter().cloned());
         }
@@ -1978,6 +2058,42 @@ impl Dispatch for PeerManager {
 
     fn drain_tun(&mut self, out: &mut Vec<Vec<u8>>) {
         self.drain_tun(out);
+    }
+
+    fn flush_tun(&mut self, out: &mut Vec<Vec<u8>>) {
+        self.flush_tun(out);
+    }
+
+    fn drain_egress(&mut self, out: &mut Vec<EgressDatagram>) {
+        if let Some(ref mut pool) = self.crypto_pool {
+            pool.outbound.drain_completed(|mut item| {
+                for dg in item.datagrams.drain(..) {
+                    if !dg.bytes.is_empty() {
+                        out.push(dg);
+                    }
+                }
+            });
+        }
+    }
+
+    fn flush_egress(&mut self, out: &mut Vec<EgressDatagram>) {
+        if let Some(ref mut pool) = self.crypto_pool {
+            while self.tx_crypto_seq > pool.outbound.next_expected_seq() {
+                let drained = pool.outbound.drain_completed(|mut item| {
+                    for dg in item.datagrams.drain(..) {
+                        if !dg.bytes.is_empty() {
+                            out.push(dg);
+                        }
+                    }
+                });
+                if self.tx_crypto_seq == pool.outbound.next_expected_seq() {
+                    break;
+                }
+                if drained == 0 {
+                    std::hint::spin_loop();
+                }
+            }
+        }
     }
 
     fn recycle(&mut self, batch: &mut Vec<EgressDatagram>) {
@@ -2286,7 +2402,60 @@ impl PeerManager {
                     unreachable!("just matched Established above");
                 };
                 let start_len = out.len();
-                epochs.current_mut().on_tun_into(inner, now_ms, out);
+                if let Some(ref mut pool) = self.crypto_pool {
+                    while self
+                        .tx_crypto_seq
+                        .wrapping_sub(pool.outbound.next_expected_seq())
+                        >= (crate::crypto_pool::outbound::ROB_CAPACITY - 64) as u64
+                    {
+                        pool.outbound.drain_completed(|mut item| {
+                            for dg in item.datagrams.drain(..) {
+                                if !dg.bytes.is_empty() {
+                                    out.push(dg);
+                                }
+                            }
+                        });
+                        std::hint::spin_loop();
+                    }
+                    let dp = epochs.current_mut();
+                    let clamped = dp.clamp_syn(inner).to_vec();
+                    if let Ok(counter) = dp.advance_send_counter() {
+                        let seq = self.tx_crypto_seq;
+                        self.tx_crypto_seq = self.tx_crypto_seq.wrapping_add(1);
+                        let fate = (counter & 0xFFFF) as u16;
+                        let dst = dp.peer_addr();
+                        let conn_tag = dp.conn_tag();
+                        dp.record_sent(
+                            counter,
+                            yip_transport::FlowClass::Default,
+                            fate,
+                            &clamped,
+                            now_ms,
+                        );
+                        let sym_size = dp.symbol_size();
+                        let task = crate::crypto_pool::outbound::EncryptTask {
+                            seq,
+                            peer_id: idx,
+                            counter,
+                            fate,
+                            dst,
+                            conn_tag,
+                            class: yip_transport::FlowClass::Default,
+                            symbol_size: sym_size,
+                            payload: clamped,
+                        };
+                        pool.outbound
+                            .dispatch_encrypt_backpressure(task, |mut item| {
+                                for dg in item.datagrams.drain(..) {
+                                    if !dg.bytes.is_empty() {
+                                        out.push(dg);
+                                    }
+                                }
+                            });
+                    }
+                } else {
+                    epochs.current_mut().on_tun_into(inner, now_ms, out);
+                }
                 let added = out.len() - start_len;
                 self.metrics.record_fec_tx(added as u64);
                 self.handle_daita_egress_actions(idx, start_len, now_ms, out);

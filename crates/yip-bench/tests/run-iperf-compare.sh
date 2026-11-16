@@ -70,7 +70,7 @@ NS_YA="ipfYA"; NS_YB="ipfYB"; VYA="ipfvYA"; VYB="ipfvYB"
 VYA_IP="10.10.0.1"; VYB_IP="10.10.0.2"
 TUN_YA_IP="10.11.0.1"; TUN_YB_IP="10.11.0.2"
 TUN_YA_IP6="fd00:11::1"; TUN_YB_IP6="fd00:11::2"
-YPORT_A="443"; YPORT_B="443"; TUN_DEV="yip0"; YIP_MTU="${YIP_MTU:-1420}"; YIP_SHARDS="${YIP_SHARDS:-1}"
+YPORT_A="443"; YPORT_B="443"; TUN_DEV="yip0"; YIP_MTU="${YIP_MTU:-1420}"; YIP_SHARDS="${YIP_SHARDS:-1}"; YIP_CRYPTO_WORKERS="${YIP_CRYPTO_WORKERS:-auto}"
 PID_YA=""; PID_YB=""
 
 # ── WireGuard ─────────────────────────────────────────────────────────────────
@@ -534,6 +534,7 @@ peer_endpoint=${VYB_IP}:${YPORT_B}
 device=${TUN_DEV}
 initiate=false
 shards=${YIP_SHARDS}
+crypto_workers=${YIP_CRYPTO_WORKERS}
 mtu=${YIP_MTU}
 EOF
 cat > "$CFG_B" <<EOF
@@ -545,6 +546,7 @@ peer_endpoint=${VYA_IP}:${YPORT_A}
 device=${TUN_DEV}
 initiate=true
 shards=${YIP_SHARDS}
+crypto_workers=${YIP_CRYPTO_WORKERS}
 mtu=${YIP_MTU}
 EOF
 

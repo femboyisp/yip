@@ -7,6 +7,7 @@
 mod addr;
 mod config;
 mod control;
+pub mod crypto_pool;
 mod dataplane;
 mod epoch;
 pub(crate) mod flow;

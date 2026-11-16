@@ -154,6 +154,7 @@ pub enum WireError {
 
 /// Wire codec: frames `Frame`s with a SipHash coverage-auth tag and keyed
 /// header protection. Keys are injected (real session keys arrive in M3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Codec {
     auth_key: [u8; 16],
     hp_key: [u8; 16],

@@ -501,6 +501,16 @@ impl Session {
         self.send_counter
     }
 
+    /// Advance and return the next send counter for offloaded parallel encryption.
+    pub fn advance_send_counter(&mut self) -> Result<u64, CryptoError> {
+        let counter = self.send_counter;
+        self.send_counter = self
+            .send_counter
+            .checked_add(self.stride)
+            .ok_or(CryptoError::Decrypt)?;
+        Ok(counter)
+    }
+
     /// Seal one inner frame, assigning it the next send counter.
     pub fn seal(&mut self, plaintext: &[u8]) -> Result<Sealed, CryptoError> {
         let counter = self.send_counter;

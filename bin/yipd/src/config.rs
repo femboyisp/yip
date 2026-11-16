@@ -201,6 +201,9 @@ pub struct Config {
     /// Number of worker shards for multi-core throughput scaling (`shards=N` or `threads=N`).
     /// Defaults to 1 (single-threaded).
     pub shards: usize,
+    /// Dedicated parallel worker threads for ChaCha20-Poly1305 encryption/decryption
+    /// (`crypto_workers=N` or `crypto_threads=N`). Defaults to 0 (inline crypto on reactor).
+    pub crypto_workers: usize,
     /// Optional path to UNIX domain control socket (`control_socket=<path>` or `--control <path>`).
     pub control_socket: Option<std::path::PathBuf>,
     /// Configured TUN device MTU (`mtu=<576..=65535>`).
@@ -556,6 +559,7 @@ impl Config {
         let mut transport = TransportMode::default();
         let mut tls_sni: Option<String> = None;
         let mut shards: Option<usize> = None;
+        let mut crypto_workers: Option<usize> = None;
         let mut control_socket: Option<std::path::PathBuf> = None;
         let mut mtu: Option<u32> = None;
         let mut metrics_listen: Option<SocketAddr> = None;
@@ -758,6 +762,21 @@ impl Config {
                         parsed
                     };
                     shards = Some(n);
+                }
+                "crypto_workers" | "crypto_threads" => {
+                    let n = if val.eq_ignore_ascii_case("auto") {
+                        std::thread::available_parallelism()
+                            .map(|p| (p.get() / 2).clamp(2, 4))
+                            .unwrap_or(2)
+                    } else {
+                        val.parse::<usize>().map_err(|e| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("invalid crypto_workers count: {e}"),
+                            )
+                        })?
+                    };
+                    crypto_workers = Some(n);
                 }
                 "control_socket" | "control" => {
                     control_socket = Some(std::path::PathBuf::from(val));
@@ -1017,6 +1036,20 @@ impl Config {
             transport,
             tls_sni: tls_sni.unwrap_or_else(|| DEFAULT_TLS_SNI.to_owned()),
             shards: shards.unwrap_or(1),
+            crypto_workers: crypto_workers.unwrap_or_else(|| {
+                std::env::var("YIP_CRYPTO_WORKERS")
+                    .ok()
+                    .and_then(|v| {
+                        if v.eq_ignore_ascii_case("auto") {
+                            std::thread::available_parallelism()
+                                .map(|p| (p.get() / 2).clamp(2, 4))
+                                .ok()
+                        } else {
+                            v.parse().ok()
+                        }
+                    })
+                    .unwrap_or(0)
+            }),
             control_socket,
             mtu,
             metrics_listen,

@@ -415,6 +415,65 @@ impl DataPlane {
         self.conn_tag
     }
 
+    /// The wire codec used for framing and deframing packets on this session.
+    pub fn codec(&self) -> Codec {
+        self.codec
+    }
+
+    /// The remote peer's UDP destination address.
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr
+    }
+
+    /// Advance and return the next monotonic send counter for offloaded parallel encryption.
+    pub fn advance_send_counter(&mut self) -> Result<u64, yip_crypto::CryptoError> {
+        self.session.advance_send_counter()
+    }
+
+    /// Clamp TCP SYN MSS to tunnel MTU for offloaded parallel encryption.
+    pub fn clamp_syn<'a>(&'a mut self, inner: &'a [u8]) -> &'a [u8] {
+        if !self.l2 {
+            self.pmtu.clamp_syn(inner, &mut self.syn_clamp_buf)
+        } else {
+            inner
+        }
+    }
+
+    /// Record outbound transmission in sent log and ARQ tracking for offloaded encryption.
+    pub fn record_sent(
+        &mut self,
+        counter: u64,
+        class: FlowClass,
+        fate: u16,
+        payload: &[u8],
+        now_ms: u64,
+    ) {
+        self.sent_log.insert(counter, class);
+        if class.params().arq {
+            let mut buf = self
+                .retx_buf_pool
+                .pop()
+                .unwrap_or_else(|| Vec::with_capacity(payload.len() + 16));
+            buf.clear();
+            buf.extend_from_slice(payload);
+            self.retx.put(counter, buf, class, fate, now_ms);
+        }
+    }
+
+    /// Run deframing, replay protection, loss detection, and FEC reassembly on an incoming
+    /// data datagram wire payload, returning `Some((counter, ciphertext))` for offloaded parallel decryption.
+    pub fn inbound_pre_decrypt(&mut self, wire: &[u8], now_ms: u64) -> Option<(u64, Vec<u8>)> {
+        let frame = self.codec.deframe_borrowed(wire).ok()?;
+        let (sym, counter, class) = wire_glue::frame_ref_to_symbol(&frame)?;
+        if !self.session.check_replay(counter) {
+            return None;
+        }
+        self.detector.on_seen(counter, now_ms);
+        let ciphertext = self.transport.decode(counter, &sym, class, now_ms)?;
+        self.detector.on_delivered(counter);
+        Some((counter, ciphertext))
+    }
+
     /// Redirect this data plane's egress to a new peer address — WireGuard-style
     /// roaming, after the peer's authenticated source moved (M2). Every
     /// subsequently-built egress datagram (data, ARQ retransmit, tick feedback)
@@ -438,6 +497,11 @@ impl DataPlane {
     /// Dynamically override the FEC repair ratio across transport controllers.
     pub fn set_fec_repair_ratio(&mut self, ratio: f32) {
         self.transport.set_fec_repair_ratio(ratio);
+    }
+
+    /// Return the active transport symbol size.
+    pub fn symbol_size(&self) -> u16 {
+        self.transport.symbol_size()
     }
 
     /// Total count of FEC symbols produced and transmitted.

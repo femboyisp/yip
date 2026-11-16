@@ -97,7 +97,7 @@ fn test_reorder_buffer_stale_and_duplicate_rejected() {
     // Duplicate insertion
     assert_eq!(
         rob.insert(10, "ten-again"),
-        Err(ReorderError::Duplicate(10))
+        Err(("ten-again", ReorderError::Duplicate(10)))
     );
 
     // Drain
@@ -105,7 +105,10 @@ fn test_reorder_buffer_stale_and_duplicate_rejected() {
     assert_eq!(rob.next_expected_seq(), 12);
 
     // Stale insertion for seq < next_expected_seq
-    assert_eq!(rob.insert(11, "eleven-stale"), Err(ReorderError::Stale(11)));
+    assert_eq!(
+        rob.insert(11, "eleven-stale"),
+        Err(("eleven-stale", ReorderError::Stale(11)))
+    );
 }
 
 #[test]
@@ -114,7 +117,7 @@ fn test_reorder_buffer_window_full() {
 
     // Capacity is 8. seq 0..7 are in-window. seq 8 is out of window.
     rob.insert(7, 70).unwrap();
-    assert_eq!(rob.insert(8, 80), Err(ReorderError::Full(8)));
+    assert_eq!(rob.insert(8, 80), Err((80, ReorderError::Full(8))));
 
     // Fill the window and check full condition
     for i in 0..7 {

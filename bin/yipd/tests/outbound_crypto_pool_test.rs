@@ -35,6 +35,7 @@ fn test_outbound_crypto_pool_parallel_encryption_and_in_order_delivery() {
             dst: peer_addr,
             conn_tag: 0x1122334455667788,
             class: FlowClass::Default,
+            symbol_size: 1200,
             payload,
         };
 
@@ -65,13 +66,15 @@ fn test_outbound_crypto_pool_parallel_encryption_and_in_order_delivery() {
             item.seq, seq,
             "completed packet must preserve strict sequence"
         );
-        assert_eq!(item.dst, peer_addr);
-        assert_eq!(item.fate, (seq & 0xFFFF) as u16);
+        assert_eq!(item.datagrams.len(), 1);
+        let dg = &item.datagrams[0];
+        assert_eq!(dg.dst, peer_addr);
+        assert_eq!(dg.fate, (seq & 0xFFFF) as u16);
 
         // Verify that the ciphertext decrypts cleanly with the peer cipher
-        let mut decrypt_buf = item.bytes.clone();
+        let mut decrypt_buf = dg.bytes.clone();
         let decrypted_len = cipher
-            .open_in_place(seq + 1, &mut decrypt_buf, item.bytes.len())
+            .open_in_place(seq + 1, &mut decrypt_buf, dg.bytes.len())
             .expect("ciphertext must authenticate and decrypt cleanly");
 
         assert_eq!(
@@ -97,6 +100,7 @@ fn test_outbound_crypto_pool_handles_unregistered_peer() {
         dst: peer_addr,
         conn_tag: 0x1234,
         class: FlowClass::Default,
+        symbol_size: 1200,
         payload: vec![1, 2, 3],
     };
 

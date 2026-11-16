@@ -85,27 +85,28 @@ impl<T, const CAP: usize> ReorderBuffer<T, CAP> {
     /// Insert an item with sequence number `seq`.
     ///
     /// # Errors
+    /// Returns `(item, ReorderError)` if insertion cannot proceed:
     /// - `ReorderError::Stale`: `seq` is strictly less than `next_expected_seq`.
     /// - `ReorderError::Full`: `seq >= next_expected_seq + CAP`.
     /// - `ReorderError::Duplicate`: an item with sequence `seq` is already buffered.
-    pub fn insert(&mut self, seq: u64, item: T) -> Result<(), ReorderError> {
+    pub fn insert(&mut self, seq: u64, item: T) -> Result<(), (T, ReorderError)> {
         let delta = seq.wrapping_sub(self.next_expected_seq);
         if delta >= (1u64 << 63) {
             // Sequence is in the past
-            return Err(ReorderError::Stale(seq));
+            return Err((item, ReorderError::Stale(seq)));
         }
         if delta >= CAP as u64 {
             // Sequence exceeds buffer capacity horizon
-            return Err(ReorderError::Full(seq));
+            return Err((item, ReorderError::Full(seq)));
         }
 
         let slot_idx = (seq as usize) & (CAP - 1);
         if let Some((existing_seq, _)) = &self.slots[slot_idx] {
             if *existing_seq == seq {
-                return Err(ReorderError::Duplicate(seq));
+                return Err((item, ReorderError::Duplicate(seq)));
             }
             // Slot is occupied by a different sequence (should not occur if delta < CAP)
-            return Err(ReorderError::Full(seq));
+            return Err((item, ReorderError::Full(seq)));
         }
 
         self.slots[slot_idx] = Some((seq, item));

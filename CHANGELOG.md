@@ -6,6 +6,13 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **Parallel Worker Crypto Pool & Lock-Free Multi-Core Encryption Scaling (`bin/yipd`, `crates/yip-crypto`, #243).**
+  - Implemented multi-threaded worker crypto pool (`OutboundCryptoPool` and `InboundCryptoPool`) distributing ChaCha20-Poly1305 AEAD encryption and decryption across worker threads with sequence-preserving `ReorderBuffer`.
+  - Configurable worker count via `--crypto-workers <N>` CLI flag and `crypto_workers` config file setting (with `auto` defaulting to available logical CPU cores).
+  - Designed lock-free atomic sleep state (`STATE_RUNNING` / `STATE_SLEEPING`) with adaptive spinning, completely eliminating per-packet `futex` syscalls on the hot path while maintaining microsecond wakeups for idle ping traffic.
+  - Sized pre-allocated lock-free bounded SPSC channels and ring buffers (`ROB_CAPACITY = 4096`, `WORKER_QUEUE_CAP = 1024`) with strict zero heap allocations during steady-state packet processing.
+  - Integrated `FecEncoder::build_with_arena` with transport `symbol_size` slicing in worker loops, correctly handling MTU packet fragmentation without receiver reassembly drops.
+  - Bounded memory footprint to maintain <30 MB RSS under multi-gigabit throughput.
 - **Phase 2: Multi-Queue Underlay Dispatch, Socket Buffer Expansion & Lock-Free Sharding (`crates/yip-io`, `bin/yipd`, #205, #240, #241).**
   - Expanded socket buffer sizing via privileged `SO_RCVBUFFORCE` / `SO_SNDBUFFORCE` with graceful fallback to standard `SO_RCVBUF` / `SO_SNDBUF` up to 16 MiB, eliminating socket drop bottlenecks during high-throughput bursts.
   - Quadrupled ARQ retention horizon in `DataPlane` (`SENT_LOG_CAPACITY` and `RETX_BUFFER_MAX` to 65,536 entries), ensuring NACKs within the retransmission feedback loop locate packets without eviction.

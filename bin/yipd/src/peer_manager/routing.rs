@@ -263,6 +263,53 @@ impl PeerManager {
             // packet also routes through here).
             if dg[0] == PacketType::Data as u8 {
                 self.peers[idx].last_activity_ms = now_ms;
+                if let Some(ref mut pool) = self.crypto_pool {
+                    let PeerState::Established(epochs) = &mut self.peers[idx].state else {
+                        return DispatchOut::None;
+                    };
+                    if let Some((counter, ciphertext)) =
+                        epochs.current_mut().inbound_pre_decrypt(&dg[1..], now_ms)
+                    {
+                        while self
+                            .rx_crypto_seq
+                            .wrapping_sub(pool.inbound.next_expected_seq())
+                            >= (crate::crypto_pool::inbound::ROB_CAPACITY - 64) as u64
+                        {
+                            self.tun_batch_scratch.clear();
+                            let scratch = &mut self.tun_batch_scratch;
+                            pool.inbound.drain_completed(|item| {
+                                if !item.plaintext.is_empty() {
+                                    scratch.push(item.plaintext);
+                                }
+                            });
+                            std::hint::spin_loop();
+                        }
+                        let seq = self.rx_crypto_seq;
+                        self.rx_crypto_seq = self.rx_crypto_seq.wrapping_add(1);
+                        let task = crate::crypto_pool::inbound::DecryptTask {
+                            seq,
+                            peer_id: idx,
+                            counter,
+                            ciphertext,
+                        };
+                        self.tun_batch_scratch.clear();
+                        let scratch = &mut self.tun_batch_scratch;
+                        pool.inbound.dispatch_decrypt_backpressure(task, |item| {
+                            scratch.push(item.plaintext);
+                        });
+                        if !self.tun_batch_scratch.is_empty() {
+                            let total_bytes: u64 =
+                                self.tun_batch_scratch.iter().map(|b| b.len() as u64).sum();
+                            self.peers[idx].rx_bytes += total_bytes;
+                            self.peers[idx].rx_packets += self.tun_batch_scratch.len() as u64;
+                            self.metrics
+                                .record_rx(total_bytes, self.tun_batch_scratch.len() as u64);
+                            return DispatchOut::TunBatch(&self.tun_batch_scratch);
+                        }
+                        return DispatchOut::None;
+                    }
+                    return DispatchOut::None;
+                }
             }
             return self.dispatch_established(idx, src, dg, now_ms);
         }

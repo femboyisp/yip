@@ -199,6 +199,7 @@ pub fn run(config: Config) -> io::Result<()> {
     manager.set_cover_traffic_ms(config.cover_traffic_ms);
     manager.set_traffic_defense(config.traffic_defense.clone());
     manager.set_threshold_ca_server(config.threshold_ca_server);
+    manager.set_crypto_workers(config.crypto_workers);
     let control_handle = if let Some(ref path) = config.control_socket {
         Some(crate::control::ControlHandle::bind(path)?)
     } else {
