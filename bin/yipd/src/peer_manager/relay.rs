@@ -450,7 +450,7 @@ impl PeerManager {
         if !dg.is_empty() && dg[0] == PacketType::Data as u8 {
             self.peers[idx].last_activity_ms = now_ms;
         }
-        let ((tun, udp), promoted_epoch) = {
+        let ((tun, tun_batch, udp), promoted_epoch) = {
             let PeerState::Established(epochs) = &mut self.peers[idx].state else {
                 return DispatchOut::None;
             };
@@ -476,22 +476,44 @@ impl PeerManager {
             let res = match opened {
                 crate::epoch::EpochInbound::None => {
                     self.metrics.record_drop(1);
-                    (None, Vec::new())
+                    (None, None, Vec::new())
                 }
                 crate::epoch::EpochInbound::Tun(buf) => {
                     self.peers[idx].rx_bytes += buf.len() as u64;
                     self.peers[idx].rx_packets += 1;
                     self.metrics.record_rx(buf.len() as u64, 1);
-                    (Some(buf), Vec::new())
+                    (Some(buf), None, Vec::new())
                 }
                 crate::epoch::EpochInbound::Send(dgs) => {
-                    (None, dgs.iter().map(|d| d.bytes.clone()).collect())
+                    (None, None, dgs.iter().map(|d| d.bytes.clone()).collect())
                 }
                 crate::epoch::EpochInbound::TunThenSend(buf, dgs) => {
                     self.peers[idx].rx_bytes += buf.len() as u64;
                     self.peers[idx].rx_packets += 1;
                     self.metrics.record_rx(buf.len() as u64, 1);
-                    (Some(buf), dgs.iter().map(|d| d.bytes.clone()).collect())
+                    (
+                        Some(buf),
+                        None,
+                        dgs.iter().map(|d| d.bytes.clone()).collect(),
+                    )
+                }
+                crate::epoch::EpochInbound::TunBatch(batch) => {
+                    let total_bytes: u64 = batch.iter().map(|b| b.len() as u64).sum();
+                    self.peers[idx].rx_bytes += total_bytes;
+                    self.peers[idx].rx_packets += batch.len() as u64;
+                    self.metrics.record_rx(total_bytes, batch.len() as u64);
+                    (None, Some(batch), Vec::new())
+                }
+                crate::epoch::EpochInbound::TunBatchThenSend(batch, dgs) => {
+                    let total_bytes: u64 = batch.iter().map(|b| b.len() as u64).sum();
+                    self.peers[idx].rx_bytes += total_bytes;
+                    self.peers[idx].rx_packets += batch.len() as u64;
+                    self.metrics.record_rx(total_bytes, batch.len() as u64);
+                    (
+                        None,
+                        Some(batch),
+                        dgs.iter().map(|d| d.bytes.clone()).collect(),
+                    )
                 }
             };
             (res, promoted_epoch)
@@ -507,17 +529,25 @@ impl PeerManager {
                 self.egress.push(d);
             }
         }
-        match (tun, self.egress.is_empty()) {
-            (Some(t), true) => {
+        match (tun, tun_batch, self.egress.is_empty()) {
+            (Some(t), _, true) => {
                 self.tun_scratch = t;
                 DispatchOut::Tun(&self.tun_scratch)
             }
-            (Some(t), false) => {
+            (Some(t), _, false) => {
                 self.tun_scratch = t;
                 DispatchOut::Both(&self.tun_scratch, &self.egress)
             }
-            (None, false) => DispatchOut::Udp(&self.egress),
-            (None, true) => DispatchOut::None,
+            (_, Some(b), true) => {
+                self.tun_batch_scratch = b;
+                DispatchOut::TunBatch(&self.tun_batch_scratch)
+            }
+            (_, Some(b), false) => {
+                self.tun_batch_scratch = b;
+                DispatchOut::TunBatchThenUdp(&self.tun_batch_scratch, &self.egress)
+            }
+            (None, None, false) => DispatchOut::Udp(&self.egress),
+            (None, None, true) => DispatchOut::None,
         }
     }
 

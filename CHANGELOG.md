@@ -5,7 +5,40 @@ All notable changes to this project are documented here, following
 
 ## [Unreleased]
 
+### Added
+- **In-Order Ingress Micro-Reorder Buffering (`crates/yip-transport`, `bin/yipd`, `crates/yip-io`, #234).**
+  Implemented a flow-aware zero-allocation ingress micro-reorder buffer (`ReorderBuffer`) in `crates/yip-transport/src/reorder.rs` with pre-allocated slot ring (`MAX_FLOW_REORDER_SLOTS = 16`, `MAX_CONCURRENT_TRACKED_FLOWS = 64`) and ~2.0 ms micro-deadline timer eviction. Bypasses non-TCP traffic (UDP, ICMP, ARP) and TCP control frames (SYN, RST, pure ACKs) without latency, while buffering out-of-order TCP segments under channel packet loss. Emits contiguous runs in sequence (`Outcome::TunWriteBatch` / `DispatchOut::TunBatch`), preventing premature TCP 3-duplicate-ACK fast retransmits and maintaining high TCP goodput under loss.
+- **Benchmark Fairness, High-BDP Sysctls, and TCP Stack Parameterization (`crates/yip-bench`, #237).**
+  Configured `limit 50000` on `apply_netem` in `run-iperf-compare.sh`, eliminating queue buffer overflows on 10 Gbps delayed paths. Applied uniform `txqueuelen 10000` across all contender interfaces (`wg0`, `wggo0`, `awg0`, `tailscale0`, `tun0`, `wt0`, `yip0`), parameterized `TCP_CC="${TCP_CC:-cubic}"` and `IPERF_STREAMS="${IPERF_STREAMS:-1}"`, and tuned high-BDP socket buffers (`rmem_max=67108864`, `wmem_max=67108864`, `tcp_rmem`, `tcp_wmem`) and `tcp_reordering=20` across test namespaces.
+- **WireGuard-Go Userspace Contender Integration & CI Provisioning (`crates/yip-bench`, `.github/workflows/benchmarks.yml`, #221).**
+  Added automated installation and evaluation of userspace Go WireGuard (`wireguard-go`) in `setup-contenders.sh` (`--wireguard-go`) and `run-iperf-compare.sh`. Measures dual-stack IPv4/IPv6 throughput, loss, latency, CPU utilization, and peak resident memory (`get_ns_ram_mb`), enabling direct userspace-to-userspace comparisons against YIP. Added Go module build caching in `benchmarks.yml` to accelerate CI benchmarking runs.
+
 ### Fixed
+- **CI PR Mutation Testing Scope Alignment (`.github/workflows/mutants.yml`).**
+  Scoped PR diff mutation testing to the logic and control crates (`yip-wire`, `yip-transport`, `yip-crypto`, `yip-obf`, `yip-membership`, `yip-rendezvous`), matching the scheduled mutation testing suite and removing daemon binary integration test overhead (`yipd`).
+- **Benchmark Contender Setup, Host Isolation, and Mesh Protocol Provisioning (`crates/yip-bench`, #221, #237, #238).**
+  Fixed runtime configuration and provisioning issues across benchmark contenders in `crates/yip-bench/setup-contenders.sh` and `crates/yip-bench/tests/run-iperf-compare.sh`:
+  - Added `--accept-dns=false --accept-routes=false` to Tailscale namespace activation, isolating network namespace DNS configuration from host systemd-resolved and preventing host network connectivity loss during benchmark runs.
+  - Added n2n version 3+ verification (`v.3+`) with automated source compilation fallback (`git clone https://github.com/ntop/n2n.git` or release tarball fallback). Stripped `.git` directory during build to prevent tag mismatch errors (`Error: VERSION file does not match tag version`) in `scripts/version.sh`. Fixed IPv6 NDP neighbor discovery drops on n2n by passing `-r` (community packet forwarding) and `-E` (accept multicast MAC addresses) to `edge` and `-M` (disable MAC/IP spoofing checks) to `supernode`.
+  - Resolved dynamic IPv6 addresses for Tailscale via `tailscale --socket=... ip -6`, querying Headscale-assigned overlay IPv6 addresses and enabling full line-rate dual-stack IPv4/IPv6 routing.
+  - Implemented standalone ZeroTier moon generation via `zerotier-idtool initmoon`/`genmoon` with local veth `stableEndpoints`, enabling isolated network namespace operation without internet connectivity to global planet roots, along with deb archive binary extraction for non-Debian distributions.
+  - Provisioned local standalone NetBird management coordinator (`netbird-mgmt`) and WebRTC signal daemon (`netbird-signal`) with SQLite schema initialization, automated pre-population of required Geolite2/geonames databases during host setup, listening socket validation (`:8080`), and bounded 6s connection timeouts, eliminating 30-minute runner stalls in isolated network namespaces.
+  - Replaced static overlay IP assumptions with dynamic IP resolution for mesh contenders (Tailscale `tailscale0` CGNAT addresses and ZeroTier assigned addresses).
+  - Added bounded polling retry loops for OpenVPN TLS handshake completion and n2n edge supernode registration before baseline ping checks.
+  - Extended iperf connect timeout (`--connect-timeout 10000`) and command execution timeouts (`timeout 35`) under 10% synthetic netem loss, preventing client abortion during kernel SYN retry backoff and enabling accurate TCP throughput reporting (e.g. 94.0 Mbit/s IPv6 TCP under 10% packet loss).
+  - Added TUN device IPv6 sysctls (`disable_ipv6=0`, `accept_dad=0`) on `yip0` to ensure prompt overlay IPv6 address binding without Duplicate Address Detection delays.
+  - Corrected NetBird Go package import path to `github.com/netbirdio/netbird/client@latest` and resolved GitHub release tarball URLs via HTTP redirect headers to bypass unauthenticated API rate limits.
+  - Enabled dual-stack IPv6 routing in standalone NetBird coordinator by initializing `settings_ipv6_enabled_groups = '["grp_all"]'` in the SQLite account schema and adding warm-up ping verification on `wt0` IPv6 overlay endpoints.
+  - Enhanced `iperf3` listening verification and server resilience under high packet loss by removing the `-1` single-connection flag, actively polling listening sockets (`ss -tlpn`) and verifying process liveness, increasing connection timeout to 20 seconds (`--connect-timeout 20000`), ensuring port clearance before binding, and expanding the retry loop to 3 attempts across both TCP and UDP measurement routines (fixing `ss -ulpn` to `ss -tlpn` for iperf3's control channel).
+  - Added strict benchmark assertion gating in `run-iperf-compare.sh`, exiting with non-zero failure code if YIP experiences zero throughput or failure across any evaluated loss condition.
+  - Configured per-namespace UAPI directory symlinks (`/run/amneziawg`, `/var/run/amneziawg` -> `/etc/netns/$NS/amneziawg-run`) and launched `amneziawg-go` in foreground mode (`-f`) with tracked process cleanup, preventing socket collision and daemon termination.
+  - Updated Headscale coordinator setup for v0.29+ compatibility, provisioning `noise.private_key_path`, `prefixes.v4/v6`, local DERP region definitions, `unix_socket` paths, and integer user ID lookup (`-u 1`) with backward-compatible `--user` fallback.
+  - Replaced manual shell MTU mutations with autonomous daemon MTU configuration (`mtu=${YIP_MTU}` in `CFG_A`/`CFG_B`), synchronizing TUN device MTU, PLPMTU discovery, and TCP SYN MSS clamping directly within `yipd`.
+  - Added selective contender filtering via `CONTENDERS="<name1> <name2>"` in `run-iperf-compare.sh` to allow targeted sweeps without running all nine contenders.
+- **TCP Retransmission Delivery in Ingress Micro-Reorder Buffer (`crates/yip-transport`, #234).**
+  Fixed TCP goodput collapse where high-throughput streams dropped from ~1.5 Gbps to ~90-118 Mbps under packet jitter. Previously, incoming TCP packets with sequence ranges prior to or equal to `flow.expected_seq` were discarded without calling `emit(packet)`. When slot capacity evictions or deadline flushes advanced `expected_seq`, subsequent retransmissions for missing or dropped segments were discarded, preventing the kernel TCP stack from receiving retransmitted data and stalling the congestion window. All duplicate and retransmitted TCP segments are now emitted to the TUN interface so the OS TCP stack receives SACKs, duplicate ACKs, and repair segments promptly.
+- **TCP Retransmit Loss Telemetry & JSON Benchmarking (`crates/yip-bench`, #237).**
+  Updated `measure_iperf` in `run-iperf-compare.sh` to execute `iperf3 -J` in structured JSON mode, extracting exact sender bytes and retransmissions to report `tcp_loss%` alongside `tcp_Mbit/s` across both console logs and markdown comparison tables.
 - **Single-Segment TCP Packet GSO Type & Checksum Seeding in Coalescer (`crates/yip-io`).**
   Fixed `EINVAL (os error 22)` on TUN device writes during iperf benchmarking caused by uncoalesced single TCP packets being emitted with GSO metadata. When `Coalescer` flushes an uncoalesced single TCP segment (`self.segs == 1`), it now emits `gso_type: GSO_NONE` with flags zeroed and leaves the original valid wire checksum byte-for-byte intact, matching the behavior of `PendingKind::Udp`. For multi-segment coalesced TCP runs (`self.segs > 1`), seeded the uncomplemented pseudo-header checksum (`tcp_pseudo_header_checksum`) at the TCP checksum field as required by virtio-net `F_NEEDS_CSUM`, and guarded `push`, `write_to_tun`, `send_to_tun`, and `queue_tun_write` against empty slices.
 - **Recycled FEC Repair Buffer Length Regression (`crates/yip-transport`).**
@@ -432,7 +465,7 @@ All notable changes to this project are documented here, following
   LLC. The AGPL network-use clause (§13) means anyone running a modified `yip` as a
   network service must offer their users the corresponding source — privacy
   infrastructure stays open. (Closes #53.)
-- README rewritten with the project identity ("🦊 what does the fox say? — nothing a
+- README rewritten with the project identity ("what does the fox say? — nothing a
   DPI firewall can hear") and a "Silicon Slopes Paradox" section on Utah SB 73 and
   the EFF's coverage; corrected the lingering "RaptorQ" references to Reed–Solomon
   across README, `CLAUDE.md`, and `yip-transport`/`yip-wire` doc comments (the codec

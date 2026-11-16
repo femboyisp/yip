@@ -738,18 +738,25 @@ impl Config {
                 }
                 "tls_sni" => tls_sni = Some(val.to_owned()),
                 "shards" | "threads" => {
-                    let n = val.parse::<usize>().map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("invalid shards count: {e}"),
-                        )
-                    })?;
-                    if n == 0 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "shards must be at least 1",
-                        ));
-                    }
+                    let n = if val.eq_ignore_ascii_case("auto") {
+                        std::thread::available_parallelism()
+                            .map(|p| p.get().min(8))
+                            .unwrap_or(1)
+                    } else {
+                        let parsed = val.parse::<usize>().map_err(|e| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("invalid shards count: {e}"),
+                            )
+                        })?;
+                        if parsed == 0 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "shards must be at least 1",
+                            ));
+                        }
+                        parsed
+                    };
                     shards = Some(n);
                 }
                 "control_socket" | "control" => {
@@ -1055,6 +1062,14 @@ mod tests {
 
         let text_zero = format!("{base}shards=0\n");
         assert!(Config::parse(&text_zero).is_err());
+
+        let text_auto = format!("{base}shards=auto\n");
+        let c_auto = Config::parse(&text_auto).unwrap();
+        assert!(c_auto.shards >= 1 && c_auto.shards <= 8);
+
+        let text_threads_auto = format!("{base}threads=auto\n");
+        let c_threads_auto = Config::parse(&text_threads_auto).unwrap();
+        assert!(c_threads_auto.shards >= 1 && c_threads_auto.shards <= 8);
     }
 
     #[test]

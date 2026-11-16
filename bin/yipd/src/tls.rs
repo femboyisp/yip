@@ -353,10 +353,13 @@ pub(crate) fn write_all_tls(
 fn owned_out(
     out: DispatchOut<'_>,
     pkts: Vec<EgressDatagram>,
-) -> (Option<Vec<u8>>, Vec<EgressDatagram>) {
+) -> (Vec<Vec<u8>>, Vec<EgressDatagram>) {
     match out {
-        DispatchOut::None | DispatchOut::Udp(_) => (None, pkts),
-        DispatchOut::Tun(inner) | DispatchOut::Both(inner, _) => (Some(inner.to_vec()), pkts),
+        DispatchOut::None | DispatchOut::Udp(_) => (Vec::new(), pkts),
+        DispatchOut::Tun(inner) | DispatchOut::Both(inner, _) => (vec![inner.to_vec()], pkts),
+        DispatchOut::TunBatch(batch) | DispatchOut::TunBatchThenUdp(batch, _) => {
+            (batch.to_vec(), pkts)
+        }
     }
 }
 
@@ -714,9 +717,10 @@ pub(crate) trait TlsDispatch {
         src: SocketAddr,
         dg: &[u8],
         now_ms: u64,
-    ) -> (Option<Vec<u8>>, Vec<EgressDatagram>);
+    ) -> (Vec<Vec<u8>>, Vec<EgressDatagram>);
     fn on_tun(&mut self, inner: &[u8], now_ms: u64) -> Vec<EgressDatagram>;
     fn tick(&mut self, now_ms: u64) -> Vec<EgressDatagram>;
+    fn drain_tun(&mut self, out: &mut Vec<Vec<u8>>);
     fn is_peer_established(&self, pubkey: &[u8; 32]) -> bool;
 }
 
@@ -726,7 +730,7 @@ impl TlsDispatch for PeerManager {
         src: SocketAddr,
         dg: &[u8],
         now_ms: u64,
-    ) -> (Option<Vec<u8>>, Vec<EgressDatagram>) {
+    ) -> (Vec<Vec<u8>>, Vec<EgressDatagram>) {
         let mut out = Vec::new();
         let disp = Dispatch::on_udp(self, src, dg, now_ms, &mut out);
         owned_out(disp, out)
@@ -742,6 +746,10 @@ impl TlsDispatch for PeerManager {
         let mut out = Vec::new();
         Dispatch::tick(self, now_ms, &mut out);
         out
+    }
+
+    fn drain_tun(&mut self, out: &mut Vec<Vec<u8>>) {
+        self.drain_tun(out);
     }
 
     fn is_peer_established(&self, pubkey: &[u8; 32]) -> bool {
@@ -870,6 +878,7 @@ pub(crate) fn pump<M: TlsDispatch>(
     let mut tls_read_buf = [0u8; TLS_FRAME_MAX];
     let mut tun_read_buf = [0u8; TLS_FRAME_MAX];
     let mut ready_tokens = Vec::new();
+    let mut tun_batch = Vec::new();
     let mut iters = 0;
 
     loop {
@@ -1094,13 +1103,13 @@ pub(crate) fn pump<M: TlsDispatch>(
                             for dg in frames {
                                 let (tun, egress) = manager.on_udp(peer_addr, &dg, now_ms);
                                 if (!was_established && manager.is_peer_established(&peer_public))
-                                    || tun.is_some()
+                                    || !tun.is_empty()
                                     || !egress.is_empty()
                                 {
                                     peers[idx].conn.mark_inner_confirmed();
                                 }
-                                if let Some(inner) = tun {
-                                    write_tun(tun_fd, &inner);
+                                for inner in &tun {
+                                    write_tun(tun_fd, inner);
                                 }
                                 route_egress_to_peers(&egress, peers, poller, now)?;
                             }
@@ -1127,6 +1136,10 @@ pub(crate) fn pump<M: TlsDispatch>(
 
         // 6. Cadence tick (feedback / keepalive / handshake retry / cover).
         let ticked_egress = manager.tick(now_ms);
+        manager.drain_tun(&mut tun_batch);
+        for inner in tun_batch.drain(..) {
+            write_tun(tun_fd, &inner);
+        }
         route_egress_to_peers(&ticked_egress, peers, poller, now)?;
     }
 }
@@ -1990,9 +2003,9 @@ mod tests {
                 src: SocketAddr,
                 dg: &[u8],
                 _now_ms: u64,
-            ) -> (Option<Vec<u8>>, Vec<EgressDatagram>) {
+            ) -> (Vec<Vec<u8>>, Vec<EgressDatagram>) {
                 self.on_udp_calls.push((src, dg.to_vec()));
-                (None, Vec::new())
+                (Vec::new(), Vec::new())
             }
 
             fn on_tun(&mut self, inner: &[u8], _now_ms: u64) -> Vec<EgressDatagram> {
@@ -2003,6 +2016,8 @@ mod tests {
             fn tick(&mut self, _now_ms: u64) -> Vec<EgressDatagram> {
                 Vec::new()
             }
+
+            fn drain_tun(&mut self, _out: &mut Vec<Vec<u8>>) {}
 
             fn is_peer_established(&self, _pubkey: &[u8; 32]) -> bool {
                 true
@@ -2130,35 +2145,55 @@ mod tests {
 
         // DispatchOut::None
         let (tun, pkts) = owned_out(DispatchOut::None, Vec::new());
-        assert!(tun.is_none());
+        assert!(tun.is_empty());
         assert!(pkts.is_empty());
         let (tun, pkts) = owned_out(DispatchOut::None, vec![dummy.clone()]);
-        assert!(tun.is_none());
+        assert!(tun.is_empty());
         assert_eq!(pkts.len(), 1);
 
         // DispatchOut::Udp
         let (tun, pkts) = owned_out(DispatchOut::Udp(&[]), Vec::new());
-        assert!(tun.is_none());
+        assert!(tun.is_empty());
         assert!(pkts.is_empty());
         let (tun, pkts) = owned_out(DispatchOut::Udp(&[]), vec![dummy.clone()]);
-        assert!(tun.is_none());
+        assert!(tun.is_empty());
         assert_eq!(pkts.len(), 1);
 
         // DispatchOut::Tun
         let payload = b"inner_tun_data";
         let (tun, pkts) = owned_out(DispatchOut::Tun(payload), Vec::new());
-        assert_eq!(tun.as_deref(), Some(payload.as_slice()));
+        assert_eq!(tun, vec![payload.to_vec()]);
         assert!(pkts.is_empty());
         let (tun, pkts) = owned_out(DispatchOut::Tun(payload), vec![dummy.clone()]);
-        assert_eq!(tun.as_deref(), Some(payload.as_slice()));
+        assert_eq!(tun, vec![payload.to_vec()]);
         assert_eq!(pkts.len(), 1);
 
         // DispatchOut::Both
         let (tun, pkts) = owned_out(DispatchOut::Both(payload, &[]), Vec::new());
-        assert_eq!(tun.as_deref(), Some(payload.as_slice()));
+        assert_eq!(tun, vec![payload.to_vec()]);
         assert!(pkts.is_empty());
         let (tun, pkts) = owned_out(DispatchOut::Both(payload, &[]), vec![dummy.clone()]);
-        assert_eq!(tun.as_deref(), Some(payload.as_slice()));
+        assert_eq!(tun, vec![payload.to_vec()]);
+        assert_eq!(pkts.len(), 1);
+
+        // DispatchOut::TunBatch
+        let batch = vec![b"pkt1".to_vec(), b"pkt2".to_vec()];
+        let (tun, pkts) = owned_out(DispatchOut::TunBatch(&batch), Vec::new());
+        assert_eq!(tun, batch);
+        assert!(pkts.is_empty());
+        let (tun, pkts) = owned_out(DispatchOut::TunBatch(&batch), vec![dummy.clone()]);
+        assert_eq!(tun, batch);
+        assert_eq!(pkts.len(), 1);
+
+        // DispatchOut::TunBatchThenUdp
+        let (tun, pkts) = owned_out(DispatchOut::TunBatchThenUdp(&batch, &[]), Vec::new());
+        assert_eq!(tun, batch);
+        assert!(pkts.is_empty());
+        let (tun, pkts) = owned_out(
+            DispatchOut::TunBatchThenUdp(&batch, &[]),
+            vec![dummy.clone()],
+        );
+        assert_eq!(tun, batch);
         assert_eq!(pkts.len(), 1);
     }
 
@@ -2192,7 +2227,7 @@ mod tests {
         let mut recovered = None;
         for dg in egress {
             let (tun, _) = <PeerManager as TlsDispatch>::on_udp(&mut pm_b, ep_a, &dg.bytes, 100);
-            if let Some(inner) = tun {
+            if let Some(inner) = tun.into_iter().next() {
                 recovered = Some(inner);
                 break;
             }

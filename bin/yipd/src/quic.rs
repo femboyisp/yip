@@ -581,12 +581,14 @@ fn drain_transmits(conn: &mut Connection, now: Instant, out: &mut Vec<OutPacket>
 
 /// Take a `PeerManager` UDP/TUN outcome as owned data, decoupling it from the
 /// manager borrow so the caller can immediately drive QUIC sends.
-fn owned_out(out: DispatchOut<'_>) -> (Option<Vec<u8>>, Vec<yip_io::poll::EgressDatagram>) {
+fn owned_out(out: DispatchOut<'_>) -> (Vec<Vec<u8>>, Vec<yip_io::poll::EgressDatagram>) {
     match out {
-        DispatchOut::None => (None, Vec::new()),
-        DispatchOut::Tun(inner) => (Some(inner.to_vec()), Vec::new()),
-        DispatchOut::Udp(dgs) => (None, dgs.to_vec()),
-        DispatchOut::Both(inner, dgs) => (Some(inner.to_vec()), dgs.to_vec()),
+        DispatchOut::None => (Vec::new(), Vec::new()),
+        DispatchOut::Tun(inner) => (vec![inner.to_vec()], Vec::new()),
+        DispatchOut::Udp(dgs) => (Vec::new(), dgs.to_vec()),
+        DispatchOut::Both(inner, dgs) => (vec![inner.to_vec()], dgs.to_vec()),
+        DispatchOut::TunBatch(batch) => (batch.to_vec(), Vec::new()),
+        DispatchOut::TunBatchThenUdp(batch, dgs) => (batch.to_vec(), dgs.to_vec()),
     }
 }
 
@@ -671,6 +673,7 @@ pub fn run_quic(
     // the inner yip handshake builds any DataPlane (received frames — which
     // trigger the inner handshake — are processed after this point each loop).
     let mut symbol_set = false;
+    let mut tun_batch = Vec::new();
 
     loop {
         let now = Instant::now();
@@ -721,7 +724,7 @@ pub fn run_quic(
         // 4. Each received DATAGRAM frame is a plain yip datagram → PeerManager.
         for (peer_addr, payload) in recv {
             let (tun, egress) = owned_out(manager.on_udp(peer_addr, &payload, now_ms));
-            if let Some(inner) = tun {
+            for inner in tun {
                 write_tun(tun_fd, &inner);
             }
             send_egress(&mut qe, &egress, now, &mut out);
@@ -736,6 +739,10 @@ pub fn run_quic(
         let ticked = manager.tick(now_ms).map(|dgs| dgs.to_vec());
         if let Some(egress) = ticked {
             send_egress(&mut qe, &egress, now, &mut out);
+        }
+        manager.drain_tun(&mut tun_batch);
+        for inner in tun_batch.drain(..) {
+            write_tun(tun_fd, &inner);
         }
 
         // 7. Flush any transmits the sends/handshake progression produced.

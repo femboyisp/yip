@@ -673,12 +673,14 @@ const TICK_MS: i32 = 10;
 /// Take a `PeerManager` UDP outcome as owned data, decoupling it from the
 /// manager borrow. Duplicated from `crate::tls`'s private `owned_out` (same
 /// per-module small-helper duplication as `TICK_MS` above).
-fn owned_out(out: DispatchOut<'_>) -> (Option<Vec<u8>>, Vec<EgressDatagram>) {
+fn owned_out(out: DispatchOut<'_>) -> (Vec<Vec<u8>>, Vec<EgressDatagram>) {
     match out {
-        DispatchOut::None => (None, Vec::new()),
-        DispatchOut::Tun(inner) => (Some(inner.to_vec()), Vec::new()),
-        DispatchOut::Udp(dgs) => (None, dgs.to_vec()),
-        DispatchOut::Both(inner, dgs) => (Some(inner.to_vec()), dgs.to_vec()),
+        DispatchOut::None => (Vec::new(), Vec::new()),
+        DispatchOut::Tun(inner) => (vec![inner.to_vec()], Vec::new()),
+        DispatchOut::Udp(dgs) => (Vec::new(), dgs.to_vec()),
+        DispatchOut::Both(inner, dgs) => (vec![inner.to_vec()], dgs.to_vec()),
+        DispatchOut::TunBatch(batch) => (batch.to_vec(), Vec::new()),
+        DispatchOut::TunBatchThenUdp(batch, dgs) => (batch.to_vec(), dgs.to_vec()),
     }
 }
 
@@ -754,7 +756,7 @@ pub(crate) fn run_relay_tls(
         if ready.udp {
             drain_socketpair(&sock, &mut sock_read_buf, |env| {
                 let (tun, egress) = owned_out(manager.on_udp(relay_addr, env, now_ms));
-                if let Some(inner) = tun {
+                for inner in tun {
                     write_tun(tun_fd, &inner);
                 }
                 send_egress_to_relay_thread(&sock, &egress)

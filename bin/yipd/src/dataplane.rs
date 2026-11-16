@@ -158,6 +158,11 @@ pub enum Outcome<'a> {
     /// Write to TUN *and* send datagrams (currently unused, reserved for future).
     #[expect(dead_code, reason = "reserved for future combined TUN+UDP paths")]
     TunWriteThenSend(&'a [u8], &'a [yip_io::poll::EgressDatagram]),
+    /// Write a contiguous batch of packets to the TUN device.
+    TunWriteBatch(&'a [Vec<u8>]),
+    /// Write a contiguous batch of packets to the TUN device and send datagrams.
+    #[expect(dead_code, reason = "reserved for future combined TUN+UDP batch paths")]
+    TunWriteBatchThenSend(&'a [Vec<u8>], &'a [yip_io::poll::EgressDatagram]),
 }
 
 // ── DataPlane ─────────────────────────────────────────────────────────────────
@@ -243,6 +248,11 @@ pub struct DataPlane {
     wire_payload_scratch: Vec<u8>,
     /// Reused scratch for TCP SYN MSS clamping on the egress tunnel dispatch hotpath.
     syn_clamp_buf: Vec<u8>,
+    reorder_buffer: yip_transport::reorder::ReorderBuffer,
+    tun_drained: Vec<Vec<u8>>,
+    tun_drained_count: usize,
+    tick_tun_drained: Vec<Vec<u8>>,
+    tick_tun_drained_count: usize,
 }
 
 impl DataPlane {
@@ -389,6 +399,11 @@ impl DataPlane {
             seal_buf: Vec::new(),
             wire_payload_scratch: Vec::new(),
             syn_clamp_buf: Vec::new(),
+            reorder_buffer: yip_transport::reorder::ReorderBuffer::default(),
+            tun_drained: (0..32).map(|_| Vec::with_capacity(2048)).collect(),
+            tun_drained_count: 0,
+            tick_tun_drained: (0..32).map(|_| Vec::with_capacity(2048)).collect(),
+            tick_tun_drained_count: 0,
         }
     }
 
@@ -641,7 +656,27 @@ impl DataPlane {
                         );
                     }
                 }
-                Outcome::TunWrite(&self.inner_scratch)
+
+                self.tun_drained_count = 0;
+                let inner = &self.inner_scratch;
+                let l2 = self.l2;
+                let tun_drained = &mut self.tun_drained;
+                let tun_drained_count = &mut self.tun_drained_count;
+                self.reorder_buffer.process(inner, l2, now_ms, |pkt| {
+                    if *tun_drained_count < tun_drained.len() {
+                        tun_drained[*tun_drained_count].clear();
+                        tun_drained[*tun_drained_count].extend_from_slice(pkt);
+                    } else {
+                        tun_drained.push(pkt.to_vec());
+                    }
+                    *tun_drained_count += 1;
+                });
+
+                match self.tun_drained_count {
+                    0 => Outcome::None,
+                    1 => Outcome::TunWrite(&self.tun_drained[0]),
+                    _ => Outcome::TunWriteBatch(&self.tun_drained[..self.tun_drained_count]),
+                }
             }
 
             b if b == PacketType::Control as u8 => {
@@ -876,6 +911,19 @@ impl DataPlane {
     /// feedback packet was built (the caller must send it to the peer).
     /// Returns `None` if no feedback interval has elapsed.
     pub fn tick(&mut self, now_ms: u64) -> Option<&[yip_io::poll::EgressDatagram]> {
+        self.tick_tun_drained_count = 0;
+        let tick_drained = &mut self.tick_tun_drained;
+        let tick_drained_count = &mut self.tick_tun_drained_count;
+        self.reorder_buffer.poll_timeouts(now_ms, |pkt| {
+            if *tick_drained_count < tick_drained.len() {
+                tick_drained[*tick_drained_count].clear();
+                tick_drained[*tick_drained_count].extend_from_slice(pkt);
+            } else {
+                tick_drained.push(pkt.to_vec());
+            }
+            *tick_drained_count += 1;
+        });
+
         if now_ms.saturating_sub(self.last_sweep_ms) >= MAC_SWEEP_INTERVAL_MS {
             self.last_sweep_ms = now_ms;
             self.mac_table.sweep(now_ms);
@@ -963,6 +1011,14 @@ impl DataPlane {
 
         Some(&self.tick_scratch)
     }
+
+    /// Drain any pending packets (e.g. flushed due to expired reorder deadlines).
+    pub fn drain_tun(&mut self, out: &mut Vec<Vec<u8>>) {
+        for pkt in &self.tick_tun_drained[..self.tick_tun_drained_count] {
+            out.push(pkt.clone());
+        }
+        self.tick_tun_drained_count = 0;
+    }
 }
 
 // ── conn_tag derivation ───────────────────────────────────────────────────────
@@ -1028,6 +1084,11 @@ impl yip_io::poll::Dispatch for DataPlane {
                 out.extend(pkts.iter().cloned());
                 yip_io::poll::DispatchOut::Both(buf, &[])
             }
+            Outcome::TunWriteBatch(batch) => yip_io::poll::DispatchOut::TunBatch(batch),
+            Outcome::TunWriteBatchThenSend(batch, pkts) => {
+                out.extend(pkts.iter().cloned());
+                yip_io::poll::DispatchOut::TunBatchThenUdp(batch, &[])
+            }
         }
     }
 
@@ -1039,6 +1100,10 @@ impl yip_io::poll::Dispatch for DataPlane {
         if let Some(pkts) = self.tick(now_ms) {
             out.extend(pkts.iter().cloned());
         }
+    }
+
+    fn drain_tun(&mut self, out: &mut Vec<Vec<u8>>) {
+        self.drain_tun(out);
     }
 
     fn recycle(&mut self, batch: &mut Vec<yip_io::poll::EgressDatagram>) {

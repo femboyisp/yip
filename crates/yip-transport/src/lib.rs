@@ -55,6 +55,12 @@ pub use lossdetect::LossDetector;
 pub mod retxbuf;
 pub use retxbuf::RetxBuffer;
 
+pub mod reorder;
+pub use reorder::{
+    FlowReorderState, ReorderBuffer, ReorderOutcome, ReorderSlot, MAX_CONCURRENT_TRACKED_FLOWS,
+    MAX_FLOW_REORDER_SLOTS, MAX_SLOT_PACKET_LEN,
+};
+
 use std::collections::HashMap;
 use std::time::Duration;
 

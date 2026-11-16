@@ -400,12 +400,14 @@ pub fn reset_shutdown() {
 
 fn owned_out(
     out: yip_io::poll::DispatchOut<'_>,
-) -> (Option<Vec<u8>>, Vec<yip_io::poll::EgressDatagram>) {
+) -> (Vec<Vec<u8>>, Vec<yip_io::poll::EgressDatagram>) {
     match out {
-        yip_io::poll::DispatchOut::None => (None, Vec::new()),
-        yip_io::poll::DispatchOut::Tun(inner) => (Some(inner.to_vec()), Vec::new()),
-        yip_io::poll::DispatchOut::Udp(dgs) => (None, dgs.to_vec()),
-        yip_io::poll::DispatchOut::Both(inner, dgs) => (Some(inner.to_vec()), dgs.to_vec()),
+        yip_io::poll::DispatchOut::None => (Vec::new(), Vec::new()),
+        yip_io::poll::DispatchOut::Tun(inner) => (vec![inner.to_vec()], Vec::new()),
+        yip_io::poll::DispatchOut::Udp(dgs) => (Vec::new(), dgs.to_vec()),
+        yip_io::poll::DispatchOut::Both(inner, dgs) => (vec![inner.to_vec()], dgs.to_vec()),
+        yip_io::poll::DispatchOut::TunBatch(batch) => (batch.to_vec(), Vec::new()),
+        yip_io::poll::DispatchOut::TunBatchThenUdp(batch, dgs) => (batch.to_vec(), dgs.to_vec()),
     }
 }
 
@@ -770,6 +772,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                 let start = std::time::Instant::now();
                 let mut cached_now_ms: u64 = 0;
                 let mut spsc_batch = Vec::new();
+                let mut tun_batch = Vec::new();
 
                 loop {
                     if SHUTDOWN.load(Ordering::Relaxed) {
@@ -864,8 +867,8 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
 
                                             let (tun_out, egress) =
                                                 owned_out(manager.on_udp(dg.src, payload, cached_now_ms));
-                                            if let Some(inner) = tun_out {
-                                                write_tun(tun_fd, &inner, vnet_len > 0);
+                                            for inner in &tun_out {
+                                                write_tun(tun_fd, inner, vnet_len > 0);
                                             }
                                             if !egress.is_empty() {
                                                 let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
@@ -933,8 +936,8 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                         } else {
                                             let (tun_out, egress) =
                                                 owned_out(manager.on_udp(cfg.listen, payload, cached_now_ms));
-                                            if let Some(inner) = tun_out {
-                                                write_tun(tun_fd, &inner, vnet_len > 0);
+                                            for inner in &tun_out {
+                                                write_tun(tun_fd, inner, vnet_len > 0);
                                             }
                                             if !egress.is_empty() {
                                                 let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
@@ -1115,8 +1118,8 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                 ShardMsg::HandshakeForward(bytes, src) => {
                                     let (tun_out, egress) =
                                         owned_out(manager.on_udp(*src, bytes, cached_now_ms));
-                                    if let Some(inner) = tun_out {
-                                        write_tun(tun_fd, &inner, vnet_len > 0);
+                                    for inner in &tun_out {
+                                        write_tun(tun_fd, inner, vnet_len > 0);
                                     }
                                     if !egress.is_empty() {
                                         let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
@@ -1136,8 +1139,8 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                 ShardMsg::ArqFeedback(bytes, src) => {
                                     let (tun_out, egress) =
                                         owned_out(manager.on_udp(*src, bytes, cached_now_ms));
-                                    if let Some(inner) = tun_out {
-                                        write_tun(tun_fd, &inner, vnet_len > 0);
+                                    for inner in &tun_out {
+                                        write_tun(tun_fd, inner, vnet_len > 0);
                                     }
                                     if !egress.is_empty() {
                                         let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
@@ -1182,6 +1185,10 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                         egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
                                     let _ = batch_sock.sendmmsg_batch(&egress_batch);
                                 }
+                            }
+                            manager.drain_tun(&mut tun_batch);
+                            for inner in tun_batch.drain(..) {
+                                write_tun(tun_fd, &inner, vnet_len > 0);
                             }
                             if shard_id == 0 {
                                 for epoch in manager.drain_new_epochs() {

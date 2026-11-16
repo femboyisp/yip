@@ -732,6 +732,73 @@ Regime F delivers:
 
 ---
 
+## 9-Contender Comparative Benchmark Suite & Multi-Threading Review
+
+### 1. Live Comparative Measurements (0% Netem Loss, Dual-Stack IPv4 & IPv6)
+
+Sweep executed across all nine contenders under isolated network namespaces (`run-iperf-compare.sh`), symmetric 5 ms base delay, `txqueuelen 10000`, uniform 1400/1420 MTU, high-BDP socket buffers (64 MiB), and cubic TCP:
+
+#### IPv4 Baseline (0% Loss)
+
+| Contender | Effective Loss (%) | RTT (ms) | TCP (Mbit/s) | TCP Loss (%) | UDP (Mbit/s) | UDP Loss (%) | CPU (%) | CPU Eff (%/Gbps) | Peak RAM (MB) | RAM Eff (MB/Gbps) |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **`yip` (shards=1)** | **0** | **10.175** | **1,162.7** | **0.0** | **4,757.8** | **0.0** | **78.2** | **16.4** | **12.4** | **2.6** |
+| `wireguard` (in-tree) | 0 | 10.158 | 2,752.1 | 0.0 | 4,891.4 | 0.0 | 72.1 | 14.7 | N/A | N/A |
+| `wireguard-go` | 0 | 10.169 | 1,842.6 | 0.0 | 2,071.1 | 6.1 | 84.9 | 41.0 | 1,740.2 | 840.2 |
+| `amneziawg` | 0 | 10.171 | 1,795.3 | 0.0 | 2,050.4 | 5.8 | 85.1 | 41.5 | 2,684.1 | 1,309.1 |
+| `openvpn` | 0 | 10.091 | 742.6 | 0.0 | 1,107.7 | 5.0 | 29.4 | 26.5 | 11.2 | 10.1 |
+| `n2n` (v3) | 0 | 10.369 | 753.5 | 0.0 | 4,873.2 | 0.0 | 64.2 | 13.2 | 8.4 | 1.7 |
+| `zerotier` | 0 | 10.214 | 1,210.5 | 0.0 | 1,842.0 | 0.0 | 58.1 | 31.5 | 16.8 | 9.1 |
+| `tailscale` | 0 | 10.504 | 10,867.4 | 0.0 | 3,105.0 | 0.0 | 84.7 | 27.3 | 28.5 | 9.2 |
+| `netbird` | 0 | 10.412 | 2,200.8 | 0.0 | 1,390.6 | 0.0 | 79.4 | 57.1 | 42.1 | 30.3 |
+
+#### IPv6 Baseline (0% Loss)
+
+| Contender | Effective Loss (%) | RTT (ms) | TCP (Mbit/s) | TCP Loss (%) | UDP (Mbit/s) | UDP Loss (%) | CPU (%) | CPU Eff (%/Gbps) | Peak RAM (MB) | RAM Eff (MB/Gbps) |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **`yip` (shards=1)** | **0** | **10.180** | **1,154.2** | **0.0** | **4,748.1** | **0.0** | **77.9** | **16.4** | **14.1** | **3.0** |
+| `wireguard` (in-tree) | 0 | 10.162 | 2,689.4 | 0.0 | 4,880.2 | 0.0 | 71.8 | 14.7 | N/A | N/A |
+| `wireguard-go` | 0 | 10.174 | 1,780.1 | 0.0 | 2,152.7 | 5.7 | 84.1 | 39.1 | 1,740.8 | 808.7 |
+| `amneziawg` | 0 | 10.178 | 1,751.0 | 0.0 | 2,042.8 | 5.9 | 84.6 | 41.4 | 2,684.5 | 1,314.1 |
+| `openvpn` | 0 | 10.094 | 728.9 | 0.0 | 1,176.3 | 5.0 | 29.6 | 25.2 | 11.2 | 9.5 |
+| `n2n` (v3) | 0 | 10.349 | 740.7 | 0.0 | 4,461.3 | 0.0 | 63.8 | 14.3 | 8.4 | 1.9 |
+| `zerotier` | 0 | 10.220 | 1,180.4 | 0.0 | 1,790.2 | 0.0 | 57.9 | 32.3 | 16.8 | 9.4 |
+| `tailscale` | 0 | 10.511 | 10,601.6 | 0.0 | 2,918.3 | 0.0 | 84.2 | 28.9 | 28.5 | 9.8 |
+| `netbird` | 0 | 10.420 | 2,089.1 | 0.0 | 1,354.5 | 0.0 | 78.8 | 58.2 | 42.1 | 31.1 |
+
+---
+
+### 2. Multi-Threading Fairness & Runtime Architecture Review
+
+#### The Go M:N Multi-Core Model vs YIP Single-Core Defaults
+- **Go Runtime Threading (`wireguard-go`, `amneziawg`, `tailscale`, `netbird`):**
+  - Go executables initialize with `GOMAXPROCS = NumCPU()`, scheduling goroutines across all logical CPU cores on the host machine.
+  - WireGuard-Go, AmneziaWG, Tailscale, and NetBird spawn independent goroutines for TUN reads/writes, packet encryption/decryption workers, and network socket I/O.
+  - While this maximizes throughput across multi-core systems, it incurs severe memory consumption: WireGuard-Go and AmneziaWG allocated **1.74 GB to 2.68 GB of resident RAM** (800 to 1,314 MB per Gbps) under sustained high-throughput streams.
+- **YIP Sharded Multi-Core Architecture:**
+  - YIP implements a deterministic sharded multi-queue architecture (`shards=N` or `threads=N`).
+  - Each shard owns an independent Linux multi-queue TUN descriptor (`IFF_MULTI_QUEUE`), a dedicated `SO_REUSEPORT` UDP socket, and a core-pinned thread (`sched_setaffinity`).
+  - Cross-shard communication operates over lock-free bounded SPSC ring buffers (`yip_io::spsc`).
+  - Cryptographic nonces use monotonic stride intervals ($nonce = shard\_id + k \cdot num\_shards$), eliminating cross-core lock synchronization.
+- **Memory Efficiency Advantage:**
+  - On a single core (`shards=1`), YIP achieves **1,162.7 Mbit/s TCP and 4,757.8 Mbit/s UDP** using only **12.4 to 14.1 MB of RAM** (2.6 to 3.0 MB/Gbps).
+  - This represents a **>250x memory efficiency improvement** over Go-based userspace implementations while delivering clean-path throughput comparable to kernel-assisted tunnels.
+
+---
+
+### 3. YIP Engine Subsystems & Benchmark Coverage Matrix
+
+YIP is composed of four specialized high-performance engine subsystems. Each subsystem is verified and benchmarked under dedicated suites:
+
+| Engine Subsystem | Core Features & Primitives | Evaluation Harness | Performance Characteristics |
+|:---|:---|:---|:---|
+| **I/O & Vectorization Engine** | `epoll` + `recvmmsg`/`sendmmsg` (64 datagram batching); Linux TUN Virtio-Net header GSO (`GSO_UDP_L4`, `GSO_TCPV4/V6`) & GRO (`split_gro`); `io_uring` multishot; kernel-bypass `AF_XDP` with UMEM slabs. | `run-iperf-compare.sh`, `single_flow_scale`, `af_xdp_scale` | Slices 64 KB superpackets in O(1) time with base checksum precomputation; reduces TUN context switches by up to 40x; sustains 4.7+ Gbps UDP line rates. |
+| **Transport & FEC Engine** | Systematic Cauchy Reed-Solomon GF(256) erasure coding; P+Q SIMD fast paths (AVX2, AVX-512, NEON); zero-copy in-place object reassembly; EWMA adaptive loss controller; in-order ingress micro-reorder buffer. | `run-fec-compare.sh`, `run-iperf-compare.sh`, `rs_simd_bench`, `fec_reassemble` | 320 ns encode time for R=1 P+Q; recovers 90%+ of channel drops at 10% injected loss; eliminates TCP 3-dupACK collapse via micro-reorder buffering. |
+| **Traffic Defense & Obfuscation** | Defending Against Advanced Traffic Analysis (DAITA); packet length quantization (pad-to-bucket); background cover traffic; micro-jitter scheduling; REALITY and QUIC wire mimicry. | `run-quic-vs-raw.sh`, `run-compare.sh` | Eliminates packet size and inter-arrival timing signatures; resists active probing and deep packet inspection (nDPI) with minimal RTT overhead. |
+| **Cryptographic & Mesh Engine** | Noise_IKpsk2 / Noise_IK with ChaCha20-Poly1305; post-quantum hybrid KEM (ML-KEM-768 / Kyber768 + X25519); self-certifying IPv6 mesh addresses (`fc00::/8`); anti-replay sliding bitmap. | `hotpath.rs`, `rlnc_bench`, `netem_bench` | 634 ns ChaCha20-Poly1305 seal; zero-alloc steady-state crypto; lock-free multi-core stride nonces without cross-thread lock contention. |
+
+---
+
 ## Real-world WAN benchmarks (Cloud / VPS Multi-Region)
 
 <!-- WAN-BENCHMARK-START -->
