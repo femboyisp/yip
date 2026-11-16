@@ -6,5 +6,6 @@
 
 #![forbid(unsafe_code)]
 
+pub mod inbound;
 pub mod outbound;
 pub mod reorder;
