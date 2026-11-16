@@ -229,12 +229,28 @@ setup_netbird() {
 
     # Geolocation databases for management daemon in offline/isolated network namespaces
     local geo_dir="/usr/local/share/netbird-geo"
-    if [ ! -f "$geo_dir/GeoLite2-City_20261013.mmdb" ] || [ ! -f "$geo_dir/geonames_20261013.db" ]; then
-        mkdir -p "$geo_dir" 2>/dev/null || true
-        curl -fsSL -o "$geo_dir/GeoLite2-City_20261013.mmdb.tar.gz" "https://pkgs.netbird.io/geolocation-dbs/GeoLite2-City/download?suffix=tar.gz" 2>/dev/null && \
-            tar -xzf "$geo_dir/GeoLite2-City_20261013.mmdb.tar.gz" -C "$geo_dir" 2>/dev/null && rm -f "$geo_dir"/*.tar.gz || true
-        curl -fsSL -o "$geo_dir/geonames_20261013.db.tar.gz" "https://pkgs.netbird.io/geolocation-dbs/geonames/download?suffix=tar.gz" 2>/dev/null && \
-            tar -xzf "$geo_dir/geonames_20261013.db.tar.gz" -C "$geo_dir" 2>/dev/null && rm -f "$geo_dir"/*.tar.gz || true
+    mkdir -p "$geo_dir" 2>/dev/null || true
+    if command -v netbird-mgmt >/dev/null 2>&1 && { [ ! -f "$geo_dir"/GeoLite2-City_*.mmdb ] || [ ! -f "$geo_dir"/geonames_*.db ]; }; then
+        log "Initializing netbird-mgmt geolocation databases..."
+        local tmp_geo; tmp_geo="$(mktemp -d /tmp/nb-geo.XXXXXX)"
+        cat > "$tmp_geo/config.json" <<EOF
+{
+  "Signal": { "Proto": "http", "URI": "127.0.0.1:10000" },
+  "EmbeddedIdP": { "Enabled": true, "Issuer": "http://127.0.0.1:18999" },
+  "Datadir": "$geo_dir"
+}
+EOF
+        netbird-mgmt management --config "$tmp_geo/config.json" --datadir "$geo_dir" --port 18999 --metrics-port 19098 >/dev/null 2>&1 &
+        local pid_geo=$!
+        for i in $(seq 1 40); do
+            if ls "$geo_dir"/GeoLite2-City_*.mmdb >/dev/null 2>&1 && ls "$geo_dir"/geonames_*.db >/dev/null 2>&1; then
+                break
+            fi
+            sleep 0.5
+        done
+        kill -9 $pid_geo 2>/dev/null || true
+        wait $pid_geo 2>/dev/null || true
+        rm -rf "$tmp_geo" "$geo_dir"/store.db "$geo_dir"/events.db "$geo_dir"/access_logs.db "$geo_dir"/idp 2>/dev/null || true
     fi
     log "NetBird setup step complete."
 }

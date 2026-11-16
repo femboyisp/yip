@@ -1251,10 +1251,34 @@ setup_netbird() {
         if ! command -v netbird-mgmt >/dev/null 2>&1 || ! command -v netbird-signal >/dev/null 2>&1; then
             echo "[netbird] SKIP: 'netbird-mgmt' or 'netbird-signal' not found (run setup-contenders.sh --netbird)"; NB_AVAILABLE=false; return
         fi
+        local geo_dir="/usr/local/share/netbird-geo"
+        mkdir -p "$geo_dir" 2>/dev/null || true
+        if [ ! -f "$geo_dir"/GeoLite2-City_*.mmdb ] || [ ! -f "$geo_dir"/geonames_*.db ]; then
+            local tmp_geo; tmp_geo="$(mktemp -d /tmp/nb-geo.XXXXXX)"
+            cat > "$tmp_geo/config.json" <<EOF
+{
+  "Signal": { "Proto": "http", "URI": "127.0.0.1:10000" },
+  "EmbeddedIdP": { "Enabled": true, "Issuer": "http://127.0.0.1:18999" },
+  "Datadir": "$geo_dir"
+}
+EOF
+            netbird-mgmt management --config "$tmp_geo/config.json" --datadir "$geo_dir" --port 18999 --metrics-port 19098 >/dev/null 2>&1 &
+            local pid_geo=$!
+            for i in $(seq 1 30); do
+                if ls "$geo_dir"/GeoLite2-City_*.mmdb >/dev/null 2>&1 && ls "$geo_dir"/geonames_*.db >/dev/null 2>&1; then
+                    break
+                fi
+                sleep 0.5
+            done
+            kill -9 $pid_geo 2>/dev/null || true
+            wait $pid_geo 2>/dev/null || true
+            rm -rf "$tmp_geo" "$geo_dir"/store.db "$geo_dir"/events.db "$geo_dir"/access_logs.db "$geo_dir"/idp 2>/dev/null || true
+        fi
+
         local nb_dir="$TMPDIR_TEST/nb_coord"
         mkdir -p "$nb_dir/data"
-        if [ -d /usr/local/share/netbird-geo ]; then
-            cp -s /usr/local/share/netbird-geo/* "$nb_dir/data/" 2>/dev/null || true
+        if [ -d "$geo_dir" ]; then
+            cp -f "$geo_dir"/* "$nb_dir/data/" 2>/dev/null || true
         fi
         cat > "$nb_dir/management.json" <<EOF
 {
@@ -1305,12 +1329,19 @@ VALUES ('key_bench', 'acc_bench', 'mewqgKYulb4neyT85tvUyw1QzCAhxDjA9+5h7WeAysw='
 SQL
         ip netns exec "$NS_BA" netbird-mgmt management --config "$nb_dir/management.json" --datadir "$nb_dir/data" --port 8080 --metrics-port 9099 --log-file "$TMPDIR_TEST/nb-mgmt.log" >/dev/null 2>&1 &
         local pid_mgmt2=$!
+        local mgmt_ok=false
         for i in $(seq 1 60); do
             if ip netns exec "$NS_BA" ss -tlpn 2>/dev/null | grep -q ":8080"; then
+                mgmt_ok=true
                 break
             fi
             sleep 0.25
         done
+        if [ "$mgmt_ok" = false ]; then
+            echo "[netbird] SKIP: netbird-mgmt port 8080 not listening"
+            tail -15 "$TMPDIR_TEST/nb-mgmt.log" 2>/dev/null || true
+            NB_AVAILABLE=false; return
+        fi
         mgmt_url="http://${VBA_IP}:8080"
         setup_key="A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
     fi
@@ -1325,11 +1356,11 @@ SQL
         fi
         sleep 0.25
     done
-    for i in $(seq 1 30); do
-        ip netns exec "$NS_BA" netbird up --daemon-addr "unix://$nb_dir_a/daemon.sock" --management-url "$mgmt_url" --setup-key "$setup_key" --disable-dns --disable-firewall >/dev/null 2>&1 && break || sleep 0.5
+    for i in $(seq 1 10); do
+        timeout 6 ip netns exec "$NS_BA" netbird up --daemon-addr "unix://$nb_dir_a/daemon.sock" --management-url "$mgmt_url" --setup-key "$setup_key" --disable-dns --disable-firewall >/dev/null 2>&1 && break || sleep 0.5
     done
-    for i in $(seq 1 30); do
-        ip netns exec "$NS_BB" netbird up --daemon-addr "unix://$nb_dir_b/daemon.sock" --management-url "$mgmt_url" --setup-key "$setup_key" --disable-dns --disable-firewall >/dev/null 2>&1 && break || sleep 0.5
+    for i in $(seq 1 10); do
+        timeout 6 ip netns exec "$NS_BB" netbird up --daemon-addr "unix://$nb_dir_b/daemon.sock" --management-url "$mgmt_url" --setup-key "$setup_key" --disable-dns --disable-firewall >/dev/null 2>&1 && break || sleep 0.5
     done
     local found=false
     for i in $(seq 1 40); do
