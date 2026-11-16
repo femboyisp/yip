@@ -921,3 +921,22 @@ fn test_oversized_packet_bypasses_buffering() {
     assert_eq!(emitted.len(), 1);
     assert_eq!(emitted[0], p_over);
 }
+
+#[test]
+fn test_reorder_buffer_deadline_accessors_and_dynamic_update() {
+    let mut rb = ReorderBuffer::new(10);
+    assert_eq!(rb.deadline_ms(), 10);
+
+    rb.set_deadline_ms(25);
+    assert_eq!(rb.deadline_ms(), 25);
+
+    // Clamping to minimum of 1
+    rb.set_deadline_ms(0);
+    assert_eq!(rb.deadline_ms(), 1);
+
+    let def = ReorderBuffer::default();
+    assert_eq!(
+        def.deadline_ms(),
+        yip_transport::reorder::DEFAULT_REORDER_DEADLINE_MS
+    );
+}
