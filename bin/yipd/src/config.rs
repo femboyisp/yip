@@ -765,9 +765,14 @@ impl Config {
                 }
                 "crypto_workers" | "crypto_threads" => {
                     let n = if val.eq_ignore_ascii_case("auto") {
-                        std::thread::available_parallelism()
-                            .map(|p| (p.get() / 2).clamp(2, 4))
-                            .unwrap_or(2)
+                        let p = std::thread::available_parallelism()
+                            .map(|p| p.get())
+                            .unwrap_or(1);
+                        if p <= 2 {
+                            0
+                        } else {
+                            (p / 2).clamp(2, 8)
+                        }
                     } else {
                         val.parse::<usize>().map_err(|e| {
                             io::Error::new(
@@ -1041,9 +1046,14 @@ impl Config {
                     .ok()
                     .and_then(|v| {
                         if v.eq_ignore_ascii_case("auto") {
-                            std::thread::available_parallelism()
-                                .map(|p| (p.get() / 2).clamp(2, 4))
-                                .ok()
+                            let p = std::thread::available_parallelism()
+                                .map(|p| p.get())
+                                .unwrap_or(1);
+                            if p <= 2 {
+                                Some(0)
+                            } else {
+                                Some((p / 2).clamp(2, 8))
+                            }
                         } else {
                             v.parse().ok()
                         }

@@ -39,7 +39,7 @@ device=yip0
     // Auto detection
     let text_auto = format!("{base}crypto_workers=auto\n");
     let c_auto = Config::parse(&text_auto).unwrap();
-    assert!(c_auto.crypto_workers >= 1 && c_auto.crypto_workers <= 16);
+    assert!(c_auto.crypto_workers <= 16);
 }
 
 #[test]

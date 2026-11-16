@@ -157,7 +157,9 @@ impl OutboundCryptoPool {
 
         match self.worker_txs[worker_idx].push(WorkerCommand::Task(task)) {
             Ok(()) => {
-                if self.worker_states[worker_idx].load(Ordering::Acquire) == STATE_SLEEPING {
+                if self.worker_states[worker_idx].swap(STATE_RUNNING, Ordering::SeqCst)
+                    == STATE_SLEEPING
+                {
                     self.worker_handles[worker_idx].thread().unpark();
                 }
                 Ok(())
@@ -375,17 +377,18 @@ fn worker_loop(
             }
             Some(WorkerCommand::Shutdown) => break,
             None => {
-                if idle_spins < 100_000 {
+                if idle_spins < 64 {
                     idle_spins += 1;
                     std::hint::spin_loop();
-                } else if idle_spins < 150_000 {
-                    idle_spins += 1;
-                    std::thread::yield_now();
                 } else {
-                    state.store(STATE_SLEEPING, Ordering::Release);
-                    std::thread::park_timeout(std::time::Duration::from_millis(10));
-                    state.store(STATE_RUNNING, Ordering::Release);
                     idle_spins = 0;
+                    state.store(STATE_SLEEPING, Ordering::SeqCst);
+                    if !rx.is_empty() {
+                        state.store(STATE_RUNNING, Ordering::SeqCst);
+                        continue;
+                    }
+                    std::thread::park_timeout(std::time::Duration::from_millis(1));
+                    state.store(STATE_RUNNING, Ordering::SeqCst);
                 }
             }
         }

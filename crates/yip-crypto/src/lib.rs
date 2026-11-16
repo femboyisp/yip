@@ -999,6 +999,21 @@ mod tests {
     }
 
     #[test]
+    fn test_session_advance_send_counter() {
+        let (mut a, _b) = crate::test_session_pair();
+        assert_eq!(a.send_counter(), 0);
+        let c0 = a.advance_send_counter().unwrap();
+        assert_eq!(c0, 0);
+        assert_eq!(a.send_counter(), 1);
+        let c1 = a.advance_send_counter().unwrap();
+        assert_eq!(c1, 1);
+        assert_eq!(a.send_counter(), 2);
+        let c2 = a.advance_send_counter().unwrap();
+        assert_eq!(c2, 2);
+        assert_eq!(a.send_counter(), 3);
+    }
+
+    #[test]
     fn pq_keypair_encapsulate_decapsulate_roundtrip() {
         let (ek, dk) = generate_pq_keypair();
         assert_eq!(ek.0.len(), PQ_ENCAPS_KEY_LEN);
