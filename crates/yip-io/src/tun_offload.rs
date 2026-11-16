@@ -789,6 +789,9 @@ pub fn split_gro(frame: &[u8], out: &mut Vec<u8>, offsets: &mut Vec<(usize, usiz
             s[x.ip_hdr_len + 4..x.ip_hdr_len + 8].copy_from_slice(&seq.to_be_bytes());
             let ip_ck = ipv4_checksum_with_base(base_sum, total, ip_id);
             s[10..12].copy_from_slice(&ip_ck.to_be_bytes());
+            if off + n < payload.len() {
+                s[x.ip_hdr_len + 13] &= !TCP_FLAG_PSH;
+            }
             tcp_checksum(s, x.ip_hdr_len);
             offsets.push((start, hdr + n));
             seq = seq.wrapping_add(u32::try_from(n).expect("n fits u32"));
@@ -815,6 +818,9 @@ pub fn split_gro(frame: &[u8], out: &mut Vec<u8>, offsets: &mut Vec<(usize, usiz
             let ipv6_payload_len = u16::try_from((hdr - 40) + n).expect("segment fits u16");
             s[4..6].copy_from_slice(&ipv6_payload_len.to_be_bytes());
             s[44..48].copy_from_slice(&seq.to_be_bytes());
+            if off + n < payload.len() {
+                s[40 + 13] &= !TCP_FLAG_PSH;
+            }
             ipv6_tcp_checksum(s);
             offsets.push((start, hdr + n));
             seq = seq.wrapping_add(u32::try_from(n).expect("n fits u32"));
@@ -1795,6 +1801,56 @@ mod tests {
     }
 
     #[test]
+    fn split_gro_clears_psh_on_intermediate_segments() {
+        let big = mk_tcp(
+            [10, 0, 0, 1],
+            [10, 0, 0, 2],
+            9,
+            80,
+            1000,
+            TCP_FLAG_PSH,
+            &vec![0xAA; 250],
+        );
+        let mut frame = vec![0u8; VNET_HDR_LEN];
+        write_vnet_hdr(
+            &VnetHdr {
+                flags: F_NEEDS_CSUM,
+                gso_type: GSO_TCPV4,
+                hdr_len: 40,
+                gso_size: 100,
+                csum_start: 20,
+                csum_offset: 16,
+            },
+            &mut frame,
+        );
+        frame.extend_from_slice(&big);
+        let (mut out, mut offs) = (Vec::new(), Vec::new());
+        assert!(split_gro(&frame, &mut out, &mut offs));
+        assert_eq!(offs.len(), 3);
+        for (i, &(s, l)) in offs.iter().enumerate() {
+            let seg = &out[s..s + l];
+            let x = parse_ipv4_tcp(seg).expect("valid segment");
+            if i < 2 {
+                assert_eq!(
+                    x.flags & TCP_FLAG_PSH,
+                    0,
+                    "intermediate segment {i} must clear PSH flag"
+                );
+            } else {
+                assert_eq!(
+                    x.flags & TCP_FLAG_PSH,
+                    TCP_FLAG_PSH,
+                    "final segment must retain PSH flag"
+                );
+            }
+            assert!(
+                verify_ipv4_tcp_checksum(seg),
+                "TCP segment checksum must be valid"
+            );
+        }
+    }
+
+    #[test]
     fn split_then_coalesce_roundtrip() {
         // Distinct (non-constant) bytes so any off-by-one/duplication bug is caught.
         let payload: Vec<u8> = (0..250usize)
@@ -2057,6 +2113,51 @@ mod tests {
                 verify_ipv6_tcp_checksum(seg),
                 "segment {} must have valid ipv6 tcp checksum",
                 i
+            );
+        }
+    }
+
+    #[test]
+    fn split_gro_ipv6_clears_psh_on_intermediate_segments() {
+        let src = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let payload = vec![0x33u8; 2500];
+        let big = mk_ipv6_tcp(src, dst, 1234, 80, 1000, TCP_FLAG_PSH, &payload);
+        let mut frame = vec![0u8; VNET_HDR_LEN];
+        write_vnet_hdr(
+            &VnetHdr {
+                flags: F_NEEDS_CSUM,
+                gso_type: GSO_TCPV6,
+                hdr_len: 60,
+                gso_size: 1000,
+                csum_start: 40,
+                csum_offset: 16,
+            },
+            &mut frame,
+        );
+        frame.extend_from_slice(&big);
+        let (mut out, mut offs) = (Vec::new(), Vec::new());
+        assert!(split_gro(&frame, &mut out, &mut offs));
+        assert_eq!(offs.len(), 3);
+        for (i, &(s, l)) in offs.iter().enumerate() {
+            let seg = &out[s..s + l];
+            let x = parse_ipv6_tcp(seg).expect("valid ipv6 tcp segment");
+            if i < 2 {
+                assert_eq!(
+                    x.flags & TCP_FLAG_PSH,
+                    0,
+                    "intermediate ipv6 segment {i} must clear PSH flag"
+                );
+            } else {
+                assert_eq!(
+                    x.flags & TCP_FLAG_PSH,
+                    TCP_FLAG_PSH,
+                    "final ipv6 segment must retain PSH flag"
+                );
+            }
+            assert!(
+                verify_ipv6_tcp_checksum(seg),
+                "segment {i} must have valid ipv6 tcp checksum"
             );
         }
     }
