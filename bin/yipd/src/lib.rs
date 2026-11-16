@@ -5,6 +5,7 @@
 mod addr;
 pub mod config;
 pub mod control;
+pub mod crypto_pool;
 pub mod dataplane;
 mod epoch;
 pub mod flow;
