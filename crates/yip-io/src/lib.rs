@@ -2,6 +2,7 @@
 //! servicing UDP + TUN/TAP), then AF_XDP. This is the only crate permitted to
 //! contain `unsafe`; every `unsafe` block must carry a `// SAFETY:` comment.
 
+pub mod ack_coalesce;
 pub mod addr;
 pub mod af_xdp;
 pub mod batch;
@@ -24,6 +25,7 @@ pub(crate) type CmsgLen = libc::socklen_t;
 #[cfg(not(target_env = "musl"))]
 pub(crate) type CmsgLen = usize;
 
+pub use ack_coalesce::AckCompressor;
 pub use addr::{sockaddr_to_std, std_to_sockaddr};
 pub use bpf::{BpfFilterStatus, XdpRedirectFilter};
 

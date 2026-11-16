@@ -87,14 +87,18 @@ pub(crate) enum FlowKey {
     },
 }
 
+impl FlowKey {
+    pub const EMPTY: Self = Self::V4 {
+        src: [0; 4],
+        dst: [0; 4],
+        sport: 0,
+        dport: 0,
+    };
+}
+
 impl Default for FlowKey {
     fn default() -> Self {
-        Self::V4 {
-            src: [0; 4],
-            dst: [0; 4],
-            sport: 0,
-            dport: 0,
-        }
+        Self::EMPTY
     }
 }
 
