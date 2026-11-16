@@ -14,6 +14,8 @@ All notable changes to this project are documented here, following
   Added automated installation and evaluation of userspace Go WireGuard (`wireguard-go`) in `setup-contenders.sh` (`--wireguard-go`) and `run-iperf-compare.sh`. Measures dual-stack IPv4/IPv6 throughput, loss, latency, CPU utilization, and peak resident memory (`get_ns_ram_mb`), enabling direct userspace-to-userspace comparisons against YIP. Added Go module build caching in `benchmarks.yml` to accelerate CI benchmarking runs.
 
 ### Fixed
+- **CI PR Mutation Testing Scope Alignment (`.github/workflows/mutants.yml`).**
+  Scoped PR diff mutation testing to the logic and control crates (`yip-wire`, `yip-transport`, `yip-crypto`, `yip-obf`, `yip-membership`, `yip-rendezvous`), matching the scheduled mutation testing suite and removing daemon binary integration test overhead (`yipd`).
 - **Benchmark Contender Setup, Host Isolation, and Mesh Protocol Provisioning (`crates/yip-bench`, #221, #237, #238).**
   Fixed runtime configuration and provisioning issues across benchmark contenders in `crates/yip-bench/setup-contenders.sh` and `crates/yip-bench/tests/run-iperf-compare.sh`:
   - Added `--accept-dns=false --accept-routes=false` to Tailscale namespace activation, isolating network namespace DNS configuration from host systemd-resolved and preventing host network connectivity loss during benchmark runs.
