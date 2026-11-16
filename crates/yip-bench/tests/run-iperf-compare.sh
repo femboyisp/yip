@@ -384,6 +384,7 @@ calc_ram_efficiency() {
 
 TCP_CC="${TCP_CC:-cubic}"
 IPERF_STREAMS="${IPERF_STREAMS:-1}"
+YIP_FAILED=false
 
 # ── helper: iperf3 TCP Mbit/s; server in <ns_srv> bound to <srv_ip>, client in
 #    <ns_cli> -> <srv_ip>.  echo "<mbps> <loss>" ───────────────────────────────
@@ -397,43 +398,49 @@ measure_iperf() {
     if [[ "$srv_ip" == *:* ]]; then
         v6_flag="-6"
     fi
-    ip netns exec "$ns_srv" killall -9 iperf3 2>/dev/null || true
-    ip netns exec "$ns_cli" killall -9 iperf3 2>/dev/null || true
-    ip netns exec "$ns_srv" iperf3 -s -1 -B "$srv_ip" $v6_flag >/dev/null 2>&1 &
-    srv_pid=$!
-    sleep 0.5
-    out="$(timeout 35 ip netns exec "$ns_cli" iperf3 -c "$srv_ip" $v6_flag -C "$TCP_CC" -P "$streams" --connect-timeout 10000 -t 8 -J 2>/dev/null || true)"
-    kill -9 "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-    ip netns exec "$ns_srv" killall -9 iperf3 2>/dev/null || true
-    ip netns exec "$ns_cli" killall -9 iperf3 2>/dev/null || true
 
-    if [ -n "$out" ]; then
-        if command -v jq >/dev/null 2>&1; then
-            mbps="$(echo "$out" | jq -r '.end.sum_received.bits_per_second // .end.sum_sent.bits_per_second // empty' 2>/dev/null || true)"
-            retransmits="$(echo "$out" | jq -r '.end.sum_sent.retransmits // 0' 2>/dev/null || true)"
-            bytes="$(echo "$out" | jq -r '.end.sum_sent.bytes // 0' 2>/dev/null || true)"
-        else
-            mbps="$(echo "$out" | grep -oP '"bits_per_second":\s*[0-9.]+' | tail -1 | grep -oP '[0-9.]+' || true)"
-            retransmits="$(echo "$out" | grep -oP '"retransmits":\s*[0-9]+' | head -1 | grep -oP '[0-9]+' || true)"
-            bytes="$(echo "$out" | grep -oP '"bytes":\s*[0-9]+' | head -1 | grep -oP '[0-9]+' || true)"
-        fi
-        if [ -n "$mbps" ] && [ "$mbps" != "null" ]; then
-            mbps="$(awk "BEGIN {printf \"%.1f\", $mbps / 1000000}")"
-        else
-            mbps="0.0"
-        fi
-        if [ -n "$retransmits" ] && [ "$retransmits" != "null" ] && [ -n "$bytes" ] && [ "$bytes" != "null" ]; then
-            loss="$(awk -v r="${retransmits:-0}" -v b="${bytes:-0}" 'BEGIN { segs = b / 1400.0; if (segs + r > 0) printf "%.1f", (r / (segs + r)) * 100.0; else printf "0.0" }')"
-        else
-            loss="0.0"
-        fi
-    else
-        mbps="0.0"
-        loss="100.0"
-    fi
+    for attempt in 1 2; do
+        ip netns exec "$ns_srv" killall -9 iperf3 2>/dev/null || true
+        ip netns exec "$ns_cli" killall -9 iperf3 2>/dev/null || true
+        ip netns exec "$ns_srv" iperf3 -s -B "$srv_ip" $v6_flag >/dev/null 2>&1 &
+        srv_pid=$!
+        for _ in $(seq 1 30); do
+            if ip netns exec "$ns_srv" ss -tlpn 2>/dev/null | grep -q ":5201 "; then
+                break
+            fi
+            sleep 0.05
+        done
+        out="$(timeout 40 ip netns exec "$ns_cli" iperf3 -c "$srv_ip" $v6_flag -C "$TCP_CC" -P "$streams" --connect-timeout 10000 -t 8 -J 2>/dev/null || true)"
+        kill -9 "$srv_pid" 2>/dev/null || true
+        wait "$srv_pid" 2>/dev/null || true
+        ip netns exec "$ns_srv" killall -9 iperf3 2>/dev/null || true
+        ip netns exec "$ns_cli" killall -9 iperf3 2>/dev/null || true
 
-    echo "$mbps $loss"
+        if [ -n "$out" ]; then
+            if command -v jq >/dev/null 2>&1; then
+                mbps="$(echo "$out" | jq -r '.end.sum_received.bits_per_second // .end.sum_sent.bits_per_second // empty' 2>/dev/null || true)"
+                retransmits="$(echo "$out" | jq -r '.end.sum_sent.retransmits // 0' 2>/dev/null || true)"
+                bytes="$(echo "$out" | jq -r '.end.sum_sent.bytes // 0' 2>/dev/null || true)"
+            else
+                mbps="$(echo "$out" | grep -oP '"bits_per_second":\s*[0-9.]+' | tail -1 | grep -oP '[0-9.]+' || true)"
+                retransmits="$(echo "$out" | grep -oP '"retransmits":\s*[0-9]+' | head -1 | grep -oP '[0-9]+' || true)"
+                bytes="$(echo "$out" | grep -oP '"bytes":\s*[0-9]+' | head -1 | grep -oP '[0-9]+' || true)"
+            fi
+            if [ -n "$mbps" ] && [ "$mbps" != "null" ] && [ "$(awk "BEGIN {print ($mbps > 0)}")" = "1" ]; then
+                mbps="$(awk "BEGIN {printf \"%.1f\", $mbps / 1000000}")"
+                if [ -n "$retransmits" ] && [ "$retransmits" != "null" ] && [ -n "$bytes" ] && [ "$bytes" != "null" ]; then
+                    loss="$(awk -v r="${retransmits:-0}" -v b="${bytes:-0}" 'BEGIN { segs = b / 1400.0; if (segs + r > 0) printf "%.1f", (r / (segs + r)) * 100.0; else printf "0.0" }')"
+                else
+                    loss="0.0"
+                fi
+                echo "$mbps $loss"
+                return
+            fi
+        fi
+        sleep 0.5
+    done
+
+    echo "0.0 100.0"
 }
 measure_iperf_v6() { measure_iperf "$@"; }
 
@@ -448,51 +455,51 @@ measure_iperf_udp() {
     if [[ "$srv_ip" == *:* ]]; then
         v6_flag="-6"
     fi
-    ip netns exec "$ns_srv" killall -9 iperf3 2>/dev/null || true
-    ip netns exec "$ns_cli" killall -9 iperf3 2>/dev/null || true
-    ip netns exec "$ns_srv" iperf3 -s -1 -B "$srv_ip" $v6_flag >/dev/null 2>&1 &
-    srv_pid=$!
-    sleep 0.5
-    sample_cpu_start
-    out="$(timeout 35 ip netns exec "$ns_cli" iperf3 -c "$srv_ip" $v6_flag -u \
-        -b "${UDP_RATE:-10G}" -l "${UDP_LEN:-1400}" --connect-timeout 10000 -t 8 -J 2>/dev/null || true)"
-    read -r cpu_pct _ <<< "$(sample_cpu_end)"
-    kill -9 "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-    ip netns exec "$ns_srv" killall -9 iperf3 2>/dev/null || true
-    ip netns exec "$ns_cli" killall -9 iperf3 2>/dev/null || true
 
-    if [ -n "$out" ]; then
-        if command -v jq >/dev/null 2>&1; then
-            mbps="$(echo "$out" | jq -r '.end.sum.bits_per_second // empty' 2>/dev/null || true)"
-            loss="$(echo "$out" | jq -r '.end.sum.lost_percent // empty' 2>/dev/null || true)"
-        else
-            mbps="$(echo "$out" | grep -oP '"bits_per_second":\s*[0-9.]+' | tail -1 | grep -oP '[0-9.]+' || true)"
-            loss="$(echo "$out" | grep -oP '"lost_percent":\s*[0-9.]+' | tail -1 | grep -oP '[0-9.]+' || true)"
-        fi
-        if [ -n "$mbps" ] && [ "$mbps" != "null" ]; then
-            mbps="$(awk "BEGIN {printf \"%.1f\", $mbps / 1000000}")"
-        else
-            mbps="N/A"
-        fi
-        if [ -n "$loss" ] && [ "$loss" != "null" ]; then
-            loss="$(awk "BEGIN {printf \"%.1f\", $loss}")"
-        else
-            loss="N/A"
-        fi
-    else
-        mbps="N/A"
-        loss="N/A"
-    fi
+    for attempt in 1 2; do
+        ip netns exec "$ns_srv" killall -9 iperf3 2>/dev/null || true
+        ip netns exec "$ns_cli" killall -9 iperf3 2>/dev/null || true
+        ip netns exec "$ns_srv" iperf3 -s -B "$srv_ip" $v6_flag >/dev/null 2>&1 &
+        srv_pid=$!
+        for _ in $(seq 1 30); do
+            if ip netns exec "$ns_srv" ss -tlpn 2>/dev/null | grep -q ":5201 "; then
+                break
+            fi
+            sleep 0.05
+        done
+        sample_cpu_start
+        out="$(timeout 40 ip netns exec "$ns_cli" iperf3 -c "$srv_ip" $v6_flag -u \
+            -b "${UDP_RATE:-10G}" -l "${UDP_LEN:-1400}" --connect-timeout 10000 -t 8 -J 2>/dev/null || true)"
+        read -r cpu_pct _ <<< "$(sample_cpu_end)"
+        kill -9 "$srv_pid" 2>/dev/null || true
+        wait "$srv_pid" 2>/dev/null || true
+        ip netns exec "$ns_srv" killall -9 iperf3 2>/dev/null || true
+        ip netns exec "$ns_cli" killall -9 iperf3 2>/dev/null || true
 
-    if [ "$mbps" != "N/A" ]; then
-        cpu_eff="$(calc_cpu_efficiency "$cpu_pct" "$mbps")"
-    else
-        cpu_eff="N/A"
-        cpu_pct="N/A"
-    fi
+        if [ -n "$out" ]; then
+            if command -v jq >/dev/null 2>&1; then
+                mbps="$(echo "$out" | jq -r '.end.sum.bits_per_second // empty' 2>/dev/null || true)"
+                loss="$(echo "$out" | jq -r '.end.sum.lost_percent // empty' 2>/dev/null || true)"
+            else
+                mbps="$(echo "$out" | grep -oP '"bits_per_second":\s*[0-9.]+' | tail -1 | grep -oP '[0-9.]+' || true)"
+                loss="$(echo "$out" | grep -oP '"lost_percent":\s*[0-9.]+' | tail -1 | grep -oP '[0-9.]+' || true)"
+            fi
+            if [ -n "$mbps" ] && [ "$mbps" != "null" ] && [ "$(awk "BEGIN {print ($mbps > 0)}")" = "1" ]; then
+                mbps="$(awk "BEGIN {printf \"%.1f\", $mbps / 1000000}")"
+                if [ -n "$loss" ] && [ "$loss" != "null" ]; then
+                    loss="$(awk "BEGIN {printf \"%.1f\", $loss}")"
+                else
+                    loss="0.0"
+                fi
+                cpu_eff="$(calc_cpu_efficiency "$cpu_pct" "$mbps")"
+                echo "$mbps $loss $cpu_pct $cpu_eff"
+                return
+            fi
+        fi
+        sleep 0.5
+    done
 
-    echo "$mbps $loss $cpu_pct $cpu_eff"
+    echo "N/A N/A N/A N/A"
 }
 measure_iperf_udp_v6() { measure_iperf_udp "$@"; }
 
@@ -1309,8 +1316,8 @@ EOF
         kill $pid_mgmt 2>/dev/null || true
         wait $pid_mgmt 2>/dev/null || true
         sqlite3 "$nb_dir/data/store.db" <<'SQL'
-INSERT INTO accounts (id, created_by, created_at, domain, domain_category, is_domain_primary_account, network_identifier, network_net, network_net_v6, settings_peer_login_expiration_enabled, settings_groups_propagation_enabled, settings_lazy_connection_enabled)
-VALUES ('acc_bench', 'usr_bench', datetime('now'), 'netbird.selfhosted', 'private', 1, 'net_bench', '{"IP":"100.64.0.0","Mask":"//8AAA=="}', '{"IP":"fd00:4e42::","Mask":"//////////8AAAAAAAAAAA=="}', 0, 1, 0);
+INSERT INTO accounts (id, created_by, created_at, domain, domain_category, is_domain_primary_account, network_identifier, network_net, network_net_v6, settings_peer_login_expiration_enabled, settings_groups_propagation_enabled, settings_lazy_connection_enabled, settings_ipv6_enabled_groups)
+VALUES ('acc_bench', 'usr_bench', datetime('now'), 'netbird.selfhosted', 'private', 1, 'net_bench', '{"IP":"100.64.0.0","Mask":"//8AAA=="}', '{"IP":"fd00:4e42::","Mask":"//////////8AAAAAAAAAAA=="}', 0, 1, 0, '["grp_all"]');
 
 INSERT INTO users (id, account_id, role, is_service_user, non_deletable, created_at, issued)
 VALUES ('usr_bench', 'acc_bench', 'owner', 0, 1, datetime('now'), 'api');
@@ -1412,6 +1419,14 @@ SQL
     if [ "$nb_up" = false ]; then
         echo "[netbird] SKIP: baseline ping failed"; NB_AVAILABLE=false; return
     fi
+    if [ -n "$TUN_BA_IP6" ]; then
+        for i in $(seq 1 30); do
+            if ip netns exec "$NS_BB" ping -c 1 -W 1 "$TUN_BA_IP6" >/dev/null 2>&1; then
+                break
+            fi
+            sleep 0.5
+        done
+    fi
     echo "[netbird] tunnel up"
 }
 setup_netbird
@@ -1457,6 +1472,14 @@ for LOSS in $LOSS_RATES; do
     Y6_RAM="$(get_ns_ram_mb "$NS_YA")"
     Y6_RAM_EFF="$(calc_ram_efficiency "$Y6_RAM" "$Y6_UDP_MBPS")"
     echo "[yip] [ipv6] ping_loss=${Y6_LOSS}% rtt=${Y6_RTT}ms tcp=${Y6_TCP}Mbit/s tcp_loss=${Y6_TCP_LOSS}% udp=${Y6_UDP_MBPS}Mbit/s udp_loss=${Y6_UDP_LOSS}% cpu=${Y6_CPU}% eff=${Y6_EFF} ram=${Y6_RAM}MB ram_eff=${Y6_RAM_EFF}"
+
+    if [ "$Y_TCP" = "0.0" ] || [ "$Y_TCP" = "N/A" ] || \
+       [ "$Y6_TCP" = "0.0" ] || [ "$Y6_TCP" = "N/A" ] || \
+       [ "$Y_UDP_MBPS" = "0.0" ] || [ "$Y_UDP_MBPS" = "N/A" ] || \
+       [ "$Y6_UDP_MBPS" = "0.0" ] || [ "$Y6_UDP_MBPS" = "N/A" ]; then
+        echo "[error] yip throughput failure detected at loss=${LOSS}% (v4_tcp=$Y_TCP v6_tcp=$Y6_TCP v4_udp=$Y_UDP_MBPS v6_udp=$Y6_UDP_MBPS)"
+        YIP_FAILED=true
+    fi
 
     # WireGuard (IPv4 & IPv6)
     W_LOSS="N/A"; W_RTT="N/A"; W_TCP="N/A"; W_TCP_LOSS="N/A"; W_UDP_MBPS="N/A"; W_UDP_LOSS="N/A"; W_CPU="N/A"; W_EFF="N/A"; W_RAM="N/A"; W_RAM_EFF="N/A"
@@ -1657,4 +1680,9 @@ echo "[done] iperf compare sweep complete"
 [ "$ZT_AVAILABLE"   = false ] && echo "[note] ZeroTier skipped (binary absent or setup failed)"
 [ "$TS_AVAILABLE"   = false ] && echo "[note] Tailscale skipped (binary absent or setup failed)"
 [ "$NB_AVAILABLE"   = false ] && echo "[note] NetBird skipped (binary absent or setup failed)"
+
+if [ "$YIP_FAILED" = true ]; then
+    echo "[fail] benchmark sweep failed: yip did not maintain healthy throughput across all loss conditions"
+    exit 1
+fi
 true
