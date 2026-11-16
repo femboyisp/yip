@@ -30,6 +30,9 @@ sysctl -qw net.ipv6.conf.all.accept_dad=0 \
     net.ipv4.tcp_wmem="4096 65536 67108864" \
     net.ipv4.tcp_reordering=20 2>/dev/null || true
 
+# Pre-sweep: kill any orphaned contender daemons from previous runs
+killall -9 netbird netbird-mgmt netbird-signal edge supernode 2>/dev/null || true
+
 # ── binary ────────────────────────────────────────────────────────────────────
 if [ $# -ge 1 ] && [ -n "${1:-}" ]; then
     YIPD="$1"
@@ -156,6 +159,7 @@ cleanup() {
     [ -n "$PID_GGB" ] && kill -9 "$PID_GGB" 2>/dev/null || true
     [ -n "$PID_AA" ] && kill -9 "$PID_AA" 2>/dev/null || true
     [ -n "$PID_AB" ] && kill -9 "$PID_AB" 2>/dev/null || true
+    killall -9 netbird netbird-mgmt netbird-signal edge supernode 2>/dev/null || true
     # Remove virtual interfaces before deleting namespaces
     ip netns exec "$NS_WA" ip link del wg0 2>/dev/null || true
     ip netns exec "$NS_WB" ip link del wg0 2>/dev/null || true
@@ -232,6 +236,10 @@ fi
 
 measure_ping() {
     local ns="$1" dst="$2" ping_cmd out loss rttline rtt
+    if [ -z "$dst" ]; then
+        echo "N/A N/A"
+        return
+    fi
     if [[ "$dst" == *:* ]]; then
         ping_cmd="ping -6"
     else
@@ -383,6 +391,10 @@ measure_iperf() {
     local ns_srv="$1" srv_ip="$2" ns_cli="$3" v6_flag="" srv_pid out mbps loss retransmits bytes
     local TCP_CC="${TCP_CC:-cubic}"
     local IPERF_STREAMS="${IPERF_STREAMS:-1}"
+    if [ -z "$srv_ip" ]; then
+        echo "N/A N/A"
+        return
+    fi
     if [[ "$srv_ip" == *:* ]]; then
         v6_flag="-6"
     fi
@@ -430,6 +442,10 @@ measure_iperf_v6() { measure_iperf "$@"; }
 #    client in <ns_cli> -> <srv_ip>. echo "<mbps> <loss_pct> <cpu_pct> <cpu_eff>" ───────────
 measure_iperf_udp() {
     local ns_srv="$1" srv_ip="$2" ns_cli="$3" v6_flag="" srv_pid out mbps loss cpu_pct cpu_eff
+    if [ -z "$srv_ip" ]; then
+        echo "N/A N/A N/A N/A"
+        return
+    fi
     if [[ "$srv_ip" == *:* ]]; then
         v6_flag="-6"
     fi
@@ -936,6 +952,7 @@ setup_n2n() {
     if ! command -v supernode >/dev/null 2>&1 || ! command -v edge >/dev/null 2>&1; then
         echo "[n2n] SKIP: 'supernode'/'edge' not found"; N2N_AVAILABLE=false; return
     fi
+    killall -9 edge supernode 2>/dev/null || true
     echo "[n2n] creating namespaces and veth pair"
     make_pair "$NS_NA" "$NS_NB" "$VNA" "$VNB" "$VNA_IP" "$VNB_IP"
     ip netns exec "$NS_NA" supernode -p "$N2N_PORT" -f -M >"$TMPDIR_TEST/n2-sn.log" 2>&1 &
@@ -961,17 +978,27 @@ setup_n2n() {
     local n2n_up=false
     for i in $(seq 1 40); do
         if ip netns exec "$NS_NB" ping -c 1 -W 1 "$OVL_NA_IP" >/dev/null 2>&1; then
-            if ip netns exec "$NS_NB" ping -6 -c 1 -W 1 "$OVL_NA_IP6" >/dev/null 2>&1; then
-                n2n_up=true
-                break
-            fi
+            n2n_up=true
+            break
         fi
         sleep 0.5
     done
     if [ "$n2n_up" = false ]; then
-        echo "[n2n] SKIP: baseline overlay IPv4/IPv6 ping failed"
+        echo "[n2n] SKIP: baseline overlay IPv4 ping failed"
         tail -5 "$TMPDIR_TEST/n2-sn.log" "$TMPDIR_TEST/n2-eA.log" "$TMPDIR_TEST/n2-eB.log" 2>/dev/null || true
         N2N_AVAILABLE=false; return
+    fi
+    local n2n_v6_up=false
+    for i in $(seq 1 10); do
+        if ip netns exec "$NS_NB" ping -6 -c 1 -W 1 "$OVL_NA_IP6" >/dev/null 2>&1; then
+            n2n_v6_up=true
+            break
+        fi
+        sleep 0.5
+    done
+    if [ "$n2n_v6_up" = false ]; then
+        OVL_NA_IP6=""
+        OVL_NB_IP6=""
     fi
     echo "[n2n] overlay up"
 }
@@ -1212,6 +1239,7 @@ setup_netbird() {
     if ! command -v netbird >/dev/null 2>&1; then
         echo "[netbird] SKIP: 'netbird' not found"; NB_AVAILABLE=false; return
     fi
+    killall -9 netbird netbird-mgmt netbird-signal 2>/dev/null || true
     local mgmt_url="${NETBIRD_MGMT_URL:-}"
     local setup_key="${NETBIRD_SETUP_KEY:-}"
 
@@ -1275,7 +1303,13 @@ INSERT INTO setup_keys (id, account_id, key, key_secret, name, type, created_at,
 VALUES ('key_bench', 'acc_bench', 'mewqgKYulb4neyT85tvUyw1QzCAhxDjA9+5h7WeAysw=', 'A1B2C****', 'Bench Key', 'reusable', datetime('now'), datetime('now', '+10 years'), 0, 0, 0, '["grp_all"]');
 SQL
         ip netns exec "$NS_BA" netbird-mgmt management --config "$nb_dir/management.json" --datadir "$nb_dir/data" --port 8080 --metrics-port 9099 --log-file "$TMPDIR_TEST/nb-mgmt.log" >/dev/null 2>&1 &
-        sleep 2
+        local pid_mgmt2=$!
+        for i in $(seq 1 60); do
+            if ip netns exec "$NS_BA" ss -tlpn 2>/dev/null | grep -q ":8080"; then
+                break
+            fi
+            sleep 0.25
+        done
         mgmt_url="http://${VBA_IP}:8080"
         setup_key="A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
     fi
@@ -1290,10 +1324,10 @@ SQL
         fi
         sleep 0.25
     done
-    for i in $(seq 1 10); do
+    for i in $(seq 1 30); do
         ip netns exec "$NS_BA" netbird up --daemon-addr "unix://$nb_dir_a/daemon.sock" --management-url "$mgmt_url" --setup-key "$setup_key" --disable-dns --disable-firewall >/dev/null 2>&1 && break || sleep 0.5
     done
-    for i in $(seq 1 10); do
+    for i in $(seq 1 30); do
         ip netns exec "$NS_BB" netbird up --daemon-addr "unix://$nb_dir_b/daemon.sock" --management-url "$mgmt_url" --setup-key "$setup_key" --disable-dns --disable-firewall >/dev/null 2>&1 && break || sleep 0.5
     done
     local found=false
@@ -1329,6 +1363,9 @@ SQL
     if [ -n "$nb_dyn6_a" ] && [ -n "$nb_dyn6_b" ]; then
         TUN_BA_IP6="$nb_dyn6_a"
         TUN_BB_IP6="$nb_dyn6_b"
+    else
+        TUN_BA_IP6=""
+        TUN_BB_IP6=""
     fi
     ip netns exec "$NS_BA" ip link set dev wt0 txqueuelen 10000 2>/dev/null || true
     ip netns exec "$NS_BB" ip link set dev wt0 txqueuelen 10000 2>/dev/null || true
