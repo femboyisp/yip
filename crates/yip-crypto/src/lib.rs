@@ -1014,6 +1014,15 @@ mod tests {
     }
 
     #[test]
+    fn test_session_commit_replay() {
+        let (mut a, _b) = crate::test_session_pair();
+        assert!(a.check_replay(10));
+        a.commit_replay(10);
+        assert!(!a.check_replay(10));
+        assert!(a.check_replay(11));
+    }
+
+    #[test]
     fn pq_keypair_encapsulate_decapsulate_roundtrip() {
         let (ek, dk) = generate_pq_keypair();
         assert_eq!(ek.0.len(), PQ_ENCAPS_KEY_LEN);

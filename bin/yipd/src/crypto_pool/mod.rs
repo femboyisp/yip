@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use yip_crypto::session::ChaCha20Poly1305Cipher;
 
@@ -23,6 +24,8 @@ pub struct CryptoWorkerPool {
     /// Inbound decryption worker pool.
     pub inbound: InboundCryptoPool,
     num_workers: usize,
+    eventfd: Arc<yip_io::EventFd>,
+    reactor_sleeping: Arc<AtomicBool>,
 }
 
 impl CryptoWorkerPool {
@@ -31,11 +34,36 @@ impl CryptoWorkerPool {
     /// # Panics
     /// Panics if `num_workers == 0`.
     pub fn new(num_workers: usize) -> Self {
+        let eventfd = Arc::new(yip_io::EventFd::new().expect("eventfd creation succeeds"));
+        let reactor_sleeping = Arc::new(AtomicBool::new(false));
+
         Self {
-            outbound: OutboundCryptoPool::new(num_workers),
-            inbound: InboundCryptoPool::new(num_workers),
+            outbound: OutboundCryptoPool::new(
+                num_workers,
+                Arc::clone(&eventfd),
+                Arc::clone(&reactor_sleeping),
+            ),
+            inbound: InboundCryptoPool::new(
+                num_workers,
+                Arc::clone(&eventfd),
+                Arc::clone(&reactor_sleeping),
+            ),
             num_workers,
+            eventfd,
+            reactor_sleeping,
         }
+    }
+
+    /// Eventfd file descriptor for waking up the epoll event loop when workers complete tasks.
+    #[inline]
+    pub fn eventfd(&self) -> &Arc<yip_io::EventFd> {
+        &self.eventfd
+    }
+
+    /// Shared atomic flag signaling whether the reactor thread is currently sleeping in epoll_wait.
+    #[inline]
+    pub fn reactor_sleeping(&self) -> &Arc<AtomicBool> {
+        &self.reactor_sleeping
     }
 
     /// Number of worker threads allocated per direction.

@@ -1,13 +1,12 @@
 //! Integration tests for crypto worker pool integration and configuration.
 #![forbid(unsafe_code)]
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use yip_crypto::session::ChaCha20Poly1305Cipher;
 use yip_transport::FlowClass;
 use yipd::config::Config;
-use yipd::crypto_pool::inbound::DecryptTask;
+use yipd::crypto_pool::inbound::{DecryptTask, MAX_PACKET_LEN};
 use yipd::crypto_pool::outbound::EncryptTask;
 use yipd::crypto_pool::CryptoWorkerPool;
 
@@ -55,24 +54,24 @@ fn test_crypto_worker_pool_bidirectional_roundtrip() {
     let peer_id = 42;
     pool.register_cipher(peer_id, Arc::clone(&send_cipher), Arc::clone(&recv_cipher));
 
-    let dst: SocketAddr = "127.0.0.1:51820".parse().unwrap();
     let packet_count = 32;
     let mut original_payloads = Vec::with_capacity(packet_count);
 
     // 1. Dispatch outbound encryption
     for seq in 0..packet_count as u64 {
-        let payload = vec![(seq & 0xFF) as u8; 1000];
-        original_payloads.push(payload.clone());
+        let p = vec![(seq & 0xFF) as u8; 1000];
+        original_payloads.push(p.clone());
+
+        let mut payload = [0u8; MAX_PACKET_LEN];
+        payload[..1000].copy_from_slice(&p);
 
         let task = EncryptTask {
             seq,
             peer_id,
             counter: seq + 1,
             fate: 0,
-            dst,
-            conn_tag: 0x9999,
             class: FlowClass::Default,
-            symbol_size: 1200,
+            payload_len: 1000,
             payload,
         };
         pool.outbound.dispatch_encrypt(task).unwrap();
@@ -94,11 +93,13 @@ fn test_crypto_worker_pool_bidirectional_roundtrip() {
         .register_cipher(peer_id, Arc::clone(&matching_dec_cipher));
 
     for item in &sealed_packets {
+        assert!(item.success);
         let dec_task = DecryptTask {
             seq: item.seq,
             peer_id,
             counter: item.seq + 1,
-            ciphertext: item.datagrams[0].bytes.clone(),
+            ciphertext_len: item.ciphertext_len,
+            ciphertext: item.ciphertext,
         };
         pool.inbound.dispatch_decrypt(dec_task).unwrap();
     }
@@ -116,7 +117,11 @@ fn test_crypto_worker_pool_bidirectional_roundtrip() {
     // 3. Verify exact byte-for-byte roundtrip in strict in-order sequence
     for (idx, item) in decrypted_packets.iter().enumerate() {
         assert_eq!(item.seq, idx as u64);
-        assert_eq!(&item.plaintext[..], &original_payloads[idx][..]);
+        assert!(item.success);
+        assert_eq!(
+            &item.plaintext[..item.plaintext_len],
+            &original_payloads[idx][..]
+        );
     }
 
     pool.shutdown();

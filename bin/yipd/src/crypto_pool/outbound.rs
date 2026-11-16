@@ -1,13 +1,12 @@
 //! Parallel worker pool for outbound ChaCha20-Poly1305 encryption.
 //!
 //! Stripes inner TUN packets across a pool of worker threads via lock-free SPSC
-//! bounded ring buffers, performs AEAD sealing in parallel, and collects completed
-//! datagrams into an in-order reorder buffer before socket transmission.
+//! bounded ring buffers, performs AEAD sealing in parallel with zero heap allocations,
+//! and collects completed encrypted buffers into an in-order reorder buffer before socket transmission.
 
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -23,9 +22,10 @@ const STATE_SLEEPING: u8 = 1;
 
 pub const WORKER_QUEUE_CAP: usize = 1024;
 pub const ROB_CAPACITY: usize = 4096;
+pub const MAX_PACKET_LEN: usize = 2048;
 
-/// Packet encryption task dispatched to worker threads.
-#[derive(Debug)]
+/// Packet encryption task dispatched to worker threads with inline zero-allocation buffer.
+#[derive(Clone, Copy, Debug)]
 pub struct EncryptTask {
     /// Local sequencing index for in-order completion reassembly.
     pub seq: u64,
@@ -35,27 +35,42 @@ pub struct EncryptTask {
     pub counter: u64,
     /// Datagram fate / scheduling tag.
     pub fate: u16,
-    /// Destination UDP socket address.
-    pub dst: SocketAddr,
-    /// Connection identifier tag for wire framing.
-    pub conn_tag: u64,
     /// Flow classification priority.
     pub class: FlowClass,
-    /// Reed-Solomon symbol size for wire fragmentation (e.g. 1200).
-    pub symbol_size: u16,
-    /// Raw inner plaintext payload.
-    pub payload: Vec<u8>,
+    /// Raw inner plaintext payload byte count.
+    pub payload_len: usize,
+    /// Raw inner plaintext payload inline buffer.
+    pub payload: [u8; MAX_PACKET_LEN],
 }
 
-/// Completed datagram batch ready for socket transmission.
-#[derive(Debug)]
-pub struct CompletedDatagram {
+/// Completed encrypted ciphertext buffer ready for transport framing and socket transmission.
+#[derive(Clone, Copy, Debug)]
+pub struct CompletedEncrypt {
     /// Local sequence index matching [`EncryptTask::seq`].
     pub seq: u64,
-    /// Encrypted wire datagrams produced from this inner packet.
-    pub datagrams: Vec<yip_io::poll::EgressDatagram>,
+    /// Identifier for peer cipher lookup.
+    pub peer_id: usize,
+    /// Monotonic Noise/AEAD session counter.
+    pub counter: u64,
+    /// Datagram fate / scheduling tag.
+    pub fate: u16,
+    /// Flow classification priority.
+    pub class: FlowClass,
+    /// Encrypted ciphertext byte count.
+    pub ciphertext_len: usize,
+    /// Encrypted ciphertext inline buffer.
+    pub ciphertext: [u8; MAX_PACKET_LEN],
+    /// Whether encryption succeeded.
+    pub success: bool,
 }
 
+/// Backwards compatibility alias for completed tasks.
+pub type CompletedDatagram = CompletedEncrypt;
+
+#[expect(
+    clippy::large_enum_variant,
+    reason = "zero-allocation worker ring buffers require inline packet arrays"
+)]
 enum WorkerCommand {
     RegisterCipher {
         peer_id: usize,
@@ -69,10 +84,10 @@ enum WorkerCommand {
 /// Multi-threaded outbound crypto worker pool.
 pub struct OutboundCryptoPool {
     worker_txs: Vec<SpscProducer<WorkerCommand, WORKER_QUEUE_CAP>>,
-    worker_rxs: Vec<SpscConsumer<CompletedDatagram, WORKER_QUEUE_CAP>>,
+    worker_rxs: Vec<SpscConsumer<CompletedEncrypt, WORKER_QUEUE_CAP>>,
     worker_handles: Vec<JoinHandle<()>>,
     worker_states: Vec<Arc<AtomicU8>>,
-    reorder_buffer: ReorderBuffer<CompletedDatagram, ROB_CAPACITY>,
+    reorder_buffer: ReorderBuffer<CompletedEncrypt, ROB_CAPACITY>,
     next_worker_idx: usize,
     shutdown_flag: Arc<AtomicBool>,
 }
@@ -82,7 +97,11 @@ impl OutboundCryptoPool {
     ///
     /// # Panics
     /// Panics if `num_workers == 0`.
-    pub fn new(num_workers: usize) -> Self {
+    pub fn new(
+        num_workers: usize,
+        eventfd: Arc<yip_io::EventFd>,
+        reactor_sleeping: Arc<AtomicBool>,
+    ) -> Self {
         assert!(num_workers > 0, "num_workers must be at least 1");
 
         let mut worker_txs = Vec::with_capacity(num_workers);
@@ -93,15 +112,17 @@ impl OutboundCryptoPool {
 
         for worker_id in 0..num_workers {
             let (cmd_tx, cmd_rx) = spsc_pair::<WorkerCommand, WORKER_QUEUE_CAP>();
-            let (out_tx, out_rx) = spsc_pair::<CompletedDatagram, WORKER_QUEUE_CAP>();
+            let (out_tx, out_rx) = spsc_pair::<CompletedEncrypt, WORKER_QUEUE_CAP>();
             let flag = Arc::clone(&shutdown_flag);
             let state = Arc::new(AtomicU8::new(STATE_RUNNING));
             let state_worker = Arc::clone(&state);
+            let efd = Arc::clone(&eventfd);
+            let sleeping = Arc::clone(&reactor_sleeping);
 
             let handle = std::thread::Builder::new()
                 .name(format!("yipd-enc-{worker_id}"))
                 .spawn(move || {
-                    worker_loop(cmd_rx, out_tx, flag, state_worker);
+                    worker_loop(cmd_rx, out_tx, flag, state_worker, efd, sleeping);
                 })
                 .expect("failed to spawn outbound crypto worker thread");
 
@@ -151,6 +172,10 @@ impl OutboundCryptoPool {
     /// Dispatch an encryption task to the next worker thread in round-robin sequence.
     ///
     /// Returns `Ok(())` on success, or `Err(task)` if the target worker queue is full.
+    #[expect(
+        clippy::result_large_err,
+        reason = "zero-allocation task retry without heap indirection"
+    )]
     pub fn dispatch_encrypt(&mut self, task: EncryptTask) -> Result<(), EncryptTask> {
         let worker_idx = self.next_worker_idx % self.worker_txs.len();
         self.next_worker_idx = self.next_worker_idx.wrapping_add(1);
@@ -179,7 +204,7 @@ impl OutboundCryptoPool {
     ///
     /// If the target worker queue is full, drains completed datagrams into `drain_fn`
     /// until the queue accepts the task, guaranteeing no tasks are ever dropped.
-    pub fn dispatch_encrypt_backpressure<F: FnMut(CompletedDatagram)>(
+    pub fn dispatch_encrypt_backpressure<F: FnMut(CompletedEncrypt)>(
         &mut self,
         mut task: EncryptTask,
         mut drain_fn: F,
@@ -200,7 +225,7 @@ impl OutboundCryptoPool {
     ///
     /// Polls worker completion queues, inserts into the reorder buffer, and calls `f`
     /// for all contiguous sequences. Returns the number of items yielded.
-    pub fn drain_completed<F: FnMut(CompletedDatagram)>(&mut self, mut f: F) -> usize {
+    pub fn drain_completed<F: FnMut(CompletedEncrypt)>(&mut self, mut f: F) -> usize {
         let mut count = 0;
         // 1. Drain worker completion queues into reorder buffer
         for rx in &self.worker_rxs {
@@ -213,7 +238,7 @@ impl OutboundCryptoPool {
                         Err((returned_item, super::reorder::ReorderError::Full(_))) => {
                             current = returned_item;
                             self.reorder_buffer.drain_contiguous(|_seq, ready| {
-                                if !ready.datagrams.is_empty() {
+                                if ready.success && ready.ciphertext_len > 0 {
                                     f(ready);
                                     count += 1;
                                 }
@@ -228,7 +253,7 @@ impl OutboundCryptoPool {
 
         // 2. Yield contiguous in-order elements
         self.reorder_buffer.drain_contiguous(|_seq, item| {
-            if !item.datagrams.is_empty() {
+            if item.success && item.ciphertext_len > 0 {
                 f(item);
                 count += 1;
             }
@@ -266,97 +291,50 @@ impl Drop for OutboundCryptoPool {
 
 fn worker_loop(
     rx: SpscConsumer<WorkerCommand, WORKER_QUEUE_CAP>,
-    tx: SpscProducer<CompletedDatagram, WORKER_QUEUE_CAP>,
+    tx: SpscProducer<CompletedEncrypt, WORKER_QUEUE_CAP>,
     shutdown: Arc<AtomicBool>,
     state: Arc<AtomicU8>,
+    eventfd: Arc<yip_io::EventFd>,
+    reactor_sleeping: Arc<AtomicBool>,
 ) {
     let mut ciphers: HashMap<usize, (Arc<ChaCha20Poly1305Cipher>, Option<Arc<yip_wire::Codec>>)> =
         HashMap::new();
-    let mut scratch = Vec::with_capacity(2048);
-    let mut wire_scratch = Vec::with_capacity(2048);
-    let mut arena = yip_transport::FecScratchArena::with_capacity(4, 2048);
     let mut idle_spins = 0;
 
     while !shutdown.load(Ordering::Relaxed) {
         match rx.pop() {
             Some(WorkerCommand::Task(task)) => {
                 idle_spins = 0;
-                let mut dgs = Vec::with_capacity(2);
+                let mut ciphertext = [0u8; MAX_PACKET_LEN];
+                let mut ciphertext_len = 0;
+                let mut success = false;
 
-                if let Some((cipher, codec_opt)) = ciphers.get(&task.peer_id) {
-                    let plain_len = task.payload.len();
-                    let sealed_len = plain_len + 16;
-                    scratch.clear();
-                    scratch.resize(sealed_len, 0);
-                    scratch[..plain_len].copy_from_slice(&task.payload);
-
-                    if cipher
-                        .seal_in_place(task.counter, &mut scratch, plain_len)
-                        .is_ok()
-                    {
-                        if let Some(codec) = codec_opt.as_ref() {
-                            if task.conn_tag != 0 {
-                                let sym_size = if task.symbol_size == 0 {
-                                    1200
-                                } else {
-                                    task.symbol_size
-                                };
-                                let params = yip_transport::FlowParams {
-                                    symbol_size: sym_size,
-                                    initial_repair_ratio: 0.0,
-                                    deadline: std::time::Duration::from_millis(100),
-                                    arq: false,
-                                };
-                                let syms = yip_transport::FecEncoder::build_with_arena(
-                                    &scratch[..sealed_len],
-                                    params,
-                                    task.fate,
-                                    0,
-                                    &mut arena,
-                                );
-                                for sym in syms {
-                                    let frame = crate::wire_glue::symbol_to_frame(
-                                        task.conn_tag,
-                                        sym,
-                                        task.counter,
-                                        task.class,
-                                    );
-                                    let frame_ref = yip_wire::FrameRef {
-                                        conn_tag: frame.conn_tag,
-                                        object_id: frame.object_id,
-                                        payload_id: frame.payload_id,
-                                        flags: frame.flags,
-                                        payload: &frame.payload,
-                                    };
-                                    wire_scratch.clear();
-                                    wire_scratch.push(crate::handshake::PacketType::Data as u8);
-                                    codec.frame_ref_into(&frame_ref, &mut wire_scratch);
-                                    dgs.push(yip_io::poll::EgressDatagram {
-                                        fate: sym.object_id,
-                                        dst: task.dst,
-                                        bytes: wire_scratch.clone(),
-                                    });
-                                }
-                            } else {
-                                dgs.push(yip_io::poll::EgressDatagram {
-                                    fate: task.fate,
-                                    dst: task.dst,
-                                    bytes: scratch[..sealed_len].to_vec(),
-                                });
+                if let Some((cipher, _)) = ciphers.get(&task.peer_id) {
+                    if task.payload_len <= MAX_PACKET_LEN.saturating_sub(16) {
+                        ciphertext[..task.payload_len]
+                            .copy_from_slice(&task.payload[..task.payload_len]);
+                        match cipher.seal_in_place(task.counter, &mut ciphertext, task.payload_len)
+                        {
+                            Ok(sealed_len) => {
+                                ciphertext_len = sealed_len;
+                                success = true;
                             }
-                        } else {
-                            dgs.push(yip_io::poll::EgressDatagram {
-                                fate: task.fate,
-                                dst: task.dst,
-                                bytes: scratch[..sealed_len].to_vec(),
-                            });
+                            Err(_) => {
+                                success = false;
+                            }
                         }
                     }
                 }
 
-                let mut item = CompletedDatagram {
+                let mut item = CompletedEncrypt {
                     seq: task.seq,
-                    datagrams: dgs,
+                    peer_id: task.peer_id,
+                    counter: task.counter,
+                    fate: task.fate,
+                    class: task.class,
+                    ciphertext_len,
+                    ciphertext,
+                    success,
                 };
 
                 while let Err(returned) = tx.push(item) {
@@ -365,6 +343,10 @@ fn worker_loop(
                     }
                     item = returned;
                     std::hint::spin_loop();
+                }
+
+                if reactor_sleeping.load(Ordering::Acquire) {
+                    let _ = eventfd.notify();
                 }
             }
             Some(WorkerCommand::RegisterCipher {

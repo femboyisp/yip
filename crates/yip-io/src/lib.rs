@@ -8,6 +8,7 @@ pub mod af_xdp;
 pub mod batch;
 pub mod bpf;
 pub mod epoll;
+pub mod eventfd;
 pub(crate) mod gso;
 pub mod nonce;
 pub mod poll;
@@ -28,6 +29,7 @@ pub(crate) type CmsgLen = usize;
 pub use ack_coalesce::AckCompressor;
 pub use addr::{sockaddr_to_std, std_to_sockaddr};
 pub use bpf::{BpfFilterStatus, XdpRedirectFilter};
+pub use eventfd::EventFd;
 
 #[inline]
 pub(crate) fn empty_msghdr() -> libc::msghdr {

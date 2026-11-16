@@ -1,10 +1,12 @@
 //! Integration tests for parallel inbound decryption worker pool.
 #![forbid(unsafe_code)]
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use yip_crypto::session::ChaCha20Poly1305Cipher;
-use yipd::crypto_pool::inbound::{DecryptTask, DecryptedPacket, InboundCryptoPool};
+use yip_io::EventFd;
+use yipd::crypto_pool::inbound::{DecryptTask, DecryptedPacket, InboundCryptoPool, MAX_PACKET_LEN};
 
 #[test]
 fn test_inbound_crypto_pool_parallel_decryption_and_in_order_delivery() {
@@ -12,7 +14,9 @@ fn test_inbound_crypto_pool_parallel_decryption_and_in_order_delivery() {
     let cipher = Arc::new(ChaCha20Poly1305Cipher::new(key));
 
     let num_workers = 4;
-    let mut pool = InboundCryptoPool::new(num_workers);
+    let eventfd = Arc::new(EventFd::new().unwrap());
+    let sleeping = Arc::new(AtomicBool::new(false));
+    let mut pool = InboundCryptoPool::new(num_workers, eventfd, sleeping);
     let peer_id = 1;
     pool.register_cipher(peer_id, Arc::clone(&cipher));
 
@@ -36,11 +40,16 @@ fn test_inbound_crypto_pool_parallel_decryption_and_in_order_delivery() {
 
     // Dispatch ciphertexts across workers
     for seq in 0..packet_count as u64 {
+        let mut ct_arr = [0u8; MAX_PACKET_LEN];
+        let ct_bytes = &ciphertexts[seq as usize];
+        ct_arr[..ct_bytes.len()].copy_from_slice(ct_bytes);
+
         let task = DecryptTask {
             seq,
             peer_id,
             counter: seq + 1,
-            ciphertext: ciphertexts[seq as usize].clone(),
+            ciphertext_len: ct_bytes.len(),
+            ciphertext: ct_arr,
         };
         pool.dispatch_decrypt(task).expect("pool must accept task");
     }
@@ -66,8 +75,9 @@ fn test_inbound_crypto_pool_parallel_decryption_and_in_order_delivery() {
     for (idx, item) in completed.iter().enumerate() {
         let seq = idx as u64;
         assert_eq!(item.seq, seq, "decrypted packet must preserve strict order");
+        assert!(item.success);
         assert_eq!(
-            &item.plaintext[..],
+            &item.plaintext[..item.plaintext_len],
             &plaintexts[idx][..],
             "decrypted plaintext must match original payload for sequence {seq}"
         );
@@ -81,7 +91,9 @@ fn test_inbound_crypto_pool_rejects_corrupted_ciphertext() {
     let key = [0x3Cu8; 32];
     let cipher = Arc::new(ChaCha20Poly1305Cipher::new(key));
 
-    let mut pool = InboundCryptoPool::new(2);
+    let eventfd = Arc::new(EventFd::new().unwrap());
+    let sleeping = Arc::new(AtomicBool::new(false));
+    let mut pool = InboundCryptoPool::new(2, eventfd, sleeping);
     let peer_id = 1;
     pool.register_cipher(peer_id, Arc::clone(&cipher));
 
@@ -90,7 +102,8 @@ fn test_inbound_crypto_pool_rejects_corrupted_ciphertext() {
         seq: 0,
         peer_id,
         counter: 1,
-        ciphertext: vec![0xFF; 64],
+        ciphertext_len: 64,
+        ciphertext: [0xFF; MAX_PACKET_LEN],
     };
 
     pool.dispatch_decrypt(corrupted_task).expect("accepted");
@@ -102,6 +115,9 @@ fn test_inbound_crypto_pool_rejects_corrupted_ciphertext() {
         std::thread::yield_now();
     }
 
-    assert!(completed.is_empty(), "corrupt packet must be dropped");
+    assert!(
+        completed.is_empty(),
+        "corrupt packet must be dropped (success is false)"
+    );
     pool.shutdown();
 }

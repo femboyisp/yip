@@ -65,6 +65,18 @@ pub trait Dispatch {
         None
     }
 
+    /// Optional wakeup file descriptor (e.g. an [`EventFd`]) registered in epoll.
+    /// When ready, `run_poll` drains pending egress/tun batches and flushes them.
+    fn wakeup_fd(&self) -> Option<RawFd> {
+        None
+    }
+
+    /// Notify dispatch whether the reactor loop is entering (true) or leaving (false) sleep in epoll_wait.
+    fn set_sleeping(&mut self, _sleeping: bool) {}
+
+    /// Drain the wakeup file descriptor when epoll reports it readable.
+    fn drain_wakeup(&mut self) {}
+
     /// Drain pending decoded packets destined for TUN (e.g. from expired reorder deadlines).
     fn drain_tun(&mut self, _out: &mut Vec<Vec<u8>>) {}
 
@@ -900,10 +912,25 @@ pub fn run_poll<D: Dispatch>(
         return Err(io::Error::last_os_error());
     }
 
+    let wakeup_fd = d.wakeup_fd();
+    if let Some(wfd) = wakeup_fd {
+        let mut ev_w = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: wfd as u64,
+        };
+        // SAFETY: `epoll_fd` and `wfd` are valid fds.
+        let rc = unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, wfd, &raw mut ev_w) };
+        if rc < 0 {
+            // SAFETY: `epoll_fd` is a valid fd we just created.
+            unsafe { libc::close(epoll_fd) };
+            return Err(io::Error::last_os_error());
+        }
+    }
+
     let start = Instant::now();
-    // Stack-allocated event buffer: 4 events per wait is ample since we
-    // only have 2 fds registered.
-    let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
+    // Stack-allocated event buffer: 8 events per wait is ample since we
+    // have up to 3 fds registered.
+    let mut events = [libc::epoll_event { events: 0, u64: 0 }; 8];
 
     // Reusable batch buffers (one allocation for the loop's lifetime).
     let mut rx_bufs = Box::new([[0u8; MAX_WIRE_DATAGRAM]; MAX_DATAGRAM_BATCH]);
@@ -941,6 +968,7 @@ pub fn run_poll<D: Dispatch>(
             None => 10,
         };
 
+        d.set_sleeping(true);
         // SAFETY: `epoll_fd` is a valid epoll fd.  `events` is a valid
         // stack-allocated array; we pass its length as `maxevents`.
         // A timeout of 10 ms (or clamped to soonest scheduled micro-jitter delay)
@@ -953,6 +981,7 @@ pub fn run_poll<D: Dispatch>(
                 timeout_ms,
             )
         };
+        d.set_sleeping(false);
 
         if nfds < 0 {
             let e = io::Error::last_os_error();
@@ -1004,6 +1033,26 @@ pub fn run_poll<D: Dispatch>(
                     // SAFETY: `epoll_fd` is valid.
                     unsafe { libc::close(epoll_fd) };
                     return Err(e);
+                }
+            } else if Some(ready_fd) == wakeup_fd {
+                d.drain_wakeup();
+                d.drain_egress(&mut tx_batch);
+                if !tx_batch.is_empty() {
+                    if let Err(e) = flush_tx(udp_fd, &mut tx_batch, &mut gso) {
+                        // SAFETY: `epoll_fd` is valid.
+                        unsafe { libc::close(epoll_fd) };
+                        return Err(e);
+                    }
+                    d.recycle(&mut gso.recycle);
+                }
+                d.drain_tun(&mut tun_batch);
+                for pkt in tun_batch.drain(..) {
+                    write_to_tun(tun_fd, &pkt, vnet_hdr, &mut coalescer);
+                }
+                if vnet_hdr {
+                    if let Some(frame) = coalescer.flush() {
+                        send_to_tun(tun_fd, frame);
+                    }
                 }
             }
         }

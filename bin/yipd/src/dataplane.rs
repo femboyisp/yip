@@ -461,6 +461,29 @@ impl DataPlane {
     }
 
     /// Run deframing, replay protection, loss detection, and FEC reassembly on an incoming
+    /// data datagram wire payload, copying decoded ciphertext into `out_buf` and returning `Some((counter, len))`.
+    pub fn inbound_pre_decrypt_into(
+        &mut self,
+        wire: &[u8],
+        now_ms: u64,
+        out_buf: &mut [u8; 2048],
+    ) -> Option<(u64, usize)> {
+        let frame = self.codec.deframe_borrowed(wire).ok()?;
+        let (sym, counter, class) = wire_glue::frame_ref_to_symbol(&frame)?;
+        if !self.session.check_replay(counter) {
+            return None;
+        }
+        self.detector.on_seen(counter, now_ms);
+        let ciphertext = self.transport.decode(counter, &sym, class, now_ms)?;
+        self.detector.on_delivered(counter);
+        if ciphertext.len() > out_buf.len() {
+            return None;
+        }
+        out_buf[..ciphertext.len()].copy_from_slice(&ciphertext);
+        Some((counter, ciphertext.len()))
+    }
+
+    /// Run deframing, replay protection, loss detection, and FEC reassembly on an incoming
     /// data datagram wire payload, returning `Some((counter, ciphertext))` for offloaded parallel decryption.
     pub fn inbound_pre_decrypt(&mut self, wire: &[u8], now_ms: u64) -> Option<(u64, Vec<u8>)> {
         let frame = self.codec.deframe_borrowed(wire).ok()?;
@@ -605,6 +628,88 @@ impl DataPlane {
             self.codec.frame_ref_into(&frame, &mut dg.bytes);
             out.push(dg);
         }
+    }
+
+    /// Classify `inner` according to policy rules and flow heuristics.
+    pub fn classify(&mut self, inner: &[u8], now_ms: u64) -> FlowClass {
+        self.transport.classify(inner, self.l2, now_ms)
+    }
+
+    /// Process completed parallel worker encryption: encode with Cauchy FEC, update
+    /// sent-log, store in ARQ retransmit buffer with valid ciphertext, frame symbols,
+    /// and push into `out`.
+    pub fn on_sealed_into(
+        &mut self,
+        counter: u64,
+        class: FlowClass,
+        ciphertext: &[u8],
+        now_ms: u64,
+        out: &mut Vec<yip_io::poll::EgressDatagram>,
+    ) {
+        let symbols = self.transport.encode_scratch_with_class(ciphertext, class);
+        self.sent_log.insert(counter, class);
+
+        if class.params().arq {
+            if let Some(oid) = symbols.first().map(|s| s.object_id) {
+                let mut buf = self
+                    .retx_buf_pool
+                    .pop()
+                    .unwrap_or_else(|| Vec::with_capacity(ciphertext.len()));
+                buf.clear();
+                buf.extend_from_slice(ciphertext);
+                self.retx.put(counter, buf, class, oid, now_ms);
+            }
+        }
+
+        let peer_addr = self.peer_addr;
+        for sym in symbols {
+            let mut dg = self
+                .egress_pool
+                .pop()
+                .unwrap_or_else(|| yip_io::poll::EgressDatagram {
+                    fate: sym.object_id,
+                    dst: peer_addr,
+                    bytes: Vec::with_capacity(1500),
+                });
+            dg.fate = sym.object_id;
+            dg.dst = peer_addr;
+            dg.bytes.clear();
+            dg.bytes.push(PacketType::Data as u8);
+            let frame = wire_glue::symbol_to_frame_into(
+                self.conn_tag,
+                sym,
+                counter,
+                class,
+                &mut self.wire_payload_scratch,
+            );
+            self.codec.frame_ref_into(&frame, &mut dg.bytes);
+            out.push(dg);
+        }
+    }
+
+    /// Process completed parallel worker decryption: commit counter to anti-replay window,
+    /// observe ingress flow telemetry, learn MAC if L2, and pass through the TCP reorder buffer.
+    pub fn on_decrypted_into<F: FnMut(&[u8])>(
+        &mut self,
+        counter: u64,
+        plaintext: &[u8],
+        now_ms: u64,
+        mut emit_fn: F,
+    ) {
+        self.session.commit_replay(counter);
+        self.transport.observe_ingress(plaintext, self.l2, now_ms);
+
+        if self.l2 {
+            if let Some(src_mac) = source_mac_from_ethernet_frame(plaintext) {
+                self.mac_table
+                    .learn(src_mac, SINGLE_REMOTE_PEER_ID, LearnOrigin::Peer, now_ms);
+            }
+        }
+
+        self.reorder_buffer
+            .process(plaintext, self.l2, now_ms, |pkt| {
+                emit_fn(pkt);
+            });
     }
 
     /// Recycle flushed datagram buffers back into the pool to preserve capacities.

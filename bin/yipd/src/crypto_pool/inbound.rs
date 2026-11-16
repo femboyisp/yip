@@ -1,8 +1,8 @@
 //! Parallel worker pool for inbound ChaCha20-Poly1305 decryption.
 //!
 //! Stripes received UDP datagrams across worker threads via lock-free SPSC bounded
-//! ring buffers, performs AEAD opening in parallel, and collects decrypted plaintext
-//! packets into an in-order reorder buffer before TUN injection.
+//! ring buffers, performs AEAD opening in parallel with zero heap allocations,
+//! and collects decrypted plaintext packets into an in-order reorder buffer before TUN injection.
 
 #![forbid(unsafe_code)]
 
@@ -21,9 +21,10 @@ const STATE_SLEEPING: u8 = 1;
 
 pub const WORKER_QUEUE_CAP: usize = 1024;
 pub const ROB_CAPACITY: usize = 4096;
+pub const MAX_PACKET_LEN: usize = 2048;
 
-/// Packet decryption task dispatched to worker threads.
-#[derive(Debug)]
+/// Packet decryption task dispatched to worker threads with inline zero-allocation buffer.
+#[derive(Clone, Copy, Debug)]
 pub struct DecryptTask {
     /// Local sequencing index for in-order completion reassembly.
     pub seq: u64,
@@ -31,19 +32,33 @@ pub struct DecryptTask {
     pub peer_id: usize,
     /// Monotonic Noise/AEAD session counter.
     pub counter: u64,
-    /// Raw AEAD ciphertext with Poly1305 authentication tag appended.
-    pub ciphertext: Vec<u8>,
+    /// Raw AEAD ciphertext byte count.
+    pub ciphertext_len: usize,
+    /// Raw AEAD ciphertext inline buffer with Poly1305 authentication tag appended.
+    pub ciphertext: [u8; MAX_PACKET_LEN],
 }
 
-/// Decrypted plaintext packet ready for TUN writing.
-#[derive(Debug)]
+/// Decrypted plaintext packet ready for anti-replay commit, flow telemetry, and TUN injection.
+#[derive(Clone, Copy, Debug)]
 pub struct DecryptedPacket {
     /// Local sequence index matching [`DecryptTask::seq`].
     pub seq: u64,
-    /// Decrypted inner plaintext bytes.
-    pub plaintext: Vec<u8>,
+    /// Identifier for peer cipher lookup.
+    pub peer_id: usize,
+    /// Monotonic Noise/AEAD session counter.
+    pub counter: u64,
+    /// Decrypted inner plaintext byte count.
+    pub plaintext_len: usize,
+    /// Decrypted inner plaintext inline buffer.
+    pub plaintext: [u8; MAX_PACKET_LEN],
+    /// Whether decryption and Poly1305 authentication succeeded.
+    pub success: bool,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "zero-allocation worker ring buffers require inline packet arrays"
+)]
 enum WorkerCommand {
     RegisterCipher {
         peer_id: usize,
@@ -70,7 +85,11 @@ impl InboundCryptoPool {
     ///
     /// # Panics
     /// Panics if `num_workers == 0`.
-    pub fn new(num_workers: usize) -> Self {
+    pub fn new(
+        num_workers: usize,
+        eventfd: Arc<yip_io::EventFd>,
+        reactor_sleeping: Arc<AtomicBool>,
+    ) -> Self {
         assert!(num_workers > 0, "num_workers must be at least 1");
 
         let mut worker_txs = Vec::with_capacity(num_workers);
@@ -85,11 +104,13 @@ impl InboundCryptoPool {
             let flag = Arc::clone(&shutdown_flag);
             let state = Arc::new(AtomicU8::new(STATE_RUNNING));
             let state_worker = Arc::clone(&state);
+            let efd = Arc::clone(&eventfd);
+            let sleeping = Arc::clone(&reactor_sleeping);
 
             let handle = std::thread::Builder::new()
                 .name(format!("yipd-dec-{worker_id}"))
                 .spawn(move || {
-                    worker_loop(cmd_rx, out_tx, flag, state_worker);
+                    worker_loop(cmd_rx, out_tx, flag, state_worker, efd, sleeping);
                 })
                 .expect("failed to spawn inbound crypto worker thread");
 
@@ -139,6 +160,10 @@ impl InboundCryptoPool {
     /// Dispatch a decryption task to the next worker thread in round-robin sequence.
     ///
     /// Returns `Ok(())` on success, or `Err(task)` if the target worker queue is full.
+    #[expect(
+        clippy::result_large_err,
+        reason = "zero-allocation task retry without heap indirection"
+    )]
     pub fn dispatch_decrypt(&mut self, task: DecryptTask) -> Result<(), DecryptTask> {
         let worker_idx = self.next_worker_idx % self.worker_txs.len();
         self.next_worker_idx = self.next_worker_idx.wrapping_add(1);
@@ -184,7 +209,7 @@ impl InboundCryptoPool {
         }
     }
 
-    /// Drain all decrypted packets in strict in-order sequence.
+    /// Drain all completed decrypted packets in strict in-order sequence.
     ///
     /// Polls worker completion queues, inserts into the reorder buffer, and calls `f`
     /// for all contiguous sequences. Returns the number of items yielded.
@@ -201,7 +226,7 @@ impl InboundCryptoPool {
                         Err((returned_item, super::reorder::ReorderError::Full(_))) => {
                             current = returned_item;
                             self.reorder_buffer.drain_contiguous(|_seq, ready| {
-                                if !ready.plaintext.is_empty() {
+                                if ready.success && ready.plaintext_len > 0 {
                                     f(ready);
                                     count += 1;
                                 }
@@ -216,7 +241,7 @@ impl InboundCryptoPool {
 
         // 2. Yield contiguous in-order elements
         self.reorder_buffer.drain_contiguous(|_seq, item| {
-            if !item.plaintext.is_empty() {
+            if item.success && item.plaintext_len > 0 {
                 f(item);
                 count += 1;
             }
@@ -257,47 +282,60 @@ fn worker_loop(
     tx: SpscProducer<DecryptedPacket, WORKER_QUEUE_CAP>,
     shutdown: Arc<AtomicBool>,
     state: Arc<AtomicU8>,
+    eventfd: Arc<yip_io::EventFd>,
+    reactor_sleeping: Arc<AtomicBool>,
 ) {
     let mut ciphers: HashMap<usize, (Arc<ChaCha20Poly1305Cipher>, Option<Arc<yip_wire::Codec>>)> =
         HashMap::new();
-    let mut buf = Vec::with_capacity(2048);
     let mut idle_spins = 0;
 
     while !shutdown.load(Ordering::Relaxed) {
         match rx.pop() {
             Some(WorkerCommand::Task(task)) => {
                 idle_spins = 0;
-                let plain_opt = if let Some((cipher, _)) = ciphers.get(&task.peer_id) {
-                    let sealed_len = task.ciphertext.len();
-                    if sealed_len < 16 {
-                        None
-                    } else {
-                        buf.clear();
-                        buf.extend_from_slice(&task.ciphertext);
-                        if let Ok(plain_len) =
-                            cipher.open_in_place(task.counter, &mut buf, sealed_len)
-                        {
-                            Some(buf[..plain_len].to_vec())
-                        } else {
-                            None
+                let mut plaintext = [0u8; MAX_PACKET_LEN];
+                let mut plaintext_len = 0;
+                let mut success = false;
+
+                if let Some((cipher, _)) = ciphers.get(&task.peer_id) {
+                    if task.ciphertext_len >= 16 && task.ciphertext_len <= MAX_PACKET_LEN {
+                        plaintext[..task.ciphertext_len]
+                            .copy_from_slice(&task.ciphertext[..task.ciphertext_len]);
+                        match cipher.open_in_place(
+                            task.counter,
+                            &mut plaintext,
+                            task.ciphertext_len,
+                        ) {
+                            Ok(plain_len) => {
+                                plaintext_len = plain_len;
+                                success = true;
+                            }
+                            Err(_) => {
+                                success = false;
+                            }
                         }
                     }
-                } else {
-                    None
-                };
+                }
 
-                let item = DecryptedPacket {
+                let mut to_send = DecryptedPacket {
                     seq: task.seq,
-                    plaintext: plain_opt.unwrap_or_default(),
+                    peer_id: task.peer_id,
+                    counter: task.counter,
+                    plaintext_len,
+                    plaintext,
+                    success,
                 };
 
-                let mut to_send = item;
                 while let Err(returned) = tx.push(to_send) {
                     if shutdown.load(Ordering::Relaxed) {
                         return;
                     }
                     to_send = returned;
                     std::hint::spin_loop();
+                }
+
+                if reactor_sleeping.load(Ordering::Acquire) {
+                    let _ = eventfd.notify();
                 }
             }
             Some(WorkerCommand::RegisterCipher {

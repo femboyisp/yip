@@ -174,6 +174,11 @@ impl Transport {
         self.symbol_size
     }
 
+    /// Classify `inner` according to policy rules and flow heuristics.
+    pub fn classify(&mut self, inner: &[u8], l2: bool, now_ms: u64) -> FlowClass {
+        self.classifier.classify(inner, l2, now_ms)
+    }
+
     /// `class`'s default [`FlowParams`], with `symbol_size` overridden by the
     /// value this `Transport` was constructed with.
     fn params_for(&self, class: FlowClass) -> FlowParams {
@@ -218,6 +223,16 @@ impl Transport {
         let repair = self.controllers[class_index(class)].repair_count(source);
         let syms = self.encoder.encode_scratch(ciphertext, params, repair);
         (class, syms)
+    }
+
+    /// Zero-allocation encode of `ciphertext` for an already classified `class`.
+    pub fn encode_scratch_with_class(&mut self, ciphertext: &[u8], class: FlowClass) -> &[Symbol] {
+        let params = self.params_for(class);
+        let source = u32::try_from(ciphertext.len().div_ceil(usize::from(params.symbol_size)))
+            .unwrap_or(u32::MAX)
+            .max(1);
+        let repair = self.controllers[class_index(class)].repair_count(source);
+        self.encoder.encode_scratch(ciphertext, params, repair)
     }
 
     /// Feed a received symbol for `class`; returns the frame when its object decodes.
@@ -618,6 +633,30 @@ mod tests {
         assert!(syms.len() >= 3);
         for s in syms {
             assert!(!s.data.is_empty(), "symbol data must not be empty");
+        }
+    }
+
+    #[test]
+    fn test_transport_classify_policy_and_encode_scratch_with_class() {
+        let rule = PolicyRule {
+            proto: Some(6),
+            dst_port: Some(22),
+            class: FlowClass::Bulk,
+        };
+        let mut t = Transport::new(vec![rule], 1200);
+        let mut pkt = vec![0u8; 40];
+        pkt[0] = 0x45;
+        pkt[9] = 6;
+        pkt[22..24].copy_from_slice(&22u16.to_be_bytes());
+        let class = t.classify(&pkt, false, 0);
+        assert_eq!(class, FlowClass::Bulk);
+
+        let ct = vec![0x33u8; 2500];
+        let syms = t.encode_scratch_with_class(&ct, class);
+        assert!(!syms.is_empty());
+        assert!(syms.len() >= 3);
+        for s in syms {
+            assert!(!s.data.is_empty());
         }
     }
 }

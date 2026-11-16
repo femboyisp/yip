@@ -557,6 +557,12 @@ impl Session {
         self.replay.check(counter)
     }
 
+    /// Record `counter` as seen in the anti-replay window.
+    #[inline]
+    pub fn commit_replay(&mut self, counter: u64) {
+        self.replay.commit(counter);
+    }
+
     /// Returns the greatest counter seen by the anti-replay window.
     pub fn replay_latest(&self) -> u64 {
         self.replay.latest()
