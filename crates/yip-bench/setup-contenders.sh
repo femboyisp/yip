@@ -128,16 +128,18 @@ setup_n2n() {
     fi
     if [ "$need_install" = true ]; then
         if command -v apt-get >/dev/null 2>&1; then
-            apt-get update && apt-get install -y n2n || true
+            apt-get update && apt-get install -y n2n autoconf automake libtool build-essential libssl-dev || true
         fi
         local cur_ver=""
         if command -v edge >/dev/null 2>&1; then
             cur_ver="$(edge -h 2>&1 | grep -iE 'v\.[0-9]+|version [0-9]+' | head -1 || true)"
         fi
         if [[ "$cur_ver" != *"v.3"* ]] && [[ "$cur_ver" != *"v.4"* ]] && [[ "$cur_ver" != *"version 3"* ]]; then
-            log "Building latest n2n v3 from source..."
+            log "Building n2n v3 from release source..."
             local n2n_tmp; n2n_tmp="$(mktemp -d /tmp/build-n2n.XXXXXX)"
-            if git clone --depth 1 https://github.com/ntop/n2n.git "$n2n_tmp" 2>/dev/null; then
+            if (curl -fsSL "https://github.com/ntop/n2n/archive/refs/tags/3.0.tar.gz" 2>/dev/null | tar -xz -C "$n2n_tmp" --strip-components=1 2>/dev/null) || \
+               git clone --depth 1 https://github.com/ntop/n2n.git "$n2n_tmp" 2>/dev/null; then
+                rm -rf "$n2n_tmp/.git"
                 (cd "$n2n_tmp" && ./autogen.sh && ./configure && make -j"$(nproc 2>/dev/null || echo 2)" && install -m 755 edge "$TARGET_BIN_DIR/edge" && install -m 755 supernode "$TARGET_BIN_DIR/supernode") || warn "Building n2n from source failed"
             fi
             rm -rf "$n2n_tmp"
