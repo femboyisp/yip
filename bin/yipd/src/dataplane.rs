@@ -790,8 +790,7 @@ impl DataPlane {
                         // If the overall underlay channel experiences packet loss, ensure Bulk traffic
                         // is proactively aware of the channel loss floor rather than starting at zero.
                         let total_sent = sent_rt + sent_bulk + sent_default;
-                        let total_missing = (missing_rt + missing_bulk + missing_default)
-                            .max(report.missing.len() as u32);
+                        let total_missing = missing_rt + missing_bulk + missing_default;
                         if total_sent > 0 || total_missing > 0 {
                             let channel_loss =
                                 fraction_f32(total_missing, total_sent.max(total_missing).max(1));

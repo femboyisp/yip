@@ -870,11 +870,6 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                             for inner in &tun_out {
                                                 write_tun(tun_fd, inner, vnet_len > 0, &mut coalescer);
                                             }
-                                            if vnet_len > 0 {
-                                                if let Some(frame) = coalescer.flush() {
-                                                    let _ = yip_io::epoll::write_fd(tun_fd, frame);
-                                                }
-                                            }
                                             if !egress.is_empty() {
                                                 let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
                                                     egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
@@ -894,6 +889,11 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                                     Err(e) => return Err(e),
+                                }
+                            }
+                            if vnet_len > 0 {
+                                if let Some(frame) = coalescer.flush() {
+                                    let _ = yip_io::epoll::write_fd(tun_fd, frame);
                                 }
                             }
                         } else if let Some(ref mut s) = slab {
@@ -944,11 +944,6 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                             for inner in &tun_out {
                                                 write_tun(tun_fd, inner, vnet_len > 0, &mut coalescer);
                                             }
-                                            if vnet_len > 0 {
-                                                if let Some(frame) = coalescer.flush() {
-                                                    let _ = yip_io::epoll::write_fd(tun_fd, frame);
-                                                }
-                                            }
                                             if !egress.is_empty() {
                                                 let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
                                                     egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
@@ -968,6 +963,11 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                     if !fill_ring.produce(desc.addr) {
                                         s.free_chunk(desc.addr);
                                     }
+                                }
+                            }
+                            if vnet_len > 0 {
+                                if let Some(frame) = coalescer.flush() {
+                                    let _ = yip_io::epoll::write_fd(tun_fd, frame);
                                 }
                             }
                         }
@@ -1121,11 +1121,6 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                     for inner in &tun_out {
                                         write_tun(tun_fd, inner, vnet_len > 0, &mut coalescer);
                                     }
-                                    if vnet_len > 0 {
-                                        if let Some(frame) = coalescer.flush() {
-                                            let _ = yip_io::epoll::write_fd(tun_fd, frame);
-                                        }
-                                    }
                                     if !egress.is_empty() {
                                         let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
                                             egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
@@ -1147,11 +1142,6 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                     for inner in &tun_out {
                                         write_tun(tun_fd, inner, vnet_len > 0, &mut coalescer);
                                     }
-                                    if vnet_len > 0 {
-                                        if let Some(frame) = coalescer.flush() {
-                                            let _ = yip_io::epoll::write_fd(tun_fd, frame);
-                                        }
-                                    }
                                     if !egress.is_empty() {
                                         let egress_batch: Vec<(&[u8], std::net::SocketAddr)> =
                                             egress.iter().map(|d| (&d.bytes[..], d.dst)).collect();
@@ -1167,6 +1157,11 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                         }
                                     }
                                 }
+                            }
+                        }
+                        if vnet_len > 0 {
+                            if let Some(frame) = coalescer.flush() {
+                                let _ = yip_io::epoll::write_fd(tun_fd, frame);
                             }
                         }
                     }
