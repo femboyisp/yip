@@ -35,8 +35,8 @@ pub struct DataPlaneCounters {
 // ── constants (wired into DataPlane::new; tunnel.rs keeps its own copies until
 //    Task 3 replaces the two-thread loop with this DataPlane) ─────────────────
 
-const SENT_LOG_CAPACITY: usize = 4096;
-const RETX_BUFFER_MAX: usize = 16_384;
+const SENT_LOG_CAPACITY: usize = 65_536;
+const RETX_BUFFER_MAX: usize = 65_536;
 const RETX_BUFFER_TTL_MS: u64 = 2000;
 const RETX_EXTRA_REPAIR: u32 = 4;
 
@@ -790,7 +790,8 @@ impl DataPlane {
                         // If the overall underlay channel experiences packet loss, ensure Bulk traffic
                         // is proactively aware of the channel loss floor rather than starting at zero.
                         let total_sent = sent_rt + sent_bulk + sent_default;
-                        let total_missing = missing_rt + missing_bulk + missing_default;
+                        let total_missing = (missing_rt + missing_bulk + missing_default)
+                            .max(report.missing.len() as u32);
                         if total_sent > 0 || total_missing > 0 {
                             let channel_loss =
                                 fraction_f32(total_missing, total_sent.max(total_missing).max(1));
