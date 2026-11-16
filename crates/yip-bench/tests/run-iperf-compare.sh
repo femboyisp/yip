@@ -399,18 +399,24 @@ measure_iperf() {
         v6_flag="-6"
     fi
 
-    for attempt in 1 2; do
+    for attempt in 1 2 3; do
         ip netns exec "$ns_srv" killall -9 iperf3 2>/dev/null || true
         ip netns exec "$ns_cli" killall -9 iperf3 2>/dev/null || true
-        ip netns exec "$ns_srv" iperf3 -s -B "$srv_ip" $v6_flag >/dev/null 2>&1 &
-        srv_pid=$!
-        for _ in $(seq 1 30); do
-            if ip netns exec "$ns_srv" ss -tlpn 2>/dev/null | grep -q ":5201 "; then
+        for _ in $(seq 1 20); do
+            if ! ip netns exec "$ns_srv" ss -tlpn 2>/dev/null | grep -q ":5201 "; then
                 break
             fi
             sleep 0.05
         done
-        out="$(timeout 40 ip netns exec "$ns_cli" iperf3 -c "$srv_ip" $v6_flag -C "$TCP_CC" -P "$streams" --connect-timeout 10000 -t 8 -J 2>/dev/null || true)"
+        ip netns exec "$ns_srv" iperf3 -s -B "$srv_ip" $v6_flag >/dev/null 2>&1 &
+        srv_pid=$!
+        for _ in $(seq 1 40); do
+            if ip netns exec "$ns_srv" ss -tlpn 2>/dev/null | grep -q ":5201 " && kill -0 "$srv_pid" 2>/dev/null; then
+                break
+            fi
+            sleep 0.05
+        done
+        out="$(timeout 45 ip netns exec "$ns_cli" iperf3 -c "$srv_ip" $v6_flag -C "$TCP_CC" -P "$streams" --connect-timeout 20000 -t 8 -J 2>/dev/null || true)"
         kill -9 "$srv_pid" 2>/dev/null || true
         wait "$srv_pid" 2>/dev/null || true
         ip netns exec "$ns_srv" killall -9 iperf3 2>/dev/null || true
@@ -456,20 +462,26 @@ measure_iperf_udp() {
         v6_flag="-6"
     fi
 
-    for attempt in 1 2; do
+    for attempt in 1 2 3; do
         ip netns exec "$ns_srv" killall -9 iperf3 2>/dev/null || true
         ip netns exec "$ns_cli" killall -9 iperf3 2>/dev/null || true
+        for _ in $(seq 1 20); do
+            if ! ip netns exec "$ns_srv" ss -tlpn 2>/dev/null | grep -q ":5201 "; then
+                break
+            fi
+            sleep 0.05
+        done
         ip netns exec "$ns_srv" iperf3 -s -B "$srv_ip" $v6_flag >/dev/null 2>&1 &
         srv_pid=$!
-        for _ in $(seq 1 30); do
-            if ip netns exec "$ns_srv" ss -tlpn 2>/dev/null | grep -q ":5201 "; then
+        for _ in $(seq 1 40); do
+            if ip netns exec "$ns_srv" ss -tlpn 2>/dev/null | grep -q ":5201 " && kill -0 "$srv_pid" 2>/dev/null; then
                 break
             fi
             sleep 0.05
         done
         sample_cpu_start
-        out="$(timeout 40 ip netns exec "$ns_cli" iperf3 -c "$srv_ip" $v6_flag -u \
-            -b "${UDP_RATE:-10G}" -l "${UDP_LEN:-1400}" --connect-timeout 10000 -t 8 -J 2>/dev/null || true)"
+        out="$(timeout 45 ip netns exec "$ns_cli" iperf3 -c "$srv_ip" $v6_flag -u \
+            -b "${UDP_RATE:-10G}" -l "${UDP_LEN:-1400}" --connect-timeout 20000 -t 8 -J 2>/dev/null || true)"
         read -r cpu_pct _ <<< "$(sample_cpu_end)"
         kill -9 "$srv_pid" 2>/dev/null || true
         wait "$srv_pid" 2>/dev/null || true
