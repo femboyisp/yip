@@ -160,12 +160,14 @@ fn test_zero_alloc_hotpath_framing() {
     let mut out = Vec::with_capacity(70_000);
     let mut offsets = Vec::with_capacity(128);
 
-    // Warm-up phase
-    for pkt in &datagrams {
-        coalescer.push(pkt);
-    }
-    if let Some(flushed) = coalescer.flush() {
-        split_gro(flushed, &mut out, &mut offsets);
+    // Warm-up phase: exercise both ping-pong buffers in Coalescer and GRO reassembly
+    for _ in 0..4 {
+        for pkt in &datagrams {
+            coalescer.push(pkt);
+        }
+        if let Some(flushed) = coalescer.flush() {
+            split_gro(flushed, &mut out, &mut offsets);
+        }
     }
 
     // Single-shot UDP GSO verification under DHAT
