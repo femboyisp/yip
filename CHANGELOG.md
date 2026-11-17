@@ -6,6 +6,12 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **TCP Line-Rate Throughput Scaling & Hot-Path Allocation Elimination (`bin/yipd`, `crates/yip-io`, `crates/yip-transport`).**
+  - Added zero-allocation `sendmmsg_datagrams` and `sendmmsg_datagrams_burst` to `BatchUdpSocket` in `crates/yip-io`, mapping `EgressDatagram` buffers and socket addresses directly into stack arrays without allocating intermediate `Vec<(&[u8], SocketAddr)>` tuples.
+  - Enabled kernel `UDP_GRO` socket option (`SOL_UDP`, `UDP_GRO`) on underlay UDP sockets across `yip-io`, `port.rs`, and `sharding.rs` with graceful fallback on unsupported kernels, aggregating incoming contiguous UDP packets into superpackets and reducing socket layer syscall overhead.
+  - Quadrupled `ReorderBuffer` per-flow capacity from 16 to 64 slots (`MAX_FLOW_REORDER_SLOTS = 64`) in `crates/yip-transport/src/reorder.rs`, absorbing multi-queue out-of-order burstiness and network jitter without triggering premature slot flushes or spurious TCP 3-duplicate-ACK fast retransmits.
+  - Completely eliminated ingress heap allocations in `sharding.rs` by removing `owned_out` (which previously cloned every packet into a heap `Vec<u8>`) and piping `DispatchOut` slices directly to TUN coalescing and batch egress.
+  - Wired `AckCompressor` and batched egress buffers (`egress_batch`) into worker shard TUN read and SPSC drain loops in `bin/yipd/src/sharding.rs`, compressing redundant cumulative TCP ACKs on the return path and batching forward datagram transmissions in bursts of up to 32 packets per `sendmmsg` syscall.
 - **AF_XDP (XSK) Zero-Copy Kernel Bypass Pipeline for Underlay UDP (`crates/yip-io`, `bin/yipd`, #202).**
   - Implemented native AF_XDP socket abstraction (`XskSocket`) and UMEM memory pool (`UmemPool`, `UmemSlab`) in `crates/yip-io` with lock-free Fill, Completion, RX, and TX ring buffers.
   - Added transparent 3-tier fallback architecture: Native Driver Zero-Copy (`XDP_ZERO_COPY` / `XskBindMode::ZeroCopy`) -> Generic SKB Copy (`XDP_COPY` / `XskBindMode::Copy`) -> POSIX `BatchUdpSocket` (`recvmmsg`/`sendmmsg`), allowing unprivileged execution or systems without driver XDP support to gracefully fall back without service interruption.
