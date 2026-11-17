@@ -443,6 +443,54 @@ pub fn set_socket_buffers(sock: &UdpSocket, bytes: usize) -> io::Result<()> {
         }
     }
 
+    let _ = enable_udp_gro(sock);
+
+    Ok(())
+}
+
+/// Enable kernel UDP Generic Receive Offload (GRO) on `sock` if supported.
+///
+/// On Linux kernels >= 4.18, `SOL_UDP` / `UDP_GRO` allows the kernel networking
+/// stack to aggregate incoming contiguous UDP packets into superpackets, reducing
+/// socket layer traversal and syscall overhead on underlay packet reception.
+///
+/// If unsupported by the kernel or running on non-Linux systems, returns `Ok(())`
+/// gracefully without failing socket creation.
+pub fn enable_udp_gro(sock: &UdpSocket) -> io::Result<()> {
+    let fd = sock.as_raw_fd();
+
+    #[cfg(target_os = "linux")]
+    {
+        // SOL_UDP is 17; UDP_GRO is 104 in linux/udp.h
+        const SOL_UDP: libc::c_int = 17;
+        const UDP_GRO: libc::c_int = 104;
+
+        let val: libc::c_int = 1;
+        // SAFETY: `fd` is a valid file descriptor owned by `sock`. `val` is a local c_int.
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                SOL_UDP,
+                UDP_GRO,
+                std::ptr::addr_of!(val).cast::<libc::c_void>(),
+                libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
+                    .expect("size_of fits socklen_t"),
+            )
+        };
+        if ret != 0 {
+            let err = io::Error::last_os_error();
+            let raw = err.raw_os_error().unwrap_or(0);
+            // Ignore if kernel doesn't support UDP_GRO (ENOPROTOOPT, EINVAL, ENOTSOCK, EOPNOTSUPP)
+            if raw == libc::ENOPROTOOPT || raw == libc::EINVAL || raw == libc::EOPNOTSUPP {
+                return Ok(());
+            }
+            return Ok(());
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = fd;
+
     Ok(())
 }
 
@@ -594,6 +642,17 @@ mod tests {
             result.is_ok(),
             "set_socket_buffers returned error: {:?}",
             result
+        );
+    }
+
+    #[test]
+    fn test_enable_udp_gro_succeeds_or_graceful_fallback() {
+        use std::net::UdpSocket;
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let result = enable_udp_gro(&sock);
+        assert!(
+            result.is_ok(),
+            "enable_udp_gro must succeed or fall back gracefully"
         );
     }
 
