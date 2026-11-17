@@ -3207,6 +3207,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "yip-proto"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "qrcode",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "yip-rendezvous"
 version = "0.1.0"
 dependencies = [
