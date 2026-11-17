@@ -265,3 +265,40 @@ fn test_batch_size_128_burst() {
     }
     assert_eq!(total_recvd, BATCH_SIZE_128);
 }
+
+#[test]
+fn test_sendmmsg_datagrams_roundtrip() {
+    let s1 = UdpSocket::bind("127.0.0.1:0").expect("bind s1");
+    let s2 = UdpSocket::bind("127.0.0.1:0").expect("bind s2");
+    s1.set_nonblocking(true).unwrap();
+    s2.set_nonblocking(true).unwrap();
+
+    let addr1 = s1.local_addr().unwrap();
+    let addr2 = s2.local_addr().unwrap();
+    let mut b1 = BatchUdpSocket::new(&s1);
+    let mut b2 = BatchUdpSocket::new(&s2);
+
+    let dgs: Vec<yip_io::poll::EgressDatagram> = (0..16)
+        .map(|i| yip_io::poll::EgressDatagram {
+            fate: 0,
+            dst: addr2,
+            bytes: format!("egress-datagram-payload-{i}").into_bytes(),
+        })
+        .collect();
+
+    let sent = b1.sendmmsg_datagrams(&dgs).expect("sendmmsg_datagrams");
+    assert_eq!(sent, 16);
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let mut buffers = [[0u8; yip_io::MAX_WIRE_DATAGRAM]; BATCH_SIZE];
+    let mut out = [const { yip_io::batch::ReceivedDatagram::empty() }; BATCH_SIZE];
+
+    let recvd = b2.recvmmsg_batch(&mut buffers, &mut out).expect("recvmmsg");
+    assert_eq!(recvd, 16);
+    for i in 0..16 {
+        assert_eq!(out[i].len, dgs[i].bytes.len());
+        assert_eq!(&buffers[i][..out[i].len], dgs[i].bytes.as_slice());
+        assert_eq!(out[i].src, addr1);
+    }
+}
