@@ -67,6 +67,19 @@ pub trait Dispatch {
 
     /// Drain pending decoded packets destined for TUN (e.g. from expired reorder deadlines).
     fn drain_tun(&mut self, _out: &mut Vec<Vec<u8>>) {}
+
+    /// Optional raw file descriptor for an AF_XDP socket registered with the epoll reactor.
+    fn xsk_fd(&self) -> Option<RawFd> {
+        None
+    }
+
+    /// Optional hook called when the AF_XDP socket or its RX ring has packets ready.
+    /// Implementations consume descriptors from their RX ring, dispatch payloads,
+    /// replenish the fill ring, and push egress packets to `out`.
+    /// Returns the number of packets processed.
+    fn on_xsk(&mut self, _now_ms: u64, _out: &mut Vec<EgressDatagram>) -> usize {
+        0
+    }
 }
 
 /// One egress datagram: its destination, plus the FEC "fate group" it
@@ -880,10 +893,25 @@ pub fn run_poll<D: Dispatch>(
         return Err(io::Error::last_os_error());
     }
 
+    let xsk_fd_opt = d.xsk_fd().filter(|&fd| fd >= 0);
+    if let Some(xsk_fd) = xsk_fd_opt {
+        set_nonblocking(xsk_fd)?;
+        let mut ev_xsk = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: xsk_fd as u64,
+        };
+        // SAFETY: `epoll_fd` and `xsk_fd` are valid open file descriptors. `ev_xsk` is a stack-local epoll_event.
+        let rc = unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, xsk_fd, &raw mut ev_xsk) };
+        if rc < 0 {
+            // SAFETY: `epoll_fd` is a valid fd we just created.
+            unsafe { libc::close(epoll_fd) };
+            return Err(io::Error::last_os_error());
+        }
+    }
+
     let start = Instant::now();
-    // Stack-allocated event buffer: 4 events per wait is ample since we
-    // only have 2 fds registered.
-    let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
+    // Stack-allocated event buffer: 8 events per wait is ample for udp_fd, tun_fd, and xsk_fd.
+    let mut events = [libc::epoll_event { events: 0, u64: 0 }; 8];
 
     // Reusable batch buffers (one allocation for the loop's lifetime).
     let mut rx_bufs = Box::new([[0u8; MAX_WIRE_DATAGRAM]; MAX_DATAGRAM_BATCH]);
@@ -983,6 +1011,17 @@ pub fn run_poll<D: Dispatch>(
                     // SAFETY: `epoll_fd` is valid.
                     unsafe { libc::close(epoll_fd) };
                     return Err(e);
+                }
+            } else if Some(ready_fd) == xsk_fd_opt {
+                let prev_tx = tx_batch.len();
+                let _count = d.on_xsk(now_ms, &mut tx_batch);
+                if tx_batch.len() > prev_tx {
+                    if let Err(e) = flush_tx(udp_fd, &mut tx_batch, &mut gso) {
+                        // SAFETY: `epoll_fd` is valid.
+                        unsafe { libc::close(epoll_fd) };
+                        return Err(e);
+                    }
+                    d.recycle(&mut gso.recycle);
                 }
             }
         }
@@ -1677,6 +1716,153 @@ mod tests {
         unsafe {
             libc::close(rd);
             libc::close(wr);
+        }
+    }
+
+    #[test]
+    fn test_dispatch_xsk_hooks_default() {
+        struct DefaultDispatch;
+        impl Dispatch for DefaultDispatch {
+            fn on_udp(
+                &mut self,
+                _src: SocketAddr,
+                _dg: &[u8],
+                _now_ms: u64,
+                _out: &mut Vec<EgressDatagram>,
+            ) -> DispatchOut<'_> {
+                DispatchOut::None
+            }
+            fn on_tun(&mut self, _inner: &[u8], _now_ms: u64, _out: &mut Vec<EgressDatagram>) {}
+            fn tick(&mut self, _now_ms: u64, _out: &mut Vec<EgressDatagram>) {}
+        }
+
+        let mut d = DefaultDispatch;
+        assert_eq!(d.xsk_fd(), None);
+        let mut out = Vec::new();
+        assert_eq!(d.on_xsk(0, &mut out), 0);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_run_poll_with_xsk_fd() {
+        struct XskDispatch {
+            xsk_fd: Option<RawFd>,
+            udp_fd: RawFd,
+            on_xsk_called: bool,
+        }
+        impl Dispatch for XskDispatch {
+            fn on_udp(
+                &mut self,
+                _src: SocketAddr,
+                _dg: &[u8],
+                _now_ms: u64,
+                _out: &mut Vec<EgressDatagram>,
+            ) -> DispatchOut<'_> {
+                DispatchOut::None
+            }
+            fn on_tun(&mut self, _inner: &[u8], _now_ms: u64, out: &mut Vec<EgressDatagram>) {
+                if self.xsk_fd == Some(-1) {
+                    out.push(EgressDatagram {
+                        fate: 0,
+                        dst: SocketAddr::from(([127, 0, 0, 1], 1234)),
+                        bytes: vec![1, 2, 3],
+                    });
+                }
+            }
+            fn tick(&mut self, _now_ms: u64, out: &mut Vec<EgressDatagram>) {
+                if self.xsk_fd == Some(-1) {
+                    out.push(EgressDatagram {
+                        fate: 0,
+                        dst: SocketAddr::from(([127, 0, 0, 1], 1234)),
+                        bytes: vec![1, 2, 3],
+                    });
+                    // Force exit for negative fd test
+                    // SAFETY: Closing udp_fd makes flush_tx fail immediately
+                    unsafe { libc::close(self.udp_fd) };
+                }
+            }
+            fn xsk_fd(&self) -> Option<RawFd> {
+                self.xsk_fd
+            }
+            fn on_xsk(&mut self, _now_ms: u64, out: &mut Vec<EgressDatagram>) -> usize {
+                self.on_xsk_called = true;
+                out.push(EgressDatagram {
+                    fate: 0,
+                    dst: SocketAddr::from(([127, 0, 0, 1], 1234)),
+                    bytes: vec![1, 2, 3],
+                });
+                // Close udp_fd to trigger flush_tx error and break loop
+                // SAFETY: Closing valid open fd to trigger simulated I/O error
+                unsafe { libc::close(self.udp_fd) };
+                1
+            }
+        }
+
+        // 1. Negative xsk_fd is filtered and does not error in epoll_ctl
+        {
+            use std::os::fd::IntoRawFd;
+            let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let udp_fd = sock.into_raw_fd();
+            let mut fds = [0 as libc::c_int; 2];
+            // SAFETY: fds is a valid 2-element array; pipe2 creates non-blocking fds
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK) };
+            let (tun_rd, tun_wr) = (fds[0], fds[1]);
+            let byte = [42u8];
+            // SAFETY: tun_wr is open
+            unsafe { libc::write(tun_wr, byte.as_ptr().cast(), 1) };
+            let mut d = XskDispatch {
+                xsk_fd: Some(-1),
+                udp_fd,
+                on_xsk_called: false,
+            };
+            let _ = run_poll(udp_fd, tun_rd, false, false, &mut d);
+            // SAFETY: Closing tun pipe fds
+            unsafe {
+                libc::close(tun_rd);
+                libc::close(tun_wr);
+            }
+        }
+
+        // 2. Ready xsk_fd dispatches on_xsk and flushes tx
+        {
+            use std::os::fd::IntoRawFd;
+            let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let udp_fd = sock.into_raw_fd();
+            let mut tun_fds = [0 as libc::c_int; 2];
+            // SAFETY: valid non-blocking pipe
+            unsafe { libc::pipe2(tun_fds.as_mut_ptr(), libc::O_NONBLOCK) };
+            let (tun_rd, tun_wr) = (tun_fds[0], tun_fds[1]);
+
+            let mut xsk_fds = [0 as libc::c_int; 2];
+            // SAFETY: valid non-blocking pipe
+            unsafe { libc::pipe2(xsk_fds.as_mut_ptr(), libc::O_NONBLOCK) };
+            let (xsk_rd, xsk_wr) = (xsk_fds[0], xsk_fds[1]);
+
+            // Write 1 byte to xsk pipe so epoll wakes up immediately with ready_fd == xsk_rd
+            let byte = [42u8];
+            // SAFETY: xsk_wr is open
+            unsafe { libc::write(xsk_wr, byte.as_ptr().cast(), 1) };
+
+            let mut d = XskDispatch {
+                xsk_fd: Some(xsk_rd),
+                udp_fd,
+                on_xsk_called: false,
+            };
+
+            let res = run_poll(udp_fd, tun_rd, false, false, &mut d);
+            assert!(
+                res.is_err(),
+                "run_poll should exit with error after udp_fd was closed"
+            );
+            assert!(d.on_xsk_called, "on_xsk must have been called");
+
+            // SAFETY: Close remaining pipe fds
+            unsafe {
+                libc::close(tun_rd);
+                libc::close(tun_wr);
+                libc::close(xsk_rd);
+                libc::close(xsk_wr);
+            }
         }
     }
 }

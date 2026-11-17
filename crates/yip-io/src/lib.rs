@@ -29,6 +29,32 @@ pub use ack_coalesce::AckCompressor;
 pub use addr::{sockaddr_to_std, std_to_sockaddr};
 pub use bpf::{BpfFilterStatus, XdpRedirectFilter};
 
+/// Parse the default gateway interface name from the contents of Linux `/proc/net/route`.
+pub fn parse_default_gateway_from_route(content: &str) -> Option<String> {
+    for line in content.lines().skip(1) {
+        let mut parts = line.split_whitespace();
+        let iface = parts.next();
+        let dest = parts.next();
+        if let (Some(iface), Some(dest)) = (iface, dest) {
+            if dest == "00000000" {
+                return Some(iface.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Discover the default underlay network interface name on Linux by inspecting `/proc/net/route`.
+pub fn find_default_gateway_interface() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/net/route") {
+            return parse_default_gateway_from_route(&content);
+        }
+    }
+    None
+}
+
 #[inline]
 pub(crate) fn empty_msghdr() -> libc::msghdr {
     // SAFETY: msghdr contains only pointers, lengths, and integer flags, which
@@ -661,5 +687,143 @@ mod tests {
         assert_eq!(recvd, 1);
         assert_eq!(&bufs[0][..lens[0]], b"test-2");
         assert_eq!(ddp.recv_batch(&mut [], &mut lens).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_find_default_gateway_interface() {
+        let sample =
+            "Iface\tDestination\tGateway\neth0\t00000000\t0101A8C0\nwlan0\t0001A8C0\t00000000\n";
+        assert_eq!(
+            parse_default_gateway_from_route(sample).as_deref(),
+            Some("eth0")
+        );
+
+        let no_default = "Iface\tDestination\tGateway\nwlan0\t0001A8C0\t00000000\n";
+        assert_eq!(parse_default_gateway_from_route(no_default), None);
+
+        let empty = "";
+        assert_eq!(parse_default_gateway_from_route(empty), None);
+
+        let iface = find_default_gateway_interface();
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(content) = std::fs::read_to_string("/proc/net/route") {
+                assert_eq!(iface, parse_default_gateway_from_route(&content));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(iface.is_none());
+        }
+    }
+
+    #[test]
+    fn test_xsk_mode_flags_parsing() {
+        use crate::af_xdp::{parse_xsk_mode_flags, XskModeFlags};
+
+        assert_eq!(
+            parse_xsk_mode_flags(Some("generic")),
+            XskModeFlags {
+                try_zero_copy: false,
+                try_copy: true,
+            }
+        );
+        assert_eq!(
+            parse_xsk_mode_flags(Some("native")),
+            XskModeFlags {
+                try_zero_copy: true,
+                try_copy: false,
+            }
+        );
+        assert_eq!(
+            parse_xsk_mode_flags(Some("offload")),
+            XskModeFlags {
+                try_zero_copy: true,
+                try_copy: false,
+            }
+        );
+        assert_eq!(
+            parse_xsk_mode_flags(Some("auto")),
+            XskModeFlags {
+                try_zero_copy: true,
+                try_copy: true,
+            }
+        );
+        assert_eq!(
+            parse_xsk_mode_flags(None),
+            XskModeFlags {
+                try_zero_copy: true,
+                try_copy: true,
+            }
+        );
+    }
+
+    #[test]
+    fn test_bind_multi_queue_in_lib() {
+        use crate::af_xdp::{UmemPool, XskSocket, UMEM_CHUNK_SIZE};
+        let umem = UmemPool::new(16, UMEM_CHUNK_SIZE).expect("allocate UMEM pool");
+        let qids = vec![0, 1];
+        let sockets = XskSocket::bind_multi_queue("lo", &qids, &umem).unwrap();
+        assert_eq!(sockets.len(), 2);
+        for (i, (qid, sock)) in sockets.iter().enumerate() {
+            assert_eq!(*qid, i as u32);
+            assert_eq!(sock.fill_ring().capacity(), crate::af_xdp::UMEM_RING_SIZE);
+        }
+
+        let sockets_mode =
+            XskSocket::bind_multi_queue_with_mode("lo", &qids, &umem, Some("generic")).unwrap();
+        assert_eq!(sockets_mode.len(), 2);
+    }
+
+    #[test]
+    fn test_attach_xdp_with_fallback_in_lib() {
+        use crate::bpf::{
+            attach_xdp_with_fallback, attach_xdp_with_fallback_impl, XDP_FLAGS_DRV_MODE,
+            XDP_FLAGS_SKB_MODE,
+        };
+
+        // 1. Explicit flags: directly invokes attach with provided flags
+        let mut called_flags = Vec::new();
+        let res = attach_xdp_with_fallback_impl(1, 10, XDP_FLAGS_SKB_MODE, |_idx, _fd, fl| {
+            called_flags.push(fl);
+            Ok(42)
+        });
+        assert_eq!(res.unwrap(), 42);
+        assert_eq!(called_flags, vec![XDP_FLAGS_SKB_MODE]);
+
+        // 2. flags == 0 and driver mode succeeds
+        called_flags.clear();
+        let res = attach_xdp_with_fallback_impl(1, 10, 0, |_idx, _fd, fl| {
+            called_flags.push(fl);
+            Ok(99)
+        });
+        assert_eq!(res.unwrap(), 99);
+        assert_eq!(called_flags, vec![XDP_FLAGS_DRV_MODE]);
+
+        // 3. flags == 0 and driver mode unsupported -> fallback to SKB mode
+        called_flags.clear();
+        let res = attach_xdp_with_fallback_impl(1, 10, 0, |_idx, _fd, fl| {
+            called_flags.push(fl);
+            if fl == XDP_FLAGS_DRV_MODE {
+                Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+            } else {
+                Ok(123)
+            }
+        });
+        assert_eq!(res.unwrap(), 123);
+        assert_eq!(called_flags, vec![XDP_FLAGS_DRV_MODE, XDP_FLAGS_SKB_MODE]);
+
+        // 4. flags == 0 and driver mode fails with non-unsupported error (e.g. EPERM)
+        called_flags.clear();
+        let res = attach_xdp_with_fallback_impl(1, 10, 0, |_idx, _fd, fl| {
+            called_flags.push(fl);
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        });
+        assert!(res.is_err());
+        assert_eq!(called_flags, vec![XDP_FLAGS_DRV_MODE]);
+
+        // Real syscall wrapper smoke test
+        let res_real = attach_xdp_with_fallback(99999, -1, 0);
+        assert!(res_real.is_err());
     }
 }

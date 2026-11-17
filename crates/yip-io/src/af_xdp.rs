@@ -1121,12 +1121,32 @@ impl Drop for AutoCloseFd {
     }
 }
 
+/// Parsed driver and emulation flags for AF_XDP mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XskModeFlags {
+    pub try_zero_copy: bool,
+    pub try_copy: bool,
+}
+
+/// Parses an optional mode string into operational flags.
+pub fn parse_xsk_mode_flags(mode: Option<&str>) -> XskModeFlags {
+    let normalized = mode.map(|m| m.trim().to_ascii_lowercase());
+    let try_zero_copy = !matches!(normalized.as_deref(), Some("generic"));
+    let try_copy = !matches!(normalized.as_deref(), Some("native") | Some("offload"));
+    XskModeFlags {
+        try_zero_copy,
+        try_copy,
+    }
+}
+
 /// AF_XDP socket with three-tier opportunistic fallback engine.
 pub struct XskSocket {
     fd: RawFd,
     mode: XskBindMode,
     rx_ring: RxRing,
     tx_ring: TxRing,
+    fill_ring: FillRing,
+    comp_ring: CompletionRing,
     filter: Option<crate::bpf::XdpRedirectFilter>,
 }
 
@@ -1140,6 +1160,20 @@ impl XskSocket {
     ///
     /// If running unprivileged or kernel lacks AF_XDP, cleanly returns `FallbackRecvmmsg`.
     pub fn bind_opportunistic(ifname: &str, queue_id: u32, umem: &UmemPool) -> io::Result<Self> {
+        Self::bind_with_mode(ifname, queue_id, umem, None)
+    }
+
+    /// Attempts binding of an AF_XDP socket with an explicit operational mode.
+    ///
+    /// - `"generic"`: enforces `XDP_COPY` mode directly without attempting hardware zero-copy.
+    /// - `"native"` or `"offload"`: enforces `XDP_ZERO_COPY` mode directly without falling back to copy.
+    /// - `"auto"` or `None`: opportunistic fallback from `XDP_ZERO_COPY` to `XDP_COPY` to `FallbackRecvmmsg`.
+    pub fn bind_with_mode(
+        ifname: &str,
+        queue_id: u32,
+        umem: &UmemPool,
+        mode: Option<&str>,
+    ) -> io::Result<Self> {
         // SAFETY: Calling `socket(AF_XDP, SOCK_RAW, 0)` requests a raw AF_XDP socket from the kernel.
         // It requires no initialized pointers or preconditions.
         let fd = unsafe { libc::socket(libc::AF_XDP, libc::SOCK_RAW, 0) };
@@ -1263,7 +1297,10 @@ impl XskSocket {
             return Ok(Self::fallback());
         }
 
-        // 7. Attempt bind with XDP_ZERO_COPY
+        let mode_flags = parse_xsk_mode_flags(mode);
+        let try_zero_copy = mode_flags.try_zero_copy;
+        let try_copy = mode_flags.try_copy;
+
         let mut sxdp: libc::sockaddr_xdp = unsafe {
             // SAFETY: zeroing a C struct with POD fields is safe.
             std::mem::zeroed()
@@ -1272,37 +1309,37 @@ impl XskSocket {
         sxdp.sxdp_ifindex = ifindex;
         sxdp.sxdp_queue_id = queue_id;
         sxdp.sxdp_shared_umem_fd = 0;
-        sxdp.sxdp_flags = XDP_ZERO_COPY;
 
-        // SAFETY: `fd` is an open AF_XDP socket. `sxdp` is a valid stack-local sockaddr_xdp.
-        // Size passed matches `sizeof(sockaddr_xdp)`.
-        let ret_zc = unsafe {
-            libc::bind(
-                fd,
-                std::ptr::addr_of!(sxdp).cast::<libc::sockaddr>(),
-                std::mem::size_of::<libc::sockaddr_xdp>() as libc::socklen_t,
-            )
-        };
+        // 7. Attempt bind with XDP_ZERO_COPY
+        if try_zero_copy {
+            sxdp.sxdp_flags = XDP_ZERO_COPY;
 
-        if ret_zc == 0 {
-            let fd = sock_guard.into_raw();
-            return Ok(Self {
-                fd,
-                mode: XskBindMode::ZeroCopy,
-                rx_ring: RxRing::new(UMEM_RING_SIZE),
-                tx_ring: TxRing::new(UMEM_RING_SIZE),
-                filter: None,
-            });
+            // SAFETY: `fd` is an open AF_XDP socket. `sxdp` is a valid stack-local sockaddr_xdp.
+            // Size passed matches `sizeof(sockaddr_xdp)`.
+            let ret_zc = unsafe {
+                libc::bind(
+                    fd,
+                    std::ptr::addr_of!(sxdp).cast::<libc::sockaddr>(),
+                    std::mem::size_of::<libc::sockaddr_xdp>() as libc::socklen_t,
+                )
+            };
+
+            if ret_zc == 0 {
+                let fd = sock_guard.into_raw();
+                return Ok(Self {
+                    fd,
+                    mode: XskBindMode::ZeroCopy,
+                    rx_ring: RxRing::new(UMEM_RING_SIZE),
+                    tx_ring: TxRing::new(UMEM_RING_SIZE),
+                    fill_ring: FillRing::new(UMEM_RING_SIZE),
+                    comp_ring: CompletionRing::new(UMEM_RING_SIZE),
+                    filter: None,
+                });
+            }
         }
 
-        // 8. Attempt bind with XDP_COPY if ZeroCopy returned unsupported error
-        let zc_err = io::Error::last_os_error();
-        let should_try_copy = matches!(
-            zc_err.raw_os_error(),
-            Some(libc::EOPNOTSUPP | ENOTSUPP | libc::EINVAL)
-        );
-
-        if should_try_copy {
+        // 8. Attempt bind with XDP_COPY if ZeroCopy failed or generic mode requested
+        if try_copy {
             sxdp.sxdp_flags = XDP_COPY;
             // SAFETY: `fd` is an open AF_XDP socket. `sxdp` is a valid stack-local sockaddr_xdp.
             // Size passed matches `sizeof(sockaddr_xdp)`.
@@ -1321,6 +1358,8 @@ impl XskSocket {
                     mode: XskBindMode::Copy,
                     rx_ring: RxRing::new(UMEM_RING_SIZE),
                     tx_ring: TxRing::new(UMEM_RING_SIZE),
+                    fill_ring: FillRing::new(UMEM_RING_SIZE),
+                    comp_ring: CompletionRing::new(UMEM_RING_SIZE),
                     filter: None,
                 });
             }
@@ -1337,6 +1376,8 @@ impl XskSocket {
             mode: XskBindMode::FallbackRecvmmsg,
             rx_ring: RxRing::new(UMEM_RING_SIZE),
             tx_ring: TxRing::new(UMEM_RING_SIZE),
+            fill_ring: FillRing::new(UMEM_RING_SIZE),
+            comp_ring: CompletionRing::new(UMEM_RING_SIZE),
             filter: None,
         }
     }
@@ -1408,6 +1449,26 @@ impl XskSocket {
         &self.tx_ring
     }
 
+    /// Mutable reference to the socket's fill ring buffer.
+    pub fn fill_ring_mut(&mut self) -> &mut FillRing {
+        &mut self.fill_ring
+    }
+
+    /// Immutable reference to the socket's fill ring buffer.
+    pub fn fill_ring(&self) -> &FillRing {
+        &self.fill_ring
+    }
+
+    /// Mutable reference to the socket's completion ring buffer.
+    pub fn comp_ring_mut(&mut self) -> &mut CompletionRing {
+        &mut self.comp_ring
+    }
+
+    /// Immutable reference to the socket's completion ring buffer.
+    pub fn comp_ring(&self) -> &CompletionRing {
+        &self.comp_ring
+    }
+
     /// Reference to the attached eBPF redirect filter, if active.
     pub fn filter(&self) -> Option<&crate::bpf::XdpRedirectFilter> {
         self.filter.as_ref()
@@ -1426,11 +1487,28 @@ impl XskSocket {
         listen_port: u16,
         queue_id: u32,
     ) -> crate::bpf::BpfFilterStatus {
+        self.attach_bpf_filter_with_flags(ifname, listen_port, queue_id, 0)
+    }
+
+    /// Opportunistically attaches an eBPF XDP redirect filter steering incoming UDP traffic
+    /// for `listen_port` on `ifname` into this socket's RX ring with explicit flags.
+    pub fn attach_bpf_filter_with_flags(
+        &mut self,
+        ifname: &str,
+        listen_port: u16,
+        queue_id: u32,
+        flags: u32,
+    ) -> crate::bpf::BpfFilterStatus {
         if self.fd < 0 {
             return crate::bpf::BpfFilterStatus::Unsupported;
         }
-        match crate::bpf::XdpRedirectFilter::load_and_attach(ifname, listen_port, queue_id, self.fd)
-        {
+        match crate::bpf::XdpRedirectFilter::load_and_attach_with_flags(
+            ifname,
+            listen_port,
+            queue_id,
+            self.fd,
+            flags,
+        ) {
             Ok(f) => {
                 let prog_fd = f.prog_fd();
                 self.filter = Some(f);
@@ -1448,10 +1526,27 @@ impl XskSocket {
         listen_port: u16,
         queue_fds: &[(u32, RawFd)],
     ) -> crate::bpf::BpfFilterStatus {
+        self.attach_bpf_filter_multi_queue_with_flags(ifname, listen_port, queue_fds, 0)
+    }
+
+    /// Opportunistically attaches a multi-queue eBPF XDP redirect filter steering incoming UDP traffic
+    /// for `listen_port` on `ifname` across multiple RX queues into core-pinned AF_XDP rings with flags.
+    pub fn attach_bpf_filter_multi_queue_with_flags(
+        &mut self,
+        ifname: &str,
+        listen_port: u16,
+        queue_fds: &[(u32, RawFd)],
+        flags: u32,
+    ) -> crate::bpf::BpfFilterStatus {
         if self.fd < 0 {
             return crate::bpf::BpfFilterStatus::Unsupported;
         }
-        match crate::bpf::XdpRedirectFilter::load_multi_queue(ifname, listen_port, queue_fds) {
+        match crate::bpf::XdpRedirectFilter::load_multi_queue_with_flags(
+            ifname,
+            listen_port,
+            queue_fds,
+            flags,
+        ) {
             Ok(f) => {
                 let prog_fd = f.prog_fd();
                 self.filter = Some(f);
@@ -1481,9 +1576,19 @@ impl XskSocket {
         queue_ids: &[u32],
         umem: &UmemPool,
     ) -> io::Result<Vec<(u32, Self)>> {
+        Self::bind_multi_queue_with_mode(ifname, queue_ids, umem, None)
+    }
+
+    /// Binds multiple AF_XDP sockets across `queue_ids` for the given interface and UMEM pool with mode.
+    pub fn bind_multi_queue_with_mode(
+        ifname: &str,
+        queue_ids: &[u32],
+        umem: &UmemPool,
+        mode: Option<&str>,
+    ) -> io::Result<Vec<(u32, Self)>> {
         let mut sockets = Vec::with_capacity(queue_ids.len());
         for &qid in queue_ids {
-            let sock = Self::bind_opportunistic(ifname, qid, umem)?;
+            let sock = Self::bind_with_mode(ifname, qid, umem, mode)?;
             sockets.push((qid, sock));
         }
         Ok(sockets)

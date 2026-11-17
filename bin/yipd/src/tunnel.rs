@@ -50,12 +50,12 @@ use crate::peer_manager::PeerManager;
 ///
 /// Only returns on a fatal I/O error.
 pub fn run(config: Config) -> io::Result<()> {
-    // Regime B single-peer multi-core throughput scaling:
-    // When shards > 1, delegate to the sharded event loop which provides symmetric
-    // flow pinning (guaranteeing zero TCP reordering), lock-free cross-shard SPSC routing,
-    // multi-port UDP egress pool selection, and 20 Hz coalesced timer ticks.
-    if config.shards > 1 {
-        let shards = config.shards;
+    // Regime B single-peer multi-core throughput scaling & AF_XDP kernel bypass:
+    // When shards > 1 or AF_XDP kernel bypass is enabled, delegate to the sharded event loop which
+    // provides symmetric flow pinning (guaranteeing zero TCP reordering), lock-free cross-shard SPSC routing,
+    // multi-port UDP egress pool selection, AF_XDP ring processing, and 20 Hz coalesced timer ticks.
+    if config.shards > 1 || config.xdp {
+        let shards = config.shards.max(1);
         return crate::sharding::run_sharded(config, shards);
     }
 

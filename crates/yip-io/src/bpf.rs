@@ -577,6 +577,41 @@ pub fn bpf_attach_xdp(ifindex: u32, prog_fd: RawFd) -> io::Result<RawFd> {
     bpf_attach_xdp_with_flags(ifindex, prog_fd, 0)
 }
 
+/// Internal implementation of XDP program attachment with driver-to-generic fallback.
+pub fn attach_xdp_with_fallback_impl<F>(
+    ifindex: u32,
+    prog_fd: RawFd,
+    flags: u32,
+    mut attach: F,
+) -> io::Result<RawFd>
+where
+    F: FnMut(u32, RawFd, u32) -> io::Result<RawFd>,
+{
+    if flags != 0 {
+        attach(ifindex, prog_fd, flags)
+    } else {
+        match attach(ifindex, prog_fd, XDP_FLAGS_DRV_MODE) {
+            Ok(link_fd) => Ok(link_fd),
+            Err(e) => {
+                let is_unsupported = matches!(
+                    e.raw_os_error(),
+                    Some(libc::EOPNOTSUPP | libc::EINVAL | libc::ENOSYS | 524 /* ENOTSUPP */)
+                );
+                if is_unsupported {
+                    attach(ifindex, prog_fd, XDP_FLAGS_SKB_MODE)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
+/// Attaches an XDP program to `ifindex` with multi-tier fallback (driver -> generic SKB).
+pub fn attach_xdp_with_fallback(ifindex: u32, prog_fd: RawFd, flags: u32) -> io::Result<RawFd> {
+    attach_xdp_with_fallback_impl(ifindex, prog_fd, flags, bpf_attach_xdp_with_flags)
+}
+
 /// Attaches an XDP program to the network interface with explicit driver/offload flags (#186).
 pub fn bpf_attach_xdp_with_flags(ifindex: u32, prog_fd: RawFd, flags: u32) -> io::Result<RawFd> {
     // 1. Try BPF_LINK_CREATE (Linux 5.7+)
@@ -677,11 +712,22 @@ impl XdpRedirectFilter {
     }
 
     /// Loads and attaches a multi-queue XDP redirect filter to `ifname` for `listen_port`
-    /// across the specified `queue_fds`.
+    /// across the specified `queue_fds` with default flags (opportunistic driver -> generic fallback).
     pub fn load_multi_queue(
         ifname: &str,
         listen_port: u16,
         queue_fds: &[(u32, RawFd)],
+    ) -> Result<Self, BpfFilterStatus> {
+        Self::load_multi_queue_with_flags(ifname, listen_port, queue_fds, 0)
+    }
+
+    /// Loads and attaches a multi-queue XDP redirect filter to `ifname` for `listen_port`
+    /// across the specified `queue_fds` with explicit netlink/BPF flags.
+    pub fn load_multi_queue_with_flags(
+        ifname: &str,
+        listen_port: u16,
+        queue_fds: &[(u32, RawFd)],
+        flags: u32,
     ) -> Result<Self, BpfFilterStatus> {
         let c_ifname = match CString::new(ifname) {
             Ok(c) => c,
@@ -742,8 +788,8 @@ impl XdpRedirectFilter {
         };
         let prog_guard = AutoCloseFd(prog_fd);
 
-        // 4. Attach XDP program to interface
-        if let Err(e) = bpf_attach_xdp(ifindex, prog_fd) {
+        // 4. Attach XDP program to interface with multi-tier fallback
+        if let Err(e) = attach_xdp_with_fallback(ifindex, prog_fd, flags) {
             return match e.raw_os_error() {
                 Some(libc::EPERM | libc::EACCES) => Err(BpfFilterStatus::FallbackUnprivileged),
                 _ => Err(BpfFilterStatus::Unsupported),
@@ -765,6 +811,17 @@ impl XdpRedirectFilter {
         Self::load_multi_queue(ifname, listen_port, &[(queue_id, xsk_fd)])
     }
 
+    /// Loads and attaches an XDP redirect filter to `ifname` for `listen_port` on a single queue with flags.
+    pub fn load_and_attach_with_flags(
+        ifname: &str,
+        listen_port: u16,
+        queue_id: u32,
+        xsk_fd: RawFd,
+        flags: u32,
+    ) -> Result<Self, BpfFilterStatus> {
+        Self::load_multi_queue_with_flags(ifname, listen_port, &[(queue_id, xsk_fd)], flags)
+    }
+
     /// Opportunistically attempts to attach the eBPF XDP redirect filter across multiple queues.
     ///
     /// Degrades fail-soft to `FallbackUnprivileged` or `Unsupported` without panicking.
@@ -773,7 +830,17 @@ impl XdpRedirectFilter {
         listen_port: u16,
         queue_fds: &[(u32, RawFd)],
     ) -> BpfFilterStatus {
-        match Self::load_multi_queue(ifname, listen_port, queue_fds) {
+        Self::attach_multi_queue_with_flags(ifname, listen_port, queue_fds, 0)
+    }
+
+    /// Opportunistically attempts to attach the eBPF XDP redirect filter across multiple queues with flags.
+    pub fn attach_multi_queue_with_flags(
+        ifname: &str,
+        listen_port: u16,
+        queue_fds: &[(u32, RawFd)],
+        flags: u32,
+    ) -> BpfFilterStatus {
+        match Self::load_multi_queue_with_flags(ifname, listen_port, queue_fds, flags) {
             Ok(filter) => {
                 let (map_fd, prog_fd) = filter.into_raw();
                 if map_fd >= 0 {
@@ -798,6 +865,17 @@ impl XdpRedirectFilter {
         xsk_fd: RawFd,
     ) -> BpfFilterStatus {
         Self::attach_multi_queue(ifname, listen_port, &[(queue_id, xsk_fd)])
+    }
+
+    /// Opportunistically attempts to attach the eBPF XDP redirect filter on a single queue with flags.
+    pub fn attach_opportunistic_with_flags(
+        ifname: &str,
+        listen_port: u16,
+        queue_id: u32,
+        xsk_fd: RawFd,
+        flags: u32,
+    ) -> BpfFilterStatus {
+        Self::attach_multi_queue_with_flags(ifname, listen_port, &[(queue_id, xsk_fd)], flags)
     }
 }
 

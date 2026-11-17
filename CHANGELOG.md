@@ -6,6 +6,12 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **AF_XDP (XSK) Zero-Copy Kernel Bypass Pipeline for Underlay UDP (`crates/yip-io`, `bin/yipd`, #202).**
+  - Implemented native AF_XDP socket abstraction (`XskSocket`) and UMEM memory pool (`UmemPool`, `UmemSlab`) in `crates/yip-io` with lock-free Fill, Completion, RX, and TX ring buffers.
+  - Added transparent 3-tier fallback architecture: Native Driver Zero-Copy (`XDP_ZERO_COPY` / `XskBindMode::ZeroCopy`) -> Generic SKB Copy (`XDP_COPY` / `XskBindMode::Copy`) -> POSIX `BatchUdpSocket` (`recvmmsg`/`sendmmsg`), allowing unprivileged execution or systems without driver XDP support to gracefully fall back without service interruption.
+  - Implemented multi-queue XSK steering and eBPF XDP filter attachment (`attach_bpf_filter_multi_queue_with_flags`) in `crates/yip-io/src/bpf.rs` using BPF `XSKMAP`, steering incoming tunnel UDP port traffic directly to per-queue worker thread UMEM rings and bypassing kernel `sk_buff` allocations, netfilter, and conntrack overhead.
+  - Integrated AF_XDP ingress event handling into the single-reactor epoll event loop (`run_poll`) via `Dispatch::xsk_fd` and `Dispatch::on_xsk` hooks, processing packets without extra thread hops or synchronization contention.
+  - Wired `--xdp`, `--no-xdp`, `--xdp-ifname <IFNAME>`, and `--xdp-mode <auto|generic|native|offload>` daemon configuration flags and CLI overrides in `bin/yipd`. Automatically detects the default gateway interface if no interface is explicitly specified.
 - **Phase 2: Multi-Queue Underlay Dispatch, Socket Buffer Expansion & Lock-Free Sharding (`crates/yip-io`, `bin/yipd`, #205, #240, #241).**
   - Expanded socket buffer sizing via privileged `SO_RCVBUFFORCE` / `SO_SNDBUFFORCE` with graceful fallback to standard `SO_RCVBUF` / `SO_SNDBUF` up to 16 MiB, eliminating socket drop bottlenecks during high-throughput bursts.
   - Quadrupled ARQ retention horizon in `DataPlane` (`SENT_LOG_CAPACITY` and `RETX_BUFFER_MAX` to 65,536 entries), ensuring NACKs within the retransmission feedback loop locate packets without eviction.

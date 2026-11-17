@@ -59,6 +59,9 @@ fn print_daemon_usage() {
     println!("  -c, --control <SOCKET>  UNIX domain control socket path");
     println!("      --mtu <BYTES>       TUN device MTU (576-65535, default: 1400)");
     println!("      --metrics-listen <ADDR> Prometheus/OTEL HTTP metrics listen address (e.g. 127.0.0.1:9184)");
+    println!("      --xdp               Enable AF_XDP (XSK) zero-copy kernel bypass");
+    println!("      --xdp-ifname <DEV>  Underlay network interface for AF_XDP binding");
+    println!("      --xdp-mode <MODE>   XDP driver mode: auto, generic, native, offload");
     println!("      --genkey            Generate a fresh X25519 keypair");
     println!("      --addr <HEX-KEY>    Derive self-certifying mesh IPv6 address");
     println!("      --node-id <HEX-KEY> Derive rendezvous node ID");
@@ -837,16 +840,20 @@ fn run_client_subcommand(
     }
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DaemonOverrides {
+    pub control: Option<std::path::PathBuf>,
+    pub mtu: Option<u32>,
+    pub metrics_listen: Option<std::net::SocketAddr>,
+    pub xdp: Option<bool>,
+    pub xdp_ifname: Option<String>,
+    pub xdp_mode: Option<String>,
+}
+
 pub(crate) fn parse_daemon_flags(
     args: &mut impl Iterator<Item = String>,
-) -> std::io::Result<(
-    Option<std::path::PathBuf>,
-    Option<u32>,
-    Option<std::net::SocketAddr>,
-)> {
-    let mut control_override = None;
-    let mut mtu_override = None;
-    let mut metrics_listen_override = None;
+) -> std::io::Result<DaemonOverrides> {
+    let mut overrides = DaemonOverrides::default();
     while let Some(arg) = args.next() {
         if arg == "--control" || arg == "-c" {
             let cpath = args.next().ok_or_else(|| {
@@ -855,7 +862,7 @@ pub(crate) fn parse_daemon_flags(
                     "--control requires a socket path argument",
                 )
             })?;
-            control_override = Some(std::path::PathBuf::from(cpath));
+            overrides.control = Some(std::path::PathBuf::from(cpath));
         } else if arg == "--mtu" {
             let mstr = args.next().ok_or_else(|| {
                 std::io::Error::new(
@@ -875,7 +882,7 @@ pub(crate) fn parse_daemon_flags(
                     format!("invalid mtu '{m}': must be between 576 and 65535"),
                 ));
             }
-            mtu_override = Some(m);
+            overrides.mtu = Some(m);
         } else if arg == "--metrics-listen" {
             let mstr = args.next().ok_or_else(|| {
                 std::io::Error::new(
@@ -889,7 +896,37 @@ pub(crate) fn parse_daemon_flags(
                     format!("invalid metrics listen address '{mstr}': {e}"),
                 )
             })?;
-            metrics_listen_override = Some(addr);
+            overrides.metrics_listen = Some(addr);
+        } else if arg == "--xdp" {
+            overrides.xdp = Some(true);
+        } else if arg == "--no-xdp" {
+            overrides.xdp = Some(false);
+        } else if arg == "--xdp-ifname" {
+            let ifname = args.next().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--xdp-ifname requires an interface name argument",
+                )
+            })?;
+            overrides.xdp_ifname = Some(ifname);
+        } else if arg == "--xdp-mode" {
+            let mode = args.next().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--xdp-mode requires a mode argument (auto, generic, native, offload)",
+                )
+            })?;
+            match mode.to_ascii_lowercase().as_str() {
+                "auto" | "generic" | "native" | "offload" => {
+                    overrides.xdp_mode = Some(mode.to_ascii_lowercase());
+                }
+                other => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid xdp-mode '{other}', expected one of: auto, generic, native, offload"),
+                    ));
+                }
+            }
         } else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -897,7 +934,7 @@ pub(crate) fn parse_daemon_flags(
             ));
         }
     }
-    Ok((control_override, mtu_override, metrics_listen_override))
+    Ok(overrides)
 }
 
 fn main() -> std::io::Result<()> {
@@ -1038,19 +1075,27 @@ fn main() -> std::io::Result<()> {
             ))
         }
         Some(path) => {
-            let (control_override, mtu_override, metrics_listen_override) =
-                parse_daemon_flags(&mut args)?;
+            let overrides = parse_daemon_flags(&mut args)?;
 
             let text = std::fs::read_to_string(path)?;
             let mut config = Config::parse(&text)?;
-            if let Some(sock_path) = control_override {
+            if let Some(sock_path) = overrides.control {
                 config.control_socket = Some(sock_path);
             }
-            if let Some(mtu) = mtu_override {
+            if let Some(mtu) = overrides.mtu {
                 config.mtu = Some(mtu);
             }
-            if let Some(maddr) = metrics_listen_override {
+            if let Some(maddr) = overrides.metrics_listen {
                 config.metrics_listen = Some(maddr);
+            }
+            if let Some(xdp) = overrides.xdp {
+                config.xdp = xdp;
+            }
+            if let Some(ifname) = overrides.xdp_ifname {
+                config.xdp_ifname = Some(ifname);
+            }
+            if let Some(mode) = overrides.xdp_mode {
+                config.xdp_mode = Some(mode);
             }
             tunnel::run(config)
         }
@@ -1108,11 +1153,25 @@ mod tests {
             "/run/yipd.sock".to_string(),
             "--mtu".to_string(),
             "1420".to_string(),
+            "--xdp".to_string(),
+            "--xdp-ifname".to_string(),
+            "eth0".to_string(),
+            "--xdp-mode".to_string(),
+            "native".to_string(),
         ];
-        let (ctl, mtu, metrics) = parse_daemon_flags(&mut args.into_iter()).unwrap();
-        assert_eq!(metrics, Some("127.0.0.1:9184".parse().unwrap()));
-        assert_eq!(ctl, Some(std::path::PathBuf::from("/run/yipd.sock")));
-        assert_eq!(mtu, Some(1420));
+        let overrides = parse_daemon_flags(&mut args.into_iter()).unwrap();
+        assert_eq!(
+            overrides.metrics_listen,
+            Some("127.0.0.1:9184".parse().unwrap())
+        );
+        assert_eq!(
+            overrides.control,
+            Some(std::path::PathBuf::from("/run/yipd.sock"))
+        );
+        assert_eq!(overrides.mtu, Some(1420));
+        assert_eq!(overrides.xdp, Some(true));
+        assert_eq!(overrides.xdp_ifname.as_deref(), Some("eth0"));
+        assert_eq!(overrides.xdp_mode.as_deref(), Some("native"));
     }
 
     #[test]
