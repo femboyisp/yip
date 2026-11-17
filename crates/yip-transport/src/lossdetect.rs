@@ -160,11 +160,10 @@ impl LossDetector {
 
     #[inline]
     fn stream_idx(&self, counter: u64) -> usize {
-        if self.stride <= 1 || self.streams.len() <= 1 {
+        if self.stride <= 1 {
             0
         } else {
-            let idx = (counter % self.stride) as usize;
-            idx % self.streams.len()
+            (counter % self.stride) as usize
         }
     }
 
@@ -245,9 +244,8 @@ impl LossDetector {
             // Mark every counter in the stream's gap as implied-pending.
             let stride = self.stride;
             let mut c = stream.high_counter.saturating_add(stride);
-            let resolved_below = stream.resolved_below;
             while c < counter {
-                if c >= resolved_below && !self.resolved_set.contains_key(&c) {
+                if !self.resolved_set.contains_key(&c) {
                     self.pending.entry(c).or_insert(now_ms);
                 }
                 c = c.saturating_add(stride);

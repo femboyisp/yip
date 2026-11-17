@@ -438,11 +438,10 @@ impl Session {
 
     #[inline]
     fn replay_idx(&self, counter: u64) -> usize {
-        if self.stride <= 1 || self.replays.len() <= 1 {
+        if self.stride <= 1 {
             0
         } else {
-            let idx = (counter % self.stride) as usize;
-            idx % self.replays.len()
+            (counter % (self.replays.len() as u64)) as usize
         }
     }
 
@@ -509,9 +508,7 @@ impl Session {
         }
         self.stride = stride;
         let replays_count = stride.clamp(1, 64) as usize;
-        if self.replays.len() < replays_count {
-            self.replays.resize_with(replays_count, ReplayWindow::new);
-        }
+        self.replays.resize_with(replays_count, ReplayWindow::new);
     }
 
     /// The current nonce stride increment.

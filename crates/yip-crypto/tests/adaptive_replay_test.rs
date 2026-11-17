@@ -113,3 +113,61 @@ fn test_multi_shard_stride_nonce_skew_does_not_drop_lagger_shards() {
     // Replay of p0_next must still be strictly rejected
     assert!(s_recv.open(p0_next.counter, &p0_next.ciphertext).is_err());
 }
+
+#[test]
+fn test_session_multi_stride_replay_window_mapping() {
+    let k_send = [0x33u8; 32];
+    let k_recv = [0x77u8; 32];
+    let mut s_recv = yip_crypto::Session::from_raw_keys(&k_recv, &k_send, 0, 4).unwrap();
+    assert_eq!(s_recv.stride(), 4);
+
+    let mut shard0 = yip_crypto::Session::from_raw_keys(&k_send, &k_recv, 0, 4).unwrap();
+    let mut shard1 = yip_crypto::Session::from_raw_keys(&k_send, &k_recv, 1, 4).unwrap();
+    let mut shard2 = yip_crypto::Session::from_raw_keys(&k_send, &k_recv, 2, 4).unwrap();
+    let mut shard3 = yip_crypto::Session::from_raw_keys(&k_send, &k_recv, 3, 4).unwrap();
+
+    let p0 = shard0.seal(b"p0").unwrap();
+    let p1 = shard1.seal(b"p1").unwrap();
+    let p2 = shard2.seal(b"p2").unwrap();
+    let p3 = shard3.seal(b"p3").unwrap();
+
+    assert_eq!(p0.counter, 0);
+    assert_eq!(p1.counter, 1);
+    assert_eq!(p2.counter, 2);
+    assert_eq!(p3.counter, 3);
+
+    // Each must open and commit into its specific stride window
+    assert!(s_recv.open(p0.counter, &p0.ciphertext).is_ok());
+    assert!(s_recv.open(p1.counter, &p1.ciphertext).is_ok());
+    assert!(s_recv.open(p2.counter, &p2.ciphertext).is_ok());
+    assert!(s_recv.open(p3.counter, &p3.ciphertext).is_ok());
+
+    // Replay of each must be rejected
+    assert!(s_recv.open(p0.counter, &p0.ciphertext).is_err());
+    assert!(s_recv.open(p1.counter, &p1.ciphertext).is_err());
+    assert!(s_recv.open(p2.counter, &p2.ciphertext).is_err());
+    assert!(s_recv.open(p3.counter, &p3.ciphertext).is_err());
+
+    // Shard 2 advances 100,000 packets; window 0, 1 and 3 must remain unaffected
+    let mut last_p2 = None;
+    for _ in 0..100_000 {
+        last_p2 = Some(shard2.seal(b"p2_bulk").unwrap());
+    }
+    let p2_last = last_p2.unwrap();
+    assert!(s_recv.open(p2_last.counter, &p2_last.ciphertext).is_ok());
+
+    // Shard 0 sends its next packet (counter 4)
+    let p0_next = shard0.seal(b"p0_next").unwrap();
+    assert_eq!(p0_next.counter, 4);
+    assert!(s_recv.open(p0_next.counter, &p0_next.ciphertext).is_ok());
+
+    // Shard 1 sends its next packet (counter 5)
+    let p1_next = shard1.seal(b"p1_next").unwrap();
+    assert_eq!(p1_next.counter, 5);
+    assert!(s_recv.open(p1_next.counter, &p1_next.ciphertext).is_ok());
+
+    // Shard 3 sends its next packet (counter 7)
+    let p3_next = shard3.seal(b"p3_next").unwrap();
+    assert_eq!(p3_next.counter, 7);
+    assert!(s_recv.open(p3_next.counter, &p3_next.ciphertext).is_ok());
+}

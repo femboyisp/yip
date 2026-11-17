@@ -564,6 +564,19 @@ mod tests {
     }
 
     #[test]
+    fn test_transport_decode_borrowed() {
+        let mut t = Transport::new(vec![], 1200);
+        let payload = b"hello zero-copy world, this is a test payload for decode_borrowed";
+        let (class, syms) = t.encode(payload, payload, false, 0);
+        assert_eq!(class, FlowClass::Default);
+        assert!(!syms.is_empty());
+
+        let obj_key = u64::from(syms[0].object_id);
+        let res = t.decode_borrowed(obj_key, &syms[0], class, 100);
+        assert_eq!(res, Some(payload.as_slice()));
+    }
+
+    #[test]
     fn test_transport_set_fec_repair_ratio() {
         let mut t = Transport::new(vec![], 1200);
         t.set_fec_repair_ratio(0.42);

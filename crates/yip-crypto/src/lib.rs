@@ -467,6 +467,16 @@ mod tests {
         assert_eq!(opened, b"reply");
         assert_eq!(s.replay_latest(), 0);
         assert_eq!(s.replay_floor(), 0);
+
+        let mut s_peer2 = Session::from_raw_keys(&k2, &k1, 200_000, 1).unwrap();
+        let sealed_peer2 = s_peer2.seal(b"far_future").unwrap();
+        assert_eq!(sealed_peer2.counter, 200_000);
+        let opened2 = s
+            .open(sealed_peer2.counter, &sealed_peer2.ciphertext)
+            .unwrap();
+        assert_eq!(opened2, b"far_future");
+        assert_eq!(s.replay_latest(), 200_000);
+        assert_eq!(s.replay_floor(), 68_929);
     }
 
     #[test]
