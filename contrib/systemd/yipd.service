@@ -33,6 +33,7 @@ RestrictNamespaces=false
 
 # Runtime and configuration directories
 RuntimeDirectory=yipd
+RuntimeDirectoryMode=0755
 ConfigurationDirectory=yip
 
 [Install]
