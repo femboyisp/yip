@@ -815,7 +815,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                 let poller = yip_io::epoll::Epoll::new(sock_fd, tun_fd)?;
                 let vnet_len = tun_dev.vnet_hdr_len().unwrap_or(0);
                 let is_tap = cfg.device_kind == crate::mode::TunnelMode::L2Tap;
-                let egress_pool: Vec<std::net::UdpSocket> = if num_shards > 1 || std::env::var_os("YIP_EGRESS_POOL").is_some() {
+                let egress_pool: Vec<std::net::UdpSocket> = if std::env::var_os("YIP_EGRESS_POOL").is_some() {
                     let egress_bind = if cfg.listen.is_ipv6() {
                         std::net::SocketAddr::from(([0u8; 16], 0))
                     } else {
