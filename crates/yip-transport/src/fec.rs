@@ -829,15 +829,17 @@ impl FecReassembler {
         self.symbol_size = s;
     }
 
-    /// Feed one received symbol. Returns the decoded object when it completes.
+    /// Feed one received symbol. Returns a borrowed slice of the decoded object when it completes.
+    /// The decoded payload remains buffered in internal state and will be recycled when subsequent
+    /// objects arrive, avoiding per-packet heap allocations.
     /// Returns `None` (never panics) for any malformed/attacker field.
-    pub fn push(
+    pub fn push_borrowed(
         &mut self,
         object_key: u64,
         symbol: &Symbol,
         now_ms: u64,
         deadline_ms: u64,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<&[u8]> {
         // --- Guards: object_size, codec tag, symbol_index, K bounds ---
         if symbol.object_size == 0 || symbol.object_size > MAX_OBJECT_SIZE || self.symbol_size == 0
         {
@@ -1000,12 +1002,10 @@ impl FecReassembler {
 
         if state.source_count == state.k {
             // All K source shards arrived: fast systematic path with no RS decode!
-            let mut object = std::mem::take(&mut state.payload);
             for (_, buf) in state.repair_shards.drain(..) {
                 state.repair_pool.push(buf);
             }
-            object.truncate(size);
-            return Some(object);
+            return Some(&state.payload[..size]);
         }
 
         // Loss path: at least one repair shard is required.
@@ -1026,12 +1026,22 @@ impl FecReassembler {
             state.scheme,
         )?;
 
-        let mut object = std::mem::take(&mut state.payload);
         for (_, buf) in state.repair_shards.drain(..) {
             state.repair_pool.push(buf);
         }
-        object.truncate(size);
-        Some(object)
+        Some(&state.payload[..size])
+    }
+
+    /// Feed one received symbol. Returns the decoded object as an owned `Vec<u8>` when it completes.
+    pub fn push(
+        &mut self,
+        object_key: u64,
+        symbol: &Symbol,
+        now_ms: u64,
+        deadline_ms: u64,
+    ) -> Option<Vec<u8>> {
+        self.push_borrowed(object_key, symbol, now_ms, deadline_ms)
+            .map(|s| s.to_vec())
     }
 }
 

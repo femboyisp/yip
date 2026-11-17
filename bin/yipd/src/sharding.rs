@@ -1096,6 +1096,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                             sock_fd
                                         };
                                         let _ = yip_io::poll::flush_tx(send_fd, egress_buf, gso_scratch);
+                                        mgr.recycle(&mut gso_scratch.recycle);
                                         for epoch in mgr.drain_new_epochs() {
                                             for k in 1..num_shards {
                                                 if let Some(Some(ref tx)) = tx_chans.get(k) {
@@ -1124,6 +1125,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                         sock_fd
                                     };
                                     let _ = yip_io::poll::flush_tx(send_fd, egress_buf, gso_scratch);
+                                    mgr.recycle(&mut gso_scratch.recycle);
                                 }
                             };
 
@@ -1199,6 +1201,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                 sock_fd
                             };
                             let _ = yip_io::poll::flush_tx(send_fd, &mut egress_batch, &mut gso);
+                            manager.recycle(&mut gso.recycle);
                         }
                     }
 
@@ -1228,6 +1231,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                                 sock_fd
                                             };
                                             let _ = yip_io::poll::flush_tx(send_fd, &mut egress_batch, &mut gso);
+                                            manager.recycle(&mut gso.recycle);
                                             for epoch in manager.drain_new_epochs() {
                                                 for k in 1..num_shards {
                                                     if let Some(Some(ref tx)) = tx_channels.get(k) {
@@ -1252,6 +1256,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                                 sock_fd
                                             };
                                             let _ = yip_io::poll::flush_tx(send_fd, &mut egress_batch, &mut gso);
+                                            manager.recycle(&mut gso.recycle);
                                         }
                                     }
                                     if shard_id == 0 {
@@ -1343,6 +1348,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                 sock_fd
                             };
                             let _ = yip_io::poll::flush_tx(send_fd, &mut egress_batch, &mut gso);
+                            manager.recycle(&mut gso.recycle);
                         }
                         if vnet_len > 0 {
                             if let Some(frame) = coalescer.flush() {
@@ -1374,6 +1380,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                     egress_batch.clear();
                                     egress_batch.extend_from_slice(egress);
                                     let _ = yip_io::poll::flush_tx(sock_fd, &mut egress_batch, &mut gso);
+                                    manager.recycle(&mut gso.recycle);
                                 }
                             }
                             manager.drain_tun(&mut tun_batch);
@@ -1396,6 +1403,8 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                             }
                         }
                     }
+
+                    manager.recycle(&mut gso.recycle);
                 }
 
                 Ok(())

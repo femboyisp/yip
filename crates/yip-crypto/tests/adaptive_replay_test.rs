@@ -69,3 +69,47 @@ fn test_stride_session_sealing_and_opening() {
     let opened2 = s_recv.open(sealed2.counter, &sealed2.ciphertext).unwrap();
     assert_eq!(opened2, b"packet2");
 }
+
+#[test]
+fn test_multi_shard_stride_nonce_skew_does_not_drop_lagger_shards() {
+    let k_send = [0x55u8; 32];
+    let k_recv = [0xaau8; 32];
+
+    // Shard 0 (idle / low volume, e.g. tick / control packets)
+    let mut shard_0 = yip_crypto::Session::from_raw_keys(&k_send, &k_recv, 0, 4).unwrap();
+    // Shard 1 (high volume, bulk TCP data)
+    let mut shard_1 = yip_crypto::Session::from_raw_keys(&k_send, &k_recv, 1, 4).unwrap();
+
+    // Receiver configured with 4 shards
+    let mut s_recv = yip_crypto::Session::from_raw_keys(&k_recv, &k_send, 0, 4).unwrap();
+
+    // Shard 0 sends an initial packet (counter = 0)
+    let p0 = shard_0.seal(b"tick-0").unwrap();
+    assert_eq!(p0.counter, 0);
+    assert_eq!(s_recv.open(p0.counter, &p0.ciphertext).unwrap(), b"tick-0");
+
+    // Shard 1 sends 200,000 packets, advancing far past the 131,072 bit replay window
+    let mut last_p1 = None;
+    for _ in 0..200_000 {
+        last_p1 = Some(shard_1.seal(b"bulk-tcp").unwrap());
+    }
+    let p1 = last_p1.unwrap();
+    assert!(p1.counter >= 799_997);
+    assert_eq!(
+        s_recv.open(p1.counter, &p1.ciphertext).unwrap(),
+        b"bulk-tcp"
+    );
+
+    // Shard 0 sends its second packet (counter = 4)
+    // Under a naive single replay window, diff = (800_000+ - 4) >> 131,072 bits, which would drop as replay!
+    // Under per-stride window, Shard 0's stream is isolated and must open successfully.
+    let p0_next = shard_0.seal(b"tick-1").unwrap();
+    assert_eq!(p0_next.counter, 4);
+    assert_eq!(
+        s_recv.open(p0_next.counter, &p0_next.ciphertext).unwrap(),
+        b"tick-1"
+    );
+
+    // Replay of p0_next must still be strictly rejected
+    assert!(s_recv.open(p0_next.counter, &p0_next.ciphertext).is_err());
+}
