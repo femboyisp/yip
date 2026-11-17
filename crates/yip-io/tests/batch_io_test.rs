@@ -302,3 +302,118 @@ fn test_sendmmsg_datagrams_roundtrip() {
         assert_eq!(out[i].src, addr1);
     }
 }
+
+#[test]
+fn test_dual_stack_ipv4_and_ipv6_sendmmsg_bursts() {
+    let s_v4_tx = UdpSocket::bind("127.0.0.1:0").expect("bind v4 tx");
+    let s_v4_rx = UdpSocket::bind("127.0.0.1:0").expect("bind v4 rx");
+    s_v4_tx.set_nonblocking(true).unwrap();
+    s_v4_rx.set_nonblocking(true).unwrap();
+
+    let s_v6_tx = match UdpSocket::bind("[::1]:0") {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("IPv6 loopback unavailable, skipping IPv6 portion of dual-stack test");
+            return;
+        }
+    };
+    let s_v6_rx = UdpSocket::bind("[::1]:0").expect("bind v6 rx");
+    s_v6_tx.set_nonblocking(true).unwrap();
+    s_v6_rx.set_nonblocking(true).unwrap();
+
+    let addr4_rx = s_v4_rx.local_addr().unwrap();
+    let addr6_rx = s_v6_rx.local_addr().unwrap();
+
+    let mut b_v4_tx = BatchUdpSocket::new(&s_v4_tx);
+    let mut b_v4_rx = BatchUdpSocket::new(&s_v4_rx);
+    let mut b_v6_tx = BatchUdpSocket::new(&s_v6_tx);
+    let mut b_v6_rx = BatchUdpSocket::new(&s_v6_rx);
+
+    // 16 IPv4 datagrams
+    let dgs_v4: Vec<yip_io::poll::EgressDatagram> = (0..16)
+        .map(|i| yip_io::poll::EgressDatagram {
+            fate: 0,
+            dst: addr4_rx,
+            bytes: format!("dual-stack-v4-payload-{i}").into_bytes(),
+        })
+        .collect();
+
+    // 16 IPv6 datagrams
+    let dgs_v6: Vec<yip_io::poll::EgressDatagram> = (0..16)
+        .map(|i| yip_io::poll::EgressDatagram {
+            fate: 0,
+            dst: addr6_rx,
+            bytes: format!("dual-stack-v6-payload-{i}").into_bytes(),
+        })
+        .collect();
+
+    let sent_v4 = b_v4_tx.sendmmsg_datagrams(&dgs_v4).expect("sendmmsg v4");
+    let sent_v6 = b_v6_tx.sendmmsg_datagrams(&dgs_v6).expect("sendmmsg v6");
+    assert_eq!(sent_v4, 16);
+    assert_eq!(sent_v6, 16);
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let mut buffers = [[0u8; yip_io::MAX_WIRE_DATAGRAM]; BATCH_SIZE];
+    let mut out = [const { yip_io::batch::ReceivedDatagram::empty() }; BATCH_SIZE];
+
+    let recvd_v4 = b_v4_rx
+        .recvmmsg_batch(&mut buffers, &mut out)
+        .expect("recvmmsg v4");
+    assert_eq!(recvd_v4, 16);
+    for i in 0..16 {
+        assert_eq!(&buffers[i][..out[i].len], dgs_v4[i].bytes.as_slice());
+    }
+
+    let recvd_v6 = b_v6_rx
+        .recvmmsg_batch(&mut buffers, &mut out)
+        .expect("recvmmsg v6");
+    assert_eq!(recvd_v6, 16);
+    for i in 0..16 {
+        assert_eq!(&buffers[i][..out[i].len], dgs_v6[i].bytes.as_slice());
+    }
+}
+
+#[test]
+fn test_sendmmsg_datagrams_full_batch_saturation_and_fate() {
+    let s1 = UdpSocket::bind("127.0.0.1:0").expect("bind s1");
+    let s2 = UdpSocket::bind("127.0.0.1:0").expect("bind s2");
+    s1.set_nonblocking(true).unwrap();
+    s2.set_nonblocking(true).unwrap();
+
+    let addr1 = s1.local_addr().unwrap();
+    let addr2 = s2.local_addr().unwrap();
+    let mut b1 = BatchUdpSocket::new(&s1);
+    let mut b2 = BatchUdpSocket::new(&s2);
+
+    let dgs: Vec<yip_io::poll::EgressDatagram> = (0..BATCH_SIZE)
+        .map(|i| {
+            let len = 64 + (i * 32);
+            let mut bytes = vec![i as u8; len];
+            bytes[0..4].copy_from_slice(&(i as u32).to_be_bytes());
+            yip_io::poll::EgressDatagram {
+                fate: i as u16,
+                dst: addr2,
+                bytes,
+            }
+        })
+        .collect();
+
+    let sent = b1.sendmmsg_datagrams(&dgs).expect("sendmmsg full 32");
+    assert_eq!(sent, BATCH_SIZE);
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let mut buffers = [[0u8; yip_io::MAX_WIRE_DATAGRAM]; BATCH_SIZE];
+    let mut out = [const { yip_io::batch::ReceivedDatagram::empty() }; BATCH_SIZE];
+
+    let recvd = b2
+        .recvmmsg_batch(&mut buffers, &mut out)
+        .expect("recvmmsg full 32");
+    assert_eq!(recvd, BATCH_SIZE);
+    for i in 0..BATCH_SIZE {
+        assert_eq!(out[i].len, dgs[i].bytes.len());
+        assert_eq!(&buffers[i][..out[i].len], dgs[i].bytes.as_slice());
+        assert_eq!(out[i].src, addr1);
+    }
+}
