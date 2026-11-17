@@ -38,7 +38,7 @@ impl PeerManager {
     /// retry cadence as `HandshakingState`'s cold-start retransmit arm in
     /// `tick_dispatch`) so the rekey `Init` carries no new fingerprint
     /// distinguishing it from a cold-start one. Unlike `begin_handshake`, it
-    /// does not transition `PeerState` (the peer stays `Established`) and
+    /// does not transition `PeerSessionState` (the peer stays `Established`) and
     /// does not emit an obfuscation junk burst (Task 3 scope: scheduling
     /// only, not a new decoy shape).
     ///
@@ -200,17 +200,17 @@ impl PeerManager {
         let peer_hex: String = pubkey.iter().map(|b| format!("{b:02x}")).collect();
 
         match &self.peers[idx].state {
-            PeerState::Established(epochs) => {
+            PeerSessionState::Established(epochs) => {
                 if epochs.rekey.is_some() {
                     return Err(format!("rekey already in progress for peer {peer_hex}"));
                 }
             }
-            PeerState::Handshaking(_) => {
+            PeerSessionState::Handshaking(_) => {
                 return Err(format!(
                     "cannot rekey peer {peer_hex}: initial handshake is in progress"
                 ))
             }
-            PeerState::Idle => {
+            PeerSessionState::Idle => {
                 return Err(format!(
                     "cannot rekey peer {peer_hex}: session is not established (state: Idle)"
                 ))
@@ -246,7 +246,7 @@ impl PeerManager {
         };
 
         let epoch_num = match &mut self.peers[idx].state {
-            PeerState::Established(epochs) => {
+            PeerSessionState::Established(epochs) => {
                 epochs.rekey = Some(crate::epoch::RekeyInFlight {
                     hs,
                     init_pkt: init_pkt.clone(),
@@ -392,7 +392,7 @@ impl PeerManager {
             };
         }
 
-        let PeerState::Established(epochs) = &mut self.peers[idx].state else {
+        let PeerSessionState::Established(epochs) = &mut self.peers[idx].state else {
             unreachable!("rekey_init_core is only called for an Established peer")
         };
 
@@ -436,7 +436,7 @@ impl PeerManager {
             self.obf_key.is_some(),
             self.data_symbol_size,
         ));
-        let PeerState::Established(epochs) = &mut self.peers[idx].state else {
+        let PeerSessionState::Established(epochs) = &mut self.peers[idx].state else {
             unreachable!("state cannot change between the two borrows above")
         };
         epochs.install_next(dp, init_eph, resp_pkt.clone());
@@ -534,7 +534,7 @@ impl PeerManager {
         via_relay: bool,
     ) -> DispatchOut<'_> {
         let rk = {
-            let PeerState::Established(epochs) = &mut self.peers[idx].state else {
+            let PeerSessionState::Established(epochs) = &mut self.peers[idx].state else {
                 unreachable!("rekey_resp_core is only called for an Established peer")
             };
             match epochs.rekey.take() {
@@ -605,7 +605,7 @@ impl PeerManager {
         }
 
         let (old_tag, new_epoch, obf_key) = {
-            let PeerState::Established(epochs) = &mut self.peers[idx].state else {
+            let PeerSessionState::Established(epochs) = &mut self.peers[idx].state else {
                 unreachable!("state cannot change between the borrows above")
             };
             let old_tag = epochs.current().conn_tag();
@@ -654,7 +654,7 @@ mod tests {
             "current epoch must be untouched by scheduling a rekey"
         );
         match &pm.peers[0].state {
-            PeerState::Established(epochs) => assert!(
+            PeerSessionState::Established(epochs) => assert!(
                 epochs.rekey.is_some(),
                 "EpochSet.rekey must be populated once a rekey is in flight"
             ),
@@ -722,7 +722,7 @@ mod tests {
             "the relay peer's rekey Init must never be sent as a raw (unwrapped) HandshakeInit"
         );
         match &pm.peers[0].state {
-            PeerState::Established(epochs) => assert!(
+            PeerSessionState::Established(epochs) => assert!(
                 epochs.rekey.is_some(),
                 "EpochSet.rekey must be populated once a relay rekey is in flight"
             ),
@@ -748,7 +748,7 @@ mod tests {
             "a glare-loser must not rekey before 2x the interval"
         );
         match &pm.peers[0].state {
-            PeerState::Established(epochs) => {
+            PeerSessionState::Established(epochs) => {
                 assert!(epochs.rekey.is_none(), "no rekey should be scheduled yet")
             }
             _ => panic!("peer must still be Established"),
@@ -806,7 +806,7 @@ mod tests {
 
         pm.tick(100);
         match &pm.peers[0].state {
-            PeerState::Established(epochs) => assert!(epochs.rekey.is_some()),
+            PeerSessionState::Established(epochs) => assert!(epochs.rekey.is_some()),
             _ => panic!("peer must still be Established"),
         }
 
@@ -815,7 +815,7 @@ mod tests {
         // no-op survivor — untouched.
         pm.tick(100 + HANDSHAKE_TOTAL_MS);
         match &pm.peers[0].state {
-            PeerState::Established(epochs) => assert!(
+            PeerSessionState::Established(epochs) => assert!(
                 epochs.rekey.is_none(),
                 "an abandoned rekey must clear EpochSet.rekey"
             ),
@@ -853,7 +853,7 @@ mod tests {
         )
         .unwrap();
         {
-            let PeerState::Established(epochs) = &mut pm_a.peers[0].state else {
+            let PeerSessionState::Established(epochs) = &mut pm_a.peers[0].state else {
                 panic!("pm_a must be Established");
             };
             epochs.rekey = Some(crate::epoch::RekeyInFlight {
@@ -876,7 +876,7 @@ mod tests {
             "B's current must stay on the old epoch until confirmed"
         );
         match &pm_b.peers[0].state {
-            PeerState::Established(epochs) => assert!(epochs.next.is_some()),
+            PeerSessionState::Established(epochs) => assert!(epochs.next.is_some()),
             _ => panic!("pm_b must still be Established"),
         }
 
@@ -897,7 +897,7 @@ mod tests {
         assert_ne!(new_tag, old_tag, "current must become the NEW epoch");
         assert_eq!(pm_a.metrics().snapshot(&[]).crypto.current_epoch, 2);
         match &pm_a.peers[0].state {
-            PeerState::Established(epochs) => {
+            PeerSessionState::Established(epochs) => {
                 assert!(
                     epochs.rekey.is_none(),
                     "rekey must be cleared on completion"
@@ -981,7 +981,7 @@ mod tests {
         )
         .unwrap();
         {
-            let PeerState::Established(epochs) = &mut pm_a.peers[0].state else {
+            let PeerSessionState::Established(epochs) = &mut pm_a.peers[0].state else {
                 panic!("pm_a must be Established");
             };
             epochs.rekey = Some(crate::epoch::RekeyInFlight {
@@ -1110,7 +1110,7 @@ mod tests {
         )
         .unwrap();
         {
-            let PeerState::Established(epochs) = &mut pm_a.peers[0].state else {
+            let PeerSessionState::Established(epochs) = &mut pm_a.peers[0].state else {
                 panic!("pm_a must be Established");
             };
             epochs.rekey = Some(crate::epoch::RekeyInFlight {
@@ -1201,7 +1201,7 @@ mod tests {
             "a fresh-ts new-ephemeral Init must complete regardless of current's age"
         );
         match &pm_a.peers[0].state {
-            PeerState::Established(epochs) => {
+            PeerSessionState::Established(epochs) => {
                 assert!(epochs.next.is_some(), "next must be installed")
             }
             _ => panic!("pm_a must still be Established"),
@@ -1226,7 +1226,7 @@ mod tests {
         let resp = resp_bytes(&pm_b.on_udp(ep_a, &init_pkt, 100));
         assert_eq!(resp.len(), 1, "an admitted rekey Init must produce a Resp");
         match &pm_b.peers[0].state {
-            PeerState::Established(epochs) => {
+            PeerSessionState::Established(epochs) => {
                 assert!(epochs.next.is_some(), "next must be installed");
             }
             _ => panic!("pm_b must still be Established"),
@@ -1320,7 +1320,7 @@ mod tests {
             "current must be unchanged"
         );
         match &pm_r.peers[0].state {
-            PeerState::Established(epochs) => assert!(
+            PeerSessionState::Established(epochs) => assert!(
                 epochs.next.is_none(),
                 "a cold-start retransmit must NOT install a rekey `next`"
             ),
@@ -1335,7 +1335,7 @@ mod tests {
 
         // Ensure obfuscation is active on initial established session
         let initial_obf_a = match &pm_a.peers[0].state {
-            PeerState::Established(epochs) => epochs.current_obf_key(),
+            PeerSessionState::Established(epochs) => epochs.current_obf_key(),
             _ => unreachable!(),
         };
         assert!(initial_obf_a.is_some(), "initial epoch must have obf_key");
@@ -1349,7 +1349,7 @@ mod tests {
         .unwrap();
 
         // Install RekeyInFlight on A
-        if let PeerState::Established(epochs) = &mut pm_a.peers[0].state {
+        if let PeerSessionState::Established(epochs) = &mut pm_a.peers[0].state {
             epochs.rekey = Some(crate::epoch::RekeyInFlight {
                 hs: _hs,
                 init_pkt: init_pkt.clone(),
@@ -1392,7 +1392,7 @@ mod tests {
 
         // Verify A's current_obf_key rotated to a new key
         let new_obf_a = match &pm_a.peers[0].state {
-            PeerState::Established(epochs) => epochs.current_obf_key(),
+            PeerSessionState::Established(epochs) => epochs.current_obf_key(),
             _ => unreachable!(),
         };
         assert_ne!(
@@ -1409,7 +1409,7 @@ mod tests {
         let _ = out_b;
 
         let new_obf_b = match &pm_b.peers[0].state {
-            PeerState::Established(epochs) => epochs.current_obf_key(),
+            PeerSessionState::Established(epochs) => epochs.current_obf_key(),
             _ => unreachable!(),
         };
         assert_eq!(

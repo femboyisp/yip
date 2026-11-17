@@ -62,7 +62,7 @@ impl PeerManager {
                 };
                 if record_ok {
                     if let Some(&idx) = self.by_node.get(&node) {
-                        if !matches!(self.peers[idx].state, PeerState::Established(_)) {
+                        if !matches!(self.peers[idx].state, PeerSessionState::Established(_)) {
                             match (self.membership.as_ref(), record.as_deref()) {
                                 (Some(_), Some(r)) => {
                                     self.peers[idx].path.on_peer_candidate(addr, now_ms);
@@ -83,7 +83,7 @@ impl PeerManager {
                 let Some(&idx) = self.by_node.get(&node) else {
                     return DispatchOut::None;
                 };
-                if !matches!(self.peers[idx].state, PeerState::Established(_)) {
+                if !matches!(self.peers[idx].state, PeerSessionState::Established(_)) {
                     // Mesh mode: only fire proactive begin_handshake if node is
                     // known and verified in membership.directory or is a statically
                     // configured peer in self.by_node. If unrecognized/unverified,
@@ -100,7 +100,7 @@ impl PeerManager {
                         // Open our own binding toward `addr` immediately so the
                         // two NATs punch simultaneously — but only if we are not
                         // already probing (keep the in-flight ephemeral).
-                        if matches!(self.peers[idx].state, PeerState::Idle) {
+                        if matches!(self.peers[idx].state, PeerSessionState::Idle) {
                             if let Some(dgs) = self.begin_handshake(idx, addr, false, now_ms) {
                                 self.egress.clear();
                                 self.egress.extend(dgs);
@@ -130,7 +130,7 @@ impl PeerManager {
         // Mark this peer as relay-reached before producing any egress — but only
         // while it is not Established (anti-hijack: never re-route a live
         // session onto the relay from an unauthenticated server message).
-        if !matches!(self.peers[idx].state, PeerState::Established(_)) {
+        if !matches!(self.peers[idx].state, PeerSessionState::Established(_)) {
             self.peers[idx].relay = true;
         }
 
@@ -209,7 +209,7 @@ impl PeerManager {
             // FRESH new-ephemeral Init — never for a bare retransmit of the
             // Init that built its own session. See the freshness-gated
             // adoption block below.
-            PeerState::Established(_) => {
+            PeerSessionState::Established(_) => {
                 let Some(init_eph) = crate::handshake::init_ephemeral(dg) else {
                     return DispatchOut::None; // malformed Init
                 };
@@ -271,10 +271,10 @@ impl PeerManager {
                     DispatchOut::None
                 }
             }
-            PeerState::Handshaking(_) if self.local_pub < self.peers[idx].pubkey => {
+            PeerSessionState::Handshaking(_) if self.local_pub < self.peers[idx].pubkey => {
                 DispatchOut::None
             }
-            PeerState::Idle | PeerState::Handshaking(_) => {
+            PeerSessionState::Idle | PeerSessionState::Handshaking(_) => {
                 // #41: re-admission gate. A tabled mesh peer re-establishing
                 // (its session was dropped by the rekey re-verify or the
                 // liveness sweep) must present a currently-valid cert, else a
@@ -335,8 +335,9 @@ impl PeerManager {
                     self.metrics.record_fec_tx(out.len() as u64);
                     owned.extend(out.iter().map(|d| d.bytes.clone()));
                 }
-                self.peers[idx].state =
-                    PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, now_ms)));
+                self.peers[idx].state = PeerSessionState::Established(Box::new(
+                    crate::epoch::EpochSet::new(dp, now_ms),
+                ));
                 self.record_new_epoch(idx);
                 self.metrics.record_handshake_success();
                 self.metrics.update_peer_stats(self.list_peers());
@@ -363,16 +364,16 @@ impl PeerManager {
         // `relayed_handshake_init` for the full black-hole rationale. A
         // direct peer with a relayed Resp falls through to the
         // non-`Handshaking` drop below (fail-closed; `current` untouched).
-        if matches!(&self.peers[idx].state, PeerState::Established(epochs) if epochs.rekey.is_some())
+        if matches!(&self.peers[idx].state, PeerSessionState::Established(epochs) if epochs.rekey.is_some())
             && self.peers[idx].relay
         {
             return self.rekey_resp_core(idx, dg, now_ms, true);
         }
-        if !matches!(self.peers[idx].state, PeerState::Handshaking(_)) {
+        if !matches!(self.peers[idx].state, PeerSessionState::Handshaking(_)) {
             return DispatchOut::None;
         }
-        let old_state = std::mem::replace(&mut self.peers[idx].state, PeerState::Idle);
-        let PeerState::Handshaking(handshaking) = old_state else {
+        let old_state = std::mem::replace(&mut self.peers[idx].state, PeerSessionState::Idle);
+        let PeerSessionState::Handshaking(handshaking) = old_state else {
             unreachable!("just matched Handshaking above");
         };
         match handshaking.hs.read_response(dg) {
@@ -415,8 +416,9 @@ impl PeerManager {
                     self.metrics.record_fec_tx(out.len() as u64);
                     owned.extend(out.iter().map(|d| d.bytes.clone()));
                 }
-                self.peers[idx].state =
-                    PeerState::Established(Box::new(crate::epoch::EpochSet::new(dp, now_ms)));
+                self.peers[idx].state = PeerSessionState::Established(Box::new(
+                    crate::epoch::EpochSet::new(dp, now_ms),
+                ));
                 self.record_new_epoch(idx);
                 self.metrics.record_handshake_success();
                 self.metrics.update_peer_stats(self.list_peers());
@@ -451,7 +453,7 @@ impl PeerManager {
             self.peers[idx].last_activity_ms = now_ms;
         }
         let ((tun, tun_batch, udp), promoted_epoch) = {
-            let PeerState::Established(epochs) = &mut self.peers[idx].state else {
+            let PeerSessionState::Established(epochs) = &mut self.peers[idx].state else {
                 return DispatchOut::None;
             };
             let prev_rec = epochs.fec_recovered_count();
@@ -556,9 +558,9 @@ impl PeerManager {
     /// `Membership::on_gossip` and emits bounded reply datagrams relay-wrapped
     /// back through the server.
     ///
-    /// Fail-closed gate: strictly restricted to peers in `PeerState::Established`.
+    /// Fail-closed gate: strictly restricted to peers in `PeerSessionState::Established`.
     fn relayed_gossip(&mut self, idx: usize, dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
-        if !matches!(self.peers[idx].state, PeerState::Established(_)) {
+        if !matches!(self.peers[idx].state, PeerSessionState::Established(_)) {
             return DispatchOut::None;
         }
         let Some(msg) = GossipMsg::decode(&dg[1..]) else {
@@ -638,7 +640,7 @@ mod tests {
         // `last_accepted_init_ts` (and `relay`) are in-memory and survive
         // (never reset by `drop_session`), same as the direct-path sibling.
         pm.drop_session(0);
-        assert!(matches!(pm.peers[0].state, PeerState::Idle));
+        assert!(matches!(pm.peers[0].state, PeerSessionState::Idle));
         assert_eq!(pm.peers[0].last_accepted_init_ts, Some(t1));
 
         // A NEW-ephemeral Init with ts < t1, redelivered over the relay (as
@@ -657,7 +659,7 @@ mod tests {
             _ => panic!("a stale-ts relayed cold-start Init must be silently dropped"),
         }
         assert!(
-            matches!(pm.peers[0].state, PeerState::Idle),
+            matches!(pm.peers[0].state, PeerSessionState::Idle),
             "a rejected relayed cold-start Init must not admit a session"
         );
         assert_eq!(
@@ -688,7 +690,7 @@ mod tests {
 
         // Splice in a live Established session reaching `endpoint`.
         const TAG: u64 = 0x0102_0304_0506_0708;
-        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+        pm.peers[0].state = PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(
             Box::new(fake_established_dataplane(TAG, endpoint)),
             0,
         )));
@@ -729,7 +731,10 @@ mod tests {
         // Egress target unchanged: still Established, endpoint still `endpoint`,
         // relay never enabled, and the path never left Direct (on_peer_candidate
         // was never applied — it would have moved the stage to Punching).
-        assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+        assert!(matches!(
+            pm.peers[0].state,
+            PeerSessionState::Established(_)
+        ));
         assert_eq!(pm.peers[0].endpoint, Some(endpoint));
         assert!(!pm.peers[0].relay);
         assert_eq!(pm.peers[0].path.stage(), PathStage::Direct);
@@ -754,7 +759,7 @@ mod tests {
 
         // Splice in a live direct session reaching `endpoint`.
         const TAG: u64 = 0x1122_3344_5566_7788;
-        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+        pm.peers[0].state = PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(
             Box::new(fake_established_dataplane(TAG, endpoint)),
             0,
         )));
@@ -840,7 +845,7 @@ mod tests {
              until the initiator confirms the new one)"
         );
         match &pm_r.peers[0].state {
-            PeerState::Established(epochs) => assert!(
+            PeerSessionState::Established(epochs) => assert!(
                 epochs.next.is_some(),
                 "a fresh new-ephemeral Init must REBUILD: install a new `next` epoch, \
                  not replay a cached_resp"
@@ -1019,7 +1024,7 @@ mod tests {
         )
         .unwrap();
         {
-            let PeerState::Established(epochs) = &mut pm.peers[0].state else {
+            let PeerSessionState::Established(epochs) = &mut pm.peers[0].state else {
                 panic!("pm must be Established");
             };
             epochs.rekey = Some(crate::epoch::RekeyInFlight {
@@ -1062,7 +1067,7 @@ mod tests {
         let new_tag = established_tag(&pm, 0).unwrap();
         assert_ne!(new_tag, old_tag, "current must become the NEW epoch");
         match &pm.peers[0].state {
-            PeerState::Established(epochs) => {
+            PeerSessionState::Established(epochs) => {
                 assert!(
                     epochs.rekey.is_none(),
                     "rekey must be cleared on completion"
@@ -1114,7 +1119,7 @@ mod tests {
         )
         .unwrap();
         {
-            let PeerState::Established(epochs) = &mut pm.peers[0].state else {
+            let PeerSessionState::Established(epochs) = &mut pm.peers[0].state else {
                 panic!("pm must be Established");
             };
             epochs.rekey = Some(crate::epoch::RekeyInFlight {
@@ -1171,7 +1176,7 @@ mod tests {
              complete a direct peer's rekey"
         );
         match &pm.peers[0].state {
-            PeerState::Established(epochs) => {
+            PeerSessionState::Established(epochs) => {
                 assert!(
                     epochs.rekey.is_some(),
                     "rekey must stay in flight, awaiting a genuinely direct Resp"
@@ -1209,7 +1214,7 @@ mod tests {
 
         const OLD_TAG: u64 = 0x1234_5678_9ABC_DEF0;
         let placeholder: SocketAddr = "203.0.113.1:51821".parse().unwrap();
-        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+        pm.peers[0].state = PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(
             Box::new(fake_established_dataplane(OLD_TAG, placeholder)),
             0,
         )));
@@ -1303,7 +1308,7 @@ mod tests {
 
         // Session dropped (revocation / sweep); the peer stays tabled, Idle.
         pm.drop_session(0);
-        assert!(matches!(pm.peers[0].state, PeerState::Idle));
+        assert!(matches!(pm.peers[0].state, PeerSessionState::Idle));
 
         // A fresh relayed cold-start Init carrying an EXPIRED cert.
         let expired = expired_cert_bytes(&pm, 0);
@@ -1319,7 +1324,7 @@ mod tests {
             matches!(out2, DispatchOut::None),
             "an expired cert must not re-admit a tabled relay peer"
         );
-        assert!(matches!(pm.peers[0].state, PeerState::Idle));
+        assert!(matches!(pm.peers[0].state, PeerSessionState::Idle));
     }
 
     /// #102: when a `PeerCandidate` arrives with a verified `Record`, all
@@ -1561,7 +1566,10 @@ mod tests {
         let out1 = pm.on_udp(mock_server(), &relay_deliver(&peer_kp, init_pkt_1), 0);
         assert!(has_relayed_handshake_resp(&out1));
         assert!(pm.peers[0].relay);
-        assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+        assert!(matches!(
+            pm.peers[0].state,
+            PeerSessionState::Established(_)
+        ));
 
         // Send a relayed Gossip PullRequest
         let pull = GossipMsg::PullRequest(vec![yip_membership::node_id(&local.public)]);
@@ -1602,7 +1610,10 @@ mod tests {
         let out1 = pm.on_udp(mock_server(), &relay_deliver(&peer_kp, init_pkt_1), 0);
         assert!(has_relayed_handshake_resp(&out1));
         assert!(pm.peers[0].relay);
-        assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+        assert!(matches!(
+            pm.peers[0].state,
+            PeerSessionState::Established(_)
+        ));
 
         // Ingest a record for another member into pm so a PullRequest has something to return
         let other_kp = generate_keypair();
@@ -1662,7 +1673,7 @@ mod tests {
         };
         let mem = membership_for(&ca, local.public);
         let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[cfg_peer], mem);
-        assert!(matches!(pm.peers[0].state, PeerState::Idle));
+        assert!(matches!(pm.peers[0].state, PeerSessionState::Idle));
 
         let pull = GossipMsg::PullRequest(vec![yip_membership::node_id(&local.public)]);
         let mut gossip_bytes = vec![PacketType::Gossip as u8];
@@ -1700,7 +1711,10 @@ mod tests {
         .unwrap();
         let out1 = pm.on_udp(mock_server(), &relay_deliver(&peer_kp, init_pkt_1), 0);
         assert!(has_relayed_handshake_resp(&out1));
-        assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+        assert!(matches!(
+            pm.peers[0].state,
+            PeerSessionState::Established(_)
+        ));
 
         // Malformed payload: Gossip tag followed by garbage that cannot decode
         let malformed_bytes = vec![PacketType::Gossip as u8, 0xff, 0xff, 0xff];

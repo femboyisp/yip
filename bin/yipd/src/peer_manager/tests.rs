@@ -295,7 +295,10 @@ fn initiator_retransmits_same_init_within_total_window_then_gives_up() {
     assert_eq!(init_out.len(), 1);
     let init_bytes = init_out[0].bytes.clone();
     assert_eq!(init_bytes[0], PacketType::HandshakeInit as u8);
-    assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    assert!(matches!(
+        pm.peers[0].state,
+        PeerSessionState::Handshaking(_)
+    ));
 
     // Drive tick ~20 retry intervals — 4x the old MAX_RETRIES=5 cap. Each
     // interval must retransmit the identical init and keep it Handshaking.
@@ -309,7 +312,7 @@ fn initiator_retransmits_same_init_within_total_window_then_gives_up() {
             "retransmit reuses the same init (same ephemeral)"
         );
         assert!(
-            matches!(pm.peers[0].state, PeerState::Handshaking(_)),
+            matches!(pm.peers[0].state, PeerSessionState::Handshaking(_)),
             "peer keeps handshaking within the total window (past the old 5-retry cap)"
         );
     }
@@ -324,7 +327,7 @@ fn initiator_retransmits_same_init_within_total_window_then_gives_up() {
         "no further init once the total window elapsed"
     );
     assert!(
-        matches!(pm.peers[0].state, PeerState::Idle),
+        matches!(pm.peers[0].state, PeerSessionState::Idle),
         "peer reverts to Idle after the total window"
     );
     assert!(
@@ -355,7 +358,10 @@ fn pending_tun_is_capped_while_handshaking() {
     for _ in 0..(MAX_PENDING_TUN + 50) {
         let _ = pm.on_tun(&dummy_tun_pkt(), 0);
     }
-    assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    assert!(matches!(
+        pm.peers[0].state,
+        PeerSessionState::Handshaking(_)
+    ));
     assert!(
         pm.peers[0].pending_tun.len() <= MAX_PENDING_TUN,
         "pending buffer must stay capped at MAX_PENDING_TUN"
@@ -392,7 +398,7 @@ fn rendezvous_only_peer_emits_lookup_on_tun_traffic() {
         "the mock recorded a Lookup"
     );
     // Still Idle (searching), packet buffered.
-    assert!(matches!(pm.peers[0].state, PeerState::Idle));
+    assert!(matches!(pm.peers[0].state, PeerSessionState::Idle));
     assert_eq!(pm.peers[0].pending_tun.len(), 1);
 }
 
@@ -440,7 +446,10 @@ fn peer_candidate_then_tick_probes_candidate_with_init() {
         PacketType::HandshakeInit as u8,
         "the datagram to the candidate is a handshake Init"
     );
-    assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    assert!(matches!(
+        pm.peers[0].state,
+        PeerSessionState::Handshaking(_)
+    ));
 }
 
 /// #37 Task 5: a `PeerCandidate` carrying a record that VERIFIES against
@@ -492,7 +501,10 @@ fn peer_candidate_with_valid_signed_record_is_accepted_and_probed() {
         PacketType::HandshakeInit as u8,
         "the datagram to the candidate is a handshake Init"
     );
-    assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    assert!(matches!(
+        pm.peers[0].state,
+        PeerSessionState::Handshaking(_)
+    ));
 }
 
 /// #37 Task 5: a `PeerCandidate` carrying a record that FAILS
@@ -544,7 +556,7 @@ fn peer_candidate_with_invalid_record_is_dropped_no_probe() {
         "no probe may be sent toward a candidate carrying an unverifiable record"
     );
     assert!(
-        matches!(pm.peers[0].state, PeerState::Idle),
+        matches!(pm.peers[0].state, PeerSessionState::Idle),
         "the peer must stay Idle: the forged candidate was never acted on"
     );
 }
@@ -593,7 +605,7 @@ fn peer_candidate_with_valid_record_for_wrong_node_is_dropped() {
         !out.iter().any(|d| d.dst == candidate),
         "no probe toward a candidate whose record binds a different identity",
     );
-    assert!(matches!(pm.peers[0].state, PeerState::Idle));
+    assert!(matches!(pm.peers[0].state, PeerSessionState::Idle));
 }
 
 /// (c) With NO rendezvous configured, a peer with a direct endpoint behaves
@@ -622,7 +634,10 @@ fn no_rendezvous_direct_endpoint_is_pure_2a() {
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].dst, endpoint, "Init targets the configured endpoint");
     assert_eq!(out[0].bytes[0], PacketType::HandshakeInit as u8);
-    assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    assert!(matches!(
+        pm.peers[0].state,
+        PeerSessionState::Handshaking(_)
+    ));
     // No relay flag, no path commitment yet.
     assert!(!pm.peers[0].relay);
     assert_eq!(pm.peers[0].path_kind, None);
@@ -672,7 +687,10 @@ fn punch_handshake_escalates_to_relay_at_punch_window_not_90s() {
                 && d.bytes.first() == Some(&(PacketType::HandshakeInit as u8))),
         "punch Init is probed toward the candidate"
     );
-    assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    assert!(matches!(
+        pm.peers[0].state,
+        PeerSessionState::Handshaking(_)
+    ));
     assert!(!pm.peers[0].relay);
 
     // Tick just past the punch window (measured from the candidate/stage
@@ -704,7 +722,10 @@ fn punch_handshake_escalates_to_relay_at_punch_window_not_90s() {
     }
     // The escalation flipped the peer onto the relay, still handshaking.
     assert!(pm.peers[0].relay, "peer is now relay-reached");
-    assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    assert!(matches!(
+        pm.peers[0].state,
+        PeerSessionState::Handshaking(_)
+    ));
 }
 
 /// (e') #116 regression: the punch->relay retarget must draw a FRESH
@@ -750,7 +771,10 @@ fn punch_relay_retarget_draws_fresh_ephemeral_even_if_relay_flag_preset() {
         .find(|d| d.dst == candidate && d.bytes.first() == Some(&(PacketType::HandshakeInit as u8)))
         .expect("punch Init is probed toward the candidate");
     let e1 = crate::handshake::init_ephemeral(&punch_init.bytes).expect("E1 ephemeral");
-    assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    assert!(matches!(
+        pm.peers[0].state,
+        PeerSessionState::Handshaking(_)
+    ));
 
     // RACE: a relayed packet from the peer arrives BEFORE our punch->relay
     // escalation timer fires, flipping `relay = true` while we still hold the
@@ -863,7 +887,10 @@ fn late_punch_reply_after_relay_escalation_does_not_poison_relay() {
                 && d.bytes.first() == Some(&(PacketType::HandshakeInit as u8))),
         "punch Init is probed toward the candidate C"
     );
-    assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    assert!(matches!(
+        pm.peers[0].state,
+        PeerSessionState::Handshaking(_)
+    ));
     assert_eq!(
         pm.peers[0].endpoint,
         Some(candidate),
@@ -883,7 +910,10 @@ fn late_punch_reply_after_relay_escalation_does_not_poison_relay() {
         "escalated to relay: a RelaySend goes to the server"
     );
     assert!(pm.peers[0].relay, "peer is now relay-reached");
-    assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    assert!(matches!(
+        pm.peers[0].state,
+        PeerSessionState::Handshaking(_)
+    ));
     assert_eq!(
         pm.peers[0].endpoint, None,
         "fix: stale punch-candidate endpoint C must be cleared on escalation \
@@ -911,7 +941,7 @@ fn late_punch_reply_after_relay_escalation_does_not_poison_relay() {
     // `endpoint == None` means no match, so the relay attempt survives
     // untouched.
     assert!(
-        matches!(pm.peers[0].state, PeerState::Handshaking(_)),
+        matches!(pm.peers[0].state, PeerSessionState::Handshaking(_)),
         "relay handshake must survive the stray late punch reply from C \
          (pre-fix this would be Idle, having been poisoned)"
     );
@@ -1000,7 +1030,10 @@ fn endpoint_peer_emits_lookup_and_punches_after_direct_window() {
     let out = pm.on_tun(&dummy_tun_pkt(), 0).to_vec();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].dst, endpoint, "Init targets the configured endpoint");
-    assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    assert!(matches!(
+        pm.peers[0].state,
+        PeerSessionState::Handshaking(_)
+    ));
     assert_eq!(pm.peers[0].path.stage(), PathStage::Direct);
 
     // 2. Tick past DIRECT_MS: the peer is still Handshaking (no resp
@@ -1034,7 +1067,10 @@ fn endpoint_peer_emits_lookup_and_punches_after_direct_window() {
     );
     // The direct Init stays in flight alongside the lookup (NeedLookup
     // does not abandon it) — the peer is still Handshaking, not relayed.
-    assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    assert!(matches!(
+        pm.peers[0].state,
+        PeerSessionState::Handshaking(_)
+    ));
     assert!(!pm.peers[0].relay);
 
     // 3. A reflexive candidate for the peer now arrives (as if the lookup
@@ -1074,7 +1110,10 @@ fn endpoint_peer_emits_lookup_and_punches_after_direct_window() {
         Some(candidate),
         "endpoint re-stamped to the punch candidate"
     );
-    assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    assert!(matches!(
+        pm.peers[0].state,
+        PeerSessionState::Handshaking(_)
+    ));
 }
 
 // ── membership wiring (mock Membership via an in-test CA + certs) ──────
@@ -1125,7 +1164,10 @@ fn on_tun_unknown_addr_resolves_admits_and_handshakes() {
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].dst, peer_ep);
     assert_eq!(out[0].bytes[0], PacketType::HandshakeInit as u8);
-    assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+    assert!(matches!(
+        pm.peers[0].state,
+        PeerSessionState::Handshaking(_)
+    ));
 }
 
 /// (a2) Regression (2c/Task 7): with exactly one already-admitted peer
@@ -1283,7 +1325,7 @@ fn anti_hijack_established_peer_unmoved_by_gossip_and_resolve() {
 
     // Splice in a live Established session reaching `committed_ep`.
     const TAG: u64 = 0x0a0b_0c0d_0e0f_1011;
-    pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+    pm.peers[0].state = PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(
         Box::new(fake_established_dataplane(TAG, committed_ep)),
         0,
     )));
@@ -1405,7 +1447,7 @@ fn obf_on_data_roundtrips_through_send_and_on_udp() {
     let (mut init_dp, resp_dp, hp_key, conn_tag) = established_pair(peer_ep);
     let sess = yip_obf::derive_key(&hp_key);
     pm.peers[0].state =
-        PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(resp_dp), 0)));
+        PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(resp_dp), 0)));
     pm.peers[0].session_obf_key = Some(sess);
     pm.by_tag.insert(conn_tag, 0);
 
@@ -1505,7 +1547,10 @@ fn obf_on_unknown_src_handshake_init_via_obf_psk() {
         PacketType::HandshakeResp as u8,
         "the reply is an obfuscated HandshakeResp"
     );
-    assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+    assert!(matches!(
+        pm.peers[0].state,
+        PeerSessionState::Established(_)
+    ));
     assert_eq!(
         pm.peers[0].endpoint,
         Some(src),
@@ -1537,7 +1582,7 @@ fn obf_on_garbage_is_dropped_no_panic() {
     assert!(matches!(pm.on_udp(src, &[], 0), DispatchOut::None));
     assert!(matches!(pm.on_udp(src, &[0u8; 3], 0), DispatchOut::None));
     // No peer disturbed.
-    assert!(matches!(pm.peers[0].state, PeerState::Idle));
+    assert!(matches!(pm.peers[0].state, PeerSessionState::Idle));
     assert!(pm.by_tag.is_empty());
 }
 
@@ -1643,7 +1688,10 @@ fn obf_off_on_udp_is_plaintext_as_today() {
         PacketType::HandshakeResp as u8,
         "reply carries a plaintext PacketType prefix (no obfuscation envelope)"
     );
-    assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+    assert!(matches!(
+        pm.peers[0].state,
+        PeerSessionState::Established(_)
+    ));
 }
 
 /// (e) With obfuscation on and a rendezvous server configured, a `Lookup`
@@ -1870,7 +1918,7 @@ fn obf_on_established_peer_for_cover(
     }
     pm.set_cover_traffic_ms(cover_traffic_ms);
 
-    pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+    pm.peers[0].state = PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(
         Box::new(fake_established_dataplane(TAG, peer_ep)),
         0,
     )));
@@ -2071,7 +2119,7 @@ fn pm_mesh_two_established_one_expired(
 
     const TAG0: u64 = 0xAAAA_0000_0000_0001;
     const TAG1: u64 = 0xBBBB_0000_0000_0002;
-    pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+    pm.peers[0].state = PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(
         Box::new(fake_established_dataplane(
             TAG0,
             "10.0.0.2:2000".parse().unwrap(),
@@ -2079,7 +2127,7 @@ fn pm_mesh_two_established_one_expired(
         0,
     )));
     pm.by_tag.insert(TAG0, 0);
-    pm.peers[1].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+    pm.peers[1].state = PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(
         Box::new(fake_established_dataplane(
             TAG1,
             "10.0.0.3:3000".parse().unwrap(),
@@ -2097,7 +2145,7 @@ fn tick_sweep_drops_established_peer_with_expired_cert() {
     let (mut pm, tag1) = pm_mesh_two_established_one_expired([1u8; 32], [2u8; 32]);
     pm.tick(500_000); // a tick past the sweep cadence, now_secs shows peer 0 expired
     assert!(
-        matches!(pm.peers[0].state, PeerState::Idle),
+        matches!(pm.peers[0].state, PeerSessionState::Idle),
         "expired-cert peer's session is dropped"
     );
     assert!(
@@ -2356,7 +2404,7 @@ fn is_peer_established_reports_correct_state() {
 
     let fake_dp = fake_established_dataplane(42, "10.0.0.1:1000".parse().unwrap());
     pm.peers[0].state =
-        PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(fake_dp), 0)));
+        PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(fake_dp), 0)));
     assert!(pm.is_peer_established(&[1u8; 32]));
     assert!(!pm.is_peer_established(&[2u8; 32]));
 }
@@ -2601,7 +2649,7 @@ fn decoy_burst_emits_multiple_bucket_sized_packets() {
     let dp = fake_established_dataplane(TAG, peer_ep);
     let sess = [0xBBu8; 16];
     pm.peers[0].state =
-        PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+        PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
     pm.peers[0].session_obf_key = Some(sess);
     pm.by_tag.insert(TAG, 0);
 
@@ -2656,7 +2704,7 @@ fn stochastic_cover_cadence_jitters_interval() {
     let dp = fake_established_dataplane(TAG, peer_ep);
     let sess = [0xCCu8; 16];
     pm.peers[0].state =
-        PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+        PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
     pm.peers[0].session_obf_key = Some(sess);
     pm.by_tag.insert(TAG, 0);
 
@@ -3283,7 +3331,7 @@ fn test_peer_manager_dispatch_trait_methods() {
     let mut pm = test_peer_manager();
     let dp = fake_established_dataplane(1234, "10.0.0.1:1000".parse().unwrap());
     pm.peers[0].state =
-        PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+        PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
 
     let mut out = Vec::new();
 
@@ -3402,7 +3450,7 @@ fn test_peer_manager_daita_profile_and_engine_mut() {
     let mut pm = test_peer_manager();
     let dp = fake_established_dataplane(1234, "10.0.0.1:1000".parse().unwrap());
     pm.peers[0].state =
-        PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+        PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
 
     // Test set_traffic_defense with Front profile
     let cfg = TrafficDefenseConfig::default().with_daita_profile(yip_obf::DaitaProfile::Front);
@@ -3445,7 +3493,7 @@ fn test_peer_manager_handle_daita_egress_actions() {
         let mut pm = test_peer_manager();
         let dp = fake_established_dataplane(1234, "10.0.0.1:1000".parse().unwrap());
         pm.peers[0].state =
-            PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+            PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
         let mut out = Vec::new();
         pm.on_tun_into(&pkt, 100, &mut out);
         out.len()
@@ -3457,7 +3505,7 @@ fn test_peer_manager_handle_daita_egress_actions() {
         let mut pm = test_peer_manager();
         let dp = fake_established_dataplane(1234, "10.0.0.1:1000".parse().unwrap());
         pm.peers[0].state =
-            PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+            PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
         pm.peers[0].daita_engine = Some(DaitaEngine::new_test_padding_on_tunnel_sent(
             Duration::ZERO,
             Instant::now(),
@@ -3478,7 +3526,7 @@ fn test_peer_manager_handle_daita_egress_actions() {
         let mut pm = test_peer_manager();
         let dp = fake_established_dataplane(1234, "10.0.0.1:1000".parse().unwrap());
         pm.peers[0].state =
-            PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+            PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
         pm.peers[0].daita_engine = Some(DaitaEngine::new_test_blocking_engine(
             Duration::from_millis(50),
             Instant::now(),
@@ -3502,7 +3550,7 @@ fn test_peer_manager_handle_daita_egress_actions() {
         let mut pm = test_peer_manager();
         let dp = fake_established_dataplane(1234, "10.0.0.1:1000".parse().unwrap());
         pm.peers[0].state =
-            PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+            PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
         pm.peers[0].daita_engine = Some(DaitaEngine::new_test_blocking_engine(
             Duration::ZERO,
             Instant::now(),
@@ -3530,7 +3578,7 @@ fn test_peer_manager_tick_daita_timer_actions() {
         let mut pm = test_peer_manager();
         let dp = fake_established_dataplane(1234, "10.0.0.1:1000".parse().unwrap());
         pm.peers[0].state =
-            PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+            PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
         pm.peers[0].daita_engine = Some(DaitaEngine::new_test_padding_on_timer(
             Duration::from_millis(1),
             Duration::ZERO,
@@ -3554,7 +3602,7 @@ fn test_peer_manager_tick_daita_timer_actions() {
     // 2. Idle (non-Established) peer must NOT emit DAITA padding on tick
     {
         let mut pm = test_peer_manager();
-        pm.peers[0].state = PeerState::Idle;
+        pm.peers[0].state = PeerSessionState::Idle;
         pm.peers[0].daita_engine = Some(DaitaEngine::new_test_padding_on_timer(
             Duration::from_millis(1),
             Duration::ZERO,

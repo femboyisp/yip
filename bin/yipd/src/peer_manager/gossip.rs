@@ -30,11 +30,9 @@ impl PeerManager {
         dg: &[u8],
         _now_ms: u64,
     ) -> DispatchOut<'_> {
-        let Some(peer_idx) = self
-            .peers
-            .iter()
-            .position(|p| p.endpoint == Some(src) && matches!(p.state, PeerState::Established(_)))
-        else {
+        let Some(peer_idx) = self.peers.iter().position(|p| {
+            p.endpoint == Some(src) && matches!(p.state, PeerSessionState::Established(_))
+        }) else {
             return DispatchOut::None;
         };
         let Some(msg) = GossipMsg::decode(&dg[1..]) else {
@@ -86,7 +84,7 @@ impl PeerManager {
             if out.len() >= MAX_GOSSIP_TARGETS {
                 return out;
             }
-            if matches!(p.state, PeerState::Established(_)) {
+            if matches!(p.state, PeerSessionState::Established(_)) {
                 if p.relay {
                     out.push((self.server_addr(), Some(i)));
                 } else if let Some(ep) = p.endpoint {
@@ -113,7 +111,7 @@ impl PeerManager {
         let have_established = self
             .peers
             .iter()
-            .any(|p| matches!(p.state, PeerState::Established(_)));
+            .any(|p| matches!(p.state, PeerSessionState::Established(_)));
 
         // Debounced digest (spacing handled inside `tick_digest`), chunked
         // (#44) into one or more `GossipMsg::Digest` messages when the
@@ -155,11 +153,9 @@ impl PeerManager {
                 .map(|m| m.roots().iter().map(|(_, a)| *a).collect())
                 .unwrap_or_default();
             for addr in root_addrs {
-                if let Some(i) = self
-                    .peers
-                    .iter()
-                    .position(|p| p.endpoint == Some(addr) && matches!(p.state, PeerState::Idle))
-                {
+                if let Some(i) = self.peers.iter().position(|p| {
+                    p.endpoint == Some(addr) && matches!(p.state, PeerSessionState::Idle)
+                }) {
                     if let Some(dgs) = self.begin_handshake(i, addr, false, now_ms) {
                         self.tick_egress.extend(dgs);
                     }
@@ -204,7 +200,7 @@ mod tests {
             false,
         );
         const TAG: u64 = 0x9988_7766_5544_3322;
-        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+        pm.peers[0].state = PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(
             Box::new(fake_established_dataplane(TAG, src)),
             0,
         )));
@@ -282,7 +278,7 @@ mod tests {
             false,
         );
         const TAG: u64 = 0x1357_9bdf_2468_ace0;
-        pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+        pm.peers[0].state = PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(
             Box::new(fake_established_dataplane(TAG, peer_ep)),
             0,
         )));

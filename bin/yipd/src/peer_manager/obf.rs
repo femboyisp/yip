@@ -42,12 +42,11 @@ impl PeerManager {
     /// mismatch a safe drop — never a mis-dispatch with side effects.
     pub(super) fn deobf_ingress(&mut self, src: SocketAddr, dg: &[u8]) -> Option<Vec<u8>> {
         // (a) established peer whose endpoint matches src → session candidate keys.
-        let peer_idx = self
-            .peers
-            .iter()
-            .position(|p| p.endpoint == Some(src) && matches!(p.state, PeerState::Established(_)));
+        let peer_idx = self.peers.iter().position(|p| {
+            p.endpoint == Some(src) && matches!(p.state, PeerSessionState::Established(_))
+        });
         if let Some(idx) = peer_idx {
-            if let PeerState::Established(ref epochs) = self.peers[idx].state {
+            if let PeerSessionState::Established(ref epochs) = self.peers[idx].state {
                 let mut keys = epochs.candidate_obf_keys();
                 if keys.is_empty() {
                     if let Some(k) = self.peers[idx].session_obf_key {
@@ -87,7 +86,7 @@ impl PeerManager {
         // garbage type that the type-set + the downstream inner Noise/AEAD verify
         // drop safely.
         for idx in 0..self.peers.len() {
-            if let PeerState::Established(ref epochs) = self.peers[idx].state {
+            if let PeerSessionState::Established(ref epochs) = self.peers[idx].state {
                 let mut keys = epochs.candidate_obf_keys();
                 if keys.is_empty() {
                     if let Some(k) = self.peers[idx].session_obf_key {
@@ -171,7 +170,7 @@ impl PeerManager {
             .iter()
             .find_map(|p| {
                 if p.endpoint == Some(dst) {
-                    if let PeerState::Established(ref epochs) = p.state {
+                    if let PeerSessionState::Established(ref epochs) = p.state {
                         return epochs.current_obf_key().or(p.session_obf_key);
                     }
                 }
@@ -403,7 +402,7 @@ mod tests {
         let dp = fake_established_dataplane_with_obf(TAG, peer_ep, true);
         let sess = dp.obf_key().unwrap();
         pm.peers[0].state =
-            PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+            PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
         pm.peers[0].session_obf_key = Some(sess);
         pm.by_tag.insert(TAG, 0);
 
@@ -505,7 +504,7 @@ mod tests {
         let dp = fake_established_dataplane_with_obf(TAG, peer_ep, true);
         let sess = dp.obf_key().unwrap();
         pm.peers[0].state =
-            PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+            PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
         pm.peers[0].session_obf_key = Some(sess);
         pm.by_tag.insert(TAG, 0);
 
@@ -522,7 +521,10 @@ mod tests {
             matches!(out, DispatchOut::None),
             "session-keyed junk must be dropped, not dispatched"
         );
-        assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+        assert!(matches!(
+            pm.peers[0].state,
+            PeerSessionState::Established(_)
+        ));
         assert_eq!(
             pm.peers[0].session_obf_key,
             Some(sess),
@@ -558,7 +560,7 @@ mod tests {
             .expect("small test body fits u16");
         let src: SocketAddr = "203.0.113.55:5555".parse().unwrap();
         assert!(matches!(pm.on_udp(src, &junk, 0), DispatchOut::None));
-        assert!(matches!(pm.peers[0].state, PeerState::Idle));
+        assert!(matches!(pm.peers[0].state, PeerSessionState::Idle));
         assert!(pm.by_tag.is_empty());
     }
 
@@ -588,7 +590,7 @@ mod tests {
         dg.extend_from_slice(&[0u8; 16]);
         let src: SocketAddr = "203.0.113.66:6666".parse().unwrap();
         assert!(matches!(pm.on_udp(src, &dg, 0), DispatchOut::None));
-        assert!(matches!(pm.peers[0].state, PeerState::Idle));
+        assert!(matches!(pm.peers[0].state, PeerSessionState::Idle));
     }
 
     #[test]
@@ -617,7 +619,7 @@ mod tests {
         assert_ne!(k_curr, k_next);
 
         epochs.install_next(Box::new(dp_next), [1u8; 32], vec![]);
-        pm.peers[0].state = PeerState::Established(Box::new(epochs));
+        pm.peers[0].state = PeerSessionState::Established(Box::new(epochs));
         // pm.peers[0].session_obf_key is deliberately left None or pointing to k_curr
         pm.peers[0].session_obf_key = Some(k_curr);
 
@@ -661,7 +663,7 @@ mod tests {
         let key = [0x55u8; 16];
         let dp = fake_established_dataplane(5555, peer_ep);
         pm.peers[0].state =
-            PeerState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+            PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
         pm.peers[0].session_obf_key = Some(key);
 
         let ctl_plain = [1, 2, 3];

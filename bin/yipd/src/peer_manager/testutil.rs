@@ -108,7 +108,7 @@ pub(super) fn fake_established_dataplane_with_obf(
 
 pub(super) fn established_tag(pm: &PeerManager, idx: usize) -> Option<u64> {
     match &pm.peers[idx].state {
-        PeerState::Established(epochs) => Some(epochs.current().conn_tag()),
+        PeerSessionState::Established(epochs) => Some(epochs.current().conn_tag()),
         _ => None,
     }
 }
@@ -200,7 +200,7 @@ pub(super) fn pm_with_established_peer(
     );
     pm.rekey_interval_ms = interval_ms;
     const FAKE_TAG: u64 = 0x1234_5678_9abc_def0;
-    pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+    pm.peers[0].state = PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(
         Box::new(fake_established_dataplane(FAKE_TAG, ep)),
         0,
     )));
@@ -397,7 +397,7 @@ pub(super) fn established_pair_for_roaming() -> (PeerManager, PeerManager, Socke
 /// regressions below.
 pub(super) fn next_conn_tag(pm: &PeerManager) -> u64 {
     match &pm.peers[0].state {
-        PeerState::Established(epochs) => epochs
+        PeerSessionState::Established(epochs) => epochs
             .next
             .as_ref()
             .expect("next must be installed")
@@ -731,7 +731,7 @@ pub(super) fn established_relay_pm(
     pm.rekey_interval_ms = rekey_interval_ms;
 
     const OLD_TAG: u64 = 0xAAAA_BBBB_CCCC_DDDD;
-    pm.peers[0].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+    pm.peers[0].state = PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(
         Box::new(fake_established_dataplane(OLD_TAG, mock_server())),
         0,
     )));

@@ -8,7 +8,7 @@
 //!
 //! # Lazy handshake
 //!
-//! A peer starts in `PeerState::Idle`: nothing has been sent to it yet.
+//! A peer starts in `PeerSessionState::Idle`: nothing has been sent to it yet.
 //! The first TUN packet routed to that peer (see "TUN routing" below)
 //! buffers the packet in `pending_tun`, starts a [`HandshakeState`] initiator,
 //! and emits `[HandshakeInit]`. The peer stays `Handshaking` until either:
@@ -152,9 +152,9 @@ const MAX_GOSSIP_TARGETS: usize = 4;
 const MAX_GOSSIP_REPLIES: usize = 8;
 
 /// An initiator handshake in flight, awaiting `[HandshakeResp]`. Boxed by
-/// [`PeerState::Handshaking`] so that variant stays pointer-sized like
+/// [`PeerSessionState::Handshaking`] so that variant stays pointer-sized like
 /// `Established(Box<DataPlane>)` — `HandshakeState`/`init_pkt` are much
-/// larger than the other `PeerState` variants (clippy `large_enum_variant`).
+/// larger than the other `PeerSessionState` variants (clippy `large_enum_variant`).
 struct HandshakingState {
     hs: HandshakeState,
     /// When this handshake attempt first started. The attempt is abandoned
@@ -195,34 +195,10 @@ struct HandshakingState {
     via_relay: bool,
 }
 
-/// Summary telemetry and status for an individual peer.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct PeerStats {
-    pub public_key: [u8; 32],
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub alias: Option<String>,
-    pub endpoint: Option<SocketAddr>,
-    pub node_addr: std::net::Ipv6Addr,
-    pub state: String,
-    pub last_activity_ms: u64,
-    pub tx_bytes: u64,
-    pub rx_bytes: u64,
-    pub tx_packets: u64,
-    pub rx_packets: u64,
-    pub fec_recovered: u64,
-    pub transport: String,
-    pub rtt_ms: Option<u32>,
-    pub fec_ratio_pct: u8,
-    #[serde(default = "default_cert_status")]
-    pub cert_status: String,
-}
-
-fn default_cert_status() -> String {
-    "CA Valid".to_string()
-}
+pub use yip_proto::peer::{PeerState, PeerStats};
 
 /// One remote peer's handshake/session state.
-enum PeerState {
+enum PeerSessionState {
     /// No handshake has been attempted yet.
     Idle,
     /// An initiator handshake is in flight, awaiting `[HandshakeResp]`.
@@ -247,7 +223,7 @@ struct Peer {
     /// rendezvous/relay, which Task 6 wires into this path; such a peer
     /// cannot yet be routed to directly (see `on_tun`'s `Idle` branch).
     endpoint: Option<SocketAddr>,
-    state: PeerState,
+    state: PeerSessionState,
     /// TUN packets buffered while no `Established` session exists yet.
     pending_tun: Vec<Vec<u8>>,
     /// The `[HandshakeResp]` bytes that established the *current* session,
@@ -593,7 +569,7 @@ impl PeerManager {
                 alias: p.alias.clone(),
                 addr,
                 endpoint: p.endpoint,
-                state: PeerState::Idle,
+                state: PeerSessionState::Idle,
                 pending_tun: Vec::new(),
                 cached_resp: None,
                 cached_resp_init_eph: None,
@@ -717,7 +693,7 @@ impl PeerManager {
             alias: None,
             addr,
             endpoint: endpoints.first().copied(),
-            state: PeerState::Idle,
+            state: PeerSessionState::Idle,
             pending_tun: Vec::new(),
             cached_resp: None,
             cached_resp_init_eph: None,
@@ -777,7 +753,7 @@ impl PeerManager {
         self.traffic_defense = cfg;
         let now = std::time::Instant::now();
         for peer in &mut self.peers {
-            if matches!(peer.state, PeerState::Established(_)) {
+            if matches!(peer.state, PeerSessionState::Established(_)) {
                 if profile == yip_obf::DaitaProfile::Off {
                     peer.daita_engine = None;
                 } else {
@@ -1081,7 +1057,7 @@ impl PeerManager {
             replay_floor,
             replay_latest,
         ) = match &p.state {
-            PeerState::Established(epochs) => {
+            PeerSessionState::Established(epochs) => {
                 let age_ms = now_ms.saturating_sub(epochs.current_created_ms());
                 (
                     "Established".to_string(),
@@ -1095,7 +1071,7 @@ impl PeerManager {
                     Some(epochs.current_replay_latest()),
                 )
             }
-            PeerState::Handshaking(_) => (
+            PeerSessionState::Handshaking(_) => (
                 "Handshaking".to_string(),
                 None,
                 None,
@@ -1106,7 +1082,7 @@ impl PeerManager {
                 None,
                 None,
             ),
-            PeerState::Idle => (
+            PeerSessionState::Idle => (
                 "Idle".to_string(),
                 None,
                 None,
@@ -1182,7 +1158,7 @@ impl PeerManager {
             Some(PathKind::Direct) | Some(PathKind::Punched)
         ) || (peer.endpoint.is_some() && !peer.relay);
 
-        let is_established = matches!(peer.state, PeerState::Established(_));
+        let is_established = matches!(peer.state, PeerSessionState::Established(_));
         let is_responsive = is_established || peer.endpoint.is_some();
 
         if !is_responsive {
@@ -1257,7 +1233,7 @@ impl PeerManager {
         let mut samples = Vec::new();
         let mut received = 0;
 
-        let is_established = matches!(peer.state, PeerState::Established(_));
+        let is_established = matches!(peer.state, PeerSessionState::Established(_));
         let is_responsive = is_established || peer.endpoint.is_some();
 
         if is_responsive {
@@ -1577,7 +1553,7 @@ impl PeerManager {
     pub(crate) fn record_new_epoch(&mut self, idx: usize) {
         let peer_pk = self.peers[idx].pubkey;
         let endpoint = self.peers[idx].endpoint;
-        if let PeerState::Established(ref mut epochs) = self.peers[idx].state {
+        if let PeerSessionState::Established(ref mut epochs) = self.peers[idx].state {
             if self.num_shards > 1 {
                 epochs
                     .current_mut()
@@ -1615,13 +1591,13 @@ impl PeerManager {
     pub fn is_peer_established(&self, pubkey: &[u8; 32]) -> bool {
         self.peers
             .iter()
-            .any(|p| p.pubkey == *pubkey && matches!(p.state, PeerState::Established(_)))
+            .any(|p| p.pubkey == *pubkey && matches!(p.state, PeerSessionState::Established(_)))
     }
 
     /// Check whether the target peer for this inner packet is already established locally.
     pub fn is_tun_target_established(&self, inner: &[u8]) -> bool {
         if let Some(idx) = self.route_tun_index(inner) {
-            matches!(self.peers[idx].state, PeerState::Established(_))
+            matches!(self.peers[idx].state, PeerSessionState::Established(_))
         } else {
             false
         }
@@ -1680,7 +1656,7 @@ impl PeerManager {
         self.peers[idx].path_kind = Some(PathKind::Direct);
         let mut epoch_set = Box::new(crate::epoch::EpochSet::new(dp, 0));
         epoch_set.set_fec_repair_ratio(self.fec_config.redundancy_pct as f32 / 100.0);
-        self.peers[idx].state = PeerState::Established(epoch_set);
+        self.peers[idx].state = PeerSessionState::Established(epoch_set);
     }
 
     /// Returns the active FEC runtime configuration.
@@ -1693,7 +1669,7 @@ impl PeerManager {
         self.fec_config = config;
         let ratio = config.redundancy_pct as f32 / 100.0;
         for peer in &mut self.peers {
-            if let PeerState::Established(ref mut epochs) = peer.state {
+            if let PeerSessionState::Established(ref mut epochs) = peer.state {
                 epochs.set_fec_repair_ratio(ratio);
             }
         }
@@ -1706,7 +1682,7 @@ impl PeerManager {
         let mut unrecoverable_burst_drops = 0u64;
 
         for peer in &self.peers {
-            if let PeerState::Established(ref epochs) = peer.state {
+            if let PeerSessionState::Established(ref epochs) = peer.state {
                 total_symbols_tx += epochs.total_symbols_tx();
                 recovered_symbols_rx += epochs.fec_recovered_count();
                 unrecoverable_burst_drops += epochs.fec_unrecoverable_count();
@@ -1769,7 +1745,7 @@ impl PeerManager {
             alias: cfg.alias,
             addr,
             endpoint: cfg.endpoint,
-            state: PeerState::Idle,
+            state: PeerSessionState::Idle,
             pending_tun: Vec::new(),
             cached_resp: None,
             cached_resp_init_eph: None,
@@ -1843,9 +1819,9 @@ impl PeerManager {
             .iter()
             .map(|p| {
                 let state_str = match &p.state {
-                    PeerState::Idle => "idle",
-                    PeerState::Handshaking(_) => "handshaking",
-                    PeerState::Established(_) => "established",
+                    PeerSessionState::Idle => PeerState::Idle.as_str(),
+                    PeerSessionState::Handshaking(_) => PeerState::Handshaking.as_str(),
+                    PeerSessionState::Established(_) => PeerState::Established.as_str(),
                 };
                 let transport = if let Some(t) = &p.transport_name {
                     t.clone()
@@ -1864,7 +1840,7 @@ impl PeerManager {
                 };
 
                 let (fec_ratio_pct, fec_recovered) = match &p.state {
-                    PeerState::Established(epochs) => {
+                    PeerSessionState::Established(epochs) => {
                         let ratio = (epochs.bulk_repair_ratio() * 100.0).round() as u8;
                         let rec = epochs.fec_recovered_count();
                         (ratio, rec)
@@ -1992,7 +1968,7 @@ impl PeerManager {
     /// Drain any pending decoded packets across all peers' active epochs into `out`.
     pub fn drain_tun(&mut self, out: &mut Vec<Vec<u8>>) {
         for peer in &mut self.peers {
-            if let PeerState::Established(epochs) = &mut peer.state {
+            if let PeerSessionState::Established(epochs) = &mut peer.state {
                 epochs.drain_tun(out);
             }
         }
@@ -2168,7 +2144,7 @@ impl PeerManager {
 
     pub fn recycle(&mut self, batch: &mut Vec<EgressDatagram>) {
         for p in &mut self.peers {
-            if let PeerState::Established(epochs) = &mut p.state {
+            if let PeerSessionState::Established(epochs) = &mut p.state {
                 epochs.current_mut().recycle(batch);
                 if batch.is_empty() {
                     return;
@@ -2329,7 +2305,7 @@ impl PeerManager {
         // arm that returns borrowed data, which then conflicts with any
         // other arm that also touches `self.peers[idx]`. Splitting into
         // independent statements gives each one its own borrow region.
-        if matches!(self.peers[idx].state, PeerState::Established(_)) {
+        if matches!(self.peers[idx].state, PeerSessionState::Established(_)) {
             // Real Data egress for this peer (3b Task 4): mark it active so
             // the idle-cover-traffic gate in `tick_dispatch` does not fire
             // while real traffic is flowing.
@@ -2343,7 +2319,7 @@ impl PeerManager {
             // peer's datagrams already carry the correct `dst` — return them
             // borrowed, byte-identical to 2a.
             if !self.peers[idx].relay {
-                let PeerState::Established(epochs) = &mut self.peers[idx].state else {
+                let PeerSessionState::Established(epochs) = &mut self.peers[idx].state else {
                     unreachable!("just matched Established above");
                 };
                 let start_len = out.len();
@@ -2355,7 +2331,7 @@ impl PeerManager {
             }
             let start_len = out.len();
             let owned: Vec<Vec<u8>> = {
-                let PeerState::Established(epochs) = &mut self.peers[idx].state else {
+                let PeerSessionState::Established(epochs) = &mut self.peers[idx].state else {
                     unreachable!("just matched Established above");
                 };
                 let mut tmp = Vec::new();
@@ -2372,7 +2348,7 @@ impl PeerManager {
             return;
         }
 
-        if matches!(self.peers[idx].state, PeerState::Handshaking(_)) {
+        if matches!(self.peers[idx].state, PeerSessionState::Handshaking(_)) {
             Self::push_pending(&mut self.peers[idx].pending_tun, inner);
             return;
         }
@@ -2420,9 +2396,9 @@ impl PeerManager {
         if self.num_shards > 1 && self.shard_id != 0 {
             for i in 0..self.peers.len() {
                 let relay = self.peers[i].relay;
-                let old_state = std::mem::replace(&mut self.peers[i].state, PeerState::Idle);
+                let old_state = std::mem::replace(&mut self.peers[i].state, PeerSessionState::Idle);
                 let new_state = match old_state {
-                    PeerState::Established(mut epochs) => {
+                    PeerSessionState::Established(mut epochs) => {
                         epochs.retire_previous_if_due(now_ms);
                         if let Some(pkts) = epochs.current_mut().tick(now_ms) {
                             if relay {
@@ -2443,7 +2419,7 @@ impl PeerManager {
                                 }
                             }
                         }
-                        PeerState::Established(epochs)
+                        PeerSessionState::Established(epochs)
                     }
                     other => other,
                 };
@@ -2516,10 +2492,10 @@ impl PeerManager {
             // regardless of when `relay` flipped, while a Relay Init (via_relay)
             // is still left to the retransmit arm (no ephemeral-churn loop).
             if self.rendezvous.is_some()
-                && matches!(self.peers[i].state, PeerState::Handshaking(ref h) if !h.via_relay)
+                && matches!(self.peers[i].state, PeerSessionState::Handshaking(ref h) if !h.via_relay)
             {
                 let target = match &self.peers[i].state {
-                    PeerState::Handshaking(h) => h.target,
+                    PeerSessionState::Handshaking(h) => h.target,
                     _ => unreachable!("matched Handshaking above"),
                 };
                 match self.peers[i].path.advance(now_ms) {
@@ -2536,7 +2512,7 @@ impl PeerManager {
                         // `[HandshakeResp]` for the abandoned punch candidate must not match
                         // this now-relay-flagged peer.
                         let server = self.server_addr();
-                        self.peers[i].state = PeerState::Idle;
+                        self.peers[i].state = PeerSessionState::Idle;
                         self.peers[i].endpoint = None;
                         if let Some(dgs) = self.begin_handshake(i, server, true, now_ms) {
                             self.tick_egress.extend(dgs);
@@ -2556,7 +2532,7 @@ impl PeerManager {
                         // `relay` flag (the egress-wrap mismatch flagged near the Idle
                         // branch). The SM re-escalates to the relay after the punch
                         // window if the direct candidate also fails, redrawing again.
-                        self.peers[i].state = PeerState::Idle;
+                        self.peers[i].state = PeerSessionState::Idle;
                         self.peers[i].relay = false;
                         if let Some(dgs) = self.begin_handshake(i, addr, false, now_ms) {
                             self.tick_egress.extend(dgs);
@@ -2599,9 +2575,9 @@ impl PeerManager {
             }
 
             let relay = self.peers[i].relay;
-            let old_state = std::mem::replace(&mut self.peers[i].state, PeerState::Idle);
+            let old_state = std::mem::replace(&mut self.peers[i].state, PeerSessionState::Idle);
             let new_state = match old_state {
-                PeerState::Established(mut epochs) => {
+                PeerSessionState::Established(mut epochs) => {
                     epochs.retire_previous_if_due(now_ms);
                     self.drive_rekey_schedule(i, relay, &mut epochs, now_ms);
                     if let Some(pkts) = epochs.current_mut().tick(now_ms) {
@@ -2619,9 +2595,9 @@ impl PeerManager {
                             self.tick_egress.extend(pkts.iter().cloned());
                         }
                     }
-                    PeerState::Established(epochs)
+                    PeerSessionState::Established(epochs)
                 }
-                PeerState::Handshaking(mut handshaking)
+                PeerSessionState::Handshaking(mut handshaking)
                     if now_ms.saturating_sub(handshaking.last_sent_ms) >= handshaking.retry_ms =>
                 {
                     if now_ms.saturating_sub(handshaking.started_ms) >= HANDSHAKE_TOTAL_MS {
@@ -2629,7 +2605,7 @@ impl PeerManager {
                         // peer is unreachable. Give up and free the ephemeral;
                         // the next TUN packet starts a fresh attempt.
                         self.peers[i].pending_tun.clear();
-                        PeerState::Idle
+                        PeerSessionState::Idle
                     } else {
                         // Retransmit the SAME init (same ephemeral) so the
                         // responder's cached reply stays valid — see
@@ -2654,7 +2630,7 @@ impl PeerManager {
                                 bytes: handshaking.init_pkt.clone(),
                             });
                         }
-                        PeerState::Handshaking(handshaking)
+                        PeerSessionState::Handshaking(handshaking)
                     }
                 }
                 other => other,
@@ -2670,7 +2646,7 @@ impl PeerManager {
         // hole-punching proactive rather than waiting on TUN traffic.
         if self.rendezvous.is_some() {
             for i in 0..self.peers.len() {
-                if matches!(self.peers[i].state, PeerState::Idle) {
+                if matches!(self.peers[i].state, PeerSessionState::Idle) {
                     self.drive_path_idle(i, now_ms);
                 }
             }
@@ -2701,7 +2677,8 @@ impl PeerManager {
             }
 
             for i in 0..self.peers.len() {
-                if !matches!(self.peers[i].state, PeerState::Established(_)) || self.peers[i].relay
+                if !matches!(self.peers[i].state, PeerSessionState::Established(_))
+                    || self.peers[i].relay
                 {
                     continue;
                 }
@@ -2753,7 +2730,7 @@ impl PeerManager {
         // ── DAITA state machine timers ───────────────────────────────────────
         let now_instant = std::time::Instant::now();
         for i in 0..self.peers.len() {
-            if !matches!(self.peers[i].state, PeerState::Established(_)) {
+            if !matches!(self.peers[i].state, PeerSessionState::Established(_)) {
                 continue;
             }
             let Some(endpoint) = self.peers[i].endpoint else {
@@ -2820,7 +2797,7 @@ impl PeerManager {
                 .iter()
                 .enumerate()
                 .filter(|(_, p)| {
-                    matches!(p.state, PeerState::Established(_))
+                    matches!(p.state, PeerSessionState::Established(_))
                         && !m.member_or_admitted_cert_valid(
                             &p.pubkey,
                             p.admitted_cert_not_after,
