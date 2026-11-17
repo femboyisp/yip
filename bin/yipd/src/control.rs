@@ -766,6 +766,12 @@ pub enum ControlResponse {
         version: String,
         node_addr: String,
         device: String,
+        #[serde(default)]
+        public_key: String,
+        #[serde(default)]
+        listen_port: u16,
+        #[serde(default)]
+        network_id: String,
         peers_count: usize,
         uptime_secs: u64,
         #[serde(default)]
@@ -917,10 +923,41 @@ impl ControlHandle {
         }
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
+            }
         }
 
         let listener = UnixListener::bind(&path)?;
         listener.set_nonblocking(false)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Configure socket permissions: default 0666 so unprivileged desktop users
+            // (e.g. yip-client or CLI) can query status without sudo.
+            // Mode can be overridden via YIP_CONTROL_SOCKET_MODE (e.g. "0660" or "0600").
+            let mode = if let Ok(val) = std::env::var("YIP_CONTROL_SOCKET_MODE") {
+                let trimmed = val.trim().trim_start_matches("0o").trim_start_matches('0');
+                if trimmed.is_empty() {
+                    0o666
+                } else {
+                    u32::from_str_radix(trimmed, 8).unwrap_or(0o666)
+                }
+            } else {
+                0o666
+            };
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+
+            // Optionally chown group to "yip" (or YIP_CONTROL_SOCKET_GROUP) if present
+            let target_group =
+                std::env::var("YIP_CONTROL_SOCKET_GROUP").unwrap_or_else(|_| "yip".into());
+            if let Some(gid) = lookup_group_gid(&target_group) {
+                let _ = std::os::unix::fs::chown(&path, None, Some(gid));
+            }
+        }
 
         let (tx, rx) = channel();
         let socket_path = path.clone();
@@ -956,6 +993,24 @@ impl Drop for ControlHandle {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket_path);
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn lookup_group_gid(group_name: &str) -> Option<u32> {
+    let content = std::fs::read_to_string("/etc/group").ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split(':');
+        if let (Some(name), Some(_), Some(gid_str)) = (parts.next(), parts.next(), parts.next()) {
+            if name == group_name {
+                return gid_str.parse::<u32>().ok();
+            }
+        }
+    }
+    None
 }
 
 /// Background thread loop accepting connections and servicing client requests.
@@ -1057,6 +1112,9 @@ pub fn dispatch_cmd(
                 version: env!("CARGO_PKG_VERSION").into(),
                 node_addr: pm.local_addr().to_string(),
                 device: device_name.into(),
+                public_key: pm.local_pub_hex(),
+                listen_port: pm.listen_port(),
+                network_id: pm.network_id_hex(),
                 peers_count: stats.len(),
                 uptime_secs: start_time.elapsed().as_secs(),
                 ca_status: Some("Enforced (Root Ed25519) — Zero-Trust Admission".into()),
@@ -1646,6 +1704,9 @@ pub fn run_cli_status(socket_path: &Path, json: bool) -> Result<(), String> {
             version,
             node_addr,
             device,
+            public_key,
+            listen_port,
+            network_id,
             peers_count,
             uptime_secs,
             ca_status,
@@ -1656,6 +1717,15 @@ pub fn run_cli_status(socket_path: &Path, json: bool) -> Result<(), String> {
             println!("\x1b[1;32m●\x1b[0m \x1b[1myipd\x1b[0m v{version}");
             println!("  Device:     \x1b[1m{device}\x1b[0m");
             println!("  Mesh IPv6:  \x1b[36m{node_addr}\x1b[0m");
+            if !public_key.is_empty() {
+                println!("  Public Key: \x1b[33m{public_key}\x1b[0m");
+            }
+            if listen_port > 0 {
+                println!("  Listen:     :{listen_port}");
+            }
+            if !network_id.is_empty() {
+                println!("  Network ID: {network_id}");
+            }
             let ca_str = ca_status
                 .unwrap_or_else(|| "Enforced (Root Ed25519) — Zero-Trust Admission".into());
             println!("  CA Gating:  \x1b[32m{ca_str}\x1b[0m");
@@ -2762,12 +2832,51 @@ mod tests {
     #[test]
     fn control_protocol_status_serialization() {
         let mut pm = crate::peer_manager::testutil::test_peer_manager();
+        pm.set_listen_port(51820);
         let start = Instant::now();
         let resp = dispatch_cmd(&mut pm, ControlCmd::Status, "yip0", start);
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"ok\":true"));
         assert!(json.contains("\"device\":\"yip0\""));
         assert!(json.contains("\"peers_count\":1"));
+        assert!(json.contains("\"public_key\":"));
+        assert!(json.contains("\"listen_port\":51820"));
+        assert!(json.contains("\"network_id\":"));
+
+        // Test round-trip deserialization
+        let deserialized: ControlResponse = serde_json::from_str(&json).unwrap();
+        if let ControlResponse::Status {
+            ok,
+            device,
+            public_key,
+            listen_port,
+            ..
+        } = deserialized
+        {
+            assert!(ok);
+            assert_eq!(device, "yip0");
+            assert_eq!(public_key, pm.local_pub_hex());
+            assert_eq!(listen_port, 51820);
+        } else {
+            panic!("expected ControlResponse::Status deserialization");
+        }
+
+        // Test backward-compatibility: deserializing old json without the new fields
+        let old_json = r#"{"ok":true,"version":"0.1.0","node_addr":"fd00::1","device":"yip0","peers_count":0,"uptime_secs":10}"#;
+        let old_parsed: ControlResponse = serde_json::from_str(old_json).unwrap();
+        if let ControlResponse::Status {
+            public_key,
+            listen_port,
+            network_id,
+            ..
+        } = old_parsed
+        {
+            assert_eq!(public_key, "");
+            assert_eq!(listen_port, 0);
+            assert_eq!(network_id, "");
+        } else {
+            panic!("expected backward-compatible Status deserialization");
+        }
     }
 
     #[test]
@@ -2819,6 +2928,14 @@ mod tests {
         let socket_path = format!("/tmp/test_control_{}.sock", std::process::id());
         let handle = ControlHandle::bind(&socket_path).unwrap();
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&socket_path).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o666);
+        }
+
         let mut pm = crate::peer_manager::testutil::test_peer_manager();
         let start = Instant::now();
 
@@ -2846,6 +2963,33 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
         assert!(line.contains("\"device\":\"yip0\""));
+    }
+
+    #[test]
+    fn test_lookup_group_gid_root() {
+        #[cfg(unix)]
+        {
+            let gid = lookup_group_gid("root");
+            assert_eq!(gid, Some(0));
+            assert_eq!(lookup_group_gid("nonexistent_test_group_xyz"), None);
+        }
+    }
+
+    #[test]
+    fn test_control_handle_custom_permissions() {
+        let socket_path = format!("/tmp/test_control_perm_{}.sock", std::process::id());
+        std::env::set_var("YIP_CONTROL_SOCKET_MODE", "0660");
+        let handle = ControlHandle::bind(&socket_path).unwrap();
+        std::env::remove_var("YIP_CONTROL_SOCKET_MODE");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&socket_path).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o660);
+        }
+        drop(handle);
     }
 
     #[test]

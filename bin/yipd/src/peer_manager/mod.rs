@@ -498,6 +498,7 @@ pub struct PeerManager {
     device_name: String,
     /// Loop start time for uptime reporting.
     start_time: std::time::Instant,
+    listen_port: u16,
     /// Optional online Threshold CA coordinator address for automated 70% TTL certificate rotation.
     pub threshold_ca_server: Option<SocketAddr>,
     /// Monotonic timestamp in milliseconds of the last certificate renewal check.
@@ -655,6 +656,7 @@ impl PeerManager {
             control: None,
             device_name: "yip0".into(),
             start_time: std::time::Instant::now(),
+            listen_port: 443,
             threshold_ca_server: None,
             last_cert_check_ms: 0,
             fec_config: crate::control::FecConfig::default(),
@@ -1381,6 +1383,30 @@ impl PeerManager {
         self.control = control;
         self.device_name = device_name;
         self.start_time = start_time;
+    }
+
+    /// Return the active UDP listen port.
+    pub fn listen_port(&self) -> u16 {
+        self.listen_port
+    }
+
+    /// Set the active UDP listen port.
+    pub fn set_listen_port(&mut self, port: u16) {
+        self.listen_port = port;
+    }
+
+    /// Return the local public key as a 64-character lowercase hex string.
+    pub fn local_pub_hex(&self) -> String {
+        self.local_pub.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Return the mesh network ID as a 32-character lowercase hex string, or empty if standalone.
+    pub fn network_id_hex(&self) -> String {
+        if let Some(ref m) = self.membership {
+            m.network_id().iter().map(|b| format!("{b:02x}")).collect()
+        } else {
+            String::new()
+        }
     }
 
     /// Access the shared lock-free telemetry metrics registry.

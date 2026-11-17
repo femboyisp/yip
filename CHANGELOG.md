@@ -6,6 +6,9 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **Control Socket Status RPC Metadata Exposure (`bin/yipd`, #194).**
+  - Exposed local node public key (`public_key`), active UDP listen port (`listen_port`), and mesh network ID (`network_id`) in `ControlResponse::Status`.
+  - Added CLI status printout formatting and JSON serialization for node public keys, listen ports, and network IDs, enabling unprivileged desktop clients and orchestration tools to query local node identity without reading secret configuration files.
 - **TCP Line-Rate Throughput Scaling & Hot-Path Allocation Elimination (`bin/yipd`, `crates/yip-io`, `crates/yip-transport`).**
   - Added zero-allocation `sendmmsg_datagrams` and `sendmmsg_datagrams_burst` to `BatchUdpSocket` in `crates/yip-io`, mapping `EgressDatagram` buffers and socket addresses directly into stack arrays without allocating intermediate `Vec<(&[u8], SocketAddr)>` tuples.
   - Enabled kernel `UDP_GRO` socket option (`SOL_UDP`, `UDP_GRO`) on underlay UDP sockets across `yip-io`, `port.rs`, and `sharding.rs` with graceful fallback on unsupported kernels, aggregating incoming contiguous UDP packets into superpackets and reducing socket layer syscall overhead.
@@ -37,6 +40,11 @@ All notable changes to this project are documented here, following
   Added automated installation and evaluation of userspace Go WireGuard (`wireguard-go`) in `setup-contenders.sh` (`--wireguard-go`) and `run-iperf-compare.sh`. Measures dual-stack IPv4/IPv6 throughput, loss, latency, CPU utilization, and peak resident memory (`get_ns_ram_mb`), enabling direct userspace-to-userspace comparisons against YIP. Added Go module build caching in `benchmarks.yml` to accelerate CI benchmarking runs.
 
 ### Fixed
+- **Control Socket Permissions and Unprivileged Access (`bin/yipd`, `contrib/systemd`, #195).**
+  - Configured explicit file permissions (`0666` default or configurable via `YIP_CONTROL_SOCKET_MODE`) on the control UNIX domain socket (`/run/yipd/yip.sock`) and parent directory (`0755`), allowing unprivileged desktop users (e.g. `yip-client` or CLI tools) to query daemon status without requiring `sudo`.
+  - Added automatic group ownership resolution (`chown`) to group `yip` (or `YIP_CONTROL_SOCKET_GROUP`) when present.
+  - Updated `contrib/systemd/yipd.service` with `RuntimeDirectoryMode=0755` for `/run/yipd`.
+  - Wired control socket binding and polling on Shard 0 in sharded multi-core mode (`shards > 1`).
 - **Multi-Shard Scaling, Monotonic Nonce Skew & RAM Boundedness (`crates/yip-crypto`, `crates/yip-transport`, `bin/yipd`, #251).**
   - Added per-stride replay windows (`Session::replays`) in `crates/yip-crypto/src/session.rs` indexed by `counter % stride`, eliminating spurious replay drops on idle or slower worker shards when concurrent high-throughput shards advance the sliding nonce counter past the replay window boundary.
   - Implemented per-stream gap and watermark tracking in `LossDetector` (`crates/yip-transport/src/lossdetect.rs`), eliminating false packet loss detection and false NACK generation across interleaved worker shards.

@@ -797,6 +797,19 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                 let mut manager = create_peer_manager(&cfg, &peers)?;
                 manager.set_num_shards(num_shards);
                 manager.set_shard_id(shard_id);
+                manager.set_listen_port(cfg.listen.port());
+                if shard_id == 0 {
+                    let control_handle = if let Some(ref path) = cfg.control_socket {
+                        Some(crate::control::ControlHandle::bind(path)?)
+                    } else {
+                        None
+                    };
+                    manager.set_control(
+                        control_handle,
+                        cfg.device.clone(),
+                        std::time::Instant::now(),
+                    );
+                }
                 let derived_symbol_size = u16::try_from(mtu.saturating_add(30)).unwrap_or(u16::MAX);
                 manager.set_data_symbol_size(derived_symbol_size);
                 let tun_fd = tun_dev.as_raw_fd();
