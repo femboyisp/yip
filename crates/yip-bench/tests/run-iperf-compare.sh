@@ -39,9 +39,14 @@ if [ $# -ge 1 ] && [ -n "${1:-}" ]; then
 else
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+    if [ -n "${SUDO_USER:-}" ]; then
+        sudo -u "$SUDO_USER" bash -lc "cargo build --release -p yipd --quiet --manifest-path '$WORKSPACE_ROOT/Cargo.toml'" 2>/dev/null || true
+    elif command -v cargo >/dev/null 2>&1; then
+        cargo build --release -p yipd --quiet --manifest-path "$WORKSPACE_ROOT/Cargo.toml" 2>/dev/null || true
+    fi
     if [ ! -x "$WORKSPACE_ROOT/target/release/yipd" ]; then
-        echo "[build] running cargo build --release -p yipd --quiet in $WORKSPACE_ROOT"
-        cargo build --release -p yipd --quiet --manifest-path "$WORKSPACE_ROOT/Cargo.toml"
+        echo "[error] target/release/yipd does not exist and cargo build failed" >&2
+        exit 1
     fi
     YIPD="$WORKSPACE_ROOT/target/release/yipd"
 fi

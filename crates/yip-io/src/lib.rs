@@ -443,7 +443,10 @@ pub fn set_socket_buffers(sock: &UdpSocket, bytes: usize) -> io::Result<()> {
         }
     }
 
-    let _ = enable_udp_gro(sock);
+    // Note: UDP_GRO requires 64KB rx buffers + cmsg parsing in recvmmsg to segment on receive.
+    // Without full recvmmsg GRO cmsg handling, enabling UDP_GRO causes incoming coalesced
+    // datagrams to truncate to MAX_WIRE_DATAGRAM (2048 bytes), corrupting AEAD framing.
+    // let _ = enable_udp_gro(sock);
 
     Ok(())
 }
