@@ -25,6 +25,8 @@ All notable changes to this project are documented here, following
   Added automated installation and evaluation of userspace Go WireGuard (`wireguard-go`) in `setup-contenders.sh` (`--wireguard-go`) and `run-iperf-compare.sh`. Measures dual-stack IPv4/IPv6 throughput, loss, latency, CPU utilization, and peak resident memory (`get_ns_ram_mb`), enabling direct userspace-to-userspace comparisons against YIP. Added Go module build caching in `benchmarks.yml` to accelerate CI benchmarking runs.
 
 ### Fixed
+- **DHAT Zero-Allocation Warm-Up for Double-Buffered Arenas (`crates/yip-bench`).**
+  Extended warm-up phase in `test_zero_alloc_hotpath_framing` (`crates/yip-bench/tests/zero_alloc_hotpath.rs`) to exercise both double-buffered ping-pong arenas in `Coalescer` before baseline DHAT heap allocation measurement, eliminating false-positive single-block allocation detections in CI.
 - **CI PR Mutation Testing Scope Alignment (`.github/workflows/mutants.yml`).**
   Scoped PR diff mutation testing to the logic and control crates (`yip-wire`, `yip-transport`, `yip-crypto`, `yip-obf`, `yip-membership`, `yip-rendezvous`), matching the scheduled mutation testing suite and removing daemon binary integration test overhead (`yipd`).
 - **Benchmark Contender Setup, Host Isolation, and Mesh Protocol Provisioning (`crates/yip-bench`, #221, #237, #238).**
