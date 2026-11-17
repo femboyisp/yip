@@ -239,9 +239,16 @@ fn test_reorder_slot_overflow_flushes() {
     // All MAX_FLOW_REORDER_SLOTS slots are now filled
     assert!(emitted.is_empty());
 
-    // 17th out-of-order packet causes overflow eviction
-    let overflow_p =
-        make_ipv4_tcp_packet([10, 0, 0, 1], [10, 0, 0, 2], 5001, 8080, 5000, &[0x99; 50]);
+    // Out-of-order packet in the future beyond all slots causes overflow eviction
+    let overflow_seq = 1000 + ((MAX_FLOW_REORDER_SLOTS as u32 + 1) * 100);
+    let overflow_p = make_ipv4_tcp_packet(
+        [10, 0, 0, 1],
+        [10, 0, 0, 2],
+        5001,
+        8080,
+        overflow_seq,
+        &[0x99; 50],
+    );
     let o_over = rb.process(&overflow_p, false, 100, |pkt| emitted.push(pkt.to_vec()));
     assert_eq!(o_over, ReorderOutcome::Flushed);
     assert_eq!(
@@ -939,4 +946,176 @@ fn test_reorder_buffer_deadline_accessors_and_dynamic_update() {
         def.deadline_ms(),
         yip_transport::reorder::DEFAULT_REORDER_DEADLINE_MS
     );
+}
+
+#[test]
+fn test_concurrent_multi_stream_tcp_reorder_isolation_up_to_64_slots() {
+    let mut rb = ReorderBuffer::new(100);
+    const NUM_FLOWS: usize = 4;
+    const PACKETS_PER_FLOW: usize = 64;
+    const PAYLOAD_SIZE: usize = 40;
+
+    // 1. Initialize all 4 flows with packet 0 (seq = 0)
+    for flow_idx in 0..NUM_FLOWS {
+        let sport = 20000 + flow_idx as u16;
+        let p0 = make_ipv4_tcp_packet(
+            [10, 0, 0, 1],
+            [10, 0, 0, 2],
+            sport,
+            80,
+            0,
+            &[flow_idx as u8; PAYLOAD_SIZE],
+        );
+        let mut emitted = Vec::new();
+        let outcome = rb.process(&p0, false, 100, |p| emitted.push(p.to_vec()));
+        assert_eq!(outcome, ReorderOutcome::InOrder);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(
+            &emitted[0][40..40 + PAYLOAD_SIZE],
+            &[flow_idx as u8; PAYLOAD_SIZE]
+        );
+    }
+
+    // 2. Interleave packets 2..64 in reverse order across all 4 flows.
+    // Packets seq=1 (offset PAYLOAD_SIZE) are held back as holes.
+    for seq_idx in (2..PACKETS_PER_FLOW).rev() {
+        for flow_idx in 0..NUM_FLOWS {
+            let sport = 20000 + flow_idx as u16;
+            let seq = (seq_idx * PAYLOAD_SIZE) as u32;
+            let mut payload = vec![flow_idx as u8; PAYLOAD_SIZE];
+            // Encode sequence index into payload for verification
+            payload[0] = seq_idx as u8;
+            let pkt = make_ipv4_tcp_packet([10, 0, 0, 1], [10, 0, 0, 2], sport, 80, seq, &payload);
+
+            let mut emitted = Vec::new();
+            let outcome = rb.process(&pkt, false, 101, |p| emitted.push(p.to_vec()));
+            assert_eq!(outcome, ReorderOutcome::Buffered);
+            assert!(emitted.is_empty(), "out-of-order packet must be buffered");
+        }
+    }
+
+    // 3. Fill the hole for each flow one by one by sending packet 1 (seq = PAYLOAD_SIZE)
+    for flow_idx in 0..NUM_FLOWS {
+        let sport = 20000 + flow_idx as u16;
+        let seq = PAYLOAD_SIZE as u32;
+        let mut payload = vec![flow_idx as u8; PAYLOAD_SIZE];
+        payload[0] = 1; // seq_idx = 1
+        let hole_fill =
+            make_ipv4_tcp_packet([10, 0, 0, 1], [10, 0, 0, 2], sport, 80, seq, &payload);
+
+        let mut emitted = Vec::new();
+        let outcome = rb.process(&hole_fill, false, 102, |p| emitted.push(p.to_vec()));
+        assert_eq!(outcome, ReorderOutcome::InOrder);
+        // Should drain packet 1 through 63 (63 packets total)
+        assert_eq!(
+            emitted.len(),
+            PACKETS_PER_FLOW - 1,
+            "filling hole must drain all remaining contiguous buffered packets"
+        );
+
+        // Verify strictly monotonic sequence progression and data integrity
+        for (i, drained_pkt) in emitted.iter().enumerate() {
+            let expected_seq_idx = i + 1;
+            let expected_seq = (expected_seq_idx * PAYLOAD_SIZE) as u32;
+            let actual_seq = u32::from_be_bytes(drained_pkt[24..28].try_into().unwrap());
+            assert_eq!(
+                actual_seq, expected_seq,
+                "drained packet sequence must be strictly monotonic"
+            );
+            assert_eq!(
+                drained_pkt[40], expected_seq_idx as u8,
+                "payload header must match sequence index"
+            );
+            assert_eq!(
+                &drained_pkt[41..40 + PAYLOAD_SIZE],
+                &vec![flow_idx as u8; PAYLOAD_SIZE - 1][..],
+                "payload body must belong to flow_idx with zero cross-stream crosstalk"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_dual_stack_ipv4_and_ipv6_concurrent_reordering() {
+    let mut rb = ReorderBuffer::new(50);
+
+    let v4_src = [10, 0, 0, 1];
+    let v4_dst = [10, 0, 0, 2];
+    let v6_src = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let v6_dst = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    let sport = 9999;
+    let dport = 80;
+
+    // Initialize both flows with seq 1000
+    let v4_init = make_ipv4_tcp_packet(v4_src, v4_dst, sport, dport, 1000, b"v4-init");
+    let v6_init = make_ipv6_tcp_packet(v6_src, v6_dst, sport, dport, 1000, b"v6-init");
+
+    let mut emitted = Vec::new();
+    assert_eq!(
+        rb.process(&v4_init, false, 10, |p| emitted.push(p.to_vec())),
+        ReorderOutcome::InOrder
+    );
+    assert_eq!(
+        rb.process(&v6_init, false, 10, |p| emitted.push(p.to_vec())),
+        ReorderOutcome::InOrder
+    );
+    assert_eq!(emitted.len(), 2);
+
+    // Send future packet for IPv4 (seq 1000 + 7 + 10 = 1017)
+    let v4_future = make_ipv4_tcp_packet(v4_src, v4_dst, sport, dport, 1017, b"v4-future");
+    // Send future packet for IPv6 (seq 1000 + 7 + 20 = 1027)
+    let v6_future = make_ipv6_tcp_packet(v6_src, v6_dst, sport, dport, 1027, b"v6-future");
+
+    assert_eq!(
+        rb.process(&v4_future, false, 11, |_| {}),
+        ReorderOutcome::Buffered
+    );
+    assert_eq!(
+        rb.process(&v6_future, false, 11, |_| {}),
+        ReorderOutcome::Buffered
+    );
+
+    // Fill IPv4 hole (seq 1007, 10 bytes)
+    let v4_hole = make_ipv4_tcp_packet(v4_src, v4_dst, sport, dport, 1007, b"0123456789");
+    emitted.clear();
+    let o = rb.process(&v4_hole, false, 12, |p| emitted.push(p.to_vec()));
+    assert_eq!(o, ReorderOutcome::InOrder);
+    assert_eq!(emitted.len(), 2);
+    assert_eq!(&emitted[0][40..], b"0123456789");
+    assert_eq!(&emitted[1][40..], b"v4-future");
+
+    // Fill IPv6 hole (seq 1007, 20 bytes)
+    let v6_hole = make_ipv6_tcp_packet(v6_src, v6_dst, sport, dport, 1007, b"01234567890123456789");
+    emitted.clear();
+    let o = rb.process(&v6_hole, false, 13, |p| emitted.push(p.to_vec()));
+    assert_eq!(o, ReorderOutcome::InOrder);
+    assert_eq!(emitted.len(), 2);
+    assert_eq!(&emitted[0][60..], b"01234567890123456789");
+    assert_eq!(&emitted[1][60..], b"v6-future");
+}
+
+#[test]
+fn test_reorder_buffer_high_concurrency_churn() {
+    let mut rb = ReorderBuffer::new(50);
+    // Cycle through 40 distinct flows to test tracking table capacity and eviction
+    for flow_id in 0..40 {
+        let sport = 10000 + flow_id as u16;
+        let p_init = make_ipv4_tcp_packet([10, 0, 0, 1], [10, 0, 0, 2], sport, 80, 500, b"init");
+        assert_eq!(
+            rb.process(&p_init, false, 10 + flow_id as u64, |_| {}),
+            ReorderOutcome::InOrder
+        );
+
+        let p_out_of_order =
+            make_ipv4_tcp_packet([10, 0, 0, 1], [10, 0, 0, 2], sport, 80, 504 + 10, b"later");
+        assert_eq!(
+            rb.process(&p_out_of_order, false, 10 + flow_id as u64, |_| {}),
+            ReorderOutcome::Buffered
+        );
+    }
+
+    // Now trigger timeout on all remaining buffered packets
+    let mut flushed = 0;
+    flushed += rb.poll_timeouts(200, |_| {});
+    assert!(flushed > 0, "timeouts must flush pending buffered packets");
 }

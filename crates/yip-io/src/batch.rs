@@ -244,6 +244,86 @@ impl BatchUdpSocket {
             return Ok(usize::try_from(ret).expect("sendmmsg return fits usize"));
         }
     }
+
+    /// Send a batch of up to [`BATCH_SIZE`] (32) [`crate::poll::EgressDatagram`] packets in a single `sendmmsg` syscall.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`io::Error`] if the underlying `sendmmsg` syscall fails with an unrecoverable error.
+    pub fn sendmmsg_datagrams(&mut self, dgs: &[crate::poll::EgressDatagram]) -> io::Result<usize> {
+        self.sendmmsg_datagrams_burst::<BATCH_SIZE>(dgs)
+    }
+
+    /// Send a burst of up to `N` [`crate::poll::EgressDatagram`] packets in a single `libc::sendmmsg` syscall.
+    ///
+    /// If `dgs.len() > N`, only the first `N` packets are submitted.
+    /// Returns the number of datagrams accepted by the kernel (0 if the socket would block).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`io::Error`] if the underlying `sendmmsg` syscall fails with an unrecoverable error.
+    pub fn sendmmsg_datagrams_burst<const N: usize>(
+        &mut self,
+        dgs: &[crate::poll::EgressDatagram],
+    ) -> io::Result<usize> {
+        let count = dgs.len().min(N);
+        if count == 0 {
+            return Ok(0);
+        }
+
+        let mut storages: [libc::sockaddr_storage; N] = unsafe {
+            // SAFETY: `sockaddr_storage` is plain-old-data. An all-zero value is a valid
+            // initial state that is overwritten for the first `count` items below.
+            std::mem::zeroed()
+        };
+        let mut addrlens = [0 as libc::socklen_t; N];
+        let mut iovecs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        }; N];
+        let mut msgs = [crate::empty_mmsghdr(); N];
+
+        for (i, dg) in dgs[..count].iter().enumerate() {
+            let (storage, addr_len) = crate::addr::std_to_sockaddr(dg.dst);
+            storages[i] = storage;
+            addrlens[i] = addr_len;
+            iovecs[i].iov_base = dg.bytes.as_ptr().cast_mut().cast::<libc::c_void>();
+            iovecs[i].iov_len = dg.bytes.len();
+            msgs[i].msg_hdr.msg_iov = &raw mut iovecs[i];
+            msgs[i].msg_hdr.msg_iovlen = 1;
+            msgs[i].msg_hdr.msg_name = std::ptr::from_mut(&mut storages[i]).cast::<libc::c_void>();
+            msgs[i].msg_hdr.msg_namelen = addrlens[i];
+        }
+
+        loop {
+            // SAFETY: `msgs[..count]` is fully initialized: each `msg_iov` points to `iovecs[i]`
+            // and `msg_name` points to `storages[i]` on this stack frame. The `bytes` buffers
+            // are borrowed from `dgs` and remain valid for the duration of the call.
+            // `MSG_NOSIGNAL` suppresses SIGPIPE if a peer connection is reset.
+            let ret = unsafe {
+                libc::sendmmsg(
+                    self.fd,
+                    msgs.as_mut_ptr(),
+                    u32::try_from(count).expect("count fits u32"),
+                    libc::MSG_NOSIGNAL as crate::MsgFlags,
+                )
+            };
+
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                let raw = err.raw_os_error().unwrap_or(0);
+                if raw == libc::EINTR {
+                    continue;
+                }
+                if raw == libc::EWOULDBLOCK || raw == libc::EAGAIN || raw == libc::ENOBUFS {
+                    return Ok(0);
+                }
+                return Err(err);
+            }
+
+            return Ok(usize::try_from(ret).expect("sendmmsg return fits usize"));
+        }
+    }
 }
 
 impl AsRawFd for BatchUdpSocket {
