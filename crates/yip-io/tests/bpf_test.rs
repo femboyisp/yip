@@ -220,6 +220,15 @@ fn test_bpf_filter_dual_stack_bytecode_validation() {
 }
 
 #[test]
+fn test_attach_xdp_with_fallback_invalid_interface() {
+    use yip_io::bpf::{attach_xdp_with_fallback, XDP_FLAGS_SKB_MODE};
+    let res_zero = attach_xdp_with_fallback(99999, -1, 0);
+    assert!(res_zero.is_err());
+    let res_explicit = attach_xdp_with_fallback(99999, -1, XDP_FLAGS_SKB_MODE);
+    assert!(res_explicit.is_err());
+}
+
+#[test]
 fn test_xdp_flags_constants_and_bpf_attach_with_flags() {
     assert_eq!(XDP_FLAGS_SKB_MODE, 1 << 1);
     assert_eq!(XDP_FLAGS_DRV_MODE, 1 << 2);

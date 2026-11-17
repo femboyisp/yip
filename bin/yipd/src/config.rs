@@ -207,6 +207,12 @@ pub struct Config {
     pub mtu: Option<u32>,
     /// Optional Prometheus/OpenTelemetry HTTP metrics scraping endpoint (`metrics_listen=<ip:port>`).
     pub metrics_listen: Option<SocketAddr>,
+    /// Whether AF_XDP (XSK) kernel bypass is enabled (`xdp=true|false` or `--xdp`).
+    pub xdp: bool,
+    /// Underlay network interface name for AF_XDP socket binding (`xdp_ifname=<ifname>` or `--xdp-ifname <ifname>`).
+    pub xdp_ifname: Option<String>,
+    /// Hardware/kernel driver XDP mode (`xdp_mode=auto|generic|native|offload`, defaults to `auto`).
+    pub xdp_mode: Option<String>,
 }
 
 // ── hex decode helper ─────────────────────────────────────────────────────────
@@ -559,6 +565,9 @@ impl Config {
         let mut control_socket: Option<std::path::PathBuf> = None;
         let mut mtu: Option<u32> = None;
         let mut metrics_listen: Option<SocketAddr> = None;
+        let mut xdp = false;
+        let mut xdp_ifname: Option<String> = None;
+        let mut xdp_mode: Option<String> = None;
 
         for line in text.lines() {
             let line = line.trim();
@@ -781,6 +790,28 @@ impl Config {
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                     metrics_listen = Some(addr);
                 }
+                "xdp" => {
+                    xdp = val.eq_ignore_ascii_case("true")
+                        || val == "1"
+                        || val.eq_ignore_ascii_case("yes")
+                        || val.eq_ignore_ascii_case("on");
+                }
+                "xdp_ifname" => {
+                    xdp_ifname = Some(val.to_owned());
+                }
+                "xdp_mode" => match val.to_ascii_lowercase().as_str() {
+                    "auto" | "generic" | "native" | "offload" => {
+                        xdp_mode = Some(val.to_ascii_lowercase());
+                    }
+                    other => {
+                        return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "invalid xdp_mode '{other}', expected one of: auto, generic, native, offload"
+                                ),
+                            ));
+                    }
+                },
                 // Silently ignore unknown keys for forward-compatibility. The
                 // netns config files still contain `initiate=true|false` from
                 // before Task 5 removed the field; this is intentional so
@@ -1020,6 +1051,9 @@ impl Config {
             control_socket,
             mtu,
             metrics_listen,
+            xdp,
+            xdp_ifname,
+            xdp_mode,
         })
     }
 }
@@ -1042,6 +1076,27 @@ mod tests {
         assert_eq!(c.local_private[31], 0xff);
         assert_eq!(c.peers[0].public_key[31], 0xbb);
         assert_eq!(c.shards, 1);
+        assert!(!c.xdp);
+        assert_eq!(c.xdp_ifname, None);
+        assert_eq!(c.xdp_mode, None);
+    }
+
+    #[test]
+    fn parse_config_xdp_options() {
+        let base = "device=yip0\nlisten=0.0.0.0:443\n\
+                    local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
+                    local_public=00000000000000000000000000000000000000000000000000000000000000aa\n\
+                    peer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\n";
+
+        let text_xdp = format!("{base}xdp=true\nxdp_ifname=eth0\nxdp_mode=native\n");
+        let c = Config::parse(&text_xdp).unwrap();
+        assert!(c.xdp);
+        assert_eq!(c.xdp_ifname.as_deref(), Some("eth0"));
+        assert_eq!(c.xdp_mode.as_deref(), Some("native"));
+
+        let text_bad_mode = format!("{base}xdp=true\nxdp_mode=invalid\n");
+        assert!(Config::parse(&text_bad_mode).is_err());
     }
 
     #[test]

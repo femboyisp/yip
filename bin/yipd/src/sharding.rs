@@ -149,11 +149,11 @@ pub fn shard_for_fec_control(payload: &[u8], num_shards: usize) -> Option<usize>
 
 use std::io;
 use std::net::ToSocketAddrs;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use yip_io::af_xdp::{
-    FillRing, UmemPool, UmemPoolConfig, UmemSlab, XskBindMode, XskDesc, XskSocket, UMEM_RING_SIZE,
+    FillRing, UmemPool, UmemPoolConfig, XskBindMode, XskDesc, XskSocket, UMEM_RING_SIZE,
 };
 
 use crate::config::Config;
@@ -644,8 +644,21 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
         }
     }
 
+    // Resolve underlay network interface for AF_XDP
+    let xsk_ifname_opt = config
+        .xdp_ifname
+        .clone()
+        .or_else(|| std::env::var("YIP_XDP_IFNAME").ok())
+        .or_else(|| {
+            if config.xdp {
+                yip_io::find_default_gateway_interface()
+            } else {
+                None
+            }
+        });
+
     // Allocate single shared UMEM pool partitioned into per-worker slabs for AF_XDP
-    let mut slabs: Option<Vec<UmemSlab>> = if std::env::var("YIP_XDP_IFNAME").is_ok() {
+    let (umem_pool, mut slabs) = if let Some(ref _ifname) = xsk_ifname_opt {
         let lazy = std::env::var("YIP_UMEM_LAZY")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -658,11 +671,63 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
             pre_fault: !lazy,
             lock_memory: mlock,
         };
-        UmemPool::new_slabs_with_config(pool_cfg, num_shards)
-            .ok()
-            .map(|(_, s)| s)
+        match UmemPool::new_slabs_with_config(pool_cfg, num_shards) {
+            Ok((p, s)) => (Some(p), Some(s)),
+            Err(_) => (None, None),
+        }
     } else {
-        None
+        (None, None)
+    };
+
+    // Pre-bind AF_XDP sockets and attach eBPF redirect filter if interface and UMEM are active
+    let mut xsk_sockets: Vec<XskSocket> = match (&xsk_ifname_opt, &umem_pool) {
+        (Some(ifname), Some(pool)) => {
+            let mut socks = Vec::with_capacity(num_shards);
+            for shard_id in 0..num_shards {
+                let sock = XskSocket::bind_with_mode(
+                    ifname,
+                    shard_id as u32,
+                    pool,
+                    config.xdp_mode.as_deref(),
+                )
+                .unwrap_or_else(|_| XskSocket::fallback());
+                socks.push(sock);
+            }
+
+            let has_active_xsk = socks
+                .iter()
+                .any(|s| s.mode() != XskBindMode::FallbackRecvmmsg && s.fd() >= 0);
+            if has_active_xsk {
+                let bpf_flags = match config.xdp_mode.as_deref() {
+                    Some("generic") => yip_io::bpf::XDP_FLAGS_SKB_MODE,
+                    Some("native") => yip_io::bpf::XDP_FLAGS_DRV_MODE,
+                    Some("offload") => yip_io::bpf::XDP_FLAGS_HW_MODE,
+                    _ => 0,
+                };
+                if num_shards == 1 {
+                    let _ = socks[0].attach_bpf_filter_with_flags(
+                        ifname,
+                        config.listen.port(),
+                        0,
+                        bpf_flags,
+                    );
+                } else {
+                    let queue_fds: Vec<(u32, RawFd)> = socks
+                        .iter()
+                        .enumerate()
+                        .map(|(qid, s)| (qid as u32, s.fd()))
+                        .collect();
+                    let _ = socks[0].attach_bpf_filter_multi_queue_with_flags(
+                        ifname,
+                        config.listen.port(),
+                        &queue_fds,
+                        bpf_flags,
+                    );
+                }
+            }
+            socks
+        }
+        _ => (0..num_shards).map(|_| XskSocket::fallback()).collect(),
     };
 
     let mut handles = Vec::with_capacity(num_shards);
@@ -674,6 +739,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
         let rx_channels = std::mem::take(&mut rx_matrix[shard_id]);
         let peers = all_peers.clone();
         let cfg = config.clone();
+        let mut xsk_sock = xsk_sockets.remove(0);
         let mut slab = slabs.as_mut().and_then(|s| {
             if !s.is_empty() {
                 Some(s.remove(0))
@@ -699,18 +765,6 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                 let derived_symbol_size = u16::try_from(mtu.saturating_add(30)).unwrap_or(u16::MAX);
                 manager.set_data_symbol_size(derived_symbol_size);
                 let tun_fd = tun_dev.as_raw_fd();
-
-                // Probe opportunistic AF_XDP socket with 3-tier fallback
-                let mut xsk_sock = if let Some(ref s) = slab {
-                    if let Ok(xsk_ifname) = std::env::var("YIP_XDP_IFNAME") {
-                        XskSocket::bind_opportunistic(&xsk_ifname, shard_id as u32, s.pool())
-                            .unwrap_or_else(|_| XskSocket::fallback())
-                    } else {
-                        XskSocket::fallback()
-                    }
-                } else {
-                    XskSocket::fallback()
-                };
 
                 let mut fill_ring = FillRing::new(UMEM_RING_SIZE);
                 if let Some(ref mut s) = slab {

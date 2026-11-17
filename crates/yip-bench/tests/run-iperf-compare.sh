@@ -535,6 +535,9 @@ device=${TUN_DEV}
 initiate=false
 shards=${YIP_SHARDS}
 mtu=${YIP_MTU}
+${YIP_XDP:+xdp=$YIP_XDP}
+${YIP_XDP:+xdp_ifname=${YIP_XDP_IFNAME:-$VYA}}
+${YIP_XDP_MODE:+xdp_mode=$YIP_XDP_MODE}
 EOF
 cat > "$CFG_B" <<EOF
 local_private=${PRIV_B}
@@ -546,6 +549,9 @@ device=${TUN_DEV}
 initiate=true
 shards=${YIP_SHARDS}
 mtu=${YIP_MTU}
+${YIP_XDP:+xdp=$YIP_XDP}
+${YIP_XDP:+xdp_ifname=${YIP_XDP_IFNAME:-$VYB}}
+${YIP_XDP_MODE:+xdp_mode=$YIP_XDP_MODE}
 EOF
 
 echo "[yip] creating namespaces and veth pair"

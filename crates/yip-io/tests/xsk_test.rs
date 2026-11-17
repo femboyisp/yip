@@ -170,6 +170,72 @@ fn test_xsk_socket_fallback_mode() {
     // Rings should be accessible and operational
     assert_eq!(sock.rx_ring_mut().capacity(), UMEM_RING_SIZE);
     assert_eq!(sock.tx_ring_mut().capacity(), UMEM_RING_SIZE);
+    assert_eq!(sock.fill_ring_mut().capacity(), UMEM_RING_SIZE);
+    assert_eq!(sock.comp_ring_mut().capacity(), UMEM_RING_SIZE);
+    assert!(sock.rx_ring().is_empty());
+    assert!(sock.tx_ring().is_empty());
+    assert!(sock.fill_ring().is_empty());
+    assert!(sock.comp_ring().is_empty());
+}
+
+#[test]
+fn test_parse_xsk_mode_flags() {
+    use yip_io::af_xdp::{parse_xsk_mode_flags, XskModeFlags};
+
+    assert_eq!(
+        parse_xsk_mode_flags(Some("generic")),
+        XskModeFlags {
+            try_zero_copy: false,
+            try_copy: true,
+        }
+    );
+    assert_eq!(
+        parse_xsk_mode_flags(Some("native")),
+        XskModeFlags {
+            try_zero_copy: true,
+            try_copy: false,
+        }
+    );
+    assert_eq!(
+        parse_xsk_mode_flags(Some("offload")),
+        XskModeFlags {
+            try_zero_copy: true,
+            try_copy: false,
+        }
+    );
+    assert_eq!(
+        parse_xsk_mode_flags(Some("auto")),
+        XskModeFlags {
+            try_zero_copy: true,
+            try_copy: true,
+        }
+    );
+    assert_eq!(
+        parse_xsk_mode_flags(None),
+        XskModeFlags {
+            try_zero_copy: true,
+            try_copy: true,
+        }
+    );
+}
+
+#[test]
+fn test_bind_with_mode_variants() {
+    let umem = UmemPool::new(16, UMEM_CHUNK_SIZE).expect("allocate UMEM pool");
+    let modes = [
+        Some("generic"),
+        Some("native"),
+        Some("auto"),
+        Some("offload"),
+        None,
+    ];
+    for m in modes {
+        let res = XskSocket::bind_with_mode("lo", 0, &umem, m);
+        assert!(
+            res.is_ok(),
+            "bind_with_mode must succeed or fallback gracefully"
+        );
+    }
 }
 
 #[test]
