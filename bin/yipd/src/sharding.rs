@@ -855,6 +855,8 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                 let mut spsc_batch = Vec::new();
                 let mut tun_batch = Vec::new();
                 let mut drained_jitter = Vec::with_capacity(32);
+                let mut egress_batch = Vec::with_capacity(32);
+                let mut ack_compressor = yip_io::ack_coalesce::AckCompressor::new();
 
                 loop {
                     if SHUTDOWN.load(Ordering::Relaxed) {
@@ -1051,102 +1053,48 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
 
                     // 2. Drain local TUN queue fd
                     if ready.tun {
-                        loop {
-                            match yip_io::epoll::read_fd(tun_fd, &mut tun_buf) {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    if n > vnet_len {
-                                        let dispatch_pkt = |pkt: &[u8],
-                                                            mgr: &mut crate::peer_manager::PeerManager,
-                                                            tx_chans: &[Option<
-                                            yip_io::spsc::SpscProducer<OutboundPacket, 2048>,
-                                        >]| {
-                                            if !mgr.is_tun_target_established(pkt) {
-                                                if shard_id == 0 {
-                                                    let egress = mgr.on_tun(pkt, cached_now_ms);
-                                                    for dg in egress {
-                                                        let _ = sock.send_to(&dg.bytes, dg.dst);
-                                                    }
-                                                    for epoch in mgr.drain_new_epochs() {
-                                                        for k in 1..num_shards {
-                                                            if let Some(Some(ref tx)) = tx_chans.get(k) {
-                                                                let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
-                                                            }
-                                                        }
-                                                    }
-                                                } else if let Some(Some(ref tx)) = tx_chans.first() {
-                                                    let _ = tx.push(ShardMsg::Packet(pkt.to_vec()));
-                                                }
-                                                return;
-                                            }
-
-                                            let egress = mgr.on_tun(pkt, cached_now_ms);
-                                            for dg in egress {
-                                                let is_data = dg.bytes.first()
-                                                    == Some(&(crate::handshake::PacketType::Data as u8));
-                                                let send_sock = if is_data {
-                                                    select_egress_socket(
-                                                        &sock,
-                                                        &egress_pool,
-                                                        pkt,
-                                                        is_tap,
-                                                        dg.dst,
-                                                    )
-                                                } else {
-                                                    &sock
-                                                };
-                                                let _ = send_sock.send_to(&dg.bytes, dg.dst);
-                                            }
-                                        };
-
-                                        if vnet_len > 0
-                                            && yip_io::tun_offload::split_gro(
-                                                &tun_buf[..n],
-                                                &mut split_out,
-                                                &mut split_offs,
-                                            )
-                                        {
-                                            for &(s, l) in &split_offs {
-                                                packets_this_iter =
-                                                    packets_this_iter.wrapping_add(1);
-                                                dispatch_pkt(
-                                                    &split_out[s..s + l],
-                                                    &mut manager,
-                                                    &tx_channels,
-                                                );
-                                            }
+                        let dispatch_pkt =
+                            |pkt: &[u8],
+                             mgr: &mut crate::peer_manager::PeerManager,
+                             tx_chans: &[Option<
+                                yip_io::spsc::SpscProducer<OutboundPacket, 2048>,
+                            >],
+                             egress_buf: &mut Vec<yip_io::poll::EgressDatagram>,
+                             bsock: &mut yip_io::batch::BatchUdpSocket| {
+                                if !mgr.is_tun_target_established(pkt) {
+                                    if shard_id == 0 {
+                                        let egress = mgr.on_tun(pkt, cached_now_ms);
+                                        if egress_pool.is_empty() {
+                                            let _ = bsock.sendmmsg_datagrams(egress);
                                         } else {
-                                            packets_this_iter =
-                                                packets_this_iter.wrapping_add(1);
-                                            dispatch_pkt(
-                                                &tun_buf[vnet_len..n],
-                                                &mut manager,
-                                                &tx_channels,
-                                            );
+                                            for dg in egress {
+                                                let _ = sock.send_to(&dg.bytes, dg.dst);
+                                            }
                                         }
+                                        for epoch in mgr.drain_new_epochs() {
+                                            for k in 1..num_shards {
+                                                if let Some(Some(ref tx)) = tx_chans.get(k) {
+                                                    let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
+                                                }
+                                            }
+                                        }
+                                    } else if let Some(Some(ref tx)) = tx_chans.first() {
+                                        let _ = tx.push(ShardMsg::Packet(pkt.to_vec()));
                                     }
+                                    return;
                                 }
-                                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                                Err(e) => {
-                                    eprintln!("yipd-shard-{shard_id}: tun read error: {e}");
-                                    break;
-                                }
-                            }
-                        }
-                    }
 
-                    // 3. Drain incoming SPSC inboxes
-                    for rx in &rx_channels {
-                        spsc_batch.clear();
-                        rx.drain_batch(&mut spsc_batch, 64);
-                        packets_this_iter = packets_this_iter.wrapping_add(spsc_batch.len() as u64);
-                        for msg in &spsc_batch {
-                            match msg {
-                                ShardMsg::Packet(pkt) => {
-                                    let egress = manager.on_tun(pkt, cached_now_ms);
+                                if egress_pool.is_empty() {
+                                    mgr.on_tun_into(pkt, cached_now_ms, egress_buf);
+                                    if egress_buf.len() >= yip_io::batch::BATCH_SIZE {
+                                        let _ = bsock.sendmmsg_datagrams(egress_buf);
+                                        egress_buf.clear();
+                                    }
+                                } else {
+                                    let egress = mgr.on_tun(pkt, cached_now_ms);
                                     for dg in egress {
-                                        let is_data = dg.bytes.first() == Some(&(crate::handshake::PacketType::Data as u8));
+                                        let is_data = dg.bytes.first()
+                                            == Some(&(crate::handshake::PacketType::Data as u8));
                                         let send_sock = if is_data {
                                             select_egress_socket(
                                                 &sock,
@@ -1159,6 +1107,123 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                             &sock
                                         };
                                         let _ = send_sock.send_to(&dg.bytes, dg.dst);
+                                    }
+                                }
+                            };
+
+                        loop {
+                            match yip_io::epoll::read_fd(tun_fd, &mut tun_buf) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    if n > vnet_len {
+                                        if vnet_len > 0
+                                            && yip_io::tun_offload::split_gro(
+                                                &tun_buf[..n],
+                                                &mut split_out,
+                                                &mut split_offs,
+                                            )
+                                        {
+                                            for &(s, l) in &split_offs {
+                                                packets_this_iter =
+                                                    packets_this_iter.wrapping_add(1);
+                                                ack_compressor.push(&split_out[s..s + l], |p| {
+                                                    dispatch_pkt(
+                                                        p,
+                                                        &mut manager,
+                                                        &tx_channels,
+                                                        &mut egress_batch,
+                                                        &mut batch_sock,
+                                                    );
+                                                });
+                                            }
+                                        } else {
+                                            packets_this_iter =
+                                                packets_this_iter.wrapping_add(1);
+                                            ack_compressor.push(&tun_buf[vnet_len..n], |p| {
+                                                dispatch_pkt(
+                                                    p,
+                                                    &mut manager,
+                                                    &tx_channels,
+                                                    &mut egress_batch,
+                                                    &mut batch_sock,
+                                                );
+                                            });
+                                        }
+                                    }
+                                }
+                                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                                Err(e) => {
+                                    eprintln!("yipd-shard-{shard_id}: tun read error: {e}");
+                                    break;
+                                }
+                            }
+                        }
+
+                        ack_compressor.flush(|p| {
+                            dispatch_pkt(
+                                p,
+                                &mut manager,
+                                &tx_channels,
+                                &mut egress_batch,
+                                &mut batch_sock,
+                            );
+                        });
+                        if !egress_batch.is_empty() {
+                            let _ = batch_sock.sendmmsg_datagrams(&egress_batch);
+                            egress_batch.clear();
+                        }
+                    }
+
+                    // 3. Drain incoming SPSC inboxes
+                    for rx in &rx_channels {
+                        spsc_batch.clear();
+                        rx.drain_batch(&mut spsc_batch, 64);
+                        packets_this_iter = packets_this_iter.wrapping_add(spsc_batch.len() as u64);
+                        for msg in &spsc_batch {
+                            match msg {
+                                ShardMsg::Packet(pkt) => {
+                                    if !manager.is_tun_target_established(pkt) {
+                                        if shard_id == 0 {
+                                            let egress = manager.on_tun(pkt, cached_now_ms);
+                                            if egress_pool.is_empty() {
+                                                let _ = batch_sock.sendmmsg_datagrams(egress);
+                                            } else {
+                                                for dg in egress {
+                                                    let _ = sock.send_to(&dg.bytes, dg.dst);
+                                                }
+                                            }
+                                            for epoch in manager.drain_new_epochs() {
+                                                for k in 1..num_shards {
+                                                    if let Some(Some(ref tx)) = tx_channels.get(k) {
+                                                        let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else if egress_pool.is_empty() {
+                                        manager.on_tun_into(pkt, cached_now_ms, &mut egress_batch);
+                                        if egress_batch.len() >= yip_io::batch::BATCH_SIZE {
+                                            let _ = batch_sock.sendmmsg_datagrams(&egress_batch);
+                                            egress_batch.clear();
+                                        }
+                                    } else {
+                                        let egress = manager.on_tun(pkt, cached_now_ms);
+                                        for dg in egress {
+                                            let is_data = dg.bytes.first() == Some(&(crate::handshake::PacketType::Data as u8));
+                                            let send_sock = if is_data {
+                                                select_egress_socket(
+                                                    &sock,
+                                                    &egress_pool,
+                                                    pkt,
+                                                    is_tap,
+                                                    dg.dst,
+                                                )
+                                            } else {
+                                                &sock
+                                            };
+                                            let _ = send_sock.send_to(&dg.bytes, dg.dst);
+                                        }
                                     }
                                     if shard_id == 0 {
                                         for epoch in manager.drain_new_epochs() {
@@ -1230,6 +1295,10 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                     }
                                 }
                             }
+                        }
+                        if !egress_batch.is_empty() {
+                            let _ = batch_sock.sendmmsg_datagrams(&egress_batch);
+                            egress_batch.clear();
                         }
                         if vnet_len > 0 {
                             if let Some(frame) = coalescer.flush() {
