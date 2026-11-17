@@ -239,9 +239,16 @@ fn test_reorder_slot_overflow_flushes() {
     // All MAX_FLOW_REORDER_SLOTS slots are now filled
     assert!(emitted.is_empty());
 
-    // 17th out-of-order packet causes overflow eviction
-    let overflow_p =
-        make_ipv4_tcp_packet([10, 0, 0, 1], [10, 0, 0, 2], 5001, 8080, 5000, &[0x99; 50]);
+    // Out-of-order packet in the future beyond all slots causes overflow eviction
+    let overflow_seq = 1000 + ((MAX_FLOW_REORDER_SLOTS as u32 + 1) * 100);
+    let overflow_p = make_ipv4_tcp_packet(
+        [10, 0, 0, 1],
+        [10, 0, 0, 2],
+        5001,
+        8080,
+        overflow_seq,
+        &[0x99; 50],
+    );
     let o_over = rb.process(&overflow_p, false, 100, |pkt| emitted.push(pkt.to_vec()));
     assert_eq!(o_over, ReorderOutcome::Flushed);
     assert_eq!(

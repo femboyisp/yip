@@ -9,7 +9,7 @@
 use crate::classify::FlowKey;
 
 /// Maximum number of out-of-order slots buffered per flow.
-pub const MAX_FLOW_REORDER_SLOTS: usize = 16;
+pub const MAX_FLOW_REORDER_SLOTS: usize = 64;
 
 /// Maximum number of concurrent flows actively tracked in the reorder table.
 pub const MAX_CONCURRENT_TRACKED_FLOWS: usize = 64;
