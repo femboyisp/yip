@@ -22,6 +22,7 @@ mod quic;
 mod relay_client;
 mod rendezvous;
 pub mod sharding;
+pub mod ticket;
 mod tls;
 mod tunnel;
 mod wire_glue;
@@ -51,6 +52,7 @@ fn print_daemon_usage() {
     println!("Commands:");
     println!("  status       Display daemon status and summary");
     println!("  peers        List connected peers and statistics");
+    println!("  ticket       Generate or inspect network invitation tickets and QR codes");
     println!("  crypto       Inspect active cryptographic session states or trigger rekeying");
     println!("  metrics      Display runtime metrics and telemetry");
     println!("  top          Real-time ANSI telemetry dashboard");
@@ -146,7 +148,26 @@ fn print_cli_usage(subcmd: &str) {
             println!();
             println!("Options:");
             println!("  -c, --control <SOCKET>  Path to yipd UNIX control socket");
+            println!("      --alias <ALIAS>     Human-readable nickname/alias for peer");
             println!("  -h, --help              Print help");
+        }
+        "ticket" => {
+            println!("Usage: yipctl ticket <create|show> [ARGS] [OPTIONS]");
+            println!();
+            println!("Generate or inspect network onboarding tickets and terminal QR codes.");
+            println!();
+            println!("Commands:");
+            println!("  create [--name <NAME>] [--route-mode <MODE>] [--endpoint <EP>]  Generate new ticket");
+            println!("  show   <TICKET_OR_URI>                                          Display existing ticket");
+            println!();
+            println!("Options:");
+            println!("  -c, --control <SOCKET>    Path to yipd UNIX control socket");
+            println!("      --name <NAME>         Network human-readable name");
+            println!("  -m, --route-mode <MODE>   Routing mode (MeshOnly, ExitNode, SplitTunnel)");
+            println!("  -e, --endpoint <ADDR>     External endpoint (e.g. 203.0.113.1:51820)");
+            println!("      --no-qr               Omit rendering terminal QR code");
+            println!("      --json                Output raw JSON");
+            println!("  -h, --help                Print help");
         }
         "fec" => {
             println!("Usage: yipctl fec <status|set> [OPTIONS]");
@@ -280,6 +301,7 @@ fn print_cli_usage(subcmd: &str) {
             println!("  ping      Probe round-trip latency to a peer");
             println!("  trace     Trace multi-hop path and segment latencies across mesh");
             println!("  peer      Dynamically add or remove peers");
+            println!("  ticket    Generate or inspect network onboarding tickets and QR codes");
             println!("  fec       Query or configure dynamic Reed-Solomon FEC");
             println!("  daita     Query or configure dynamic DAITA traffic defense");
             println!("  cert      Display certificate status or trigger manual renewal");
@@ -313,6 +335,10 @@ fn run_client_subcommand(
     let mut apps: Option<Vec<String>> = None;
     let mut ping_count = 4u32;
     let mut ping_timeout = 2000u64;
+    let mut alias: Option<String> = None;
+    let mut ticket_name: Option<String> = None;
+    let mut ticket_endpoint: Option<String> = None;
+    let mut no_qr = false;
     let mut positional: Vec<String> = Vec::new();
 
     while let Some(arg) = args.next() {
@@ -549,6 +575,45 @@ fn run_client_subcommand(
                 })?;
                 ping_timeout = t;
             }
+            "--alias" => {
+                let a = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--alias requires a peer nickname/alias",
+                    )
+                })?;
+                alias = Some(a);
+            }
+            "--name" => {
+                let n = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--name requires a network name",
+                    )
+                })?;
+                ticket_name = Some(n);
+            }
+            "--route-mode" => {
+                let m = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--route-mode requires a mode (MeshOnly, ExitNode, SplitTunnel)",
+                    )
+                })?;
+                mode = Some(m);
+            }
+            "--endpoint" | "-e" => {
+                let ep = args.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--endpoint requires an address (e.g. 203.0.113.1:51820)",
+                    )
+                })?;
+                ticket_endpoint = Some(ep);
+            }
+            "--no-qr" => {
+                no_qr = true;
+            }
             "--help" | "-h" => {
                 print_cli_usage(subcmd);
                 return Ok(());
@@ -597,7 +662,8 @@ fn run_client_subcommand(
                     let pk = &positional[1];
                     let ep = positional.get(2).map(|s| s.as_str());
                     let tr = positional.get(3).map(|s| s.as_str());
-                    control::run_cli_peer_add(&socket, pk, ep, tr).map_err(std::io::Error::other)
+                    control::run_cli_peer_add(&socket, pk, ep, tr, alias.as_deref())
+                        .map_err(std::io::Error::other)
                 }
                 "rm" => {
                     if positional.len() < 2 {
@@ -647,6 +713,41 @@ fn run_client_subcommand(
                     Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         "unknown peer action",
+                    ))
+                }
+            }
+        }
+        "ticket" => {
+            if positional.is_empty() {
+                print_cli_usage("ticket");
+                return Ok(());
+            }
+            match positional[0].as_str() {
+                "create" => control::run_cli_ticket_create(
+                    &socket,
+                    ticket_name,
+                    mode,
+                    ticket_endpoint,
+                    no_qr,
+                    json,
+                )
+                .map_err(std::io::Error::other),
+                "show" => {
+                    if positional.len() < 2 {
+                        eprintln!("Usage: yipctl ticket show <TICKET_OR_URI> [OPTIONS]");
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "missing ticket or URI payload",
+                        ));
+                    }
+                    let raw = &positional[1];
+                    control::run_cli_ticket_show(raw, no_qr, json).map_err(std::io::Error::other)
+                }
+                other => {
+                    eprintln!("Unknown ticket action: {other}");
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "unknown ticket action (expected 'create' or 'show')",
                     ))
                 }
             }

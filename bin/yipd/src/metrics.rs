@@ -935,6 +935,7 @@ mod tests {
             rtt_ms: Some(15),
             fec_ratio_pct: 5,
             cert_status: "CA Valid".into(),
+            alias: None,
         };
 
         let snap = registry.snapshot(std::slice::from_ref(&peer));
@@ -1114,6 +1115,7 @@ mod tests {
             rtt_ms: Some(25),
             fec_ratio_pct: 10,
             cert_status: "CA Valid".into(),
+            alias: None,
         };
 
         let server = MetricsHttpServer::start(

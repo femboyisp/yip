@@ -6,6 +6,15 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **Peer Aliases and Ergonomic Control Resolution (`bin/yipd`, #197).**
+  - Added optional `alias: Option<String>` to `PeerConfig`, configuration file parser (`alias = "..."` within `[peer]` blocks), `ControlCmd::AddPeer` RPC, and `PeerStats`.
+  - Added case-insensitive peer resolution by human-readable alias in `PeerManager` (`find_peer_by_alias`, `peer_pubkey`, and fallback in `find_peer_index_by_id`), allowing CLI commands (`peer remove`, `peer set-transport`, `ping`, `trace`, `crypto`) to accept friendly peer aliases as drop-in alternatives to full 64-hex public keys or IPv6 node addresses.
+  - Updated `yipctl peers` and `yipctl top` dashboard displays to render peer aliases alongside node overlay addresses when configured.
+- **Network Invitation Tickets and Terminal QR Code Rendering (`bin/yipd`, #198).**
+  - Implemented `NetworkTicket` schema in `bin/yipd/src/ticket.rs` compatible with cross-platform desktop/mobile clients (`yip-client`), supporting Base64 serialization, JSON payloads, and `yip://join?ticket={b64}` invitation URIs.
+  - Added compact terminal Unicode QR code generation using `qrcode` crate with `Dense1x2` half-block glyph rendering.
+  - Added `ControlCmd::CreateTicket` RPC command and responses (`ControlResponse::Ticket`) over the UNIX domain control socket `/run/yipd/yip.sock`.
+  - Added CLI subcommands `yip ticket create [--name <NAME>] [--route-mode <MODE>] [--endpoint <ADDR>] [--no-qr] [--json]` and `yip ticket show <TICKET_OR_URI> [--no-qr] [--json]`.
 - **Control Socket Status RPC Metadata Exposure (`bin/yipd`, #194).**
   - Exposed local node public key (`public_key`), active UDP listen port (`listen_port`), and mesh network ID (`network_id`) in `ControlResponse::Status`.
   - Added CLI status printout formatting and JSON serialization for node public keys, listen ports, and network IDs, enabling unprivileged desktop clients and orchestration tools to query local node identity without reading secret configuration files.

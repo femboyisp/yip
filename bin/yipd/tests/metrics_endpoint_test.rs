@@ -19,6 +19,7 @@ fn make_test_peer_manager() -> PeerManager {
     let peer = PeerConfig {
         public_key: [1u8; 32],
         endpoint: Some("10.0.0.1:1000".parse().unwrap()),
+        alias: None,
     };
     PeerManager::new(
         kp.private,
@@ -664,6 +665,7 @@ fn test_metrics_registry_cached_peer_stats_fallback_in_http_scraper() {
         rtt_ms: Some(15),
         fec_ratio_pct: 3,
         cert_status: "CA Valid".to_string(),
+        alias: None,
     };
     registry.update_peer_stats(vec![peer]);
 

@@ -613,6 +613,7 @@ mod tests {
         let cfg_peer = PeerConfig {
             public_key: peer_kp.public,
             endpoint: None,
+            alias: None,
         };
         let (mut pm, _sent) = pm_with_mock_rdv(&local, &[cfg_peer]);
 
@@ -681,6 +682,7 @@ mod tests {
         let peer = PeerConfig {
             public_key: peer_kp.public,
             endpoint: Some(endpoint),
+            alias: None,
         };
         let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
 
@@ -746,6 +748,7 @@ mod tests {
         let peer = PeerConfig {
             public_key: peer_kp.public,
             endpoint: Some(endpoint),
+            alias: None,
         };
         let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
 
@@ -1191,6 +1194,7 @@ mod tests {
         let peer = PeerConfig {
             public_key: peer_kp.public,
             endpoint: None,
+            alias: None,
         };
         let mut pm = PeerManager::new(
             local.private,
@@ -1258,6 +1262,7 @@ mod tests {
         let cfg_peer = PeerConfig {
             public_key: peer.public,
             endpoint: None,
+            alias: None,
         };
         let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let rdv: Box<dyn Rendezvous> = Box::new(MockRdv {
@@ -1328,6 +1333,7 @@ mod tests {
         let peer = PeerConfig {
             public_key: peer_kp.public,
             endpoint: None,
+            alias: None,
         };
         let membership = membership_trusting_ca_via_roots(&ca, local.public);
         let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[peer], membership);
@@ -1375,6 +1381,7 @@ mod tests {
         let peer = PeerConfig {
             public_key: peer_kp.public,
             endpoint: None,
+            alias: None,
         };
         let membership = membership_trusting_ca_via_roots(&ca, local.public);
         let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[peer], membership);
@@ -1539,6 +1546,7 @@ mod tests {
         let cfg_peer = PeerConfig {
             public_key: peer_kp.public,
             endpoint: None,
+            alias: None,
         };
         let (mut pm, _sent) = pm_with_mock_rdv(&local, &[cfg_peer]);
 
@@ -1573,6 +1581,7 @@ mod tests {
         let cfg_peer = PeerConfig {
             public_key: peer_kp.public,
             endpoint: None,
+            alias: None,
         };
         let mem = membership_for(&ca, local.public);
         let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[cfg_peer], mem);
@@ -1649,6 +1658,7 @@ mod tests {
         let cfg_peer = PeerConfig {
             public_key: peer_kp.public,
             endpoint: None,
+            alias: None,
         };
         let mem = membership_for(&ca, local.public);
         let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[cfg_peer], mem);
@@ -1670,6 +1680,7 @@ mod tests {
         let cfg_peer = PeerConfig {
             public_key: peer_kp.public,
             endpoint: None,
+            alias: None,
         };
         let mem = membership_for(&ca, local.public);
         let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[cfg_peer], mem);

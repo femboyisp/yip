@@ -20,6 +20,7 @@ mod quic;
 mod relay_client;
 mod rendezvous;
 pub mod sharding;
+pub mod ticket;
 mod tls;
 mod tunnel;
 pub mod wire_glue;

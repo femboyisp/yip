@@ -95,6 +95,28 @@ pub struct PeerConfig {
     /// only by public key (reachable only via rendezvous/relay once Task 6
     /// wires that path in).
     pub endpoint: Option<SocketAddr>,
+    /// Optional human-readable nickname or alias for this peer.
+    pub alias: Option<String>,
+}
+
+impl PeerConfig {
+    /// Create a peer configuration without an alias.
+    pub fn new(public_key: [u8; 32], endpoint: Option<SocketAddr>) -> Self {
+        Self {
+            public_key,
+            endpoint,
+            alias: None,
+        }
+    }
+
+    /// Attach a human-readable alias to this peer configuration.
+    pub fn with_alias(mut self, alias: impl Into<String>) -> Self {
+        let a = alias.into().trim().to_string();
+        if !a.is_empty() {
+            self.alias = Some(a);
+        }
+        self
+    }
 }
 
 /// Configuration for packet length quantization (DAITA) and cover traffic defenses.
@@ -503,6 +525,7 @@ fn missing(key: &str) -> io::Error {
 fn flush_peer_block(
     cur_pk: Option<[u8; 32]>,
     cur_ep: Option<SocketAddr>,
+    cur_alias: Option<String>,
     peers: &mut Vec<PeerConfig>,
 ) -> io::Result<()> {
     match cur_pk {
@@ -512,11 +535,12 @@ fn flush_peer_block(
         Some(pk) => peers.push(PeerConfig {
             public_key: pk,
             endpoint: cur_ep,
+            alias: cur_alias,
         }),
-        None if cur_ep.is_some() => {
+        None if cur_ep.is_some() || cur_alias.is_some() => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "peer block has an endpoint but no public_key".to_string(),
+                "peer block has an endpoint or alias but no public_key".to_string(),
             ));
         }
         None => {}
@@ -539,6 +563,7 @@ impl Config {
         let mut peers: Vec<PeerConfig> = Vec::new();
         let mut cur_pk: Option<[u8; 32]> = None;
         let mut cur_ep: Option<SocketAddr> = None;
+        let mut cur_alias: Option<String> = None;
         let mut legacy_peer_public: Option<[u8; 32]> = None;
         let mut legacy_peer_endpoint: Option<SocketAddr> = None;
         let mut listen: Option<SocketAddr> = None;
@@ -577,9 +602,10 @@ impl Config {
 
             // Check for [peer] block header
             if line == "[peer]" {
-                flush_peer_block(cur_pk, cur_ep, &mut peers)?;
+                flush_peer_block(cur_pk, cur_ep, cur_alias, &mut peers)?;
                 cur_pk = None;
                 cur_ep = None;
+                cur_alias = None;
                 continue;
             }
 
@@ -595,6 +621,12 @@ impl Config {
                 "local_private" => local_private = Some(hex_to_32(val)?),
                 "local_public" => local_public = Some(hex_to_32(val)?),
                 "public_key" => cur_pk = Some(hex_to_32(val)?),
+                "alias" => {
+                    let clean = val.trim_matches('"').trim();
+                    if !clean.is_empty() {
+                        cur_alias = Some(clean.to_string());
+                    }
+                }
                 "endpoint" => {
                     cur_ep =
                         Some(val.parse::<SocketAddr>().map_err(|e| {
@@ -823,7 +855,7 @@ impl Config {
         }
 
         // Flush any trailing peer block
-        flush_peer_block(cur_pk, cur_ep, &mut peers)?;
+        flush_peer_block(cur_pk, cur_ep, cur_alias, &mut peers)?;
 
         // If no [peer] blocks, try legacy single-peer format
         if peers.is_empty() {
@@ -831,6 +863,7 @@ impl Config {
                 peers.push(PeerConfig {
                     public_key: pk,
                     endpoint: Some(ep),
+                    alias: None,
                 });
             }
         }
@@ -1359,6 +1392,41 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
         assert_eq!(cfg.peers.len(), 2);
         assert_eq!(cfg.peers[0].endpoint, Some("10.0.0.2:443".parse().unwrap()));
         assert_eq!(cfg.peers[1].public_key[31], 0xb2);
+    }
+
+    #[test]
+    fn parses_peers_with_optional_aliases() {
+        let text = "local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
+                    local_public=000000000000000000000000000000000000000000000000000000000000aa01\n\
+                    listen=0.0.0.0:443\ndevice=yip0\n\
+                    [peer]\npublic_key=00000000000000000000000000000000000000000000000000000000000000b1\nendpoint=10.0.0.2:443\nalias=home-gateway\n\
+                    [peer]\npublic_key=00000000000000000000000000000000000000000000000000000000000000b2\nalias=\"alice-laptop\"\n\
+                    [peer]\npublic_key=00000000000000000000000000000000000000000000000000000000000000b3\n";
+        let cfg = Config::parse(text).expect("parses");
+        assert_eq!(cfg.peers.len(), 3);
+        assert_eq!(cfg.peers[0].alias.as_deref(), Some("home-gateway"));
+        assert_eq!(cfg.peers[1].alias.as_deref(), Some("alice-laptop"));
+        assert_eq!(cfg.peers[2].alias, None);
+    }
+
+    #[test]
+    fn test_peer_config_constructors_and_alias() {
+        let p = PeerConfig::new([1u8; 32], None);
+        assert_eq!(p.alias, None);
+        let p2 = p.with_alias("   ");
+        assert_eq!(p2.alias, None);
+        let p3 = PeerConfig::new([1u8; 32], None).with_alias("gateway");
+        assert_eq!(p3.alias.as_deref(), Some("gateway"));
+    }
+
+    #[test]
+    fn test_peer_block_with_alias_no_public_key_is_error() {
+        let text =
+            "local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
+                    local_public=000000000000000000000000000000000000000000000000000000000000aa01\n\
+                    listen=0.0.0.0:443\ndevice=yip0\n\
+                    [peer]\nalias=no-pubkey-peer\n";
+        assert!(Config::parse(text).is_err());
     }
 
     #[test]

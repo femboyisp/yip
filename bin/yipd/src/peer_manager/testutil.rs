@@ -16,6 +16,7 @@ pub(super) fn peer_cfg(tag_byte: u8, endpoint: &str) -> PeerConfig {
     PeerConfig {
         public_key: [tag_byte; 32],
         endpoint: Some(endpoint.parse().unwrap()),
+        alias: None,
     }
 }
 
@@ -186,6 +187,7 @@ pub(super) fn pm_with_established_peer(
     let cfg = PeerConfig {
         public_key: peer_pubkey,
         endpoint: Some(ep),
+        alias: None,
     };
     let mut pm = PeerManager::new(
         [7u8; 32],
@@ -254,10 +256,12 @@ pub(crate) fn established_pm_pair(
     let cfg_b = PeerConfig {
         public_key: kp_b.public,
         endpoint: Some(ep_b),
+        alias: None,
     };
     let cfg_a = PeerConfig {
         public_key: kp_a.public,
         endpoint: Some(ep_a),
+        alias: None,
     };
     let mut pm_a = PeerManager::new(
         kp_a.private,
@@ -317,10 +321,12 @@ pub(super) fn established_pm_pair_with_obf(
     let cfg_b = PeerConfig {
         public_key: kp_b.public,
         endpoint: Some(ep_b),
+        alias: None,
     };
     let cfg_a = PeerConfig {
         public_key: kp_a.public,
         endpoint: Some(ep_a),
+        alias: None,
     };
     let mut pm_a = PeerManager::new(
         kp_a.private,
@@ -622,6 +628,7 @@ pub(super) fn responder_established_for_initiator(
     let cfg_a = PeerConfig {
         public_key: kp_a.public,
         endpoint: None,
+        alias: None,
     };
     let (mut pm_r, _sent) = pm_with_mock_rdv(&kp_r, &[cfg_a]);
 
@@ -665,6 +672,7 @@ pub(super) fn responder_established_direct_for_initiator(
     let cfg_a = PeerConfig {
         public_key: kp_a.public,
         endpoint: Some(ep_a),
+        alias: None,
     };
     let (mut pm_r, _sent) = pm_with_mock_rdv(&kp_r, &[cfg_a]);
 
@@ -717,6 +725,7 @@ pub(super) fn established_relay_pm(
     let peer = PeerConfig {
         public_key: peer_kp.public,
         endpoint: None,
+        alias: None,
     };
     let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
     pm.rekey_interval_ms = rekey_interval_ms;
@@ -885,6 +894,7 @@ pub(super) fn pm_mesh_established_peer(
     let cfg_peer = PeerConfig {
         public_key: peer.public,
         endpoint: Some(peer_ep),
+        alias: None,
     };
     let mut pm = PeerManager::new(
         local.private,
