@@ -75,6 +75,7 @@ fn test_control_response_config_and_reload_serde() {
     let resp_reload = ControlResponse::Reload {
         ok: true,
         message: "configuration reloaded successfully".to_string(),
+        reloaded: true,
     };
     let json = serde_json::to_string(&resp_reload).unwrap();
     let deserialized: ControlResponse = serde_json::from_str(&json).unwrap();
@@ -384,6 +385,10 @@ fn test_all_existing_control_response_variants_round_trip() {
             uri: "yip://ticket-xyz".to_string(),
             qr_terminal: "████".to_string(),
         },
+        ControlResponse::Ack {
+            ok: true,
+            message: "peer added".to_string(),
+        },
         ControlResponse::Err {
             ok: false,
             error: "bad request".to_string(),
@@ -395,6 +400,44 @@ fn test_all_existing_control_response_variants_round_trip() {
         let deserialized: ControlResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, resp);
     }
+}
+
+#[test]
+fn test_control_response_reload_and_ack_no_collision() {
+    let resp_reload = ControlResponse::Reload {
+        ok: true,
+        message: "configuration reloaded".to_string(),
+        reloaded: true,
+    };
+    let resp_ack = ControlResponse::Ack {
+        ok: true,
+        message: "peer added".to_string(),
+    };
+
+    let reload_json = serde_json::to_string(&resp_reload).unwrap();
+    let ack_json = serde_json::to_string(&resp_ack).unwrap();
+
+    let deserialized_reload: ControlResponse = serde_json::from_str(&reload_json).unwrap();
+    let deserialized_ack: ControlResponse = serde_json::from_str(&ack_json).unwrap();
+
+    assert_eq!(deserialized_reload, resp_reload);
+    assert_eq!(deserialized_ack, resp_ack);
+
+    assert!(matches!(
+        deserialized_reload,
+        ControlResponse::Reload {
+            ok: true,
+            reloaded: true,
+            ..
+        }
+    ));
+    assert!(matches!(
+        deserialized_ack,
+        ControlResponse::Ack {
+            ok: true,
+            ref message
+        } if message == "peer added"
+    ));
 }
 
 #[test]

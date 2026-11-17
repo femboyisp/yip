@@ -285,6 +285,7 @@ pub enum ControlResponse {
     Reload {
         ok: bool,
         message: String,
+        reloaded: bool,
     },
     Ack {
         ok: bool,
