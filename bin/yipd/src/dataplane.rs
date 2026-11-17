@@ -35,8 +35,8 @@ pub struct DataPlaneCounters {
 // ── constants (wired into DataPlane::new; tunnel.rs keeps its own copies until
 //    Task 3 replaces the two-thread loop with this DataPlane) ─────────────────
 
-const SENT_LOG_CAPACITY: usize = 65_536;
-const RETX_BUFFER_MAX: usize = 65_536;
+const SENT_LOG_CAPACITY: usize = 4_096;
+const RETX_BUFFER_MAX: usize = 4_096;
 const RETX_BUFFER_TTL_MS: u64 = 2000;
 const RETX_EXTRA_REPAIR: u32 = 4;
 
@@ -458,6 +458,7 @@ impl DataPlane {
     /// Reconfigure shard start object id and stride increment for multi-core scaling.
     pub fn set_shard(&mut self, shard_id: usize, num_shards: usize) {
         self.transport.set_shard(shard_id, num_shards);
+        self.detector.set_stride(num_shards as u64);
     }
 
     /// Seal `inner`, FEC-encode, frame each symbol, and return the resulting
@@ -512,7 +513,12 @@ impl DataPlane {
                     .unwrap_or_else(|| Vec::with_capacity(self.seal_buf.len()));
                 buf.clear();
                 buf.extend_from_slice(&self.seal_buf);
-                self.retx.put(counter, buf, class, oid, now_ms);
+                if let Some(mut recycled) = self.retx.put(counter, buf, class, oid, now_ms) {
+                    recycled.clear();
+                    if self.retx_buf_pool.len() < 512 {
+                        self.retx_buf_pool.push(recycled);
+                    }
+                }
             }
         }
 
@@ -547,7 +553,9 @@ impl DataPlane {
     pub fn recycle(&mut self, batch: &mut Vec<yip_io::poll::EgressDatagram>) {
         for mut dg in batch.drain(..) {
             dg.bytes.clear();
-            self.egress_pool.push(dg);
+            if self.egress_pool.len() < 512 {
+                self.egress_pool.push(dg);
+            }
         }
     }
 
@@ -622,7 +630,8 @@ impl DataPlane {
                 self.detector.on_seen(counter, now_ms);
 
                 // Feed the symbol to the FEC reassembler; continue until an object decodes.
-                let ciphertext = match self.transport.decode(counter, &sym, class, now_ms) {
+                let ciphertext = match self.transport.decode_borrowed(counter, &sym, class, now_ms)
+                {
                     Some(ct) => ct,
                     None => return Outcome::None,
                 };
@@ -634,7 +643,7 @@ impl DataPlane {
                 self.inner_scratch.clear();
                 if self
                     .session
-                    .open_into(counter, &ciphertext, &mut self.inner_scratch)
+                    .open_into(counter, ciphertext, &mut self.inner_scratch)
                     .is_err()
                 {
                     self.counters

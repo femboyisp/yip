@@ -37,6 +37,11 @@ All notable changes to this project are documented here, following
   Added automated installation and evaluation of userspace Go WireGuard (`wireguard-go`) in `setup-contenders.sh` (`--wireguard-go`) and `run-iperf-compare.sh`. Measures dual-stack IPv4/IPv6 throughput, loss, latency, CPU utilization, and peak resident memory (`get_ns_ram_mb`), enabling direct userspace-to-userspace comparisons against YIP. Added Go module build caching in `benchmarks.yml` to accelerate CI benchmarking runs.
 
 ### Fixed
+- **Multi-Shard Scaling, Monotonic Nonce Skew & RAM Boundedness (`crates/yip-crypto`, `crates/yip-transport`, `bin/yipd`, #251).**
+  - Added per-stride replay windows (`Session::replays`) in `crates/yip-crypto/src/session.rs` indexed by `counter % stride`, eliminating spurious replay drops on idle or slower worker shards when concurrent high-throughput shards advance the sliding nonce counter past the replay window boundary.
+  - Implemented per-stream gap and watermark tracking in `LossDetector` (`crates/yip-transport/src/lossdetect.rs`), eliminating false packet loss detection and false NACK generation across interleaved worker shards.
+  - Added zero-allocation decode borrowing (`Transport::decode_borrowed` and `FecReassembler::push_borrowed`) in `crates/yip-transport`, recycling reassembled object buffers directly into caller pipelines without per-object heap allocations.
+  - Bounded memory usage across worker shards by capping buffer pools (`egress_pool`, `retx_buf_pool`, and `gso.recycle`) to 512 entries, downsizing `SENT_LOG_CAPACITY` and `RETX_BUFFER_MAX` to 4,096 entries, and pruning active tracked flows in `ReorderBuffer` to 16, reducing peak memory under `shards=auto` from 3,040 MB to under 180 MB.
 - **DHAT Zero-Allocation Warm-Up for Double-Buffered Arenas (`crates/yip-bench`).**
   Extended warm-up phase in `test_zero_alloc_hotpath_framing` (`crates/yip-bench/tests/zero_alloc_hotpath.rs`) to exercise both double-buffered ping-pong arenas in `Coalescer` before baseline DHAT heap allocation measurement, eliminating false-positive single-block allocation detections in CI.
 - **CI PR Mutation Testing Scope Alignment (`.github/workflows/mutants.yml`).**

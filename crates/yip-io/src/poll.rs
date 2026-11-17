@@ -553,7 +553,9 @@ pub fn flush_tx(
     // Retain datagram buffer capacity in `gso.recycle` so subsequent packets do not reallocate heap buffers
     for mut dg in tx.drain(..) {
         dg.bytes.clear();
-        gso.recycle.push(dg);
+        if gso.recycle.len() < 512 {
+            gso.recycle.push(dg);
+        }
     }
 
     outcome

@@ -237,6 +237,24 @@ impl Transport {
             .push(object_key, symbol, now_ms, deadline_ms)
     }
 
+    /// Feed a received symbol into the FEC reassembler for `class`. Returns a borrowed
+    /// slice of the decoded object upon completion with zero heap allocations.
+    pub fn decode_borrowed(
+        &mut self,
+        object_key: u64,
+        symbol: &Symbol,
+        class: FlowClass,
+        now_ms: u64,
+    ) -> Option<&[u8]> {
+        let params = self.params_for(class);
+        let idx = u8::try_from(class_index(class)).expect("3 classes");
+        let deadline_ms = params.deadline.as_millis() as u64;
+        self.reassemblers
+            .entry(idx)
+            .or_insert_with(|| FecReassembler::new(params.symbol_size, 256))
+            .push_borrowed(object_key, symbol, now_ms, deadline_ms)
+    }
+
     /// Update the classifier flow table with an observed decrypted ingress packet.
     pub fn observe_ingress(&mut self, inner: &[u8], l2: bool, now_ms: u64) {
         self.classifier.observe_ingress(inner, l2, now_ms);
@@ -543,6 +561,19 @@ mod tests {
         );
         assert_eq!(decoded.as_deref(), Some(fwd.as_slice()));
         assert_eq!(t.fec_recovered_count(), 1);
+    }
+
+    #[test]
+    fn test_transport_decode_borrowed() {
+        let mut t = Transport::new(vec![], 1200);
+        let payload = b"hello zero-copy world, this is a test payload for decode_borrowed";
+        let (class, syms) = t.encode(payload, payload, false, 0);
+        assert_eq!(class, FlowClass::Default);
+        assert!(!syms.is_empty());
+
+        let obj_key = u64::from(syms[0].object_id);
+        let res = t.decode_borrowed(obj_key, &syms[0], class, 100);
+        assert_eq!(res, Some(payload.as_slice()));
     }
 
     #[test]

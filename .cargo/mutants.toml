@@ -255,7 +255,15 @@
 #       evaluates to `false` at line 81 instead of line 125, producing identical `false` return value and zero state modification.
 #     - `opt_idx >= opt_end`: `opt_idx` begins at `opt_start <= opt_end` and increments strictly by `1` or `len <= remaining`,
 #       so `opt_idx` is never strictly greater than `opt_end`. Mutating `>=` to `==` is mathematically identical.
+# 40. `replace < with <= in LossDetector::on_seen` (crates/yip-transport/src/lossdetect.rs)
+#     `while c < counter { self.pending.entry(c).or_insert(now_ms); c = c.saturating_add(stride); }`.
+#     When `c == counter`, mutating `<` to `<=` causes an extra iteration at `c = counter`, executing
+#     `self.pending.entry(counter).or_insert(now_ms)`. Immediately following the while loop, line 258
+#     unconditionally executes the identical `self.pending.entry(counter).or_insert(now_ms)`.
+#     Because `BTreeMap::entry(...).or_insert(...)` is idempotent, duplicate insertion produces
+#     100% identical state under all executions.
 exclude_re = [
+    "crates/yip-transport/src/lossdetect\\.rs:.*replace < with <= in LossDetector::on_seen",
     "crates/yip-transport/src/pmtu\\.rs:.*replace < with (<=|==) in clamp_tcp_mss",
     "crates/yip-transport/src/pmtu\\.rs:.*replace >= with == in clamp_tcp_mss",
     "replace \\| with \\^ in Coalescer::push",

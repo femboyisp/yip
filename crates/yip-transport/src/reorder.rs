@@ -12,7 +12,7 @@ use crate::classify::FlowKey;
 pub const MAX_FLOW_REORDER_SLOTS: usize = 64;
 
 /// Maximum number of concurrent flows actively tracked in the reorder table.
-pub const MAX_CONCURRENT_TRACKED_FLOWS: usize = 64;
+pub const MAX_CONCURRENT_TRACKED_FLOWS: usize = 16;
 
 /// Maximum packet size in bytes that can be held in an individual reorder slot.
 pub const MAX_SLOT_PACKET_LEN: usize = 2048;

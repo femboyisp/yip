@@ -407,7 +407,7 @@ pub struct Session {
     pair: SessionPair,
     send_counter: u64,
     stride: u64,
-    replay: ReplayWindow,
+    replays: Vec<ReplayWindow>,
 }
 
 impl Session {
@@ -425,12 +425,30 @@ impl Session {
 
     /// Construct a session from an established [`SessionPair`].
     pub fn from_session_pair(pair: SessionPair, start_counter: u64, stride: u64) -> Self {
+        let stride = if stride == 0 { 1 } else { stride };
+        let replays_count = stride.clamp(1, 64) as usize;
+        let replays = (0..replays_count).map(|_| ReplayWindow::new()).collect();
         Session {
             pair,
             send_counter: start_counter,
-            stride: if stride == 0 { 1 } else { stride },
-            replay: ReplayWindow::new(),
+            stride,
+            replays,
         }
+    }
+
+    #[inline]
+    fn replay_idx(&self, counter: u64) -> usize {
+        if self.stride <= 1 {
+            0
+        } else {
+            (counter % (self.replays.len() as u64)) as usize
+        }
+    }
+
+    #[inline]
+    fn replay_window_for(&self, counter: u64) -> &ReplayWindow {
+        let idx = self.replay_idx(counter);
+        &self.replays[idx]
     }
 
     /// Access the underlying directional [`SessionPair`].
@@ -489,6 +507,8 @@ impl Session {
             self.send_counter = self.send_counter.saturating_add(diff);
         }
         self.stride = stride;
+        let replays_count = stride.clamp(1, 64) as usize;
+        self.replays.resize_with(replays_count, ReplayWindow::new);
     }
 
     /// The current nonce stride increment.
@@ -528,7 +548,8 @@ impl Session {
     /// The replay window is checked read-only *before* AEAD, then committed only
     /// *after* the frame authenticates.
     pub fn open(&mut self, counter: u64, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        if !self.replay.check(counter) {
+        let idx = self.replay_idx(counter);
+        if !self.replays[idx].check(counter) {
             return Err(CryptoError::Replay);
         }
         let mut buf = ciphertext.to_vec();
@@ -536,7 +557,7 @@ impl Session {
             .pair
             .recv
             .open_in_place(counter, &mut buf, ciphertext.len())?;
-        self.replay.commit(counter);
+        self.replays[idx].commit(counter);
         buf.truncate(plain_len);
         Ok(buf)
     }
@@ -544,17 +565,17 @@ impl Session {
     /// Check whether `counter` is valid within the anti-replay window without committing it.
     #[inline]
     pub fn check_replay(&self, counter: u64) -> bool {
-        self.replay.check(counter)
+        self.replay_window_for(counter).check(counter)
     }
 
     /// Returns the greatest counter seen by the anti-replay window.
     pub fn replay_latest(&self) -> u64 {
-        self.replay.latest()
+        self.replays.iter().map(|w| w.latest()).max().unwrap_or(0)
     }
 
     /// Returns the lowest counter acceptable by the anti-replay window without being too old.
     pub fn replay_floor(&self) -> u64 {
-        self.replay.floor()
+        self.replays.iter().map(|w| w.floor()).min().unwrap_or(0)
     }
 
     /// Seal into a caller-owned reusable buffer (no per-call allocation).
@@ -665,7 +686,8 @@ impl Session {
         ciphertext: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<(), CryptoError> {
-        if !self.replay.check(counter) {
+        let idx = self.replay_idx(counter);
+        if !self.replays[idx].check(counter) {
             return Err(CryptoError::Replay);
         }
         out.clear();
@@ -674,7 +696,7 @@ impl Session {
             .pair
             .recv
             .open_in_place(counter, out, ciphertext.len())?;
-        self.replay.commit(counter);
+        self.replays[idx].commit(counter);
         out.truncate(plain_len);
         Ok(())
     }
@@ -709,8 +731,10 @@ impl Session {
         buf: &mut [u8],
         sealed_len: usize,
     ) -> Result<usize, CryptoError> {
+        let idx = self.replay_idx(counter);
+        let window = &mut self.replays[idx];
         self.pair
             .recv
-            .open_in_place_with_window(counter, buf, sealed_len, &mut self.replay)
+            .open_in_place_with_window(counter, buf, sealed_len, window)
     }
 }

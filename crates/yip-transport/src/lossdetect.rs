@@ -91,24 +91,41 @@ use crate::{LossReport, MAX_NACK};
 ///
 /// The pending set is also bounded to `window` entries; when it would exceed
 /// that size the smallest (oldest-sequence) entries are evicted.
+#[derive(Debug, Clone)]
+struct StreamState {
+    high_counter: u64,
+    seen_any: bool,
+    resolved_below: u64,
+}
+
+impl StreamState {
+    fn new(start: u64) -> Self {
+        Self {
+            high_counter: 0,
+            seen_any: false,
+            resolved_below: start,
+        }
+    }
+}
+
 pub struct LossDetector {
     /// Grace period in milliseconds before a pending entry is promoted to missing.
     grace_ms: u64,
     /// Maximum number of entries to keep in the pending set and in the resolved set.
     window: usize,
-    /// Highest counter ever seen.
-    high_counter: u64,
-    /// Whether we have seen at least one packet (so `high_counter` is valid).
-    seen_any: bool,
+    /// Nonce stride increment for multi-shard streams.
+    stride: u64,
+    /// Per-stride stream state tracking high counters and resolved watermarks.
+    streams: Vec<StreamState>,
     /// Pending counters: counter → timestamp when first seen/implied.
-    pending: BTreeMap<u64, u64>,
+    pub(crate) pending: BTreeMap<u64, u64>,
     /// Objects delivered since the last `report` call.
     delivered: u32,
     /// All counters strictly below this value are considered resolved.
-    resolved_below: u64,
+    pub(crate) resolved_below: u64,
     /// Out-of-order resolved counters at or above `resolved_below`.
     /// Bounded to `window` entries.
-    resolved_set: BTreeMap<u64, ()>,
+    pub(crate) resolved_set: BTreeMap<u64, ()>,
 }
 
 impl LossDetector {
@@ -122,8 +139,8 @@ impl LossDetector {
         Self {
             grace_ms,
             window,
-            high_counter: 0,
-            seen_any: false,
+            stride: 1,
+            streams: vec![StreamState::new(0)],
             pending: BTreeMap::new(),
             delivered: 0,
             resolved_below: 0,
@@ -131,25 +148,51 @@ impl LossDetector {
         }
     }
 
+    /// Reconfigure the expected nonce stride increment for multi-shard streams.
+    pub fn set_stride(&mut self, stride: u64) {
+        let stride = stride.clamp(1, 64);
+        if self.stride != stride {
+            self.stride = stride;
+            self.streams = (0..stride).map(StreamState::new).collect();
+            self.resolved_below = 0;
+        }
+    }
+
+    #[inline]
+    fn stream_idx(&self, counter: u64) -> usize {
+        if self.stride <= 1 {
+            0
+        } else {
+            (counter % self.stride) as usize
+        }
+    }
+
     /// Return `true` if `c` is already resolved (delivered or reported missing).
     fn is_resolved(&self, c: u64) -> bool {
-        c < self.resolved_below || self.resolved_set.contains_key(&c)
+        let s = self.stream_idx(c);
+        c < self.streams[s].resolved_below || self.resolved_set.contains_key(&c)
     }
 
     /// Mark `c` as resolved and advance the low-watermark if possible.
     fn mark_resolved(&mut self, c: u64) {
-        if c < self.resolved_below {
+        let s = self.stream_idx(c);
+        if c < self.streams[s].resolved_below {
             // Already below the watermark — nothing to do.
             return;
         }
         self.resolved_set.insert(c, ());
 
-        // Advance the watermark over any consecutive prefix.
-        // `saturating_add` is belt-and-suspenders: reaching u64::MAX would take
-        // ~1.8e19 objects, but it keeps the loop panic-free in debug builds.
-        while self.resolved_set.contains_key(&self.resolved_below) {
-            self.resolved_set.remove(&self.resolved_below);
-            self.resolved_below = self.resolved_below.saturating_add(1);
+        // Advance the watermark over any consecutive prefix for this stream.
+        let stride = self.stride;
+        while self
+            .resolved_set
+            .contains_key(&self.streams[s].resolved_below)
+        {
+            self.resolved_set.remove(&self.streams[s].resolved_below);
+            self.streams[s].resolved_below = self.streams[s].resolved_below.saturating_add(stride);
+        }
+        if s == 0 {
+            self.resolved_below = self.streams[0].resolved_below;
         }
 
         // Bound the resolved set: evict the smallest entries if over capacity.
@@ -185,24 +228,29 @@ impl LossDetector {
             return;
         }
 
-        if !self.seen_any {
-            self.high_counter = counter;
-            self.seen_any = true;
+        let s = self.stream_idx(counter);
+        let stream = &mut self.streams[s];
+
+        if !stream.seen_any {
+            stream.high_counter = counter;
+            stream.seen_any = true;
             // Add counter itself to pending (seen-awaiting-delivery).
             self.pending.entry(counter).or_insert(now_ms);
             self.enforce_window();
             return;
         }
 
-        if counter > self.high_counter {
-            // Mark every counter in the gap as implied-pending.
-            let gap_start = self.high_counter + 1;
-            for c in gap_start..counter {
-                if !self.is_resolved(c) {
+        if counter > stream.high_counter {
+            // Mark every counter in the stream's gap as implied-pending.
+            let stride = self.stride;
+            let mut c = stream.high_counter.saturating_add(stride);
+            while c < counter {
+                if !self.resolved_set.contains_key(&c) {
                     self.pending.entry(c).or_insert(now_ms);
                 }
+                c = c.saturating_add(stride);
             }
-            self.high_counter = counter;
+            stream.high_counter = counter;
         }
 
         // Add counter itself to pending (seen-awaiting-delivery), idempotent.
@@ -270,7 +318,13 @@ impl LossDetector {
         // Cap at MAX_NACK (the wire-format limit).
         missing.truncate(MAX_NACK);
 
-        let high_counter = if self.seen_any { self.high_counter } else { 0 };
+        let high_counter = self
+            .streams
+            .iter()
+            .filter(|st| st.seen_any)
+            .map(|st| st.high_counter)
+            .max()
+            .unwrap_or(0);
         let delivered_count = self.delivered;
         self.delivered = 0;
 
@@ -604,5 +658,40 @@ mod tests {
             d.resolved_set.is_empty(),
             "resolved_set must be drained when watermark advances to 6"
         );
+    }
+
+    #[test]
+    fn test_stride_loss_detection_isolates_gaps() {
+        let mut d = LossDetector::new(5, 1024);
+        d.set_stride(4);
+
+        // Shard 0 sends: 0, 4, 8, 12
+        d.on_seen(0, 0);
+        d.on_delivered(0);
+        d.on_seen(4, 0);
+        d.on_delivered(4);
+        d.on_seen(8, 0);
+        d.on_delivered(8);
+
+        // There should be NO pending phantom entries for 1, 2, 3, 5, 6, 7!
+        assert!(
+            d.pending.is_empty(),
+            "pending must be empty on zero loss under stride 4; got {:?}",
+            d.pending
+        );
+
+        // Now simulate Shard 1 sending 1, then 9 (dropping packet 5)
+        d.on_seen(1, 0);
+        d.on_delivered(1);
+        d.on_seen(9, 0);
+        d.on_delivered(9);
+
+        // Gap in Shard 1 is ONLY packet 5! (Not 2, 3, 6, 7)
+        assert_eq!(d.pending.len(), 1);
+        assert!(d.pending.contains_key(&5));
+
+        // After grace period, report must contain only 5
+        let rep = d.report(10);
+        assert_eq!(rep.missing, vec![5]);
     }
 }

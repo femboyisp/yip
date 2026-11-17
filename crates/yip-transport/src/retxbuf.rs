@@ -62,23 +62,27 @@ impl RetxBuffer {
         class: FlowClass,
         object_id: u16,
         now_ms: u64,
-    ) {
+    ) -> Option<Vec<u8>> {
         // Defensive: if this counter already exists, update it in place without
         // pushing to the order deque again (which would create a phantom entry).
         if let Some(existing) = self.map.get_mut(&counter) {
-            existing.ciphertext = ciphertext;
+            let old = std::mem::replace(&mut existing.ciphertext, ciphertext);
             existing.class = class;
             existing.object_id = object_id;
             existing.inserted_ms = now_ms;
-            return;
+            return Some(old);
         }
 
         // Evict any entries that have passed their TTL before checking capacity.
-        self.evict_expired(now_ms);
+        let mut recycled = self.evict_expired(now_ms);
 
         if self.map.len() >= self.max {
             if let Some(old) = self.order.pop_front() {
-                self.map.remove(&old);
+                if let Some(entry) = self.map.remove(&old) {
+                    if recycled.is_none() {
+                        recycled = Some(entry.ciphertext);
+                    }
+                }
             }
         }
 
@@ -92,6 +96,7 @@ impl RetxBuffer {
             },
         );
         self.order.push_back(counter);
+        recycled
     }
 
     /// Retrieve a stored object by send-counter.
@@ -108,7 +113,8 @@ impl RetxBuffer {
     }
 
     /// Evict all entries whose age exceeds `ttl_ms`.
-    fn evict_expired(&mut self, now_ms: u64) {
+    fn evict_expired(&mut self, now_ms: u64) -> Option<Vec<u8>> {
+        let mut evicted = None;
         while let Some(front) = self.order.front() {
             let expired = self
                 .map
@@ -116,11 +122,16 @@ impl RetxBuffer {
                 .is_none_or(|e| now_ms.saturating_sub(e.inserted_ms) > self.ttl_ms);
             if expired {
                 let k = self.order.pop_front().expect("front exists");
-                self.map.remove(&k);
+                if let Some(entry) = self.map.remove(&k) {
+                    if evicted.is_none() {
+                        evicted = Some(entry.ciphertext);
+                    }
+                }
             } else {
                 break;
             }
         }
+        evicted
     }
 }
 
