@@ -199,6 +199,8 @@ struct HandshakingState {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PeerStats {
     pub public_key: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
     pub endpoint: Option<SocketAddr>,
     pub node_addr: std::net::Ipv6Addr,
     pub state: String,
@@ -232,6 +234,7 @@ enum PeerState {
 /// One configured remote peer plus its live handshake/session state.
 struct Peer {
     pubkey: [u8; 32],
+    alias: Option<String>,
     /// This peer's self-certifying inner IPv6 address (`node_addr(pubkey)`).
     /// Routing itself goes through `by_addr` (kept alongside for tests and
     /// future logging/debugging use).
@@ -587,6 +590,7 @@ impl PeerManager {
             }
             peers.push(Peer {
                 pubkey: p.public_key,
+                alias: p.alias.clone(),
                 addr,
                 endpoint: p.endpoint,
                 state: PeerState::Idle,
@@ -710,6 +714,7 @@ impl PeerManager {
         self.by_node.insert(node, idx);
         self.peers.push(Peer {
             pubkey,
+            alias: None,
             addr,
             endpoint: endpoints.first().copied(),
             state: PeerState::Idle,
@@ -998,6 +1003,15 @@ impl PeerManager {
         let cleaned = target.trim().to_ascii_lowercase();
         if cleaned.is_empty() {
             return if self.peers.is_empty() { None } else { Some(0) };
+        }
+
+        // 0. Match human-readable alias (case-insensitive)
+        for (i, p) in self.peers.iter().enumerate() {
+            if let Some(alias) = &p.alias {
+                if alias.eq_ignore_ascii_case(&cleaned) {
+                    return Some(i);
+                }
+            }
         }
 
         // 1. Match full hex or prefix hex
@@ -1752,6 +1766,7 @@ impl PeerManager {
         self.by_addr.insert(addr, idx);
         self.peers.push(Peer {
             pubkey: cfg.public_key,
+            alias: cfg.alias,
             addr,
             endpoint: cfg.endpoint,
             state: PeerState::Idle,
@@ -1861,6 +1876,7 @@ impl PeerManager {
 
                 PeerStats {
                     public_key: p.pubkey,
+                    alias: p.alias.clone(),
                     endpoint: p.endpoint,
                     node_addr: p.addr,
                     state: state_str.to_string(),
@@ -1882,6 +1898,25 @@ impl PeerManager {
     /// Retrieve summary status telemetry for all known peers (alias for peer_stats).
     pub fn list_peers(&self) -> Vec<PeerStats> {
         self.peer_stats()
+    }
+
+    /// Lookup peer index by human-readable alias (case-insensitive).
+    pub fn find_peer_by_alias(&self, alias: &str) -> Option<usize> {
+        let clean = alias.trim();
+        if clean.is_empty() {
+            return None;
+        }
+        self.peers.iter().position(|p| {
+            p.alias
+                .as_deref()
+                .map(|a| a.eq_ignore_ascii_case(clean))
+                .unwrap_or(false)
+        })
+    }
+
+    /// Retrieve public key for peer at index.
+    pub fn peer_pubkey(&self, idx: usize) -> Option<[u8; 32]> {
+        self.peers.get(idx).map(|p| p.pubkey)
     }
 
     // ── rendezvous / path helpers ─────────────────────────────────────────

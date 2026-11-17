@@ -1282,6 +1282,7 @@ mod tests {
         let cfg_i = PeerConfig {
             public_key: kp_i.public,
             endpoint: Some(ep_i),
+            alias: None,
         };
         let mut pm_r = PeerManager::new(
             kp_r.private,

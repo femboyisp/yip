@@ -1427,6 +1427,7 @@ mod tests {
         let peer_cfg = crate::config::PeerConfig {
             public_key: peer_pub,
             endpoint: Some(addr),
+            alias: None,
         };
         let mut manager = PeerManager::new(
             local_priv,
@@ -1521,6 +1522,7 @@ mod tests {
         let peer_cfg = crate::config::PeerConfig {
             public_key: peer_pub,
             endpoint: Some(addr),
+            alias: None,
         };
         let mut manager = PeerManager::new(
             local_priv,

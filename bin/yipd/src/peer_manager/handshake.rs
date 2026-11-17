@@ -547,6 +547,7 @@ mod tests {
         let cfg_i = PeerConfig {
             public_key: kp_i.public,
             endpoint: Some(ep_i),
+            alias: None,
         };
         let mut pm_r = PeerManager::new(
             kp_r.private,
@@ -639,6 +640,7 @@ mod tests {
         let cfg_i = PeerConfig {
             public_key: kp_i.public,
             endpoint: Some(ep_i),
+            alias: None,
         };
         let mut pm_r = PeerManager::new(
             kp_r.private,
@@ -733,10 +735,12 @@ mod tests {
         let cfg_b = PeerConfig {
             public_key: kp_b.public,
             endpoint: Some(ep_b),
+            alias: None,
         };
         let cfg_a = PeerConfig {
             public_key: kp_a.public,
             endpoint: Some(ep_a),
+            alias: None,
         };
         let mut pm_a = PeerManager::new(
             kp_a.private,
@@ -811,6 +815,7 @@ mod tests {
         let peer = PeerConfig {
             public_key: peer_pubkey,
             endpoint: Some(ep),
+            alias: None,
         };
         let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
         pm.on_tun(&dummy_tun_pkt(), started_ms);
@@ -1314,6 +1319,7 @@ mod tests {
         let cfg_peer = PeerConfig {
             public_key: peer.public,
             endpoint: Some(peer_ep),
+            alias: None,
         };
         let mut pm = PeerManager::new(
             local.private,
@@ -1371,6 +1377,7 @@ mod tests {
         let cfg = PeerConfig {
             public_key: peer_kp.public,
             endpoint: Some(peer_ep),
+            alias: None,
         };
 
         // ── absent cert in msg2 → rejected ──
@@ -1456,6 +1463,7 @@ mod tests {
         let cfg = PeerConfig {
             public_key: root.public,
             endpoint: Some(root_ep),
+            alias: None,
         };
         let roots = RootSet {
             roots: vec![(root.public, root_ep)],
@@ -1634,6 +1642,7 @@ mod tests {
         let peer = PeerConfig {
             public_key: peer_kp.public,
             endpoint: None,
+            alias: None,
         };
         let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
         pm.set_obf_psk(Some([0xBBu8; 32]));

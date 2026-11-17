@@ -97,10 +97,12 @@ fn setup_peer_manager_pair() -> (PeerManager, PeerManager, SocketAddr, SocketAdd
     let peer_b_cfg = PeerConfig {
         public_key: kp_b.public,
         endpoint: Some(ep_b),
+        alias: None,
     };
     let peer_a_cfg = PeerConfig {
         public_key: kp_a.public,
         endpoint: Some(ep_a),
+        alias: None,
     };
 
     let mut pm_a = PeerManager::new(

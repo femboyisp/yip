@@ -192,6 +192,7 @@ mod tests {
         let cfg = PeerConfig {
             public_key: gossip_peer.public,
             endpoint: Some(src),
+            alias: None,
         };
         let mut pm = PeerManager::new(
             local.private,
@@ -269,6 +270,7 @@ mod tests {
         let cfg = PeerConfig {
             public_key: peer.public,
             endpoint: Some(peer_ep),
+            alias: None,
         };
         let mut pm = PeerManager::new(
             local.private,

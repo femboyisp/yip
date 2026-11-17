@@ -29,6 +29,8 @@ pub enum ControlCmd {
         endpoint: Option<String>,
         #[serde(default)]
         transport: Option<String>,
+        #[serde(default)]
+        alias: Option<String>,
     },
     #[serde(rename = "remove_peer")]
     RemovePeer { public_key: String },
@@ -114,6 +116,15 @@ pub enum ControlCmd {
     GetXdpStatus,
     #[serde(rename = "set_xdp_mode")]
     SetXdpMode { mode: String },
+    #[serde(rename = "create_ticket")]
+    CreateTicket {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        route_mode: Option<String>,
+        #[serde(default)]
+        endpoint: Option<String>,
+    },
 }
 
 fn default_ping_count() -> u32 {
@@ -891,6 +902,13 @@ pub enum ControlResponse {
         metrics: crate::metrics::TelemetrySnapshot,
         prometheus: String,
     },
+    Ticket {
+        ok: bool,
+        ticket: crate::ticket::NetworkTicket,
+        uri: String,
+        #[serde(default)]
+        qr_terminal: String,
+    },
     Ack {
         ok: bool,
         message: String,
@@ -1128,6 +1146,7 @@ pub fn dispatch_cmd(
             public_key,
             endpoint,
             transport,
+            alias,
         } => {
             let pk = match crate::config::hex_to_32(&public_key) {
                 Ok(k) => k,
@@ -1150,14 +1169,13 @@ pub fn dispatch_cmd(
                 },
                 None => None,
             };
+            let cfg = PeerConfig {
+                public_key: pk,
+                endpoint: ep,
+                alias,
+            };
             if let Some(tr) = transport {
-                match pm.add_peer_with_transport(
-                    PeerConfig {
-                        public_key: pk,
-                        endpoint: ep,
-                    },
-                    Some(tr),
-                ) {
+                match pm.add_peer_with_transport(cfg, Some(tr)) {
                     Ok(()) => ControlResponse::Ack {
                         ok: true,
                         message: "peer added".into(),
@@ -1168,10 +1186,7 @@ pub fn dispatch_cmd(
                     },
                 }
             } else {
-                match pm.add_peer(PeerConfig {
-                    public_key: pk,
-                    endpoint: ep,
-                }) {
+                match pm.add_peer(cfg) {
                     Ok(()) => ControlResponse::Ack {
                         ok: true,
                         message: "peer added".into(),
@@ -1187,10 +1202,14 @@ pub fn dispatch_cmd(
             let pk = match crate::config::hex_to_32(&public_key) {
                 Ok(k) => k,
                 Err(_) => {
-                    return ControlResponse::Err {
-                        ok: false,
-                        error: "invalid public_key hex (must be 64 hex characters)".into(),
-                    };
+                    if let Some(idx) = pm.find_peer_by_alias(&public_key) {
+                        pm.peer_pubkey(idx).expect("peer exists")
+                    } else {
+                        return ControlResponse::Err {
+                            ok: false,
+                            error: "invalid public_key hex or unknown peer alias".into(),
+                        };
+                    }
                 }
             };
             match pm.remove_peer(&pk) {
@@ -1211,10 +1230,14 @@ pub fn dispatch_cmd(
             let pk = match crate::config::hex_to_32(&public_key) {
                 Ok(k) => k,
                 Err(_) => {
-                    return ControlResponse::Err {
-                        ok: false,
-                        error: "invalid public_key hex (must be 64 hex characters)".into(),
-                    };
+                    if let Some(idx) = pm.find_peer_by_alias(&public_key) {
+                        pm.peer_pubkey(idx).expect("peer exists")
+                    } else {
+                        return ControlResponse::Err {
+                            ok: false,
+                            error: "invalid public_key hex or unknown peer alias".into(),
+                        };
+                    }
                 }
             };
             pm.set_peer_transport(&pk, transport);
@@ -1550,6 +1573,47 @@ pub fn dispatch_cmd(
             Ok(message) => ControlResponse::Ack { ok: true, message },
             Err(error) => ControlResponse::Err { ok: false, error },
         },
+        ControlCmd::CreateTicket {
+            name,
+            route_mode,
+            endpoint,
+        } => {
+            let mut net_id = pm.network_id_hex();
+            if net_id.is_empty() {
+                net_id = "default".to_string();
+            }
+            let net_name = name.unwrap_or_else(|| {
+                let pubkey = pm.local_pub_hex();
+                if pubkey.len() >= 8 {
+                    format!("yip-{}", &pubkey[..8])
+                } else {
+                    "yip-mesh".to_string()
+                }
+            });
+            let mode = route_mode.unwrap_or_else(|| "MeshOnly".to_string());
+            let mut ticket = crate::ticket::NetworkTicket::new(net_name, net_id, mode);
+            if let Some(ep) = endpoint {
+                ticket = ticket.with_endpoint(ep);
+            } else if pm.listen_port() > 0 {
+                ticket = ticket.with_endpoint(format!("0.0.0.0:{}", pm.listen_port()));
+            }
+            let uri = match ticket.to_uri() {
+                Ok(u) => u,
+                Err(e) => {
+                    return ControlResponse::Err {
+                        ok: false,
+                        error: format!("failed to format ticket URI: {e}"),
+                    };
+                }
+            };
+            let qr_terminal = ticket.render_qr_terminal().unwrap_or_default();
+            ControlResponse::Ticket {
+                ok: true,
+                ticket,
+                uri,
+                qr_terminal,
+            }
+        }
     }
 }
 
@@ -1789,7 +1853,10 @@ pub fn run_cli_peers(socket_path: &Path, json: bool) -> Result<(), String> {
                     _ => format!("\x1b[90m{}\x1b[0m", p.state),
                 };
                 let cert_colored = format!("\x1b[32m{}\x1b[0m", p.cert_status);
-                let peer_str = p.node_addr.to_string();
+                let peer_str = match &p.alias {
+                    Some(alias) if !alias.is_empty() => format!("{} ({alias})", p.node_addr),
+                    _ => p.node_addr.to_string(),
+                };
                 println!(
                     "{:<39} {:<22} {:<8} {:<22} {:<16} {:<19} {:<24} {:<10} {:<12}",
                     peer_str,
@@ -1961,11 +2028,13 @@ pub fn run_cli_peer_add(
     public_key: &str,
     endpoint: Option<&str>,
     transport: Option<&str>,
+    alias: Option<&str>,
 ) -> Result<(), String> {
     let cmd = ControlCmd::AddPeer {
         public_key: public_key.into(),
         endpoint: endpoint.map(|s| s.into()),
         transport: transport.map(|s| s.into()),
+        alias: alias.map(|s| s.into()),
     };
     match client_query(socket_path, cmd)? {
         ControlResponse::Ack { message, .. } => {
@@ -1975,6 +2044,90 @@ pub fn run_cli_peer_add(
         ControlResponse::Err { error, .. } => Err(error),
         _ => Err("unexpected response format from daemon".into()),
     }
+}
+
+/// Create an invitation ticket for the running node or specified parameters.
+pub fn run_cli_ticket_create(
+    socket_path: &Path,
+    name: Option<String>,
+    route_mode: Option<String>,
+    endpoint: Option<String>,
+    no_qr: bool,
+    json: bool,
+) -> Result<(), String> {
+    let resp = client_query(
+        socket_path,
+        ControlCmd::CreateTicket {
+            name,
+            route_mode,
+            endpoint,
+        },
+    )?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+    match resp {
+        ControlResponse::Ticket {
+            ok,
+            ticket,
+            uri,
+            qr_terminal,
+        } => {
+            if !ok {
+                return Err("daemon reported error creating ticket".into());
+            }
+            if !no_qr && !qr_terminal.is_empty() {
+                println!("{qr_terminal}\n");
+            }
+            println!("\x1b[1;38;5;208m●\x1b[0m \x1b[1mYip Network Invitation Ticket\x1b[0m");
+            println!("  Network Name:  \x1b[1m{}\x1b[0m", ticket.name);
+            println!("  Network ID:    \x1b[1;36m{}\x1b[0m", ticket.network_id);
+            println!("  Route Mode:    \x1b[1;32m{}\x1b[0m", ticket.route_mode);
+            if let Some(ep) = &ticket.endpoint {
+                println!("  Endpoint:      {ep}");
+            }
+            println!("\n\x1b[1mInvitation URI:\x1b[0m\n  \x1b[4;34m{uri}\x1b[0m\n");
+            let b64 = ticket.to_base64().unwrap_or_default();
+            println!("\x1b[1mBase64 Payload:\x1b[0m\n  {b64}");
+            Ok(())
+        }
+        ControlResponse::Err { error, .. } => Err(error),
+        _ => Err("unexpected response format from daemon".into()),
+    }
+}
+
+/// Inspect and display a ticket or URI.
+pub fn run_cli_ticket_show(raw_ticket: &str, no_qr: bool, json: bool) -> Result<(), String> {
+    let ticket = crate::ticket::NetworkTicket::parse(raw_ticket)?;
+    if json {
+        let text = serde_json::to_string_pretty(&ticket).map_err(|e| e.to_string())?;
+        println!("{text}");
+        return Ok(());
+    }
+    let uri = ticket.to_uri()?;
+    let qr = if !no_qr {
+        ticket.render_qr_terminal().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if !qr.is_empty() {
+        println!("{qr}\n");
+    }
+    println!("\x1b[1;38;5;208m●\x1b[0m \x1b[1mYip Network Invitation Ticket\x1b[0m");
+    println!("  Network Name:  \x1b[1m{}\x1b[0m", ticket.name);
+    println!("  Network ID:    \x1b[1;36m{}\x1b[0m", ticket.network_id);
+    println!("  Route Mode:    \x1b[1;32m{}\x1b[0m", ticket.route_mode);
+    if let Some(ep) = &ticket.endpoint {
+        println!("  Endpoint:      {ep}");
+    }
+    println!("\n\x1b[1mInvitation URI:\x1b[0m\n  \x1b[4;34m{uri}\x1b[0m\n");
+    let b64 = ticket.to_base64().unwrap_or_default();
+    println!("\x1b[1mBase64 Payload:\x1b[0m\n  {b64}");
+    Ok(())
 }
 
 /// Query and display Reed-Solomon dynamic FEC status.
@@ -2889,6 +3042,7 @@ mod tests {
             public_key: new_pk_hex.clone(),
             endpoint: Some("198.51.100.2:51820".into()),
             transport: None,
+            alias: Some("peer2".into()),
         };
         let resp = dispatch_cmd(&mut pm, add_cmd, "yip0", start);
         assert_eq!(
@@ -2921,6 +3075,111 @@ mod tests {
             }
         );
         assert_eq!(pm.peer_stats().len(), 1);
+    }
+
+    #[test]
+    fn control_protocol_add_peer_with_alias_and_actions_by_alias() {
+        let mut pm = crate::peer_manager::testutil::test_peer_manager();
+        let start = Instant::now();
+
+        let new_pk_hex = "05".repeat(32);
+        let add_cmd = ControlCmd::AddPeer {
+            public_key: new_pk_hex,
+            endpoint: Some("198.51.100.5:51820".into()),
+            transport: None,
+            alias: Some("office-relay".into()),
+        };
+        let resp = dispatch_cmd(&mut pm, add_cmd, "yip0", start);
+        assert_eq!(
+            resp,
+            ControlResponse::Ack {
+                ok: true,
+                message: "peer added".into()
+            }
+        );
+
+        // Verify alias is exposed in PeerStats
+        let peers = pm.peer_stats();
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[1].alias.as_deref(), Some("office-relay"));
+
+        // Set transport using alias instead of hex key
+        let set_tr_cmd = ControlCmd::SetTransport {
+            public_key: "office-relay".into(),
+            transport: "TLS Over Proxy".into(),
+        };
+        let resp = dispatch_cmd(&mut pm, set_tr_cmd, "yip0", start);
+        assert!(matches!(resp, ControlResponse::Ack { .. }));
+        assert_eq!(pm.peer_stats()[1].transport, "TLS Over Proxy");
+
+        // Remove peer using alias instead of hex key
+        let rm_cmd = ControlCmd::RemovePeer {
+            public_key: "office-relay".into(),
+        };
+        let resp = dispatch_cmd(&mut pm, rm_cmd, "yip0", start);
+        assert_eq!(
+            resp,
+            ControlResponse::Ack {
+                ok: true,
+                message: "peer removed".into()
+            }
+        );
+        assert_eq!(pm.peer_stats().len(), 1);
+    }
+
+    #[test]
+    fn control_protocol_create_ticket_rpc_and_serialization() {
+        let mut pm = crate::peer_manager::testutil::test_peer_manager();
+        pm.set_listen_port(51820);
+        let start = Instant::now();
+
+        // 1. Create ticket via dispatch_cmd
+        let cmd = ControlCmd::CreateTicket {
+            name: Some("TestCluster".into()),
+            route_mode: Some("ExitNode".into()),
+            endpoint: Some("203.0.113.88:51820".into()),
+        };
+        let resp = dispatch_cmd(&mut pm, cmd, "yip0", start);
+        if let ControlResponse::Ticket {
+            ok,
+            ticket,
+            uri,
+            qr_terminal,
+        } = resp
+        {
+            assert!(ok);
+            assert_eq!(ticket.name, "TestCluster");
+            assert_eq!(ticket.route_mode, "ExitNode");
+            assert_eq!(ticket.endpoint.as_deref(), Some("203.0.113.88:51820"));
+            assert!(uri.starts_with("yip://join?ticket="));
+            assert!(!qr_terminal.is_empty());
+
+            // Parse URI back and assert equality
+            let parsed = crate::ticket::NetworkTicket::parse(&uri).expect("parse URI");
+            assert_eq!(parsed.name, ticket.name);
+            assert_eq!(parsed.network_id, ticket.network_id);
+            assert_eq!(parsed.route_mode, ticket.route_mode);
+            assert_eq!(parsed.endpoint, ticket.endpoint);
+        } else {
+            panic!("expected Ticket response");
+        }
+
+        // 2. Test JSON round-trip serialization of CreateTicket and Ticket
+        let cmd_json = r#"{"cmd":"create_ticket","name":"QuickNet","route_mode":"MeshOnly"}"#;
+        let deserialized_cmd: ControlCmd =
+            serde_json::from_str(cmd_json).expect("deserialize CreateTicket");
+        if let ControlCmd::CreateTicket {
+            name,
+            route_mode,
+            endpoint,
+        } = deserialized_cmd
+        {
+            assert_eq!(name.as_deref(), Some("QuickNet"));
+            assert_eq!(route_mode.as_deref(), Some("MeshOnly"));
+            assert_eq!(endpoint, None);
+        } else {
+            panic!("expected CreateTicket cmd variant");
+        }
     }
 
     #[test]
@@ -3041,6 +3300,7 @@ mod tests {
             public_key: "bad_hex".into(),
             endpoint: None,
             transport: None,
+            alias: None,
         };
         assert!(matches!(
             dispatch_cmd(&mut pm, bad_add, "yip0", start),
@@ -3052,6 +3312,7 @@ mod tests {
             public_key: "03".repeat(32),
             endpoint: Some("not_an_ip".into()),
             transport: None,
+            alias: None,
         };
         assert!(matches!(
             dispatch_cmd(&mut pm, bad_ep, "yip0", start),
@@ -3064,6 +3325,7 @@ mod tests {
             public_key: pk3.clone(),
             endpoint: Some("127.0.0.1:51820".into()),
             transport: Some("Holepunched UDP".into()),
+            alias: Some("peer3".into()),
         };
         assert_eq!(
             dispatch_cmd(&mut pm, ok_add, "yip0", start),
@@ -3123,6 +3385,7 @@ mod tests {
             rtt_ms: Some(28),
             fec_ratio_pct: 3,
             cert_status: "CA Valid".into(),
+            alias: None,
         };
 
         let p2 = PeerStats {
@@ -3140,6 +3403,7 @@ mod tests {
             rtt_ms: None,
             fec_ratio_pct: 0,
             cert_status: "CA Valid".into(),
+            alias: None,
         };
 
         let peers = vec![p1, p2];
@@ -3221,9 +3485,33 @@ mod tests {
         assert!(run_cli_trace(path, "10.0.0.1", false).is_ok());
         assert!(run_cli_trace(path, "10.0.0.1", true).is_ok());
         assert!(run_cli_trace(path, "nonexistent", false).is_ok());
-        assert!(
-            run_cli_peer_add(path, &"04".repeat(32), Some("1.2.3.4:51820"), Some("TLS")).is_ok()
-        );
+        assert!(run_cli_peer_add(
+            path,
+            &"04".repeat(32),
+            Some("1.2.3.4:51820"),
+            Some("TLS"),
+            Some("peer4")
+        )
+        .is_ok());
+        assert!(run_cli_peer_add(path, "bad_hex", None, None, None).is_err());
+        assert!(run_cli_ticket_create(
+            path,
+            Some("MyNet".into()),
+            Some("MeshOnly".into()),
+            Some("1.2.3.4:51820".into()),
+            false,
+            false
+        )
+        .is_ok());
+        assert!(run_cli_ticket_create(path, None, None, None, true, true).is_ok());
+        assert!(run_cli_ticket_create(path, None, None, None, false, true).is_ok());
+        let sample_ticket = "yip://join?ticket=eyJuYW1lIjoiVGVzdE5ldCIsIm5ldHdvcmtfaWQiOiJhYWJiY2NkZCIsInJvdXRlX21vZGUiOiJNZXNoT25seSJ9";
+        assert!(run_cli_ticket_show(sample_ticket, false, false).is_ok());
+        assert!(run_cli_ticket_show(sample_ticket, false, true).is_ok());
+        assert!(run_cli_ticket_show(sample_ticket, true, true).is_ok());
+        assert!(run_cli_ticket_show(sample_ticket, true, false).is_ok());
+        assert!(run_cli_ticket_show("not-a-ticket@@@", false, false).is_err());
+        assert!(run_cli_ticket_show("not-a-ticket@@@", true, false).is_err());
         assert!(run_cli_fec_status(path, false).is_ok());
         assert!(run_cli_fec_status(path, true).is_ok());
         assert!(run_cli_fec_set(path, Some("hostile".into()), Some(30), Some(10), Some(4)).is_ok());
