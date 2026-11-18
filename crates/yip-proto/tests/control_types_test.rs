@@ -692,3 +692,61 @@ fn test_telemetry_item_and_ping_result_serde() {
     let dec: PeerTelemetryItem = serde_json::from_str(&json).unwrap();
     assert_eq!(dec, item);
 }
+
+#[test]
+fn test_default_ping_and_xdp_flags_and_cidr_boundary_mutants() {
+    // Ping defaults
+    let ping_cmd_json = r#"{"cmd":"ping_peer","peer_node_id":"peer123"}"#;
+    let parsed: ControlCmd = serde_json::from_str(ping_cmd_json).unwrap();
+    if let ControlCmd::PingPeer {
+        count, timeout_ms, ..
+    } = parsed
+    {
+        assert_eq!(count, 4);
+        assert_eq!(timeout_ms, 2000);
+    } else {
+        panic!("expected PingPeer");
+    }
+
+    // XdpMode::to_flags
+    assert_eq!(XdpMode::Auto.to_flags(), 0);
+    assert_eq!(XdpMode::Generic.to_flags(), 2);
+    assert_eq!(XdpMode::Native.to_flags(), 4);
+    assert_eq!(XdpMode::Offload.to_flags(), 8);
+
+    // parse_cidr prefix bounds
+    assert!(parse_cidr("10.0.0.1/32").is_ok());
+    assert!(parse_cidr("10.0.0.1/33").is_err());
+    assert!(parse_cidr("10.0.0.1/24/extra").is_err());
+    assert!(parse_cidr("fd00::1/128").is_ok());
+    assert!(parse_cidr("fd00::1/129").is_err());
+
+    // ip_matches_cidr prefix boundary / mask
+    let v4_target: std::net::IpAddr = "192.168.1.100".parse().unwrap();
+    let v4_net: std::net::IpAddr = "192.168.1.100".parse().unwrap();
+    assert!(ip_matches_cidr(v4_target, v4_net, 32));
+    assert!(!ip_matches_cidr(
+        "192.168.1.101".parse().unwrap(),
+        v4_net,
+        32
+    ));
+    assert!(!ip_matches_cidr(v4_target, v4_net, 33));
+
+    let v6_target: std::net::IpAddr = "fd00::1234".parse().unwrap();
+    let v6_net: std::net::IpAddr = "fd00::1234".parse().unwrap();
+    assert!(ip_matches_cidr(v6_target, v6_net, 128));
+    assert!(!ip_matches_cidr("fd00::1235".parse().unwrap(), v6_net, 128));
+    assert!(!ip_matches_cidr(v6_target, v6_net, 129));
+
+    // extract_ip_dst short or malformed packets
+    assert_eq!(extract_ip_dst(&[]), None);
+    let mut short_v4 = [0u8; 19];
+    short_v4[0] = 0x45;
+    assert_eq!(extract_ip_dst(&short_v4), None);
+    let mut bad_ver_v4 = [0u8; 20];
+    bad_ver_v4[0] = 0x55;
+    assert_eq!(extract_ip_dst(&bad_ver_v4), None);
+    let mut short_v6 = [0u8; 39];
+    short_v6[0] = 0x60;
+    assert_eq!(extract_ip_dst(&short_v6), None);
+}

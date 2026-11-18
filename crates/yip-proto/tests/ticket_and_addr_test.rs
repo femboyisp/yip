@@ -96,3 +96,13 @@ fn test_ticket_fallback_uri_and_validation() {
     assert!(NetworkTicket::parse(r#"{"name":"","network_id":"abc"}"#).is_err());
     assert!(NetworkTicket::parse(r#"{"name":"abc","network_id":""}"#).is_err());
 }
+
+#[test]
+fn test_ticket_serde_defaults() {
+    let json = r#"{"name":"DefaultNet","network_id":"net-12345"}"#;
+    let parsed: NetworkTicket = serde_json::from_str(json).expect("deserialize with defaults");
+    assert_eq!(parsed.v, 1);
+    assert_eq!(parsed.route_mode, "MeshOnly");
+    assert_eq!(parsed.endpoint, None);
+    assert_eq!(parsed.seeds, None);
+}
