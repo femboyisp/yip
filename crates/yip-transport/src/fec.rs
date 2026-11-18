@@ -2405,4 +2405,59 @@ mod tests {
         assert!(re.pool_repair_shards.len() <= MAX_POOL_BUFFERS);
         assert!(re.pool_repair_pools.len() <= MAX_POOL_BUFFERS);
     }
+
+    #[test]
+    fn test_push_borrowed_expired_recycling_and_pool_limit() {
+        let params = FlowClass::Bulk.params();
+        let mut enc = FecEncoder::new();
+        let mut re = FecReassembler::new(1200, 2);
+
+        // 1. Initial push on a fresh object
+        let ct = vec![0x33u8; 2000];
+        let syms = enc.encode(&ct, params, 0); // K=2
+                                               // Push symbol 0 at t=0 with deadline 10 ms (expires at t=10)
+        assert!(re.push_borrowed(1, &syms[0], 0, 10).is_none());
+        assert_eq!(re.pool_payloads.len(), 0);
+
+        // 2. Second symbol arrives at t=11 (past deadline).
+        // Must mark done, return None, and recycle the non-empty payload to pool_payloads.
+        assert!(re.push_borrowed(1, &syms[1], 11, 10).is_none());
+        assert_eq!(
+            re.pool_payloads.len(),
+            1,
+            "expired non-empty payload must be recycled to pool"
+        );
+        assert!(
+            re.pool_payloads[0].capacity() >= 2000,
+            "recycled payload buffer must retain allocated capacity"
+        );
+
+        // 3. A subsequent duplicate/late symbol arrives at t=12 for the same expired object.
+        // Since state.payload is now empty, it must NOT recycle an empty vector into pool_payloads.
+        assert!(re.push_borrowed(1, &syms[1], 12, 10).is_none());
+        assert_eq!(
+            re.pool_payloads.len(),
+            1,
+            "already-drained payload must not be re-added to pool"
+        );
+
+        // 4. Object 2 arrives and later expires when pool_payloads is ALREADY at pool_limit (2).
+        // It must NOT exceed pool_limit.
+        let ct2 = vec![0x44u8; 2000];
+        let syms2 = enc.encode(&ct2, params, 0);
+        assert!(re.push_borrowed(2, &syms2[0], 20, 10).is_none());
+        // acquire_buffers popped 1 payload, so pool_payloads.len() is 0.
+        // Pad pool_payloads to pool_limit (2) to test capacity bounding.
+        re.pool_payloads.push(Vec::new());
+        re.pool_payloads.push(Vec::new());
+        assert_eq!(re.pool_payloads.len(), 2);
+
+        // Second symbol for object 2 arrives past deadline (t=35 > 30).
+        assert!(re.push_borrowed(2, &syms2[1], 35, 10).is_none());
+        assert_eq!(
+            re.pool_payloads.len(),
+            2,
+            "pool must not exceed capacity 2 when already full"
+        );
+    }
 }
