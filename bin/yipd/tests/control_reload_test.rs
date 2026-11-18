@@ -347,3 +347,90 @@ fn test_control_get_config_and_reload() {
     let _ = std::fs::remove_file(&config_path);
     let _ = std::fs::remove_file(&mismatch_path);
 }
+
+#[test]
+fn test_reload_preserves_dynamic_peers_and_rejects_device_or_port_change() {
+    let tmp = std::env::temp_dir();
+    let nonce: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+
+    let cfg_path = tmp.join(format!("test_dyn_peers_{nonce}.conf"));
+
+    let local_priv = [10u8; 32];
+    let local_pub = [20u8; 32];
+    let static_peer_pk = [30u8; 32];
+    let dynamic_peer_pk = [40u8; 32];
+
+    let initial_content = format!(
+        "local_private={}\nlocal_public={}\nlisten=127.0.0.1:443\ndevice=yip0\n[peer]\npublic_key={}\n",
+        hex_encode(&local_priv),
+        hex_encode(&local_pub),
+        hex_encode(&static_peer_pk),
+    );
+    std::fs::write(&cfg_path, &initial_content).unwrap();
+
+    let initial_config = Config::parse(&initial_content).unwrap();
+    let mut pm = PeerManager::new(
+        local_priv,
+        local_pub,
+        &initial_config.peers,
+        initial_config.device_kind,
+        None,
+        None,
+        false,
+    );
+    pm.set_listen_port(443);
+    pm.set_control(None, "yip0".to_string(), std::time::Instant::now());
+
+    // Dynamically add a non-static peer (e.g. from gossip or RPC)
+    assert!(pm
+        .add_peer_with_transport(yipd::config::PeerConfig::new(dynamic_peer_pk, None), None)
+        .is_ok());
+    assert_eq!(pm.list_peers().len(), 2);
+
+    // Reload with same file (which only lists static_peer_pk)
+    let report = pm
+        .reload_config(Some(cfg_path.to_str().unwrap()))
+        .expect("reload succeeds");
+    assert_eq!(report.preserved_peers, 1);
+    assert_eq!(report.removed_peers, 0);
+
+    // Both static peer and non-static dynamic peer must remain present!
+    let peers = pm.list_peers();
+    assert_eq!(peers.len(), 2);
+    assert!(peers.iter().any(|p| p.public_key == static_peer_pk));
+    assert!(peers.iter().any(|p| p.public_key == dynamic_peer_pk));
+
+    // Test rejection on device change
+    let changed_device_path = tmp.join(format!("test_dev_chg_{nonce}.conf"));
+    let changed_device_content = format!(
+        "local_private={}\nlocal_public={}\nlisten=127.0.0.1:443\ndevice=yip99\n[peer]\npublic_key={}\n",
+        hex_encode(&local_priv),
+        hex_encode(&local_pub),
+        hex_encode(&static_peer_pk),
+    );
+    std::fs::write(&changed_device_path, &changed_device_content).unwrap();
+    let res = pm.reload_config(Some(changed_device_path.to_str().unwrap()));
+    assert!(res.is_err());
+    assert!(res.unwrap_err().contains("device interface"));
+
+    // Test rejection on listen port change
+    let changed_port_path = tmp.join(format!("test_port_chg_{nonce}.conf"));
+    let changed_port_content = format!(
+        "local_private={}\nlocal_public={}\nlisten=127.0.0.1:8443\ndevice=yip0\n[peer]\npublic_key={}\n",
+        hex_encode(&local_priv),
+        hex_encode(&local_pub),
+        hex_encode(&static_peer_pk),
+    );
+    std::fs::write(&changed_port_path, &changed_port_content).unwrap();
+    let res = pm.reload_config(Some(changed_port_path.to_str().unwrap()));
+    assert!(res.is_err());
+    assert!(res.unwrap_err().contains("listen port"));
+
+    // Cleanup
+    let _ = std::fs::remove_file(&cfg_path);
+    let _ = std::fs::remove_file(&changed_device_path);
+    let _ = std::fs::remove_file(&changed_port_path);
+}

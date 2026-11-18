@@ -1877,10 +1877,22 @@ impl PeerManager {
             .map_err(|e| format!("failed to parse config file: {e}"))?;
 
         if new_config.local_public != self.local_pub {
-            return Err("cannot change local_public identity via dynamic reload".into());
+            return Err(
+                "cannot change local_public identity via dynamic reload (restart required)".into(),
+            );
         }
         if new_config.local_private != self.local_priv {
-            return Err("cannot change local_private key via dynamic reload".into());
+            return Err(
+                "cannot change local_private key via dynamic reload (restart required)".into(),
+            );
+        }
+        if !self.device_name.is_empty() && new_config.device != self.device_name {
+            return Err(
+                "cannot change device interface via dynamic reload (restart required)".into(),
+            );
+        }
+        if self.listen_port != 0 && new_config.listen.port() != self.listen_port {
+            return Err("cannot change listen port via dynamic reload (restart required)".into());
         }
 
         self.config_path = Some(path.clone());
@@ -1890,11 +1902,12 @@ impl PeerManager {
         let mut removed_peers = 0;
         let mut added_peers = 0;
 
-        // 1. Remove peers that are in self.peers but missing from new_config.peers
+        // 1. Remove static peers that are in self.peers but missing from new_config.peers.
+        // Dynamic mesh peers (admitted via membership gossip or CA roots with is_static: false) are preserved.
         let to_remove: Vec<[u8; 32]> = self
             .peers
             .iter()
-            .filter(|p| !new_config.peers.iter().any(|np| np.public_key == p.pubkey))
+            .filter(|p| p.is_static && !new_config.peers.iter().any(|np| np.public_key == p.pubkey))
             .map(|p| p.pubkey)
             .collect();
 
@@ -1927,8 +1940,10 @@ impl PeerManager {
                 if changed {
                     updated_peers += 1;
                 }
-            } else {
-                let _ = self.add_peer_with_transport(new_peer.clone(), None);
+            } else if self.add_peer_with_transport(new_peer.clone(), None).is_ok() {
+                if let Some(peer) = self.peers.last_mut() {
+                    peer.is_static = true;
+                }
                 added_peers += 1;
             }
         }
@@ -1940,6 +1955,7 @@ impl PeerManager {
 
         // 4. Update dynamic parameters: DAITA
         self.set_traffic_defense(new_config.traffic_defense.clone());
+        self.set_cover_traffic_ms(new_config.cover_traffic_ms);
 
         // 5. Update MTU if configured
         if let Some(mtu) = new_config.mtu {
