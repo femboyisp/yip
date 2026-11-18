@@ -53,6 +53,8 @@ const SINGLE_REMOTE_PEER_ID: u64 = 1;
 const LOCAL_TAP_PEER_ID: u64 = 0;
 const ETHERNET_HEADER_LEN: usize = 14;
 const ETHERNET_SOURCE_MAC_OFFSET: usize = 6;
+const DRAINED_SCRATCH_CAP: usize = 32;
+const SCRATCH_BUFFER_MAX_CAP: usize = 65_536 + 256;
 
 // ── SentLog ───────────────────────────────────────────────────────────────────
 
@@ -400,9 +402,13 @@ impl DataPlane {
             wire_payload_scratch: Vec::new(),
             syn_clamp_buf: Vec::new(),
             reorder_buffer: yip_transport::reorder::ReorderBuffer::default(),
-            tun_drained: (0..32).map(|_| Vec::with_capacity(2048)).collect(),
+            tun_drained: (0..DRAINED_SCRATCH_CAP)
+                .map(|_| Vec::with_capacity(2048))
+                .collect(),
             tun_drained_count: 0,
-            tick_tun_drained: (0..32).map(|_| Vec::with_capacity(2048)).collect(),
+            tick_tun_drained: (0..DRAINED_SCRATCH_CAP)
+                .map(|_| Vec::with_capacity(2048))
+                .collect(),
             tick_tun_drained_count: 0,
         }
     }
@@ -933,6 +939,27 @@ impl DataPlane {
     /// feedback packet was built (the caller must send it to the peer).
     /// Returns `None` if no feedback interval has elapsed.
     pub fn tick(&mut self, now_ms: u64) -> Option<&[yip_io::poll::EgressDatagram]> {
+        if self.tun_drained.len() > DRAINED_SCRATCH_CAP {
+            self.tun_drained.truncate(DRAINED_SCRATCH_CAP);
+            self.tun_drained.shrink_to_fit();
+        }
+        if self.tick_tun_drained.len() > DRAINED_SCRATCH_CAP {
+            self.tick_tun_drained.truncate(DRAINED_SCRATCH_CAP);
+            self.tick_tun_drained.shrink_to_fit();
+        }
+        if self.inner_scratch.capacity() > SCRATCH_BUFFER_MAX_CAP {
+            self.inner_scratch.shrink_to(SCRATCH_BUFFER_MAX_CAP);
+        }
+        if self.control_scratch.capacity() > SCRATCH_BUFFER_MAX_CAP {
+            self.control_scratch.shrink_to(SCRATCH_BUFFER_MAX_CAP);
+        }
+        if self.wire_payload_scratch.capacity() > SCRATCH_BUFFER_MAX_CAP {
+            self.wire_payload_scratch.shrink_to(SCRATCH_BUFFER_MAX_CAP);
+        }
+        if self.syn_clamp_buf.capacity() > SCRATCH_BUFFER_MAX_CAP {
+            self.syn_clamp_buf.shrink_to(SCRATCH_BUFFER_MAX_CAP);
+        }
+
         self.tick_tun_drained_count = 0;
         let tick_drained = &mut self.tick_tun_drained;
         let tick_drained_count = &mut self.tick_tun_drained_count;
@@ -1965,5 +1992,54 @@ mod tests {
         a.set_daita_profile(yip_obf::DaitaProfile::Off, now)
             .unwrap();
         assert!(a.daita_engine().is_none());
+    }
+
+    #[test]
+    fn test_dataplane_tick_trims_oversized_drained_scratch() {
+        let (mut a, _b) = dataplane_pair(TunnelMode::L3Tun, false);
+
+        assert_eq!(a.tun_drained.len(), 32);
+        assert_eq!(a.tick_tun_drained.len(), 32);
+
+        // Artificially grow tun_drained and tick_tun_drained to 64 elements
+        // (simulating a large reorder burst).
+        while a.tun_drained.len() < 64 {
+            a.tun_drained.push(vec![0u8; 1500]);
+        }
+        while a.tick_tun_drained.len() < 64 {
+            a.tick_tun_drained.push(vec![0u8; 1500]);
+        }
+        assert_eq!(a.tun_drained.len(), 64);
+        assert_eq!(a.tick_tun_drained.len(), 64);
+        assert!(a.tun_drained.capacity() >= 64);
+        assert!(a.tick_tun_drained.capacity() >= 64);
+
+        // Expand scratch buffers beyond 65_536 + 256 bytes
+        let oversized_cap = 100_000;
+        a.inner_scratch.reserve(oversized_cap);
+        a.control_scratch.reserve(oversized_cap);
+        a.wire_payload_scratch.reserve(oversized_cap);
+        a.syn_clamp_buf.reserve(oversized_cap);
+        assert!(a.inner_scratch.capacity() >= oversized_cap);
+        assert!(a.control_scratch.capacity() >= oversized_cap);
+        assert!(a.wire_payload_scratch.capacity() >= oversized_cap);
+        assert!(a.syn_clamp_buf.capacity() >= oversized_cap);
+
+        // Trigger tick sweep
+        let now_ms = 1_000;
+        a.tick(now_ms);
+
+        // Verify both are trimmed back to 32 elements and capacity is reclaimed
+        assert_eq!(a.tun_drained.len(), 32);
+        assert_eq!(a.tick_tun_drained.len(), 32);
+        assert_eq!(a.tun_drained.capacity(), 32);
+        assert_eq!(a.tick_tun_drained.capacity(), 32);
+
+        // Verify scratch buffers are shrunk down
+        let max_scratch_cap = 65_536 + 256;
+        assert!(a.inner_scratch.capacity() <= max_scratch_cap);
+        assert!(a.control_scratch.capacity() <= max_scratch_cap);
+        assert!(a.wire_payload_scratch.capacity() <= max_scratch_cap);
+        assert!(a.syn_clamp_buf.capacity() <= max_scratch_cap);
     }
 }

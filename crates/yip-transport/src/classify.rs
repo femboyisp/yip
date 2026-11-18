@@ -68,7 +68,7 @@ impl Classifier {
     pub fn new(rules: Vec<PolicyRule>) -> Self {
         Self {
             rules,
-            flows: FlowTable::new(4096, 30_000),
+            flows: FlowTable::new(1024, 10_000),
         }
     }
 
@@ -95,10 +95,12 @@ impl Classifier {
             _ => {}
         }
         // 3. heuristic: observe this packet, then consult flow history
-        let canonical = p.key.canonical();
-        self.flows.observe(&canonical, inner.len(), now_ms);
-        if let Some(class) = self.flows.classify(&canonical) {
-            return class;
+        if p.key.proto == 6 || p.key.proto == 17 {
+            let canonical = p.key.canonical();
+            self.flows.observe(&canonical, inner.len(), now_ms);
+            if let Some(class) = self.flows.classify(&canonical) {
+                return class;
+            }
         }
         // 4. default
         FlowClass::Default
@@ -108,8 +110,10 @@ impl Classifier {
     /// flow heuristic state without emitting a classification decision.
     pub fn observe_ingress(&mut self, inner: &[u8], l2: bool, now_ms: u64) {
         if let Some(p) = parse_ip(inner, l2) {
-            let canonical = p.key.canonical();
-            self.flows.observe(&canonical, inner.len(), now_ms);
+            if p.key.proto == 6 || p.key.proto == 17 {
+                let canonical = p.key.canonical();
+                self.flows.observe(&canonical, inner.len(), now_ms);
+            }
         }
     }
 }
@@ -365,5 +369,45 @@ mod tests {
 
         // After the 4th packet (2 forward + 2 reverse), the flow heuristic kicks in -> Realtime.
         assert_eq!(c.classify(&fwd, false, 30), FlowClass::Realtime);
+    }
+
+    #[test]
+    fn icmpv6_and_multicast_do_not_populate_flow_table() {
+        let mut c = Classifier::new(vec![]);
+        let make_ipv6 = |proto: u8, dst: [u8; 16]| {
+            let mut p = vec![0u8; 48];
+            p[0] = 0x60; // IPv6, TC 0
+            p[6] = proto;
+            p[8..24].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+            p[24..40].copy_from_slice(&dst);
+            p
+        };
+
+        // ICMPv6 unicast (proto 58)
+        let icmpv6 = make_ipv6(
+            58,
+            [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        );
+        assert_eq!(c.classify(&icmpv6, false, 0), FlowClass::Default);
+        assert!(c.flows.is_empty(), "ICMPv6 must not populate flow table");
+
+        // IPv6 multicast discovery (ff02::1, all-nodes)
+        let mut mcast_dst = [0u8; 16];
+        mcast_dst[0] = 0xff;
+        mcast_dst[1] = 0x02;
+        mcast_dst[15] = 0x01;
+        let mcast_icmp = make_ipv6(58, mcast_dst);
+        assert_eq!(c.classify(&mcast_icmp, false, 10), FlowClass::Default);
+        assert!(
+            c.flows.is_empty(),
+            "multicast ICMPv6 must not populate flow table"
+        );
+
+        // Also test observe_ingress with ICMPv6
+        c.observe_ingress(&icmpv6, false, 20);
+        assert!(
+            c.flows.is_empty(),
+            "observe_ingress on ICMPv6 must not populate flow table"
+        );
     }
 }
