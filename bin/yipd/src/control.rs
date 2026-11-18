@@ -930,14 +930,22 @@ pub fn dispatch_cmd(
                 qr_terminal,
             }
         }
-        ControlCmd::Reload { .. } => ControlResponse::Err {
-            ok: false,
-            error: "reload not implemented in this milestone".to_string(),
+        ControlCmd::Reload { path } => match pm.reload_config(path.as_deref()) {
+            Ok(report) => ControlResponse::Reload {
+                ok: true,
+                message: report.summary(),
+                reloaded: true,
+            },
+            Err(e) => ControlResponse::Reload {
+                ok: false,
+                message: e,
+                reloaded: false,
+            },
         },
-        ControlCmd::GetConfig => ControlResponse::Err {
-            ok: false,
-            error: "get_config not implemented in this milestone".to_string(),
-        },
+        ControlCmd::GetConfig => {
+            let config = pm.get_active_config();
+            ControlResponse::Config { ok: true, config }
+        }
     }
 }
 
@@ -2299,6 +2307,98 @@ pub fn run_cli_top(socket_path: &Path, interval_ms: u64) -> Result<(), String> {
 
         let _ = std::io::stdout().flush();
         std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+    }
+}
+
+/// Dynamically reload daemon configuration from disk.
+pub fn run_cli_reload(
+    socket_path: &Path,
+    custom_path: Option<&str>,
+    json: bool,
+) -> std::io::Result<()> {
+    let cmd = ControlCmd::Reload {
+        path: custom_path.map(|s| s.to_string()),
+    };
+    let resp = client_query(socket_path, cmd).map_err(std::io::Error::other)?;
+    if json {
+        let text = serde_json::to_string_pretty(&resp).map_err(std::io::Error::other)?;
+        println!("{text}");
+        return Ok(());
+    }
+    match resp {
+        ControlResponse::Reload { ok, message, .. } => {
+            if ok {
+                println!("{message}");
+                Ok(())
+            } else {
+                Err(std::io::Error::other(message))
+            }
+        }
+        ControlResponse::Err { error, .. } => Err(std::io::Error::other(error)),
+        other => Err(std::io::Error::other(format!(
+            "unexpected response: {other:?}"
+        ))),
+    }
+}
+
+/// Inspect active running daemon configuration.
+pub fn run_cli_config(socket_path: &Path, json: bool) -> std::io::Result<()> {
+    let resp = client_query(socket_path, ControlCmd::GetConfig).map_err(std::io::Error::other)?;
+    if json {
+        let text = serde_json::to_string_pretty(&resp).map_err(std::io::Error::other)?;
+        println!("{text}");
+        return Ok(());
+    }
+    match resp {
+        ControlResponse::Config { ok, config } => {
+            if !ok {
+                return Err(std::io::Error::other("failed to retrieve daemon config"));
+            }
+            println!("\x1b[1;32m●\x1b[0m \x1b[1mActive Daemon Configuration\x1b[0m");
+            println!("  Device:     \x1b[1m{}\x1b[0m", config.device);
+            if let Some(ref pk) = config.public_key {
+                println!("  Public Key: \x1b[33m{}\x1b[0m", pk);
+            }
+            if let Some(ref l) = config.listen {
+                println!("  Listen:     {}", l);
+            }
+            if let Some(ref rdv) = config.rendezvous {
+                println!("  Rendezvous: {}", rdv);
+            }
+            if let Some(ref nid) = config.network_id {
+                println!("  Network ID: {}", nid);
+            }
+            if let Some(ref fec) = config.fec {
+                println!(
+                    "  FEC:        preset={} redundancy={}% shards={}+{}",
+                    fec.preset, fec.redundancy_pct, fec.data_shards, fec.parity_shards
+                );
+            }
+            if let Some(ref daita) = config.daita {
+                println!(
+                    "  DAITA:      preset={} buckets={:?} burst_max={} jitter={}ms",
+                    daita.preset, daita.buckets, daita.cover_burst_max, daita.jitter_max_ms
+                );
+            }
+            if let Some(ref st) = config.split_tunnel {
+                println!("  Split:      enabled={} mode={}", st.enabled, st.mode);
+            }
+            println!("  Peers ({}):", config.peers.len());
+            for p in &config.peers {
+                let alias = p.alias.as_deref().unwrap_or("-");
+                let ep = p.endpoint.as_deref().unwrap_or("-");
+                let tr = p.transport.as_deref().unwrap_or("-");
+                println!(
+                    "    • {} alias={} endpoint={} transport={}",
+                    p.public_key, alias, ep, tr
+                );
+            }
+            Ok(())
+        }
+        ControlResponse::Err { error, .. } => Err(std::io::Error::other(error)),
+        other => Err(std::io::Error::other(format!(
+            "unexpected response: {other:?}"
+        ))),
     }
 }
 
@@ -3886,5 +3986,87 @@ mod tests {
         // Nonexistent socket fails cleanly
         assert!(run_cli_xdp_status(Path::new("/tmp/nonexistent_xdp.sock"), false).is_err());
         assert!(run_cli_xdp_set(Path::new("/tmp/nonexistent_xdp.sock"), "native", false).is_err());
+    }
+
+    #[test]
+    fn test_cli_reload_and_config() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let sock_path = format!("/tmp/test_cli_reload_config_{}.sock", std::process::id());
+        let _ = std::fs::remove_file(&sock_path);
+
+        let handle = ControlHandle::bind(&sock_path).unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let r_clone = running.clone();
+
+        let srv = std::thread::spawn(move || {
+            while r_clone.load(Ordering::Relaxed) {
+                if let Ok(req) = handle.try_recv() {
+                    let resp = match req.cmd {
+                        ControlCmd::GetConfig => ControlResponse::Config {
+                            ok: true,
+                            config: yip_proto::control::DaemonConfig {
+                                device: "yip0".into(),
+                                listen: Some("0.0.0.0:51820".into()),
+                                public_key: Some("aa".repeat(32)),
+                                rendezvous: Some("127.0.0.1:443".into()),
+                                network_id: Some("01".repeat(16)),
+                                peers: vec![yip_proto::control::PeerConfigEntry {
+                                    public_key: "bb".repeat(32),
+                                    endpoint: Some("10.0.0.2:51820".into()),
+                                    alias: Some("peer-b".into()),
+                                    transport: Some("raw".into()),
+                                }],
+                                fec: Some(yip_proto::control::FecConfig::default()),
+                                daita: Some(yip_proto::control::DaitaConfig::default()),
+                                split_tunnel: Some(yip_proto::control::SplitTunnelConfig::default()),
+                            },
+                        },
+                        ControlCmd::Reload { path } => ControlResponse::Reload {
+                            ok: true,
+                            message: format!(
+                                "configuration reloaded from {}: 1 peers added, 0 peers removed, 0 peers updated, 1 sessions preserved",
+                                path.unwrap_or_else(|| "default.conf".into())
+                            ),
+                            reloaded: true,
+                        },
+                        _ => ControlResponse::Err {
+                            ok: false,
+                            error: "unexpected cmd".into(),
+                        },
+                    };
+                    let _ = req.responder.send(resp);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let path = Path::new(&sock_path);
+
+        // Test config ANSI
+        let res_cfg_ansi = run_cli_config(path, false);
+        assert!(res_cfg_ansi.is_ok());
+
+        // Test config JSON
+        let res_cfg_json = run_cli_config(path, true);
+        assert!(res_cfg_json.is_ok());
+
+        // Test reload ANSI
+        let res_reload_ansi = run_cli_reload(path, Some("/etc/yip/yip0.conf"), false);
+        assert!(res_reload_ansi.is_ok());
+
+        // Test reload JSON
+        let res_reload_json = run_cli_reload(path, None, true);
+        assert!(res_reload_json.is_ok());
+
+        running.store(false, Ordering::Relaxed);
+        let _ = srv.join();
+        let _ = std::fs::remove_file(&sock_path);
+
+        // Nonexistent socket fails cleanly
+        assert!(run_cli_config(Path::new("/tmp/nonexistent_cfg.sock"), false).is_err());
+        assert!(run_cli_reload(Path::new("/tmp/nonexistent_cfg.sock"), None, false).is_err());
     }
 }

@@ -494,6 +494,33 @@ pub struct PeerManager {
     metrics: std::sync::Arc<crate::metrics::MetricsRegistry>,
     /// Monotonic timestamp in milliseconds of the last cached metrics peer stats update.
     last_metrics_update_ms: u64,
+    /// Path to the configuration file on disk from which the daemon was loaded.
+    config_path: Option<std::path::PathBuf>,
+    /// Configured TUN device MTU.
+    mtu: u32,
+}
+
+/// Summary report returned after a dynamic configuration reload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReloadReport {
+    pub path: std::path::PathBuf,
+    pub added_peers: usize,
+    pub removed_peers: usize,
+    pub updated_peers: usize,
+    pub preserved_peers: usize,
+}
+
+impl ReloadReport {
+    pub fn summary(&self) -> String {
+        format!(
+            "configuration reloaded from {}: {} peers added, {} peers removed, {} peers updated, {} sessions preserved",
+            self.path.display(),
+            self.added_peers,
+            self.removed_peers,
+            self.updated_peers,
+            self.preserved_peers,
+        )
+    }
 }
 
 /// Dynamic DAITA traffic analysis defense runtime metrics.
@@ -645,6 +672,8 @@ impl PeerManager {
             xdp_state: crate::control::XdpState::default(),
             metrics: std::sync::Arc::new(crate::metrics::MetricsRegistry::new()),
             last_metrics_update_ms: 0,
+            config_path: None,
+            mtu: 1420,
         };
 
         // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
@@ -1385,6 +1414,26 @@ impl PeerManager {
         self.listen_port = port;
     }
 
+    /// Set the path to the daemon configuration file.
+    pub fn set_config_path(&mut self, path: Option<std::path::PathBuf>) {
+        self.config_path = path;
+    }
+
+    /// Return the path to the daemon configuration file, if set.
+    pub fn config_path(&self) -> Option<&std::path::Path> {
+        self.config_path.as_deref()
+    }
+
+    /// Set the device MTU.
+    pub fn set_mtu(&mut self, mtu: u32) {
+        self.mtu = mtu;
+    }
+
+    /// Return the device MTU.
+    pub fn mtu(&self) -> u32 {
+        self.mtu
+    }
+
     /// Return the local public key as a 64-character lowercase hex string.
     pub fn local_pub_hex(&self) -> String {
         self.local_pub.iter().map(|b| format!("{b:02x}")).collect()
@@ -1440,11 +1489,9 @@ impl PeerManager {
         &mut self,
         cmd: crate::control::ControlCmd,
     ) -> crate::control::ControlResponse {
-        let device_name = std::mem::take(&mut self.device_name);
+        let device_name = self.device_name.clone();
         let start_time = self.start_time;
-        let resp = crate::control::dispatch_cmd(self, cmd, &device_name, start_time);
-        self.device_name = device_name;
-        resp
+        crate::control::dispatch_cmd(self, cmd, &device_name, start_time)
     }
 
     /// Configure online Threshold CA coordinator address for automated 70% TTL certificate rotation.
@@ -1811,6 +1858,161 @@ impl PeerManager {
 
         self.metrics.update_peer_stats(self.list_peers());
         Ok(())
+    }
+
+    /// Dynamically reload daemon configuration from disk, updating dynamic parameters
+    /// (peers, endpoints, aliases, FEC, DAITA, MTU) and preserving established sessions.
+    pub fn reload_config(&mut self, custom_path: Option<&str>) -> Result<ReloadReport, String> {
+        let path = match custom_path {
+            Some(p) => std::path::PathBuf::from(p),
+            None => match &self.config_path {
+                Some(p) => p.clone(),
+                None => return Err("no config file specified or previously loaded".into()),
+            },
+        };
+
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read config file {}: {e}", path.display()))?;
+        let new_config = crate::config::Config::parse(&text)
+            .map_err(|e| format!("failed to parse config file: {e}"))?;
+
+        if new_config.local_public != self.local_pub {
+            return Err("cannot change local_public identity via dynamic reload".into());
+        }
+        if new_config.local_private != self.local_priv {
+            return Err("cannot change local_private key via dynamic reload".into());
+        }
+
+        self.config_path = Some(path.clone());
+
+        let mut preserved_peers = 0;
+        let mut updated_peers = 0;
+        let mut removed_peers = 0;
+        let mut added_peers = 0;
+
+        // 1. Remove peers that are in self.peers but missing from new_config.peers
+        let to_remove: Vec<[u8; 32]> = self
+            .peers
+            .iter()
+            .filter(|p| !new_config.peers.iter().any(|np| np.public_key == p.pubkey))
+            .map(|p| p.pubkey)
+            .collect();
+
+        for pk in to_remove {
+            if self.remove_peer(&pk).is_ok() {
+                removed_peers += 1;
+            }
+        }
+
+        // 2. Update existing peers and add new peers
+        for new_peer in &new_config.peers {
+            if let Some(idx) = self
+                .peers
+                .iter()
+                .position(|p| p.pubkey == new_peer.public_key)
+            {
+                preserved_peers += 1;
+                let mut changed = false;
+                if self.peers[idx].endpoint != new_peer.endpoint {
+                    self.peers[idx].endpoint = new_peer.endpoint;
+                    if let Some(ep) = new_peer.endpoint {
+                        self.peers[idx].path.on_direct_addr(ep);
+                    }
+                    changed = true;
+                }
+                if self.peers[idx].alias != new_peer.alias {
+                    self.peers[idx].alias = new_peer.alias.clone();
+                    changed = true;
+                }
+                if changed {
+                    updated_peers += 1;
+                }
+            } else {
+                let _ = self.add_peer_with_transport(new_peer.clone(), None);
+                added_peers += 1;
+            }
+        }
+
+        // 3. Update dynamic parameters: FEC
+        if let Some(fec) = new_config.fec {
+            self.set_fec_config(fec);
+        }
+
+        // 4. Update dynamic parameters: DAITA
+        self.set_traffic_defense(new_config.traffic_defense.clone());
+
+        // 5. Update MTU if configured
+        if let Some(mtu) = new_config.mtu {
+            self.mtu = mtu;
+        }
+
+        self.metrics.update_peer_stats(self.list_peers());
+
+        Ok(ReloadReport {
+            path,
+            added_peers,
+            removed_peers,
+            updated_peers,
+            preserved_peers,
+        })
+    }
+
+    /// Returns the active running daemon configuration.
+    pub fn get_active_config(&self) -> yip_proto::control::DaemonConfig {
+        let peers = self
+            .peers
+            .iter()
+            .map(|p| yip_proto::control::PeerConfigEntry {
+                public_key: crate::config::hex_encode(&p.pubkey),
+                endpoint: p.endpoint.map(|e| e.to_string()),
+                alias: p.alias.clone(),
+                transport: p.transport_name.clone(),
+            })
+            .collect();
+
+        let daita_preset = match self.traffic_defense.preset {
+            yip_obf::TrafficDefensePreset::Off => yip_proto::control::DaitaPreset::Off,
+            yip_obf::TrafficDefensePreset::Balanced => yip_proto::control::DaitaPreset::Balanced,
+            yip_obf::TrafficDefensePreset::Paranoid => yip_proto::control::DaitaPreset::Paranoid,
+        };
+
+        let daita = Some(yip_proto::control::DaitaConfig {
+            preset: daita_preset,
+            buckets: self.traffic_defense.buckets.clone(),
+            cover_interval_ms: self.traffic_defense.cover_interval_ms,
+            cover_burst_max: self.traffic_defense.cover_burst_max,
+            jitter_max_ms: self.traffic_defense.jitter_max_ms,
+        });
+
+        let rendezvous = self
+            .rendezvous
+            .as_ref()
+            .map(|r| r.server_addr().to_string());
+
+        let net_id = self.network_id_hex();
+        let network_id = if net_id.is_empty() {
+            None
+        } else {
+            Some(net_id)
+        };
+
+        let listen = if self.listen_port > 0 {
+            Some(format!("0.0.0.0:{}", self.listen_port))
+        } else {
+            None
+        };
+
+        yip_proto::control::DaemonConfig {
+            device: self.device_name.clone(),
+            listen,
+            public_key: Some(self.local_pub_hex()),
+            rendezvous,
+            network_id,
+            peers,
+            fec: Some(self.fec_config),
+            daita,
+            split_tunnel: Some(self.split_tunnel.config()),
+        }
     }
 
     /// Retrieve summary status telemetry for all known peers.

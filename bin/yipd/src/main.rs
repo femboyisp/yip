@@ -285,12 +285,34 @@ fn print_cli_usage(subcmd: &str) {
             println!("      --json              Output raw JSON");
             println!("  -h, --help              Print help");
         }
+        "reload" => {
+            println!("Usage: yipctl reload [CONFIG_FILE] [OPTIONS]");
+            println!();
+            println!("Dynamically reload daemon configuration from disk without network downtime.");
+            println!();
+            println!("Options:");
+            println!("  -c, --control <SOCKET>  Path to yipd UNIX control socket");
+            println!("      --json              Output raw JSON");
+            println!("  -h, --help              Print help");
+        }
+        "config" => {
+            println!("Usage: yipctl config [get] [OPTIONS]");
+            println!();
+            println!("Inspect active running daemon configuration.");
+            println!();
+            println!("Options:");
+            println!("  -c, --control <SOCKET>  Path to yipd UNIX control socket");
+            println!("      --json              Output raw JSON");
+            println!("  -h, --help              Print help");
+        }
         _ => {
             println!("Usage: yipctl <COMMAND> [OPTIONS]");
             println!();
             println!("Commands:");
             println!("  status    Display daemon status and summary");
             println!("  peers     List connected peers and statistics");
+            println!("  config    Inspect active running daemon configuration");
+            println!("  reload    Reload daemon configuration dynamically from file");
             println!("  crypto    Inspect active crypto session states or trigger rekeying");
             println!("  xdp       Inspect eBPF XDP telemetry or configure hardware offload mode");
             println!("  metrics   Display runtime metrics and telemetry");
@@ -934,6 +956,11 @@ fn run_client_subcommand(
                 }
             }
         }
+        "reload" => {
+            let custom_path = positional.first().map(|s| s.as_str());
+            control::run_cli_reload(&socket, custom_path, json)
+        }
+        "config" => control::run_cli_config(&socket, json),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("unknown subcommand: {subcmd}"),
@@ -1073,6 +1100,8 @@ fn main() -> std::io::Result<()> {
             Some("metrics") => return run_client_subcommand("metrics", args),
             Some("crypto") => return run_client_subcommand("crypto", args),
             Some("xdp") => return run_client_subcommand("xdp", args),
+            Some("reload") => return run_client_subcommand("reload", args),
+            Some("config") => return run_client_subcommand("config", args),
             Some("genkey") | Some("--genkey") => {
                 let kp = yip_crypto::generate_keypair();
                 println!("private={}", hex_encode(&kp.private));
@@ -1130,6 +1159,8 @@ fn main() -> std::io::Result<()> {
         Some("metrics") => run_client_subcommand("metrics", args),
         Some("crypto") => run_client_subcommand("crypto", args),
         Some("xdp") => run_client_subcommand("xdp", args),
+        Some("reload") => run_client_subcommand("reload", args),
+        Some("config") => run_client_subcommand("config", args),
         Some("--version") | Some("-V") => {
             println!("{}", banner());
             Ok(())
@@ -1180,6 +1211,7 @@ fn main() -> std::io::Result<()> {
 
             let text = std::fs::read_to_string(path)?;
             let mut config = Config::parse(&text)?;
+            config.config_path = Some(std::path::PathBuf::from(path));
             if let Some(sock_path) = overrides.control {
                 config.control_socket = Some(sock_path);
             }
