@@ -1911,10 +1911,10 @@ mod tests {
         // Independently computed expected chunk count — deliberately does NOT
         // call `max_gso_datagrams_for_segment` (the function under test). These
         // literals mirror the module constants MAX_UDP_PAYLOAD (65507),
-        // MAX_GSO_SEGMENTS_PER_SEND (32), and MAX_GSO_DATAGRAMS (64); keep them in
+        // MAX_GSO_SEGMENTS_PER_SEND (32), and MAX_GSO_DATAGRAMS (128); keep them in
         // sync with the constants by hand if those change.
         let mtu_cap = 65_507_usize / datagram_size;
-        let max_chunk = mtu_cap.min(32).min(64);
+        let max_chunk = mtu_cap.min(32).min(128);
         let expected_submissions = datagram_count.div_ceil(max_chunk);
         assert!(expected_submissions >= 2, "test should exercise chunking");
         assert!(

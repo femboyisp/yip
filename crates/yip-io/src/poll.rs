@@ -395,7 +395,7 @@ pub fn drain_tun(
 /// Holds the OS-level header structures (`mmsghdr`, `iovec`, `sockaddr_storage`,
 /// and `socklen_t`) for up to [`MAX_DATAGRAM_BATCH`] datagrams. Pre-allocating and
 /// boxing this arena once at initialization eliminates allocating and zeroing
-/// ~13.5 KB on the stack on every I/O burst.
+/// ~27 KB on the stack on every I/O burst.
 #[repr(C)]
 pub struct MmsgBatchArena {
     pub msgs: [libc::mmsghdr; MAX_DATAGRAM_BATCH],
@@ -408,7 +408,7 @@ impl MmsgBatchArena {
     /// Creates a zeroed `MmsgBatchArena` on the stack.
     ///
     /// For hot-path event loops, prefer [`MmsgBatchArena::new_boxed`] to avoid
-    /// allocating ~13.5 KB on the stack even during startup.
+    /// allocating ~27 KB on the stack even during startup.
     pub fn new() -> Self {
         // SAFETY: `MmsgBatchArena` consists entirely of plain-old-data structs
         // (`libc::mmsghdr`, `libc::iovec`, `libc::sockaddr_storage`, `libc::socklen_t`)
@@ -629,7 +629,7 @@ pub fn send_mmsg(
         libc::sendmmsg(
             udp_fd,
             arena.msgs.as_mut_ptr(),
-            u32::try_from(count).expect("count ≤ 64 fits u32"),
+            u32::try_from(count).expect("count ≤ MAX_DATAGRAM_BATCH ≤ 128 fits u32"),
             libc::MSG_NOSIGNAL as crate::MsgFlags,
         )
     };
@@ -807,7 +807,7 @@ pub fn recv_mmsg(
         libc::recvmmsg(
             udp_fd,
             arena.msgs.as_mut_ptr(),
-            u32::try_from(count).expect("count ≤ 64 fits u32"),
+            u32::try_from(count).expect("count ≤ MAX_DATAGRAM_BATCH ≤ 128 fits u32"),
             flags,
             std::ptr::null_mut(),
         )

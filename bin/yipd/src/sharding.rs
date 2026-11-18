@@ -870,9 +870,11 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                 let mut auto_poller = AutoTunedPoller::new(min_spin_us, max_spin_us);
 
                 let mut batch_sock = yip_io::batch::BatchUdpSocket::new(&sock);
-                let mut rx_buffers = [[0u8; yip_io::MAX_WIRE_DATAGRAM]; yip_io::batch::BATCH_SIZE];
-                let mut rx_datagrams =
-                    [const { yip_io::batch::ReceivedDatagram::empty() }; yip_io::batch::BATCH_SIZE];
+                let mut rx_buffers =
+                    Box::new([[0u8; yip_io::MAX_WIRE_DATAGRAM]; yip_io::batch::BATCH_SIZE_64]);
+                let mut rx_datagrams = Box::new(
+                    [const { yip_io::batch::ReceivedDatagram::empty() }; yip_io::batch::BATCH_SIZE_64],
+                );
                 let tun_buf_len = if vnet_len > 0 {
                     vnet_len + 65536
                 } else {

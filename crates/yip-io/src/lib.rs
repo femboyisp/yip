@@ -69,7 +69,7 @@ pub(crate) fn empty_mmsghdr() -> libc::mmsghdr {
 }
 
 /// Maximum number of datagrams in a single batched send/recv call.
-pub const MAX_DATAGRAM_BATCH: usize = 64;
+pub const MAX_DATAGRAM_BATCH: usize = 128;
 
 /// Maximum size (bytes) of a single wire datagram. 2 KiB is ample for any
 /// encapsulated MTU-1500 payload plus yip-wire framing overhead.
@@ -233,7 +233,7 @@ impl DataPlaneIo for PlainIo {
         }
 
         // Build parallel arrays of iovec + mmsghdr.  We cap at MAX_DATAGRAM_BATCH
-        // to keep these stack arrays reasonably sized (64 × small structs).
+        // to keep these stack arrays reasonably sized (128 × small structs).
         let count = datagrams.len().min(MAX_DATAGRAM_BATCH);
 
         // iovec[i] points into the caller-owned slice datagrams[i]; the slices
@@ -266,7 +266,7 @@ impl DataPlaneIo for PlainIo {
             libc::sendmmsg(
                 self.socket.as_raw_fd(),
                 msgs.as_mut_ptr(),
-                u32::try_from(count).expect("count ≤ MAX_DATAGRAM_BATCH ≤ 64 fits u32"),
+                u32::try_from(count).expect("count ≤ MAX_DATAGRAM_BATCH ≤ 128 fits u32"),
                 libc::MSG_NOSIGNAL as MsgFlags,
             )
         };
@@ -320,7 +320,7 @@ impl DataPlaneIo for PlainIo {
             libc::recvmmsg(
                 self.socket.as_raw_fd(),
                 msgs.as_mut_ptr(),
-                u32::try_from(count).expect("count ≤ MAX_DATAGRAM_BATCH ≤ 64 fits u32"),
+                u32::try_from(count).expect("count ≤ MAX_DATAGRAM_BATCH ≤ 128 fits u32"),
                 libc::MSG_WAITFORONE as MsgFlags,
                 std::ptr::null_mut(),
             )
