@@ -379,6 +379,11 @@ impl MetricsRegistry {
         out.push_str("# TYPE yip_traffic_dropped_packets_total counter\n");
         let _ = writeln!(out, "yip_traffic_dropped_packets_total {dropped_packets}");
 
+        let spsc_drops = crate::sharding::SPSC_QUEUE_DROPS.load(Ordering::Relaxed);
+        out.push_str("# HELP yip_spsc_queue_drops_total Total datagrams dropped due to cross-shard ring buffer overflow\n");
+        out.push_str("# TYPE yip_spsc_queue_drops_total counter\n");
+        let _ = writeln!(out, "yip_spsc_queue_drops_total {spsc_drops}");
+
         // Per-peer metrics
         if !peer_stats.is_empty() {
             out.push_str("# HELP yip_peer_tx_bytes_total Transmitted bytes per peer\n");
@@ -776,6 +781,30 @@ mod tests {
         assert!(rendered.contains("yip_crypto_handshakes_total 1"));
         assert!(rendered.contains("yip_crypto_rekeys_total 1"));
         assert!(rendered.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_prometheus_exposition_spsc_queue_drops() {
+        let registry = MetricsRegistry::new();
+
+        // Increment drop counter
+        let prev = crate::sharding::SPSC_QUEUE_DROPS.load(Ordering::Relaxed);
+        crate::sharding::SPSC_QUEUE_DROPS.fetch_add(15, Ordering::Relaxed);
+
+        let rendered = registry.render_prometheus(&[]);
+        assert!(
+            rendered.contains("# HELP yip_spsc_queue_drops_total Total datagrams dropped due to cross-shard ring buffer overflow\n"),
+            "Prometheus output missing HELP for yip_spsc_queue_drops_total"
+        );
+        assert!(
+            rendered.contains("# TYPE yip_spsc_queue_drops_total counter\n"),
+            "Prometheus output missing TYPE counter for yip_spsc_queue_drops_total"
+        );
+        let expected_line = format!("yip_spsc_queue_drops_total {}\n", prev + 15);
+        assert!(
+            rendered.contains(&expected_line),
+            "Prometheus output missing expected metric line: {expected_line}"
+        );
     }
 
     #[test]
