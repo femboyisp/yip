@@ -150,7 +150,7 @@ pub fn shard_for_fec_control(payload: &[u8], num_shards: usize) -> Option<usize>
 use std::io;
 use std::net::ToSocketAddrs;
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use yip_io::af_xdp::{
     FillRing, UmemPool, UmemPoolConfig, XskBindMode, XskDesc, XskSocket, UMEM_RING_SIZE,
@@ -184,6 +184,23 @@ pub struct SessionEpochMsg {
 
 /// Backwards-compatible alias for cross-shard packet messages.
 pub type OutboundPacket = ShardMsg;
+
+/// Global atomic counter for cross-shard SPSC ring drops on queue overflow.
+pub static SPSC_QUEUE_DROPS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn push_spsc<const CAP: usize>(
+    tx: &yip_io::spsc::SpscProducer<OutboundPacket, CAP>,
+    msg: OutboundPacket,
+) -> bool {
+    match tx.push(msg) {
+        Ok(()) => true,
+        Err(_) => {
+            SPSC_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
+}
 
 /// Coalesced timer for 20 Hz cadence ticks under multi-core packet traffic.
 #[derive(Debug, Clone)]
@@ -658,18 +675,18 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
         crate::port::bind_udp_reuseport(config.listen, config.listen_port_auto, num_shards)?;
 
     // Set up N x (N - 1) SPSC ring buffer matrix
-    let mut tx_matrix: Vec<Vec<Option<yip_io::spsc::SpscProducer<OutboundPacket, 2048>>>> = (0
+    let mut tx_matrix: Vec<Vec<Option<yip_io::spsc::SpscProducer<OutboundPacket, 8192>>>> = (0
         ..num_shards)
         .map(|_| (0..num_shards).map(|_| None).collect())
         .collect();
-    let mut rx_matrix: Vec<Vec<yip_io::spsc::SpscConsumer<OutboundPacket, 2048>>> = (0..num_shards)
+    let mut rx_matrix: Vec<Vec<yip_io::spsc::SpscConsumer<OutboundPacket, 8192>>> = (0..num_shards)
         .map(|_| Vec::with_capacity(num_shards.saturating_sub(1)))
         .collect();
 
     for (i, row) in tx_matrix.iter_mut().enumerate() {
         for k in 0..num_shards {
             if i != k {
-                let (tx, rx) = yip_io::spsc::spsc_pair::<OutboundPacket, 2048>();
+                let (tx, rx) = yip_io::spsc::spsc_pair::<OutboundPacket, 8192>();
                 row[k] = Some(tx);
                 rx_matrix[k].push(rx);
             }
@@ -885,7 +902,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                 let mut split_offs = Vec::new();
                 let start = std::time::Instant::now();
                 let mut cached_now_ms: u64 = 0;
-                let mut spsc_batch = Vec::new();
+                let mut spsc_batch = Vec::with_capacity(128);
                 let mut tun_batch = Vec::new();
                 let mut drained_jitter = Vec::with_capacity(32);
                 let mut egress_batch = Vec::with_capacity(32);
@@ -950,10 +967,13 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                                     || payload[0] == crate::handshake::PacketType::HandshakeResp as u8);
                                             if shard_id != 0 && is_hs {
                                                 if let Some(Some(ref tx)) = tx_channels.first() {
-                                                    let _ = tx.push(ShardMsg::HandshakeForward(
-                                                        payload.to_vec(),
-                                                        dg.src,
-                                                    ));
+                                                    push_spsc(
+                                                        tx,
+                                                        ShardMsg::HandshakeForward(
+                                                            payload.to_vec(),
+                                                            dg.src,
+                                                        ),
+                                                    );
                                                 }
                                                 continue;
                                             }
@@ -968,13 +988,13 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                                         if let Some(Some(ref tx)) =
                                                             tx_channels.get(target_shard)
                                                         {
-                                                            if tx
-                                                                .push(ShardMsg::ArqFeedback(
+                                                            if push_spsc(
+                                                                tx,
+                                                                ShardMsg::ArqFeedback(
                                                                     payload.to_vec(),
                                                                     dg.src,
-                                                                ))
-                                                                .is_ok()
-                                                            {
+                                                                ),
+                                                            ) {
                                                                 continue;
                                                             }
                                                         }
@@ -996,7 +1016,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                                 for epoch in manager.drain_new_epochs() {
                                                     for k in 1..num_shards {
                                                         if let Some(Some(ref tx)) = tx_channels.get(k) {
-                                                            let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
+                                                            push_spsc(tx, ShardMsg::SessionEpoch(epoch.clone()));
                                                         }
                                                     }
                                                 }
@@ -1038,20 +1058,25 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                                             .get(target_shard)
                                                             .and_then(|opt| opt.as_ref())
                                                             .is_some_and(|tx| {
-                                                                tx.push(ShardMsg::ArqFeedback(
-                                                                    payload.to_vec(),
-                                                                    cfg.listen,
-                                                                ))
-                                                                .is_ok()
+                                                                push_spsc(
+                                                                    tx,
+                                                                    ShardMsg::ArqFeedback(
+                                                                        payload.to_vec(),
+                                                                        cfg.listen,
+                                                                    ),
+                                                                )
                                                             })
                                                 },
                                             );
                                         if shard_id != 0 && is_hs {
                                             if let Some(Some(ref tx)) = tx_channels.first() {
-                                                let _ = tx.push(ShardMsg::HandshakeForward(
-                                                    payload.to_vec(),
-                                                    cfg.listen,
-                                                ));
+                                                push_spsc(
+                                                    tx,
+                                                    ShardMsg::HandshakeForward(
+                                                        payload.to_vec(),
+                                                        cfg.listen,
+                                                    ),
+                                                );
                                             }
                                         } else if forwarded_ctrl {
                                             // Forwarded to target worker shard via SPSC
@@ -1070,7 +1095,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                                 for epoch in manager.drain_new_epochs() {
                                                     for k in 1..num_shards {
                                                         if let Some(Some(ref tx)) = tx_channels.get(k) {
-                                                            let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
+                                                            push_spsc(tx, ShardMsg::SessionEpoch(epoch.clone()));
                                                         }
                                                     }
                                                 }
@@ -1096,7 +1121,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                             |pkt: &[u8],
                              mgr: &mut crate::peer_manager::PeerManager,
                              tx_chans: &[Option<
-                                yip_io::spsc::SpscProducer<OutboundPacket, 2048>,
+                                yip_io::spsc::SpscProducer<OutboundPacket, 8192>,
                             >],
                              egress_buf: &mut Vec<yip_io::poll::EgressDatagram>,
                              gso_scratch: &mut yip_io::poll::GsoScratch| {
@@ -1122,12 +1147,12 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                         for epoch in mgr.drain_new_epochs() {
                                             for k in 1..num_shards {
                                                 if let Some(Some(ref tx)) = tx_chans.get(k) {
-                                                    let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
+                                                    push_spsc(tx, ShardMsg::SessionEpoch(epoch.clone()));
                                                 }
                                             }
                                         }
                                     } else if let Some(Some(ref tx)) = tx_chans.first() {
-                                        let _ = tx.push(ShardMsg::Packet(pkt.to_vec()));
+                                        push_spsc(tx, ShardMsg::Packet(pkt.to_vec()));
                                     }
                                     return;
                                 }
@@ -1229,126 +1254,133 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
 
                     // 3. Drain incoming SPSC inboxes
                     for rx in &rx_channels {
-                        spsc_batch.clear();
-                        rx.drain_batch(&mut spsc_batch, 64);
-                        packets_this_iter = packets_this_iter.wrapping_add(spsc_batch.len() as u64);
-                        for msg in &spsc_batch {
-                            match msg {
-                                ShardMsg::Packet(pkt) => {
-                                    if !manager.is_tun_target_established(pkt) {
+                        let mut drained_total: usize = 0;
+                        while drained_total < 512 {
+                            spsc_batch.clear();
+                            let count = rx.drain_batch(&mut spsc_batch, 128);
+                            if count == 0 {
+                                break;
+                            }
+                            drained_total = drained_total.saturating_add(count);
+                            packets_this_iter = packets_this_iter.wrapping_add(count as u64);
+                            for msg in &spsc_batch {
+                                match msg {
+                                    ShardMsg::Packet(pkt) => {
+                                        if !manager.is_tun_target_established(pkt) {
+                                            if shard_id == 0 {
+                                                let egress = manager.on_tun(pkt, cached_now_ms);
+                                                egress_batch.clear();
+                                                egress_batch.extend_from_slice(egress);
+                                                let send_fd = if let Some(first_dg) = egress_batch.first() {
+                                                    select_egress_socket(
+                                                        &sock,
+                                                        &egress_pool,
+                                                        pkt,
+                                                        is_tap,
+                                                        first_dg.dst,
+                                                    )
+                                                    .as_raw_fd()
+                                                } else {
+                                                    sock_fd
+                                                };
+                                                let _ = yip_io::poll::flush_tx(send_fd, &mut egress_batch, &mut gso);
+                                                manager.recycle(&mut gso.recycle);
+                                                for epoch in manager.drain_new_epochs() {
+                                                    for k in 1..num_shards {
+                                                        if let Some(Some(ref tx)) = tx_channels.get(k) {
+                                                            push_spsc(tx, ShardMsg::SessionEpoch(epoch.clone()));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            manager.on_tun_into(pkt, cached_now_ms, &mut egress_batch);
+                                            if egress_batch.len() >= yip_io::batch::BATCH_SIZE {
+                                                let send_fd = if let Some(first_dg) = egress_batch.first() {
+                                                    select_egress_socket(
+                                                        &sock,
+                                                        &egress_pool,
+                                                        pkt,
+                                                        is_tap,
+                                                        first_dg.dst,
+                                                    )
+                                                    .as_raw_fd()
+                                                } else {
+                                                    sock_fd
+                                                };
+                                                let _ = yip_io::poll::flush_tx(send_fd, &mut egress_batch, &mut gso);
+                                                manager.recycle(&mut gso.recycle);
+                                            }
+                                        }
                                         if shard_id == 0 {
-                                            let egress = manager.on_tun(pkt, cached_now_ms);
-                                            egress_batch.clear();
-                                            egress_batch.extend_from_slice(egress);
-                                            let send_fd = if let Some(first_dg) = egress_batch.first() {
-                                                select_egress_socket(
-                                                    &sock,
-                                                    &egress_pool,
-                                                    pkt,
-                                                    is_tap,
-                                                    first_dg.dst,
-                                                )
-                                                .as_raw_fd()
-                                            } else {
-                                                sock_fd
-                                            };
-                                            let _ = yip_io::poll::flush_tx(send_fd, &mut egress_batch, &mut gso);
-                                            manager.recycle(&mut gso.recycle);
                                             for epoch in manager.drain_new_epochs() {
                                                 for k in 1..num_shards {
                                                     if let Some(Some(ref tx)) = tx_channels.get(k) {
-                                                        let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
+                                                        push_spsc(tx, ShardMsg::SessionEpoch(epoch.clone()));
                                                     }
                                                 }
                                             }
                                         }
-                                    } else {
-                                        manager.on_tun_into(pkt, cached_now_ms, &mut egress_batch);
-                                        if egress_batch.len() >= yip_io::batch::BATCH_SIZE {
-                                            let send_fd = if let Some(first_dg) = egress_batch.first() {
-                                                select_egress_socket(
-                                                    &sock,
-                                                    &egress_pool,
-                                                    pkt,
-                                                    is_tap,
-                                                    first_dg.dst,
-                                                )
-                                                .as_raw_fd()
-                                            } else {
-                                                sock_fd
+                                    }
+                                    ShardMsg::SessionEpoch(epoch) => {
+                                        if let Ok(shard_session) = yip_crypto::Session::from_raw_keys(
+                                            &epoch.send_key,
+                                            &epoch.recv_key,
+                                            shard_id as u64,
+                                            num_shards as u64,
+                                        ) {
+                                            let established = crate::handshake::Established {
+                                                session: shard_session,
+                                                auth_key: epoch.auth_key,
+                                                hp_key: epoch.hp_key,
+                                                raw_send_key: epoch.send_key,
+                                                raw_recv_key: epoch.recv_key,
                                             };
-                                            let _ = yip_io::poll::flush_tx(send_fd, &mut egress_batch, &mut gso);
-                                            manager.recycle(&mut gso.recycle);
+                                            manager.install_established_session(
+                                                &epoch.peer_pk,
+                                                established,
+                                                epoch.endpoint,
+                                            );
                                         }
                                     }
-                                    if shard_id == 0 {
-                                        for epoch in manager.drain_new_epochs() {
-                                            for k in 1..num_shards {
-                                                if let Some(Some(ref tx)) = tx_channels.get(k) {
-                                                    let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                ShardMsg::SessionEpoch(epoch) => {
-                                    if let Ok(shard_session) = yip_crypto::Session::from_raw_keys(
-                                        &epoch.send_key,
-                                        &epoch.recv_key,
-                                        shard_id as u64,
-                                        num_shards as u64,
-                                    ) {
-                                        let established = crate::handshake::Established {
-                                            session: shard_session,
-                                            auth_key: epoch.auth_key,
-                                            hp_key: epoch.hp_key,
-                                            raw_send_key: epoch.send_key,
-                                            raw_recv_key: epoch.recv_key,
-                                        };
-                                        manager.install_established_session(
-                                            &epoch.peer_pk,
-                                            established,
-                                            epoch.endpoint,
+                                    ShardMsg::HandshakeForward(bytes, src) => {
+                                        let out = manager.on_udp(*src, bytes, cached_now_ms);
+                                        handle_dispatch_out(
+                                            out,
+                                            tun_fd,
+                                            vnet_len > 0,
+                                            &mut coalescer,
+                                            sock_fd,
+                                            &mut gso,
+                                            &mut udp_scratch,
                                         );
-                                    }
-                                }
-                                ShardMsg::HandshakeForward(bytes, src) => {
-                                    let out = manager.on_udp(*src, bytes, cached_now_ms);
-                                    handle_dispatch_out(
-                                        out,
-                                        tun_fd,
-                                        vnet_len > 0,
-                                        &mut coalescer,
-                                        sock_fd,
-                                        &mut gso,
-                                        &mut udp_scratch,
-                                    );
-                                    if shard_id == 0 {
-                                        for epoch in manager.drain_new_epochs() {
-                                            for k in 1..num_shards {
-                                                if let Some(Some(ref tx)) = tx_channels.get(k) {
-                                                    let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
+                                        if shard_id == 0 {
+                                            for epoch in manager.drain_new_epochs() {
+                                                for k in 1..num_shards {
+                                                    if let Some(Some(ref tx)) = tx_channels.get(k) {
+                                                        push_spsc(tx, ShardMsg::SessionEpoch(epoch.clone()));
+                                                    }
                                                 }
                                             }
                                         }
                                     }
-                                }
-                                ShardMsg::ArqFeedback(bytes, src) => {
-                                    let out = manager.on_udp(*src, bytes, cached_now_ms);
-                                    handle_dispatch_out(
-                                        out,
-                                        tun_fd,
-                                        vnet_len > 0,
-                                        &mut coalescer,
-                                        sock_fd,
-                                        &mut gso,
-                                        &mut udp_scratch,
-                                    );
-                                    if shard_id == 0 {
-                                        for epoch in manager.drain_new_epochs() {
-                                            for k in 1..num_shards {
-                                                if let Some(Some(ref tx)) = tx_channels.get(k) {
-                                                    let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
+                                    ShardMsg::ArqFeedback(bytes, src) => {
+                                        let out = manager.on_udp(*src, bytes, cached_now_ms);
+                                        handle_dispatch_out(
+                                            out,
+                                            tun_fd,
+                                            vnet_len > 0,
+                                            &mut coalescer,
+                                            sock_fd,
+                                            &mut gso,
+                                            &mut udp_scratch,
+                                        );
+                                        if shard_id == 0 {
+                                            for epoch in manager.drain_new_epochs() {
+                                                for k in 1..num_shards {
+                                                    if let Some(Some(ref tx)) = tx_channels.get(k) {
+                                                        push_spsc(tx, ShardMsg::SessionEpoch(epoch.clone()));
+                                                    }
                                                 }
                                             }
                                         }
@@ -1418,7 +1450,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                 for epoch in manager.drain_new_epochs() {
                                     for k in 1..num_shards {
                                         if let Some(Some(ref tx)) = tx_channels.get(k) {
-                                            let _ = tx.push(ShardMsg::SessionEpoch(epoch.clone()));
+                                            push_spsc(tx, ShardMsg::SessionEpoch(epoch.clone()));
                                         }
                                     }
                                 }
@@ -2093,5 +2125,59 @@ mod tests {
         let t2 = t1 + std::time::Duration::from_micros(100);
         poller.record_packet_burst(t2, 2);
         assert!(poller.current_spin_window_us() > 50);
+    }
+
+    #[test]
+    fn test_spsc_ring_8192_capacity_and_drop_telemetry() {
+        let (tx, rx) = yip_io::spsc::spsc_pair::<OutboundPacket, 8192>();
+        let initial_drops = SPSC_QUEUE_DROPS.load(Ordering::Relaxed);
+
+        // Fill ring buffer to capacity (8192 items)
+        for i in 0..8192 {
+            let ok = push_spsc(&tx, ShardMsg::Packet(vec![i as u8]));
+            assert!(ok, "push should succeed up to capacity: failed at {i}");
+        }
+
+        // Pushing beyond capacity must fail and increment SPSC_QUEUE_DROPS
+        let dropped_1 = push_spsc(&tx, ShardMsg::Packet(vec![99]));
+        assert!(!dropped_1, "push beyond capacity must fail");
+        assert_eq!(
+            SPSC_QUEUE_DROPS.load(Ordering::Relaxed),
+            initial_drops.saturating_add(1)
+        );
+
+        let dropped_2 = push_spsc(&tx, ShardMsg::Packet(vec![100]));
+        assert!(!dropped_2, "push beyond capacity must fail");
+        assert_eq!(
+            SPSC_QUEUE_DROPS.load(Ordering::Relaxed),
+            initial_drops.saturating_add(2)
+        );
+
+        // Multi-batch draining up to 512 per iteration
+        let mut spsc_batch = Vec::with_capacity(128);
+        let mut drained_total: usize = 0;
+        while drained_total < 512 {
+            spsc_batch.clear();
+            let count = rx.drain_batch(&mut spsc_batch, 128);
+            if count == 0 {
+                break;
+            }
+            drained_total = drained_total.saturating_add(count);
+            assert_eq!(spsc_batch.len(), count);
+        }
+        assert_eq!(drained_total, 512);
+
+        // After draining 512, 512 slots should be available again
+        for i in 0..512 {
+            let ok = push_spsc(&tx, ShardMsg::Packet(vec![i as u8]));
+            assert!(ok, "push should succeed for drained slots: failed at {i}");
+        }
+
+        let dropped_3 = push_spsc(&tx, ShardMsg::Packet(vec![101]));
+        assert!(!dropped_3, "push beyond capacity must fail again");
+        assert_eq!(
+            SPSC_QUEUE_DROPS.load(Ordering::Relaxed),
+            initial_drops.saturating_add(3)
+        );
     }
 }
