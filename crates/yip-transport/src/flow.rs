@@ -18,6 +18,7 @@ struct FlowStat {
     packets: u32,
     first_ms: u64,
     last_ms: u64,
+    order_ms: u64,
 }
 
 /// A bounded per-flow table feeding the classifier heuristic.
@@ -75,6 +76,7 @@ impl FlowTable {
                         packets: 1,
                         first_ms: now_ms,
                         last_ms: now_ms,
+                        order_ms: now_ms,
                     },
                 );
                 self.order.push_back(key.clone());
@@ -114,14 +116,26 @@ impl FlowTable {
     }
 
     fn evict_expired(&mut self, now_ms: u64) {
-        while let Some(front) = self.order.front() {
-            let expired = self
-                .map
-                .get(front)
-                .is_none_or(|s| now_ms.saturating_sub(s.last_ms) > self.ttl_ms);
-            if expired {
+        let limit = self.order.len();
+        let mut checked = 0;
+        while checked < limit {
+            let Some(front) = self.order.front() else {
+                break;
+            };
+            let Some(stat) = self.map.get_mut(front) else {
+                self.order.pop_front();
+                checked += 1;
+                continue;
+            };
+            if now_ms.saturating_sub(stat.last_ms) > self.ttl_ms {
                 let k = self.order.pop_front().expect("front exists");
                 self.map.remove(&k);
+                checked += 1;
+            } else if stat.last_ms > stat.order_ms {
+                stat.order_ms = stat.last_ms;
+                let k = self.order.pop_front().expect("front exists");
+                self.order.push_back(k);
+                checked += 1;
             } else {
                 break;
             }
@@ -388,6 +402,27 @@ mod tests {
             "second observe at the exact TTL boundary must update the same \
              entry (packets=2), not wrongly evict-and-reinsert (packets=1)"
         );
+    }
+
+    #[test]
+    fn evict_expired_active_flow_does_not_block_stale_entries() {
+        let mut t = FlowTable::new(1024, 50);
+        let k1 = key(1);
+        let k2 = key(2);
+        t.observe(&k1, 100, 0);
+        t.observe(&k2, 100, 1);
+        // Keep flow 1 active so it never expires:
+        t.observe(&k1, 100, 30);
+        t.observe(&k1, 100, 60);
+        t.observe(&k1, 100, 100);
+        t.evict_expired(100);
+        assert_eq!(
+            t.len(),
+            1,
+            "stale flow 2 must be evicted even though flow 1 is active at head"
+        );
+        assert!(t.map.contains_key(&k1));
+        assert!(!t.map.contains_key(&k2));
     }
 
     #[test]
