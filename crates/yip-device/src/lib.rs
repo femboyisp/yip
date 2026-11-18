@@ -249,6 +249,43 @@ fn set_device_mtu(ifname: &[u8; libc::IFNAMSIZ], mtu: u32) -> Result<(), DeviceE
     }
 }
 
+/// Set the transmit queue length (txqueuelen) of a network interface via `SIOCSIFTXQLEN`.
+fn set_device_tx_queue_len(ifname: &[u8; libc::IFNAMSIZ], qlen: u32) -> Result<(), DeviceError> {
+    #[repr(C)]
+    struct IfReqTxQLen {
+        name: [u8; libc::IFNAMSIZ],
+        qlen: libc::c_int,
+        _pad: [u8; 20],
+    }
+    let req = IfReqTxQLen {
+        name: *ifname,
+        qlen: qlen as libc::c_int,
+        _pad: [0; 20],
+    };
+
+    // SAFETY: `sock_fd` is a valid AF_INET socket returned by `socket(2)`; `req` is a
+    // correctly-laid-out `ifreq` for SIOCSIFTXQLEN, exclusively owned here. We check both
+    // socket creation and ioctl return values, and close `sock_fd` before returning.
+    let err = unsafe {
+        let sock_fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if sock_fd < 0 {
+            return Err(DeviceError::Io(io::Error::last_os_error()));
+        }
+        let rc = libc::ioctl(sock_fd, libc::SIOCSIFTXQLEN as IoctlReq, &req);
+        let e = if rc != 0 {
+            Some(io::Error::last_os_error())
+        } else {
+            None
+        };
+        libc::close(sock_fd);
+        e
+    };
+    if let Some(e) = err {
+        return Err(DeviceError::Io(e));
+    }
+    Ok(())
+}
+
 // struct ifreq: name[IFNAMSIZ] then a union; we only set ifr_flags.
 #[repr(C)]
 struct IfReq {
@@ -285,13 +322,18 @@ impl TunTap {
     ) -> Result<TunTap, DeviceError> {
         let ifname = encode_ifname(name)?;
 
-        if want_vnet_hdr {
+        let tun = if want_vnet_hdr {
             if let Some(tun) = Self::open_with_offload(kind, &ifname)? {
-                return Ok(tun);
+                tun
+            } else {
+                Self::open_plain(kind, &ifname)?
             }
-        }
+        } else {
+            Self::open_plain(kind, &ifname)?
+        };
 
-        Self::open_plain(kind, &ifname)
+        let _ = tun.set_tx_queue_len(10_000);
+        Ok(tun)
     }
 
     /// Create a multi-queue TUN/TAP device with `queue_count` independent queue fds.
@@ -325,13 +367,21 @@ impl TunTap {
 
         let ifname = encode_ifname(name)?;
 
-        if want_vnet_hdr {
+        let queues = if want_vnet_hdr {
             if let Some(queues) = Self::open_multi_queue_with_offload(kind, &ifname, queue_count)? {
-                return Ok(queues);
+                queues
+            } else {
+                Self::open_multi_queue_plain(kind, &ifname, queue_count)?
             }
+        } else {
+            Self::open_multi_queue_plain(kind, &ifname, queue_count)?
+        };
+
+        if let Some(tun) = queues.first() {
+            let _ = tun.set_tx_queue_len(10_000);
         }
 
-        Self::open_multi_queue_plain(kind, &ifname, queue_count)
+        Ok(queues)
     }
 
     /// Attempt to open with `IFF_VNET_HDR` framing and kernel GSO/GRO
@@ -669,6 +719,12 @@ impl TunTap {
         let ifname = encode_ifname(&self.name)?;
         set_device_mtu(&ifname, mtu)
     }
+
+    /// Set the transmit queue length (txqueuelen) of this device. Requires `CAP_NET_ADMIN`.
+    pub fn set_tx_queue_len(&self, qlen: u32) -> Result<(), DeviceError> {
+        let ifname = encode_ifname(&self.name)?;
+        set_device_tx_queue_len(&ifname, qlen)
+    }
 }
 
 /// The read half of a split [`TunTap`].
@@ -869,6 +925,13 @@ mod tests {
     }
 
     #[test]
+    fn test_set_device_tx_queue_len_nonexistent_interface() {
+        let enc = encode_ifname("nonexistent0").unwrap();
+        let res = set_device_tx_queue_len(&enc, 10_000);
+        assert!(matches!(res, Err(DeviceError::Io(_))));
+    }
+
+    #[test]
     fn set_mtu_nonexistent_interface() {
         let dummy_file = std::fs::File::open("/dev/null").unwrap();
         let dev = TunTap {
@@ -890,5 +953,49 @@ mod tests {
         let dev = TunTap::create("yipmtu0", DeviceKind::Tun, false).unwrap();
         assert!(dev.set_mtu(1400).is_ok());
         assert!(dev.set_mtu(1500).is_ok());
+    }
+
+    #[test]
+    fn set_tx_queue_len_fails_on_too_long_name() {
+        let dummy_file = std::fs::File::open("/dev/null").unwrap();
+        let dev = TunTap {
+            file: dummy_file,
+            kind: DeviceKind::Tun,
+            name: "x".repeat(libc::IFNAMSIZ),
+            vnet_hdr_len: None,
+            offload_mode: None,
+        };
+        assert!(matches!(
+            dev.set_tx_queue_len(10_000),
+            Err(DeviceError::NameTooLong)
+        ));
+    }
+
+    #[test]
+    fn test_set_tx_queue_len_nonexistent_interface() {
+        let dummy_file = std::fs::File::open("/dev/null").unwrap();
+        let dev = TunTap {
+            file: dummy_file,
+            kind: DeviceKind::Tun,
+            name: "nonexistent0".to_owned(),
+            vnet_hdr_len: None,
+            offload_mode: None,
+        };
+        assert!(matches!(
+            dev.set_tx_queue_len(10_000),
+            Err(DeviceError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn test_tun_set_tx_queue_len_succeeds_when_privileged() {
+        if !can_create_devices() {
+            eprintln!(
+                "SKIP test_tun_set_tx_queue_len_succeeds_when_privileged: needs CAP_NET_ADMIN"
+            );
+            return;
+        }
+        let dev = TunTap::create("yiptxq0", DeviceKind::Tun, false).unwrap();
+        assert!(dev.set_tx_queue_len(10_000).is_ok());
     }
 }
