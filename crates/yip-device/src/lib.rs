@@ -185,7 +185,7 @@ fn bring_up(ifname: &[u8; libc::IFNAMSIZ]) -> Result<(), DeviceError> {
     // We check both ioctl return values and close the socket before returning.
     let err = unsafe {
         let sock_fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
-        if sock_fd < 0 {
+        if sock_fd.is_negative() {
             return Err(DeviceError::Io(io::Error::last_os_error()));
         }
         let rc_get = libc::ioctl(sock_fd, libc::SIOCGIFFLAGS as IoctlReq, &raw mut req);
@@ -231,7 +231,7 @@ fn set_device_mtu(ifname: &[u8; libc::IFNAMSIZ], mtu: u32) -> Result<(), DeviceE
     // socket creation and ioctl return values, and close `sock_fd` before returning.
     let err = unsafe {
         let sock_fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
-        if sock_fd < 0 {
+        if sock_fd.is_negative() {
             return Err(DeviceError::Io(io::Error::last_os_error()));
         }
         let rc = libc::ioctl(sock_fd, libc::SIOCSIFMTU as IoctlReq, &req);
@@ -268,7 +268,7 @@ fn set_device_tx_queue_len(ifname: &[u8; libc::IFNAMSIZ], qlen: u32) -> Result<(
     // socket creation and ioctl return values, and close `sock_fd` before returning.
     let err = unsafe {
         let sock_fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
-        if sock_fd < 0 {
+        if sock_fd.is_negative() {
             return Err(DeviceError::Io(io::Error::last_os_error()));
         }
         let rc = libc::ioctl(sock_fd, libc::SIOCSIFTXQLEN as IoctlReq, &req);
@@ -928,7 +928,16 @@ mod tests {
     fn test_set_device_tx_queue_len_nonexistent_interface() {
         let enc = encode_ifname("nonexistent0").unwrap();
         let res = set_device_tx_queue_len(&enc, 10_000);
-        assert!(matches!(res, Err(DeviceError::Io(_))));
+        match res {
+            Err(DeviceError::Io(e)) => {
+                let code = e.raw_os_error();
+                assert!(
+                    code == Some(libc::EPERM) || code == Some(libc::ENODEV),
+                    "unexpected error code: {code:?}"
+                );
+            }
+            other => panic!("expected Err(DeviceError::Io(EPERM or ENODEV)), got {other:?}"),
+        }
     }
 
     #[test]
@@ -981,10 +990,16 @@ mod tests {
             vnet_hdr_len: None,
             offload_mode: None,
         };
-        assert!(matches!(
-            dev.set_tx_queue_len(10_000),
-            Err(DeviceError::Io(_))
-        ));
+        match dev.set_tx_queue_len(10_000) {
+            Err(DeviceError::Io(e)) => {
+                let code = e.raw_os_error();
+                assert!(
+                    code == Some(libc::EPERM) || code == Some(libc::ENODEV),
+                    "unexpected error code: {code:?}"
+                );
+            }
+            other => panic!("expected Err(DeviceError::Io(EPERM or ENODEV)), got {other:?}"),
+        }
     }
 
     #[test]

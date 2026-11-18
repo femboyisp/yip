@@ -633,11 +633,15 @@ pub fn send_mmsg(
             libc::MSG_NOSIGNAL as crate::MsgFlags,
         )
     };
-    if ret < 0 {
+    if ret.is_negative() {
         let e = io::Error::last_os_error();
         let raw = e.raw_os_error().unwrap_or(0);
         // Transient full send buffer: report 0 sent (caller drops this burst's tail).
-        if raw == libc::EWOULDBLOCK || raw == libc::EAGAIN || raw == libc::ENOBUFS {
+        #[expect(
+            unreachable_patterns,
+            reason = "EWOULDBLOCK and EAGAIN share numeric value on Linux"
+        )]
+        if matches!(raw, libc::EWOULDBLOCK | libc::EAGAIN | libc::ENOBUFS) {
             return Ok(0);
         }
         return Err(e);
@@ -812,10 +816,14 @@ pub fn recv_mmsg(
             std::ptr::null_mut(),
         )
     };
-    if ret < 0 {
+    if ret.is_negative() {
         let e = io::Error::last_os_error();
         let raw = e.raw_os_error().unwrap_or(0);
-        if raw == libc::EWOULDBLOCK || raw == libc::EAGAIN {
+        #[expect(
+            unreachable_patterns,
+            reason = "EWOULDBLOCK and EAGAIN share numeric value on Linux"
+        )]
+        if matches!(raw, libc::EWOULDBLOCK | libc::EAGAIN) {
             return Ok(0);
         }
         return Err(e);
