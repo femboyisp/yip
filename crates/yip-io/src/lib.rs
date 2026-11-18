@@ -69,11 +69,14 @@ pub(crate) fn empty_mmsghdr() -> libc::mmsghdr {
 }
 
 /// Maximum number of datagrams in a single batched send/recv call.
-pub const MAX_DATAGRAM_BATCH: usize = 64;
+pub const MAX_DATAGRAM_BATCH: usize = 128;
 
 /// Maximum size (bytes) of a single wire datagram. 2 KiB is ample for any
 /// encapsulated MTU-1500 payload plus yip-wire framing overhead.
 pub const MAX_WIRE_DATAGRAM: usize = 2048;
+
+/// Default socket buffer size in bytes (32 MiB) for UDP send and receive queues.
+pub const DEFAULT_SOCKET_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 
 /// Selected I/O backend, in fallback-preference order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,7 +233,7 @@ impl DataPlaneIo for PlainIo {
         }
 
         // Build parallel arrays of iovec + mmsghdr.  We cap at MAX_DATAGRAM_BATCH
-        // to keep these stack arrays reasonably sized (64 × small structs).
+        // to keep these stack arrays reasonably sized (128 × small structs).
         let count = datagrams.len().min(MAX_DATAGRAM_BATCH);
 
         // iovec[i] points into the caller-owned slice datagrams[i]; the slices
@@ -263,12 +266,12 @@ impl DataPlaneIo for PlainIo {
             libc::sendmmsg(
                 self.socket.as_raw_fd(),
                 msgs.as_mut_ptr(),
-                u32::try_from(count).expect("count ≤ MAX_DATAGRAM_BATCH ≤ 64 fits u32"),
+                u32::try_from(count).expect("count ≤ MAX_DATAGRAM_BATCH ≤ 128 fits u32"),
                 libc::MSG_NOSIGNAL as MsgFlags,
             )
         };
 
-        if ret < 0 {
+        if ret.is_negative() {
             return Err(io::Error::last_os_error());
         }
         Ok(usize::try_from(ret).expect("non-negative sendmmsg return fits usize"))
@@ -317,13 +320,13 @@ impl DataPlaneIo for PlainIo {
             libc::recvmmsg(
                 self.socket.as_raw_fd(),
                 msgs.as_mut_ptr(),
-                u32::try_from(count).expect("count ≤ MAX_DATAGRAM_BATCH ≤ 64 fits u32"),
+                u32::try_from(count).expect("count ≤ MAX_DATAGRAM_BATCH ≤ 128 fits u32"),
                 libc::MSG_WAITFORONE as MsgFlags,
                 std::ptr::null_mut(),
             )
         };
 
-        if ret < 0 {
+        if ret.is_negative() {
             return Err(io::Error::last_os_error());
         }
         let received = usize::try_from(ret).expect("non-negative recvmmsg return fits usize");
@@ -343,7 +346,48 @@ impl DataPlaneIo for PlainIo {
 /// it to account for bookkeeping overhead), so callers should not assume the
 /// returned kernel value matches `bytes` exactly — only that the call succeeded.
 ///
-/// This function lives in yip-io (the only crate where `unsafe` is permitted)
+fn set_single_buffer_opt(
+    fd: std::os::fd::RawFd,
+    opt_force: Option<libc::c_int>,
+    opt_std: libc::c_int,
+    size: i32,
+) -> io::Result<()> {
+    if let Some(force) = opt_force {
+        // SAFETY: `fd` is a valid file descriptor; `size` is a correctly-typed `i32`
+        // matching setsockopt's expected `optval` type, valid for reads of `optlen`.
+        let ret_force = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                force,
+                std::ptr::addr_of!(size).cast::<libc::c_void>(),
+                libc::socklen_t::try_from(std::mem::size_of::<i32>())
+                    .expect("size_of::<i32>() fits socklen_t"),
+            )
+        };
+        if ret_force == 0 {
+            return Ok(());
+        }
+    }
+
+    // SAFETY: same rationale as above; standard unprivileged setsockopt.
+    let ret_std = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            opt_std,
+            std::ptr::addr_of!(size).cast::<libc::c_void>(),
+            libc::socklen_t::try_from(std::mem::size_of::<i32>())
+                .expect("size_of::<i32>() fits socklen_t"),
+        )
+    };
+    if ret_std != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Helper to configure both send and receive buffer sizes on a UDP socket,
 /// so that the yipd daemon can stay `#![forbid(unsafe_code)]`.
 pub fn set_socket_buffers(sock: &UdpSocket, bytes: usize) -> io::Result<()> {
     let size = i32::try_from(bytes)
@@ -351,103 +395,12 @@ pub fn set_socket_buffers(sock: &UdpSocket, bytes: usize) -> io::Result<()> {
     let fd = sock.as_raw_fd();
 
     #[cfg(target_os = "linux")]
-    {
-        // First try privileged SO_SNDBUFFORCE, falling back to standard SO_SNDBUF
-        // SAFETY: `fd` is a valid file descriptor owned by `sock`. `size` is a correctly-typed
-        // `i32` matching setsockopt's expected `optval` type, valid for reads of `optlen`.
-        let ret_snd_force = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_SNDBUFFORCE,
-                std::ptr::addr_of!(size).cast::<libc::c_void>(),
-                libc::socklen_t::try_from(std::mem::size_of::<i32>())
-                    .expect("size_of::<i32>() fits socklen_t"),
-            )
-        };
-        if ret_snd_force != 0 {
-            // SAFETY: same rationale as above; standard unprivileged SO_SNDBUF.
-            let ret_snd = unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_SNDBUF,
-                    std::ptr::addr_of!(size).cast::<libc::c_void>(),
-                    libc::socklen_t::try_from(std::mem::size_of::<i32>())
-                        .expect("size_of::<i32>() fits socklen_t"),
-                )
-            };
-            if ret_snd != 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-
-        // First try privileged SO_RCVBUFFORCE, falling back to standard SO_RCVBUF
-        // SAFETY: same rationale as above; only the option name differs.
-        let ret_rcv_force = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUFFORCE,
-                std::ptr::addr_of!(size).cast::<libc::c_void>(),
-                libc::socklen_t::try_from(std::mem::size_of::<i32>())
-                    .expect("size_of::<i32>() fits socklen_t"),
-            )
-        };
-        if ret_rcv_force != 0 {
-            // SAFETY: same rationale as above; standard unprivileged SO_RCVBUF.
-            let ret_rcv = unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_RCVBUF,
-                    std::ptr::addr_of!(size).cast::<libc::c_void>(),
-                    libc::socklen_t::try_from(std::mem::size_of::<i32>())
-                        .expect("size_of::<i32>() fits socklen_t"),
-                )
-            };
-            if ret_rcv != 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-    }
-
+    let (snd_force, rcv_force) = (Some(libc::SO_SNDBUFFORCE), Some(libc::SO_RCVBUFFORCE));
     #[cfg(not(target_os = "linux"))]
-    {
-        let ret_snd = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_SNDBUF,
-                std::ptr::addr_of!(size).cast::<libc::c_void>(),
-                libc::socklen_t::try_from(std::mem::size_of::<i32>())
-                    .expect("size_of::<i32>() fits socklen_t"),
-            )
-        };
-        if ret_snd != 0 {
-            return Err(io::Error::last_os_error());
-        }
+    let (snd_force, rcv_force) = (None, None);
 
-        let ret_rcv = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                std::ptr::addr_of!(size).cast::<libc::c_void>(),
-                libc::socklen_t::try_from(std::mem::size_of::<i32>())
-                    .expect("size_of::<i32>() fits socklen_t"),
-            )
-        };
-        if ret_rcv != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-
-    // Note: UDP_GRO requires 64KB rx buffers + cmsg parsing in recvmmsg to segment on receive.
-    // Without full recvmmsg GRO cmsg handling, enabling UDP_GRO causes incoming coalesced
-    // datagrams to truncate to MAX_WIRE_DATAGRAM (2048 bytes), corrupting AEAD framing.
-    // let _ = enable_udp_gro(sock);
-
+    set_single_buffer_opt(fd, snd_force, libc::SO_SNDBUF, size)?;
+    set_single_buffer_opt(fd, rcv_force, libc::SO_RCVBUF, size)?;
     Ok(())
 }
 
@@ -635,17 +588,109 @@ mod tests {
     }
 
     #[test]
-    fn set_socket_buffers_succeeds_on_loopback() {
+    fn set_socket_buffers_succeeds_and_updates_buffers() {
         use std::net::UdpSocket;
+        use std::os::fd::AsRawFd;
+
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-        // Request 4 MiB buffers; the kernel may clamp or double the value, so
-        // we only assert that the call itself succeeds.
-        let result = set_socket_buffers(&sock, 4 * 1024 * 1024);
+
+        // Helper to query current socket buffer size via getsockopt.
+        let query_buffer = |opt: libc::c_int| -> i32 {
+            let mut val: i32 = 0;
+            let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+            // SAFETY: `sock.as_raw_fd()` is a valid open socket fd; `val` is an `i32`
+            // matching the expected getsockopt type, and `len` accurately reflects its size.
+            let rc = unsafe {
+                libc::getsockopt(
+                    sock.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    opt,
+                    std::ptr::addr_of_mut!(val).cast(),
+                    &raw mut len,
+                )
+            };
+            assert_eq!(rc, 0, "getsockopt must succeed");
+            val
+        };
+
+        // First set a small baseline buffer size (8 KiB).
+        let small_val: i32 = 8192;
+        let len = std::mem::size_of::<i32>() as libc::socklen_t;
+        // SAFETY: `sock.as_raw_fd()` is valid, `small_val` is an `i32`, and `len` is size_of::<i32>().
+        unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                std::ptr::addr_of!(small_val).cast(),
+                len,
+            );
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                std::ptr::addr_of!(small_val).cast(),
+                len,
+            );
+        }
+        let initial_rcv = query_buffer(libc::SO_RCVBUF);
+        let initial_snd = query_buffer(libc::SO_SNDBUF);
+
+        // Now configure 64 KiB via set_socket_buffers.
+        let result = set_socket_buffers(&sock, 65536);
         assert!(
             result.is_ok(),
             "set_socket_buffers returned error: {:?}",
             result
         );
+
+        let final_rcv = query_buffer(libc::SO_RCVBUF);
+        let final_snd = query_buffer(libc::SO_SNDBUF);
+
+        // Linux kernel doubles the requested buffer size and caps at sysctl limits.
+        // Both final sizes must strictly exceed the initial 8 KiB settings.
+        assert!(
+            final_rcv > initial_rcv,
+            "SO_RCVBUF did not increase: initial={initial_rcv}, final={final_rcv}"
+        );
+        assert!(
+            final_snd > initial_snd,
+            "SO_SNDBUF did not increase: initial={initial_snd}, final={final_snd}"
+        );
+
+        // Also verify DEFAULT_SOCKET_BUFFER_BYTES succeeds without error.
+        assert!(set_socket_buffers(&sock, DEFAULT_SOCKET_BUFFER_BYTES).is_ok());
+    }
+
+    #[test]
+    fn set_socket_buffers_rejects_invalid_fd() {
+        use std::net::UdpSocket;
+        use std::os::fd::{FromRawFd, IntoRawFd};
+
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fd = sock.into_raw_fd();
+        // SAFETY: Closing `fd` invalidates the descriptor to test error handling.
+        unsafe {
+            libc::close(fd);
+        }
+        // SAFETY: Wrapping the closed descriptor in UdpSocket temporarily for testing.
+        // It is immediately forgotten via `mem::forget` to avoid double-close.
+        let closed_sock = unsafe { UdpSocket::from_raw_fd(fd) };
+        let res = set_socket_buffers(&closed_sock, 65536);
+        std::mem::forget(closed_sock);
+        assert!(
+            res.is_err(),
+            "set_socket_buffers must fail on invalid socket fd"
+        );
+    }
+
+    #[test]
+    fn set_socket_buffers_rejects_oversized_value() {
+        use std::net::UdpSocket;
+
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let res = set_socket_buffers(&sock, usize::MAX);
+        assert!(res.is_err(), "set_socket_buffers must fail on usize::MAX");
     }
 
     #[test]
@@ -686,6 +731,62 @@ mod tests {
         }
         assert!(got.contains(&a.to_vec()));
         assert!(got.contains(&b.to_vec()));
+    }
+
+    #[test]
+    fn plainio_send_and_recv_batch_exceeding_64() {
+        use std::net::UdpSocket;
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        set_socket_buffers(&rx, DEFAULT_SOCKET_BUFFER_BYTES).unwrap();
+        set_socket_buffers(&tx, DEFAULT_SOCKET_BUFFER_BYTES).unwrap();
+        tx.connect(rx.local_addr().unwrap()).unwrap();
+        rx.connect(tx.local_addr().unwrap()).unwrap();
+        let mut tx_io = PlainIo::new(tx);
+        let mut rx_io = PlainIo::new(rx);
+
+        // Send 80 distinct datagrams in a single batch (exceeding the old 64 limit).
+        let packets: Vec<Vec<u8>> = (0..80u32).map(|i| i.to_be_bytes().to_vec()).collect();
+        let packet_slices: Vec<&[u8]> = packets.iter().map(|p| p.as_slice()).collect();
+
+        let sent = tx_io.send_batch(&packet_slices).unwrap();
+        assert_eq!(sent, 80);
+
+        let mut bufs = vec![[0u8; MAX_WIRE_DATAGRAM]; 128];
+        let mut lens = [0usize; 128];
+        let mut received = 0;
+        while received < 80 {
+            let n = rx_io.recv_batch(&mut bufs, &mut lens).unwrap();
+            assert!(n > 0);
+            received += n;
+        }
+        assert_eq!(received, 80);
+    }
+
+    #[test]
+    fn plainio_send_batch_fails_when_unconnected() {
+        use std::net::UdpSocket;
+
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut io = PlainIo::new(sock);
+
+        let data = [b"test".as_slice()];
+        assert!(io.send_batch(&data).is_err());
+    }
+
+    #[test]
+    fn plainio_recv_batch_fails_on_nonblocking_empty_socket() {
+        use std::net::UdpSocket;
+
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_nonblocking(true).unwrap();
+        let mut io = PlainIo::new(sock);
+
+        let mut bufs = vec![[0u8; MAX_WIRE_DATAGRAM]; 2];
+        let mut lens = [0usize; 2];
+        let res = io.recv_batch(&mut bufs, &mut lens);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::WouldBlock);
     }
 
     #[test]

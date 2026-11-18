@@ -58,6 +58,13 @@ All notable changes to this project are documented here, following
 - **WireGuard-Go Userspace Contender Integration & CI Provisioning (`crates/yip-bench`, `.github/workflows/benchmarks.yml`, #221).**
   Added automated installation and evaluation of userspace Go WireGuard (`wireguard-go`) in `setup-contenders.sh` (`--wireguard-go`) and `run-iperf-compare.sh`. Measures dual-stack IPv4/IPv6 throughput, loss, latency, CPU utilization, and peak resident memory (`get_ns_ram_mb`), enabling direct userspace-to-userspace comparisons against YIP. Added Go module build caching in `benchmarks.yml` to accelerate CI benchmarking runs.
 
+### Performance
+- **Line-Rate UDP Burst Loss Elimination & Socket Queue Hardening (`crates/yip-device`, `crates/yip-io`, `bin/yipd`, #254).**
+  - Raised default UDP socket buffer allocations to 32 MiB (`DEFAULT_SOCKET_BUFFER_BYTES = 32 * 1024 * 1024`) via privileged `SO_RCVBUFFORCE` and `SO_SNDBUFFORCE` (with automatic fallback to unprivileged `SO_RCVBUF` / `SO_SNDBUF`) across daemon underlay and worker sockets, preventing kernel buffer exhaustion during multi-gigabit line-rate bursts.
+  - Configured 10,000 `txqueuelen` via `SIOCSIFTXQLEN` ioctl during TUN/TAP device creation in `crates/yip-device` (`TunTap::create` and `TunTap::create_multi_queue`), eliminating interface transmit queue drops when kernel network stacks blast high-rate UDP microbursts into the overlay.
+  - Expanded worker event-loop `recvmmsg` polling bursts from 32 to 64 datagrams per syscall and doubled `MmsgBatchArena` pre-allocated header storage capacity to 128 datagrams (`MAX_DATAGRAM_BATCH = 128`), cutting syscall overhead by half during burst drainage.
+  - Expanded cross-shard SPSC ring buffer depth from 2,048 to 8,192 slots and implemented a continuous multi-batch draining loop (harvesting up to 512 datagrams per event loop iteration) with drop telemetry (`SPSC_QUEUE_DROPS`), absorbing transient packet surges without packet loss across worker shards.
+
 ### Fixed
 - **Control Socket Permissions and Unprivileged Access (`bin/yipd`, `contrib/systemd`, #195).**
   - Configured explicit file permissions (`0666` default or configurable via `YIP_CONTROL_SOCKET_MODE`) on the control UNIX domain socket (`/run/yipd/yip.sock`) and parent directory (`0755`), allowing unprivileged desktop users (e.g. `yip-client` or CLI tools) to query daemon status without requiring `sudo`.
