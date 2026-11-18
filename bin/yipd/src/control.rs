@@ -1089,14 +1089,8 @@ pub fn sparkline(values: &[f64]) -> String {
         .collect()
 }
 
-/// Query and display daemon status.
-pub fn run_cli_status(socket_path: &Path, json: bool) -> Result<(), String> {
-    let resp = client_query(socket_path, ControlCmd::Status)?;
-    if json {
-        let text = serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?;
-        println!("{text}");
-        return Ok(());
-    }
+/// Format the text output for CLI daemon status.
+pub fn format_cli_status(resp: &ControlResponse) -> Result<String, String> {
     match resp {
         ControlResponse::Status {
             ok,
@@ -1114,31 +1108,47 @@ pub fn run_cli_status(socket_path: &Path, json: bool) -> Result<(), String> {
             if !ok {
                 return Err("daemon reported status error".into());
             }
-            println!("\x1b[1;32m●\x1b[0m \x1b[1myipd\x1b[0m v{version}");
-            println!("  Device:     \x1b[1m{device}\x1b[0m");
-            println!("  Mesh IPv6:  \x1b[36m{node_addr}\x1b[0m");
+            use std::fmt::Write;
+            let mut out = String::new();
+            let _ = writeln!(out, "\x1b[1;32m●\x1b[0m \x1b[1myipd\x1b[0m v{version}");
+            let _ = writeln!(out, "  Device:     \x1b[1m{device}\x1b[0m");
+            let _ = writeln!(out, "  Mesh IPv6:  \x1b[36m{node_addr}\x1b[0m");
             if !public_key.is_empty() {
-                println!("  Public Key: \x1b[33m{public_key}\x1b[0m");
+                let _ = writeln!(out, "  Public Key: \x1b[33m{public_key}\x1b[0m");
             }
-            if listen_port > 0 {
-                println!("  Listen:     :{listen_port}");
+            if *listen_port > 0 {
+                let _ = writeln!(out, "  Listen:     :{listen_port}");
             }
             if !network_id.is_empty() {
-                println!("  Network ID: {network_id}");
+                let _ = writeln!(out, "  Network ID: {network_id}");
             }
             let ca_str = ca_status
-                .unwrap_or_else(|| "Enforced (Root Ed25519) — Zero-Trust Admission".into());
-            println!("  CA Gating:  \x1b[32m{ca_str}\x1b[0m");
-            println!("  Uptime:     {}", format_duration(uptime_secs));
-            println!("  Peers:      {peers_count} configured");
-            if spsc_queue_drops > 0 {
-                println!("  Ring Drops: \x1b[31m{spsc_queue_drops}\x1b[0m");
+                .as_deref()
+                .unwrap_or("Enforced (Root Ed25519) — Zero-Trust Admission");
+            let _ = writeln!(out, "  CA Gating:  \x1b[32m{ca_str}\x1b[0m");
+            let _ = writeln!(out, "  Uptime:     {}", format_duration(*uptime_secs));
+            let _ = writeln!(out, "  Peers:      {peers_count} configured");
+            if *spsc_queue_drops > 0 {
+                let _ = writeln!(out, "  Ring Drops: \x1b[31m{spsc_queue_drops}\x1b[0m");
             }
-            Ok(())
+            Ok(out)
         }
-        ControlResponse::Err { error, .. } => Err(error),
+        ControlResponse::Err { error, .. } => Err(error.clone()),
         _ => Err("unexpected response format from daemon".into()),
     }
+}
+
+/// Query and display daemon status.
+pub fn run_cli_status(socket_path: &Path, json: bool) -> Result<(), String> {
+    let resp = client_query(socket_path, ControlCmd::Status)?;
+    if json {
+        let text = serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?;
+        println!("{text}");
+        return Ok(());
+    }
+    let text = format_cli_status(&resp)?;
+    print!("{text}");
+    Ok(())
 }
 
 /// Query and display peer table.
@@ -2421,6 +2431,82 @@ mod tests {
     }
 
     #[test]
+    fn test_format_cli_status_ring_drops() {
+        let resp_zero = ControlResponse::Status {
+            ok: true,
+            version: "0.1.0".into(),
+            node_addr: "fd00::1".into(),
+            device: "yip0".into(),
+            public_key: "".into(),
+            listen_port: 0,
+            network_id: "".into(),
+            peers_count: 2,
+            uptime_secs: 10,
+            ca_status: None,
+            spsc_queue_drops: 0,
+        };
+        let text_zero = format_cli_status(&resp_zero).unwrap();
+        assert!(!text_zero.contains("Ring Drops"));
+        assert!(!text_zero.contains("Public Key:"));
+        assert!(!text_zero.contains("Listen:"));
+        assert!(!text_zero.contains("Network ID:"));
+        assert!(text_zero.contains("v0.1.0"));
+
+        let resp_nonzero = ControlResponse::Status {
+            ok: true,
+            version: "0.1.0".into(),
+            node_addr: "fd00::1".into(),
+            device: "yip0".into(),
+            public_key: "0123456789abcdef".into(),
+            listen_port: 51820,
+            network_id: "net42".into(),
+            peers_count: 2,
+            uptime_secs: 10,
+            ca_status: None,
+            spsc_queue_drops: 42,
+        };
+        let text_nonzero = format_cli_status(&resp_nonzero).unwrap();
+        assert!(text_nonzero.contains("Ring Drops: \x1b[31m42\x1b[0m\n"));
+        assert!(text_nonzero.contains("Public Key: \x1b[33m0123456789abcdef\x1b[0m"));
+        assert!(text_nonzero.contains("Listen:     :51820"));
+        assert!(text_nonzero.contains("Network ID: net42"));
+        assert!(text_nonzero.contains("v0.1.0"));
+
+        let resp_err = ControlResponse::Err {
+            ok: false,
+            error: "mock error".into(),
+        };
+        assert_eq!(format_cli_status(&resp_err), Err("mock error".into()));
+
+        let resp_other = ControlResponse::Ack {
+            ok: true,
+            message: "ack".into(),
+        };
+        assert_eq!(
+            format_cli_status(&resp_other),
+            Err("unexpected response format from daemon".into())
+        );
+
+        let resp_not_ok = ControlResponse::Status {
+            ok: false,
+            version: "0.1.0".into(),
+            node_addr: "fd00::1".into(),
+            device: "yip0".into(),
+            public_key: "".into(),
+            listen_port: 0,
+            network_id: "".into(),
+            peers_count: 2,
+            uptime_secs: 10,
+            ca_status: None,
+            spsc_queue_drops: 0,
+        };
+        assert_eq!(
+            format_cli_status(&resp_not_ok),
+            Err("daemon reported status error".into())
+        );
+    }
+
+    #[test]
     fn test_dispatch_status_includes_spsc_queue_drops() {
         let (mut pm, start) = setup_test_peer_manager();
 
@@ -2939,6 +3025,9 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(50));
         let path = Path::new(&sock_path);
+
+        assert!(run_cli_status(Path::new("/tmp/nonexistent_status_12345.sock"), false).is_err());
+        assert!(run_cli_status(Path::new("/tmp/nonexistent_status_12345.sock"), true).is_err());
 
         assert!(run_cli_status(path, false).is_ok());
         assert!(run_cli_status(path, true).is_ok());

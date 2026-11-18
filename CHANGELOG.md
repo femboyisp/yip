@@ -6,6 +6,7 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **Cross-Shard Ring Drop Telemetry**: SPSC queue drop metrics are now surfaced in `ControlResponse::Status` (`yip status --json`), displayed conditionally as `Ring Drops` in `yip status`, and exported via Prometheus as `yip_spsc_queue_drops_total` ([#260](https://github.com/femboyisp/yip/issues/260)).
 - **Cross-Platform Shared Protocol Crate (`crates/yip-proto`, #199).**
   - Extracted cross-platform, OS-agnostic wire and IPC data structures from `bin/yipd` into a dedicated `crates/yip-proto` workspace crate.
   - Moved `ControlCmd`, `ControlResponse`, `DaemonConfig`, `PeerConfigEntry`, `PeerStats`, `PeerState`, `NetworkTicket`, `FecPreset`, `FecConfig`, `DaitaPreset`, `DaitaConfig`, `SplitMode`, `SplitTunnelConfig`, `XdpMode`, and pure CIDR helpers (`parse_cidr`, `ip_matches_cidr`, `extract_ip_dst`) into `yip-proto`.
