@@ -711,6 +711,10 @@ struct ReassemblyBuffers {
     repair_pool: Vec<Vec<u8>>,
 }
 
+/// Maximum number of recycled payload and repair buffers retained in the idle pool.
+/// Keeps steady-state reassembly zero-allocation while bounding resident memory footprint.
+pub const MAX_POOL_BUFFERS: usize = 16;
+
 /// Reassembles RS symbols into objects, keeping multiple objects in flight
 /// (keyed by `object_key: u64`), tolerating loss/reordering, evicting oldest at cap.
 pub struct FecReassembler {
@@ -730,6 +734,7 @@ impl FecReassembler {
     /// `max_objects` partially-received objects.
     pub fn new(symbol_size: u16, max_objects: usize) -> Self {
         let max_obj = max_objects.max(1);
+        let pool_cap = MAX_POOL_BUFFERS.min(max_obj);
         Self {
             symbol_size,
             objects: ObjectTable::new(max_obj),
@@ -737,14 +742,15 @@ impl FecReassembler {
             max_objects: max_obj,
             recovered_count: 0,
             unrecoverable_count: 0,
-            pool_payloads: Vec::with_capacity(max_obj),
-            pool_repair_shards: Vec::with_capacity(max_obj),
-            pool_repair_pools: Vec::with_capacity(max_obj),
+            pool_payloads: Vec::with_capacity(pool_cap),
+            pool_repair_shards: Vec::with_capacity(pool_cap),
+            pool_repair_pools: Vec::with_capacity(pool_cap),
         }
     }
 
     fn recycle_state(&mut self, state: &mut ObjState) {
-        if self.pool_payloads.len() < self.max_objects && !state.payload.is_empty() {
+        let pool_limit = MAX_POOL_BUFFERS.min(self.max_objects);
+        if self.pool_payloads.len() < pool_limit && !state.payload.is_empty() {
             let mut payload = std::mem::take(&mut state.payload);
             payload.clear();
             self.pool_payloads.push(payload);
@@ -752,12 +758,12 @@ impl FecReassembler {
         for (_, buf) in state.repair_shards.drain(..) {
             state.repair_pool.push(buf);
         }
-        if self.pool_repair_shards.len() < self.max_objects {
+        if self.pool_repair_shards.len() < pool_limit {
             let mut shards = std::mem::take(&mut state.repair_shards);
             shards.clear();
             self.pool_repair_shards.push(shards);
         }
-        if self.pool_repair_pools.len() < self.max_objects && !state.repair_pool.is_empty() {
+        if self.pool_repair_pools.len() < pool_limit && !state.repair_pool.is_empty() {
             let mut pool = std::mem::take(&mut state.repair_pool);
             for buf in &mut pool {
                 buf.clear();
@@ -944,7 +950,8 @@ impl FecReassembler {
         let state = self.objects.get_mut(&object_key)?;
         if now_ms > state.expires_at_ms {
             state.done = true;
-            if self.pool_payloads.len() < self.max_objects && !state.payload.is_empty() {
+            let pool_limit = MAX_POOL_BUFFERS.min(self.max_objects);
+            if self.pool_payloads.len() < pool_limit && !state.payload.is_empty() {
                 let mut payload = std::mem::take(&mut state.payload);
                 payload.clear();
                 self.pool_payloads.push(payload);
@@ -2371,5 +2378,31 @@ mod tests {
         let recovered2 = re.push(2, &syms2[1], 10, 100_000);
         assert!(recovered2.is_some());
         assert_eq!(recovered2.unwrap(), ct2);
+    }
+
+    #[test]
+    fn test_pool_buffers_capped_at_max_pool_buffers() {
+        let params = FlowClass::Bulk.params();
+        let mut enc = FecEncoder::new();
+        let mut re = FecReassembler::new(1200, 256);
+
+        // Feed and complete 32 objects
+        for i in 1..=32u64 {
+            let ct = vec![0x11u8; 1000];
+            let syms = enc.encode(&ct, params, 0);
+            let res = re.push(i, &syms[0], 0, 100_000);
+            assert!(res.is_some());
+        }
+
+        // Trigger sweeping/recycling
+        for i in 33..=40u64 {
+            let ct = vec![0x22u8; 1000];
+            let syms = enc.encode(&ct, params, 0);
+            let _ = re.push(i, &syms[0], 0, 100_000);
+        }
+
+        assert!(re.pool_payloads.len() <= MAX_POOL_BUFFERS);
+        assert!(re.pool_repair_shards.len() <= MAX_POOL_BUFFERS);
+        assert!(re.pool_repair_pools.len() <= MAX_POOL_BUFFERS);
     }
 }

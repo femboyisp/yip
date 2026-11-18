@@ -233,7 +233,7 @@ impl Transport {
         let deadline_ms = params.deadline.as_millis() as u64;
         self.reassemblers
             .entry(idx)
-            .or_insert_with(|| FecReassembler::new(params.symbol_size, 64))
+            .or_insert_with(|| FecReassembler::new(params.symbol_size, 256))
             .push(object_key, symbol, now_ms, deadline_ms)
     }
 
@@ -251,7 +251,7 @@ impl Transport {
         let deadline_ms = params.deadline.as_millis() as u64;
         self.reassemblers
             .entry(idx)
-            .or_insert_with(|| FecReassembler::new(params.symbol_size, 64))
+            .or_insert_with(|| FecReassembler::new(params.symbol_size, 256))
             .push_borrowed(object_key, symbol, now_ms, deadline_ms)
     }
 

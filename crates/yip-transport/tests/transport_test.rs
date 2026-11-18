@@ -1,3 +1,4 @@
+use yip_transport::fec::MAX_POOL_BUFFERS;
 use yip_transport::Transport;
 
 #[test]
@@ -11,8 +12,8 @@ fn test_transport_reassembler_capacity_decode() {
     let payload = vec![0x42u8; 2500];
     let inner = vec![0x00u8; 64];
 
-    // Feed 64 incomplete objects
-    for _ in 0..64 {
+    // Feed 256 incomplete objects
+    for _ in 0..256 {
         let (class, syms) = tx.encode(&payload, &inner, false, 0);
         assert!(syms.len() >= 3);
         let key = u64::from(syms[0].object_id);
@@ -22,10 +23,10 @@ fn test_transport_reassembler_capacity_decode() {
     assert_eq!(
         rx.fec_unrecoverable_count(),
         0,
-        "64 in-flight objects should fit without eviction"
+        "256 in-flight objects should fit without eviction"
     );
 
-    // Feed 65th incomplete object: should trigger eviction of oldest incomplete object
+    // Feed 257th incomplete object: should trigger eviction of oldest incomplete object
     let (class, syms) = tx.encode(&payload, &inner, false, 0);
     assert!(syms.len() >= 3);
     let key = u64::from(syms[0].object_id);
@@ -34,7 +35,7 @@ fn test_transport_reassembler_capacity_decode() {
     assert_eq!(
         rx.fec_unrecoverable_count(),
         1,
-        "65th in-flight object must evict the oldest uncompleted object at capacity 64"
+        "257th in-flight object must evict the oldest uncompleted object at capacity 256"
     );
 }
 
@@ -48,8 +49,8 @@ fn test_transport_reassembler_capacity_decode_borrowed() {
     let payload = vec![0x5au8; 2500];
     let inner = vec![0x5au8; 64];
 
-    // Feed 64 incomplete objects
-    for _ in 0..64 {
+    // Feed 256 incomplete objects
+    for _ in 0..256 {
         let (class, syms) = tx.encode(&payload, &inner, false, 0);
         assert!(syms.len() >= 3);
         let key = u64::from(syms[0].object_id);
@@ -59,10 +60,10 @@ fn test_transport_reassembler_capacity_decode_borrowed() {
     assert_eq!(
         rx.fec_unrecoverable_count(),
         0,
-        "64 in-flight objects should fit without eviction in decode_borrowed"
+        "256 in-flight objects should fit without eviction in decode_borrowed"
     );
 
-    // Feed 65th incomplete object
+    // Feed 257th incomplete object
     let (class, syms) = tx.encode(&payload, &inner, false, 0);
     assert!(syms.len() >= 3);
     let key = u64::from(syms[0].object_id);
@@ -71,16 +72,18 @@ fn test_transport_reassembler_capacity_decode_borrowed() {
     assert_eq!(
         rx.fec_unrecoverable_count(),
         1,
-        "65th in-flight object must evict the oldest uncompleted object at capacity 64"
+        "257th in-flight object must evict the oldest uncompleted object at capacity 256"
     );
 }
 
 #[test]
-fn test_transport_reassemble_64_objects_cleanly() {
+fn test_transport_reassemble_256_objects_cleanly() {
     let mut tx = Transport::new(vec![], 1200);
     let mut rx = Transport::new(vec![], 1200);
 
-    for i in 0..64 {
+    assert_eq!(MAX_POOL_BUFFERS, 16);
+
+    for i in 0..256 {
         let mut payload = vec![0u8; 1500];
         payload[0] = (i & 0xff) as u8;
         payload[1499] = ((i >> 8) & 0xff) as u8;
@@ -105,8 +108,8 @@ fn test_transport_reassemble_64_objects_cleanly() {
     }
     assert_eq!(rx.fec_unrecoverable_count(), 0);
 
-    // Verify decode_borrowed also handles sequential 64 objects cleanly
-    for i in 0..64 {
+    // Verify decode_borrowed also handles sequential 256 objects cleanly
+    for i in 0..256 {
         let mut payload = vec![0u8; 1500];
         payload[0] = (i & 0xff) as u8;
         payload[1] = 0xbb;

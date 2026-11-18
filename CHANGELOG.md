@@ -60,7 +60,7 @@ All notable changes to this project are documented here, following
 
 ### Performance
 - **IPv6 Multi-Shard Resident Memory Footprint Optimization (`crates/yip-transport`, `bin/yipd`, #255).**
-  - Sized `FecReassembler` pool capacity in `crates/yip-transport/src/lib.rs` from 256 to 64 objects per class, reducing max reassembly pool memory across 8 worker shards from ~393 MB down to ~98 MB.
+  - Decoupled `FecReassembler` in-flight reassembly tracking (256 objects per class for robust high-throughput ARQ recovery under loss) from idle buffer retention by capping recycled payload and repair pools (`MAX_POOL_BUFFERS = 16`), reducing idle pooled reassembly memory across 8 worker shards down to ~24 MB.
   - Sized `FlowTable` in `Classifier::new` to 1,024 entries with 10s TTL and bypassed heuristic flow tracking for non-TCP/UDP control and multicast protocols (ICMPv4, ICMPv6, IGMP, `ff00::/8`), eliminating background discovery table bloat.
   - Resolved queue-head starvation in `FlowTable::evict_expired` by rotating active flows to the back of the queue, allowing stale entries queued behind them to be evicted cleanly.
   - Bounded and reclaimed `DataPlane` drained scratch vectors (`tun_drained`, `tick_tun_drained` capped to 32 elements) and oversized scratch buffers during periodic `tick` idle sweeps in `bin/yipd/src/dataplane.rs`.
