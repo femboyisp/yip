@@ -117,25 +117,21 @@ impl FlowTable {
 
     fn evict_expired(&mut self, now_ms: u64) {
         let limit = self.order.len();
-        let mut checked = 0;
-        while checked < limit {
+        for _ in 0..limit {
             let Some(front) = self.order.front() else {
                 break;
             };
-            let Some(stat) = self.map.get_mut(front) else {
-                self.order.pop_front();
-                checked += 1;
-                continue;
-            };
+            let stat = self
+                .map
+                .get_mut(front)
+                .expect("entry in order must exist in map");
             if now_ms.saturating_sub(stat.last_ms) > self.ttl_ms {
                 let k = self.order.pop_front().expect("front exists");
                 self.map.remove(&k);
-                checked += 1;
             } else if stat.last_ms > stat.order_ms {
                 stat.order_ms = stat.last_ms;
                 let k = self.order.pop_front().expect("front exists");
                 self.order.push_back(k);
-                checked += 1;
             } else {
                 break;
             }
@@ -423,6 +419,33 @@ mod tests {
         );
         assert!(t.map.contains_key(&k1));
         assert!(!t.map.contains_key(&k2));
+    }
+
+    #[test]
+    fn evict_expired_lru_preserves_most_recently_used() {
+        let mut t = FlowTable::new(2, 100_000);
+        let k1 = key(1);
+        let k2 = key(2);
+        let k3 = key(3);
+        t.observe(&k1, 100, 0);
+        t.observe(&k2, 100, 10);
+        // Touch k1 at t=20, so k1 is more recent than k2 (k2 last used at t=10).
+        t.observe(&k1, 100, 20);
+        // Insert k3 at t=30. With max=2, least-recently-used k2 must be evicted; k1 and k3 retained.
+        t.observe(&k3, 100, 30);
+        assert_eq!(t.len(), 2);
+        assert!(
+            t.map.contains_key(&k1),
+            "recently-used flow k1 must be retained"
+        );
+        assert!(
+            t.map.contains_key(&k3),
+            "newly-inserted flow k3 must be retained"
+        );
+        assert!(
+            !t.map.contains_key(&k2),
+            "least-recently-used flow k2 must be evicted"
+        );
     }
 
     #[test]
