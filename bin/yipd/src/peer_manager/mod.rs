@@ -858,7 +858,7 @@ impl PeerManager {
                     next_hop,
                     peer_name,
                     direct,
-                    mtu: 1420,
+                    mtu: self.mtu as u16,
                     margin: 80,
                     metric,
                 }

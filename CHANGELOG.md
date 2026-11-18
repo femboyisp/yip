@@ -6,6 +6,16 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **Cross-Platform Shared Protocol Crate (`crates/yip-proto`, #199).**
+  - Extracted cross-platform, OS-agnostic wire and IPC data structures from `bin/yipd` into a dedicated `crates/yip-proto` workspace crate.
+  - Moved `ControlCmd`, `ControlResponse`, `DaemonConfig`, `PeerConfigEntry`, `PeerStats`, `PeerState`, `NetworkTicket`, `FecPreset`, `FecConfig`, `DaitaPreset`, `DaitaConfig`, `SplitMode`, `SplitTunnelConfig`, `XdpMode`, and pure CIDR helpers (`parse_cidr`, `ip_matches_cidr`, `extract_ip_dst`) into `yip-proto`.
+  - Extracted self-certifying IPv6 overlay address derivation (`derive_overlay_ipv6`, `node_addr`, `verify_addr`, `OVERLAY_ADDR_CONTEXT_V2`, `MESH_PREFIX_LEN`) without OS or socket dependencies.
+  - Enabled cross-platform desktop and mobile client implementations (`yip-client`) to consume the single source of truth for IPC schemas and invitation ticket rendering.
+- **Dynamic Daemon Configuration Reload & Active Configuration Inspection (`bin/yipd`, #196).**
+  - Added `ControlCmd::Reload` and `ControlCmd::GetConfig` commands over the UNIX domain control socket `/run/yipd/yip.sock`.
+  - Added `ControlResponse::Config { config: DaemonConfig }` and `ControlResponse::Reload { ok, message, reloaded }`.
+  - Implemented dynamic zero-downtime configuration reload in `PeerManager` (`reload_config`): re-reads the configuration file on disk, updates dynamic endpoints, aliases, and dynamic parameters (Reed-Solomon FEC, DAITA traffic defense, and MTU) without restarting the process or tearing down the TUN interface device, while preserving active cryptographic sessions and epochs for peers with matching public keys.
+  - Added CLI subcommands `yip reload [config_path]` and `yip config [get] [--json]` in `bin/yipd/src/main.rs`.
 - **Peer Aliases and Ergonomic Control Resolution (`bin/yipd`, #197).**
   - Added optional `alias: Option<String>` to `PeerConfig`, configuration file parser (`alias = "..."` within `[peer]` blocks), `ControlCmd::AddPeer` RPC, and `PeerStats`.
   - Added case-insensitive peer resolution by human-readable alias in `PeerManager` (`find_peer_by_alias`, `peer_pubkey`, and fallback in `find_peer_index_by_id`), allowing CLI commands (`peer remove`, `peer set-transport`, `ping`, `trace`, `crypto`) to accept friendly peer aliases as drop-in alternatives to full 64-hex public keys or IPv6 node addresses.
