@@ -66,7 +66,7 @@ pub(crate) fn bind_udp_reuseport(
         Err(e) => return Err(e),
     };
     let std_sock0: UdpSocket = sock0.into();
-    yip_io::set_socket_buffers(&std_sock0, 16 * 1024 * 1024)?;
+    yip_io::set_socket_buffers(&std_sock0, yip_io::DEFAULT_SOCKET_BUFFER_BYTES)?;
     if bound_addr.port() == 0 {
         bound_addr = SocketAddr::new(bound_addr.ip(), std_sock0.local_addr()?.port());
     }
@@ -76,7 +76,7 @@ pub(crate) fn bind_udp_reuseport(
         let sock = create_reuseport_socket(bound_addr)?;
         sock.bind(&bound_addr.into())?;
         let std_sock: UdpSocket = sock.into();
-        yip_io::set_socket_buffers(&std_sock, 16 * 1024 * 1024)?;
+        yip_io::set_socket_buffers(&std_sock, yip_io::DEFAULT_SOCKET_BUFFER_BYTES)?;
         sockets.push(std_sock);
     }
 
@@ -111,7 +111,7 @@ pub(crate) fn bind_udp_egress_pool(
         };
         let sock = UdpSocket::bind(bind_target)?;
         sock.set_nonblocking(true)?;
-        let _ = yip_io::set_socket_buffers(&sock, 16 * 1024 * 1024);
+        let _ = yip_io::set_socket_buffers(&sock, yip_io::DEFAULT_SOCKET_BUFFER_BYTES);
         sockets.push(sock);
     }
     Ok(sockets)

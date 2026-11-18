@@ -452,7 +452,7 @@ pub fn clamp_reactor_timeout_ms(
 /// per-peer `DataPlane`'s own stamped `dst`) instead of a fixed connected peer.
 fn bind_dataplane_udp(config: &Config) -> io::Result<UdpSocket> {
     let sock = crate::port::bind_udp(config.listen, config.listen_port_auto)?;
-    set_socket_buffers(&sock, 16 * 1024 * 1024)?;
+    set_socket_buffers(&sock, yip_io::DEFAULT_SOCKET_BUFFER_BYTES)?;
     sock.set_nonblocking(true)?;
     Ok(sock)
 }

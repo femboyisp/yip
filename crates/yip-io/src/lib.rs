@@ -75,6 +75,9 @@ pub const MAX_DATAGRAM_BATCH: usize = 64;
 /// encapsulated MTU-1500 payload plus yip-wire framing overhead.
 pub const MAX_WIRE_DATAGRAM: usize = 2048;
 
+/// Default socket buffer size in bytes (32 MiB) for UDP send and receive queues.
+pub const DEFAULT_SOCKET_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+
 /// Selected I/O backend, in fallback-preference order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
@@ -638,9 +641,9 @@ mod tests {
     fn set_socket_buffers_succeeds_on_loopback() {
         use std::net::UdpSocket;
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-        // Request 4 MiB buffers; the kernel may clamp or double the value, so
+        // Request 32 MiB buffers; the kernel may clamp or double the value, so
         // we only assert that the call itself succeeds.
-        let result = set_socket_buffers(&sock, 4 * 1024 * 1024);
+        let result = set_socket_buffers(&sock, DEFAULT_SOCKET_BUFFER_BYTES);
         assert!(
             result.is_ok(),
             "set_socket_buffers returned error: {:?}",
