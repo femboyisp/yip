@@ -200,6 +200,13 @@ pub fn run(config: Config) -> io::Result<()> {
     manager.set_traffic_defense(config.traffic_defense.clone());
     manager.set_threshold_ca_server(config.threshold_ca_server);
     manager.set_listen_port(config.listen.port());
+    manager.set_config_path(config.config_path.clone());
+    if let Some(mtu) = config.mtu {
+        manager.set_mtu(mtu);
+    }
+    if let Some(fec) = config.fec {
+        manager.set_fec_config(fec);
+    }
     let control_handle = if let Some(ref path) = config.control_socket {
         Some(crate::control::ControlHandle::bind(path)?)
     } else {

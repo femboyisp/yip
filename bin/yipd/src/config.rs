@@ -235,9 +235,23 @@ pub struct Config {
     pub xdp_ifname: Option<String>,
     /// Hardware/kernel driver XDP mode (`xdp_mode=auto|generic|native|offload`, defaults to `auto`).
     pub xdp_mode: Option<String>,
+    /// Optional dynamic Reed-Solomon FEC runtime configuration (`fec=preset`).
+    pub fec: Option<yip_proto::control::FecConfig>,
+    /// Optional filesystem path from which this configuration was loaded.
+    pub config_path: Option<std::path::PathBuf>,
 }
 
 // ── hex decode helper ─────────────────────────────────────────────────────────
+
+/// Encode a byte slice as lowercase hexadecimal.
+pub fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
 
 /// Decode a 64-char hex string into 32 bytes. Shared with `main.rs`'s
 /// `--addr` subcommand so the two paths cannot drift.
@@ -584,6 +598,10 @@ impl Config {
         let mut raw_defense_cover_interval_ms: Option<u64> = None;
         let mut raw_defense_cover_burst_max: Option<u64> = None;
         let mut raw_defense_jitter_max_ms: Option<u64> = None;
+        let mut raw_fec_preset: Option<yip_proto::control::FecPreset> = None;
+        let mut raw_fec_redundancy: Option<u8> = None;
+        let mut raw_fec_k: Option<usize> = None;
+        let mut raw_fec_m: Option<usize> = None;
         let mut transport = TransportMode::default();
         let mut tls_sni: Option<String> = None;
         let mut shards: Option<usize> = None;
@@ -706,11 +724,11 @@ impl Config {
                     }
                     cover_traffic_ms = Some(ms);
                 }
-                "traffic_defense" => {
+                "traffic_defense" | "daita" | "daita_preset" => {
                     let p = match val {
                         "off" => yip_obf::TrafficDefensePreset::Off,
-                        "balanced" => yip_obf::TrafficDefensePreset::Balanced,
-                        "paranoid" => yip_obf::TrafficDefensePreset::Paranoid,
+                        "low" | "balanced" => yip_obf::TrafficDefensePreset::Balanced,
+                        "max" | "paranoid" => yip_obf::TrafficDefensePreset::Paranoid,
                         other => {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -720,7 +738,7 @@ impl Config {
                     };
                     raw_defense_preset = Some(p);
                 }
-                "defense_buckets" => {
+                "defense_buckets" | "daita_buckets" => {
                     let mut buckets = Vec::new();
                     for part in val.split(',') {
                         let part = part.trim();
@@ -740,7 +758,7 @@ impl Config {
                     }
                     raw_defense_buckets = Some(buckets);
                 }
-                "defense_cover_interval_ms" => {
+                "defense_cover_interval_ms" | "daita_cover_interval_ms" => {
                     let ms = val
                         .parse::<u64>()
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -752,17 +770,53 @@ impl Config {
                     }
                     raw_defense_cover_interval_ms = Some(ms);
                 }
-                "defense_cover_burst_max" => {
+                "defense_cover_burst_max" | "daita_cover_burst_max" => {
                     let burst = val
                         .parse::<u64>()
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                     raw_defense_cover_burst_max = Some(burst);
                 }
-                "defense_jitter_max_ms" => {
+                "defense_jitter_max_ms" | "daita_jitter_max_ms" => {
                     let jitter = val
                         .parse::<u64>()
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                     raw_defense_jitter_max_ms = Some(jitter);
+                }
+                "fec" | "fec_preset" => {
+                    let p = val
+                        .parse::<yip_proto::control::FecPreset>()
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    raw_fec_preset = Some(p);
+                }
+                "fec_redundancy" | "fec_redundancy_pct" => {
+                    let pct = val
+                        .parse::<u8>()
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    if pct > 100 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "fec_redundancy must be between 0 and 100",
+                        ));
+                    }
+                    raw_fec_redundancy = Some(pct);
+                }
+                "fec_data_shards" | "fec_k" => {
+                    let k = val
+                        .parse::<usize>()
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    if k == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "fec_data_shards must be at least 1",
+                        ));
+                    }
+                    raw_fec_k = Some(k);
+                }
+                "fec_parity_shards" | "fec_m" => {
+                    let m = val
+                        .parse::<usize>()
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    raw_fec_m = Some(m);
                 }
                 "transport" => {
                     transport = match val {
@@ -1060,6 +1114,32 @@ impl Config {
             SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), DEFAULT_LISTEN_PORT)
         });
 
+        let fec = if raw_fec_preset.is_some()
+            || raw_fec_redundancy.is_some()
+            || raw_fec_k.is_some()
+            || raw_fec_m.is_some()
+        {
+            let base_preset = raw_fec_preset.unwrap_or_default();
+            let mut cfg = base_preset.default_config();
+            if let Some(pct) = raw_fec_redundancy {
+                cfg.redundancy_pct = pct;
+                if cfg.preset != yip_proto::control::FecPreset::Custom
+                    && cfg.preset != yip_proto::control::FecPreset::Adaptive
+                {
+                    cfg.preset = yip_proto::control::FecPreset::Custom;
+                }
+            }
+            if let Some(k) = raw_fec_k {
+                cfg.data_shards = k;
+            }
+            if let Some(m) = raw_fec_m {
+                cfg.parity_shards = m;
+            }
+            Some(cfg)
+        } else {
+            None
+        };
+
         Ok(Config {
             local_private: local_private.ok_or_else(|| missing("local_private"))?,
             local_public: local_public.ok_or_else(|| missing("local_public"))?,
@@ -1087,6 +1167,8 @@ impl Config {
             xdp,
             xdp_ifname,
             xdp_mode,
+            fec,
+            config_path: None,
         })
     }
 }

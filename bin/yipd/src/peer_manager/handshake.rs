@@ -69,7 +69,7 @@ impl PeerManager {
         } else {
             HANDSHAKE_RETRY_MS
         };
-        self.peers[idx].state = PeerState::Handshaking(Box::new(HandshakingState {
+        self.peers[idx].state = PeerSessionState::Handshaking(Box::new(HandshakingState {
             hs,
             started_ms: now_ms,
             last_sent_ms: now_ms,
@@ -159,7 +159,7 @@ impl PeerManager {
     /// Re-admission is guarded by the cold-start cert check, so a revoked
     /// peer cannot re-establish.
     pub(super) fn drop_session(&mut self, idx: usize) {
-        let tags: Vec<u64> = if let PeerState::Established(epochs) = &self.peers[idx].state {
+        let tags: Vec<u64> = if let PeerSessionState::Established(epochs) = &self.peers[idx].state {
             let mut t = vec![epochs.current.conn_tag()];
             if let Some(n) = epochs.next.as_ref() {
                 t.push(n.dp.conn_tag());
@@ -174,7 +174,7 @@ impl PeerManager {
         for tag in tags {
             self.by_tag.remove(&tag);
         }
-        self.peers[idx].state = PeerState::Idle;
+        self.peers[idx].state = PeerSessionState::Idle;
         self.peers[idx].admitted_cert_not_after = None;
         self.metrics.update_peer_stats(self.list_peers());
     }
@@ -268,7 +268,7 @@ impl PeerManager {
             // direct-addressed core — its Inits are meant to arrive relayed.
             // Fail-closed drop instead, mirroring the guard in
             // `relayed_handshake_init`; `current` stays untouched.
-            PeerState::Established(_) if !self.peers[idx].relay => {
+            PeerSessionState::Established(_) if !self.peers[idx].relay => {
                 // #41: a mid-session rekey Init must carry a currently-valid cert
                 // (mesh mode). A revoked/expired member presenting a stale cert
                 // loses its session within a rekey interval instead of at process
@@ -287,7 +287,7 @@ impl PeerManager {
                 );
                 self.handle_rekey_init(idx, src, established, resp_pkt, init_ts, init_eph)
             }
-            PeerState::Established(_) => DispatchOut::None,
+            PeerSessionState::Established(_) => DispatchOut::None,
             // Glare: both sides initiated simultaneously (e.g. the TUN's IPv6
             // autoconf multicast races the peer's traffic at startup). Break
             // the tie deterministically by static-key order so both converge on
@@ -295,13 +295,13 @@ impl PeerManager {
             // (accepts this `Init`); the smaller key is the designated
             // initiator and ignores the competing `Init`, keeping its own
             // attempt (it completes when the peer's `[HandshakeResp]` arrives).
-            PeerState::Handshaking(_) if self.local_pub < self.peers[idx].pubkey => {
+            PeerSessionState::Handshaking(_) if self.local_pub < self.peers[idx].pubkey => {
                 DispatchOut::None
             }
             // `Idle` (no competition — whoever initiates first wins, preserving
             // lazy establishment) or `Handshaking` with the larger key (adopt
             // responder role): admit this session.
-            PeerState::Idle | PeerState::Handshaking(_) => {
+            PeerSessionState::Idle | PeerSessionState::Handshaking(_) => {
                 // #41: re-admission gate. A tabled mesh peer re-establishing
                 // (its session was dropped by the rekey re-verify or the
                 // liveness sweep) must present a currently-valid cert, else a
@@ -373,7 +373,7 @@ impl PeerManager {
                 }
                 let mut epoch_set = Box::new(crate::epoch::EpochSet::new(dp, now_ms));
                 epoch_set.set_fec_repair_ratio(self.fec_config.redundancy_pct as f32 / 100.0);
-                self.peers[idx].state = PeerState::Established(epoch_set);
+                self.peers[idx].state = PeerSessionState::Established(epoch_set);
                 self.record_new_epoch(idx);
                 self.metrics.record_handshake_success();
                 self.metrics.update_peer_stats(self.list_peers());
@@ -396,23 +396,21 @@ impl PeerManager {
     ) -> DispatchOut<'_> {
         if let Some(idx) = self.peers.iter().position(|p| {
             p.endpoint == Some(src)
-                && matches!(&p.state, PeerState::Established(epochs) if epochs.rekey.is_some())
+                && matches!(&p.state, PeerSessionState::Established(epochs) if epochs.rekey.is_some())
                 && !p.relay
         }) {
             return self.handle_rekey_resp(idx, dg, now_ms);
         }
 
-        let Some(idx) = self
-            .peers
-            .iter()
-            .position(|p| p.endpoint == Some(src) && matches!(p.state, PeerState::Handshaking(_)))
-        else {
+        let Some(idx) = self.peers.iter().position(|p| {
+            p.endpoint == Some(src) && matches!(p.state, PeerSessionState::Handshaking(_))
+        }) else {
             return DispatchOut::None;
         };
 
-        let old_state = std::mem::replace(&mut self.peers[idx].state, PeerState::Idle);
-        let PeerState::Handshaking(handshaking) = old_state else {
-            unreachable!("index was matched against PeerState::Handshaking above");
+        let old_state = std::mem::replace(&mut self.peers[idx].state, PeerSessionState::Idle);
+        let PeerSessionState::Handshaking(handshaking) = old_state else {
+            unreachable!("index was matched against PeerSessionState::Handshaking above");
         };
 
         match handshaking.hs.read_response(dg) {
@@ -468,7 +466,7 @@ impl PeerManager {
                 }
                 let mut epoch_set = Box::new(crate::epoch::EpochSet::new(dp, now_ms));
                 epoch_set.set_fec_repair_ratio(self.fec_config.redundancy_pct as f32 / 100.0);
-                self.peers[idx].state = PeerState::Established(epoch_set);
+                self.peers[idx].state = PeerSessionState::Established(epoch_set);
                 self.record_new_epoch(idx);
                 self.metrics.record_handshake_success();
                 self.metrics.update_peer_stats(self.list_peers());
@@ -575,7 +573,7 @@ mod tests {
         // `last_accepted_init_ts` is in-memory and survives (never reset by
         // `drop_session`).
         pm_r.drop_session(0);
-        assert!(matches!(pm_r.peers[0].state, PeerState::Idle));
+        assert!(matches!(pm_r.peers[0].state, PeerSessionState::Idle));
         assert!(
             !pm_r.by_tag.contains_key(&old_tag),
             "drop_session must evict the old tag"
@@ -664,7 +662,7 @@ mod tests {
         assert_eq!(pm_r.peers[0].endpoint, Some(ep_i));
 
         pm_r.drop_session(0);
-        assert!(matches!(pm_r.peers[0].state, PeerState::Idle));
+        assert!(matches!(pm_r.peers[0].state, PeerSessionState::Idle));
         assert_eq!(pm_r.peers[0].last_accepted_init_ts, Some(t1));
 
         // A NEW-ephemeral Init with ts <= t1, replayed from an attacker's
@@ -682,7 +680,7 @@ mod tests {
             _ => panic!("a stale-ts cold-start Init must be silently dropped"),
         }
         assert!(
-            matches!(pm_r.peers[0].state, PeerState::Idle),
+            matches!(pm_r.peers[0].state, PeerSessionState::Idle),
             "a rejected cold-start Init must not admit a session"
         );
         assert_eq!(
@@ -820,7 +818,7 @@ mod tests {
         let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
         pm.on_tun(&dummy_tun_pkt(), started_ms);
         assert!(
-            matches!(pm.peers[0].state, PeerState::Handshaking(_)),
+            matches!(pm.peers[0].state, PeerSessionState::Handshaking(_)),
             "setup must drive the peer into Handshaking on the direct endpoint"
         );
         (pm, 0)
@@ -841,7 +839,7 @@ mod tests {
         // A peer mid-handshake toward a direct candidate.
         let (mut pm, idx) = pm_handshaking_direct_peer([7u8; 32], "10.0.0.9:9000", 100);
         let (orig_init, orig_target) = match &pm.peers[idx].state {
-            PeerState::Handshaking(h) => (h.init_pkt.clone(), h.target),
+            PeerSessionState::Handshaking(h) => (h.init_pkt.clone(), h.target),
             _ => panic!("peer must be Handshaking"),
         };
         let orig_eph =
@@ -852,7 +850,7 @@ mod tests {
         // to `Idle` (clearing `endpoint`, anti-mismatch) and calls
         // `begin_handshake`, exactly like the production `PathAction::Relay`
         // arm in `tick_dispatch`.
-        pm.peers[idx].state = PeerState::Idle;
+        pm.peers[idx].state = PeerSessionState::Idle;
         pm.peers[idx].endpoint = None;
         let out = pm
             .begin_handshake(idx, server, true, 5_000)
@@ -860,7 +858,7 @@ mod tests {
 
         // A FRESH ephemeral is drawn — NOT the byte-identical resend #36 used to do.
         match &pm.peers[idx].state {
-            PeerState::Handshaking(h) => {
+            PeerSessionState::Handshaking(h) => {
                 let new_eph = crate::handshake::init_ephemeral(&h.init_pkt)
                     .expect("valid Init carries an ephemeral");
                 assert_ne!(
@@ -927,7 +925,10 @@ mod tests {
             assert_eq!(replies.len(), 1, "a valid cert is admitted and replied to");
             assert_eq!(pm.peers.len(), 1, "the cert-verified member was admitted");
             assert_eq!(pm.peers[0].pubkey, stranger.public);
-            assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+            assert!(matches!(
+                pm.peers[0].state,
+                PeerSessionState::Established(_)
+            ));
             assert_eq!(pm.peers[0].endpoint, Some(src), "endpoint learned from src");
         }
 
@@ -1036,7 +1037,10 @@ mod tests {
                 "a framed [ts || cert] Init is admitted and replied to"
             );
             assert_eq!(pm.peers.len(), 1, "the cert-verified member was admitted");
-            assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+            assert!(matches!(
+                pm.peers[0].state,
+                PeerSessionState::Established(_)
+            ));
         }
 
         // ── raw (unframed) cert, no ts prefix → NOT admitted ──
@@ -1086,7 +1090,7 @@ mod tests {
 
         // Session dropped: Idle, by_tag entry gone, no resp emitted.
         assert!(
-            matches!(pm.peers[0].state, PeerState::Idle),
+            matches!(pm.peers[0].state, PeerSessionState::Idle),
             "invalid-cert rekey drops the session"
         );
         assert!(
@@ -1120,7 +1124,7 @@ mod tests {
             "current stays on the OLD epoch until the initiator confirms (9a Task 4)"
         );
         match &pm.peers[0].state {
-            PeerState::Established(epochs) => assert!(
+            PeerSessionState::Established(epochs) => assert!(
                 epochs.next.is_some(),
                 "the valid-cert rekey Init installed a next epoch"
             ),
@@ -1149,7 +1153,7 @@ mod tests {
         // Session dropped (as the #41a rekey guard, or the liveness sweep,
         // would do): the peer stays tabled, reverts to Idle.
         pm.drop_session(0);
-        assert!(matches!(pm.peers[0].state, PeerState::Idle));
+        assert!(matches!(pm.peers[0].state, PeerSessionState::Idle));
         assert!(pm.by_tag.is_empty());
 
         let init = rekey_init_with_payload(&pm, 0, &expired_cert_bytes(&pm, 0));
@@ -1160,7 +1164,7 @@ mod tests {
             "an expired cert must not re-admit a tabled peer"
         );
         assert!(
-            matches!(pm.peers[0].state, PeerState::Idle),
+            matches!(pm.peers[0].state, PeerSessionState::Idle),
             "peer stays Idle: no session was created for the rejected re-init"
         );
         assert!(
@@ -1207,7 +1211,7 @@ mod tests {
         // `PeerManager::new` auto-admits the root: tabled, Idle.
         assert_eq!(pm.peers.len(), 1);
         assert_eq!(pm.peers[0].pubkey, root.public);
-        assert!(matches!(pm.peers[0].state, PeerState::Idle));
+        assert!(matches!(pm.peers[0].state, PeerSessionState::Idle));
 
         // Cold-start Init from the root, NO cert payload — would fail
         // `responder_cert_ok` for a non-root peer.
@@ -1224,7 +1228,10 @@ mod tests {
             1,
             "the root is admitted despite presenting no cert"
         );
-        assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+        assert!(matches!(
+            pm.peers[0].state,
+            PeerSessionState::Established(_)
+        ));
     }
 
     /// Task 2's rekey re-verify must exempt roots exactly like Task 2b's
@@ -1280,7 +1287,10 @@ mod tests {
         .unwrap();
         let out = pm.on_udp(root_ep, &init_pkt, 0);
         assert_eq!(resp_bytes(&out).len(), 1, "root cold-start admitted");
-        assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+        assert!(matches!(
+            pm.peers[0].state,
+            PeerSessionState::Established(_)
+        ));
         let tag = established_tag(&pm, 0).expect("root established");
 
         // A further `[HandshakeInit]` from the root (fresh ephemeral — an
@@ -1296,7 +1306,7 @@ mod tests {
         let _out2 = pm.on_udp(root_ep, &init_pkt2, 200_000);
 
         assert!(
-            matches!(pm.peers[0].state, PeerState::Established(_)),
+            matches!(pm.peers[0].state, PeerSessionState::Established(_)),
             "the root's session must NOT be dropped: roots are exempt from \
              cert-based revocation on rekey re-verify, same as the Task 2b gate"
         );
@@ -1339,12 +1349,15 @@ mod tests {
         .unwrap();
         let out1 = pm.on_udp(peer_ep, &init1, 0);
         assert_eq!(resp_bytes(&out1).len(), 1, "initial cold-start establishes");
-        assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+        assert!(matches!(
+            pm.peers[0].state,
+            PeerSessionState::Established(_)
+        ));
 
         // Drop the session (as a real revocation/liveness event would), then
         // re-establish from Idle with another empty-payload Init.
         pm.drop_session(0);
-        assert!(matches!(pm.peers[0].state, PeerState::Idle));
+        assert!(matches!(pm.peers[0].state, PeerSessionState::Idle));
 
         let (_hs2, init2) = HandshakeState::start_initiator(
             &peer.private,
@@ -1358,7 +1371,10 @@ mod tests {
             1,
             "re-establishment from Idle is unaffected by the gate when membership is None"
         );
-        assert!(matches!(pm.peers[0].state, PeerState::Established(_)));
+        assert!(matches!(
+            pm.peers[0].state,
+            PeerSessionState::Established(_)
+        ));
     }
 
     /// (g) Fix-pass (Task 6, Minor): mutual-proof rejection on the INITIATOR
@@ -1394,7 +1410,10 @@ mod tests {
             let init_out = pm.on_tun(&dummy_tun_pkt(), 0).to_vec();
             assert_eq!(init_out.len(), 1);
             let init_pkt = init_out[0].bytes.clone();
-            assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+            assert!(matches!(
+                pm.peers[0].state,
+                PeerSessionState::Handshaking(_)
+            ));
 
             // Out-of-band responder step with NO cert payload in msg2.
             let (_established, resp_pkt, _remote_static, _initiator_payload) =
@@ -1405,7 +1424,7 @@ mod tests {
                 DispatchOut::None
             ));
             assert!(
-                matches!(pm.peers[0].state, PeerState::Idle),
+                matches!(pm.peers[0].state, PeerSessionState::Idle),
                 "no responder cert ⇒ session must not establish, reverts to Idle"
             );
         }
@@ -1443,7 +1462,7 @@ mod tests {
                 DispatchOut::None
             ));
             assert!(
-                matches!(pm.peers[0].state, PeerState::Idle),
+                matches!(pm.peers[0].state, PeerSessionState::Idle),
                 "untrusted-CA responder cert ⇒ session must not establish, reverts to Idle"
             );
         }
@@ -1502,7 +1521,10 @@ mod tests {
             .find(|d| d.dst == root_ep)
             .map(|d| d.bytes.clone())
             .expect("an Init toward the root");
-        assert!(matches!(pm.peers[idx].state, PeerState::Handshaking(_)));
+        assert!(matches!(
+            pm.peers[idx].state,
+            PeerSessionState::Handshaking(_)
+        ));
 
         // The root responds with NO cert in msg2 — rejected for a non-root
         // peer, but the root is exempt.
@@ -1511,7 +1533,7 @@ mod tests {
         let _ = pm.on_udp(root_ep, &resp_pkt, 0);
 
         assert!(
-            matches!(pm.peers[idx].state, PeerState::Established(_)),
+            matches!(pm.peers[idx].state, PeerSessionState::Established(_)),
             "a root responder is admitted despite a missing cert (is_root exemption)"
         );
     }
@@ -1569,7 +1591,10 @@ mod tests {
         // obfuscation happens one layer up, in `obf_egress`).
         assert_eq!(init.len(), 1, "exactly one real Init");
         assert_eq!(init[0].bytes[0], PacketType::HandshakeInit as u8);
-        assert!(matches!(pm.peers[0].state, PeerState::Handshaking(_)));
+        assert!(matches!(
+            pm.peers[0].state,
+            PeerSessionState::Handshaking(_)
+        ));
     }
 
     /// Across many `begin_handshake` calls (obf on, direct), the junk count
@@ -1593,7 +1618,7 @@ mod tests {
         let mut counts = std::collections::HashSet::new();
         for _ in 0..64 {
             // Reset to Idle so begin_handshake can restart the peer each call.
-            pm.peers[0].state = PeerState::Idle;
+            pm.peers[0].state = PeerSessionState::Idle;
             let dgs = pm
                 .begin_handshake(0, target, false, 0)
                 .expect("handshake starts");

@@ -111,14 +111,14 @@ impl PeerManager {
             let tag_bytes: [u8; 8] = dg[1..9].try_into().expect("checked len >= 9 above");
             let tag = u64::from_be_bytes(tag_bytes);
             if let Some(&idx) = self.by_tag.get(&tag) {
-                if matches!(self.peers[idx].state, PeerState::Established(_)) {
+                if matches!(self.peers[idx].state, PeerSessionState::Established(_)) {
                     return Some(idx);
                 }
             }
         }
-        self.peers
-            .iter()
-            .position(|p| p.endpoint == Some(src) && matches!(p.state, PeerState::Established(_)))
+        self.peers.iter().position(|p| {
+            p.endpoint == Some(src) && matches!(p.state, PeerSessionState::Established(_))
+        })
     }
 
     /// WireGuard-style roaming: after a datagram has AUTHENTICATED and passed
@@ -146,14 +146,14 @@ impl PeerManager {
             if ep.ip() != src.ip() {
                 ep.set_ip(src.ip());
                 let new_endpoint = *ep;
-                if let PeerState::Established(epochs) = &mut self.peers[idx].state {
+                if let PeerSessionState::Established(epochs) = &mut self.peers[idx].state {
                     epochs.set_peer_addr(new_endpoint);
                 }
                 eprintln!("peer_manager: relearn_endpoint: peer {idx} roamed to {new_endpoint}");
             }
         } else {
             self.peers[idx].endpoint = Some(src);
-            if let PeerState::Established(epochs) = &mut self.peers[idx].state {
+            if let PeerSessionState::Established(epochs) = &mut self.peers[idx].state {
                 epochs.set_peer_addr(src);
             }
         }
@@ -170,7 +170,7 @@ impl PeerManager {
         dg: &[u8],
         now_ms: u64,
     ) -> DispatchOut<'_> {
-        let PeerState::Established(epochs) = &mut self.peers[idx].state else {
+        let PeerSessionState::Established(epochs) = &mut self.peers[idx].state else {
             return DispatchOut::None;
         };
         let prev_rec = epochs.fec_recovered_count();
@@ -284,12 +284,12 @@ impl PeerManager {
             .peers
             .iter()
             .enumerate()
-            .filter(|(_, p)| matches!(p.state, PeerState::Established(_)))
+            .filter(|(_, p)| matches!(p.state, PeerSessionState::Established(_)))
             .map(|(i, _)| i)
             .collect();
         for idx in candidates {
             let (hit, rec_diff, burst_diff, promoted_epoch) = {
-                let PeerState::Established(epochs) = &mut self.peers[idx].state else {
+                let PeerSessionState::Established(epochs) = &mut self.peers[idx].state else {
                     continue;
                 };
                 let prev_rec = epochs.fec_recovered_count();
@@ -489,7 +489,7 @@ mod tests {
         // (the "test seam": direct access to private fields from the child
         // `tests` module).
         const FAKE_TAG: u64 = 0xAAAA_BBBB_CCCC_DDDD;
-        pm.peers[1].state = PeerState::Established(Box::new(crate::epoch::EpochSet::new(
+        pm.peers[1].state = PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(
             Box::new(fake_established_dataplane(
                 FAKE_TAG,
                 peer_b.endpoint.unwrap(),

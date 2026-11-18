@@ -8,7 +8,7 @@
 //!
 //! # Lazy handshake
 //!
-//! A peer starts in `PeerState::Idle`: nothing has been sent to it yet.
+//! A peer starts in `PeerSessionState::Idle`: nothing has been sent to it yet.
 //! The first TUN packet routed to that peer (see "TUN routing" below)
 //! buffers the packet in `pending_tun`, starts a [`HandshakeState`] initiator,
 //! and emits `[HandshakeInit]`. The peer stays `Handshaking` until either:
@@ -152,9 +152,9 @@ const MAX_GOSSIP_TARGETS: usize = 4;
 const MAX_GOSSIP_REPLIES: usize = 8;
 
 /// An initiator handshake in flight, awaiting `[HandshakeResp]`. Boxed by
-/// [`PeerState::Handshaking`] so that variant stays pointer-sized like
+/// [`PeerSessionState::Handshaking`] so that variant stays pointer-sized like
 /// `Established(Box<DataPlane>)` — `HandshakeState`/`init_pkt` are much
-/// larger than the other `PeerState` variants (clippy `large_enum_variant`).
+/// larger than the other `PeerSessionState` variants (clippy `large_enum_variant`).
 struct HandshakingState {
     hs: HandshakeState,
     /// When this handshake attempt first started. The attempt is abandoned
@@ -195,34 +195,10 @@ struct HandshakingState {
     via_relay: bool,
 }
 
-/// Summary telemetry and status for an individual peer.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct PeerStats {
-    pub public_key: [u8; 32],
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub alias: Option<String>,
-    pub endpoint: Option<SocketAddr>,
-    pub node_addr: std::net::Ipv6Addr,
-    pub state: String,
-    pub last_activity_ms: u64,
-    pub tx_bytes: u64,
-    pub rx_bytes: u64,
-    pub tx_packets: u64,
-    pub rx_packets: u64,
-    pub fec_recovered: u64,
-    pub transport: String,
-    pub rtt_ms: Option<u32>,
-    pub fec_ratio_pct: u8,
-    #[serde(default = "default_cert_status")]
-    pub cert_status: String,
-}
-
-fn default_cert_status() -> String {
-    "CA Valid".to_string()
-}
+pub use yip_proto::peer::{PeerState, PeerStats};
 
 /// One remote peer's handshake/session state.
-enum PeerState {
+enum PeerSessionState {
     /// No handshake has been attempted yet.
     Idle,
     /// An initiator handshake is in flight, awaiting `[HandshakeResp]`.
@@ -247,7 +223,7 @@ struct Peer {
     /// rendezvous/relay, which Task 6 wires into this path; such a peer
     /// cannot yet be routed to directly (see `on_tun`'s `Idle` branch).
     endpoint: Option<SocketAddr>,
-    state: PeerState,
+    state: PeerSessionState,
     /// TUN packets buffered while no `Established` session exists yet.
     pending_tun: Vec<Vec<u8>>,
     /// The `[HandshakeResp]` bytes that established the *current* session,
@@ -518,6 +494,33 @@ pub struct PeerManager {
     metrics: std::sync::Arc<crate::metrics::MetricsRegistry>,
     /// Monotonic timestamp in milliseconds of the last cached metrics peer stats update.
     last_metrics_update_ms: u64,
+    /// Path to the configuration file on disk from which the daemon was loaded.
+    config_path: Option<std::path::PathBuf>,
+    /// Configured TUN device MTU.
+    mtu: u32,
+}
+
+/// Summary report returned after a dynamic configuration reload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReloadReport {
+    pub path: std::path::PathBuf,
+    pub added_peers: usize,
+    pub removed_peers: usize,
+    pub updated_peers: usize,
+    pub preserved_peers: usize,
+}
+
+impl ReloadReport {
+    pub fn summary(&self) -> String {
+        format!(
+            "configuration reloaded from {}: {} peers added, {} peers removed, {} peers updated, {} sessions preserved",
+            self.path.display(),
+            self.added_peers,
+            self.removed_peers,
+            self.updated_peers,
+            self.preserved_peers,
+        )
+    }
 }
 
 /// Dynamic DAITA traffic analysis defense runtime metrics.
@@ -593,7 +596,7 @@ impl PeerManager {
                 alias: p.alias.clone(),
                 addr,
                 endpoint: p.endpoint,
-                state: PeerState::Idle,
+                state: PeerSessionState::Idle,
                 pending_tun: Vec::new(),
                 cached_resp: None,
                 cached_resp_init_eph: None,
@@ -669,6 +672,8 @@ impl PeerManager {
             xdp_state: crate::control::XdpState::default(),
             metrics: std::sync::Arc::new(crate::metrics::MetricsRegistry::new()),
             last_metrics_update_ms: 0,
+            config_path: None,
+            mtu: 1420,
         };
 
         // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
@@ -717,7 +722,7 @@ impl PeerManager {
             alias: None,
             addr,
             endpoint: endpoints.first().copied(),
-            state: PeerState::Idle,
+            state: PeerSessionState::Idle,
             pending_tun: Vec::new(),
             cached_resp: None,
             cached_resp_init_eph: None,
@@ -777,7 +782,7 @@ impl PeerManager {
         self.traffic_defense = cfg;
         let now = std::time::Instant::now();
         for peer in &mut self.peers {
-            if matches!(peer.state, PeerState::Established(_)) {
+            if matches!(peer.state, PeerSessionState::Established(_)) {
                 if profile == yip_obf::DaitaProfile::Off {
                     peer.daita_engine = None;
                 } else {
@@ -853,7 +858,7 @@ impl PeerManager {
                     next_hop,
                     peer_name,
                     direct,
-                    mtu: 1420,
+                    mtu: self.mtu as u16,
                     margin: 80,
                     metric,
                 }
@@ -1081,7 +1086,7 @@ impl PeerManager {
             replay_floor,
             replay_latest,
         ) = match &p.state {
-            PeerState::Established(epochs) => {
+            PeerSessionState::Established(epochs) => {
                 let age_ms = now_ms.saturating_sub(epochs.current_created_ms());
                 (
                     "Established".to_string(),
@@ -1095,7 +1100,7 @@ impl PeerManager {
                     Some(epochs.current_replay_latest()),
                 )
             }
-            PeerState::Handshaking(_) => (
+            PeerSessionState::Handshaking(_) => (
                 "Handshaking".to_string(),
                 None,
                 None,
@@ -1106,7 +1111,7 @@ impl PeerManager {
                 None,
                 None,
             ),
-            PeerState::Idle => (
+            PeerSessionState::Idle => (
                 "Idle".to_string(),
                 None,
                 None,
@@ -1182,7 +1187,7 @@ impl PeerManager {
             Some(PathKind::Direct) | Some(PathKind::Punched)
         ) || (peer.endpoint.is_some() && !peer.relay);
 
-        let is_established = matches!(peer.state, PeerState::Established(_));
+        let is_established = matches!(peer.state, PeerSessionState::Established(_));
         let is_responsive = is_established || peer.endpoint.is_some();
 
         if !is_responsive {
@@ -1257,7 +1262,7 @@ impl PeerManager {
         let mut samples = Vec::new();
         let mut received = 0;
 
-        let is_established = matches!(peer.state, PeerState::Established(_));
+        let is_established = matches!(peer.state, PeerSessionState::Established(_));
         let is_responsive = is_established || peer.endpoint.is_some();
 
         if is_responsive {
@@ -1409,6 +1414,26 @@ impl PeerManager {
         self.listen_port = port;
     }
 
+    /// Set the path to the daemon configuration file.
+    pub fn set_config_path(&mut self, path: Option<std::path::PathBuf>) {
+        self.config_path = path;
+    }
+
+    /// Return the path to the daemon configuration file, if set.
+    pub fn config_path(&self) -> Option<&std::path::Path> {
+        self.config_path.as_deref()
+    }
+
+    /// Set the device MTU.
+    pub fn set_mtu(&mut self, mtu: u32) {
+        self.mtu = mtu;
+    }
+
+    /// Return the device MTU.
+    pub fn mtu(&self) -> u32 {
+        self.mtu
+    }
+
     /// Return the local public key as a 64-character lowercase hex string.
     pub fn local_pub_hex(&self) -> String {
         self.local_pub.iter().map(|b| format!("{b:02x}")).collect()
@@ -1464,11 +1489,9 @@ impl PeerManager {
         &mut self,
         cmd: crate::control::ControlCmd,
     ) -> crate::control::ControlResponse {
-        let device_name = std::mem::take(&mut self.device_name);
+        let device_name = self.device_name.clone();
         let start_time = self.start_time;
-        let resp = crate::control::dispatch_cmd(self, cmd, &device_name, start_time);
-        self.device_name = device_name;
-        resp
+        crate::control::dispatch_cmd(self, cmd, &device_name, start_time)
     }
 
     /// Configure online Threshold CA coordinator address for automated 70% TTL certificate rotation.
@@ -1577,7 +1600,7 @@ impl PeerManager {
     pub(crate) fn record_new_epoch(&mut self, idx: usize) {
         let peer_pk = self.peers[idx].pubkey;
         let endpoint = self.peers[idx].endpoint;
-        if let PeerState::Established(ref mut epochs) = self.peers[idx].state {
+        if let PeerSessionState::Established(ref mut epochs) = self.peers[idx].state {
             if self.num_shards > 1 {
                 epochs
                     .current_mut()
@@ -1615,13 +1638,13 @@ impl PeerManager {
     pub fn is_peer_established(&self, pubkey: &[u8; 32]) -> bool {
         self.peers
             .iter()
-            .any(|p| p.pubkey == *pubkey && matches!(p.state, PeerState::Established(_)))
+            .any(|p| p.pubkey == *pubkey && matches!(p.state, PeerSessionState::Established(_)))
     }
 
     /// Check whether the target peer for this inner packet is already established locally.
     pub fn is_tun_target_established(&self, inner: &[u8]) -> bool {
         if let Some(idx) = self.route_tun_index(inner) {
-            matches!(self.peers[idx].state, PeerState::Established(_))
+            matches!(self.peers[idx].state, PeerSessionState::Established(_))
         } else {
             false
         }
@@ -1680,7 +1703,7 @@ impl PeerManager {
         self.peers[idx].path_kind = Some(PathKind::Direct);
         let mut epoch_set = Box::new(crate::epoch::EpochSet::new(dp, 0));
         epoch_set.set_fec_repair_ratio(self.fec_config.redundancy_pct as f32 / 100.0);
-        self.peers[idx].state = PeerState::Established(epoch_set);
+        self.peers[idx].state = PeerSessionState::Established(epoch_set);
     }
 
     /// Returns the active FEC runtime configuration.
@@ -1693,7 +1716,7 @@ impl PeerManager {
         self.fec_config = config;
         let ratio = config.redundancy_pct as f32 / 100.0;
         for peer in &mut self.peers {
-            if let PeerState::Established(ref mut epochs) = peer.state {
+            if let PeerSessionState::Established(ref mut epochs) = peer.state {
                 epochs.set_fec_repair_ratio(ratio);
             }
         }
@@ -1706,7 +1729,7 @@ impl PeerManager {
         let mut unrecoverable_burst_drops = 0u64;
 
         for peer in &self.peers {
-            if let PeerState::Established(ref epochs) = peer.state {
+            if let PeerSessionState::Established(ref epochs) = peer.state {
                 total_symbols_tx += epochs.total_symbols_tx();
                 recovered_symbols_rx += epochs.fec_recovered_count();
                 unrecoverable_burst_drops += epochs.fec_unrecoverable_count();
@@ -1769,7 +1792,7 @@ impl PeerManager {
             alias: cfg.alias,
             addr,
             endpoint: cfg.endpoint,
-            state: PeerState::Idle,
+            state: PeerSessionState::Idle,
             pending_tun: Vec::new(),
             cached_resp: None,
             cached_resp_init_eph: None,
@@ -1837,15 +1860,186 @@ impl PeerManager {
         Ok(())
     }
 
+    /// Dynamically reload daemon configuration from disk, updating dynamic parameters
+    /// (peers, endpoints, aliases, FEC, DAITA, MTU) and preserving established sessions.
+    pub fn reload_config(&mut self, custom_path: Option<&str>) -> Result<ReloadReport, String> {
+        let path = match custom_path {
+            Some(p) => std::path::PathBuf::from(p),
+            None => match &self.config_path {
+                Some(p) => p.clone(),
+                None => return Err("no config file specified or previously loaded".into()),
+            },
+        };
+
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read config file {}: {e}", path.display()))?;
+        let new_config = crate::config::Config::parse(&text)
+            .map_err(|e| format!("failed to parse config file: {e}"))?;
+
+        if new_config.local_public != self.local_pub {
+            return Err(
+                "cannot change local_public identity via dynamic reload (restart required)".into(),
+            );
+        }
+        if new_config.local_private != self.local_priv {
+            return Err(
+                "cannot change local_private key via dynamic reload (restart required)".into(),
+            );
+        }
+        if !self.device_name.is_empty() && new_config.device != self.device_name {
+            return Err(
+                "cannot change device interface via dynamic reload (restart required)".into(),
+            );
+        }
+        if self.listen_port != 0 && new_config.listen.port() != self.listen_port {
+            return Err("cannot change listen port via dynamic reload (restart required)".into());
+        }
+
+        self.config_path = Some(path.clone());
+
+        let mut preserved_peers = 0;
+        let mut updated_peers = 0;
+        let mut removed_peers = 0;
+        let mut added_peers = 0;
+
+        // 1. Remove static peers that are in self.peers but missing from new_config.peers.
+        // Dynamic mesh peers (admitted via membership gossip or CA roots with is_static: false) are preserved.
+        let to_remove: Vec<[u8; 32]> = self
+            .peers
+            .iter()
+            .filter(|p| p.is_static && !new_config.peers.iter().any(|np| np.public_key == p.pubkey))
+            .map(|p| p.pubkey)
+            .collect();
+
+        for pk in to_remove {
+            if self.remove_peer(&pk).is_ok() {
+                removed_peers += 1;
+            }
+        }
+
+        // 2. Update existing peers and add new peers
+        for new_peer in &new_config.peers {
+            if let Some(idx) = self
+                .peers
+                .iter()
+                .position(|p| p.pubkey == new_peer.public_key)
+            {
+                preserved_peers += 1;
+                let mut changed = false;
+                if self.peers[idx].endpoint != new_peer.endpoint {
+                    self.peers[idx].endpoint = new_peer.endpoint;
+                    if let Some(ep) = new_peer.endpoint {
+                        self.peers[idx].path.on_direct_addr(ep);
+                    }
+                    changed = true;
+                }
+                if self.peers[idx].alias != new_peer.alias {
+                    self.peers[idx].alias = new_peer.alias.clone();
+                    changed = true;
+                }
+                if changed {
+                    updated_peers += 1;
+                }
+            } else if self.add_peer_with_transport(new_peer.clone(), None).is_ok() {
+                if let Some(peer) = self.peers.last_mut() {
+                    peer.is_static = true;
+                }
+                added_peers += 1;
+            }
+        }
+
+        // 3. Update dynamic parameters: FEC
+        if let Some(fec) = new_config.fec {
+            self.set_fec_config(fec);
+        }
+
+        // 4. Update dynamic parameters: DAITA
+        self.set_traffic_defense(new_config.traffic_defense.clone());
+        self.set_cover_traffic_ms(new_config.cover_traffic_ms);
+
+        // 5. Update MTU if configured
+        if let Some(mtu) = new_config.mtu {
+            self.mtu = mtu;
+        }
+
+        self.metrics.update_peer_stats(self.list_peers());
+
+        Ok(ReloadReport {
+            path,
+            added_peers,
+            removed_peers,
+            updated_peers,
+            preserved_peers,
+        })
+    }
+
+    /// Returns the active running daemon configuration.
+    pub fn get_active_config(&self) -> yip_proto::control::DaemonConfig {
+        let peers = self
+            .peers
+            .iter()
+            .map(|p| yip_proto::control::PeerConfigEntry {
+                public_key: crate::config::hex_encode(&p.pubkey),
+                endpoint: p.endpoint.map(|e| e.to_string()),
+                alias: p.alias.clone(),
+                transport: p.transport_name.clone(),
+            })
+            .collect();
+
+        let daita_preset = match self.traffic_defense.preset {
+            yip_obf::TrafficDefensePreset::Off => yip_proto::control::DaitaPreset::Off,
+            yip_obf::TrafficDefensePreset::Balanced => yip_proto::control::DaitaPreset::Balanced,
+            yip_obf::TrafficDefensePreset::Paranoid => yip_proto::control::DaitaPreset::Paranoid,
+        };
+
+        let daita = Some(yip_proto::control::DaitaConfig {
+            preset: daita_preset,
+            buckets: self.traffic_defense.buckets.clone(),
+            cover_interval_ms: self.traffic_defense.cover_interval_ms,
+            cover_burst_max: self.traffic_defense.cover_burst_max,
+            jitter_max_ms: self.traffic_defense.jitter_max_ms,
+        });
+
+        let rendezvous = self
+            .rendezvous
+            .as_ref()
+            .map(|r| r.server_addr().to_string());
+
+        let net_id = self.network_id_hex();
+        let network_id = if net_id.is_empty() {
+            None
+        } else {
+            Some(net_id)
+        };
+
+        let listen = if self.listen_port > 0 {
+            Some(format!("0.0.0.0:{}", self.listen_port))
+        } else {
+            None
+        };
+
+        yip_proto::control::DaemonConfig {
+            device: self.device_name.clone(),
+            listen,
+            public_key: Some(self.local_pub_hex()),
+            rendezvous,
+            network_id,
+            peers,
+            fec: Some(self.fec_config),
+            daita,
+            split_tunnel: Some(self.split_tunnel.config()),
+        }
+    }
+
     /// Retrieve summary status telemetry for all known peers.
     pub fn peer_stats(&self) -> Vec<PeerStats> {
         self.peers
             .iter()
             .map(|p| {
                 let state_str = match &p.state {
-                    PeerState::Idle => "idle",
-                    PeerState::Handshaking(_) => "handshaking",
-                    PeerState::Established(_) => "established",
+                    PeerSessionState::Idle => PeerState::Idle.as_str(),
+                    PeerSessionState::Handshaking(_) => PeerState::Handshaking.as_str(),
+                    PeerSessionState::Established(_) => PeerState::Established.as_str(),
                 };
                 let transport = if let Some(t) = &p.transport_name {
                     t.clone()
@@ -1864,7 +2058,7 @@ impl PeerManager {
                 };
 
                 let (fec_ratio_pct, fec_recovered) = match &p.state {
-                    PeerState::Established(epochs) => {
+                    PeerSessionState::Established(epochs) => {
                         let ratio = (epochs.bulk_repair_ratio() * 100.0).round() as u8;
                         let rec = epochs.fec_recovered_count();
                         (ratio, rec)
@@ -1992,7 +2186,7 @@ impl PeerManager {
     /// Drain any pending decoded packets across all peers' active epochs into `out`.
     pub fn drain_tun(&mut self, out: &mut Vec<Vec<u8>>) {
         for peer in &mut self.peers {
-            if let PeerState::Established(epochs) = &mut peer.state {
+            if let PeerSessionState::Established(epochs) = &mut peer.state {
                 epochs.drain_tun(out);
             }
         }
@@ -2168,7 +2362,7 @@ impl PeerManager {
 
     pub fn recycle(&mut self, batch: &mut Vec<EgressDatagram>) {
         for p in &mut self.peers {
-            if let PeerState::Established(epochs) = &mut p.state {
+            if let PeerSessionState::Established(epochs) = &mut p.state {
                 epochs.current_mut().recycle(batch);
                 if batch.is_empty() {
                     return;
@@ -2329,7 +2523,7 @@ impl PeerManager {
         // arm that returns borrowed data, which then conflicts with any
         // other arm that also touches `self.peers[idx]`. Splitting into
         // independent statements gives each one its own borrow region.
-        if matches!(self.peers[idx].state, PeerState::Established(_)) {
+        if matches!(self.peers[idx].state, PeerSessionState::Established(_)) {
             // Real Data egress for this peer (3b Task 4): mark it active so
             // the idle-cover-traffic gate in `tick_dispatch` does not fire
             // while real traffic is flowing.
@@ -2343,7 +2537,7 @@ impl PeerManager {
             // peer's datagrams already carry the correct `dst` — return them
             // borrowed, byte-identical to 2a.
             if !self.peers[idx].relay {
-                let PeerState::Established(epochs) = &mut self.peers[idx].state else {
+                let PeerSessionState::Established(epochs) = &mut self.peers[idx].state else {
                     unreachable!("just matched Established above");
                 };
                 let start_len = out.len();
@@ -2355,7 +2549,7 @@ impl PeerManager {
             }
             let start_len = out.len();
             let owned: Vec<Vec<u8>> = {
-                let PeerState::Established(epochs) = &mut self.peers[idx].state else {
+                let PeerSessionState::Established(epochs) = &mut self.peers[idx].state else {
                     unreachable!("just matched Established above");
                 };
                 let mut tmp = Vec::new();
@@ -2372,7 +2566,7 @@ impl PeerManager {
             return;
         }
 
-        if matches!(self.peers[idx].state, PeerState::Handshaking(_)) {
+        if matches!(self.peers[idx].state, PeerSessionState::Handshaking(_)) {
             Self::push_pending(&mut self.peers[idx].pending_tun, inner);
             return;
         }
@@ -2420,9 +2614,9 @@ impl PeerManager {
         if self.num_shards > 1 && self.shard_id != 0 {
             for i in 0..self.peers.len() {
                 let relay = self.peers[i].relay;
-                let old_state = std::mem::replace(&mut self.peers[i].state, PeerState::Idle);
+                let old_state = std::mem::replace(&mut self.peers[i].state, PeerSessionState::Idle);
                 let new_state = match old_state {
-                    PeerState::Established(mut epochs) => {
+                    PeerSessionState::Established(mut epochs) => {
                         epochs.retire_previous_if_due(now_ms);
                         if let Some(pkts) = epochs.current_mut().tick(now_ms) {
                             if relay {
@@ -2443,7 +2637,7 @@ impl PeerManager {
                                 }
                             }
                         }
-                        PeerState::Established(epochs)
+                        PeerSessionState::Established(epochs)
                     }
                     other => other,
                 };
@@ -2516,10 +2710,10 @@ impl PeerManager {
             // regardless of when `relay` flipped, while a Relay Init (via_relay)
             // is still left to the retransmit arm (no ephemeral-churn loop).
             if self.rendezvous.is_some()
-                && matches!(self.peers[i].state, PeerState::Handshaking(ref h) if !h.via_relay)
+                && matches!(self.peers[i].state, PeerSessionState::Handshaking(ref h) if !h.via_relay)
             {
                 let target = match &self.peers[i].state {
-                    PeerState::Handshaking(h) => h.target,
+                    PeerSessionState::Handshaking(h) => h.target,
                     _ => unreachable!("matched Handshaking above"),
                 };
                 match self.peers[i].path.advance(now_ms) {
@@ -2536,7 +2730,7 @@ impl PeerManager {
                         // `[HandshakeResp]` for the abandoned punch candidate must not match
                         // this now-relay-flagged peer.
                         let server = self.server_addr();
-                        self.peers[i].state = PeerState::Idle;
+                        self.peers[i].state = PeerSessionState::Idle;
                         self.peers[i].endpoint = None;
                         if let Some(dgs) = self.begin_handshake(i, server, true, now_ms) {
                             self.tick_egress.extend(dgs);
@@ -2556,7 +2750,7 @@ impl PeerManager {
                         // `relay` flag (the egress-wrap mismatch flagged near the Idle
                         // branch). The SM re-escalates to the relay after the punch
                         // window if the direct candidate also fails, redrawing again.
-                        self.peers[i].state = PeerState::Idle;
+                        self.peers[i].state = PeerSessionState::Idle;
                         self.peers[i].relay = false;
                         if let Some(dgs) = self.begin_handshake(i, addr, false, now_ms) {
                             self.tick_egress.extend(dgs);
@@ -2599,9 +2793,9 @@ impl PeerManager {
             }
 
             let relay = self.peers[i].relay;
-            let old_state = std::mem::replace(&mut self.peers[i].state, PeerState::Idle);
+            let old_state = std::mem::replace(&mut self.peers[i].state, PeerSessionState::Idle);
             let new_state = match old_state {
-                PeerState::Established(mut epochs) => {
+                PeerSessionState::Established(mut epochs) => {
                     epochs.retire_previous_if_due(now_ms);
                     self.drive_rekey_schedule(i, relay, &mut epochs, now_ms);
                     if let Some(pkts) = epochs.current_mut().tick(now_ms) {
@@ -2619,9 +2813,9 @@ impl PeerManager {
                             self.tick_egress.extend(pkts.iter().cloned());
                         }
                     }
-                    PeerState::Established(epochs)
+                    PeerSessionState::Established(epochs)
                 }
-                PeerState::Handshaking(mut handshaking)
+                PeerSessionState::Handshaking(mut handshaking)
                     if now_ms.saturating_sub(handshaking.last_sent_ms) >= handshaking.retry_ms =>
                 {
                     if now_ms.saturating_sub(handshaking.started_ms) >= HANDSHAKE_TOTAL_MS {
@@ -2629,7 +2823,7 @@ impl PeerManager {
                         // peer is unreachable. Give up and free the ephemeral;
                         // the next TUN packet starts a fresh attempt.
                         self.peers[i].pending_tun.clear();
-                        PeerState::Idle
+                        PeerSessionState::Idle
                     } else {
                         // Retransmit the SAME init (same ephemeral) so the
                         // responder's cached reply stays valid — see
@@ -2654,7 +2848,7 @@ impl PeerManager {
                                 bytes: handshaking.init_pkt.clone(),
                             });
                         }
-                        PeerState::Handshaking(handshaking)
+                        PeerSessionState::Handshaking(handshaking)
                     }
                 }
                 other => other,
@@ -2670,7 +2864,7 @@ impl PeerManager {
         // hole-punching proactive rather than waiting on TUN traffic.
         if self.rendezvous.is_some() {
             for i in 0..self.peers.len() {
-                if matches!(self.peers[i].state, PeerState::Idle) {
+                if matches!(self.peers[i].state, PeerSessionState::Idle) {
                     self.drive_path_idle(i, now_ms);
                 }
             }
@@ -2701,7 +2895,8 @@ impl PeerManager {
             }
 
             for i in 0..self.peers.len() {
-                if !matches!(self.peers[i].state, PeerState::Established(_)) || self.peers[i].relay
+                if !matches!(self.peers[i].state, PeerSessionState::Established(_))
+                    || self.peers[i].relay
                 {
                     continue;
                 }
@@ -2753,7 +2948,7 @@ impl PeerManager {
         // ── DAITA state machine timers ───────────────────────────────────────
         let now_instant = std::time::Instant::now();
         for i in 0..self.peers.len() {
-            if !matches!(self.peers[i].state, PeerState::Established(_)) {
+            if !matches!(self.peers[i].state, PeerSessionState::Established(_)) {
                 continue;
             }
             let Some(endpoint) = self.peers[i].endpoint else {
@@ -2820,7 +3015,7 @@ impl PeerManager {
                 .iter()
                 .enumerate()
                 .filter(|(_, p)| {
-                    matches!(p.state, PeerState::Established(_))
+                    matches!(p.state, PeerSessionState::Established(_))
                         && !m.member_or_admitted_cert_valid(
                             &p.pubkey,
                             p.admitted_cert_not_after,

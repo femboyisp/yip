@@ -1,0 +1,26 @@
+[package]
+name = "yip-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "OS-agnostic wire, IPC, ticket, and overlay address protocol definitions for yip"
+
+[dependencies]
+base64 = "0.22"
+blake3 = { workspace = true }
+qrcode = { version = "0.14", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

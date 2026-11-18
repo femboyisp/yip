@@ -599,6 +599,13 @@ fn create_peer_manager(
     manager.set_obf_psk(config.obf_psk);
     manager.set_cover_traffic_ms(config.cover_traffic_ms);
     manager.set_traffic_defense(config.traffic_defense.clone());
+    manager.set_config_path(config.config_path.clone());
+    if let Some(mtu) = config.mtu {
+        manager.set_mtu(mtu);
+    }
+    if let Some(fec) = config.fec {
+        manager.set_fec_config(fec);
+    }
     Ok(manager)
 }
 

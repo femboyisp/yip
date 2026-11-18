@@ -15,265 +15,14 @@ use std::time::Instant;
 use crate::config::PeerConfig;
 use crate::peer_manager::{PeerManager, PeerStats};
 
-/// Inbound control commands received over the UNIX socket.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "cmd")]
-pub enum ControlCmd {
-    #[serde(rename = "status")]
-    Status,
-    #[serde(rename = "list_peers")]
-    ListPeers,
-    #[serde(rename = "add_peer")]
-    AddPeer {
-        public_key: String,
-        endpoint: Option<String>,
-        #[serde(default)]
-        transport: Option<String>,
-        #[serde(default)]
-        alias: Option<String>,
-    },
-    #[serde(rename = "remove_peer")]
-    RemovePeer { public_key: String },
-    #[serde(rename = "set_transport")]
-    SetTransport {
-        public_key: String,
-        transport: String,
-    },
-    #[serde(rename = "cert_status")]
-    CertStatus,
-    #[serde(rename = "cert_renew")]
-    CertRenew,
-    #[serde(rename = "get_fec_status")]
-    GetFecStatus,
-    #[serde(rename = "set_fec_config")]
-    SetFecConfig {
-        #[serde(default)]
-        preset: Option<String>,
-        #[serde(default)]
-        redundancy_pct: Option<u8>,
-        #[serde(default)]
-        data_shards: Option<usize>,
-        #[serde(default)]
-        parity_shards: Option<usize>,
-    },
-    #[serde(rename = "get_daita_status")]
-    GetDaitaStatus,
-    #[serde(rename = "set_daita_config")]
-    SetDaitaConfig {
-        #[serde(default)]
-        preset: Option<String>,
-        #[serde(default)]
-        buckets: Option<Vec<usize>>,
-        #[serde(default)]
-        cover_interval_ms: Option<u64>,
-        #[serde(default)]
-        cover_burst_max: Option<u64>,
-        #[serde(default)]
-        jitter_max_ms: Option<u64>,
-    },
-    #[serde(rename = "get_routes")]
-    GetRoutes,
-    #[serde(rename = "get_topology")]
-    GetTopology,
-    #[serde(rename = "get_split_tunnel")]
-    GetSplitTunnelStatus,
-    #[serde(rename = "set_split_tunnel")]
-    SetSplitTunnelConfig {
-        #[serde(default)]
-        enabled: Option<bool>,
-        #[serde(default)]
-        mode: Option<String>,
-        #[serde(default)]
-        cidrs: Option<Vec<String>>,
-        #[serde(default)]
-        domains: Option<Vec<String>>,
-        #[serde(default)]
-        apps: Option<Vec<String>>,
-    },
-    #[serde(rename = "trace_path")]
-    TracePath { peer_node_id: String },
-    #[serde(rename = "ping_peer")]
-    PingPeer {
-        peer_node_id: String,
-        #[serde(default = "default_ping_count")]
-        count: u32,
-        #[serde(default = "default_ping_timeout_ms")]
-        timeout_ms: u64,
-    },
-    #[serde(rename = "get_metrics")]
-    GetMetrics {
-        #[serde(default)]
-        peer: Option<String>,
-    },
-    #[serde(rename = "get_crypto_status")]
-    GetCryptoStatus {
-        #[serde(default)]
-        peer: Option<String>,
-    },
-    #[serde(rename = "trigger_rekey")]
-    TriggerRekey { peer: String },
-    #[serde(rename = "get_xdp_status")]
-    GetXdpStatus,
-    #[serde(rename = "set_xdp_mode")]
-    SetXdpMode { mode: String },
-    #[serde(rename = "create_ticket")]
-    CreateTicket {
-        #[serde(default)]
-        name: Option<String>,
-        #[serde(default)]
-        route_mode: Option<String>,
-        #[serde(default)]
-        endpoint: Option<String>,
-    },
+pub use yip_proto::control::*;
+
+pub trait DaitaPresetExt {
+    fn to_defense_config(self) -> crate::config::TrafficDefenseConfig;
 }
 
-fn default_ping_count() -> u32 {
-    4
-}
-
-fn default_ping_timeout_ms() -> u64 {
-    2000
-}
-
-/// Supported Reed-Solomon dynamic FEC presets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum FecPreset {
-    Off,
-    Low,
-    #[default]
-    Adaptive,
-    Hostile,
-    Custom,
-}
-
-impl std::str::FromStr for FecPreset {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "off" => Ok(FecPreset::Off),
-            "low" => Ok(FecPreset::Low),
-            "adaptive" => Ok(FecPreset::Adaptive),
-            "hostile" => Ok(FecPreset::Hostile),
-            "custom" => Ok(FecPreset::Custom),
-            other => Err(format!(
-                "unknown FEC preset: {other} (valid: off, low, adaptive, hostile, custom)"
-            )),
-        }
-    }
-}
-
-impl std::fmt::Display for FecPreset {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FecPreset::Off => write!(f, "off"),
-            FecPreset::Low => write!(f, "low"),
-            FecPreset::Adaptive => write!(f, "adaptive"),
-            FecPreset::Hostile => write!(f, "hostile"),
-            FecPreset::Custom => write!(f, "custom"),
-        }
-    }
-}
-
-impl FecPreset {
-    pub fn default_config(&self) -> FecConfig {
-        match self {
-            FecPreset::Off => FecConfig {
-                preset: *self,
-                redundancy_pct: 0,
-                data_shards: 10,
-                parity_shards: 0,
-            },
-            FecPreset::Low => FecConfig {
-                preset: *self,
-                redundancy_pct: 5,
-                data_shards: 10,
-                parity_shards: 1,
-            },
-            FecPreset::Adaptive => FecConfig {
-                preset: *self,
-                redundancy_pct: 12,
-                data_shards: 10,
-                parity_shards: 2,
-            },
-            FecPreset::Hostile => FecConfig {
-                preset: *self,
-                redundancy_pct: 30,
-                data_shards: 10,
-                parity_shards: 4,
-            },
-            FecPreset::Custom => FecConfig {
-                preset: *self,
-                redundancy_pct: 15,
-                data_shards: 10,
-                parity_shards: 2,
-            },
-        }
-    }
-}
-
-/// Dynamic Reed-Solomon FEC runtime configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct FecConfig {
-    pub preset: FecPreset,
-    pub redundancy_pct: u8,
-    pub data_shards: usize,
-    pub parity_shards: usize,
-}
-
-impl Default for FecConfig {
-    fn default() -> Self {
-        FecPreset::Adaptive.default_config()
-    }
-}
-
-/// Supported DAITA traffic defense presets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum DaitaPreset {
-    #[default]
-    Off,
-    Low,
-    Balanced,
-    Max,
-    Paranoid,
-    Custom,
-}
-
-impl std::str::FromStr for DaitaPreset {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "off" => Ok(DaitaPreset::Off),
-            "low" => Ok(DaitaPreset::Low),
-            "balanced" => Ok(DaitaPreset::Balanced),
-            "max" => Ok(DaitaPreset::Max),
-            "paranoid" => Ok(DaitaPreset::Paranoid),
-            "custom" => Ok(DaitaPreset::Custom),
-            other => Err(format!(
-                "unknown DAITA preset: {other} (valid: off, low, balanced, max, paranoid, custom)"
-            )),
-        }
-    }
-}
-
-impl std::fmt::Display for DaitaPreset {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DaitaPreset::Off => write!(f, "off"),
-            DaitaPreset::Low => write!(f, "low"),
-            DaitaPreset::Balanced => write!(f, "balanced"),
-            DaitaPreset::Max => write!(f, "max"),
-            DaitaPreset::Paranoid => write!(f, "paranoid"),
-            DaitaPreset::Custom => write!(f, "custom"),
-        }
-    }
-}
-
-impl DaitaPreset {
-    pub fn to_defense_config(self) -> crate::config::TrafficDefenseConfig {
+impl DaitaPresetExt for DaitaPreset {
+    fn to_defense_config(self) -> crate::config::TrafficDefenseConfig {
         match self {
             DaitaPreset::Off => crate::config::TrafficDefenseConfig {
                 preset: yip_obf::TrafficDefensePreset::Off,
@@ -317,114 +66,6 @@ pub fn defense_preset_name(preset: yip_obf::TrafficDefensePreset) -> &'static st
         yip_obf::TrafficDefensePreset::Balanced => "balanced",
         yip_obf::TrafficDefensePreset::Paranoid => "paranoid",
     }
-}
-
-/// An entry in the active overlay routing table (#183).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
-pub struct RouteEntry {
-    pub prefix: String,
-    pub next_hop: String,
-    pub peer_name: String,
-    pub direct: bool,
-    pub mtu: u16,
-    pub margin: u16,
-    pub metric: u32,
-}
-
-/// A node in the projected mesh topology graph (#183).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Default)]
-pub struct TopologyNode {
-    pub id: String,
-    pub label: String,
-    pub ip: String,
-    pub is_self: bool,
-    pub is_relay: bool,
-    pub rtt_ms: f64,
-    pub kem_algo: String,
-    pub rx_bytes: u64,
-    pub tx_bytes: u64,
-}
-
-/// Latency classification for link visualization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-pub enum LatencyCategory {
-    #[default]
-    Optimal,
-    Normal,
-    Elevated,
-}
-
-/// A bidirectional or directional edge in the projected mesh topology graph (#183).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Default)]
-pub struct TopologyLink {
-    pub source: String,
-    pub target: String,
-    pub direct: bool,
-    pub rtt_ms: f64,
-    pub metric: u32,
-    pub latency_category: LatencyCategory,
-}
-
-/// Complete network mesh topology projection (#183).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Default)]
-pub struct MeshTopologyGraph {
-    pub nodes: Vec<TopologyNode>,
-    pub links: Vec<TopologyLink>,
-    pub total_peers: usize,
-    pub direct_peers: usize,
-    pub relay_peers: usize,
-    pub avg_rtt_ms: f64,
-}
-
-/// Supported split-tunnel policy routing modes (#184).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum SplitMode {
-    #[default]
-    Exclude,
-    Include,
-}
-
-impl std::str::FromStr for SplitMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "exclude" => Ok(SplitMode::Exclude),
-            "include" => Ok(SplitMode::Include),
-            other => Err(format!(
-                "unknown split mode: {other} (valid: exclude, include)"
-            )),
-        }
-    }
-}
-
-impl std::fmt::Display for SplitMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SplitMode::Exclude => write!(f, "exclude"),
-            SplitMode::Include => write!(f, "include"),
-        }
-    }
-}
-
-/// Split-tunnel route and application bypass configuration (#184).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-pub struct SplitTunnelConfig {
-    pub enabled: bool,
-    pub mode: SplitMode,
-    pub cidrs: Vec<String>,
-    pub domains: Vec<String>,
-    pub apps: Vec<String>,
-}
-
-/// Live split-tunnel traffic counters (#184).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-pub struct SplitTunnelTelemetry {
-    pub bypassed_packets: u64,
-    pub bypassed_bytes: u64,
-    pub overlay_packets: u64,
-    pub overlay_bytes: u64,
 }
 
 /// Internal split-tunnel engine state with pre-parsed CIDR masks.
@@ -477,180 +118,6 @@ impl SplitTunnelState {
     pub fn record_routed(&mut self, bytes: u64) {
         self.telemetry.overlay_packets += 1;
         self.telemetry.overlay_bytes += bytes;
-    }
-}
-
-/// Parse a CIDR string into an IP address and prefix length.
-pub fn parse_cidr(cidr_str: &str) -> Result<(std::net::IpAddr, u8), String> {
-    let parts: Vec<&str> = cidr_str.trim().split('/').collect();
-    if parts.is_empty() || parts.len() > 2 {
-        return Err(format!("invalid CIDR syntax: '{cidr_str}'"));
-    }
-    let ip: std::net::IpAddr = parts[0]
-        .parse()
-        .map_err(|e| format!("invalid IP address '{}': {e}", parts[0]))?;
-    let prefix = if parts.len() == 2 {
-        let p: u8 = parts[1]
-            .parse()
-            .map_err(|e| format!("invalid prefix '{}': {e}", parts[1]))?;
-        match ip {
-            std::net::IpAddr::V4(_) if p > 32 => {
-                return Err(format!("IPv4 prefix /{p} must be <= 32"));
-            }
-            std::net::IpAddr::V6(_) if p > 128 => {
-                return Err(format!("IPv6 prefix /{p} must be <= 128"));
-            }
-            _ => p,
-        }
-    } else {
-        match ip {
-            std::net::IpAddr::V4(_) => 32,
-            std::net::IpAddr::V6(_) => 128,
-        }
-    };
-    Ok((ip, prefix))
-}
-
-/// Check if an IP address falls within a given CIDR subnet.
-pub fn ip_matches_cidr(target: std::net::IpAddr, net: std::net::IpAddr, prefix: u8) -> bool {
-    match (target, net) {
-        (std::net::IpAddr::V4(t), std::net::IpAddr::V4(n)) => {
-            if prefix == 0 {
-                return true;
-            }
-            if prefix > 32 {
-                return false;
-            }
-            let mask = if prefix >= 32 {
-                !0u32
-            } else {
-                !((1u32 << (32 - prefix)) - 1)
-            };
-            (u32::from(t) & mask) == (u32::from(n) & mask)
-        }
-        (std::net::IpAddr::V6(t), std::net::IpAddr::V6(n)) => {
-            if prefix == 0 {
-                return true;
-            }
-            if prefix > 128 {
-                return false;
-            }
-            let mask = if prefix >= 128 {
-                !0u128
-            } else {
-                !((1u128 << (128 - prefix)) - 1)
-            };
-            (u128::from(t) & mask) == (u128::from(n) & mask)
-        }
-        _ => false,
-    }
-}
-
-/// Extract destination IP address from raw IPv4 or IPv6 packet bytes.
-pub fn extract_ip_dst(inner: &[u8]) -> Option<std::net::IpAddr> {
-    if inner.len() >= 20 && inner[0] >> 4 == 4 {
-        let mut octets = [0u8; 4];
-        octets.copy_from_slice(&inner[16..20]);
-        Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets)))
-    } else if inner.len() >= 40 && inner[0] >> 4 == 6 {
-        let mut octets = [0u8; 16];
-        octets.copy_from_slice(&inner[24..40]);
-        Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)))
-    } else {
-        None
-    }
-}
-
-/// A single segment or hop along a mesh circuit trace (#187).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Default)]
-pub struct HopTrace {
-    pub hop_index: u32,
-    pub node_id: String,
-    pub endpoint: Option<String>,
-    pub rtt_ms: f64,
-    pub is_direct: bool,
-    pub transport: String,
-}
-
-/// Statistics and probe samples from pinging a mesh peer (#187).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Default)]
-pub struct PingPeerResult {
-    pub target: String,
-    pub endpoint: Option<String>,
-    pub sent: u32,
-    pub received: u32,
-    pub packet_loss_pct: f64,
-    pub min_rtt_ms: Option<f64>,
-    pub avg_rtt_ms: Option<f64>,
-    pub max_rtt_ms: Option<f64>,
-    pub stddev_rtt_ms: Option<f64>,
-    pub samples: Vec<f64>,
-}
-
-/// Active cryptographic session states and anti-replay floors (#185).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Default)]
-pub struct PeerCryptoStatus {
-    pub peer: String,
-    pub node_addr: String,
-    pub endpoint: Option<String>,
-    pub session_state: String,
-    pub cipher_suite: String,
-    pub current_epoch: Option<u64>,
-    pub current_epoch_age_secs: Option<u64>,
-    pub next_epoch: Option<u64>,
-    pub previous_epoch: Option<u64>,
-    pub rekey_in_flight: bool,
-    pub send_counter: Option<u64>,
-    pub replay_floor: Option<u64>,
-    pub replay_latest: Option<u64>,
-    pub last_accepted_init_tai64n: Option<String>,
-}
-
-/// eBPF XDP attachment and driver offload modes (#186).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum XdpMode {
-    Auto,
-    Generic,
-    Native,
-    Offload,
-}
-
-impl std::str::FromStr for XdpMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "auto" => Ok(Self::Auto),
-            "generic" | "skb" => Ok(Self::Generic),
-            "native" | "drv" | "driver" => Ok(Self::Native),
-            "offload" | "hw" | "hardware" => Ok(Self::Offload),
-            other => Err(format!(
-                "invalid xdp mode '{other}', expected one of: auto, generic, native, offload"
-            )),
-        }
-    }
-}
-
-impl std::fmt::Display for XdpMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Auto => write!(f, "auto"),
-            Self::Generic => write!(f, "generic"),
-            Self::Native => write!(f, "native"),
-            Self::Offload => write!(f, "offload"),
-        }
-    }
-}
-
-impl XdpMode {
-    pub fn to_flags(self) -> u32 {
-        match self {
-            Self::Auto => 0,
-            Self::Generic => yip_io::bpf::XDP_FLAGS_SKB_MODE,
-            Self::Native => yip_io::bpf::XDP_FLAGS_DRV_MODE,
-            Self::Offload => yip_io::bpf::XDP_FLAGS_HW_MODE,
-        }
     }
 }
 
@@ -766,157 +233,6 @@ impl XdpState {
         );
         Ok(msg)
     }
-}
-
-/// Outbound control command responses returned to clients.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-#[serde(untagged)]
-pub enum ControlResponse {
-    Status {
-        ok: bool,
-        version: String,
-        node_addr: String,
-        device: String,
-        #[serde(default)]
-        public_key: String,
-        #[serde(default)]
-        listen_port: u16,
-        #[serde(default)]
-        network_id: String,
-        peers_count: usize,
-        uptime_secs: u64,
-        #[serde(default)]
-        ca_status: Option<String>,
-    },
-    ListPeers {
-        ok: bool,
-        peers: Vec<PeerStats>,
-    },
-    CertStatus {
-        ok: bool,
-        not_before: u64,
-        not_after: u64,
-        ttl_remaining_secs: u64,
-        renewal_threshold_secs: u64,
-        is_threshold_ca: bool,
-    },
-    CertRenew {
-        ok: bool,
-        renewed: bool,
-        message: String,
-        new_not_after: Option<u64>,
-    },
-    FecStatus {
-        ok: bool,
-        preset: String,
-        redundancy_pct: u8,
-        data_shards: usize,
-        parity_shards: usize,
-        total_symbols_tx: u64,
-        recovered_symbols_rx: u64,
-        unrecoverable_burst_drops: u64,
-        loss_recovery_rate_pct: f32,
-    },
-    DaitaStatus {
-        ok: bool,
-        preset: String,
-        buckets: Vec<usize>,
-        cover_interval_ms: Option<u64>,
-        cover_burst_max: u64,
-        jitter_max_ms: u64,
-        authentic_bytes_tx: u64,
-        padding_bytes_tx: u64,
-        decoy_packets_tx: u64,
-        decoy_bytes_tx: u64,
-        padding_ratio_pct: f32,
-    },
-    Routes {
-        ok: bool,
-        routes: Vec<RouteEntry>,
-    },
-    Topology {
-        ok: bool,
-        topology: MeshTopologyGraph,
-    },
-    SplitTunnelStatus {
-        ok: bool,
-        enabled: bool,
-        mode: String,
-        cidrs: Vec<String>,
-        domains: Vec<String>,
-        apps: Vec<String>,
-        bypassed_packets: u64,
-        bypassed_bytes: u64,
-        overlay_packets: u64,
-        overlay_bytes: u64,
-    },
-    TracePath {
-        ok: bool,
-        target: String,
-        reachable: bool,
-        hops: Vec<HopTrace>,
-        total_rtt_ms: f64,
-    },
-    PingPeer {
-        ok: bool,
-        target: String,
-        endpoint: Option<String>,
-        sent: u32,
-        received: u32,
-        packet_loss_pct: f64,
-        min_rtt_ms: Option<f64>,
-        avg_rtt_ms: Option<f64>,
-        max_rtt_ms: Option<f64>,
-        stddev_rtt_ms: Option<f64>,
-        samples: Vec<f64>,
-    },
-    CryptoStatus {
-        ok: bool,
-        sessions: Vec<PeerCryptoStatus>,
-    },
-    XdpStatus {
-        ok: bool,
-        interface: Option<String>,
-        mode: String,
-        bound_mode: String,
-        attached_mode: String,
-        zero_copy_supported: bool,
-        prog_id: Option<u32>,
-        queues_count: usize,
-        hardware_offload_queues: Vec<u32>,
-        umem_slabs: usize,
-        umem_chunk_size: usize,
-        umem_total_chunks: usize,
-        umem_free_chunks: usize,
-        fill_ring_drops: u64,
-        rx_ring_drops: u64,
-        tx_ring_drops: u64,
-        completion_ring_drops: u64,
-        rx_packets: u64,
-        tx_packets: u64,
-        rx_bytes: u64,
-        tx_bytes: u64,
-    },
-    Metrics {
-        ok: bool,
-        metrics: crate::metrics::TelemetrySnapshot,
-        prometheus: String,
-    },
-    Ticket {
-        ok: bool,
-        ticket: crate::ticket::NetworkTicket,
-        uri: String,
-        #[serde(default)]
-        qr_terminal: String,
-    },
-    Ack {
-        ok: bool,
-        message: String,
-    },
-    Err {
-        ok: bool,
-        error: String,
-    },
 }
 
 /// A request dispatched from a socket client to the main dataplane thread.
@@ -1613,6 +929,22 @@ pub fn dispatch_cmd(
                 uri,
                 qr_terminal,
             }
+        }
+        ControlCmd::Reload { path } => match pm.reload_config(path.as_deref()) {
+            Ok(report) => ControlResponse::Reload {
+                ok: true,
+                message: report.summary(),
+                reloaded: true,
+            },
+            Err(e) => ControlResponse::Reload {
+                ok: false,
+                message: e,
+                reloaded: false,
+            },
+        },
+        ControlCmd::GetConfig => {
+            let config = pm.get_active_config();
+            ControlResponse::Config { ok: true, config }
         }
     }
 }
@@ -2975,6 +2307,98 @@ pub fn run_cli_top(socket_path: &Path, interval_ms: u64) -> Result<(), String> {
 
         let _ = std::io::stdout().flush();
         std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+    }
+}
+
+/// Dynamically reload daemon configuration from disk.
+pub fn run_cli_reload(
+    socket_path: &Path,
+    custom_path: Option<&str>,
+    json: bool,
+) -> std::io::Result<()> {
+    let cmd = ControlCmd::Reload {
+        path: custom_path.map(|s| s.to_string()),
+    };
+    let resp = client_query(socket_path, cmd).map_err(std::io::Error::other)?;
+    if json {
+        let text = serde_json::to_string_pretty(&resp).map_err(std::io::Error::other)?;
+        println!("{text}");
+        return Ok(());
+    }
+    match resp {
+        ControlResponse::Reload { ok, message, .. } => {
+            if ok {
+                println!("{message}");
+                Ok(())
+            } else {
+                Err(std::io::Error::other(message))
+            }
+        }
+        ControlResponse::Err { error, .. } => Err(std::io::Error::other(error)),
+        other => Err(std::io::Error::other(format!(
+            "unexpected response: {other:?}"
+        ))),
+    }
+}
+
+/// Inspect active running daemon configuration.
+pub fn run_cli_config(socket_path: &Path, json: bool) -> std::io::Result<()> {
+    let resp = client_query(socket_path, ControlCmd::GetConfig).map_err(std::io::Error::other)?;
+    if json {
+        let text = serde_json::to_string_pretty(&resp).map_err(std::io::Error::other)?;
+        println!("{text}");
+        return Ok(());
+    }
+    match resp {
+        ControlResponse::Config { ok, config } => {
+            if !ok {
+                return Err(std::io::Error::other("failed to retrieve daemon config"));
+            }
+            println!("\x1b[1;32m●\x1b[0m \x1b[1mActive Daemon Configuration\x1b[0m");
+            println!("  Device:     \x1b[1m{}\x1b[0m", config.device);
+            if let Some(ref pk) = config.public_key {
+                println!("  Public Key: \x1b[33m{}\x1b[0m", pk);
+            }
+            if let Some(ref l) = config.listen {
+                println!("  Listen:     {}", l);
+            }
+            if let Some(ref rdv) = config.rendezvous {
+                println!("  Rendezvous: {}", rdv);
+            }
+            if let Some(ref nid) = config.network_id {
+                println!("  Network ID: {}", nid);
+            }
+            if let Some(ref fec) = config.fec {
+                println!(
+                    "  FEC:        preset={} redundancy={}% shards={}+{}",
+                    fec.preset, fec.redundancy_pct, fec.data_shards, fec.parity_shards
+                );
+            }
+            if let Some(ref daita) = config.daita {
+                println!(
+                    "  DAITA:      preset={} buckets={:?} burst_max={} jitter={}ms",
+                    daita.preset, daita.buckets, daita.cover_burst_max, daita.jitter_max_ms
+                );
+            }
+            if let Some(ref st) = config.split_tunnel {
+                println!("  Split:      enabled={} mode={}", st.enabled, st.mode);
+            }
+            println!("  Peers ({}):", config.peers.len());
+            for p in &config.peers {
+                let alias = p.alias.as_deref().unwrap_or("-");
+                let ep = p.endpoint.as_deref().unwrap_or("-");
+                let tr = p.transport.as_deref().unwrap_or("-");
+                println!(
+                    "    • {} alias={} endpoint={} transport={}",
+                    p.public_key, alias, ep, tr
+                );
+            }
+            Ok(())
+        }
+        ControlResponse::Err { error, .. } => Err(std::io::Error::other(error)),
+        other => Err(std::io::Error::other(format!(
+            "unexpected response: {other:?}"
+        ))),
     }
 }
 
@@ -4562,5 +3986,87 @@ mod tests {
         // Nonexistent socket fails cleanly
         assert!(run_cli_xdp_status(Path::new("/tmp/nonexistent_xdp.sock"), false).is_err());
         assert!(run_cli_xdp_set(Path::new("/tmp/nonexistent_xdp.sock"), "native", false).is_err());
+    }
+
+    #[test]
+    fn test_cli_reload_and_config() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let sock_path = format!("/tmp/test_cli_reload_config_{}.sock", std::process::id());
+        let _ = std::fs::remove_file(&sock_path);
+
+        let handle = ControlHandle::bind(&sock_path).unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let r_clone = running.clone();
+
+        let srv = std::thread::spawn(move || {
+            while r_clone.load(Ordering::Relaxed) {
+                if let Ok(req) = handle.try_recv() {
+                    let resp = match req.cmd {
+                        ControlCmd::GetConfig => ControlResponse::Config {
+                            ok: true,
+                            config: yip_proto::control::DaemonConfig {
+                                device: "yip0".into(),
+                                listen: Some("0.0.0.0:51820".into()),
+                                public_key: Some("aa".repeat(32)),
+                                rendezvous: Some("127.0.0.1:443".into()),
+                                network_id: Some("01".repeat(16)),
+                                peers: vec![yip_proto::control::PeerConfigEntry {
+                                    public_key: "bb".repeat(32),
+                                    endpoint: Some("10.0.0.2:51820".into()),
+                                    alias: Some("peer-b".into()),
+                                    transport: Some("raw".into()),
+                                }],
+                                fec: Some(yip_proto::control::FecConfig::default()),
+                                daita: Some(yip_proto::control::DaitaConfig::default()),
+                                split_tunnel: Some(yip_proto::control::SplitTunnelConfig::default()),
+                            },
+                        },
+                        ControlCmd::Reload { path } => ControlResponse::Reload {
+                            ok: true,
+                            message: format!(
+                                "configuration reloaded from {}: 1 peers added, 0 peers removed, 0 peers updated, 1 sessions preserved",
+                                path.unwrap_or_else(|| "default.conf".into())
+                            ),
+                            reloaded: true,
+                        },
+                        _ => ControlResponse::Err {
+                            ok: false,
+                            error: "unexpected cmd".into(),
+                        },
+                    };
+                    let _ = req.responder.send(resp);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let path = Path::new(&sock_path);
+
+        // Test config ANSI
+        let res_cfg_ansi = run_cli_config(path, false);
+        assert!(res_cfg_ansi.is_ok());
+
+        // Test config JSON
+        let res_cfg_json = run_cli_config(path, true);
+        assert!(res_cfg_json.is_ok());
+
+        // Test reload ANSI
+        let res_reload_ansi = run_cli_reload(path, Some("/etc/yip/yip0.conf"), false);
+        assert!(res_reload_ansi.is_ok());
+
+        // Test reload JSON
+        let res_reload_json = run_cli_reload(path, None, true);
+        assert!(res_reload_json.is_ok());
+
+        running.store(false, Ordering::Relaxed);
+        let _ = srv.join();
+        let _ = std::fs::remove_file(&sock_path);
+
+        // Nonexistent socket fails cleanly
+        assert!(run_cli_config(Path::new("/tmp/nonexistent_cfg.sock"), false).is_err());
+        assert!(run_cli_reload(Path::new("/tmp/nonexistent_cfg.sock"), None, false).is_err());
     }
 }

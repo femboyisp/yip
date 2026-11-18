@@ -3207,6 +3207,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "yip-proto"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "qrcode",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "yip-rendezvous"
 version = "0.1.0"
 dependencies = [
@@ -3291,14 +3302,12 @@ dependencies = [
 name = "yipd"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
  "blake3",
  "boring",
  "bytes",
  "ed25519-dalek",
  "getrandom 0.4.3",
  "libc",
- "qrcode",
  "quinn-proto",
  "rcgen",
  "rustls",
@@ -3312,6 +3321,7 @@ dependencies = [
  "yip-io",
  "yip-membership",
  "yip-obf",
+ "yip-proto",
  "yip-rendezvous",
  "yip-transport",
  "yip-utls",
