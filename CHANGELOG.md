@@ -59,6 +59,11 @@ All notable changes to this project are documented here, following
   Added automated installation and evaluation of userspace Go WireGuard (`wireguard-go`) in `setup-contenders.sh` (`--wireguard-go`) and `run-iperf-compare.sh`. Measures dual-stack IPv4/IPv6 throughput, loss, latency, CPU utilization, and peak resident memory (`get_ns_ram_mb`), enabling direct userspace-to-userspace comparisons against YIP. Added Go module build caching in `benchmarks.yml` to accelerate CI benchmarking runs.
 
 ### Performance
+- **IPv6 Multi-Shard Resident Memory Footprint Optimization (`crates/yip-transport`, `bin/yipd`, #255).**
+  - Sized `FecReassembler` pool capacity in `crates/yip-transport/src/lib.rs` from 256 to 64 objects per class, reducing max reassembly pool memory across 8 worker shards from ~393 MB down to ~98 MB.
+  - Sized `FlowTable` in `Classifier::new` to 1,024 entries with 10s TTL and bypassed heuristic flow tracking for non-TCP/UDP control and multicast protocols (ICMPv4, ICMPv6, IGMP, `ff00::/8`), eliminating background discovery table bloat.
+  - Resolved queue-head starvation in `FlowTable::evict_expired` by rotating active flows to the back of the queue, allowing stale entries queued behind them to be evicted cleanly.
+  - Bounded and reclaimed `DataPlane` drained scratch vectors (`tun_drained`, `tick_tun_drained` capped to 32 elements) and oversized scratch buffers during periodic `tick` idle sweeps in `bin/yipd/src/dataplane.rs`.
 - **Line-Rate UDP Burst Loss Elimination & Socket Queue Hardening (`crates/yip-device`, `crates/yip-io`, `bin/yipd`, #254).**
   - Raised default UDP socket buffer allocations to 32 MiB (`DEFAULT_SOCKET_BUFFER_BYTES = 32 * 1024 * 1024`) via privileged `SO_RCVBUFFORCE` and `SO_SNDBUFFORCE` (with automatic fallback to unprivileged `SO_RCVBUF` / `SO_SNDBUF`) across daemon underlay and worker sockets, preventing kernel buffer exhaustion during multi-gigabit line-rate bursts.
   - Configured 10,000 `txqueuelen` via `SIOCSIFTXQLEN` ioctl during TUN/TAP device creation in `crates/yip-device` (`TunTap::create` and `TunTap::create_multi_queue`), eliminating interface transmit queue drops when kernel network stacks blast high-rate UDP microbursts into the overlay.
