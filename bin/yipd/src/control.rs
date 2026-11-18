@@ -441,6 +441,8 @@ pub fn dispatch_cmd(
     match cmd {
         ControlCmd::Status => {
             let stats = pm.peer_stats();
+            let spsc_drops =
+                crate::sharding::SPSC_QUEUE_DROPS.load(std::sync::atomic::Ordering::Relaxed);
             ControlResponse::Status {
                 ok: true,
                 version: env!("CARGO_PKG_VERSION").into(),
@@ -452,6 +454,7 @@ pub fn dispatch_cmd(
                 peers_count: stats.len(),
                 uptime_secs: start_time.elapsed().as_secs(),
                 ca_status: Some("Enforced (Root Ed25519) — Zero-Trust Admission".into()),
+                spsc_queue_drops: spsc_drops,
             }
         }
         ControlCmd::ListPeers => {
@@ -1106,6 +1109,7 @@ pub fn run_cli_status(socket_path: &Path, json: bool) -> Result<(), String> {
             peers_count,
             uptime_secs,
             ca_status,
+            spsc_queue_drops,
         } => {
             if !ok {
                 return Err("daemon reported status error".into());
@@ -1127,6 +1131,9 @@ pub fn run_cli_status(socket_path: &Path, json: bool) -> Result<(), String> {
             println!("  CA Gating:  \x1b[32m{ca_str}\x1b[0m");
             println!("  Uptime:     {}", format_duration(uptime_secs));
             println!("  Peers:      {peers_count} configured");
+            if spsc_queue_drops > 0 {
+                println!("  Ring Drops: \x1b[31m{spsc_queue_drops}\x1b[0m");
+            }
             Ok(())
         }
         ControlResponse::Err { error, .. } => Err(error),
@@ -2406,6 +2413,33 @@ pub fn run_cli_config(socket_path: &Path, json: bool) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    fn setup_test_peer_manager() -> (PeerManager, Instant) {
+        (
+            crate::peer_manager::testutil::test_peer_manager(),
+            Instant::now(),
+        )
+    }
+
+    #[test]
+    fn test_dispatch_status_includes_spsc_queue_drops() {
+        let (mut pm, start) = setup_test_peer_manager();
+
+        // Record drops before check
+        let initial_drops =
+            crate::sharding::SPSC_QUEUE_DROPS.load(std::sync::atomic::Ordering::Relaxed);
+        crate::sharding::SPSC_QUEUE_DROPS.fetch_add(7, std::sync::atomic::Ordering::Relaxed);
+
+        let resp = dispatch_cmd(&mut pm, ControlCmd::Status, "yip0", start);
+        match resp {
+            ControlResponse::Status {
+                spsc_queue_drops, ..
+            } => {
+                assert_eq!(spsc_queue_drops, initial_drops + 7);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
     #[test]
     fn control_protocol_status_serialization() {
         let mut pm = crate::peer_manager::testutil::test_peer_manager();
@@ -2427,6 +2461,7 @@ mod tests {
             device,
             public_key,
             listen_port,
+            spsc_queue_drops,
             ..
         } = deserialized
         {
@@ -2434,6 +2469,10 @@ mod tests {
             assert_eq!(device, "yip0");
             assert_eq!(public_key, pm.local_pub_hex());
             assert_eq!(listen_port, 51820);
+            assert_eq!(
+                spsc_queue_drops,
+                crate::sharding::SPSC_QUEUE_DROPS.load(std::sync::atomic::Ordering::Relaxed)
+            );
         } else {
             panic!("expected ControlResponse::Status deserialization");
         }
@@ -2445,12 +2484,14 @@ mod tests {
             public_key,
             listen_port,
             network_id,
+            spsc_queue_drops,
             ..
         } = old_parsed
         {
             assert_eq!(public_key, "");
             assert_eq!(listen_port, 0);
             assert_eq!(network_id, "");
+            assert_eq!(spsc_queue_drops, 0);
         } else {
             panic!("expected backward-compatible Status deserialization");
         }
@@ -2899,6 +2940,9 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         let path = Path::new(&sock_path);
 
+        assert!(run_cli_status(path, false).is_ok());
+        assert!(run_cli_status(path, true).is_ok());
+        crate::sharding::SPSC_QUEUE_DROPS.fetch_add(5, Ordering::Relaxed);
         assert!(run_cli_status(path, false).is_ok());
         assert!(run_cli_status(path, true).is_ok());
         assert!(run_cli_peers(path, false).is_ok());
