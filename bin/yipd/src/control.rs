@@ -1090,7 +1090,7 @@ pub fn sparkline(values: &[f64]) -> String {
 }
 
 /// Format the text output for CLI daemon status.
-pub fn format_cli_status(resp: &ControlResponse) -> Result<String, String> {
+pub fn format_cli_status(resp: &ControlResponse) -> Result<String, &str> {
     match resp {
         ControlResponse::Status {
             ok,
@@ -1106,7 +1106,7 @@ pub fn format_cli_status(resp: &ControlResponse) -> Result<String, String> {
             spsc_queue_drops,
         } => {
             if !ok {
-                return Err("daemon reported status error".into());
+                return Err("daemon reported status error");
             }
             use std::fmt::Write;
             let mut out = String::new();
@@ -1133,8 +1133,8 @@ pub fn format_cli_status(resp: &ControlResponse) -> Result<String, String> {
             }
             Ok(out)
         }
-        ControlResponse::Err { error, .. } => Err(error.clone()),
-        _ => Err("unexpected response format from daemon".into()),
+        ControlResponse::Err { error, .. } => Err(error.as_str()),
+        _ => Err("unexpected response format from daemon"),
     }
 }
 
@@ -1146,7 +1146,7 @@ pub fn run_cli_status(socket_path: &Path, json: bool) -> Result<(), String> {
         println!("{text}");
         return Ok(());
     }
-    let text = format_cli_status(&resp)?;
+    let text = format_cli_status(&resp).map_err(|e| e.to_string())?;
     print!("{text}");
     Ok(())
 }
@@ -2476,7 +2476,7 @@ mod tests {
             ok: false,
             error: "mock error".into(),
         };
-        assert_eq!(format_cli_status(&resp_err), Err("mock error".into()));
+        assert_eq!(format_cli_status(&resp_err), Err("mock error"));
 
         let resp_other = ControlResponse::Ack {
             ok: true,
@@ -2484,7 +2484,7 @@ mod tests {
         };
         assert_eq!(
             format_cli_status(&resp_other),
-            Err("unexpected response format from daemon".into())
+            Err("unexpected response format from daemon")
         );
 
         let resp_not_ok = ControlResponse::Status {
@@ -2502,7 +2502,7 @@ mod tests {
         };
         assert_eq!(
             format_cli_status(&resp_not_ok),
-            Err("daemon reported status error".into())
+            Err("daemon reported status error")
         );
     }
 
