@@ -156,6 +156,8 @@ pub enum ControlResponse {
         uptime_secs: u64,
         #[serde(default)]
         ca_status: Option<String>,
+        #[serde(default)]
+        spsc_queue_drops: u64,
     },
     ListPeers {
         ok: bool,
@@ -814,5 +816,61 @@ pub fn extract_ip_dst(inner: &[u8]) -> Option<IpAddr> {
         Some(IpAddr::V6(Ipv6Addr::from(octets)))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_status_response_spsc_queue_drops_backward_compatibility() {
+        // Payload from an older daemon lacking spsc_queue_drops
+        let legacy_json = r#"{
+            "ok": true,
+            "version": "0.1.0",
+            "node_addr": "fd00::1",
+            "device": "yip0",
+            "peers_count": 2,
+            "uptime_secs": 120
+        }"#;
+
+        let resp: ControlResponse = serde_json::from_str(legacy_json)
+            .expect("legacy status JSON must deserialize with default spsc_queue_drops");
+
+        match resp {
+            ControlResponse::Status {
+                spsc_queue_drops,
+                node_addr,
+                ..
+            } => {
+                assert_eq!(node_addr, "fd00::1");
+                assert_eq!(spsc_queue_drops, 0, "legacy status must default to 0 drops");
+            }
+            other => panic!("expected ControlResponse::Status, got {other:?}"),
+        }
+
+        // Payload with explicit non-zero spsc_queue_drops
+        let modern_json = r#"{
+            "ok": true,
+            "version": "0.1.0",
+            "node_addr": "fd00::2",
+            "device": "yip0",
+            "peers_count": 1,
+            "uptime_secs": 60,
+            "spsc_queue_drops": 42
+        }"#;
+
+        let resp_modern: ControlResponse =
+            serde_json::from_str(modern_json).expect("modern status JSON must deserialize");
+
+        match resp_modern {
+            ControlResponse::Status {
+                spsc_queue_drops, ..
+            } => {
+                assert_eq!(spsc_queue_drops, 42);
+            }
+            other => panic!("expected ControlResponse::Status, got {other:?}"),
+        }
     }
 }

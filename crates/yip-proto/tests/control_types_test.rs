@@ -186,6 +186,7 @@ fn test_all_existing_control_response_variants_round_trip() {
             peers_count: 3,
             uptime_secs: 100,
             ca_status: Some("valid".to_string()),
+            spsc_queue_drops: 0,
         },
         ControlResponse::ListPeers {
             ok: true,
