@@ -16,7 +16,7 @@ pub mod rlnc;
 pub use rlnc::{RlncDecoder, RlncEncoder};
 
 pub mod classify;
-pub use classify::{Classifier, FlowKey, PolicyRule};
+pub use classify::{is_pure_tcp_ack, Classifier, FlowKey, PolicyRule};
 
 pub mod flow;
 pub use flow::FlowTable;
@@ -74,6 +74,8 @@ pub enum FlowClass {
     /// Baseline when nothing else applies.
     #[default]
     Default,
+    /// Pure TCP acknowledgments: elevated proactive FEC, 0-RTT, no reactive ARQ.
+    Ack,
 }
 
 /// Per-class FEC parameters.
@@ -111,6 +113,12 @@ impl FlowClass {
                 deadline: Duration::from_millis(100),
                 arq: false,
             },
+            FlowClass::Ack => FlowParams {
+                symbol_size: 1200,
+                initial_repair_ratio: 0.30,
+                deadline: Duration::from_millis(40),
+                arq: false,
+            },
         }
     }
 }
@@ -121,6 +129,7 @@ fn class_index(c: FlowClass) -> usize {
         FlowClass::Realtime => 0,
         FlowClass::Bulk => 1,
         FlowClass::Default => 2,
+        FlowClass::Ack => 3,
     }
 }
 
@@ -129,7 +138,7 @@ fn class_index(c: FlowClass) -> usize {
 pub struct Transport {
     classifier: Classifier,
     encoder: FecEncoder,
-    controllers: [AdaptiveController; 3],
+    controllers: [AdaptiveController; 4],
     reassemblers: HashMap<u8, FecReassembler>,
     /// Reed–Solomon symbol size applied to every class's [`FlowParams`], overriding
     /// the per-class default from `FlowClass::params()`. Raw/obf mode passes
@@ -150,6 +159,7 @@ impl Transport {
                 AdaptiveController::new_for(FlowClass::Realtime.params()),
                 AdaptiveController::new_for(FlowClass::Bulk.params()),
                 AdaptiveController::new_for(FlowClass::Default.params()),
+                AdaptiveController::new_for(FlowClass::Ack.params()),
             ],
             reassemblers: HashMap::new(),
             symbol_size,
@@ -229,7 +239,7 @@ impl Transport {
         now_ms: u64,
     ) -> Option<Vec<u8>> {
         let params = self.params_for(class);
-        let idx = u8::try_from(class_index(class)).expect("3 classes");
+        let idx = u8::try_from(class_index(class)).expect("4 classes");
         let deadline_ms = params.deadline.as_millis() as u64;
         self.reassemblers
             .entry(idx)
@@ -247,7 +257,7 @@ impl Transport {
         now_ms: u64,
     ) -> Option<&[u8]> {
         let params = self.params_for(class);
-        let idx = u8::try_from(class_index(class)).expect("3 classes");
+        let idx = u8::try_from(class_index(class)).expect("4 classes");
         let deadline_ms = params.deadline.as_millis() as u64;
         self.reassemblers
             .entry(idx)
@@ -479,7 +489,12 @@ mod tests {
     #[test]
     fn transport_new_overrides_symbol_size_for_every_class() {
         let t = Transport::new(vec![], 1150);
-        for class in [FlowClass::Realtime, FlowClass::Bulk, FlowClass::Default] {
+        for class in [
+            FlowClass::Realtime,
+            FlowClass::Bulk,
+            FlowClass::Default,
+            FlowClass::Ack,
+        ] {
             assert_eq!(
                 t.params_for(class).symbol_size,
                 1150,
@@ -493,7 +508,12 @@ mod tests {
     #[test]
     fn transport_new_default_symbol_size_is_1200() {
         let t = Transport::new(vec![], 1200);
-        for class in [FlowClass::Realtime, FlowClass::Bulk, FlowClass::Default] {
+        for class in [
+            FlowClass::Realtime,
+            FlowClass::Bulk,
+            FlowClass::Default,
+            FlowClass::Ack,
+        ] {
             assert_eq!(t.params_for(class).symbol_size, 1200);
         }
     }

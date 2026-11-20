@@ -122,7 +122,9 @@ impl SentLog {
                     match class {
                         FlowClass::Realtime => counts.realtime = counts.realtime.saturating_add(1),
                         FlowClass::Bulk => counts.bulk = counts.bulk.saturating_add(1),
-                        FlowClass::Default => counts.default = counts.default.saturating_add(1),
+                        FlowClass::Default | FlowClass::Ack => {
+                            counts.default = counts.default.saturating_add(1)
+                        }
                     }
                 }
             }
@@ -754,6 +756,9 @@ impl DataPlane {
                                 }
                                 Some(FlowClass::Default) => {
                                     missing_default = missing_default.saturating_add(1);
+                                }
+                                Some(FlowClass::Ack) => {
+                                    // Pure TCP ACKs are proactive-only; ARQ retransmission is not performed.
                                 }
                                 None => {
                                     // Counter not in log (too old or was a control packet) — ignore.

@@ -77,6 +77,15 @@ impl Classifier {
     /// `now_ms` is the current wall-clock time in milliseconds, used by the flow
     /// heuristic.
     pub fn classify(&mut self, inner: &[u8], l2: bool, now_ms: u64) -> FlowClass {
+        // 0. stateless pure TCP ACK detection
+        if is_pure_tcp_ack(inner, l2) {
+            if let Some(p) = parse_ip(inner, l2) {
+                let canonical = p.key.canonical();
+                self.flows.observe(&canonical, inner.len(), now_ms);
+            }
+            return FlowClass::Ack;
+        }
+
         let Some(p) = parse_ip(inner, l2) else {
             return FlowClass::Default;
         };
@@ -116,6 +125,84 @@ impl Classifier {
             }
         }
     }
+}
+
+/// Statelessly inspect an L3/L2 packet to check whether it is a pure TCP ACK
+/// (zero payload bytes, ACK flag set, and SYN/FIN/RST cleared).
+///
+/// Pure TCP ACKs are latency-critical and cumulative; classifying them into
+/// `FlowClass::Ack` provides 0-RTT proactive FEC protection without blocking
+/// on reactive ARQ timeouts.
+pub fn is_pure_tcp_ack(inner: &[u8], l2: bool) -> bool {
+    let ip = if l2 {
+        if inner.len() < 14 {
+            return false;
+        }
+        let ethertype = u16::from_be_bytes([inner[12], inner[13]]);
+        match ethertype {
+            0x0800 | 0x86DD => &inner[14..],
+            _ => return false,
+        }
+    } else {
+        inner
+    };
+
+    if ip.is_empty() {
+        return false;
+    }
+    let version = ip[0] >> 4;
+    let (ip_hl, total_ip_len, proto) = match version {
+        4 => {
+            if ip.len() < 20 {
+                return false;
+            }
+            let ihl = usize::from(ip[0] & 0x0F) * 4;
+            if ihl < 20 || ip.len() < ihl {
+                return false;
+            }
+            let total_len = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
+            if ip.len() < total_len || total_len < ihl {
+                return false;
+            }
+            (ihl, total_len, ip[9])
+        }
+        6 => {
+            if ip.len() < 40 {
+                return false;
+            }
+            let payload_len = usize::from(u16::from_be_bytes([ip[4], ip[5]]));
+            let total_len = 40 + payload_len;
+            if ip.len() < total_len {
+                return false;
+            }
+            (40, total_len, ip[6])
+        }
+        _ => return false,
+    };
+
+    if proto != 6 {
+        return false;
+    }
+
+    let tcp = &ip[ip_hl..total_ip_len];
+    if tcp.len() < 20 {
+        return false;
+    }
+
+    let data_offset = usize::from(tcp[12] >> 4) * 4;
+    if data_offset < 20 || data_offset > tcp.len() {
+        return false;
+    }
+
+    let flags = tcp[13];
+    // ACK must be set (0x10)
+    // SYN (0x02), FIN (0x01), RST (0x04) must be cleared (flags & 0x07 == 0)
+    if (flags & 0x10) == 0 || (flags & 0x07) != 0 {
+        return false;
+    }
+
+    let tcp_payload_len = tcp.len() - data_offset;
+    tcp_payload_len == 0
 }
 
 /// Extract DSCP/proto/dst-port from an IPv4/IPv6 inner packet (None if malformed).
@@ -409,5 +496,109 @@ mod tests {
             c.flows.is_empty(),
             "observe_ingress on ICMPv6 must not populate flow table"
         );
+    }
+
+    #[test]
+    fn pure_tcp_ack_classification_ipv4_and_ipv6() {
+        let mut c = Classifier::new(vec![]);
+
+        // 1. Minimal IPv4 pure ACK (20B IP + 20B TCP, ACK set, data_offset = 20B)
+        let mut v4_ack = vec![0u8; 40];
+        v4_ack[0] = 0x45; // IPv4, IHL 5
+        v4_ack[2..4].copy_from_slice(&(40u16).to_be_bytes()); // total len = 40
+        v4_ack[9] = 6; // TCP
+        v4_ack[32] = 0x50; // data offset = 5 words (20 bytes)
+        v4_ack[33] = 0x10; // ACK flag
+        assert!(is_pure_tcp_ack(&v4_ack, false));
+        assert_eq!(c.classify(&v4_ack, false, 0), FlowClass::Ack);
+
+        // 2. IPv4 pure ACK with TCP Timestamps (20B IP + 32B TCP, total len = 52)
+        let mut v4_ts_ack = vec![0u8; 52];
+        v4_ts_ack[0] = 0x45;
+        v4_ts_ack[2..4].copy_from_slice(&(52u16).to_be_bytes());
+        v4_ts_ack[9] = 6;
+        v4_ts_ack[32] = 0x80; // data offset = 8 words (32 bytes)
+        v4_ts_ack[33] = 0x10; // ACK
+        assert!(is_pure_tcp_ack(&v4_ts_ack, false));
+        assert_eq!(c.classify(&v4_ts_ack, false, 0), FlowClass::Ack);
+
+        // 3. Minimal IPv6 pure ACK (40B IP + 20B TCP, total len = 60, payload_len = 20)
+        let mut v6_ack = vec![0u8; 60];
+        v6_ack[0] = 0x60; // IPv6
+        v6_ack[4..6].copy_from_slice(&(20u16).to_be_bytes()); // payload len = 20
+        v6_ack[6] = 6; // TCP
+        v6_ack[52] = 0x50; // data offset = 5 words (20 bytes)
+        v6_ack[53] = 0x10; // ACK
+        assert!(is_pure_tcp_ack(&v6_ack, false));
+        assert_eq!(c.classify(&v6_ack, false, 0), FlowClass::Ack);
+
+        // 4. IPv6 pure ACK with TCP Timestamps (40B IP + 32B TCP, payload_len = 32)
+        let mut v6_ts_ack = vec![0u8; 72];
+        v6_ts_ack[0] = 0x60;
+        v6_ts_ack[4..6].copy_from_slice(&(32u16).to_be_bytes());
+        v6_ts_ack[6] = 6;
+        v6_ts_ack[52] = 0x80; // data offset = 8 words (32 bytes)
+        v6_ts_ack[53] = 0x10; // ACK
+        assert!(is_pure_tcp_ack(&v6_ts_ack, false));
+        assert_eq!(c.classify(&v6_ts_ack, false, 0), FlowClass::Ack);
+
+        // 5. Ethernet L2 pure ACK frame
+        let mut l2_ack = vec![0u8; 14 + 40];
+        l2_ack[12] = 0x08;
+        l2_ack[13] = 0x00; // IPv4
+        l2_ack[14..].copy_from_slice(&v4_ack);
+        assert!(is_pure_tcp_ack(&l2_ack, true));
+        assert_eq!(c.classify(&l2_ack, true, 0), FlowClass::Ack);
+    }
+
+    #[test]
+    fn non_pure_tcp_acks_rejected() {
+        // TCP ACK carrying payload (40B headers + 10B payload = 50B)
+        let mut ack_with_payload = vec![0u8; 50];
+        ack_with_payload[0] = 0x45;
+        ack_with_payload[2..4].copy_from_slice(&(50u16).to_be_bytes());
+        ack_with_payload[9] = 6;
+        ack_with_payload[32] = 0x50; // 20B TCP header
+        ack_with_payload[33] = 0x10; // ACK
+        assert!(!is_pure_tcp_ack(&ack_with_payload, false));
+
+        // TCP SYN-ACK (SYN bit set: 0x12)
+        let mut syn_ack = vec![0u8; 40];
+        syn_ack[0] = 0x45;
+        syn_ack[2..4].copy_from_slice(&(40u16).to_be_bytes());
+        syn_ack[9] = 6;
+        syn_ack[32] = 0x50;
+        syn_ack[33] = 0x12; // SYN | ACK
+        assert!(!is_pure_tcp_ack(&syn_ack, false));
+
+        // TCP FIN-ACK (FIN bit set: 0x11)
+        let mut fin_ack = vec![0u8; 40];
+        fin_ack[0] = 0x45;
+        fin_ack[2..4].copy_from_slice(&(40u16).to_be_bytes());
+        fin_ack[9] = 6;
+        fin_ack[32] = 0x50;
+        fin_ack[33] = 0x11; // FIN | ACK
+        assert!(!is_pure_tcp_ack(&fin_ack, false));
+
+        // TCP RST-ACK (RST bit set: 0x14)
+        let mut rst_ack = vec![0u8; 40];
+        rst_ack[0] = 0x45;
+        rst_ack[2..4].copy_from_slice(&(40u16).to_be_bytes());
+        rst_ack[9] = 6;
+        rst_ack[32] = 0x50;
+        rst_ack[33] = 0x14; // RST | ACK
+        assert!(!is_pure_tcp_ack(&rst_ack, false));
+
+        // Bogus data offset < 20 (e.g. data_offset = 16)
+        let mut bogus_offset = vec![0u8; 40];
+        bogus_offset[0] = 0x45;
+        bogus_offset[2..4].copy_from_slice(&(40u16).to_be_bytes());
+        bogus_offset[9] = 6;
+        bogus_offset[32] = 0x40; // 4 words = 16 bytes (< 20)
+        bogus_offset[33] = 0x10;
+        assert!(!is_pure_tcp_ack(&bogus_offset, false));
+
+        // Truncated packet
+        assert!(!is_pure_tcp_ack(&[0x45, 0, 0, 40], false));
     }
 }
