@@ -72,6 +72,14 @@ All notable changes to this project are documented here, following
   - Expanded cross-shard SPSC ring buffer depth from 2,048 to 8,192 slots and implemented a continuous multi-batch draining loop (harvesting up to 512 datagrams per event loop iteration) with drop telemetry (`SPSC_QUEUE_DROPS`), absorbing transient packet surges without packet loss across worker shards.
 
 ### Fixed
+- **IPv6 TCP Throughput Collapse Under Packet Loss & RFC 8200 Sub-1220 MSS Collapse (`crates/yip-transport`, `bin/yipd`, #272, #273).**
+  - Implemented dynamic TCP MSS clamping tied to active PLPMTU tiers (`PmtuManager::update_confirmed_symbol_size`, `max_mss_for_packet`) enforcing `K = 1` single FEC symbol packaging across tiers (`tier_mtu = confirmed_symbol_size - 28`).
+  - Enforced RFC 8200 minimum IPv6 floor (1280 MTU / 1220 MSS) preventing the Linux kernel TCP stack from collapsing congestion windows when MTU drops below 1280.
+  - Added stateless pure TCP ACK classification (`classify.rs`) matching ACK-only frames (`payload_len == 0`, `SYN`/`FIN`/`RST` cleared, options-aware `data_offset >= 20`) mapped to `FlowClass::Ack`.
+  - Configured 0-RTT proactive FEC delivery (30% repair ratio floor) without reactive ARQ retransmission for `FlowClass::Ack`, eliminating latency degradation from stale cumulative ACK retransmissions.
+  - Implemented RFC 8899 §5.2 periodic PLPMTU re-probe search timer (15s interval) in `PlpmtuController::tick`, unfreezing `Converged` state and recovering path MTU after transient underlay loss.
+  - Replaced uniform loss threshold blackhole triggers with RFC 8899 size-differential loss detection in `dataplane.rs` (requiring >= 80% large packet loss and < 30% small packet loss across 2 consecutive intervals with sample count floors), eliminating false blackhole step-downs during uniform netem channel loss.
+  - Increased 10% packet loss IPv6 TCP throughput from 3.7 Mbit/s to 153.1 Mbit/s (a 41x throughput recovery) while maintaining 0 hot-path heap allocations.
 - **Control Socket Permissions and Unprivileged Access (`bin/yipd`, `contrib/systemd`, #195).**
   - Configured explicit file permissions (`0666` default or configurable via `YIP_CONTROL_SOCKET_MODE`) on the control UNIX domain socket (`/run/yipd/yip.sock`) and parent directory (`0755`), allowing unprivileged desktop users (e.g. `yip-client` or CLI tools) to query daemon status without requiring `sudo`.
   - Added automatic group ownership resolution (`chown`) to group `yip` (or `YIP_CONTROL_SOCKET_GROUP`) when present.
