@@ -22,6 +22,9 @@ pub const PLPMTU_LADDER: [u16; 4] = [1120, 1320, 1400, 1530];
 /// Interval in milliseconds between probe attempts.
 pub const PROBE_INTERVAL_MS: u64 = 1000;
 
+/// Periodic search interval in milliseconds to re-probe higher MTU tiers after converging (RFC 8899 §5.2).
+pub const REPROBE_INTERVAL_MS: u64 = 15_000;
+
 /// Maximum number of probe attempts per candidate tier before declaring it failed.
 pub const MAX_PROBE_ATTEMPTS: u8 = 3;
 
@@ -118,6 +121,7 @@ pub struct PlpmtuController {
     next_probe_id: u16,
     active_probe_id: u16,
     last_probe_ms: Option<u64>,
+    last_converged_ms: Option<u64>,
     backoff_exp: u32,
 }
 
@@ -139,6 +143,7 @@ impl PlpmtuController {
             next_probe_id: 2,
             active_probe_id: 1,
             last_probe_ms: Some(0),
+            last_converged_ms: None,
             backoff_exp: 0,
         }
     }
@@ -178,7 +183,11 @@ impl PlpmtuController {
     ///
     /// If probing and `now_ms >= last_probe_ms + interval`:
     /// Increments `attempts`. If `attempts > MAX_PROBE_ATTEMPTS`, this candidate tier
-    /// failed; the controller converges at the current confirmed tier and returns `None`.
+    /// failed; the controller converges at the current confirmed tier and records convergence time.
+    ///
+    /// If converged and `confirmed_symbol_size < PLPMTU_LADDER.last()`, after `REPROBE_INTERVAL_MS` (15s)
+    /// unfreezes converged state to re-probe the next tier up (RFC 8899 §5.2).
+    ///
     /// Otherwise, records `last_probe_ms = now_ms`, returns `Some((probe_id, target_symbol_size, pad_len))`
     /// where `pad_len` pads the probe wire size to `target_symbol_size`.
     pub fn on_tick(&mut self, now_ms: u64) -> Option<(u16, u16, usize)> {
@@ -193,6 +202,7 @@ impl PlpmtuController {
                 let next_attempts = attempts.saturating_add(1);
                 if next_attempts > MAX_PROBE_ATTEMPTS {
                     self.state = ControllerState::Converged;
+                    self.last_converged_ms = Some(now_ms);
                     return None;
                 }
 
@@ -206,7 +216,33 @@ impl PlpmtuController {
                 let pad_len = usize::from(target_symbol_size).saturating_sub(6);
                 Some((self.active_probe_id, target_symbol_size, pad_len))
             }
-            ControllerState::Converged => None,
+            ControllerState::Converged => {
+                if self.confirmed_symbol_size < PLPMTU_LADDER[PLPMTU_LADDER.len() - 1] {
+                    let converged_at = self.last_converged_ms.get_or_insert(now_ms);
+                    if now_ms.saturating_sub(*converged_at) >= REPROBE_INTERVAL_MS {
+                        // Unfreeze converged state and re-probe next tier
+                        let current_tier_idx = PLPMTU_LADDER
+                            .iter()
+                            .position(|&s| s == self.confirmed_symbol_size)
+                            .unwrap_or(0);
+                        let next_tier_idx = current_tier_idx + 1;
+                        if next_tier_idx < PLPMTU_LADDER.len() {
+                            self.active_probe_id = self.next_probe_id;
+                            self.next_probe_id = self.next_probe_id.wrapping_add(1);
+                            self.last_probe_ms = Some(now_ms);
+                            self.last_converged_ms = None;
+                            self.state = ControllerState::Probing {
+                                tier_idx: next_tier_idx,
+                                attempts: 1,
+                            };
+                            let target_symbol_size = PLPMTU_LADDER[next_tier_idx];
+                            let pad_len = usize::from(target_symbol_size).saturating_sub(6);
+                            return Some((self.active_probe_id, target_symbol_size, pad_len));
+                        }
+                    }
+                }
+                None
+            }
         }
     }
 
@@ -223,6 +259,7 @@ impl PlpmtuController {
                 if probe_id == self.active_probe_id && accepted_symbol_size == target_symbol_size {
                     self.confirmed_symbol_size = accepted_symbol_size;
                     self.backoff_exp = 0;
+                    self.last_converged_ms = None;
 
                     let next_tier = tier_idx + 1;
                     if next_tier < PLPMTU_LADDER.len() {
@@ -253,6 +290,7 @@ impl PlpmtuController {
     pub fn on_blackhole(&mut self) -> Option<u16> {
         if self.confirmed_symbol_size > PLPMTU_LADDER[0] {
             self.confirmed_symbol_size = PLPMTU_LADDER[0];
+            self.last_converged_ms = None;
             self.state = ControllerState::Probing {
                 tier_idx: 1,
                 attempts: 0,
@@ -272,6 +310,7 @@ impl PlpmtuController {
     /// restarts probing from Tier 1, and returns `1120`.
     pub fn reset_to_floor(&mut self) -> u16 {
         self.confirmed_symbol_size = PLPMTU_LADDER[0];
+        self.last_converged_ms = None;
         self.state = ControllerState::Probing {
             tier_idx: 1,
             attempts: 0,
@@ -521,5 +560,36 @@ mod tests {
         assert_eq!(ctrl.on_ack(id3, 1530), Some(1530));
         assert!(ctrl.is_converged());
         assert_eq!(ctrl.active_probe_id(), None);
+    }
+
+    #[test]
+    fn test_periodic_reprobe_unfreezes_converged_state_rfc8899() {
+        let mut ctrl = PlpmtuController::new();
+
+        // Fail 3 attempts on Tier 1 (1320), causing controller to converge at Tier 0 (1120)
+        let _ = ctrl.on_tick(1000).expect("attempt 1");
+        let _ = ctrl.on_tick(2000).expect("attempt 2");
+        let _ = ctrl.on_tick(3000).expect("attempt 3");
+        assert_eq!(ctrl.on_tick(4000), None); // timeout triggers Converged
+        assert!(ctrl.is_converged());
+        assert_eq!(ctrl.current_symbol_size(), 1120);
+
+        // Before 15 seconds (REPROBE_INTERVAL_MS = 15_000): stays Converged
+        assert_eq!(ctrl.on_tick(5000), None);
+        assert_eq!(ctrl.on_tick(18_000), None); // 18_000 - 4000 = 14_000 < 15_000
+        assert!(ctrl.is_converged());
+
+        // At 15 seconds elapsed (4000 + 15_000 = 19_000): unfreezes and emits re-probe for Tier 1 (1320)
+        let (reprobe_id, target_size, pad_len) = ctrl
+            .on_tick(19_000)
+            .expect("re-probe must fire after 15s interval");
+        assert_eq!(target_size, 1320);
+        assert_eq!(pad_len, 1314);
+        assert!(!ctrl.is_converged());
+        assert_eq!(ctrl.candidate_symbol_size(), Some(1320));
+
+        // When re-probe is ACKed, promotes to 1320!
+        assert_eq!(ctrl.on_ack(reprobe_id, 1320), Some(1320));
+        assert_eq!(ctrl.current_symbol_size(), 1320);
     }
 }

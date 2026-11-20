@@ -27,7 +27,7 @@ pub use control::AdaptiveController;
 pub mod plpmtu;
 pub use plpmtu::{
     ControlFrame, PlpmtuController, MAGIC_MTU_PROBE, MAGIC_MTU_PROBE_ACK, MAX_PROBE_ATTEMPTS,
-    PLPMTU_LADDER, PROBE_INTERVAL_MS,
+    PLPMTU_LADDER, PROBE_INTERVAL_MS, REPROBE_INTERVAL_MS,
 };
 
 pub mod pmtu;
