@@ -488,10 +488,14 @@ pub fn dispatch_cmd(
                 },
                 None => None,
             };
+            let normalized_alias = match alias.as_deref().map(str::trim) {
+                Some(s) if !s.is_empty() => Some(s.to_string()),
+                _ => None,
+            };
             let cfg = PeerConfig {
                 public_key: pk,
                 endpoint: ep,
-                alias,
+                alias: normalized_alias,
             };
             if let Some(tr) = transport {
                 match pm.add_peer_with_transport(cfg, Some(tr)) {

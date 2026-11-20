@@ -3639,3 +3639,18 @@ fn test_peer_alias_lookup_and_pubkey() {
     // Resolving by ID using alias
     assert_eq!(pm.find_peer_index_by_id("gateway-alpha"), Some(1));
 }
+
+#[test]
+fn test_peer_alias_untrimmed_whitespace_normalization() {
+    let mut pm = test_peer_manager();
+    let cfg1 = PeerConfig::new([89u8; 32], None).with_alias("   edge-node-1   ");
+    pm.add_peer(cfg1).expect("add peer 1");
+
+    assert_eq!(pm.find_peer_by_alias("edge-node-1"), Some(1));
+    assert_eq!(pm.find_peer_by_alias("  EDGE-NODE-1  "), Some(1));
+
+    // Second peer trying to use same alias with different spacing/case must be rejected
+    let cfg2 = PeerConfig::new([90u8; 32], None).with_alias("EDGE-NODE-1");
+    let err = pm.add_peer(cfg2).expect_err("must reject duplicate alias");
+    assert_eq!(err, "duplicate peer alias");
+}

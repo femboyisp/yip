@@ -1397,7 +1397,9 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                         let _ = manager.remove_peer(pk);
                                     }
                                     ShardMsg::ConfigReload(path) | ShardMsg::ReloadConfig(path) => {
-                                        let _ = manager.reload_config(path.as_deref());
+                                        if let Err(e) = manager.reload_config(path.as_deref()) {
+                                            eprintln!("worker shard reload_config error: {}", e);
+                                        }
                                     }
                                 }
                             }

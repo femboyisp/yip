@@ -106,6 +106,10 @@ impl PathState {
         self.direct = Some(addr);
     }
 
+    pub fn clear_direct(&mut self) {
+        self.direct = None;
+    }
+
     pub fn on_peer_candidate(&mut self, addr: SocketAddr, now_ms: u64) {
         // A reflexive addr arrived (from PeerInfo or a PunchHint): enter/refresh
         // the punch stage targeting it.
@@ -175,13 +179,6 @@ impl PathState {
         self.committed = true;
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "session-stale reset is a local decision wired in a later milestone"
-        )
-    )]
     pub fn reset(&mut self, now_ms: u64) {
         self.committed = false;
         self.candidate = None;

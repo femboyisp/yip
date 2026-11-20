@@ -568,3 +568,139 @@ fn test_peer_alias_uniqueness_enforced() {
     let res = pm.add_peer_with_transport(peer2, None);
     assert_eq!(res, Err("duplicate peer alias"));
 }
+
+#[test]
+fn test_path_reset_on_endpoint_update_for_unestablished_peer() {
+    let kp = yip_crypto::generate_keypair();
+    let peer_kp = yip_crypto::generate_keypair();
+    let new_ep: std::net::SocketAddr = "198.51.100.2:51820".parse().unwrap();
+
+    let initial_conf = format!(
+        "local_private = {}\n\
+         local_public = {}\n\
+         device = yip0\n\
+         listen = 127.0.0.1:51820\n\
+         \n\
+         [peer]\n\
+         public_key = {}\n",
+        hex_encode(&kp.private),
+        hex_encode(&kp.public),
+        hex_encode(&peer_kp.public),
+    );
+    let cfg_path = format!(
+        "/tmp/test_reload_unestablished_path_{}.conf",
+        std::process::id()
+    );
+    std::fs::write(&cfg_path, &initial_conf).unwrap();
+
+    let cfg = yipd::config::Config::parse(&initial_conf).unwrap();
+    let mut pm = yipd::peer_manager::PeerManager::new(
+        kp.private,
+        kp.public,
+        &cfg.peers,
+        cfg.device_kind,
+        None,
+        None,
+        false,
+    );
+    pm.set_listen_port(51820);
+
+    let stats = pm.peer_stats();
+    assert_eq!(stats[0].endpoint, None);
+
+    let updated_conf = format!(
+        "local_private = {}\n\
+         local_public = {}\n\
+         device = yip0\n\
+         listen = 127.0.0.1:51820\n\
+         \n\
+         [peer]\n\
+         public_key = {}\n\
+         endpoint = {}\n",
+        hex_encode(&kp.private),
+        hex_encode(&kp.public),
+        hex_encode(&peer_kp.public),
+        new_ep,
+    );
+    std::fs::write(&cfg_path, &updated_conf).unwrap();
+
+    let report = pm.reload_config(Some(&cfg_path)).expect("reload succeeds");
+    assert_eq!(report.preserved_peers, 1);
+    assert_eq!(report.updated_peers, 1);
+
+    let updated_stats = pm.peer_stats();
+    assert_eq!(updated_stats[0].endpoint, Some(new_ep));
+    std::fs::remove_file(&cfg_path).ok();
+}
+
+#[test]
+fn test_reload_config_alias_collision_preserves_dynamic_peer() {
+    let kp = yip_crypto::generate_keypair();
+    let kp_dynamic = yip_crypto::generate_keypair();
+    let kp_static = yip_crypto::generate_keypair();
+
+    let kp_init = yip_crypto::generate_keypair();
+
+    // Start with initial peer in config
+    let initial_conf = format!(
+        "local_private = {}\n\
+         local_public = {}\n\
+         device = yip0\n\
+         listen = 127.0.0.1:51820\n\
+         \n\
+         [peer]\n\
+         public_key = {}\n",
+        hex_encode(&kp.private),
+        hex_encode(&kp.public),
+        hex_encode(&kp_init.public),
+    );
+    let cfg_path = format!(
+        "/tmp/test_reload_alias_collision_{}.conf",
+        std::process::id()
+    );
+    std::fs::write(&cfg_path, &initial_conf).unwrap();
+
+    let cfg = yipd::config::Config::parse(&initial_conf).unwrap();
+    let mut pm = yipd::peer_manager::PeerManager::new(
+        kp.private,
+        kp.public,
+        &cfg.peers,
+        cfg.device_kind,
+        None,
+        None,
+        false,
+    );
+    pm.set_listen_port(51820);
+
+    // Add a dynamic peer with alias "primary-gateway"
+    let dynamic_peer =
+        yipd::config::PeerConfig::new(kp_dynamic.public, None).with_alias("primary-gateway");
+    pm.add_peer_with_transport(dynamic_peer, None)
+        .expect("dynamic peer added");
+
+    // Now reload config with a static peer that attempts to claim the same alias "PRIMARY-GATEWAY"
+    let collision_conf = format!(
+        "local_private = {}\n\
+         local_public = {}\n\
+         device = yip0\n\
+         listen = 127.0.0.1:51820\n\
+         \n\
+         [peer]\n\
+         public_key = {}\n\
+         \n\
+         [peer]\n\
+         public_key = {}\n\
+         alias = PRIMARY-GATEWAY\n",
+        hex_encode(&kp.private),
+        hex_encode(&kp.public),
+        hex_encode(&kp_init.public),
+        hex_encode(&kp_static.public),
+    );
+    std::fs::write(&cfg_path, &collision_conf).unwrap();
+
+    let _report = pm.reload_config(Some(&cfg_path)).expect("reload succeeds");
+
+    // Dynamic peer alias must still be preserved
+    assert_eq!(pm.find_peer_by_alias("primary-gateway"), Some(1));
+    std::fs::remove_file(&cfg_path).ok();
+}

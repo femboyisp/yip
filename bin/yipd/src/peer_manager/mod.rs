@@ -1801,12 +1801,15 @@ impl PeerManager {
         if self.by_node.contains_key(&node) {
             return Err("peer already exists");
         }
-        if let Some(ref alias) = cfg.alias {
-            let clean = alias.trim();
-            if !clean.is_empty() && self.find_peer_by_alias(clean).is_some() {
-                return Err("duplicate peer alias");
+        let normalized_alias = match cfg.alias.as_deref().map(str::trim) {
+            Some(clean) if !clean.is_empty() => {
+                if self.find_peer_by_alias(clean).is_some() {
+                    return Err("duplicate peer alias");
+                }
+                Some(clean.to_string())
             }
-        }
+            _ => None,
+        };
         let idx = self.peers.len();
         let addr = node_addr(&cfg.public_key);
         let mut path = if self.relay_only {
@@ -1821,7 +1824,7 @@ impl PeerManager {
         self.by_addr.insert(addr, idx);
         self.peers.push(Peer {
             pubkey: cfg.public_key,
-            alias: cfg.alias,
+            alias: normalized_alias,
             addr,
             endpoint: cfg.endpoint,
             state: PeerSessionState::Idle,
@@ -1968,22 +1971,64 @@ impl PeerManager {
                         if let PeerSessionState::Established(ref mut epochs) = self.peers[idx].state
                         {
                             epochs.set_peer_addr(ep);
+                        } else {
+                            self.peers[idx].path.reset(0);
+                        }
+                    } else {
+                        self.peers[idx].path.clear_direct();
+                        if !matches!(self.peers[idx].state, PeerSessionState::Established(_)) {
+                            self.peers[idx].path.reset(0);
                         }
                     }
                     changed = true;
                 }
-                if self.peers[idx].alias != new_peer.alias {
-                    self.peers[idx].alias = new_peer.alias.clone();
-                    changed = true;
+                let normalized_alias = new_peer
+                    .alias
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from);
+                if self.peers[idx].alias != normalized_alias {
+                    if let Some(ref clean) = normalized_alias {
+                        if let Some(other_idx) = self.find_peer_by_alias(clean) {
+                            if other_idx != idx {
+                                eprintln!(
+                                    "reload_config: peer alias collision '{}' for peer {}, ignoring alias update",
+                                    clean,
+                                    crate::config::hex_encode(&new_peer.public_key)
+                                );
+                            } else {
+                                self.peers[idx].alias = normalized_alias;
+                                changed = true;
+                            }
+                        } else {
+                            self.peers[idx].alias = normalized_alias;
+                            changed = true;
+                        }
+                    } else {
+                        self.peers[idx].alias = None;
+                        changed = true;
+                    }
                 }
                 if changed {
                     updated_peers += 1;
                 }
-            } else if self.add_peer_with_transport(new_peer.clone(), None).is_ok() {
-                if let Some(peer) = self.peers.last_mut() {
-                    peer.is_static = true;
+            } else {
+                match self.add_peer_with_transport(new_peer.clone(), None) {
+                    Ok(()) => {
+                        if let Some(peer) = self.peers.last_mut() {
+                            peer.is_static = true;
+                        }
+                        added_peers += 1;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "reload_config: failed to add peer {}: {}",
+                            crate::config::hex_encode(&new_peer.public_key),
+                            e
+                        );
+                    }
                 }
-                added_peers += 1;
             }
         }
 
@@ -2146,7 +2191,7 @@ impl PeerManager {
         self.peers.iter().position(|p| {
             p.alias
                 .as_deref()
-                .map(|a| a.eq_ignore_ascii_case(clean))
+                .map(|a| a.trim().eq_ignore_ascii_case(clean))
                 .unwrap_or(false)
         })
     }
