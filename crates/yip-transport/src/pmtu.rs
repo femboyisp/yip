@@ -491,14 +491,17 @@ mod tests {
         let mut mgr = PmtuManager::new();
         assert_eq!(mgr.tier(), UnderlayTier::Standard1500);
         assert_eq!(mgr.tun_mtu(), 1420);
+        assert_eq!(mgr.confirmed_symbol_size(), 1448); // 1420 + 28
 
         let c_mgr = PmtuManager::with_tier(UnderlayTier::Conservative1280);
         assert_eq!(c_mgr.tier(), UnderlayTier::Conservative1280);
         assert_eq!(c_mgr.tun_mtu(), 1212);
+        assert_eq!(c_mgr.confirmed_symbol_size(), 1240); // 1212 + 28
 
         let f_mgr = PmtuManager::with_tier(UnderlayTier::Floor1184);
         assert_eq!(f_mgr.tier(), UnderlayTier::Floor1184);
         assert_eq!(f_mgr.tun_mtu(), 1184);
+        assert_eq!(f_mgr.confirmed_symbol_size(), 1212); // 1184 + 28
 
         assert_eq!(
             PmtuManager::optimal_tun_mtu(UnderlayTier::Standard1500),
@@ -521,15 +524,23 @@ mod tests {
         mgr.on_probe_confirmed(1280);
         assert_eq!(mgr.tier(), UnderlayTier::Conservative1280);
         assert_eq!(mgr.tun_mtu(), 1212);
+        assert_eq!(mgr.confirmed_symbol_size(), 1240); // 1212 + 28
+
+        mgr.on_probe_confirmed(1150);
+        assert_eq!(mgr.tier(), UnderlayTier::Floor1184);
+        assert_eq!(mgr.tun_mtu(), 1184);
+        assert_eq!(mgr.confirmed_symbol_size(), 1212); // 1184 + 28
 
         let floor = mgr.on_blackhole_detected();
         assert_eq!(floor, 1184);
         assert_eq!(mgr.tier(), UnderlayTier::Floor1184);
         assert_eq!(mgr.tun_mtu(), 1184);
+        assert_eq!(mgr.confirmed_symbol_size(), 1212); // 1184 + 28
 
         mgr.on_probe_confirmed(1500);
         assert_eq!(mgr.tier(), UnderlayTier::Standard1500);
         assert_eq!(mgr.tun_mtu(), 1420);
+        assert_eq!(mgr.confirmed_symbol_size(), 1448); // 1420 + 28
     }
 
     #[test]

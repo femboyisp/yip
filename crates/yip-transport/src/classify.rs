@@ -135,74 +135,85 @@ impl Classifier {
 /// on reactive ARQ timeouts.
 pub fn is_pure_tcp_ack(inner: &[u8], l2: bool) -> bool {
     let ip = if l2 {
-        if inner.len() < 14 {
+        let Some(ethertype_bytes) = inner.get(12..14) else {
             return false;
-        }
-        let ethertype = u16::from_be_bytes([inner[12], inner[13]]);
+        };
+        let ethertype = u16::from_be_bytes([ethertype_bytes[0], ethertype_bytes[1]]);
         match ethertype {
-            0x0800 | 0x86DD => &inner[14..],
+            0x0800 | 0x86DD => match inner.get(14..) {
+                Some(payload) => payload,
+                None => return false,
+            },
             _ => return false,
         }
     } else {
         inner
     };
 
-    if ip.is_empty() {
+    let Some(&first_byte) = ip.first() else {
         return false;
-    }
-    let version = ip[0] >> 4;
-    let (ip_hl, total_ip_len, proto) = match version {
+    };
+    let version = first_byte >> 4;
+    let tcp = match version {
         4 => {
-            if ip.len() < 20 {
+            let ihl = usize::from(first_byte & 0x0F) * 4;
+            if ihl < 20 {
                 return false;
             }
-            let ihl = usize::from(ip[0] & 0x0F) * 4;
-            if ihl < 20 || ip.len() < ihl {
+            let total_len = match ip.get(2..4) {
+                Some(b) => usize::from(u16::from_be_bytes([b[0], b[1]])),
+                None => return false,
+            };
+            if total_len < ihl + 20 || ip.len() < total_len {
                 return false;
             }
-            let total_len = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
-            if ip.len() < total_len || total_len < ihl {
+            let proto = match ip.get(9) {
+                Some(&p) => p,
+                None => return false,
+            };
+            if proto != 6 {
                 return false;
             }
-            (ihl, total_len, ip[9])
+            &ip[ihl..total_len]
         }
         6 => {
-            if ip.len() < 40 {
+            let proto = match ip.get(6) {
+                Some(&p) => p,
+                None => return false,
+            };
+            if proto != 6 {
                 return false;
             }
-            let payload_len = usize::from(u16::from_be_bytes([ip[4], ip[5]]));
+            let payload_len = match ip.get(4..6) {
+                Some(b) => usize::from(u16::from_be_bytes([b[0], b[1]])),
+                None => return false,
+            };
             let total_len = 40 + payload_len;
             if ip.len() < total_len {
                 return false;
             }
-            (40, total_len, ip[6])
+            &ip[40..total_len]
         }
         _ => return false,
     };
 
-    if proto != 6 {
+    let Some(tcp_hdr) = tcp.get(..20) else {
+        return false;
+    };
+
+    let data_offset = usize::from(tcp_hdr[12] >> 4) * 4;
+    if data_offset < 20 || tcp.len() != data_offset {
         return false;
     }
 
-    let tcp = &ip[ip_hl..total_ip_len];
-    if tcp.len() < 20 {
-        return false;
-    }
-
-    let data_offset = usize::from(tcp[12] >> 4) * 4;
-    if data_offset < 20 || data_offset > tcp.len() {
-        return false;
-    }
-
-    let flags = tcp[13];
+    let flags = tcp_hdr[13];
     // ACK must be set (0x10)
     // SYN (0x02), FIN (0x01), RST (0x04) must be cleared (flags & 0x07 == 0)
     if (flags & 0x10) == 0 || (flags & 0x07) != 0 {
         return false;
     }
 
-    let tcp_payload_len = tcp.len() - data_offset;
-    tcp_payload_len == 0
+    true
 }
 
 /// Extract DSCP/proto/dst-port from an IPv4/IPv6 inner packet (None if malformed).
@@ -522,7 +533,17 @@ mod tests {
         assert!(is_pure_tcp_ack(&v4_ts_ack, false));
         assert_eq!(c.classify(&v4_ts_ack, false, 0), FlowClass::Ack);
 
-        // 3. Minimal IPv6 pure ACK (40B IP + 20B TCP, total len = 60, payload_len = 20)
+        // 3. IPv4 pure ACK with IP Options (24B IP + 20B TCP, total len = 44)
+        let mut v4_opt_ack = vec![0u8; 44];
+        v4_opt_ack[0] = 0x46; // IHL = 6 (24 bytes)
+        v4_opt_ack[2..4].copy_from_slice(&(44u16).to_be_bytes());
+        v4_opt_ack[9] = 6;
+        v4_opt_ack[36] = 0x50; // TCP at offset 24, data offset = 20B
+        v4_opt_ack[37] = 0x10; // ACK
+        assert!(is_pure_tcp_ack(&v4_opt_ack, false));
+        assert_eq!(c.classify(&v4_opt_ack, false, 0), FlowClass::Ack);
+
+        // 4. Minimal IPv6 pure ACK (40B IP + 20B TCP, total len = 60, payload_len = 20)
         let mut v6_ack = vec![0u8; 60];
         v6_ack[0] = 0x60; // IPv6
         v6_ack[4..6].copy_from_slice(&(20u16).to_be_bytes()); // payload len = 20
@@ -553,6 +574,20 @@ mod tests {
 
     #[test]
     fn non_pure_tcp_acks_rejected() {
+        // TCP packet without ACK flag (flags = 0x00)
+        let mut no_ack = vec![0u8; 40];
+        no_ack[0] = 0x45;
+        no_ack[2..4].copy_from_slice(&(40u16).to_be_bytes());
+        no_ack[9] = 6;
+        no_ack[32] = 0x50;
+        no_ack[33] = 0x00; // No ACK flag
+        assert!(!is_pure_tcp_ack(&no_ack, false));
+
+        // TCP packet with PSH only (flags = 0x08, no ACK)
+        let mut psh_no_ack = no_ack.clone();
+        psh_no_ack[33] = 0x08;
+        assert!(!is_pure_tcp_ack(&psh_no_ack, false));
+
         // TCP ACK carrying payload (40B headers + 10B payload = 50B)
         let mut ack_with_payload = vec![0u8; 50];
         ack_with_payload[0] = 0x45;
@@ -598,7 +633,74 @@ mod tests {
         bogus_offset[33] = 0x10;
         assert!(!is_pure_tcp_ack(&bogus_offset, false));
 
-        // Truncated packet
+        // Options advertised but packet truncated (data_offset = 32, but tcp.len() == 20)
+        let mut truncated_options = vec![0u8; 40];
+        truncated_options[0] = 0x45;
+        truncated_options[2..4].copy_from_slice(&(40u16).to_be_bytes());
+        truncated_options[9] = 6;
+        truncated_options[32] = 0x80; // data_offset = 32
+        truncated_options[33] = 0x10;
+        assert!(!is_pure_tcp_ack(&truncated_options, false));
+
+        // Non-TCP protocols (UDP = 17)
+        let mut udp_pkt = vec![0u8; 40];
+        udp_pkt[0] = 0x45;
+        udp_pkt[2..4].copy_from_slice(&(40u16).to_be_bytes());
+        udp_pkt[9] = 17; // UDP
+        assert!(!is_pure_tcp_ack(&udp_pkt, false));
+
+        // IPv4 IHL < 20 (IHL = 4 -> 16 bytes)
+        let mut bad_ihl = vec![0u8; 40];
+        bad_ihl[0] = 0x44;
+        bad_ihl[2..4].copy_from_slice(&(40u16).to_be_bytes());
+        bad_ihl[9] = 6;
+        assert!(!is_pure_tcp_ack(&bad_ihl, false));
+
+        // IPv4 total_len < ihl
+        let mut short_total = vec![0u8; 40];
+        short_total[0] = 0x45;
+        short_total[2..4].copy_from_slice(&(16u16).to_be_bytes());
+        short_total[9] = 6;
+        assert!(!is_pure_tcp_ack(&short_total, false));
+
+        // IPv4 packet buffer shorter than total_len
+        let mut truncated_v4 = vec![0u8; 39];
+        truncated_v4[0] = 0x45;
+        truncated_v4[2..4].copy_from_slice(&(40u16).to_be_bytes());
+        truncated_v4[9] = 6;
+        assert!(!is_pure_tcp_ack(&truncated_v4, false));
+
+        // IPv6 non-TCP (UDP = 17)
+        let mut v6_udp = vec![0u8; 60];
+        v6_udp[0] = 0x60;
+        v6_udp[4..6].copy_from_slice(&(20u16).to_be_bytes());
+        v6_udp[6] = 17; // UDP
+        assert!(!is_pure_tcp_ack(&v6_udp, false));
+
+        // IPv6 packet buffer shorter than 40 + payload_len
+        let mut truncated_v6 = vec![0u8; 59];
+        truncated_v6[0] = 0x60;
+        truncated_v6[4..6].copy_from_slice(&(20u16).to_be_bytes()); // total 60
+        truncated_v6[6] = 6;
+        assert!(!is_pure_tcp_ack(&truncated_v6, false));
+
+        // Unknown IP version (e.g. 5)
+        let mut bad_ver = vec![0u8; 40];
+        bad_ver[0] = 0x50;
+        assert!(!is_pure_tcp_ack(&bad_ver, false));
+
+        // L2 boundaries
+        assert!(!is_pure_tcp_ack(&[0u8; 11], true));
+        assert!(!is_pure_tcp_ack(&[0u8; 12], true));
+        assert!(!is_pure_tcp_ack(&[0u8; 13], true));
+        let mut l2_bad_ethertype = vec![0u8; 54];
+        l2_bad_ethertype[12] = 0x88;
+        l2_bad_ethertype[13] = 0x47; // MPLS
+        assert!(!is_pure_tcp_ack(&l2_bad_ethertype, true));
+
+        // Empty / truncated packets
+        assert!(!is_pure_tcp_ack(&[], false));
+        assert!(!is_pure_tcp_ack(&[0x45], false));
         assert!(!is_pure_tcp_ack(&[0x45, 0, 0, 40], false));
     }
 }

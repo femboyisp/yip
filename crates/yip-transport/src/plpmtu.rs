@@ -217,28 +217,26 @@ impl PlpmtuController {
                 Some((self.active_probe_id, target_symbol_size, pad_len))
             }
             ControllerState::Converged => {
-                if self.confirmed_symbol_size < PLPMTU_LADDER[PLPMTU_LADDER.len() - 1] {
+                let current_tier_idx = PLPMTU_LADDER
+                    .iter()
+                    .position(|&s| s == self.confirmed_symbol_size)
+                    .unwrap_or(0);
+                let next_tier_idx = current_tier_idx + 1;
+                if next_tier_idx < PLPMTU_LADDER.len() {
                     let converged_at = self.last_converged_ms.get_or_insert(now_ms);
                     if now_ms.saturating_sub(*converged_at) >= REPROBE_INTERVAL_MS {
                         // Unfreeze converged state and re-probe next tier
-                        let current_tier_idx = PLPMTU_LADDER
-                            .iter()
-                            .position(|&s| s == self.confirmed_symbol_size)
-                            .unwrap_or(0);
-                        let next_tier_idx = current_tier_idx + 1;
-                        if next_tier_idx < PLPMTU_LADDER.len() {
-                            self.active_probe_id = self.next_probe_id;
-                            self.next_probe_id = self.next_probe_id.wrapping_add(1);
-                            self.last_probe_ms = Some(now_ms);
-                            self.last_converged_ms = None;
-                            self.state = ControllerState::Probing {
-                                tier_idx: next_tier_idx,
-                                attempts: 1,
-                            };
-                            let target_symbol_size = PLPMTU_LADDER[next_tier_idx];
-                            let pad_len = usize::from(target_symbol_size).saturating_sub(6);
-                            return Some((self.active_probe_id, target_symbol_size, pad_len));
-                        }
+                        self.active_probe_id = self.next_probe_id;
+                        self.next_probe_id = self.next_probe_id.wrapping_add(1);
+                        self.last_probe_ms = Some(now_ms);
+                        self.last_converged_ms = None;
+                        self.state = ControllerState::Probing {
+                            tier_idx: next_tier_idx,
+                            attempts: 1,
+                        };
+                        let target_symbol_size = PLPMTU_LADDER[next_tier_idx];
+                        let pad_len = usize::from(target_symbol_size).saturating_sub(6);
+                        return Some((self.active_probe_id, target_symbol_size, pad_len));
                     }
                 }
                 None
@@ -576,10 +574,10 @@ mod tests {
 
         // Before 15 seconds (REPROBE_INTERVAL_MS = 15_000): stays Converged
         assert_eq!(ctrl.on_tick(5000), None);
-        assert_eq!(ctrl.on_tick(18_000), None); // 18_000 - 4000 = 14_000 < 15_000
+        assert_eq!(ctrl.on_tick(18_999), None); // 18_999 - 4000 = 14_999 < 15_000
         assert!(ctrl.is_converged());
 
-        // At 15 seconds elapsed (4000 + 15_000 = 19_000): unfreezes and emits re-probe for Tier 1 (1320)
+        // At exactly 15 seconds elapsed (4000 + 15_000 = 19_000): unfreezes and emits re-probe for Tier 1 (1320)
         let (reprobe_id, target_size, pad_len) = ctrl
             .on_tick(19_000)
             .expect("re-probe must fire after 15s interval");
@@ -591,5 +589,24 @@ mod tests {
         // When re-probe is ACKed, promotes to 1320!
         assert_eq!(ctrl.on_ack(reprobe_id, 1320), Some(1320));
         assert_eq!(ctrl.current_symbol_size(), 1320);
+
+        // Advance and ACK tier 2 (1400)
+        let (p2_id, p2_size, _) = ctrl.on_tick(20_000).expect("probe tier 2");
+        assert_eq!(p2_size, 1400);
+        assert_eq!(ctrl.on_ack(p2_id, 1400), Some(1400));
+        assert_eq!(ctrl.current_symbol_size(), 1400);
+
+        // Advance and ACK maximum tier 3 (1530)
+        let (p3_id, p3_size, _) = ctrl.on_tick(21_000).expect("probe tier 3");
+        assert_eq!(p3_size, 1530);
+        assert_eq!(ctrl.on_ack(p3_id, 1530), Some(1530));
+        assert!(ctrl.is_converged());
+        assert_eq!(ctrl.current_symbol_size(), 1530);
+
+        // When converged at maximum ladder tier, periodic re-probe must not trigger
+        assert_eq!(ctrl.on_tick(50_000), None);
+        assert_eq!(ctrl.on_tick(50_000 + REPROBE_INTERVAL_MS + 1), None);
+        assert!(ctrl.is_converged());
+        assert_eq!(ctrl.current_symbol_size(), 1530);
     }
 }
