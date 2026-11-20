@@ -169,6 +169,14 @@ pub enum ShardMsg {
     HandshakeForward(Vec<u8>, std::net::SocketAddr),
     /// ARQ loss feedback datagram forwarded to the target worker shard owning the FEC block.
     ArqFeedback(Vec<u8>, std::net::SocketAddr),
+    /// Peer removal broadcast from Shard 0 to worker shards.
+    PeerRemoval([u8; 32]),
+    /// Peer removal broadcast alias.
+    RemovePeer([u8; 32]),
+    /// Dynamic config reload broadcast from Shard 0 to worker shards.
+    ConfigReload(Option<String>),
+    /// Dynamic config reload broadcast alias.
+    ReloadConfig(Option<String>),
 }
 
 /// Established session epoch parameters replicated across worker shards.
@@ -1385,6 +1393,12 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                             }
                                         }
                                     }
+                                    ShardMsg::PeerRemoval(pk) | ShardMsg::RemovePeer(pk) => {
+                                        let _ = manager.remove_peer(pk);
+                                    }
+                                    ShardMsg::ConfigReload(path) | ShardMsg::ReloadConfig(path) => {
+                                        let _ = manager.reload_config(path.as_deref());
+                                    }
                                 }
                             }
                         }
@@ -1451,6 +1465,20 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                     for k in 1..num_shards {
                                         if let Some(Some(ref tx)) = tx_channels.get(k) {
                                             push_spsc(tx, ShardMsg::SessionEpoch(epoch.clone()));
+                                        }
+                                    }
+                                }
+                                for pk in manager.drain_peer_removals() {
+                                    for k in 1..num_shards {
+                                        if let Some(Some(ref tx)) = tx_channels.get(k) {
+                                            push_spsc(tx, ShardMsg::PeerRemoval(pk));
+                                        }
+                                    }
+                                }
+                                for path in manager.drain_config_reloads() {
+                                    for k in 1..num_shards {
+                                        if let Some(Some(ref tx)) = tx_channels.get(k) {
+                                            push_spsc(tx, ShardMsg::ConfigReload(path.clone()));
                                         }
                                     }
                                 }

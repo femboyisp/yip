@@ -471,6 +471,10 @@ pub struct PeerManager {
     num_shards: usize,
     /// Newly established session epochs queued for cross-shard broadcast.
     new_epochs: Vec<crate::sharding::SessionEpochMsg>,
+    /// Peer removals queued for cross-shard broadcast.
+    peer_removals: Vec<[u8; 32]>,
+    /// Dynamic config reloads queued for cross-shard broadcast.
+    config_reloads: Vec<Option<String>>,
     /// Background UNIX domain control socket handle, if configured.
     control: Option<crate::control::ControlHandle>,
     /// Device name for control socket reporting.
@@ -660,6 +664,8 @@ impl PeerManager {
             shard_id: 0,
             num_shards: 1,
             new_epochs: Vec::new(),
+            peer_removals: Vec::new(),
+            config_reloads: Vec::new(),
             control: None,
             device_name: "yip0".into(),
             start_time: std::time::Instant::now(),
@@ -1596,6 +1602,26 @@ impl PeerManager {
         std::mem::take(&mut self.new_epochs)
     }
 
+    /// Drain queued peer removals for cross-shard broadcast.
+    pub fn drain_peer_removals(&mut self) -> Vec<[u8; 32]> {
+        std::mem::take(&mut self.peer_removals)
+    }
+
+    /// Drain queued dynamic config reloads for cross-shard broadcast.
+    pub fn drain_config_reloads(&mut self) -> Vec<Option<String>> {
+        std::mem::take(&mut self.config_reloads)
+    }
+
+    /// Queue a peer removal for cross-shard broadcast.
+    pub fn queue_peer_removal(&mut self, pubkey: [u8; 32]) {
+        self.peer_removals.push(pubkey);
+    }
+
+    /// Queue a dynamic config reload for cross-shard broadcast.
+    pub fn queue_config_reload(&mut self, path: Option<String>) {
+        self.config_reloads.push(path);
+    }
+
     /// Record a newly established epoch and configure stride on Shard 0.
     pub(crate) fn record_new_epoch(&mut self, idx: usize) {
         let peer_pk = self.peers[idx].pubkey;
@@ -1775,6 +1801,12 @@ impl PeerManager {
         if self.by_node.contains_key(&node) {
             return Err("peer already exists");
         }
+        if let Some(ref alias) = cfg.alias {
+            let clean = alias.trim();
+            if !clean.is_empty() && self.find_peer_by_alias(clean).is_some() {
+                return Err("duplicate peer alias");
+            }
+        }
         let idx = self.peers.len();
         let addr = node_addr(&cfg.public_key);
         let mut path = if self.relay_only {
@@ -1857,6 +1889,9 @@ impl PeerManager {
         }
 
         self.metrics.update_peer_stats(self.list_peers());
+        if self.shard_id == 0 && self.num_shards > 1 {
+            self.peer_removals.push(*pubkey);
+        }
         Ok(())
     }
 
@@ -1930,6 +1965,10 @@ impl PeerManager {
                     self.peers[idx].endpoint = new_peer.endpoint;
                     if let Some(ep) = new_peer.endpoint {
                         self.peers[idx].path.on_direct_addr(ep);
+                        if let PeerSessionState::Established(ref mut epochs) = self.peers[idx].state
+                        {
+                            epochs.set_peer_addr(ep);
+                        }
                     }
                     changed = true;
                 }
@@ -1963,6 +2002,10 @@ impl PeerManager {
         }
 
         self.metrics.update_peer_stats(self.list_peers());
+
+        if self.shard_id == 0 && self.num_shards > 1 {
+            self.config_reloads.push(custom_path.map(|s| s.to_string()));
+        }
 
         Ok(ReloadReport {
             path,

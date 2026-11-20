@@ -913,8 +913,6 @@ pub fn dispatch_cmd(
             let mut ticket = crate::ticket::NetworkTicket::new(net_name, net_id, mode);
             if let Some(ep) = endpoint {
                 ticket = ticket.with_endpoint(ep);
-            } else if pm.listen_port() > 0 {
-                ticket = ticket.with_endpoint(format!("0.0.0.0:{}", pm.listen_port()));
             }
             let uri = match ticket.to_uri() {
                 Ok(u) => u,
@@ -2730,6 +2728,20 @@ mod tests {
             assert_eq!(endpoint, None);
         } else {
             panic!("expected CreateTicket cmd variant");
+        }
+
+        // 3. Test CreateTicket with omitted endpoint leaves endpoint as None (no 0.0.0.0 fallback)
+        let omitted_ep_cmd = ControlCmd::CreateTicket {
+            name: Some("NoFallbackNet".into()),
+            route_mode: Some("MeshOnly".into()),
+            endpoint: None,
+        };
+        let omitted_resp = dispatch_cmd(&mut pm, omitted_ep_cmd, "yip0", start);
+        if let ControlResponse::Ticket { ok, ticket, .. } = omitted_resp {
+            assert!(ok);
+            assert_eq!(ticket.endpoint, None);
+        } else {
+            panic!("expected Ticket response");
         }
     }
 

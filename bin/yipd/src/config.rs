@@ -546,11 +546,28 @@ fn flush_peer_block(
         // `endpoint` is optional: a peer known only by public key is
         // rendezvous-only (unreachable directly until Task 6 supplies a
         // candidate).
-        Some(pk) => peers.push(PeerConfig {
-            public_key: pk,
-            endpoint: cur_ep,
-            alias: cur_alias,
-        }),
+        Some(pk) => {
+            if let Some(ref alias) = cur_alias {
+                let clean = alias.trim();
+                if !clean.is_empty() {
+                    for existing in peers.iter() {
+                        if let Some(ref existing_alias) = existing.alias {
+                            if existing_alias.trim().eq_ignore_ascii_case(clean) {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!("duplicate peer alias: {clean}"),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            peers.push(PeerConfig {
+                public_key: pk,
+                endpoint: cur_ep,
+                alias: cur_alias,
+            });
+        }
         None if cur_ep.is_some() || cur_alias.is_some() => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

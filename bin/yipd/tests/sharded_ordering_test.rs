@@ -498,3 +498,74 @@ fn test_cross_shard_arq_feedback_routes_to_encoder_shard() {
         _ => panic!("unexpected ShardMsg variant"),
     }
 }
+
+#[test]
+fn test_cross_shard_broadcast_variants_and_sync() {
+    use yip_io::spsc::spsc_pair;
+    use yipd::sharding::ShardMsg;
+
+    let peer_pk = [0x55u8; 32];
+    let custom_path = Some("/etc/yip/dynamic.conf".to_string());
+
+    // 1. ShardMsg::PeerRemoval and ShardMsg::RemovePeer SPSC round-trip
+    let (tx, rx) = spsc_pair::<ShardMsg, 64>();
+    assert!(tx.push(ShardMsg::PeerRemoval(peer_pk)).is_ok());
+    assert!(tx.push(ShardMsg::RemovePeer(peer_pk)).is_ok());
+    assert!(tx.push(ShardMsg::ConfigReload(custom_path.clone())).is_ok());
+    assert!(tx.push(ShardMsg::ReloadConfig(custom_path.clone())).is_ok());
+
+    let mut msgs = Vec::new();
+    rx.drain_batch(&mut msgs, 4);
+    assert_eq!(msgs.len(), 4);
+
+    match &msgs[0] {
+        ShardMsg::PeerRemoval(pk) => assert_eq!(*pk, peer_pk),
+        _ => panic!("expected PeerRemoval"),
+    }
+    match &msgs[1] {
+        ShardMsg::RemovePeer(pk) => assert_eq!(*pk, peer_pk),
+        _ => panic!("expected RemovePeer"),
+    }
+    match &msgs[2] {
+        ShardMsg::ConfigReload(path) => assert_eq!(*path, custom_path),
+        _ => panic!("expected ConfigReload"),
+    }
+    match &msgs[3] {
+        ShardMsg::ReloadConfig(path) => assert_eq!(*path, custom_path),
+        _ => panic!("expected ReloadConfig"),
+    }
+
+    // 2. PeerManager cross-shard broadcast queuing and draining
+    let kp = yip_crypto::generate_keypair();
+    let mut pm0 = yipd::peer_manager::PeerManager::new(
+        kp.private,
+        kp.public,
+        &[],
+        yipd::mode::TunnelMode::L3Tun,
+        None,
+        None,
+        false,
+    );
+    pm0.set_num_shards(2);
+    pm0.set_shard_id(0);
+
+    // Add peer
+    assert!(pm0
+        .add_peer_with_transport(yipd::config::PeerConfig::new(peer_pk, None), None)
+        .is_ok());
+
+    // Remove peer on shard 0 queues broadcast
+    assert!(pm0.remove_peer(&peer_pk).is_ok());
+    let drained_removals = pm0.drain_peer_removals();
+    assert_eq!(drained_removals, vec![peer_pk]);
+    assert!(pm0.drain_peer_removals().is_empty());
+
+    // Manual queueing test
+    pm0.queue_peer_removal(peer_pk);
+    assert_eq!(pm0.drain_peer_removals(), vec![peer_pk]);
+
+    pm0.queue_config_reload(custom_path.clone());
+    let drained_reloads = pm0.drain_config_reloads();
+    assert_eq!(drained_reloads, vec![custom_path]);
+    assert!(pm0.drain_config_reloads().is_empty());
+}

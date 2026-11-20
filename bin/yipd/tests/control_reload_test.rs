@@ -434,3 +434,137 @@ fn test_reload_preserves_dynamic_peers_and_rejects_device_or_port_change() {
     let _ = std::fs::remove_file(&changed_device_path);
     let _ = std::fs::remove_file(&changed_port_path);
 }
+
+#[test]
+fn test_reload_config_propagates_endpoint_to_established_epochs() {
+    let daemon_kp = yip_crypto::generate_keypair();
+    let peer_kp = yip_crypto::generate_keypair();
+    let old_ep: std::net::SocketAddr = "198.51.100.1:51820".parse().unwrap();
+    let new_ep: std::net::SocketAddr = "198.51.100.2:51820".parse().unwrap();
+
+    let initial_config_text = format!(
+        "local_private = {}\n\
+         local_public = {}\n\
+         device = yip0\n\
+         listen = 127.0.0.1:51820\n\
+         \n\
+         [peer]\n\
+         public_key = {}\n\
+         endpoint = {}\n",
+        hex_encode(&daemon_kp.private),
+        hex_encode(&daemon_kp.public),
+        hex_encode(&peer_kp.public),
+        old_ep,
+    );
+    let cfg_path = format!("/tmp/test_reload_ep_{}.conf", std::process::id());
+    std::fs::write(&cfg_path, &initial_config_text).unwrap();
+
+    let cfg = yipd::config::Config::parse(&initial_config_text).unwrap();
+    let mut pm = yipd::peer_manager::PeerManager::new(
+        daemon_kp.private,
+        daemon_kp.public,
+        &cfg.peers,
+        cfg.device_kind,
+        None,
+        None,
+        false,
+    );
+    pm.set_listen_port(51820);
+    pm.set_config_path(Some(std::path::PathBuf::from(&cfg_path)));
+
+    // Install established session for peer with old_ep
+    let established = fake_established(&daemon_kp.private, &peer_kp.private, &peer_kp.public);
+    pm.install_established_session(&peer_kp.public, established, Some(old_ep));
+
+    // Verify initial peer is established
+    assert!(pm.is_peer_established(&peer_kp.public));
+
+    // Write updated config with new_ep
+    let updated_config_text = format!(
+        "local_private = {}\n\
+         local_public = {}\n\
+         device = yip0\n\
+         listen = 127.0.0.1:51820\n\
+         \n\
+         [peer]\n\
+         public_key = {}\n\
+         endpoint = {}\n",
+        hex_encode(&daemon_kp.private),
+        hex_encode(&daemon_kp.public),
+        hex_encode(&peer_kp.public),
+        new_ep,
+    );
+    std::fs::write(&cfg_path, &updated_config_text).unwrap();
+
+    // Reload config
+    let report = pm.reload_config(Some(&cfg_path)).expect("reload succeeds");
+    assert_eq!(report.preserved_peers, 1);
+    assert_eq!(report.updated_peers, 1);
+
+    // Verify endpoint was propagated to the peer's endpoint field
+    let stats = pm.peer_stats();
+    assert_eq!(stats[0].endpoint, Some(new_ep));
+
+    // Verify on_tun egress uses new_ep!
+    let peer_addr = yip_proto::addr::node_addr(&peer_kp.public);
+    let mut pkt = vec![0x60, 0, 0, 0, 0, 8, 59, 64];
+    pkt.extend_from_slice(&[0u8; 16]); // src
+    pkt.extend_from_slice(&peer_addr.octets()); // dst
+    pkt.extend_from_slice(&[0u8; 8]); // payload
+
+    let egress = pm.on_tun(&pkt, 1000);
+    assert!(!egress.is_empty(), "expected egress datagram");
+    assert_eq!(egress[0].dst, new_ep, "egress destination should be new_ep");
+
+    let _ = std::fs::remove_file(&cfg_path);
+}
+
+#[test]
+fn test_peer_alias_uniqueness_enforced() {
+    let kp = yip_crypto::generate_keypair();
+    let kp_peer1 = yip_crypto::generate_keypair();
+    let kp_peer2 = yip_crypto::generate_keypair();
+
+    // 1. Config parsing rejects duplicate peer aliases (case-insensitive)
+    let dup_alias_conf = format!(
+        "local_private = {}\n\
+         local_public = {}\n\
+         device = yip0\n\
+         listen = 127.0.0.1:51820\n\
+         \n\
+         [peer]\n\
+         public_key = {}\n\
+         alias = my-node\n\
+         \n\
+         [peer]\n\
+         public_key = {}\n\
+         alias = MY-NODE\n",
+        hex_encode(&kp.private),
+        hex_encode(&kp.public),
+        hex_encode(&kp_peer1.public),
+        hex_encode(&kp_peer2.public),
+    );
+    let err = yipd::config::Config::parse(&dup_alias_conf);
+    assert!(err.is_err());
+    assert!(err
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate peer alias"));
+
+    // 2. add_peer_with_transport rejects duplicate peer alias
+    let mut pm = yipd::peer_manager::PeerManager::new(
+        kp.private,
+        kp.public,
+        &[],
+        yipd::mode::TunnelMode::L3Tun,
+        None,
+        None,
+        false,
+    );
+    let peer1 = yipd::config::PeerConfig::new(kp_peer1.public, None).with_alias("alice");
+    assert!(pm.add_peer_with_transport(peer1, None).is_ok());
+
+    let peer2 = yipd::config::PeerConfig::new(kp_peer2.public, None).with_alias("ALICE");
+    let res = pm.add_peer_with_transport(peer2, None);
+    assert_eq!(res, Err("duplicate peer alias"));
+}
