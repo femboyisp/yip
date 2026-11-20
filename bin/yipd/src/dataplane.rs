@@ -65,15 +65,22 @@ pub struct ClassCounts {
     pub default: u32,
 }
 
-/// A bounded ring-log that maps sealed-packet counters to their [`FlowClass`].
+/// Sized packet breakdown across recent transmission windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SizeCounts {
+    pub large: u32,
+    pub small: u32,
+}
+
+/// A bounded ring-log that maps sealed-packet counters to their [`FlowClass`] and wire byte size.
 ///
 /// Entries are inserted in arrival order (monotone counter sequence from the
-/// AEAD) and evicted oldest-first once `capacity` is reached.  Lookup is
+/// AEAD) and evicted oldest-first once `capacity` is reached. Lookup is
 /// O(1) via the `HashMap`; eviction is O(1) via the `VecDeque`.
 pub struct SentLog {
     capacity: usize,
-    map: HashMap<u64, FlowClass>,
-    order: VecDeque<(u64, FlowClass)>,
+    map: HashMap<u64, (FlowClass, u16)>,
+    order: VecDeque<(u64, FlowClass, u16)>,
 }
 
 impl SentLog {
@@ -85,23 +92,27 @@ impl SentLog {
         }
     }
 
-    pub fn insert(&mut self, counter: u64, class: FlowClass) {
+    pub fn insert(&mut self, counter: u64, class: FlowClass, len: u16) {
         if self.map.len() >= self.capacity {
-            if let Some((oldest, _)) = self.order.pop_front() {
+            if let Some((oldest, _, _)) = self.order.pop_front() {
                 self.map.remove(&oldest);
             }
         }
-        self.map.insert(counter, class);
-        self.order.push_back((counter, class));
+        self.map.insert(counter, (class, len));
+        self.order.push_back((counter, class, len));
     }
 
     pub fn get(&self, counter: u64) -> Option<FlowClass> {
-        self.map.get(&counter).copied()
+        self.map.get(&counter).map(|&(c, _)| c)
+    }
+
+    pub fn get_len(&self, counter: u64) -> Option<u16> {
+        self.map.get(&counter).map(|&(_, l)| l)
     }
 
     /// Number of entries in the log whose `FlowClass` matches `class`.
     pub fn count_class(&self, class: FlowClass) -> u32 {
-        u32::try_from(self.map.values().filter(|&&c| c == class).count()).unwrap_or(u32::MAX)
+        u32::try_from(self.map.values().filter(|&&(c, _)| c == class).count()).unwrap_or(u32::MAX)
     }
 
     pub fn count_classes_in_range(&self, start: u64, end: u64) -> ClassCounts {
@@ -111,20 +122,49 @@ impl SentLog {
         let (s1, s2) = self.order.as_slices();
         let mut counts = ClassCounts::default();
 
-        let count_slice = |slice: &[(u64, FlowClass)], counts: &mut ClassCounts| {
+        let count_slice = |slice: &[(u64, FlowClass, u16)], counts: &mut ClassCounts| {
             if slice.is_empty() {
                 return;
             }
-            let left = slice.partition_point(|&(c, _)| c < start);
-            let right = slice.partition_point(|&(c, _)| c <= end);
+            let left = slice.partition_point(|&(c, _, _)| c < start);
+            let right = slice.partition_point(|&(c, _, _)| c <= end);
             if left < right {
-                for &(_, class) in &slice[left..right] {
+                for &(_, class, _) in &slice[left..right] {
                     match class {
                         FlowClass::Realtime => counts.realtime = counts.realtime.saturating_add(1),
                         FlowClass::Bulk => counts.bulk = counts.bulk.saturating_add(1),
                         FlowClass::Default | FlowClass::Ack => {
                             counts.default = counts.default.saturating_add(1)
                         }
+                    }
+                }
+            }
+        };
+
+        count_slice(s1, &mut counts);
+        count_slice(s2, &mut counts);
+        counts
+    }
+
+    pub fn count_sizes_in_range(&self, start: u64, end: u64) -> SizeCounts {
+        if start > end {
+            return SizeCounts::default();
+        }
+        let (s1, s2) = self.order.as_slices();
+        let mut counts = SizeCounts::default();
+
+        let count_slice = |slice: &[(u64, FlowClass, u16)], counts: &mut SizeCounts| {
+            if slice.is_empty() {
+                return;
+            }
+            let left = slice.partition_point(|&(c, _, _)| c < start);
+            let right = slice.partition_point(|&(c, _, _)| c <= end);
+            if left < right {
+                for &(_, _, len) in &slice[left..right] {
+                    if len >= 1200 {
+                        counts.large = counts.large.saturating_add(1);
+                    } else if len <= 256 {
+                        counts.small = counts.small.saturating_add(1);
                     }
                 }
             }
@@ -222,6 +262,8 @@ pub struct DataPlane {
     pub plpmtu: PlpmtuController,
     /// Dynamic underlay path MTU and TCP MSS clamping manager.
     pub pmtu: PmtuManager,
+    /// Consecutive loss reporting intervals exhibiting MTU blackhole size asymmetry.
+    pub consecutive_blackhole_intervals: u8,
     /// Optional DAITA probabilistic state machine engine for traffic analysis defense.
     pub daita_engine: Option<yip_obf::DaitaEngine>,
 
@@ -392,6 +434,7 @@ impl DataPlane {
             arq_retx_count: 0,
             plpmtu: PlpmtuController::new(),
             pmtu: PmtuManager::new(),
+            consecutive_blackhole_intervals: 0,
             daita_engine: None,
             egress_scratch: Vec::new(),
             egress_pool: Vec::new(),
@@ -434,6 +477,8 @@ impl DataPlane {
             let floor = self.plpmtu.reset_to_floor();
             self.transport.set_symbol_size(floor);
             self.pmtu.on_blackhole_detected();
+            self.pmtu.update_confirmed_symbol_size(floor);
+            self.consecutive_blackhole_intervals = 0;
         }
         self.peer_addr = addr;
     }
@@ -511,7 +556,8 @@ impl DataPlane {
                 .encode_scratch(&self.seal_buf, effective_inner, self.l2, now_ms);
 
         // ── 3. Auxiliary bookkeeping ──────────────────────────────────────────
-        self.sent_log.insert(counter, class);
+        let pkt_wire_len = u16::try_from(self.seal_buf.len()).unwrap_or(u16::MAX);
+        self.sent_log.insert(counter, class, pkt_wire_len);
 
         if class.params().arq {
             if let Some(oid) = symbols.first().map(|s| s.object_id) {
@@ -741,35 +787,41 @@ impl DataPlane {
 
                 match frame {
                     ControlFrame::Feedback(report) => {
-                        // Attribute missing counters to flow classes via the sent-log.
+                        // Attribute missing counters to flow classes and size buckets via the sent-log.
                         let mut missing_rt: u32 = 0;
                         let mut missing_bulk: u32 = 0;
                         let mut missing_default: u32 = 0;
+                        let mut missing_large: u32 = 0;
+                        let mut missing_small: u32 = 0;
 
                         for &c in &report.missing {
-                            match self.sent_log.get(c) {
-                                Some(FlowClass::Realtime) => {
-                                    missing_rt = missing_rt.saturating_add(1);
+                            if let Some(&(class, len)) = self.sent_log.map.get(&c) {
+                                match class {
+                                    FlowClass::Realtime => {
+                                        missing_rt = missing_rt.saturating_add(1);
+                                    }
+                                    FlowClass::Bulk => {
+                                        missing_bulk = missing_bulk.saturating_add(1);
+                                    }
+                                    FlowClass::Default => {
+                                        missing_default = missing_default.saturating_add(1);
+                                    }
+                                    FlowClass::Ack => {
+                                        // Pure TCP ACKs are proactive-only; ARQ retransmission is not performed.
+                                    }
                                 }
-                                Some(FlowClass::Bulk) => {
-                                    missing_bulk = missing_bulk.saturating_add(1);
-                                }
-                                Some(FlowClass::Default) => {
-                                    missing_default = missing_default.saturating_add(1);
-                                }
-                                Some(FlowClass::Ack) => {
-                                    // Pure TCP ACKs are proactive-only; ARQ retransmission is not performed.
-                                }
-                                None => {
-                                    // Counter not in log (too old or was a control packet) — ignore.
+                                if len >= 1200 {
+                                    missing_large = missing_large.saturating_add(1);
+                                } else if len <= 256 {
+                                    missing_small = missing_small.saturating_add(1);
                                 }
                             }
                         }
 
-                        let (sent_rt, sent_bulk, sent_default) =
+                        let (sent_rt, sent_bulk, sent_default, sent_large, sent_small) =
                             if report.high_counter > self.last_loss_report_high {
                                 let start = if self.last_loss_report_high == 0 {
-                                    self.sent_log.order.front().map(|(c, _)| *c).unwrap_or(0)
+                                    self.sent_log.order.front().map(|(c, _, _)| *c).unwrap_or(0)
                                 } else {
                                     self.last_loss_report_high.saturating_add(1)
                                 };
@@ -777,16 +829,32 @@ impl DataPlane {
                                 let window_counts = self
                                     .sent_log
                                     .count_classes_in_range(start, report.high_counter);
+                                let size_counts = self
+                                    .sent_log
+                                    .count_sizes_in_range(start, report.high_counter);
                                 (
                                     window_counts.realtime,
                                     window_counts.bulk,
                                     window_counts.default,
+                                    size_counts.large,
+                                    size_counts.small,
                                 )
                             } else {
+                                let mut large_cnt = 0u32;
+                                let mut small_cnt = 0u32;
+                                for &(_, len) in self.sent_log.map.values() {
+                                    if len >= 1200 {
+                                        large_cnt = large_cnt.saturating_add(1);
+                                    } else if len <= 256 {
+                                        small_cnt = small_cnt.saturating_add(1);
+                                    }
+                                }
                                 (
                                     self.sent_log.count_class(FlowClass::Realtime),
                                     self.sent_log.count_class(FlowClass::Bulk),
                                     self.sent_log.count_class(FlowClass::Default),
+                                    large_cnt,
+                                    small_cnt,
                                 )
                             };
 
@@ -804,7 +872,7 @@ impl DataPlane {
 
                         let _frac_rt = observe_class(FlowClass::Realtime, missing_rt, sent_rt);
                         let frac_bulk = observe_class(FlowClass::Bulk, missing_bulk, sent_bulk);
-                        let frac_default =
+                        let _frac_default =
                             observe_class(FlowClass::Default, missing_default, sent_default);
 
                         // If the overall underlay channel experiences packet loss, ensure Bulk traffic
@@ -820,15 +888,30 @@ impl DataPlane {
                             }
                         }
 
-                        // Blackhole loss detection: severe loss across default or bulk triggers fast fallback.
-                        let severe_default =
-                            frac_default.is_some_and(|f| f >= 0.8) && sent_default >= 3;
-                        let severe_bulk = frac_bulk.is_some_and(|f| f >= 0.8) && sent_bulk >= 3;
-                        if severe_default || severe_bulk {
-                            if let Some(floor) = self.plpmtu.on_blackhole() {
-                                self.transport.set_symbol_size(floor);
-                                self.pmtu.on_blackhole_detected();
+                        // Size-differential MTU blackhole loss detection (RFC 8899 §5.2):
+                        // Distinguishes size-dependent loss (large drops while small succeeds)
+                        // from uniform link or congestion loss where all sizes drop symmetrically.
+                        if sent_large >= 5 && sent_small >= 3 {
+                            let large_loss =
+                                fraction_f32(missing_large, sent_large.max(missing_large));
+                            let small_loss =
+                                fraction_f32(missing_small, sent_small.max(missing_small));
+                            if large_loss >= 0.80 && small_loss < 0.30 {
+                                self.consecutive_blackhole_intervals =
+                                    self.consecutive_blackhole_intervals.saturating_add(1);
+                                if self.consecutive_blackhole_intervals >= 2 {
+                                    self.consecutive_blackhole_intervals = 0;
+                                    if let Some(floor) = self.plpmtu.on_blackhole() {
+                                        self.transport.set_symbol_size(floor);
+                                        self.pmtu.on_blackhole_detected();
+                                        self.pmtu.update_confirmed_symbol_size(floor);
+                                    }
+                                }
+                            } else {
+                                self.consecutive_blackhole_intervals = 0;
                             }
+                        } else if sent_large >= 5 || sent_small >= 3 {
+                            self.consecutive_blackhole_intervals = 0;
                         }
 
                         // ARQ: for each missing counter reported by the peer,
@@ -922,7 +1005,9 @@ impl DataPlane {
                     } => {
                         if let Some(new_sym) = self.plpmtu.on_ack(probe_id, accepted_symbol_size) {
                             self.transport.set_symbol_size(new_sym);
+                            self.pmtu.update_confirmed_symbol_size(new_sym);
                             self.pmtu.on_probe_confirmed(new_sym);
+                            self.consecutive_blackhole_intervals = 0;
                         }
                         Outcome::None
                     }
@@ -1401,7 +1486,7 @@ mod tests {
             .sent_log
             .order
             .back()
-            .map(|(c, _)| *c)
+            .map(|&(c, _, _)| c)
             .expect("TUN dataplane inserts a sent-log entry");
         assert_eq!(
             tun_dp.sent_log.get(tun_counter),
@@ -1415,7 +1500,7 @@ mod tests {
             .sent_log
             .order
             .back()
-            .map(|(c, _)| *c)
+            .map(|&(c, _, _)| c)
             .expect("TAP dataplane inserts a sent-log entry");
         assert_eq!(
             tap_dp.sent_log.get(tap_counter),
@@ -1594,7 +1679,7 @@ mod tests {
             .sent_log
             .order
             .back()
-            .map(|(c, _)| *c)
+            .map(|&(c, _, _)| c)
             .expect("b inserts sent-log entry");
         assert_eq!(
             b.sent_log.get(b_counter),
@@ -1677,8 +1762,8 @@ mod tests {
         assert_eq!(log.count_classes_in_range(10, 5), ClassCounts::default());
 
         // 3. Single class
-        log.insert(1, FlowClass::Realtime);
-        log.insert(2, FlowClass::Realtime);
+        log.insert(1, FlowClass::Realtime, 1400);
+        log.insert(2, FlowClass::Realtime, 1400);
         assert_eq!(
             log.count_classes_in_range(1, 2),
             ClassCounts {
@@ -1698,8 +1783,8 @@ mod tests {
         assert_eq!(log.count_classes_in_range(3, 10), ClassCounts::default());
 
         // 4. Mixed classes
-        log.insert(3, FlowClass::Bulk);
-        log.insert(4, FlowClass::Default);
+        log.insert(3, FlowClass::Bulk, 1400);
+        log.insert(4, FlowClass::Default, 200);
         assert_eq!(
             log.count_classes_in_range(1, 4),
             ClassCounts {
@@ -1718,7 +1803,7 @@ mod tests {
         );
 
         // 5. Eviction: capacity is 4, inserting 5th entry evicts counter 1 (Realtime)
-        log.insert(5, FlowClass::Bulk);
+        log.insert(5, FlowClass::Bulk, 1400);
         assert_eq!(log.get(1), None);
         assert_eq!(log.get(5), Some(FlowClass::Bulk));
         assert_eq!(
@@ -1743,7 +1828,7 @@ mod tests {
                 1 => FlowClass::Bulk,
                 _ => FlowClass::Default,
             };
-            log.insert(i, class);
+            log.insert(i, class, 1400);
         }
         assert_eq!(log.len(), 10);
         // Surviving counters in log are 16..=25.
@@ -1804,7 +1889,7 @@ mod tests {
 
         // Initial setup: A sends 100 Bulk packets (counters 1..=100)
         for c in 1..=100 {
-            a.sent_log.insert(c, FlowClass::Bulk);
+            a.sent_log.insert(c, FlowClass::Bulk, 1400);
         }
 
         // Report 1 covers counters 1..=100 with 0 missing.
@@ -1832,7 +1917,7 @@ mod tests {
 
         // Window 2: A sends 10 more Bulk packets (counters 101..=110).
         for c in 101..=110 {
-            a.sent_log.insert(c, FlowClass::Bulk);
+            a.sent_log.insert(c, FlowClass::Bulk, 1400);
         }
 
         // Report 2 covers counters 101..=110 with 2 missing (105, 106).
@@ -1863,7 +1948,7 @@ mod tests {
 
         // Window 3: consecutive report with clean traffic
         for c in 111..=120 {
-            a.sent_log.insert(c, FlowClass::Bulk);
+            a.sent_log.insert(c, FlowClass::Bulk, 1400);
         }
         let report3 = yip_transport::LossReport {
             delivered_count: 118,
@@ -2046,5 +2131,110 @@ mod tests {
         assert!(a.control_scratch.capacity() <= max_scratch_cap);
         assert!(a.wire_payload_scratch.capacity() <= max_scratch_cap);
         assert!(a.syn_clamp_buf.capacity() <= max_scratch_cap);
+    }
+
+    #[test]
+    fn test_size_differential_blackhole_detection_and_uniform_loss_isolation() {
+        let (mut a, mut b) = dataplane_pair(TunnelMode::L3Tun, false);
+
+        // Advance PLPMTU to 1400 (Tier 2)
+        let _ = a.plpmtu.on_ack(1, 1320);
+        let _ = a.plpmtu.on_ack(2, 1400);
+        a.pmtu.update_confirmed_symbol_size(1400);
+        assert_eq!(a.plpmtu.current_symbol_size(), 1400);
+        assert_eq!(a.pmtu.max_mss_for_packet(true), 1312); // 1400 - 28 - 60 = 1312
+
+        // Helper to send a feedback control frame from b to a
+        let send_feedback = |a: &mut DataPlane, b: &mut DataPlane, high: u64, missing: Vec<u64>| {
+            let delivered =
+                u32::try_from(high.saturating_sub(missing.len() as u64)).unwrap_or(u32::MAX);
+            let report = yip_transport::LossReport {
+                delivered_count: delivered,
+                high_counter: high,
+                missing,
+            };
+            let frame = ControlFrame::Feedback(report);
+            let sealed = b.session.seal(&frame.encode()).unwrap();
+            let mut dg = vec![PacketType::Control as u8];
+            dg.extend_from_slice(&sealed.counter.to_be_bytes());
+            dg.extend_from_slice(&sealed.ciphertext);
+            let _ = a.on_udp_datagram(&dg, 100);
+        };
+
+        // ── Phase 1: 10% Uniform Loss (Large and Small both drop at 10%) ──
+        // Counters 1..=20: 10 large (1400B) and 10 small (100B)
+        for i in 1..=10u64 {
+            a.sent_log.insert(i, FlowClass::Bulk, 1400);
+        }
+        for i in 11..=20u64 {
+            a.sent_log.insert(i, FlowClass::Ack, 100);
+        }
+
+        // Report 1 covers 1..=20 with 1 large (10%) and 1 small (10%) missing
+        send_feedback(&mut a, &mut b, 20, vec![5, 15]);
+        assert_eq!(
+            a.consecutive_blackhole_intervals, 0,
+            "uniform 10% loss must NOT trigger blackhole counter"
+        );
+        assert_eq!(
+            a.plpmtu.current_symbol_size(),
+            1400,
+            "confirmed MTU tier must stay intact under uniform loss"
+        );
+
+        // ── Phase 2: Size-dependent Loss Interval 1 (Large 90% loss, Small 0% loss) ──
+        // Counters 21..=40: 10 large (1400B) and 10 small (100B)
+        for i in 21..=30u64 {
+            a.sent_log.insert(i, FlowClass::Bulk, 1400);
+        }
+        for i in 31..=40u64 {
+            a.sent_log.insert(i, FlowClass::Ack, 100);
+        }
+
+        // 9 large packets missing (21..=29) and 0 small packets missing
+        let missing_large_1: Vec<u64> = (21..=29).collect();
+        send_feedback(&mut a, &mut b, 40, missing_large_1);
+        assert_eq!(
+            a.consecutive_blackhole_intervals, 1,
+            "interval 1 of size asymmetry must increment consecutive count"
+        );
+        assert_eq!(
+            a.plpmtu.current_symbol_size(),
+            1400,
+            "single interval must NOT trigger blackhole fallback (2 required)"
+        );
+
+        // ── Phase 3: Size-dependent Loss Interval 2 (Consecutive Confirmation) ──
+        // Counters 41..=60: 10 large (1400B) and 10 small (100B)
+        for i in 41..=50u64 {
+            a.sent_log.insert(i, FlowClass::Bulk, 1400);
+        }
+        for i in 51..=60u64 {
+            a.sent_log.insert(i, FlowClass::Ack, 100);
+        }
+
+        // 9 large packets missing (41..=49) and 0 small packets missing
+        let missing_large_2: Vec<u64> = (41..=49).collect();
+        send_feedback(&mut a, &mut b, 60, missing_large_2);
+        assert_eq!(
+            a.plpmtu.current_symbol_size(),
+            1120,
+            "2 consecutive intervals of size asymmetry must trigger blackhole fallback to 1120"
+        );
+        assert_eq!(
+            a.pmtu.tun_mtu(),
+            1184,
+            "tun_mtu must fall back to 1184 floor"
+        );
+        assert_eq!(
+            a.pmtu.confirmed_symbol_size(),
+            1120,
+            "pmtu confirmed_symbol_size must reflect the blackhole floor (1120)"
+        );
+        assert_eq!(
+            a.pmtu.max_mss_for_packet(true),
+            1220,
+            "IPv6 MSS must strictly clamp to 1220 floor per RFC 8200"
+        );
     }
 }

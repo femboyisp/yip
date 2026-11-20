@@ -208,7 +208,7 @@ fn test_sent_log_binary_search_monotonic_range_zero_alloc() {
             1 => FlowClass::Bulk,
             _ => FlowClass::Default,
         };
-        log.insert(i, class);
+        log.insert(i, class, 1400);
     }
     assert!(!log.is_empty());
     assert_eq!(log.len(), capacity);
