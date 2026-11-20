@@ -209,11 +209,7 @@ pub fn is_pure_tcp_ack(inner: &[u8], l2: bool) -> bool {
     let flags = tcp_hdr[13];
     // ACK must be set (0x10)
     // SYN (0x02), FIN (0x01), RST (0x04) must be cleared (flags & 0x07 == 0)
-    if (flags & 0x10) == 0 || (flags & 0x07) != 0 {
-        return false;
-    }
-
-    true
+    (flags & 0x10) != 0 && (flags & 0x07) == 0
 }
 
 /// Extract DSCP/proto/dst-port from an IPv4/IPv6 inner packet (None if malformed).
