@@ -2534,6 +2534,12 @@ mod tests {
         pm.set_listen_port(51820);
         let start = Instant::now();
         let resp = dispatch_cmd(&mut pm, ControlCmd::Status, "yip0", start);
+        let expected_drops = match &resp {
+            ControlResponse::Status {
+                spsc_queue_drops, ..
+            } => *spsc_queue_drops,
+            _ => panic!("expected Status"),
+        };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"ok\":true"));
         assert!(json.contains("\"device\":\"yip0\""));
@@ -2557,10 +2563,7 @@ mod tests {
             assert_eq!(device, "yip0");
             assert_eq!(public_key, pm.local_pub_hex());
             assert_eq!(listen_port, 51820);
-            assert_eq!(
-                spsc_queue_drops,
-                crate::sharding::SPSC_QUEUE_DROPS.load(std::sync::atomic::Ordering::Relaxed)
-            );
+            assert_eq!(spsc_queue_drops, expected_drops);
         } else {
             panic!("expected ControlResponse::Status deserialization");
         }

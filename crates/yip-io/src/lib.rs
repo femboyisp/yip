@@ -664,23 +664,18 @@ mod tests {
 
     #[test]
     fn set_socket_buffers_rejects_invalid_fd() {
+        use std::fs::File;
         use std::net::UdpSocket;
         use std::os::fd::{FromRawFd, IntoRawFd};
 
-        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let fd = sock.into_raw_fd();
-        // SAFETY: Closing `fd` invalidates the descriptor to test error handling.
-        unsafe {
-            libc::close(fd);
-        }
-        // SAFETY: Wrapping the closed descriptor in UdpSocket temporarily for testing.
-        // It is immediately forgotten via `mem::forget` to avoid double-close.
-        let closed_sock = unsafe { UdpSocket::from_raw_fd(fd) };
-        let res = set_socket_buffers(&closed_sock, 65536);
-        std::mem::forget(closed_sock);
+        let file = File::open("/dev/null").unwrap();
+        let fd = file.into_raw_fd();
+        // SAFETY: `fd` is a valid open file descriptor owned by this test, safe to wrap and close via UdpSocket.
+        let non_sock = unsafe { UdpSocket::from_raw_fd(fd) };
+        let res = set_socket_buffers(&non_sock, 65536);
         assert!(
             res.is_err(),
-            "set_socket_buffers must fail on invalid socket fd"
+            "set_socket_buffers must fail on non-socket fd"
         );
     }
 

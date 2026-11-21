@@ -23,15 +23,28 @@ pub fn update_csum_16(old_csum: u16, old_val: u16, new_val: u16) -> u16 {
     new_csum
 }
 
+/// Overhead added to plaintext TUN packets by AEAD session sealing
+/// (12B nonce/epoch/counter wire framing + 16B Poly1305 authentication tag).
+pub const CRYPTO_SEAL_OVERHEAD: u16 = 28;
+
+/// Minimum allowable IPv6 MTU per RFC 8200 Section 5.
+pub const RFC8200_MIN_IPV6_MTU: u16 = 1280;
+
+/// Minimum allowable IPv6 TCP MSS (1280B MTU - 40B IPv6 header - 20B TCP header).
+pub const RFC8200_MIN_IPV6_MSS: u16 = 1220;
+
+/// Standard minimum IPv4 TCP MSS (RFC 879: 576B MTU - 40B IPv4/TCP headers).
+pub const RFC879_MIN_IPV4_MSS: u16 = 536;
+
 /// Calculate the maximum TCP Maximum Segment Size (MSS) allowed for a given TUN MTU.
 ///
 /// Accounts for IPv4 (20 bytes) or IPv6 (40 bytes) headers plus the TCP header (20 bytes).
 #[inline]
 pub fn max_mss_for_mtu(mtu: u16, is_ipv6: bool) -> u16 {
     if is_ipv6 {
-        mtu.saturating_sub(60)
+        mtu.saturating_sub(60).max(RFC8200_MIN_IPV6_MSS)
     } else {
-        mtu.saturating_sub(40)
+        mtu.saturating_sub(40).max(RFC879_MIN_IPV4_MSS)
     }
 }
 
@@ -167,6 +180,7 @@ pub enum UnderlayTier {
 pub struct PmtuManager {
     tier: UnderlayTier,
     tun_mtu: u16,
+    confirmed_symbol_size: u16,
 }
 
 impl Default for PmtuManager {
@@ -181,13 +195,18 @@ impl PmtuManager {
         Self {
             tier: UnderlayTier::Standard1500,
             tun_mtu: 1420,
+            confirmed_symbol_size: 1420 + CRYPTO_SEAL_OVERHEAD,
         }
     }
 
     /// Construct a PMTU manager configured for a specific underlay tier.
     pub fn with_tier(tier: UnderlayTier) -> Self {
         let tun_mtu = Self::optimal_tun_mtu(tier);
-        Self { tier, tun_mtu }
+        Self {
+            tier,
+            tun_mtu,
+            confirmed_symbol_size: tun_mtu + CRYPTO_SEAL_OVERHEAD,
+        }
     }
 
     /// Calculate the optimal TUN MTU corresponding to an underlay tier.
@@ -211,9 +230,29 @@ impl PmtuManager {
         self.tier
     }
 
+    /// The confirmed FEC symbol size.
+    pub fn confirmed_symbol_size(&self) -> u16 {
+        self.confirmed_symbol_size
+    }
+
+    /// Update the confirmed FEC symbol size from the PLPMTU controller.
+    pub fn update_confirmed_symbol_size(&mut self, symbol_size: u16) {
+        self.confirmed_symbol_size = symbol_size;
+    }
+
     /// Dynamically override the TUN MTU.
     pub fn set_tun_mtu(&mut self, mtu: u16) {
         self.tun_mtu = mtu;
+    }
+
+    /// Calculate the maximum allowable MSS for a packet (IPv4 or IPv6)
+    /// keeping ciphertext within a single FEC symbol (K = 1).
+    pub fn max_mss_for_packet(&self, is_ipv6: bool) -> u16 {
+        let tier_mtu = self
+            .confirmed_symbol_size
+            .saturating_sub(CRYPTO_SEAL_OVERHEAD);
+        let effective_mtu = self.tun_mtu.min(tier_mtu);
+        max_mss_for_mtu(effective_mtu, is_ipv6)
     }
 
     /// Update state on confirmed wire MTU probe receipt.
@@ -221,12 +260,15 @@ impl PmtuManager {
         if wire_mtu >= 1500 {
             self.tier = UnderlayTier::Standard1500;
             self.tun_mtu = 1420;
+            self.confirmed_symbol_size = 1420 + CRYPTO_SEAL_OVERHEAD;
         } else if wire_mtu >= 1280 {
             self.tier = UnderlayTier::Conservative1280;
             self.tun_mtu = 1212;
+            self.confirmed_symbol_size = 1212 + CRYPTO_SEAL_OVERHEAD;
         } else {
             self.tier = UnderlayTier::Floor1184;
             self.tun_mtu = 1184;
+            self.confirmed_symbol_size = 1184 + CRYPTO_SEAL_OVERHEAD;
         }
     }
 
@@ -234,12 +276,23 @@ impl PmtuManager {
     pub fn on_blackhole_detected(&mut self) -> u16 {
         self.tier = UnderlayTier::Floor1184;
         self.tun_mtu = 1184;
+        self.confirmed_symbol_size = 1184 + CRYPTO_SEAL_OVERHEAD;
         self.tun_mtu
     }
 
-    /// Clamp MSS for a packet traversing the interface according to the current TUN MTU.
+    /// Clamp MSS for a packet traversing the interface according to the current TUN MTU
+    /// and confirmed symbol tier.
     pub fn clamp_syn<'a>(&self, pkt: &'a [u8], scratch: &'a mut Vec<u8>) -> &'a [u8] {
-        maybe_clamp_tcp_syn(pkt, scratch, self.tun_mtu)
+        if is_tcp_syn(pkt) {
+            scratch.clear();
+            scratch.extend_from_slice(pkt);
+            let is_ipv6 = (scratch[0] >> 4) == 6;
+            let max_mss = self.max_mss_for_packet(is_ipv6);
+            if clamp_tcp_mss(scratch, max_mss) {
+                return scratch.as_slice();
+            }
+        }
+        pkt
     }
 }
 
@@ -438,14 +491,17 @@ mod tests {
         let mut mgr = PmtuManager::new();
         assert_eq!(mgr.tier(), UnderlayTier::Standard1500);
         assert_eq!(mgr.tun_mtu(), 1420);
+        assert_eq!(mgr.confirmed_symbol_size(), 1448); // 1420 + 28
 
         let c_mgr = PmtuManager::with_tier(UnderlayTier::Conservative1280);
         assert_eq!(c_mgr.tier(), UnderlayTier::Conservative1280);
         assert_eq!(c_mgr.tun_mtu(), 1212);
+        assert_eq!(c_mgr.confirmed_symbol_size(), 1240); // 1212 + 28
 
         let f_mgr = PmtuManager::with_tier(UnderlayTier::Floor1184);
         assert_eq!(f_mgr.tier(), UnderlayTier::Floor1184);
         assert_eq!(f_mgr.tun_mtu(), 1184);
+        assert_eq!(f_mgr.confirmed_symbol_size(), 1212); // 1184 + 28
 
         assert_eq!(
             PmtuManager::optimal_tun_mtu(UnderlayTier::Standard1500),
@@ -468,15 +524,66 @@ mod tests {
         mgr.on_probe_confirmed(1280);
         assert_eq!(mgr.tier(), UnderlayTier::Conservative1280);
         assert_eq!(mgr.tun_mtu(), 1212);
+        assert_eq!(mgr.confirmed_symbol_size(), 1240); // 1212 + 28
+
+        mgr.on_probe_confirmed(1150);
+        assert_eq!(mgr.tier(), UnderlayTier::Floor1184);
+        assert_eq!(mgr.tun_mtu(), 1184);
+        assert_eq!(mgr.confirmed_symbol_size(), 1212); // 1184 + 28
 
         let floor = mgr.on_blackhole_detected();
         assert_eq!(floor, 1184);
         assert_eq!(mgr.tier(), UnderlayTier::Floor1184);
         assert_eq!(mgr.tun_mtu(), 1184);
+        assert_eq!(mgr.confirmed_symbol_size(), 1212); // 1184 + 28
 
         mgr.on_probe_confirmed(1500);
         assert_eq!(mgr.tier(), UnderlayTier::Standard1500);
         assert_eq!(mgr.tun_mtu(), 1420);
+        assert_eq!(mgr.confirmed_symbol_size(), 1448); // 1420 + 28
+    }
+
+    #[test]
+    fn test_dynamic_symbol_tier_mss_clamping_ipv4_and_ipv6() {
+        let mut mgr = PmtuManager::new();
+        assert_eq!(mgr.tun_mtu(), 1420);
+
+        // Tier 2 (1400B symbol size): effective TUN MTU = 1400 - 28 = 1372
+        mgr.update_confirmed_symbol_size(1400);
+        assert_eq!(mgr.max_mss_for_packet(false), 1332); // 1372 - 40 (IPv4) -> K = 1
+        assert_eq!(mgr.max_mss_for_packet(true), 1312); // 1372 - 60 (IPv6) -> K = 1
+
+        // Tier 0 (1120B symbol size): effective TUN MTU = 1120 - 28 = 1092
+        mgr.update_confirmed_symbol_size(1120);
+        assert_eq!(mgr.max_mss_for_packet(false), 1052); // 1092 - 40 (IPv4) -> K = 1
+        assert_eq!(mgr.max_mss_for_packet(true), 1220); // RFC 8200 floor: max(1220, 1092 - 60) = 1220
+    }
+
+    #[test]
+    fn test_clamp_tcp_mss_ipv6_rfc8200_floor() {
+        let mut mgr = PmtuManager::new();
+        mgr.on_blackhole_detected();
+        mgr.update_confirmed_symbol_size(1120);
+        assert_eq!(mgr.tun_mtu(), 1184);
+
+        // Craft IPv6 TCP SYN with advertised MSS 1440
+        let mut syn = vec![0u8; 64];
+        syn[0] = 0x60;
+        syn[4..6].copy_from_slice(&(24u16).to_be_bytes());
+        syn[6] = 6; // TCP
+        syn[52] = 0x60; // Data offset 24B
+        syn[53] = 0x02; // SYN
+        syn[60] = 2; // MSS
+        syn[61] = 4;
+        syn[62..64].copy_from_slice(&(1440u16).to_be_bytes());
+
+        let mut scratch = Vec::new();
+        let clamped = mgr.clamp_syn(&syn, &mut scratch);
+        let clamped_mss = u16::from_be_bytes([clamped[62], clamped[63]]);
+        assert_eq!(
+            clamped_mss, 1220,
+            "IPv6 MSS must not be clamped below 1220 (RFC 8200 floor)"
+        );
     }
 
     #[test]

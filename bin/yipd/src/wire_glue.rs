@@ -22,6 +22,7 @@ pub fn class_to_flags(c: FlowClass) -> u8 {
         FlowClass::Realtime => 0,
         FlowClass::Bulk => 1,
         FlowClass::Default => 2,
+        FlowClass::Ack => 3,
     }
 }
 
@@ -30,7 +31,8 @@ pub fn flags_to_class(f: u8) -> FlowClass {
     match f & 0x03 {
         0 => FlowClass::Realtime,
         1 => FlowClass::Bulk,
-        _ => FlowClass::Default,
+        2 => FlowClass::Default,
+        _ => FlowClass::Ack,
     }
 }
 
@@ -216,5 +218,18 @@ mod tests {
         };
         let (_, _, class_def) = frame_ref_to_symbol(&frame_default).unwrap();
         assert_eq!(class_def, FlowClass::Default);
+
+        let frame_ack = FrameRef {
+            conn_tag: 1,
+            object_id: 9,
+            payload_id: [1, 2, 3, 4],
+            flags: 3,
+            payload: &[
+                0, 0, 0, 0, 0, 0, 0, 44, // counter = 44
+                0, 0, 0, 200, // object_size = 200
+            ],
+        };
+        let (_, _, class_ack) = frame_ref_to_symbol(&frame_ack).unwrap();
+        assert_eq!(class_ack, FlowClass::Ack);
     }
 }

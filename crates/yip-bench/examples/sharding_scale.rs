@@ -127,6 +127,7 @@ fn class_to_flags(c: FlowClass) -> u8 {
         FlowClass::Realtime => 0,
         FlowClass::Bulk => 1,
         FlowClass::Default => 2,
+        FlowClass::Ack => 3,
     }
 }
 
@@ -135,7 +136,8 @@ fn flags_to_class(f: u8) -> FlowClass {
     match f & 0x03 {
         0 => FlowClass::Realtime,
         1 => FlowClass::Bulk,
-        _ => FlowClass::Default,
+        2 => FlowClass::Default,
+        _ => FlowClass::Ack,
     }
 }
 
