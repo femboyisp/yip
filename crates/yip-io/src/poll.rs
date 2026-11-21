@@ -449,6 +449,7 @@ pub struct GsoScratch {
     pub enabled: bool,
     pub runs: Vec<crate::gso::GsoRun>,
     pub payload: Vec<u8>,
+    pub plain_indices: Vec<usize>,
     pub recycle: Vec<EgressDatagram>,
     /// Pre-allocated arena for vectorized TX headers (`sendmmsg`).
     pub tx_arena: Box<MmsgBatchArena>,
@@ -462,6 +463,7 @@ impl GsoScratch {
             enabled: true,
             runs: Vec::with_capacity(MAX_DATAGRAM_BATCH),
             payload: Vec::with_capacity(MAX_WIRE_DATAGRAM * crate::gso::MAX_GSO_SEGMENTS_PER_SEND),
+            plain_indices: Vec::with_capacity(MAX_DATAGRAM_BATCH),
             recycle: Vec::with_capacity(MAX_DATAGRAM_BATCH),
             tx_arena: MmsgBatchArena::new_boxed(),
             rx_arena: MmsgBatchArena::new_boxed(),
@@ -494,6 +496,23 @@ fn send_run_plain(
     Ok(())
 }
 
+/// Plain-send non-contiguous datagrams referenced by `indices` via `send_mmsg_indexed`.
+fn send_run_plain_indexed(
+    udp_fd: RawFd,
+    tx: &[EgressDatagram],
+    mut indices: &[usize],
+    arena: &mut MmsgBatchArena,
+) -> io::Result<()> {
+    while !indices.is_empty() {
+        let n = send_mmsg_indexed(udp_fd, tx, indices, arena)?;
+        if n == 0 {
+            break;
+        }
+        indices = &indices[n..];
+    }
+    Ok(())
+}
+
 /// Send everything queued in `tx`, then drain into `gso.recycle` (preserving datagram
 /// buffer capacity). With GSO enabled, partitions `tx` into fate-safe runs and sends
 /// each run of >=2 as one `UDP_SEGMENT` send (falling back to plain sends for singletons
@@ -514,40 +533,39 @@ pub fn flush_tx(
         let GsoScratch {
             ref mut enabled,
             ref runs,
-            ref mut payload,
             ref mut tx_arena,
+            ref mut plain_indices,
             ..
         } = *gso;
+        plain_indices.clear();
         let mut res = Ok(());
         for run in runs {
             if *enabled && run.members.len() >= 2 && run.segment_size > 0 {
+                if !plain_indices.is_empty() {
+                    if let Err(e) = send_run_plain_indexed(udp_fd, tx, plain_indices, tx_arena) {
+                        res = Err(e);
+                        break;
+                    }
+                    plain_indices.clear();
+                }
                 let dst = tx[run.members[0]].dst;
-                match send_gso_indexed(udp_fd, tx, &run.members, run.segment_size, dst, payload) {
+                match send_gso_indexed(udp_fd, tx, &run.members, run.segment_size, dst) {
                     Ok(true) => {}
                     Ok(false) => {
                         *enabled = false; // latch: GSO unsupported here
-                        for &i in &run.members {
-                            if let Err(e) =
-                                send_run_plain(udp_fd, std::slice::from_ref(&tx[i]), tx_arena)
-                            {
-                                res = Err(e);
-                                break;
-                            }
-                        }
+                        plain_indices.extend_from_slice(&run.members);
                     }
-                    Err(e) => res = Err(e),
-                }
-            } else {
-                for &i in &run.members {
-                    if let Err(e) = send_run_plain(udp_fd, std::slice::from_ref(&tx[i]), tx_arena) {
+                    Err(e) => {
                         res = Err(e);
                         break;
                     }
                 }
+            } else {
+                plain_indices.extend_from_slice(&run.members);
             }
-            if res.is_err() {
-                break;
-            }
+        }
+        if res.is_ok() && !plain_indices.is_empty() {
+            res = send_run_plain_indexed(udp_fd, tx, plain_indices, tx_arena);
         }
         res
     };
@@ -627,6 +645,10 @@ pub fn send_mmsg(
     // points to disjoint elements in `arena.iovecs` and `arena.storages` within `arena`.
     // Both `arena` and `datagrams` outlive the synchronous `libc::sendmmsg` syscall.
     // MSG_NOSIGNAL suppresses SIGPIPE on a closed peer socket.
+    // SAFETY: `arena.msgs[..count]` is fully initialised; each msg_iov and msg_name
+    // points to disjoint elements in `arena.iovecs` and `arena.storages` within `arena`.
+    // Both `arena` and `tx` outlive the synchronous `libc::sendmmsg` syscall.
+    // MSG_NOSIGNAL suppresses SIGPIPE on a closed peer socket.
     let ret = unsafe {
         libc::sendmmsg(
             udp_fd,
@@ -639,6 +661,65 @@ pub fn send_mmsg(
         let e = io::Error::last_os_error();
         let raw = e.raw_os_error().unwrap_or(0);
         // Transient full send buffer: report 0 sent (caller drops this burst's tail).
+        #[expect(
+            unreachable_patterns,
+            reason = "EWOULDBLOCK and EAGAIN share numeric value on Linux"
+        )]
+        if matches!(raw, libc::EWOULDBLOCK | libc::EAGAIN | libc::ENOBUFS) {
+            return Ok(0);
+        }
+        return Err(e);
+    }
+    Ok(usize::try_from(ret).expect("non-negative sendmmsg return fits usize"))
+}
+
+/// Send up to `indices.len().min(MAX_DATAGRAM_BATCH)` indexed datagrams from `tx` in one
+/// `sendmmsg(2)`, each to its own [`EgressDatagram::dst`]. Returns the count the
+/// kernel accepted (may be fewer; the caller loops the remainder).
+pub fn send_mmsg_indexed(
+    udp_fd: RawFd,
+    tx: &[EgressDatagram],
+    indices: &[usize],
+    arena: &mut MmsgBatchArena,
+) -> io::Result<usize> {
+    if indices.is_empty() {
+        return Ok(0);
+    }
+    let count = indices.len().min(MAX_DATAGRAM_BATCH);
+
+    for (k, &i) in indices[..count].iter().enumerate() {
+        let dg = &tx[i];
+        let (storage, addr_len) = std_to_sockaddr(dg.dst);
+        arena.storages[k] = storage;
+        arena.addrlens[k] = addr_len;
+        arena.iovecs[k].iov_base = dg.bytes.as_ptr().cast_mut().cast::<libc::c_void>();
+        arena.iovecs[k].iov_len = dg.bytes.len();
+        arena.msgs[k].msg_hdr.msg_iov = &raw mut arena.iovecs[k];
+        arena.msgs[k].msg_hdr.msg_iovlen = 1;
+        arena.msgs[k].msg_hdr.msg_name =
+            std::ptr::from_mut(&mut arena.storages[k]).cast::<libc::c_void>();
+        arena.msgs[k].msg_hdr.msg_namelen = arena.addrlens[k];
+        arena.msgs[k].msg_hdr.msg_control = std::ptr::null_mut();
+        arena.msgs[k].msg_hdr.msg_controllen = 0;
+        arena.msgs[k].msg_hdr.msg_flags = 0;
+        arena.msgs[k].msg_len = 0;
+    }
+
+    // SAFETY: `arena.msgs[..count]` is fully initialised; each msg_iov and msg_name
+    // points to disjoint elements in `arena.iovecs` and `arena.storages` within `arena`.
+    // Both `arena` and `tx` outlive the synchronous `libc::sendmmsg` syscall.
+    // MSG_NOSIGNAL suppresses SIGPIPE on a closed peer socket.
+    let ret = unsafe {
+        libc::sendmmsg(
+            udp_fd,
+            arena.msgs.as_mut_ptr(),
+            u32::try_from(count).expect("count ≤ MAX_DATAGRAM_BATCH ≤ 128 fits u32"),
+            libc::MSG_NOSIGNAL as crate::MsgFlags,
+        )
+    };
+    if ret.is_negative() {
+        let e = io::Error::last_os_error();
+        let raw = e.raw_os_error().unwrap_or(0);
         #[expect(
             unreachable_patterns,
             reason = "EWOULDBLOCK and EAGAIN share numeric value on Linux"
@@ -703,6 +784,10 @@ fn send_gso_payload(
 
     // SAFETY: `msg` is fully initialised; its iov/name/control point into this
     // frame's storage, valid until sendmsg returns. MSG_NOSIGNAL suppresses SIGPIPE.
+    // SAFETY: `arena.msgs[..count]` is fully initialised; each msg_iov and msg_name
+    // points to disjoint elements in `arena.iovecs` and `arena.storages` within `arena`.
+    // Both `arena` and `tx` outlive the synchronous `libc::sendmmsg` syscall.
+    // MSG_NOSIGNAL suppresses SIGPIPE on a closed peer socket.
     let ret = unsafe { libc::sendmsg(udp_fd, &raw const msg, libc::MSG_NOSIGNAL) };
     if ret < 0 {
         let e = io::Error::last_os_error();
@@ -741,21 +826,77 @@ fn send_gso(
     send_gso_payload(udp_fd, payload, segment_size, dst)
 }
 
-/// Like `send_gso`, but reads the run's datagrams from `tx` by `indices`
-/// (avoids copying the run out of the egress batch).
+/// Scatter-gather zero-copy GSO transmit: points an array of `iovec`s directly at
+/// the datagram payloads in `tx[indices]`, eliminating memory copy in the hotpath.
 fn send_gso_indexed(
     udp_fd: RawFd,
     tx: &[EgressDatagram],
     indices: &[usize],
     segment_size: u16,
     dst: SocketAddr,
-    payload: &mut Vec<u8>,
 ) -> io::Result<bool> {
-    payload.clear();
-    for &i in indices {
-        payload.extend_from_slice(&tx[i].bytes);
+    if indices.is_empty() {
+        return Ok(true);
     }
-    send_gso_payload(udp_fd, payload, segment_size, dst)
+    let count = indices.len().min(MAX_DATAGRAM_BATCH);
+    let (mut storage, addr_len) = std_to_sockaddr(dst);
+    let mut iovecs = [libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 0,
+    }; MAX_DATAGRAM_BATCH];
+
+    for (k, &i) in indices[..count].iter().enumerate() {
+        iovecs[k].iov_base = tx[i].bytes.as_ptr().cast_mut().cast::<libc::c_void>();
+        iovecs[k].iov_len = tx[i].bytes.len();
+    }
+
+    let mut control = [0u8; GSO_CONTROL_SPACE];
+    // SAFETY: msghdr is plain-old-data; zeroed is a valid initial state.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_name = std::ptr::from_mut(&mut storage).cast::<libc::c_void>();
+    msg.msg_namelen = addr_len;
+    msg.msg_iov = iovecs.as_mut_ptr();
+    msg.msg_iovlen = count as crate::IovLen;
+    msg.msg_control = control.as_mut_ptr().cast::<libc::c_void>();
+
+    // SAFETY: CMSG_SPACE is a pure size computation with no pointer dereference.
+    let cmsg_space = usize::try_from(unsafe { libc::CMSG_SPACE(GSO_CONTROL_PAYLOAD_LEN) })
+        .expect("cmsg space fits usize");
+    if cmsg_space > control.len() {
+        return Err(io::Error::other("GSO control buffer too small"));
+    }
+    msg.msg_controllen = cmsg_space as crate::CmsgLen;
+
+    // SAFETY: `msg` points to valid in-frame control storage; we write
+    // exactly one SOL_UDP/UDP_SEGMENT cmsg (a u16 segment size) into `control`.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
+        if cmsg.is_null() {
+            return Err(io::Error::other("missing first cmsg header"));
+        }
+        (*cmsg).cmsg_level = libc::SOL_UDP;
+        (*cmsg).cmsg_type = libc::UDP_SEGMENT;
+        (*cmsg).cmsg_len = usize::try_from(libc::CMSG_LEN(GSO_CONTROL_PAYLOAD_LEN))
+            .expect("cmsg len fits usize") as crate::CmsgLen;
+        let seg_ptr = libc::CMSG_DATA(cmsg).cast::<u16>();
+        *seg_ptr = segment_size;
+    }
+
+    // SAFETY: `msg` is fully initialised; its iov points to `iovecs` which borrows from `tx`,
+    // valid until sendmsg returns. MSG_NOSIGNAL suppresses SIGPIPE on closed peer.
+    let ret = unsafe { libc::sendmsg(udp_fd, &raw const msg, libc::MSG_NOSIGNAL) };
+    if ret < 0 {
+        let e = io::Error::last_os_error();
+        let raw = e.raw_os_error().unwrap_or(0);
+        if raw == libc::EWOULDBLOCK || raw == libc::EAGAIN || raw == libc::ENOBUFS {
+            return Ok(true); // transient full buffer: drop this run (acceptable)
+        }
+        if raw == libc::EIO || raw == libc::EINVAL {
+            return Ok(false); // GSO unsupported → caller latches off + plain-sends
+        }
+        return Err(e);
+    }
+    Ok(true)
 }
 
 /// Non-blocking `recvmmsg(2)`: drain up to `bufs.len().min(MAX_DATAGRAM_BATCH)`
@@ -809,6 +950,10 @@ pub fn recv_mmsg(
     // MSG_DONTWAIT guarantees non-blocking execution; on Linux, MSG_WAITFORONE ensures
     // the kernel harvests the available queue burst without blocking past the first datagram.
     // Timeout pointer is null for non-blocking poll-driven operation.
+    // SAFETY: `arena.msgs[..count]` is fully initialised; each msg_iov and msg_name
+    // points to disjoint elements in `arena.iovecs` and `arena.storages` within `arena`.
+    // Both `arena` and `tx` outlive the synchronous `libc::sendmmsg` syscall.
+    // MSG_NOSIGNAL suppresses SIGPIPE on a closed peer socket.
     let ret = unsafe {
         libc::recvmmsg(
             udp_fd,

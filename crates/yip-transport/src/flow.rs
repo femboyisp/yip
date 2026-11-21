@@ -92,14 +92,19 @@ impl FlowTable {
     /// (e.g. heartbeats) is left unclassified rather than mis-classified as interactive.
     ///
     /// **Bulk** is rate-independent: large average packet size indicates a bulk transfer
-    /// regardless of how fast packets arrive.
+    /// regardless of how fast packets arrive. Only TCP flows (`proto == 6`) are assigned
+    /// `FlowClass::Bulk` (which enables reactive ARQ); large UDP flows remain unclassified
+    /// here so they fall through to `FlowClass::Default` without destructive ARQ amplification.
     pub fn classify(&self, key: &FlowKey) -> Option<FlowClass> {
         let stat = self.map.get(key)?;
         if stat.packets < MIN_PACKETS {
             return None;
         }
         if stat.ewma_size > LARGE_BYTES {
-            return Some(FlowClass::Bulk);
+            if key.proto == 6 {
+                return Some(FlowClass::Bulk);
+            }
+            return None;
         }
         if stat.ewma_size < SMALL_BYTES {
             // Rate check — integer-only arithmetic to avoid `as` casts.
@@ -167,13 +172,24 @@ mod tests {
     }
 
     #[test]
-    fn large_flow_classifies_bulk() {
+    fn large_tcp_flow_classifies_bulk() {
         let mut t = FlowTable::new(1024, 10_000);
-        let k = key(6000);
+        let mut k = key(6000);
+        k.proto = 6; // TCP
         for i in 0..8 {
             t.observe(&k, 1400, i * 2);
         }
         assert_eq!(t.classify(&k), Some(FlowClass::Bulk));
+    }
+
+    #[test]
+    fn large_udp_flow_does_not_classify_bulk() {
+        let mut t = FlowTable::new(1024, 10_000);
+        let k = key(6001); // proto 17 (UDP)
+        for i in 0..8 {
+            t.observe(&k, 1400, i * 2);
+        }
+        assert_eq!(t.classify(&k), None);
     }
 
     #[test]

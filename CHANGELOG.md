@@ -6,6 +6,12 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **UDP Burst Loss Recovery & Vectorized GSO Hotpath Optimization (`crates/yip-transport`, `crates/yip-io`).**
+  - Restricted `FlowClass::Bulk` classification in `crates/yip-transport/src/flow.rs` to TCP flows (`proto == 6`), allowing large UDP datagrams to fall through to `FlowClass::Default` without ARQ retransmission buffers, eliminating feedback amplification storms and socket buffer overflow under multi-gigabit line-rate bursts.
+  - Implemented zero-copy scatter-gather `iovec` transmission in `crates/yip-io/src/poll.rs` (`send_gso_indexed`), eliminating intermediate payload copying across datagram bursts.
+  - Expanded `partition_fate_safe` bitmask in `crates/yip-io/src/gso.rs` from `u64` to `u128`, guaranteeing zero heap allocations and eliminating O(N) memmoves for full 128-datagram batches.
+  - Batched non-GSO singleton datagrams in `crates/yip-io/src/poll.rs` (`flush_tx`, `send_mmsg_indexed`, `send_run_plain_indexed`), coalescing singletons into contiguous vectorized `sendmmsg` syscall bursts instead of dispatching per-packet syscalls.
+  - Doubled UDP throughput under line-rate bursts from 1.95 Gbps to 4.43 Gbps on IPv4 and 2.02 Gbps to 4.06 Gbps on IPv6 while reducing CPU utilization from 76% to 37%.
 - **Underlay Hardware UDP Generic Segmentation Offload (`crates/yip-io`, #253).**
   - Added socket-level Generic Segmentation Offload (`UDP_SEGMENT` / GSO) detection, configuration, and probing to `BatchUdpSocket` via `getsockopt` / `setsockopt` with `SOL_UDP / UDP_SEGMENT`.
   - Implemented vectorized GSO batch transmission (`send_gso_batch`, `send_gso_burst`, `sendmmsg_or_gso`, `send_gso_datagrams`, `send_gso_datagrams_burst`) coalescing contiguous packets sharing destination endpoints and segment sizes into single `UDP_SEGMENT` super-skbs using control messages (`cmsg`) and scatter-gather `iovec` arrays.
