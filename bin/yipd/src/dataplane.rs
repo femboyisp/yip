@@ -691,7 +691,7 @@ impl DataPlane {
                 {
                     Some(ct) => ct,
                     None => {
-                        if class == FlowClass::Bulk
+                        if (class == FlowClass::Bulk || class == FlowClass::Default)
                             && now_ms.saturating_sub(self.last_feedback_ms)
                                 >= MIN_GAP_FEEDBACK_INTERVAL_MS
                             && self.detector.has_expired_pending(now_ms)
@@ -748,7 +748,7 @@ impl DataPlane {
                     *tun_drained_count += 1;
                 });
 
-                let has_fb = if class == FlowClass::Bulk
+                let has_fb = if (class == FlowClass::Bulk || class == FlowClass::Default)
                     && now_ms.saturating_sub(self.last_feedback_ms) >= MIN_GAP_FEEDBACK_INTERVAL_MS
                     && self.detector.has_expired_pending(now_ms)
                 {
