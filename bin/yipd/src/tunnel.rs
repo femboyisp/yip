@@ -250,7 +250,7 @@ pub fn run(config: Config) -> io::Result<()> {
     if let Err(e) = tun.set_mtu(mtu) {
         eprintln!("warning: failed to set mtu {mtu} on {}: {e}", config.device);
     }
-    let derived_symbol_size = u16::try_from(mtu.saturating_add(30)).unwrap_or(u16::MAX);
+    let derived_symbol_size = u16::try_from(mtu.saturating_add(48)).unwrap_or(u16::MAX);
     if config.transport != crate::config::TransportMode::Quic {
         manager.set_data_symbol_size(derived_symbol_size);
     }

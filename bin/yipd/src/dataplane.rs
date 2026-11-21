@@ -35,8 +35,8 @@ pub struct DataPlaneCounters {
 // ── constants (wired into DataPlane::new; tunnel.rs keeps its own copies until
 //    Task 3 replaces the two-thread loop with this DataPlane) ─────────────────
 
-const SENT_LOG_CAPACITY: usize = 4_096;
-const RETX_BUFFER_MAX: usize = 4_096;
+const SENT_LOG_CAPACITY: usize = 16_384;
+const RETX_BUFFER_MAX: usize = 16_384;
 const RETX_BUFFER_TTL_MS: u64 = 2000;
 const RETX_EXTRA_REPAIR: u32 = 4;
 
@@ -825,6 +825,7 @@ impl DataPlane {
                         let mut missing_default: u32 = 0;
                         let mut missing_large: u32 = 0;
                         let mut missing_small: u32 = 0;
+                        let mut unmapped_missing: u32 = 0;
 
                         for &c in &report.missing {
                             if let Some(&(class, len)) = self.sent_log.map.get(&c) {
@@ -847,6 +848,8 @@ impl DataPlane {
                                 } else if len <= 256 {
                                     missing_small = missing_small.saturating_add(1);
                                 }
+                            } else {
+                                unmapped_missing = unmapped_missing.saturating_add(1);
                             }
                         }
 
@@ -890,6 +893,21 @@ impl DataPlane {
                                 )
                             };
 
+                        if unmapped_missing > 0 {
+                            if sent_default >= sent_bulk && sent_default >= sent_rt {
+                                missing_default = missing_default.saturating_add(unmapped_missing);
+                            } else if sent_bulk >= sent_default && sent_bulk >= sent_rt {
+                                missing_bulk = missing_bulk.saturating_add(unmapped_missing);
+                            } else {
+                                missing_rt = missing_rt.saturating_add(unmapped_missing);
+                            }
+                            if sent_large >= sent_small {
+                                missing_large = missing_large.saturating_add(unmapped_missing);
+                            } else {
+                                missing_small = missing_small.saturating_add(unmapped_missing);
+                            }
+                        }
+
                         let mut observe_class =
                             |class: FlowClass, missing: u32, sent: u32| -> Option<f32> {
                                 if sent > 0 || missing > 0 {
@@ -907,8 +925,8 @@ impl DataPlane {
                         let _frac_default =
                             observe_class(FlowClass::Default, missing_default, sent_default);
 
-                        // If the overall underlay channel experiences packet loss, ensure Bulk traffic
-                        // is proactively aware of the channel loss floor rather than starting at zero.
+                        // If the overall underlay channel experiences packet loss, ensure both Bulk
+                        // and Default traffic are proactively aware of the channel loss floor.
                         let total_sent = sent_rt + sent_bulk + sent_default;
                         let total_missing = missing_rt + missing_bulk + missing_default;
                         if total_sent > 0 || total_missing > 0 {
@@ -917,6 +935,10 @@ impl DataPlane {
                             if channel_loss > 0.0 {
                                 let effective_bulk = frac_bulk.unwrap_or(0.0).max(channel_loss);
                                 self.transport.observe_loss(FlowClass::Bulk, effective_bulk);
+                                let effective_default =
+                                    _frac_default.unwrap_or(0.0).max(channel_loss);
+                                self.transport
+                                    .observe_loss(FlowClass::Default, effective_default);
                             }
                         }
 
@@ -1036,7 +1058,9 @@ impl DataPlane {
                         accepted_symbol_size,
                     } => {
                         if let Some(new_sym) = self.plpmtu.on_ack(probe_id, accepted_symbol_size) {
-                            self.transport.set_symbol_size(new_sym);
+                            if new_sym > self.transport.symbol_size() {
+                                self.transport.set_symbol_size(new_sym);
+                            }
                             self.pmtu.update_confirmed_symbol_size(new_sym);
                             self.pmtu.on_probe_confirmed(new_sym);
                             self.consecutive_blackhole_intervals = 0;
