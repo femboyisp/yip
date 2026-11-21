@@ -25,6 +25,11 @@ pub(crate) type CmsgLen = libc::socklen_t;
 #[cfg(not(target_env = "musl"))]
 pub(crate) type CmsgLen = usize;
 
+#[cfg(target_env = "musl")]
+pub(crate) type IovLen = libc::c_int;
+#[cfg(not(target_env = "musl"))]
+pub(crate) type IovLen = libc::size_t;
+
 pub use ack_coalesce::AckCompressor;
 pub use addr::{sockaddr_to_std, std_to_sockaddr};
 pub use bpf::{BpfFilterStatus, XdpRedirectFilter};

@@ -14,6 +14,8 @@ use std::time::Instant;
 
 use crate::{sockaddr_to_std, std_to_sockaddr, MAX_DATAGRAM_BATCH, MAX_WIRE_DATAGRAM};
 
+pub use crate::batch::BatchUdpSocket;
+
 /// `UDP_SEGMENT` cmsg payload is a single `u16` (the segment size).
 const GSO_CONTROL_PAYLOAD_LEN: u32 = 2;
 /// Control-message scratch space for one `UDP_SEGMENT` cmsg.
