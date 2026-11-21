@@ -152,13 +152,15 @@ impl Transport {
     /// `symbol_size`, applied to every class's [`FlowParams`] in place of the
     /// per-class default from `FlowClass::params()`.
     pub fn new(rules: Vec<PolicyRule>, symbol_size: u16) -> Self {
+        let mut default_ctrl = AdaptiveController::new_for(FlowClass::Default.params());
+        default_ctrl.set_min_ratio(0.0);
         Self {
             classifier: Classifier::new(rules),
             encoder: FecEncoder::new(),
             controllers: [
                 AdaptiveController::new_for(FlowClass::Realtime.params()),
                 AdaptiveController::new_for(FlowClass::Bulk.params()),
-                AdaptiveController::new_for(FlowClass::Default.params()),
+                default_ctrl,
                 AdaptiveController::new_for(FlowClass::Ack.params()),
             ],
             reassemblers: HashMap::new(),
@@ -605,6 +607,19 @@ mod tests {
             assert!((ratio - 0.42).abs() < 1e-5);
             assert!((t.controllers[class_index(*class)].min_ratio() - 0.42).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn test_transport_default_flow_class_decays_to_zero_on_clean_link() {
+        let mut t = Transport::new(vec![], 1200);
+        let default_idx = class_index(FlowClass::Default);
+        assert_eq!(t.controllers[default_idx].min_ratio(), 0.0);
+        assert!((t.controllers[default_idx].ratio() - 0.10).abs() < 1e-5);
+        for _ in 0..200 {
+            t.controllers[default_idx].observe_loss(0.0);
+        }
+        assert_eq!(t.controllers[default_idx].ratio(), 0.0);
+        assert_eq!(t.controllers[default_idx].repair_count(1), 0);
     }
 
     #[test]

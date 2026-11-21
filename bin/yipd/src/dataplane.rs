@@ -43,6 +43,8 @@ const RETX_EXTRA_REPAIR: u32 = 4;
 // How often (in milliseconds of elapsed tunnel time) the ingress side emits
 // a loss-feedback Control packet to the peer.
 const FEEDBACK_INTERVAL_MS: u64 = 30;
+// Minimum interval between gap-triggered immediate loss feedback emissions.
+const MIN_GAP_FEEDBACK_INTERVAL_MS: u64 = 5;
 
 // How often to sweep the MAC table for expired entries. `tick` fires on every
 // epoll iteration (≥100 Hz), so an unconditional O(n) sweep would scan the whole
@@ -199,13 +201,11 @@ pub enum Outcome<'a> {
     TunWrite(&'a [u8]),
     /// Send these datagrams to the peer (control path: ARQ retransmits).
     Send(&'a [yip_io::poll::EgressDatagram]),
-    /// Write to TUN *and* send datagrams (currently unused, reserved for future).
-    #[expect(dead_code, reason = "reserved for future combined TUN+UDP paths")]
+    /// Write to TUN *and* send datagrams (e.g. decoded inner packet + immediate loss feedback).
     TunWriteThenSend(&'a [u8], &'a [yip_io::poll::EgressDatagram]),
     /// Write a contiguous batch of packets to the TUN device.
     TunWriteBatch(&'a [Vec<u8>]),
     /// Write a contiguous batch of packets to the TUN device and send datagrams.
-    #[expect(dead_code, reason = "reserved for future combined TUN+UDP batch paths")]
     TunWriteBatchThenSend(&'a [Vec<u8>], &'a [yip_io::poll::EgressDatagram]),
 }
 
@@ -474,13 +474,16 @@ impl DataPlane {
     /// spoofed source.
     pub fn set_peer_addr(&mut self, addr: SocketAddr) {
         if self.peer_addr != addr {
-            let floor = self.plpmtu.reset_to_floor();
-            self.transport.set_symbol_size(floor);
-            self.pmtu.on_blackhole_detected();
-            self.pmtu.update_confirmed_symbol_size(floor);
-            self.consecutive_blackhole_intervals = 0;
+            let is_initial = self.peer_addr.port() == 0 && self.peer_addr.ip().is_unspecified();
+            if !is_initial {
+                let floor = self.plpmtu.reset_to_floor();
+                self.transport.set_symbol_size(floor);
+                self.pmtu.on_blackhole_detected();
+                self.pmtu.update_confirmed_symbol_size(floor);
+                self.consecutive_blackhole_intervals = 0;
+            }
+            self.peer_addr = addr;
         }
-        self.peer_addr = addr;
     }
 
     /// Current FEC bulk repair ratio (0.0 = no proactive parity, 0.2 = 20% parity).
@@ -687,7 +690,17 @@ impl DataPlane {
                 let ciphertext = match self.transport.decode_borrowed(counter, &sym, class, now_ms)
                 {
                     Some(ct) => ct,
-                    None => return Outcome::None,
+                    None => {
+                        if class == FlowClass::Bulk
+                            && self.detector.has_expired_pending(now_ms)
+                            && now_ms.saturating_sub(self.last_feedback_ms)
+                                >= MIN_GAP_FEEDBACK_INTERVAL_MS
+                            && self.emit_feedback_into_scratch(now_ms)
+                        {
+                            return Outcome::Send(&self.tick_scratch);
+                        }
+                        return Outcome::None;
+                    }
                 };
 
                 // The object decoded: tell the detector it was delivered.
@@ -735,10 +748,29 @@ impl DataPlane {
                     *tun_drained_count += 1;
                 });
 
-                match self.tun_drained_count {
-                    0 => Outcome::None,
-                    1 => Outcome::TunWrite(&self.tun_drained[0]),
-                    _ => Outcome::TunWriteBatch(&self.tun_drained[..self.tun_drained_count]),
+                let has_fb = if class == FlowClass::Bulk
+                    && self.detector.has_expired_pending(now_ms)
+                    && now_ms.saturating_sub(self.last_feedback_ms) >= MIN_GAP_FEEDBACK_INTERVAL_MS
+                {
+                    self.emit_feedback_into_scratch(now_ms)
+                } else {
+                    false
+                };
+
+                match (self.tun_drained_count, has_fb) {
+                    (0, true) => Outcome::Send(&self.tick_scratch),
+                    (0, false) => Outcome::None,
+                    (1, true) => {
+                        Outcome::TunWriteThenSend(&self.tun_drained[0], &self.tick_scratch)
+                    }
+                    (1, false) => Outcome::TunWrite(&self.tun_drained[0]),
+                    (_, true) => Outcome::TunWriteBatchThenSend(
+                        &self.tun_drained[..self.tun_drained_count],
+                        &self.tick_scratch,
+                    ),
+                    (_, false) => {
+                        Outcome::TunWriteBatch(&self.tun_drained[..self.tun_drained_count])
+                    }
                 }
             }
 
@@ -1104,6 +1136,16 @@ impl DataPlane {
             }
             return None;
         }
+
+        if self.emit_feedback_into_scratch(now_ms) {
+            Some(&self.tick_scratch)
+        } else {
+            None
+        }
+    }
+
+    /// Construct and seal a `ControlFrame::Feedback` packet into `tick_scratch`.
+    fn emit_feedback_into_scratch(&mut self, now_ms: u64) -> bool {
         self.last_feedback_ms = now_ms;
         // Re-roll the interval for the NEXT emission (3a's stored-jittered-interval
         // pattern, e.g. `retry_ms`): ±25% when obf is on, held exactly at the
@@ -1128,7 +1170,7 @@ impl DataPlane {
                 self.counters
                     .tick_seal_errors
                     .fetch_add(1, Ordering::Relaxed);
-                return None;
+                return false;
             }
         };
 
@@ -1148,7 +1190,7 @@ impl DataPlane {
         dg.bytes.extend_from_slice(&sealed.counter.to_be_bytes());
         dg.bytes.extend_from_slice(&sealed.ciphertext);
 
-        Some(&self.tick_scratch)
+        true
     }
 
     /// Drain any pending packets (e.g. flushed due to expired reorder deadlines).
