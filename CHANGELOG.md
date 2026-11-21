@@ -6,6 +6,12 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **Underlay Hardware UDP Generic Segmentation Offload (`crates/yip-io`, #253).**
+  - Added socket-level Generic Segmentation Offload (`UDP_SEGMENT` / GSO) detection, configuration, and probing to `BatchUdpSocket` via `getsockopt` / `setsockopt` with `SOL_UDP / UDP_SEGMENT`.
+  - Implemented vectorized GSO batch transmission (`send_gso_batch`, `send_gso_burst`, `sendmmsg_or_gso`, `send_gso_datagrams`, `send_gso_datagrams_burst`) coalescing contiguous packets sharing destination endpoints and segment sizes into single `UDP_SEGMENT` super-skbs using control messages (`cmsg`) and scatter-gather `iovec` arrays.
+  - Enforced RaptorQ FEC fate group safety: datagrams sharing non-zero `fate` object IDs are never coalesced together into the same super-skb, ensuring FEC recovery under burst loss is preserved.
+  - Implemented zero-allocation hotpath execution and transparent fallback: if `UDP_SEGMENT` is unsupported by the host kernel or NIC (`EINVAL`, `ENOPROTOOPT`, `EOPNOTSUPP`, `EIO`), GSO is automatically latched off and transmission falls back seamlessly to standard `sendmmsg`.
+  - Re-exported `BatchUdpSocket` in `yip_io::poll`.
 - **Cross-Shard Ring Drop Telemetry**: SPSC queue drop metrics are now surfaced in `ControlResponse::Status` (`yip status --json`), displayed conditionally as `Ring Drops` in `yip status`, and exported via Prometheus as `yip_spsc_queue_drops_total` ([#260](https://github.com/femboyisp/yip/issues/260)).
 - **Cross-Platform Shared Protocol Crate (`crates/yip-proto`, #199).**
   - Extracted cross-platform, OS-agnostic wire and IPC data structures from `bin/yipd` into a dedicated `crates/yip-proto` workspace crate.
