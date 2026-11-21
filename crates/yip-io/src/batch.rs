@@ -71,6 +71,9 @@ impl BatchUdpSocket {
     }
 
     /// Create a new `BatchUdpSocket` from an existing raw file descriptor.
+    ///
+    /// Note: `is_gso_enabled()` defaults to `false` for raw file descriptors.
+    /// Call [`BatchUdpSocket::probe_gso`] to probe and enable kernel GSO support.
     #[must_use]
     pub const fn from_raw_fd(fd: RawFd) -> Self {
         Self {
@@ -668,32 +671,32 @@ impl BatchUdpSocket {
             iovecs[k].iov_len = pkt.0.len();
         }
 
-        let mut control = [0u8; 64];
+        let mut control = [0u64; 8];
         // SAFETY: msghdr is plain-old-data; zeroed is a valid initial state.
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         msg.msg_name = std::ptr::from_mut(&mut storage).cast::<libc::c_void>();
         msg.msg_namelen = addr_len;
         msg.msg_iov = iovecs.as_mut_ptr();
-        msg.msg_iovlen = run.len() as crate::IovLen;
+        msg.msg_iovlen = run.len().min(N) as crate::IovLen;
         msg.msg_control = control.as_mut_ptr().cast::<libc::c_void>();
         // SAFETY: CMSG_SPACE is a pure size computation.
         let cmsg_space =
             usize::try_from(unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) })
-                .unwrap_or(control.len());
+                .unwrap_or(std::mem::size_of_val(&control));
         msg.msg_controllen = cmsg_space as crate::CmsgLen;
 
         // SAFETY: msg points to valid control storage; write SOL_UDP / UDP_SEGMENT cmsg.
         unsafe {
             let cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
-            if !cmsg.is_null() {
-                (*cmsg).cmsg_level = libc::SOL_UDP;
-                (*cmsg).cmsg_type = libc::UDP_SEGMENT;
-                (*cmsg).cmsg_len =
-                    usize::try_from(libc::CMSG_LEN(std::mem::size_of::<u16>() as u32)).unwrap_or(0)
-                        as crate::CmsgLen;
-                let seg_ptr = libc::CMSG_DATA(cmsg).cast::<u16>();
-                *seg_ptr = segment_size;
+            if cmsg.is_null() {
+                return Err(io::Error::other("failed to acquire cmsg header"));
             }
+            (*cmsg).cmsg_level = libc::SOL_UDP;
+            (*cmsg).cmsg_type = libc::UDP_SEGMENT;
+            (*cmsg).cmsg_len = usize::try_from(libc::CMSG_LEN(std::mem::size_of::<u16>() as u32))
+                .unwrap_or(0) as crate::CmsgLen;
+            let seg_ptr = libc::CMSG_DATA(cmsg).cast::<u16>();
+            *seg_ptr = segment_size;
         }
 
         loop {
@@ -732,32 +735,32 @@ impl BatchUdpSocket {
             iovecs[k].iov_len = dg.bytes.len();
         }
 
-        let mut control = [0u8; 64];
+        let mut control = [0u64; 8];
         // SAFETY: msghdr is plain-old-data; zeroed is a valid initial state.
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         msg.msg_name = std::ptr::from_mut(&mut storage).cast::<libc::c_void>();
         msg.msg_namelen = addr_len;
         msg.msg_iov = iovecs.as_mut_ptr();
-        msg.msg_iovlen = run.len() as crate::IovLen;
+        msg.msg_iovlen = run.len().min(N) as crate::IovLen;
         msg.msg_control = control.as_mut_ptr().cast::<libc::c_void>();
         // SAFETY: CMSG_SPACE is a pure size computation.
         let cmsg_space =
             usize::try_from(unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) })
-                .unwrap_or(control.len());
+                .unwrap_or(std::mem::size_of_val(&control));
         msg.msg_controllen = cmsg_space as crate::CmsgLen;
 
         // SAFETY: msg points to valid control storage; write SOL_UDP / UDP_SEGMENT cmsg.
         unsafe {
             let cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
-            if !cmsg.is_null() {
-                (*cmsg).cmsg_level = libc::SOL_UDP;
-                (*cmsg).cmsg_type = libc::UDP_SEGMENT;
-                (*cmsg).cmsg_len =
-                    usize::try_from(libc::CMSG_LEN(std::mem::size_of::<u16>() as u32)).unwrap_or(0)
-                        as crate::CmsgLen;
-                let seg_ptr = libc::CMSG_DATA(cmsg).cast::<u16>();
-                *seg_ptr = segment_size;
+            if cmsg.is_null() {
+                return Err(io::Error::other("failed to acquire cmsg header"));
             }
+            (*cmsg).cmsg_level = libc::SOL_UDP;
+            (*cmsg).cmsg_type = libc::UDP_SEGMENT;
+            (*cmsg).cmsg_len = usize::try_from(libc::CMSG_LEN(std::mem::size_of::<u16>() as u32))
+                .unwrap_or(0) as crate::CmsgLen;
+            let seg_ptr = libc::CMSG_DATA(cmsg).cast::<u16>();
+            *seg_ptr = segment_size;
         }
 
         loop {
@@ -835,7 +838,7 @@ fn send_gso_superpacket_fd(
         iov_base: payload.as_ptr().cast_mut().cast::<libc::c_void>(),
         iov_len: payload.len(),
     };
-    let mut control = [0u8; 64];
+    let mut control = [0u64; 8];
     // SAFETY: msghdr is POD; zeroed is a valid initial state.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_name = std::ptr::from_mut(&mut storage).cast::<libc::c_void>();
@@ -846,20 +849,21 @@ fn send_gso_superpacket_fd(
     // SAFETY: CMSG_SPACE is a pure size computation.
     let cmsg_space =
         usize::try_from(unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) })
-            .unwrap_or(control.len());
+            .unwrap_or(std::mem::size_of_val(&control));
     msg.msg_controllen = cmsg_space as crate::CmsgLen;
 
     // SAFETY: msg points to valid control storage; write SOL_UDP / UDP_SEGMENT cmsg.
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
-        if !cmsg.is_null() {
-            (*cmsg).cmsg_level = libc::SOL_UDP;
-            (*cmsg).cmsg_type = libc::UDP_SEGMENT;
-            (*cmsg).cmsg_len = usize::try_from(libc::CMSG_LEN(std::mem::size_of::<u16>() as u32))
-                .unwrap_or(0) as crate::CmsgLen;
-            let seg_ptr = libc::CMSG_DATA(cmsg).cast::<u16>();
-            *seg_ptr = segment_size;
+        if cmsg.is_null() {
+            return Err(io::Error::other("failed to acquire cmsg header"));
         }
+        (*cmsg).cmsg_level = libc::SOL_UDP;
+        (*cmsg).cmsg_type = libc::UDP_SEGMENT;
+        (*cmsg).cmsg_len = usize::try_from(libc::CMSG_LEN(std::mem::size_of::<u16>() as u32))
+            .unwrap_or(0) as crate::CmsgLen;
+        let seg_ptr = libc::CMSG_DATA(cmsg).cast::<u16>();
+        *seg_ptr = segment_size;
     }
 
     loop {
