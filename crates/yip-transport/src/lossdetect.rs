@@ -285,6 +285,13 @@ impl LossDetector {
         self.delivered = self.delivered.saturating_add(1);
     }
 
+    /// Return whether any pending counter has exceeded the grace period.
+    pub fn has_expired_pending(&self, now_ms: u64) -> bool {
+        self.pending
+            .values()
+            .any(|&first_ms| now_ms.saturating_sub(first_ms) >= self.grace_ms)
+    }
+
     /// Emit a [`LossReport`] for the current window.
     ///
     /// Counters that have been pending for longer than `grace_ms` and have
@@ -693,5 +700,31 @@ mod tests {
         // After grace period, report must contain only 5
         let rep = d.report(10);
         assert_eq!(rep.missing, vec![5]);
+    }
+
+    #[test]
+    fn test_has_expired_pending() {
+        let mut d = LossDetector::new(5, 64);
+        assert!(!d.has_expired_pending(0));
+
+        // Packet 0 delivered
+        d.on_seen(0, 0);
+        d.on_delivered(0);
+        assert!(!d.has_expired_pending(0));
+
+        // Packet 2 arrives at t=0, creating implied gap for packet 1
+        d.on_seen(2, 0);
+        d.on_delivered(2);
+        assert!(!d.has_expired_pending(0));
+        assert!(!d.has_expired_pending(4)); // age 4 < grace 5
+
+        // At t=5, gap for packet 1 has expired
+        assert!(d.has_expired_pending(5));
+        assert!(d.has_expired_pending(10));
+
+        // After report, gap is promoted and resolved
+        let rep = d.report(5);
+        assert_eq!(rep.missing, vec![1]);
+        assert!(!d.has_expired_pending(5));
     }
 }

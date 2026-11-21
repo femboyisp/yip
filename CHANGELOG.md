@@ -6,6 +6,11 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **Dataplane Throughput, ARQ Feedback Acceleration & Clean Parity Decay (`bin/yipd`, `crates/yip-transport`, #276).**
+  - Accelerated ARQ loss feedback by emitting immediate gap-triggered `ControlFrame::Feedback` packets rate-limited by `MIN_GAP_FEEDBACK_INTERVAL_MS = 5ms` via combined TUN write and UDP send outcomes (`Outcome::TunWriteThenSend` and `Outcome::TunWriteBatchThenSend`), bypassing the 30ms periodic tick timer when expired pending packet gaps are detected on `FlowClass::Bulk` flows.
+  - Preserved configured MTU symbol sizing (1450 bytes) across initial peer endpoint binding in `DataPlane::set_peer_addr`, preventing baseline symbol floor resets and eliminating multi-symbol fragmentation on standard MTU payloads.
+  - Allowed adaptive FEC parity on `FlowClass::Default` flows to decay down to 0.0 on clean links (`set_min_ratio(0.0)`), eliminating unneeded proactive parity amplification on high-throughput transfers while preserving dynamic scaling when loss is detected.
+  - Updated branding asset by replacing `assets/yip.gif` with high-resolution transparent `assets/yip.png` and updating `README.md`.
 - **UDP Burst Loss Recovery & Vectorized GSO Hotpath Optimization (`crates/yip-transport`, `crates/yip-io`).**
   - Restricted `FlowClass::Bulk` classification in `crates/yip-transport/src/flow.rs` to TCP flows (`proto == 6`), allowing large UDP datagrams to fall through to `FlowClass::Default` without ARQ retransmission buffers, eliminating feedback amplification storms and socket buffer overflow under multi-gigabit line-rate bursts.
   - Implemented zero-copy scatter-gather `iovec` transmission in `crates/yip-io/src/poll.rs` (`send_gso_indexed`), eliminating intermediate payload copying across datagram bursts.
