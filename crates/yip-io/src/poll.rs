@@ -462,7 +462,7 @@ impl GsoScratch {
         Self {
             enabled: true,
             runs: Vec::with_capacity(MAX_DATAGRAM_BATCH),
-            payload: Vec::with_capacity(MAX_WIRE_DATAGRAM * crate::gso::MAX_GSO_SEGMENTS_PER_SEND),
+            payload: Vec::new(),
             plain_indices: Vec::with_capacity(MAX_DATAGRAM_BATCH),
             recycle: Vec::with_capacity(MAX_DATAGRAM_BATCH),
             tx_arena: MmsgBatchArena::new_boxed(),
@@ -645,10 +645,6 @@ pub fn send_mmsg(
     // points to disjoint elements in `arena.iovecs` and `arena.storages` within `arena`.
     // Both `arena` and `datagrams` outlive the synchronous `libc::sendmmsg` syscall.
     // MSG_NOSIGNAL suppresses SIGPIPE on a closed peer socket.
-    // SAFETY: `arena.msgs[..count]` is fully initialised; each msg_iov and msg_name
-    // points to disjoint elements in `arena.iovecs` and `arena.storages` within `arena`.
-    // Both `arena` and `tx` outlive the synchronous `libc::sendmmsg` syscall.
-    // MSG_NOSIGNAL suppresses SIGPIPE on a closed peer socket.
     let ret = unsafe {
         libc::sendmmsg(
             udp_fd,
@@ -784,10 +780,6 @@ fn send_gso_payload(
 
     // SAFETY: `msg` is fully initialised; its iov/name/control point into this
     // frame's storage, valid until sendmsg returns. MSG_NOSIGNAL suppresses SIGPIPE.
-    // SAFETY: `arena.msgs[..count]` is fully initialised; each msg_iov and msg_name
-    // points to disjoint elements in `arena.iovecs` and `arena.storages` within `arena`.
-    // Both `arena` and `tx` outlive the synchronous `libc::sendmmsg` syscall.
-    // MSG_NOSIGNAL suppresses SIGPIPE on a closed peer socket.
     let ret = unsafe { libc::sendmsg(udp_fd, &raw const msg, libc::MSG_NOSIGNAL) };
     if ret < 0 {
         let e = io::Error::last_os_error();
@@ -838,6 +830,7 @@ fn send_gso_indexed(
     if indices.is_empty() {
         return Ok(true);
     }
+    debug_assert!(indices.len() <= MAX_DATAGRAM_BATCH);
     let count = indices.len().min(MAX_DATAGRAM_BATCH);
     let (mut storage, addr_len) = std_to_sockaddr(dst);
     let mut iovecs = [libc::iovec {
@@ -950,10 +943,6 @@ pub fn recv_mmsg(
     // MSG_DONTWAIT guarantees non-blocking execution; on Linux, MSG_WAITFORONE ensures
     // the kernel harvests the available queue burst without blocking past the first datagram.
     // Timeout pointer is null for non-blocking poll-driven operation.
-    // SAFETY: `arena.msgs[..count]` is fully initialised; each msg_iov and msg_name
-    // points to disjoint elements in `arena.iovecs` and `arena.storages` within `arena`.
-    // Both `arena` and `tx` outlive the synchronous `libc::sendmmsg` syscall.
-    // MSG_NOSIGNAL suppresses SIGPIPE on a closed peer socket.
     let ret = unsafe {
         libc::recvmmsg(
             udp_fd,
@@ -1799,6 +1788,89 @@ mod tests {
                 assert_eq!(name_ptr, expected_name_ptr);
             }
         }
+    }
+
+    #[test]
+    fn send_mmsg_indexed_sparse_and_empty() {
+        use std::net::UdpSocket;
+        let mut arena = MmsgBatchArena::new_boxed();
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        let batch = [
+            EgressDatagram {
+                fate: 0,
+                dst: rx_addr,
+                bytes: b"zero".to_vec(),
+            },
+            EgressDatagram {
+                fate: 0,
+                dst: rx_addr,
+                bytes: b"one".to_vec(),
+            },
+            EgressDatagram {
+                fate: 0,
+                dst: rx_addr,
+                bytes: b"two".to_vec(),
+            },
+            EgressDatagram {
+                fate: 0,
+                dst: rx_addr,
+                bytes: b"three".to_vec(),
+            },
+        ];
+
+        // Empty indices returns 0
+        let n_empty = send_mmsg_indexed(tx.as_raw_fd(), &batch, &[], &mut arena).unwrap();
+        assert_eq!(n_empty, 0);
+
+        // Sparse out-of-order dispatch: indices [3, 1]
+        let n_sent = send_mmsg_indexed(tx.as_raw_fd(), &batch, &[3, 1], &mut arena).unwrap();
+        assert_eq!(n_sent, 2);
+
+        let mut buf = [0u8; 64];
+        let (len1, _) = rx.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..len1], b"three");
+
+        let (len2, _) = rx.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..len2], b"one");
+    }
+
+    #[test]
+    fn send_run_plain_indexed_drainage() {
+        use std::net::UdpSocket;
+        let mut arena = MmsgBatchArena::new_boxed();
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        let batch = [
+            EgressDatagram {
+                fate: 0,
+                dst: rx_addr,
+                bytes: b"alpha".to_vec(),
+            },
+            EgressDatagram {
+                fate: 0,
+                dst: rx_addr,
+                bytes: b"beta".to_vec(),
+            },
+            EgressDatagram {
+                fate: 0,
+                dst: rx_addr,
+                bytes: b"gamma".to_vec(),
+            },
+        ];
+
+        send_run_plain_indexed(tx.as_raw_fd(), &batch, &[0, 2], &mut arena).unwrap();
+
+        let mut buf = [0u8; 64];
+        let (len1, _) = rx.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..len1], b"alpha");
+
+        let (len2, _) = rx.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..len2], b"gamma");
     }
 
     #[test]
