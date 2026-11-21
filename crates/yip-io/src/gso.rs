@@ -28,7 +28,7 @@ pub(crate) fn can_coalesce(run: &[EgressDatagram]) -> Option<u16> {
         if d.bytes.len() != first_len || d.dst != first_dst {
             return None;
         }
-        if run[..i].iter().any(|prior| prior.fate == d.fate) {
+        if d.fate != 0 && run[..i].iter().any(|prior| prior.fate == d.fate) {
             return None;
         }
     }
@@ -120,7 +120,7 @@ pub fn partition_fate_safe(dgs: &[EgressDatagram], hard_cap: usize, out: &mut Ve
                 let members = &out[run_idx].members;
                 let admit = d.dst == head.dst
                     && d.bytes.len() == head.bytes.len()
-                    && members.iter().all(|&k| dgs[k].fate != d.fate)
+                    && (d.fate == 0 || members.iter().all(|&k| dgs[k].fate != d.fate))
                     && members.len() < cap;
                 if admit {
                     remaining_mask &= !(1u128 << i);
@@ -155,7 +155,7 @@ pub fn partition_fate_safe(dgs: &[EgressDatagram], hard_cap: usize, out: &mut Ve
                     let d = &dgs[i];
                     let admit = d.dst == head.dst
                         && d.bytes.len() == head.bytes.len()
-                        && members.iter().all(|&k| dgs[k].fate != d.fate)
+                        && (d.fate == 0 || members.iter().all(|&k| dgs[k].fate != d.fate))
                         && members.len() < cap;
                     if admit {
                         members.push(i);
@@ -233,6 +233,12 @@ mod tests {
     fn partition_one_run_all_distinct_fate() {
         let d = [dg(1, A, 1200), dg(2, A, 1200), dg(3, A, 1200)];
         assert_eq!(runs(&d, 64), vec![(1200, vec![0, 1, 2])]);
+    }
+    #[test]
+    fn partition_coalesces_zero_fate_datagrams() {
+        let d = [dg(0, A, 1200), dg(0, A, 1200), dg(0, A, 1200)];
+        assert_eq!(runs(&d, 64), vec![(1200, vec![0, 1, 2])]);
+        assert_eq!(can_coalesce(&d), Some(1200));
     }
     #[test]
     fn partition_splits_repeat_fate_to_next_pass() {
