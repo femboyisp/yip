@@ -66,17 +66,17 @@ pub fn partition_fate_safe(dgs: &[EgressDatagram], hard_cap: usize, out: &mut Ve
         return;
     }
 
-    if dgs.len() <= 64 {
-        let mut remaining_mask: u64 = if dgs.len() == 64 {
+    if dgs.len() <= 128 {
+        let mut remaining_mask: u128 = if dgs.len() == 128 {
             !0
         } else {
-            (1u64 << dgs.len()) - 1
+            (1u128 << dgs.len()) - 1
         };
 
         let mut run_idx = 0;
         while remaining_mask != 0 {
             let head_idx = remaining_mask.trailing_zeros() as usize;
-            remaining_mask &= !(1u64 << head_idx);
+            remaining_mask &= !(1u128 << head_idx);
             let head = &dgs[head_idx];
 
             let seg = match u16::try_from(head.bytes.len()).ok().filter(|&l| l > 0) {
@@ -113,7 +113,7 @@ pub fn partition_fate_safe(dgs: &[EgressDatagram], hard_cap: usize, out: &mut Ve
             }
 
             for i in (head_idx + 1)..dgs.len() {
-                if (remaining_mask & (1u64 << i)) == 0 {
+                if (remaining_mask & (1u128 << i)) == 0 {
                     continue;
                 }
                 let d = &dgs[i];
@@ -123,7 +123,7 @@ pub fn partition_fate_safe(dgs: &[EgressDatagram], hard_cap: usize, out: &mut Ve
                     && members.iter().all(|&k| dgs[k].fate != d.fate)
                     && members.len() < cap;
                 if admit {
-                    remaining_mask &= !(1u64 << i);
+                    remaining_mask &= !(1u128 << i);
                     out[run_idx].members.push(i);
                 }
             }
@@ -133,7 +133,7 @@ pub fn partition_fate_safe(dgs: &[EgressDatagram], hard_cap: usize, out: &mut Ve
         return;
     }
 
-    // Fallback for batches > 64:
+    // Fallback for batches > 128:
     out.clear();
     let mut remaining: Vec<usize> = (0..dgs.len()).collect();
     while !remaining.is_empty() {
