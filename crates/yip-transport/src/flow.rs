@@ -193,6 +193,17 @@ mod tests {
     }
 
     #[test]
+    fn exact_large_bytes_boundary_does_not_classify_bulk() {
+        let mut t = FlowTable::new(1024, 10_000);
+        let mut k = key(6002);
+        k.proto = 6; // TCP
+        for i in 0..8 {
+            t.observe(&k, 1000, i * 2);
+        }
+        assert_eq!(t.classify(&k), None);
+    }
+
+    #[test]
     fn cold_flow_is_unclassified() {
         let mut t = FlowTable::new(1024, 10_000);
         let k = key(7000);
