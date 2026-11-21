@@ -15,9 +15,9 @@ pub const MAGIC_MTU_PROBE_ACK: [u8; 2] = [0xFF, 0x41];
 /// Discrete search ladder of candidate symbol sizes corresponding to common MTU standards:
 /// - Tier 0: 1120 (safe minimum wire budget / IPv6 1280 / cellular relays)
 /// - Tier 1: 1320 (PPPoE / tunnel-in-tunnel)
-/// - Tier 2: 1400 (standard Ethernet WAN fits 1500B physical WAN without IP fragmentation)
+/// - Tier 2: 1440 (standard Ethernet WAN fits 1500B physical WAN without IP fragmentation)
 /// - Tier 3: 1530 (jumbo / LAN / loopback)
-pub const PLPMTU_LADDER: [u16; 4] = [1120, 1320, 1400, 1530];
+pub const PLPMTU_LADDER: [u16; 4] = [1120, 1320, 1440, 1530];
 
 /// Interval in milliseconds between probe attempts.
 pub const PROBE_INTERVAL_MS: u64 = 1000;
@@ -422,23 +422,23 @@ mod tests {
 
         // Invalid ack (mismatched ID or size) does not advance
         assert_eq!(ctrl.on_ack(999, 1320), None);
-        assert_eq!(ctrl.on_ack(id1, 1400), None);
+        assert_eq!(ctrl.on_ack(id1, 1440), None);
         assert_eq!(ctrl.current_symbol_size(), 1120);
 
-        // Valid ack for Tier 1 confirms 1320 and promotes to Tier 2 (1400)
+        // Valid ack for Tier 1 confirms 1320 and promotes to Tier 2 (1440)
         assert_eq!(ctrl.on_ack(id1, 1320), Some(1320));
         assert_eq!(ctrl.current_symbol_size(), 1320);
-        assert_eq!(ctrl.candidate_symbol_size(), Some(1400));
+        assert_eq!(ctrl.candidate_symbol_size(), Some(1440));
         assert!(!ctrl.is_converged());
 
-        // Tier 2 (1400)
+        // Tier 2 (1440)
         let (id2, size2, pad2) = ctrl.on_tick(2000).expect("probe tier 2");
         assert_eq!(id2, 2);
-        assert_eq!(size2, 1400);
-        assert_eq!(pad2, 1394);
+        assert_eq!(size2, 1440);
+        assert_eq!(pad2, 1434);
 
-        assert_eq!(ctrl.on_ack(id2, 1400), Some(1400));
-        assert_eq!(ctrl.current_symbol_size(), 1400);
+        assert_eq!(ctrl.on_ack(id2, 1440), Some(1440));
+        assert_eq!(ctrl.current_symbol_size(), 1440);
         assert_eq!(ctrl.candidate_symbol_size(), Some(1530));
         assert!(!ctrl.is_converged());
 
@@ -471,7 +471,7 @@ mod tests {
         // Attempt 1 for Tier 2
         let (id2_a, size2, _) = ctrl.on_tick(2000).expect("attempt 1");
         assert_eq!(id2_a, 2);
-        assert_eq!(size2, 1400);
+        assert_eq!(size2, 1440);
 
         // Attempt 2 for Tier 2
         let (id2_b, _, _) = ctrl.on_tick(3000).expect("attempt 2");
@@ -499,12 +499,12 @@ mod tests {
         assert_eq!(ctrl.on_blackhole(), None);
         assert_eq!(ctrl.current_symbol_size(), 1120);
 
-        // Promote to Tier 2 (1400)
+        // Promote to Tier 2 (1440)
         let (id1, _, _) = ctrl.on_tick(1000).unwrap();
         ctrl.on_ack(id1, 1320);
         let (id2, _, _) = ctrl.on_tick(2000).unwrap();
-        ctrl.on_ack(id2, 1400);
-        assert_eq!(ctrl.current_symbol_size(), 1400);
+        ctrl.on_ack(id2, 1440);
+        assert_eq!(ctrl.current_symbol_size(), 1440);
 
         // Trigger blackhole: drops confirmed tier to 1120, restarts probing with backoff
         assert_eq!(ctrl.on_blackhole(), Some(1120));
@@ -550,7 +550,7 @@ mod tests {
 
         let (id2, _, _) = ctrl.on_tick(2000).expect("second probe");
         assert_eq!(id2, 2);
-        assert_eq!(ctrl.on_ack(id2, 1400), Some(1400));
+        assert_eq!(ctrl.on_ack(id2, 1440), Some(1440));
         assert_eq!(ctrl.active_probe_id(), Some(3));
 
         let (id3, _, _) = ctrl.on_tick(3000).expect("third probe");
@@ -590,11 +590,11 @@ mod tests {
         assert_eq!(ctrl.on_ack(reprobe_id, 1320), Some(1320));
         assert_eq!(ctrl.current_symbol_size(), 1320);
 
-        // Advance and ACK tier 2 (1400)
+        // Advance and ACK tier 2 (1440)
         let (p2_id, p2_size, _) = ctrl.on_tick(20_000).expect("probe tier 2");
-        assert_eq!(p2_size, 1400);
-        assert_eq!(ctrl.on_ack(p2_id, 1400), Some(1400));
-        assert_eq!(ctrl.current_symbol_size(), 1400);
+        assert_eq!(p2_size, 1440);
+        assert_eq!(ctrl.on_ack(p2_id, 1440), Some(1440));
+        assert_eq!(ctrl.current_symbol_size(), 1440);
 
         // Advance and ACK maximum tier 3 (1530)
         let (p3_id, p3_size, _) = ctrl.on_tick(21_000).expect("probe tier 3");

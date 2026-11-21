@@ -692,9 +692,9 @@ impl DataPlane {
                     Some(ct) => ct,
                     None => {
                         if class == FlowClass::Bulk
-                            && self.detector.has_expired_pending(now_ms)
                             && now_ms.saturating_sub(self.last_feedback_ms)
                                 >= MIN_GAP_FEEDBACK_INTERVAL_MS
+                            && self.detector.has_expired_pending(now_ms)
                             && self.emit_feedback_into_scratch(now_ms)
                         {
                             return Outcome::Send(&self.tick_scratch);
@@ -749,8 +749,8 @@ impl DataPlane {
                 });
 
                 let has_fb = if class == FlowClass::Bulk
-                    && self.detector.has_expired_pending(now_ms)
                     && now_ms.saturating_sub(self.last_feedback_ms) >= MIN_GAP_FEEDBACK_INTERVAL_MS
+                    && self.detector.has_expired_pending(now_ms)
                 {
                     self.emit_feedback_into_scratch(now_ms)
                 } else {
@@ -1751,6 +1751,44 @@ mod tests {
     }
 
     #[test]
+    fn test_set_peer_addr_from_unspecified_preserves_configured_symbol_size() {
+        let est = test_established();
+        let unspec: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let configured_symbol_size = 1450;
+        let mut dp = DataPlane::new(
+            est,
+            0x12345678,
+            TunnelMode::L3Tun,
+            unspec,
+            false,
+            configured_symbol_size,
+        );
+
+        assert_eq!(dp.peer_addr, unspec);
+        assert_eq!(dp.transport.symbol_size(), 1450);
+
+        // First transition from 0.0.0.0:0 (initial binding) must preserve configured symbol size
+        let peer_addr: SocketAddr = "203.0.113.10:51820".parse().unwrap();
+        dp.set_peer_addr(peer_addr);
+        assert_eq!(dp.peer_addr, peer_addr);
+        assert_eq!(
+            dp.transport.symbol_size(),
+            1450,
+            "initial peer address resolution must not drop configured symbol size to floor"
+        );
+
+        // Subsequent transition from a known peer endpoint (actual roaming) must drop to floor
+        let roam_addr: SocketAddr = "203.0.113.20:51820".parse().unwrap();
+        dp.set_peer_addr(roam_addr);
+        assert_eq!(dp.peer_addr, roam_addr);
+        assert_eq!(
+            dp.transport.symbol_size(),
+            1120,
+            "subsequent roam must safely reset symbol size to floor"
+        );
+    }
+
+    #[test]
     fn test_dataplane_on_tun_into_clamps_tcp_syn_mss() {
         let (mut a, mut b) = dataplane_pair(TunnelMode::L3Tun, false);
         let mut out = Vec::new();
@@ -2179,12 +2217,12 @@ mod tests {
     fn test_size_differential_blackhole_detection_and_uniform_loss_isolation() {
         let (mut a, mut b) = dataplane_pair(TunnelMode::L3Tun, false);
 
-        // Advance PLPMTU to 1400 (Tier 2)
+        // Advance PLPMTU to 1440 (Tier 2)
         let _ = a.plpmtu.on_ack(1, 1320);
-        let _ = a.plpmtu.on_ack(2, 1400);
-        a.pmtu.update_confirmed_symbol_size(1400);
-        assert_eq!(a.plpmtu.current_symbol_size(), 1400);
-        assert_eq!(a.pmtu.max_mss_for_packet(true), 1312); // 1400 - 28 - 60 = 1312
+        let _ = a.plpmtu.on_ack(2, 1440);
+        a.pmtu.update_confirmed_symbol_size(1440);
+        assert_eq!(a.plpmtu.current_symbol_size(), 1440);
+        assert_eq!(a.pmtu.max_mss_for_packet(true), 1352); // 1440 - 28 - 60 = 1352
 
         // Helper to send a feedback control frame from b to a
         let send_feedback = |a: &mut DataPlane, b: &mut DataPlane, high: u64, missing: Vec<u64>| {
@@ -2204,9 +2242,9 @@ mod tests {
         };
 
         // ── Phase 1: 10% Uniform Loss (Large and Small both drop at 10%) ──
-        // Counters 1..=20: 10 large (1400B) and 10 small (100B)
+        // Counters 1..=20: 10 large (1440B) and 10 small (100B)
         for i in 1..=10u64 {
-            a.sent_log.insert(i, FlowClass::Bulk, 1400);
+            a.sent_log.insert(i, FlowClass::Bulk, 1440);
         }
         for i in 11..=20u64 {
             a.sent_log.insert(i, FlowClass::Ack, 100);
@@ -2220,14 +2258,14 @@ mod tests {
         );
         assert_eq!(
             a.plpmtu.current_symbol_size(),
-            1400,
+            1440,
             "confirmed MTU tier must stay intact under uniform loss"
         );
 
         // ── Phase 2: Size-dependent Loss Interval 1 (Large 90% loss, Small 0% loss) ──
-        // Counters 21..=40: 10 large (1400B) and 10 small (100B)
+        // Counters 21..=40: 10 large (1440B) and 10 small (100B)
         for i in 21..=30u64 {
-            a.sent_log.insert(i, FlowClass::Bulk, 1400);
+            a.sent_log.insert(i, FlowClass::Bulk, 1440);
         }
         for i in 31..=40u64 {
             a.sent_log.insert(i, FlowClass::Ack, 100);
@@ -2242,14 +2280,14 @@ mod tests {
         );
         assert_eq!(
             a.plpmtu.current_symbol_size(),
-            1400,
+            1440,
             "single interval must NOT trigger blackhole fallback (2 required)"
         );
 
         // ── Phase 3: Size-dependent Loss Interval 2 (Consecutive Confirmation) ──
-        // Counters 41..=60: 10 large (1400B) and 10 small (100B)
+        // Counters 41..=60: 10 large (1440B) and 10 small (100B)
         for i in 41..=50u64 {
-            a.sent_log.insert(i, FlowClass::Bulk, 1400);
+            a.sent_log.insert(i, FlowClass::Bulk, 1440);
         }
         for i in 51..=60u64 {
             a.sent_log.insert(i, FlowClass::Ack, 100);
