@@ -842,7 +842,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                         std::time::Instant::now(),
                     );
                 }
-                let derived_symbol_size = u16::try_from(mtu.saturating_add(30)).unwrap_or(u16::MAX);
+                let derived_symbol_size = u16::try_from(mtu.saturating_add(48)).unwrap_or(u16::MAX);
                 manager.set_data_symbol_size(derived_symbol_size);
                 let tun_fd = tun_dev.as_raw_fd();
 
