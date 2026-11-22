@@ -13,6 +13,7 @@ pub struct AdaptiveController {
     prev_loss: f32,
     loss_velocity: f32,
     initialized: bool,
+    arq: bool,
 }
 
 impl AdaptiveController {
@@ -32,6 +33,7 @@ impl AdaptiveController {
             prev_loss: 0.0,
             loss_velocity: 0.0,
             initialized: false,
+            arq: params.arq,
         }
     }
 
@@ -149,18 +151,20 @@ impl AdaptiveController {
     /// How many repair symbols to emit for an object with `source_symbols` source symbols.
     ///
     /// Returns `0` when `ratio` has decayed to zero (clean link) or when a singleton
-    /// packet (`source_symbols = 1`) on a zero-floor flow class (`Default`, `Bulk`) would incur
+    /// packet (`source_symbols = 1`) on a non-ARQ zero-floor flow class (`Default`) would incur
     /// 100% duplication overhead under non-severe loss.
     ///
-    /// Returns at least `1` whenever `ratio > 0` for multi-symbol objects or
-    /// proactive-floor classes (`Realtime`, `Ack`).
+    /// Returns at least `1` whenever `ratio > 0` for ARQ flows (`Bulk`), multi-symbol
+    /// objects, or proactive-floor classes (`Realtime`, `Ack`).
     pub fn repair_count(&self, source_symbols: u32) -> u32 {
         if self.ratio <= f32::EPSILON || source_symbols == 0 {
             return 0;
         }
-        if source_symbols == 1 && self.min_ratio <= f32::EPSILON {
-            // For zero-floor classes (Default, Bulk) with a single-symbol object (K=1),
-            // emitting 1 repair symbol represents a 100% wire packet doubling.
+        if source_symbols == 1 && !self.arq && self.min_ratio <= f32::EPSILON {
+            // For non-ARQ zero-floor flows (e.g. Default UDP streams) with a single-symbol object (K=1),
+            // emitting 1 repair symbol represents a 100% wire packet doubling. Because UDP has no
+            // congestion control back-off, doubling packet rate on high-rate streams causes socket
+            // buffer exhaustion and severe loss.
             // Avoid 100% duplication overhead unless loss is severe (ratio >= 0.50).
             if self.ratio >= 0.50 {
                 1
@@ -253,6 +257,11 @@ mod tests {
         c.observe_loss(0.07);
         assert!(c.ratio() >= 0.20);
         assert_eq!(c.repair_count(10), 2);
+        assert_eq!(
+            c.repair_count(1),
+            1,
+            "bulk ARQ class receives K=1 repair under loss to preserve TCP CWND"
+        );
 
         // Severe loss (>= 10%): targets >= 0.30
         c.observe_loss(0.12);
