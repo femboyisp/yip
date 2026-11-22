@@ -1155,6 +1155,14 @@ impl DataPlane {
             self.mac_table.sweep(now_ms);
         }
 
+        // ── gap-triggered loss feedback emission ───────────────────────────────
+        if now_ms.saturating_sub(self.last_feedback_ms) >= MIN_GAP_FEEDBACK_INTERVAL_MS
+            && self.detector.has_expired_pending(now_ms)
+            && self.emit_feedback_into_scratch(now_ms)
+        {
+            return Some(&self.tick_scratch);
+        }
+
         // ── periodic feedback emission ─────────────────────────────────────────
         if now_ms.saturating_sub(self.last_feedback_ms) < self.feedback_interval_ms {
             // Check if PLPMTUD has an in-band probe to emit between feedback ticks

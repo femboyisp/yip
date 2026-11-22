@@ -79,10 +79,6 @@ impl Classifier {
     pub fn classify(&mut self, inner: &[u8], l2: bool, now_ms: u64) -> FlowClass {
         // 0. stateless pure TCP ACK detection
         if is_pure_tcp_ack(inner, l2) {
-            if let Some(p) = parse_ip(inner, l2) {
-                let canonical = p.key.canonical();
-                self.flows.observe(&canonical, inner.len(), now_ms);
-            }
             return FlowClass::Ack;
         }
 
@@ -118,6 +114,9 @@ impl Classifier {
     /// Observe an ingress packet arriving from a peer to update the bidirectional
     /// flow heuristic state without emitting a classification decision.
     pub fn observe_ingress(&mut self, inner: &[u8], l2: bool, now_ms: u64) {
+        if is_pure_tcp_ack(inner, l2) {
+            return;
+        }
         if let Some(p) = parse_ip(inner, l2) {
             if p.key.proto == 6 || p.key.proto == 17 {
                 let canonical = p.key.canonical();
@@ -463,6 +462,80 @@ mod tests {
 
         // After the 4th packet (2 forward + 2 reverse), the flow heuristic kicks in -> Realtime.
         assert_eq!(c.classify(&fwd, false, 30), FlowClass::Realtime);
+    }
+
+    #[test]
+    fn test_tcp_data_stream_classification_with_reverse_acks() {
+        let make_tcp_v4 =
+            |src_ip: [u8; 4], dst_ip: [u8; 4], sport: u16, dport: u16, size: usize| {
+                let mut p = vec![0u8; size];
+                p[0] = 0x45;
+                p[2..4].copy_from_slice(&(size as u16).to_be_bytes());
+                p[9] = 6;
+                p[12..16].copy_from_slice(&src_ip);
+                p[16..20].copy_from_slice(&dst_ip);
+                p[20..22].copy_from_slice(&sport.to_be_bytes());
+                p[22..24].copy_from_slice(&dport.to_be_bytes());
+                p[32] = 0x50; // data offset 5 (20 bytes)
+                p
+            };
+        let make_tcp_v6 =
+            |src_ip: [u8; 16], dst_ip: [u8; 16], sport: u16, dport: u16, size: usize| {
+                let mut p = vec![0u8; size];
+                p[0] = 0x60;
+                let payload_len = (size - 40) as u16;
+                p[4..6].copy_from_slice(&payload_len.to_be_bytes());
+                p[6] = 6; // Next header: TCP
+                p[8..24].copy_from_slice(&src_ip);
+                p[24..40].copy_from_slice(&dst_ip);
+                p[40..42].copy_from_slice(&sport.to_be_bytes());
+                p[42..44].copy_from_slice(&dport.to_be_bytes());
+                p[52] = 0x80; // data offset 8 (32 bytes with options)
+                p
+            };
+
+        // Test IPv4: TCP data stream with reverse ACKs must stay Bulk
+        let mut c4 = Classifier::new(vec![]);
+        let fwd4_data = make_tcp_v4([10, 0, 0, 1], [10, 0, 0, 2], 1234, 5201, 1400);
+        let mut rev4_ack = make_tcp_v4([10, 0, 0, 2], [10, 0, 0, 1], 5201, 1234, 52);
+        rev4_ack[32] = 0x80;
+        rev4_ack[33] = 0x10; // ACK flag
+
+        for i in 0..10 {
+            c4.classify(&fwd4_data, false, i * 10);
+        }
+        for i in 11..20 {
+            c4.observe_ingress(&rev4_ack, false, i * 10);
+            let cls = c4.classify(&fwd4_data, false, i * 10 + 5);
+            assert_eq!(
+                cls,
+                FlowClass::Bulk,
+                "IPv4 packet {i} must remain Bulk despite reverse ACKs"
+            );
+        }
+
+        // Test IPv6: TCP data stream with reverse ACKs must stay Bulk
+        let mut c6 = Classifier::new(vec![]);
+        let mut src6 = [0u8; 16];
+        src6[15] = 1;
+        let mut dst6 = [0u8; 16];
+        dst6[15] = 2;
+        let fwd6_data = make_tcp_v6(src6, dst6, 1234, 5201, 1400);
+        let mut rev6_ack = make_tcp_v6(dst6, src6, 5201, 1234, 72);
+        rev6_ack[53] = 0x10; // ACK flag
+
+        for i in 0..10 {
+            c6.classify(&fwd6_data, false, i * 10);
+        }
+        for i in 11..20 {
+            c6.observe_ingress(&rev6_ack, false, i * 10);
+            let cls = c6.classify(&fwd6_data, false, i * 10 + 5);
+            assert_eq!(
+                cls,
+                FlowClass::Bulk,
+                "IPv6 packet {i} must remain Bulk despite reverse ACKs"
+            );
+        }
     }
 
     #[test]
