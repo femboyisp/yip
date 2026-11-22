@@ -80,8 +80,8 @@ pub const MAX_DATAGRAM_BATCH: usize = 128;
 /// encapsulated MTU-1500 payload plus yip-wire framing overhead.
 pub const MAX_WIRE_DATAGRAM: usize = 2048;
 
-/// Default socket buffer size in bytes (32 MiB) for UDP send and receive queues.
-pub const DEFAULT_SOCKET_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+/// Default socket buffer size in bytes (64 MiB) for UDP send and receive queues.
+pub const DEFAULT_SOCKET_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 
 /// Selected I/O backend, in fallback-preference order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

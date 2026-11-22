@@ -6,12 +6,20 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **Dataplane Throughput, ARQ Feedback Acceleration & Clean Parity Decay (`bin/yipd`, `crates/yip-transport`, #276).**
+  - Accelerated ARQ loss feedback by emitting immediate gap-triggered `ControlFrame::Feedback` packets rate-limited by `MIN_GAP_FEEDBACK_INTERVAL_MS = 5ms` via combined TUN write and UDP send outcomes (`Outcome::TunWriteThenSend` and `Outcome::TunWriteBatchThenSend`), bypassing the 30ms periodic tick timer when expired pending packet gaps are detected on `FlowClass::Bulk` flows.
+  - Preserved configured MTU symbol sizing (1450 bytes) across initial peer endpoint binding in `DataPlane::set_peer_addr`, preventing baseline symbol floor resets and eliminating multi-symbol fragmentation on standard MTU payloads.
+  - Allowed adaptive FEC parity on `FlowClass::Default` flows to decay down to 0.0 on clean links (`set_min_ratio(0.0)`), eliminating unneeded proactive parity amplification on high-throughput transfers while preserving dynamic scaling when loss is detected.
+  - Resolved multi-shard control packet misrouting in `bin/yipd/src/sharding.rs` by eliminating pseudo-random cross-shard forwarding of in-band control frames, allowing incoming PLPMTU probe confirmations and ARQ loss reports to be processed directly on the receiving shard.
+  - Updated branding asset by replacing `assets/yip.gif` with high-resolution transparent `assets/yip.png` and updating `README.md`.
 - **UDP Burst Loss Recovery & Vectorized GSO Hotpath Optimization (`crates/yip-transport`, `crates/yip-io`).**
+  - Allowed coalescing zero-fate (`fate: 0`) independent datagrams in `crates/yip-io/src/gso.rs` (`can_coalesce` and `partition_fate_safe`), fixing a collision bug where `0 == 0` caused default non-FEC traffic to reject GSO run batching and shatter into per-packet syscalls.
+  - Reserved FEC `object_id == 0` in `crates/yip-transport/src/fec.rs` (`FecEncoder`), guaranteeing that `fate == 0` is uniquely reserved for unconstrained datagrams and preventing multi-symbol FEC blocks from coalescing into fate-sharing GSO super-skbs.
   - Restricted `FlowClass::Bulk` classification in `crates/yip-transport/src/flow.rs` to TCP flows (`proto == 6`), allowing large UDP datagrams to fall through to `FlowClass::Default` without ARQ retransmission buffers, eliminating feedback amplification storms and socket buffer overflow under multi-gigabit line-rate bursts.
   - Implemented zero-copy scatter-gather `iovec` transmission in `crates/yip-io/src/poll.rs` (`send_gso_indexed`), eliminating intermediate payload copying across datagram bursts.
   - Expanded `partition_fate_safe` bitmask in `crates/yip-io/src/gso.rs` from `u64` to `u128`, guaranteeing zero heap allocations and eliminating O(N) memmoves for full 128-datagram batches.
   - Batched non-GSO singleton datagrams in `crates/yip-io/src/poll.rs` (`flush_tx`, `send_mmsg_indexed`, `send_run_plain_indexed`), coalescing singletons into contiguous vectorized `sendmmsg` syscall bursts instead of dispatching per-packet syscalls.
-  - Doubled UDP throughput under line-rate bursts from 1.95 Gbps to 4.43 Gbps on IPv4 and 2.02 Gbps to 4.06 Gbps on IPv6 while reducing CPU utilization from 76% to 37%.
+  - Doubled UDP throughput under line-rate bursts from 1.95 Gbps to 4.51 Gbps on IPv4 and 2.02 Gbps to 4.33 Gbps on IPv6 while reducing CPU utilization from 76% to 36% and UDP loss from 46.6% down to 5.2%-8.9%.
 - **Underlay Hardware UDP Generic Segmentation Offload (`crates/yip-io`, #253).**
   - Added socket-level Generic Segmentation Offload (`UDP_SEGMENT` / GSO) detection, configuration, and probing to `BatchUdpSocket` via `getsockopt` / `setsockopt` with `SOL_UDP / UDP_SEGMENT`.
   - Implemented vectorized GSO batch transmission (`send_gso_batch`, `send_gso_burst`, `sendmmsg_or_gso`, `send_gso_datagrams`, `send_gso_datagrams_burst`) coalescing contiguous packets sharing destination endpoints and segment sizes into single `UDP_SEGMENT` super-skbs using control messages (`cmsg`) and scatter-gather `iovec` arrays.

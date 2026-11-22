@@ -175,7 +175,7 @@ pub struct FecEncoder {
 impl Default for FecEncoder {
     fn default() -> Self {
         Self {
-            next_object_id: 0,
+            next_object_id: 1,
             stride: 1,
             symbols_encoded: 0,
             arena: FecScratchArena::default(),
@@ -184,7 +184,8 @@ impl Default for FecEncoder {
 }
 
 impl FecEncoder {
-    /// Create an encoder starting at object id 0 with a default scratch arena.
+    /// Create an encoder starting at object id 1 with a default scratch arena.
+    /// Object id 0 is reserved as the no-fate sentinel for GSO.
     pub fn new() -> Self {
         Self::default()
     }
@@ -192,7 +193,7 @@ impl FecEncoder {
     /// Create an encoder with a custom-capacity scratch arena.
     pub fn with_arena_capacity(max_shards: usize, max_shard_len: usize) -> Self {
         Self {
-            next_object_id: 0,
+            next_object_id: 1,
             stride: 1,
             symbols_encoded: 0,
             arena: FecScratchArena::with_capacity(max_shards, max_shard_len),
@@ -215,9 +216,22 @@ impl FecEncoder {
     }
 
     /// Reconfigure shard start object id and stride increment.
+    /// Reserves object id 0 as the no-fate sentinel for GSO.
     pub fn set_shard(&mut self, shard_id: u16, num_shards: u16) {
-        self.next_object_id = shard_id;
-        self.stride = if num_shards == 0 { 1 } else { num_shards };
+        let stride = if num_shards == 0 { 1 } else { num_shards };
+        self.next_object_id = if shard_id == 0 { stride } else { shard_id };
+        self.stride = stride;
+    }
+
+    #[inline]
+    fn advance_object_id(&mut self) -> u16 {
+        let id = self.next_object_id;
+        let mut next = self.next_object_id.wrapping_add(self.stride);
+        if next == 0 {
+            next = self.stride.max(1);
+        }
+        self.next_object_id = next;
+        id
     }
 
     /// Encode one ciphertext frame into K source + `repair` repair symbols, returning
@@ -228,8 +242,7 @@ impl FecEncoder {
         params: crate::FlowParams,
         repair: u32,
     ) -> Vec<Symbol> {
-        let object_id = self.next_object_id;
-        self.next_object_id = self.next_object_id.wrapping_add(self.stride);
+        let object_id = self.advance_object_id();
         let syms = Self::build_with_arena(ciphertext, params, object_id, repair, &mut self.arena);
         self.symbols_encoded = self.symbols_encoded.saturating_add(syms.len() as u64);
         syms.to_vec()
@@ -245,8 +258,7 @@ impl FecEncoder {
         repair: u32,
         arena: &'a mut FecScratchArena,
     ) -> &'a [Symbol] {
-        let object_id = self.next_object_id;
-        self.next_object_id = self.next_object_id.wrapping_add(self.stride);
+        let object_id = self.advance_object_id();
         let syms = Self::build_with_arena(ciphertext, params, object_id, repair, arena);
         self.symbols_encoded = self.symbols_encoded.saturating_add(syms.len() as u64);
         syms
@@ -271,8 +283,7 @@ impl FecEncoder {
         params: crate::FlowParams,
         repair: u32,
     ) -> &[Symbol] {
-        let object_id = self.next_object_id;
-        self.next_object_id = self.next_object_id.wrapping_add(self.stride);
+        let object_id = self.advance_object_id();
         let syms = Self::build_with_arena(ciphertext, params, object_id, repair, &mut self.arena);
         self.symbols_encoded = self.symbols_encoded.saturating_add(syms.len() as u64);
         syms
@@ -1082,7 +1093,7 @@ mod tests {
         assert_eq!(idx, vec![0, 1, 2, 3, 4]);
         assert!(syms
             .iter()
-            .all(|s| s.object_size == 2400 && s.object_id == 0));
+            .all(|s| s.object_size == 2400 && s.object_id == 1));
     }
 
     #[test]
@@ -1925,6 +1936,12 @@ mod tests {
         // Zero shards falls back to stride 1
         enc.set_shard(5, 0);
         assert_eq!(enc.stride, 1);
+
+        // Shard 0 starts at stride (e.g. 4) to reserve object_id 0
+        enc.set_shard(0, 4);
+        assert_eq!(enc.next_object_id, 4);
+        let syms_s0 = enc.encode(&[7, 8, 9], params, 0);
+        assert_eq!(syms_s0[0].object_id, 4);
     }
 
     #[test]

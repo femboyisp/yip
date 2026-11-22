@@ -130,10 +130,12 @@ pub fn shard_for_outer_udp(datagram: &[u8], num_shards: usize) -> Option<usize> 
 /// Deterministically map an incoming FEC Control datagram (`PacketType::Control`)
 /// to its target encoder/worker shard by `(conn_tag, object_id)`.
 ///
-/// If `payload` contains at least 11 bytes (1-byte packet type + 8-byte conn_tag + 2-byte object_id)
-/// and `payload[0] == PacketType::Control as u8`, extracts `(conn_tag, object_id)` and returns
-/// `Some(shard_for_fec_symbol(conn_tag, object_id, num_shards))`.
-/// Returns `None` if `payload` is shorter than 11 bytes, not a Control packet, or `num_shards <= 1`.
+/// Deprecated: In-band control frames carry `[type: 1B][counter: 8B][ciphertext: ...]`;
+/// their inner payload is authenticated/encrypted and cannot be demuxed by cleartext object ID.
+/// In-band control frames are processed directly on the receiving shard.
+#[deprecated(
+    note = "Control frames carry authenticated AEAD ciphertext and are processed directly on the receiving shard."
+)]
 pub fn shard_for_fec_control(payload: &[u8], num_shards: usize) -> Option<usize> {
     if num_shards <= 1 || payload.len() < 11 {
         return None;
@@ -842,7 +844,7 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                         std::time::Instant::now(),
                     );
                 }
-                let derived_symbol_size = u16::try_from(mtu.saturating_add(30)).unwrap_or(u16::MAX);
+                let derived_symbol_size = u16::try_from(mtu.saturating_add(48)).unwrap_or(u16::MAX);
                 manager.set_data_symbol_size(derived_symbol_size);
                 let tun_fd = tun_dev.as_raw_fd();
 
@@ -986,31 +988,8 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                                 continue;
                                             }
 
-                                            if !payload.is_empty()
-                                                && payload[0] == crate::handshake::PacketType::Control as u8
-                                            {
-                                                if let Some(target_shard) =
-                                                    shard_for_fec_control(payload, num_shards)
-                                                {
-                                                    if target_shard != shard_id {
-                                                        if let Some(Some(ref tx)) =
-                                                            tx_channels.get(target_shard)
-                                                        {
-                                                            if push_spsc(
-                                                                tx,
-                                                                ShardMsg::ArqFeedback(
-                                                                    payload.to_vec(),
-                                                                    dg.src,
-                                                                ),
-                                                            ) {
-                                                                continue;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-
-                                            let out = manager.on_udp(dg.src, payload, cached_now_ms);
+                                            let out =
+                                                manager.on_udp(dg.src, payload, cached_now_ms);
                                             handle_dispatch_out(
                                                 out,
                                                 tun_fd,
@@ -1057,25 +1036,6 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                         let is_hs = !payload.is_empty()
                                             && (payload[0] == crate::handshake::PacketType::HandshakeInit as u8
                                                 || payload[0] == crate::handshake::PacketType::HandshakeResp as u8);
-                                        let forwarded_ctrl = !payload.is_empty()
-                                            && payload[0] == crate::handshake::PacketType::Control as u8
-                                            && shard_for_fec_control(payload, num_shards).is_some_and(
-                                                |target_shard| {
-                                                    target_shard != shard_id
-                                                        && tx_channels
-                                                            .get(target_shard)
-                                                            .and_then(|opt| opt.as_ref())
-                                                            .is_some_and(|tx| {
-                                                                push_spsc(
-                                                                    tx,
-                                                                    ShardMsg::ArqFeedback(
-                                                                        payload.to_vec(),
-                                                                        cfg.listen,
-                                                                    ),
-                                                                )
-                                                            })
-                                                },
-                                            );
                                         if shard_id != 0 && is_hs {
                                             if let Some(Some(ref tx)) = tx_channels.first() {
                                                 push_spsc(
@@ -1086,8 +1046,6 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                                     ),
                                                 );
                                             }
-                                        } else if forwarded_ctrl {
-                                            // Forwarded to target worker shard via SPSC
                                         } else {
                                             let out = manager.on_udp(cfg.listen, payload, cached_now_ms);
                                             handle_dispatch_out(
@@ -2054,6 +2012,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(deprecated)]
     fn test_shard_for_fec_control() {
         let conn_tag = 0x0102_0304_0506_0708u64;
         let object_id = 123u16;
