@@ -99,8 +99,8 @@ fn test_drain_tun_steady_state_zero_alloc() {
     let mut split_out: Vec<u8> = Vec::with_capacity(MAX_WIRE_DATAGRAM);
     let mut split_offs: Vec<(usize, usize)> = Vec::with_capacity(16);
 
-    // Warm-up phase: run through drain_tun and flush_tx
-    for i in 0..10 {
+    // Warm-up phase: run through drain_tun and flush_tx until flow table reaches steady state
+    for i in 0..50 {
         tun_tx.send(&pkt).expect("send packet to mock tun");
         drain_tun(
             tun_rx.as_raw_fd(),

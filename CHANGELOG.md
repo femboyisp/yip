@@ -6,6 +6,9 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **Default Flow FEC Initial Repair Ratio Calibration (`crates/yip-transport`, #285).**
+  - Calibrated `FlowClass::Default` initial proactive repair ratio from 0.10 to 0.0 (`initial_repair_ratio = 0.0`), preventing 100% warm-up packet duplication overhead on singleton (K=1) UDP datagrams.
+  - Guarded `AdaptiveController::repair_count` against emitting repair shards for singleton K=1 objects when `min_ratio <= EPSILON` unless link loss exceeds severe thresholds (ratio >= 0.50), eliminating 2x packet rate amplification on clean links.
 - **Dataplane Throughput, ARQ Feedback Acceleration & Clean Parity Decay (`bin/yipd`, `crates/yip-transport`, #276).**
   - Accelerated ARQ loss feedback by emitting immediate gap-triggered `ControlFrame::Feedback` packets rate-limited by `MIN_GAP_FEEDBACK_INTERVAL_MS = 5ms` via combined TUN write and UDP send outcomes (`Outcome::TunWriteThenSend` and `Outcome::TunWriteBatchThenSend`), bypassing the 30ms periodic tick timer when expired pending packet gaps are detected on `FlowClass::Bulk` flows.
   - Preserved configured MTU symbol sizing (1450 bytes) across initial peer endpoint binding in `DataPlane::set_peer_addr`, preventing baseline symbol floor resets and eliminating multi-symbol fragmentation on standard MTU payloads.

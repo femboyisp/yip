@@ -148,17 +148,30 @@ impl AdaptiveController {
 
     /// How many repair symbols to emit for an object with `source_symbols` source symbols.
     ///
-    /// Returns `0` when `ratio` has decayed to zero (ARQ-eligible classes on a
-    /// clean link) — the caller should skip FEC-encode entirely in that case.
-    /// Returns at least `1` whenever `ratio > 0`.
+    /// Returns `0` when `ratio` has decayed to zero (clean link) or when a singleton
+    /// packet (`source_symbols = 1`) on a zero-floor flow class would incur 100%
+    /// duplication overhead under non-severe loss.
+    ///
+    /// Returns at least `1` whenever `ratio > 0` for multi-symbol objects or
+    /// proactive-floor classes (`Realtime`, `Ack`).
     pub fn repair_count(&self, source_symbols: u32) -> u32 {
-        if self.ratio <= f32::EPSILON {
+        if self.ratio <= f32::EPSILON || source_symbols == 0 {
             return 0;
         }
-        let raw = (f64::from(source_symbols) * f64::from(self.ratio) - 1e-6).ceil();
-        // f64::ceil of a non-negative product; the i64 cast is the one unavoidable float->int conversion, then checked-narrowed to u32
-        let n = u32::try_from(raw as i64).unwrap_or(u32::MAX);
-        n.max(1)
+        if source_symbols == 1 && self.min_ratio <= f32::EPSILON {
+            // For zero-floor classes (Default, Bulk) with a single-symbol object (K=1),
+            // emitting 1 repair symbol represents a 100% wire packet doubling.
+            // Avoid 100% duplication overhead unless loss is severe (ratio >= 0.50).
+            if self.ratio >= 0.50 {
+                1
+            } else {
+                0
+            }
+        } else {
+            let raw = (f64::from(source_symbols) * f64::from(self.ratio) - 1e-6).ceil();
+            let n = u32::try_from(raw as i64).unwrap_or(u32::MAX);
+            n.max(1)
+        }
     }
 }
 
@@ -256,8 +269,8 @@ mod tests {
 
     #[test]
     fn fast_adaptation_within_two_rtts_under_severe_loss() {
-        let mut c = AdaptiveController::new(FlowClass::Default.params()); // starts at 0.10
-        assert_eq!(c.repair_count(10), 1);
+        let mut c = AdaptiveController::new(FlowClass::Default.params()); // starts at 0.0
+        assert_eq!(c.repair_count(10), 0);
 
         // Interval 1: 10% loss observed
         c.observe_loss(0.10);
@@ -268,6 +281,43 @@ mod tests {
         c.observe_loss(0.10);
         assert!(c.ratio() >= 0.30);
         assert_eq!(c.repair_count(10), 3);
+    }
+
+    #[test]
+    fn test_k1_zero_overhead_under_moderate_loss() {
+        let mut c = AdaptiveController::new_for(FlowClass::Default.params());
+        // Clean setup starts with ratio 0.0 and min_ratio 0.0
+        assert_eq!(c.ratio(), 0.0);
+        assert_eq!(c.repair_count(1), 0);
+
+        // Under 5% loss (ratio 0.20): K=1 must NOT duplicate (R=0)
+        c.observe_loss(0.05);
+        assert_eq!(
+            c.repair_count(1),
+            0,
+            "K=1 must not double packets under 5% loss"
+        );
+        assert!(
+            c.repair_count(10) >= 1,
+            "multi-symbol packets get Cauchy FEC"
+        );
+
+        // Under 10% loss (ratio 0.30): K=1 must NOT duplicate (R=0)
+        c.observe_loss(0.10);
+        assert_eq!(
+            c.repair_count(1),
+            0,
+            "K=1 must not double packets under 10% loss"
+        );
+        assert_eq!(c.repair_count(10), 3);
+
+        // Under severe 55% loss: K=1 emits 1 repair packet (packet replication fallback)
+        c.set_ratio(0.55);
+        assert_eq!(
+            c.repair_count(1),
+            1,
+            "K=1 duplicates under severe >=50% loss"
+        );
     }
 
     #[test]
