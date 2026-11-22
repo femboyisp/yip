@@ -76,6 +76,10 @@ VYA_IP="10.10.0.1"; VYB_IP="10.10.0.2"
 TUN_YA_IP="10.11.0.1"; TUN_YB_IP="10.11.0.2"
 TUN_YA_IP6="fd00:11::1"; TUN_YB_IP6="fd00:11::2"
 YPORT_A="443"; YPORT_B="443"; TUN_DEV="yip0"; YIP_MTU="${YIP_MTU:-1420}"; YIP_SHARDS="${YIP_SHARDS:-1}"
+DEFAULT_UDP_LEN=$((YIP_MTU - 48))
+[ "$DEFAULT_UDP_LEN" -gt 1350 ] && DEFAULT_UDP_LEN=1350
+UDP_LEN="${UDP_LEN:-$DEFAULT_UDP_LEN}"
+UDP_RATE="${UDP_RATE:-2G}"
 PID_YA=""; PID_YB=""
 
 # ── WireGuard ─────────────────────────────────────────────────────────────────
@@ -494,7 +498,7 @@ measure_iperf_udp() {
         done
         sample_cpu_start
         out="$(timeout 45 ip netns exec "$ns_cli" iperf3 -c "$srv_ip" $v6_flag -u \
-            -b "${UDP_RATE:-10G}" -l "${UDP_LEN:-1400}" --connect-timeout 20000 -t "${IPERF_DURATION:-8}" -J 2>/dev/null || true)"
+            -b "$UDP_RATE" -l "$UDP_LEN" --connect-timeout 20000 -t "${IPERF_DURATION:-8}" -J 2>/dev/null || true)"
         read -r cpu_pct _ <<< "$(sample_cpu_end)"
         kill -9 "$srv_pid" 2>/dev/null || true
         wait "$srv_pid" 2>/dev/null || true
@@ -1473,7 +1477,7 @@ echo "  iperf3 TCP & UDP throughput + ping latency/loss under netem"
 echo "  dual-stack IPv4 & IPv6 with CPU telemetry from /proc/stat"
 echo "  ping -c ${PING_COUNT} -i ${PING_INTERVAL}; iperf3 -t 8; netem: loss X% delay 5ms (symmetric) limit 50000"
 echo "  TCP cc: ${TCP_CC}, streams: ${IPERF_STREAMS}"
-echo "  UDP rate: ${UDP_RATE:-10G}, len: ${UDP_LEN:-1400}"
+echo "  UDP rate: ${UDP_RATE}, len: ${UDP_LEN}"
 echo "=========================================================="
 
 for LOSS in $LOSS_RATES; do
