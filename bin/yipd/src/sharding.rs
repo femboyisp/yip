@@ -130,10 +130,12 @@ pub fn shard_for_outer_udp(datagram: &[u8], num_shards: usize) -> Option<usize> 
 /// Deterministically map an incoming FEC Control datagram (`PacketType::Control`)
 /// to its target encoder/worker shard by `(conn_tag, object_id)`.
 ///
-/// If `payload` contains at least 11 bytes (1-byte packet type + 8-byte conn_tag + 2-byte object_id)
-/// and `payload[0] == PacketType::Control as u8`, extracts `(conn_tag, object_id)` and returns
-/// `Some(shard_for_fec_symbol(conn_tag, object_id, num_shards))`.
-/// Returns `None` if `payload` is shorter than 11 bytes, not a Control packet, or `num_shards <= 1`.
+/// Deprecated: In-band control frames carry `[type: 1B][counter: 8B][ciphertext: ...]`;
+/// their inner payload is authenticated/encrypted and cannot be demuxed by cleartext object ID.
+/// In-band control frames are processed directly on the receiving shard.
+#[deprecated(
+    note = "Control frames carry authenticated AEAD ciphertext and are processed directly on the receiving shard."
+)]
 pub fn shard_for_fec_control(payload: &[u8], num_shards: usize) -> Option<usize> {
     if num_shards <= 1 || payload.len() < 11 {
         return None;
@@ -2010,6 +2012,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(deprecated)]
     fn test_shard_for_fec_control() {
         let conn_tag = 0x0102_0304_0506_0708u64;
         let object_id = 123u16;

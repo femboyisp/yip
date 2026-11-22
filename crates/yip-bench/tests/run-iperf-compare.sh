@@ -218,15 +218,23 @@ make_pair() {
 }
 
 # ── helper: symmetric netem loss + 5ms delay ──────────────────────────────────
+NETEM_DELAY="${NETEM_DELAY:-5ms}"
+NETEM_LIMIT="${NETEM_LIMIT:-50000}"
+
 apply_netem() {
     local nsR="$1" nsS="$2" vR="$3" vS="$4" loss="$5"
     if [ "$loss" -eq 0 ]; then
-        ip netns exec "$nsR" tc qdisc del dev "$vR" root 2>/dev/null || true
-        ip netns exec "$nsS" tc qdisc del dev "$vS" root 2>/dev/null || true
+        if [ "$NETEM_DELAY" = "0" ] || [ "$NETEM_DELAY" = "0ms" ]; then
+            ip netns exec "$nsR" tc qdisc del dev "$vR" root 2>/dev/null || true
+            ip netns exec "$nsS" tc qdisc del dev "$vS" root 2>/dev/null || true
+        else
+            ip netns exec "$nsR" tc qdisc replace dev "$vR" root netem delay "$NETEM_DELAY" limit "$NETEM_LIMIT"
+            ip netns exec "$nsS" tc qdisc replace dev "$vS" root netem delay "$NETEM_DELAY" limit "$NETEM_LIMIT"
+        fi
         return
     fi
-    ip netns exec "$nsR" tc qdisc replace dev "$vR" root netem loss "${loss}%" delay 5ms limit 50000
-    ip netns exec "$nsS" tc qdisc replace dev "$vS" root netem loss "${loss}%" delay 5ms limit 50000
+    ip netns exec "$nsR" tc qdisc replace dev "$vR" root netem loss "${loss}%" delay "$NETEM_DELAY" limit "$NETEM_LIMIT"
+    ip netns exec "$nsS" tc qdisc replace dev "$vS" root netem loss "${loss}%" delay "$NETEM_DELAY" limit "$NETEM_LIMIT"
 }
 
 # ── helper: ping a tunnel IP from a netns; echo "<loss%> <avg_rtt_ms>" ─────────
@@ -495,8 +503,8 @@ measure_iperf_udp() {
 
         if [ -n "$out" ]; then
             if command -v jq >/dev/null 2>&1; then
-                mbps="$(echo "$out" | jq -r '.end.sum.bits_per_second // empty' 2>/dev/null || true)"
-                loss="$(echo "$out" | jq -r '.end.sum.lost_percent // empty' 2>/dev/null || true)"
+                mbps="$(echo "$out" | jq -r '.end.sum_received.bits_per_second // .end.sum.bits_per_second // empty' 2>/dev/null || true)"
+                loss="$(echo "$out" | jq -r '.end.sum_received.lost_percent // .end.sum.lost_percent // empty' 2>/dev/null || true)"
             else
                 mbps="$(echo "$out" | grep -oP '"bits_per_second":\s*[0-9.]+' | tail -1 | grep -oP '[0-9.]+' || true)"
                 loss="$(echo "$out" | grep -oP '"lost_percent":\s*[0-9.]+' | tail -1 | grep -oP '[0-9.]+' || true)"

@@ -14,6 +14,7 @@ All notable changes to this project are documented here, following
   - Updated branding asset by replacing `assets/yip.gif` with high-resolution transparent `assets/yip.png` and updating `README.md`.
 - **UDP Burst Loss Recovery & Vectorized GSO Hotpath Optimization (`crates/yip-transport`, `crates/yip-io`).**
   - Allowed coalescing zero-fate (`fate: 0`) independent datagrams in `crates/yip-io/src/gso.rs` (`can_coalesce` and `partition_fate_safe`), fixing a collision bug where `0 == 0` caused default non-FEC traffic to reject GSO run batching and shatter into per-packet syscalls.
+  - Reserved FEC `object_id == 0` in `crates/yip-transport/src/fec.rs` (`FecEncoder`), guaranteeing that `fate == 0` is uniquely reserved for unconstrained datagrams and preventing multi-symbol FEC blocks from coalescing into fate-sharing GSO super-skbs.
   - Restricted `FlowClass::Bulk` classification in `crates/yip-transport/src/flow.rs` to TCP flows (`proto == 6`), allowing large UDP datagrams to fall through to `FlowClass::Default` without ARQ retransmission buffers, eliminating feedback amplification storms and socket buffer overflow under multi-gigabit line-rate bursts.
   - Implemented zero-copy scatter-gather `iovec` transmission in `crates/yip-io/src/poll.rs` (`send_gso_indexed`), eliminating intermediate payload copying across datagram bursts.
   - Expanded `partition_fate_safe` bitmask in `crates/yip-io/src/gso.rs` from `u64` to `u128`, guaranteeing zero heap allocations and eliminating O(N) memmoves for full 128-datagram batches.

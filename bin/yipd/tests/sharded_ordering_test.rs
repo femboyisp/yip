@@ -444,6 +444,7 @@ fn test_session_epoch_replication_across_shards() {
 }
 
 #[test]
+#[expect(deprecated)]
 fn test_cross_shard_arq_feedback_routes_to_encoder_shard() {
     use yipd::handshake::PacketType;
     use yipd::sharding::{shard_for_fec_control, shard_for_fec_symbol, ShardMsg};
