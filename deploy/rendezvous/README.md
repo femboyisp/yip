@@ -9,7 +9,6 @@ This guide documents the production deployment of the public `yip-rendezvous` da
    - `AAAA` record: `rendezvous.yipmesh.tech` pointing to the public IPv6 address of the rendezvous host.
 2. **Firewall Ingress Rules:**
    - **UDP port 443**: Primary rendezvous discovery, NAT traversal (STUN-like reflexive address discovery), hole-punching coordination, and blind relay path.
-   - **TCP port 443**: Fallback TLS Trojan transport front for networks where UDP is strictly throttled or dropped.
 
 ## 2. Automated Service Installation
 
@@ -20,12 +19,12 @@ sudo bash deploy/rendezvous/setup-rendezvous.sh
 ```
 
 The script:
-1. Provisions the unprivileged system user `yip-rendezvous`.
+1. Provisions the unprivileged system user and group `yip-rendezvous`.
 2. Compiles `bin/yip-rendezvous` with release optimizations (`--release`).
 3. Installs the executable into `/usr/local/bin/yip-rendezvous`.
 4. Grants `CAP_NET_BIND_SERVICE` so the service binds low-numbered port `443` without root permissions.
 5. Installs and starts the hardened systemd unit file at `/etc/systemd/system/yip-rendezvous.service`.
-6. Configures `ufw` firewall rules allowing ports `443/udp` and `443/tcp`.
+6. Configures `ufw` firewall rules allowing port `443/udp`.
 
 ## 3. Systemd Service Management
 

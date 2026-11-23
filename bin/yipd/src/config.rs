@@ -11,7 +11,7 @@
 #![allow(dead_code)]
 
 use std::io;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr};
 
 use crate::mode::TunnelMode;
 use yip_membership::{Cert, RootSet};
@@ -51,6 +51,8 @@ pub const DEFAULT_TLS_SNI: &str = "www.apple.com";
 pub enum Rendezvous {
     /// Plain UDP rendezvous (2b), `rendezvous=<ip:port>`.
     Udp(SocketAddr),
+    /// Plain UDP rendezvous with hostname resolved at runtime, `rendezvous=<host:port>`.
+    HostUdp { host: String, port: u16 },
     /// TLS relay-dial (3c.4), `rendezvous=tls://host:port`.
     Tls { host: String, port: u16 },
     /// REALITY relay-dial (REALITY.4a/4b), `rendezvous=reality://host:port?pbk=&sid=&sni=&verify=`.
@@ -345,9 +347,18 @@ fn hex_decode_vec(hex: &str) -> io::Result<Vec<u8>> {
 /// containing a hex-encoded `Cert::encode` blob, or the hex-encoded blob inline.
 fn load_cert_file(val: &str) -> io::Result<Cert> {
     let clean = val.trim();
-    let bytes = match std::fs::read_to_string(clean) {
-        Ok(contents) => hex_decode_vec(contents.trim())?,
-        Err(_) => hex_decode_vec(clean)?,
+    let bytes = if clean.len() >= 64 && clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        hex_decode_vec(clean)?
+    } else {
+        match std::fs::read_to_string(clean) {
+            Ok(contents) => hex_decode_vec(contents.trim())?,
+            Err(e) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to load cert from {clean}: {e}"),
+                ))
+            }
+        }
     };
     Cert::decode(&bytes).ok_or_else(|| {
         io::Error::new(
@@ -361,9 +372,18 @@ fn load_cert_file(val: &str) -> io::Result<Cert> {
 /// containing a hex-encoded `RootSet::encode` blob, or the hex-encoded blob inline.
 fn load_roots_file(val: &str) -> io::Result<RootSet> {
     let clean = val.trim();
-    let bytes = match std::fs::read_to_string(clean) {
-        Ok(contents) => hex_decode_vec(contents.trim())?,
-        Err(_) => hex_decode_vec(clean)?,
+    let bytes = if clean.len() >= 64 && clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        hex_decode_vec(clean)?
+    } else {
+        match std::fs::read_to_string(clean) {
+            Ok(contents) => hex_decode_vec(contents.trim())?,
+            Err(e) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to load roots from {clean}: {e}"),
+                ))
+            }
+        }
     };
     RootSet::decode(&bytes).ok_or_else(|| {
         io::Error::new(
@@ -660,12 +680,10 @@ impl Config {
 
             // Check for section headers (e.g. [peer], [mesh], [node], [general])
             if line.starts_with('[') && line.ends_with(']') {
-                if line == "[peer]" {
-                    flush_peer_block(cur_pk, cur_ep, cur_alias, &mut peers)?;
-                    cur_pk = None;
-                    cur_ep = None;
-                    cur_alias = None;
-                }
+                flush_peer_block(cur_pk, cur_ep, cur_alias, &mut peers)?;
+                cur_pk = None;
+                cur_ep = None;
+                cur_alias = None;
                 continue;
             }
 
@@ -676,13 +694,13 @@ impl Config {
                 )
             })?;
             let key = key.trim();
-            let val = val.trim().trim_matches('"').trim();
+            let val = val.trim().trim_matches(|c| c == '"' || c == '\'').trim();
             match key {
                 "local_private" => local_private = Some(hex_to_32(val)?),
                 "local_public" => local_public = Some(hex_to_32(val)?),
                 "public_key" => cur_pk = Some(hex_to_32(val)?),
                 "alias" => {
-                    let clean = val.trim_matches('"').trim();
+                    let clean = val.trim_matches(|c| c == '"' || c == '\'').trim();
                     if !clean.is_empty() {
                         cur_alias = Some(clean.to_string());
                     }
@@ -725,7 +743,7 @@ impl Config {
                         ));
                     }
                 }
-                "device" => device = Some(val.trim_matches('"').to_owned()),
+                "device" => device = Some(val.trim_matches(|c| c == '"' || c == '\'').to_owned()),
                 "device_kind" => device_kind = TunnelMode::parse_device_kind(val)?,
                 "rendezvous" => {
                     rendezvous = Some(if let Some(rest) = val.strip_prefix("reality://") {
@@ -738,20 +756,11 @@ impl Config {
                         Rendezvous::Tls { host, port }
                     } else if let Ok(sa) = val.parse::<SocketAddr>() {
                         Rendezvous::Udp(sa)
-                    } else if let Ok(mut addrs) = val.to_socket_addrs() {
-                        if let Some(sa) = addrs.next() {
-                            Rendezvous::Udp(sa)
-                        } else {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("could not resolve rendezvous host: {val}"),
-                            ));
-                        }
                     } else if let Ok((host, port_str)) = parse_rendezvous_host_port(val, "") {
                         let port = port_str.parse::<u16>().map_err(|e| {
                             io::Error::new(io::ErrorKind::InvalidData, e.to_string())
                         })?;
-                        Rendezvous::Tls { host, port }
+                        Rendezvous::HostUdp { host, port }
                     } else {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,

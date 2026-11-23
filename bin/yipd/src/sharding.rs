@@ -558,6 +558,20 @@ fn create_peer_manager(
         Some(crate::config::Rendezvous::Udp(addr)) => Some(Box::new(
             crate::rendezvous::ConfiguredServerRendezvous::new(*addr),
         )),
+        Some(crate::config::Rendezvous::HostUdp { host, port }) => {
+            let addr = (host.as_str(), *port)
+                .to_socket_addrs()?
+                .next()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("rendezvous host {host}:{port} resolved to no addresses"),
+                    )
+                })?;
+            Some(Box::new(
+                crate::rendezvous::ConfiguredServerRendezvous::new(addr),
+            ))
+        }
         Some(crate::config::Rendezvous::Tls { host, port }) => {
             let relay_addr = (host.as_str(), *port)
                 .to_socket_addrs()?
