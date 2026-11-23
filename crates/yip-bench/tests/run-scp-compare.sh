@@ -135,12 +135,15 @@ stop_sshd() {
     local pidfile="$1"
     if [ -f "$pidfile" ]; then
         local pid
-        pid="$(cat "$pidfile" 2>/dev/null)" || return 0
-        [ -n "$pid" ] || return 0
-        kill "$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
-        kill -9 "$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
+        pid="$(cat "$pidfile" 2>/dev/null || true)"
+        if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null || true
+            for _ in $(seq 1 10); do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.05
+            done
+            kill -9 "$pid" 2>/dev/null || true
+        fi
         rm -f "$pidfile"
     fi
 }
@@ -357,12 +360,29 @@ echo "  Payloads: ${FILE_SIZES_MB} MB | Loss: ${LOSS_RATES}% | Delay: 5ms"
 echo "  Contenders: ${CONTENDERS}"
 echo "=========================================================="
 
+start_contender() {
+    local name="$1"
+    case "$name" in
+        yip) start_yip ;;
+        wg|wireguard) start_wg ;;
+        ovpn|openvpn) start_ovpn ;;
+        *) echo "[skip] unknown contender: $name" >&2; return 1 ;;
+    esac
+}
+
+stop_contender() {
+    local name="$1"
+    case "$name" in
+        yip) stop_yip ;;
+        wg|wireguard) stop_wg ;;
+        ovpn|openvpn) stop_ovpn ;;
+        *) return 0 ;;
+    esac
+}
+
 for CONTENDER in $CONTENDERS; do
     echo ""
     echo "── Running contender: $CONTENDER ──"
-
-    START_FN="start_${CONTENDER}"
-    STOP_FN="stop_${CONTENDER}"
 
     case "$CONTENDER" in
         yip)
@@ -386,9 +406,9 @@ for CONTENDER in $CONTENDERS; do
             ;;
     esac
 
-    if ! "$START_FN"; then
+    if ! start_contender "$CONTENDER"; then
         echo "[$CONTENDER] startup skipped or failed"
-        "$STOP_FN" 2>/dev/null || true
+        stop_contender "$CONTENDER" 2>/dev/null || true
         continue
     fi
 
@@ -453,7 +473,7 @@ for CONTENDER in $CONTENDERS; do
         done
     done
 
-    "$STOP_FN"
+    stop_contender "$CONTENDER"
 done
 
 # ── Summary Markdown Table ────────────────────────────────────────────────────
