@@ -6,6 +6,10 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **Lazy Contender Lifecycle, Process Isolation & CI Threshold Assertions (`crates/yip-bench`, #281).**
+  - Implemented lazy contender lifecycle (`start_contender`, `stop_contender`) in `crates/yip-bench/tests/run-iperf-compare.sh`, starting each tunnel daemon on demand and tearing down its processes and network namespaces upon test completion.
+  - Enabled `CONTENDER_ISOLATION=true` by default, running contenders sequentially through all loss tiers and verifying complete process cleanup (`verify_isolation`) to eliminate multi-daemon memory (e.g. WireGuard-Go 1.8GB, AmneziaWG 1.8GB) and CPU scheduling contention.
+  - Added configurable performance threshold assertions (`ASSERT_THRESHOLDS=true`) with environment variable overrides (`THRESH_YIP_TCP_MIN_MBPS_0`, `THRESH_YIP_TCP_MIN_MBPS_5`, `THRESH_YIP_PING_MAX_LOSS_5`, `THRESH_YIP_TCP_MIN_MBPS_10`) for automated regression testing.
 - **ICMP Realtime Classification & BDP-Resilient Reorder Buffering (`crates/yip-transport`, #286).**
   - Classified ICMP (IPv4 `proto == 1`) and ICMPv6 (IPv6 `proto == 58`) packets into `FlowClass::Realtime` in `crates/yip-transport/src/classify.rs`, applying proactive single-packet FEC parity (`initial_repair_ratio = 0.15`, `R = 1` for `K = 1`) without reactive ARQ overhead, eliminating ping packet loss under netem channel loss (effective ping loss dropped from 12-24% to 0.0%).
   - Fast-initialized TCP flow EWMA size upon observing large data segments (`size > LARGE_BYTES && key.proto == 6`) following small handshake packets (`stat.packets <= 3 && stat.ewma_size < 150.0`) in `crates/yip-transport/src/flow.rs`, completely eliminating handshake EWMA dampening so that initial slow-start segments immediately receive `FlowClass::Bulk` ARQ retransmission and FEC protection.
