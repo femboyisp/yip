@@ -414,7 +414,7 @@ EOF
 
     local -a env_args=()
     if [ "$driver" = "uring" ]; then
-        env_args+=("YIP_USE_URING=1" "YIP_URING_BUSYPOLL=1")
+        env_args+=("YIP_USE_URING=1" "YIP_URING_BUSYPOLL=1" "YIP_URING_SQPOLL=${YIP_URING_SQPOLL:-1}")
     fi
 
     env "${env_args[@]}" ip netns exec "$NS_DA" "$YIPD" "$cfg_a" >"$log_a" 2>&1 &
@@ -460,6 +460,7 @@ EOF
 }
 
 stop_yip_driver() {
+    LAST_CHECK_PIDS=("$PID_DA:yipd-A" "$PID_DB:yipd-B")
     reap_pids "$PID_DA" "$PID_DB"
     PID_DA=""
     PID_DB=""
@@ -529,9 +530,11 @@ for DRIVER in $DRIVERS; do
                     echo "[fail] throughput violation: driver=${DRIVER} shards=${SHARDS} loss=${LOSS}% produced 0 throughput" >&2
                     BENCH_FAILED=true
                 fi
-                if [ "$LOSS" -eq 0 ] && [ "$(awk "BEGIN {print ($tcp_loss > 5.0 || $udp_loss > 5.0)}")" = "1" ]; then
-                    echo "[fail] clean link loss violation: driver=${DRIVER} shards=${SHARDS} loss=${LOSS}% exceeded 5% loss" >&2
-                    BENCH_FAILED=true
+                if [ "$LOSS" -eq 0 ] && [ "$tcp_loss" != "N/A" ] && [ "$udp_loss" != "N/A" ]; then
+                    if [ "$(awk -v t="$tcp_loss" -v u="$udp_loss" 'BEGIN {print (t > 5.0 || u > 5.0)}')" = "1" ]; then
+                        echo "[fail] clean link loss violation: driver=${DRIVER} shards=${SHARDS} loss=${LOSS}% exceeded 5% loss" >&2
+                        BENCH_FAILED=true
+                    fi
                 fi
             fi
         done

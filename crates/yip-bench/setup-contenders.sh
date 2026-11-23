@@ -263,7 +263,7 @@ setup_nebula() {
     if ! command -v nebula >/dev/null 2>&1 || ! command -v nebula-cert >/dev/null 2>&1; then
         log "Fetching prebuilt nebula & nebula-cert..."
         local neb_tag neb_url neb_tmp neb_arch
-        neb_tag="$(curl -sIL https://github.com/slackhq/nebula/releases/latest | grep -i location | tr -d '\r' | awk -F'/' '{print $NF}' || true)"
+        neb_tag="$(curl -sIL https://github.com/slackhq/nebula/releases/latest | grep -i location | tail -1 | tr -d '\r' | awk -F'/' '{print $NF}' || true)"
         if [ -n "$neb_tag" ]; then
             neb_arch="amd64"
             [ "$(uname -m)" = "aarch64" ] && neb_arch="arm64"

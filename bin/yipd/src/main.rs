@@ -1064,8 +1064,14 @@ pub(crate) fn parse_daemon_flags(
                 )
             })?;
             match dstr.to_ascii_lowercase().as_str() {
-                "epoll" | "poll" => overrides.driver = Some("epoll".to_string()),
-                "uring" | "io_uring" => overrides.driver = Some("uring".to_string()),
+                "epoll" | "poll" => {
+                    overrides.driver = Some("epoll".to_string());
+                    overrides.xdp = Some(false);
+                }
+                "uring" | "io_uring" => {
+                    overrides.driver = Some("uring".to_string());
+                    overrides.xdp = Some(false);
+                }
                 "xdp" | "af_xdp" => {
                     overrides.driver = Some("xdp".to_string());
                     overrides.xdp = Some(true);
@@ -1369,6 +1375,16 @@ mod tests {
         assert_eq!(overrides.xdp, Some(true));
         assert_eq!(overrides.xdp_ifname.as_deref(), Some("eth0"));
         assert_eq!(overrides.xdp_mode.as_deref(), Some("native"));
+
+        // When --driver epoll follows --xdp, it should reset xdp to false
+        let args_reset = vec![
+            "--xdp".to_string(),
+            "--driver".to_string(),
+            "epoll".to_string(),
+        ];
+        let overrides_reset = parse_daemon_flags(&mut args_reset.into_iter()).unwrap();
+        assert_eq!(overrides_reset.driver.as_deref(), Some("epoll"));
+        assert_eq!(overrides_reset.xdp, Some(false));
     }
 
     #[test]

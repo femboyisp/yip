@@ -56,6 +56,9 @@ pub fn run(config: Config) -> io::Result<()> {
     // multi-port UDP egress pool selection, AF_XDP ring processing, and 20 Hz coalesced timer ticks.
     if config.shards > 1 || config.xdp {
         let shards = config.shards.max(1);
+        if config.driver.as_deref() == Some("uring") && shards > 1 {
+            eprintln!("yipd: note: driver 'uring' specified with shards > 1; io_uring operates in single-shard mode, using sharded epoll engine");
+        }
         return crate::sharding::run_sharded(config, shards);
     }
 

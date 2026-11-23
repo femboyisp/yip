@@ -354,6 +354,14 @@ verify_isolation() {
                 if is_test_pid "$p"; then leaked_pids+=("$p(nebula)"); fi
             done
             ;;
+        yip-driver)
+            for ns in "${NS_DA:-}" "${NS_DB:-}"; do
+                if [ -n "$ns" ] && echo "$ns_list" | grep -qx "$ns"; then leaked_ns+=("$ns"); fi
+            done
+            for p in $(pgrep -f "yipd.*drv[AB]" 2>/dev/null || true); do
+                if is_test_pid "$p"; then leaked_pids+=("$p(yipd-driver)"); fi
+            done
+            ;;
     esac
 
     # Deduplicate leaked_pids

@@ -897,8 +897,14 @@ impl Config {
                     metrics_listen = Some(addr);
                 }
                 "driver" | "io_driver" | "engine" => match val.to_ascii_lowercase().as_str() {
-                    "epoll" | "poll" => driver = Some("epoll".to_string()),
-                    "uring" | "io_uring" => driver = Some("uring".to_string()),
+                    "epoll" | "poll" => {
+                        driver = Some("epoll".to_string());
+                        xdp = false;
+                    }
+                    "uring" | "io_uring" => {
+                        driver = Some("uring".to_string());
+                        xdp = false;
+                    }
                     "xdp" | "af_xdp" => {
                         driver = Some("xdp".to_string());
                         xdp = true;
@@ -1271,6 +1277,11 @@ mod tests {
         let c_xdp = Config::parse(&text_xdp).unwrap();
         assert_eq!(c_xdp.driver.as_deref(), Some("xdp"));
         assert!(c_xdp.xdp);
+
+        let text_override_xdp = format!("{base}xdp=true\ndriver=epoll\n");
+        let c_override = Config::parse(&text_override_xdp).unwrap();
+        assert_eq!(c_override.driver.as_deref(), Some("epoll"));
+        assert!(!c_override.xdp);
 
         let text_invalid = format!("{base}driver=custom_nonexistent\n");
         assert!(Config::parse(&text_invalid).is_err());

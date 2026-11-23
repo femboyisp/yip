@@ -457,14 +457,22 @@ check_threshold() {
         return 0
     fi
 
+    if [ "$val" = "N/A" ]; then
+        if [[ "$metric" == *"min"* ]]; then
+            echo "[fail] threshold violation: $contender [$ip_ver] $metric at loss=${loss}% was N/A, expected >= ${thresh}"
+            THRESHOLD_FAILED=true
+        fi
+        return 0
+    fi
+
     local failed=false
     if [[ "$metric" == *"max"* ]]; then
-        if [ "$(awk "BEGIN {print ($val > $thresh)}")" = "1" ]; then
+        if [ "$(awk -v v="$val" -v t="$thresh" 'BEGIN {print (v > t)}')" = "1" ]; then
             failed=true
             echo "[fail] threshold violation: $contender [$ip_ver] $metric at loss=${loss}% was ${val}, expected <= ${thresh}"
         fi
     else
-        if [ "$(awk "BEGIN {print ($val < $thresh)}")" = "1" ]; then
+        if [ "$(awk -v v="$val" -v t="$thresh" 'BEGIN {print (v < t)}')" = "1" ]; then
             failed=true
             echo "[fail] threshold violation: $contender [$ip_ver] $metric at loss=${loss}% was ${val}, expected >= ${thresh}"
         fi
@@ -570,10 +578,10 @@ for LOSS in $LOSS_RATES; do
             YIP_FAILED=true
         fi
         if [ "$LOSS" -eq 0 ]; then
-            if [ "$Y_TCP_LOSS" != "N/A" ] && [ "$(awk "BEGIN {print ($Y_TCP_LOSS > 5.0)}")" = "1" ] || \
-               [ "$Y6_TCP_LOSS" != "N/A" ] && [ "$(awk "BEGIN {print ($Y6_TCP_LOSS > 5.0)}")" = "1" ] || \
-               [ "$Y_UDP_LOSS" != "N/A" ] && [ "$(awk "BEGIN {print ($Y_UDP_LOSS > 5.0)}")" = "1" ] || \
-               [ "$Y6_UDP_LOSS" != "N/A" ] && [ "$(awk "BEGIN {print ($Y6_UDP_LOSS > 5.0)}")" = "1" ]; then
+            if { [ "$Y_TCP_LOSS" != "N/A" ] && [ "$(awk -v l="$Y_TCP_LOSS" 'BEGIN {print (l > 5.0)}')" = "1" ]; } || \
+               { [ "$Y6_TCP_LOSS" != "N/A" ] && [ "$(awk -v l="$Y6_TCP_LOSS" 'BEGIN {print (l > 5.0)}')" = "1" ]; } || \
+               { [ "$Y_UDP_LOSS" != "N/A" ] && [ "$(awk -v l="$Y_UDP_LOSS" 'BEGIN {print (l > 5.0)}')" = "1" ]; } || \
+               { [ "$Y6_UDP_LOSS" != "N/A" ] && [ "$(awk -v l="$Y6_UDP_LOSS" 'BEGIN {print (l > 5.0)}')" = "1" ]; }; then
                 echo "[error] yip clean-link (0% netem) packet loss failure detected (v4_tcp_loss=$Y_TCP_LOSS% v6_tcp_loss=$Y6_TCP_LOSS% v4_udp_loss=$Y_UDP_LOSS% v6_udp_loss=$Y6_UDP_LOSS%)"
                 YIP_FAILED=true
             fi
