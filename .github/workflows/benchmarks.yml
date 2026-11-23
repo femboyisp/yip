@@ -49,8 +49,25 @@ jobs:
           done
 
   iperf-netem-bench:
+    name: iperf-netem (${{ matrix.config.name }})
     runs-on: ubuntu-latest
     environment: benchmark-approval
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: "single-stream"
+            streams: 1
+            shards: 1
+          - name: "multi-stream-p4"
+            streams: 4
+            shards: 1
+          - name: "multi-stream-p8"
+            streams: 8
+            shards: 1
+          - name: "multi-shard-auto"
+            streams: 1
+            shards: "auto"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -84,13 +101,75 @@ jobs:
       - name: Run comparative iperf TCP & UDP netem benchmark
         run: |
           set -o pipefail
-          sudo env "PATH=$PATH" bash crates/yip-bench/tests/run-iperf-compare.sh ./target/release/yipd | tee iperf-results.txt
+          sudo env "PATH=$PATH" \
+            IPERF_STREAMS="${{ matrix.config.streams }}" \
+            YIP_SHARDS="${{ matrix.config.shards }}" \
+            OUTPUT_JSON="iperf-results-${{ matrix.config.name }}.json" \
+            bash crates/yip-bench/tests/run-iperf-compare.sh ./target/release/yipd | tee "iperf-results-${{ matrix.config.name }}.txt"
+      - name: Upload benchmark telemetry artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iperf-telemetry-${{ matrix.config.name }}
+          path: |
+            iperf-results-${{ matrix.config.name }}.txt
+            iperf-results-${{ matrix.config.name }}.json
       - name: Publish benchmark results to Step Summary
         if: always()
         run: |
-          if [ -f iperf-results.txt ]; then
-            echo "### Comparative iperf3 Netem Benchmark (Dual-Stack IPv4 & IPv6 with CPU Telemetry)" >> $GITHUB_STEP_SUMMARY
+          if [ -f "iperf-results-${{ matrix.config.name }}.txt" ]; then
+            echo "### Comparative iperf3 Netem Benchmark (${{ matrix.config.name }}: streams=${{ matrix.config.streams }}, shards=${{ matrix.config.shards }})" >> $GITHUB_STEP_SUMMARY
             echo '```text' >> $GITHUB_STEP_SUMMARY
-            cat iperf-results.txt >> $GITHUB_STEP_SUMMARY
+            cat "iperf-results-${{ matrix.config.name }}.txt" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+  scp-netem-bench:
+    name: scp-transfer-netem
+    runs-on: ubuntu-latest
+    environment: benchmark-approval
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install OpenSSH, OpenVPN, BoringSSL build deps & networking tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config iproute2 iputils-ping openssh-client openssh-server wireguard-tools openvpn
+      - name: Load wireguard kernel module & disable restrictive AppArmor profiles
+        run: |
+          sudo modprobe wireguard 2>/dev/null || echo "[note] wireguard module unavailable"
+          sudo apparmor_parser -R /etc/apparmor.d/wg 2>/dev/null || true
+          sudo apparmor_parser -R /etc/apparmor.d/usr.bin.wg 2>/dev/null || true
+          sudo apparmor_parser -R /etc/apparmor.d/wg-quick 2>/dev/null || true
+          sudo apparmor_parser -R /etc/apparmor.d/usr.bin.wg-quick 2>/dev/null || true
+      - name: Configure kernel sysctls for netem
+        run: |
+          sudo sysctl -w net.ipv4.ip_forward=1
+      - name: Build yipd release
+        run: cargo build --release -p yipd
+      - name: Run comparative SCP transfer netem benchmark
+        run: |
+          set -o pipefail
+          sudo env "PATH=$PATH" \
+            CONTENDERS="yip wg ovpn" \
+            FILE_SIZES_MB="100" \
+            LOSS_RATES="0 5 10" \
+            OUTPUT_JSON="scp-results.json" \
+            bash crates/yip-bench/tests/run-scp-compare.sh ./target/release/yipd | tee scp-results.txt
+      - name: Upload SCP benchmark telemetry artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scp-telemetry
+          path: |
+            scp-results.txt
+            scp-results.json
+      - name: Publish SCP benchmark results to Step Summary
+        if: always()
+        run: |
+          if [ -f scp-results.txt ]; then
+            echo "### Comparative OpenSSH SCP Transfer Benchmark (100MB File across 0%, 5%, 10% Packet Loss)" >> $GITHUB_STEP_SUMMARY
+            echo '```text' >> $GITHUB_STEP_SUMMARY
+            cat scp-results.txt >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
           fi

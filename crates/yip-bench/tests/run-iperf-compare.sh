@@ -56,6 +56,16 @@ WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 TMPDIR_TEST="$(mktemp -d /dev/shm/yip-iperf-compare.XXXXXX 2>/dev/null || mktemp -d /tmp/yip-iperf-compare.XXXXXX)"
 chmod 777 "$TMPDIR_TEST"
+OUTPUT_JSON="${OUTPUT_JSON:-}"
+TELEMETRY_RECORDS_FILE="$TMPDIR_TEST/telemetry_records.jsonl"
+
+record_telemetry() {
+    local contender="$1" loss="$2" ip_ver="$3" eff_loss="$4" rtt="$5" tcp="$6" tcp_loss="$7" udp="$8" udp_loss="$9" cpu="${10}" cpu_eff="${11}" ram="${12}" ram_eff="${13}"
+    [ -n "$OUTPUT_JSON" ] || return 0
+    cat >> "$TELEMETRY_RECORDS_FILE" <<EOF
+{"contender":"$contender","loss_rate":$loss,"ip_version":$ip_ver,"eff_loss_pct":"$eff_loss","rtt_ms":"$rtt","tcp_mbps":"$tcp","tcp_loss_pct":"$tcp_loss","udp_mbps":"$udp","udp_loss_pct":"$udp_loss","cpu_pct":"$cpu","cpu_eff":"$cpu_eff","ram_mb":"$ram","ram_eff":"$ram_eff"}
+EOF
+}
 
 contender_wanted() {
     local name="$1"
@@ -2216,6 +2226,16 @@ for LOSS in $LOSS_RATES; do
     printf "  | %-12s | %-9s | %-6s | %-10s | %-9s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "tailscale" "$T_LOSS" "$T_RTT" "$T_TCP" "$T_TCP_LOSS" "$T_UDP_MBPS" "$T_UDP_LOSS" "$T_CPU" "$T_EFF" "$T_RAM" "$T_RAM_EFF"
     printf "  | %-12s | %-9s | %-6s | %-10s | %-9s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "netbird"   "$B_LOSS" "$B_RTT" "$B_TCP" "$B_TCP_LOSS" "$B_UDP_MBPS" "$B_UDP_LOSS" "$B_CPU" "$B_EFF" "$B_RAM" "$B_RAM_EFF"
 
+    record_telemetry "$YIP_LABEL" "$LOSS" 4 "$Y_LOSS" "$Y_RTT" "$Y_TCP" "$Y_TCP_LOSS" "$Y_UDP_MBPS" "$Y_UDP_LOSS" "$Y_CPU" "$Y_EFF" "$Y_RAM" "$Y_RAM_EFF"
+    record_telemetry "wireguard" "$LOSS" 4 "$W_LOSS" "$W_RTT" "$W_TCP" "$W_TCP_LOSS" "$W_UDP_MBPS" "$W_UDP_LOSS" "$W_CPU" "$W_EFF" "$W_RAM" "$W_RAM_EFF"
+    record_telemetry "wireguard-go" "$LOSS" 4 "$GG_LOSS" "$GG_RTT" "$GG_TCP" "$GG_TCP_LOSS" "$GG_UDP_MBPS" "$GG_UDP_LOSS" "$GG_CPU" "$GG_EFF" "$GG_RAM" "$GG_RAM_EFF"
+    record_telemetry "amneziawg" "$LOSS" 4 "$A_LOSS" "$A_RTT" "$A_TCP" "$A_TCP_LOSS" "$A_UDP_MBPS" "$A_UDP_LOSS" "$A_CPU" "$A_EFF" "$A_RAM" "$A_RAM_EFF"
+    record_telemetry "openvpn" "$LOSS" 4 "$O_LOSS" "$O_RTT" "$O_TCP" "$O_TCP_LOSS" "$O_UDP_MBPS" "$O_UDP_LOSS" "$O_CPU" "$O_EFF" "$O_RAM" "$O_RAM_EFF"
+    record_telemetry "n2n" "$LOSS" 4 "$N_LOSS" "$N_RTT" "$N_TCP" "$N_TCP_LOSS" "$N_UDP_MBPS" "$N_UDP_LOSS" "$N_CPU" "$N_EFF" "$N_RAM" "$N_RAM_EFF"
+    record_telemetry "zerotier" "$LOSS" 4 "$Z_LOSS" "$Z_RTT" "$Z_TCP" "$Z_TCP_LOSS" "$Z_UDP_MBPS" "$Z_UDP_LOSS" "$Z_CPU" "$Z_EFF" "$Z_RAM" "$Z_RAM_EFF"
+    record_telemetry "tailscale" "$LOSS" 4 "$T_LOSS" "$T_RTT" "$T_TCP" "$T_TCP_LOSS" "$T_UDP_MBPS" "$T_UDP_LOSS" "$T_CPU" "$T_EFF" "$T_RAM" "$T_RAM_EFF"
+    record_telemetry "netbird" "$LOSS" 4 "$B_LOSS" "$B_RTT" "$B_TCP" "$B_TCP_LOSS" "$B_UDP_MBPS" "$B_UDP_LOSS" "$B_CPU" "$B_EFF" "$B_RAM" "$B_RAM_EFF"
+
     echo ""
     echo "  --- IPv6 loss=${LOSS}% ---"
     echo "  | contender    | eff_loss% | rtt_ms | tcp_Mbit/s | tcp_loss% | udp_Mbit/s | udp_loss% | cpu% | cpu_eff(%/Gbps) | ram_MB | ram_eff(MB/Gbps) |"
@@ -2229,6 +2249,16 @@ for LOSS in $LOSS_RATES; do
     printf "  | %-12s | %-9s | %-6s | %-10s | %-9s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "zerotier"  "$Z6_LOSS" "$Z6_RTT" "$Z6_TCP" "$Z6_TCP_LOSS" "$Z6_UDP_MBPS" "$Z6_UDP_LOSS" "$Z6_CPU" "$Z6_EFF" "$Z6_RAM" "$Z6_RAM_EFF"
     printf "  | %-12s | %-9s | %-6s | %-10s | %-9s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "tailscale" "$T6_LOSS" "$T6_RTT" "$T6_TCP" "$T6_TCP_LOSS" "$T6_UDP_MBPS" "$T6_UDP_LOSS" "$T6_CPU" "$T6_EFF" "$T6_RAM" "$T6_RAM_EFF"
     printf "  | %-12s | %-9s | %-6s | %-10s | %-9s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "netbird"   "$B6_LOSS" "$B6_RTT" "$B6_TCP" "$B6_TCP_LOSS" "$B6_UDP_MBPS" "$B6_UDP_LOSS" "$B6_CPU" "$B6_EFF" "$B6_RAM" "$B6_RAM_EFF"
+
+    record_telemetry "$YIP_LABEL" "$LOSS" 6 "$Y6_LOSS" "$Y6_RTT" "$Y6_TCP" "$Y6_TCP_LOSS" "$Y6_UDP_MBPS" "$Y6_UDP_LOSS" "$Y6_CPU" "$Y6_EFF" "$Y6_RAM" "$Y6_RAM_EFF"
+    record_telemetry "wireguard" "$LOSS" 6 "$W6_LOSS" "$W6_RTT" "$W6_TCP" "$W6_TCP_LOSS" "$W6_UDP_MBPS" "$W6_UDP_LOSS" "$W6_CPU" "$W6_EFF" "$W6_RAM" "$W6_RAM_EFF"
+    record_telemetry "wireguard-go" "$LOSS" 6 "$GG6_LOSS" "$GG6_RTT" "$GG6_TCP" "$GG6_TCP_LOSS" "$GG6_UDP_MBPS" "$GG6_UDP_LOSS" "$GG6_CPU" "$GG6_EFF" "$GG6_RAM" "$GG6_RAM_EFF"
+    record_telemetry "amneziawg" "$LOSS" 6 "$A6_LOSS" "$A6_RTT" "$A6_TCP" "$A6_TCP_LOSS" "$A6_UDP_MBPS" "$A6_UDP_LOSS" "$A6_CPU" "$A6_EFF" "$A6_RAM" "$A6_RAM_EFF"
+    record_telemetry "openvpn" "$LOSS" 6 "$O6_LOSS" "$O6_RTT" "$O6_TCP" "$O6_TCP_LOSS" "$O6_UDP_MBPS" "$O6_UDP_LOSS" "$O6_CPU" "$O6_EFF" "$O6_RAM" "$O6_RAM_EFF"
+    record_telemetry "n2n" "$LOSS" 6 "$N6_LOSS" "$N6_RTT" "$N6_TCP" "$N6_TCP_LOSS" "$N6_UDP_MBPS" "$N6_UDP_LOSS" "$N6_CPU" "$N6_EFF" "$N6_RAM" "$N6_RAM_EFF"
+    record_telemetry "zerotier" "$LOSS" 6 "$Z6_LOSS" "$Z6_RTT" "$Z6_TCP" "$Z6_TCP_LOSS" "$Z6_UDP_MBPS" "$Z6_UDP_LOSS" "$Z6_CPU" "$Z6_EFF" "$Z6_RAM" "$Z6_RAM_EFF"
+    record_telemetry "tailscale" "$LOSS" 6 "$T6_LOSS" "$T6_RTT" "$T6_TCP" "$T6_TCP_LOSS" "$T6_UDP_MBPS" "$T6_UDP_LOSS" "$T6_CPU" "$T6_EFF" "$T6_RAM" "$T6_RAM_EFF"
+    record_telemetry "netbird" "$LOSS" 6 "$B6_LOSS" "$B6_RTT" "$B6_TCP" "$B6_TCP_LOSS" "$B6_UDP_MBPS" "$B6_UDP_LOSS" "$B6_CPU" "$B6_EFF" "$B6_RAM" "$B6_RAM_EFF"
 done
 
 if [ "$CONTENDER_ISOLATION" = false ]; then
@@ -2238,6 +2268,24 @@ fi
 
 echo ""
 echo "[done] iperf compare sweep complete"
+
+if [ -n "$OUTPUT_JSON" ]; then
+    echo "[telemetry] exporting JSON telemetry to $OUTPUT_JSON"
+    mkdir -p "$(dirname "$OUTPUT_JSON")" 2>/dev/null || true
+    cat > "$OUTPUT_JSON" <<EOF
+{
+  "benchmark": "iperf-netem",
+  "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "streams": $IPERF_STREAMS,
+  "shards": "$YIP_SHARDS",
+  "loss_rates": [$(echo "$LOSS_RATES" | sed 's/  */, /g')],
+  "results": [
+$(if [ -f "$TELEMETRY_RECORDS_FILE" ]; then paste -sd, "$TELEMETRY_RECORDS_FILE"; fi)
+  ]
+}
+EOF
+    echo "[telemetry] export complete"
+fi
 [ "$WG_AVAILABLE"   = false ] && echo "[note] WireGuard skipped (module/CLI absent)"
 [ "$WGGO_AVAILABLE" = false ] && echo "[note] WireGuard-Go skipped (binary absent or setup failed)"
 [ "$AWG_AVAILABLE"  = false ] && echo "[note] AmneziaWG skipped (module/CLI absent)"

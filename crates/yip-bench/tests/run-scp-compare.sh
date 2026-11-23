@@ -1,17 +1,13 @@
 #!/usr/bin/env bash
-# run-scp-compare.sh — yip vs kernel WireGuard TCP throughput under tc netem loss.
+# run-scp-compare.sh — Real-world SCP file transfer benchmark under netem loss.
 #
-# Sets up two independent tunnel pairs in separate netns (identical to
-# run-compare.sh):
-#   yip:  yipA ↔ yipB  over vethA/vethB (10.0.0.x underlay, 10.9.0.x tunnel)
-#   wg:   wgA  ↔ wgB   over vethC/vethD (10.1.0.x underlay, 10.99.0.x tunnel)
+# Measures real OpenSSH scp throughput and goodput under packet loss across
+# VPN contenders (yip, kernel WireGuard, OpenVPN).
 #
-# Sweeps loss rates 0 5 10%; applies tc netem symmetrically to BOTH veth pairs
-# at each step; transfers a 20 MB file via scp across each tunnel; measures
-# throughput (MB/s) and emits a comparison table.
+# Sweeps configurable payload sizes (FILE_SIZES_MB, default: 100) and loss rates
+# (LOSS_RATES, default: 0 5 10). Contenders are isolated with start/stop lifecycles.
 #
-# Thesis: yip's RaptorQ FEC hides packet loss from TCP so throughput holds,
-# while WireGuard's TCP sees real retransmits and collapses under loss.
+# Emits a formatted Markdown results table and optional JSON telemetry (OUTPUT_JSON).
 #
 # Usage: run-scp-compare.sh [<path-to-yipd>]
 set -euo pipefail
@@ -32,85 +28,70 @@ if [ $# -ge 1 ] && [ -n "${1:-}" ]; then
 else
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-    # --release: yipd's RaptorQ path is ~75x slower unoptimized; a debug build
-    # measured against in-kernel WireGuard is apples-to-oranges.
     echo "[build] running cargo build --release -p yipd --quiet in $WORKSPACE_ROOT"
     cargo build --release -p yipd --quiet --manifest-path "$WORKSPACE_ROOT/Cargo.toml"
     YIPD="$WORKSPACE_ROOT/target/release/yipd"
 fi
 
-# Also locate workspace root for output
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-BENCH_DIR="$WORKSPACE_ROOT/crates/yip-bench"
+
+# ── configuration ─────────────────────────────────────────────────────────────
+CONTENDERS="${CONTENDERS:-yip wg ovpn}"
+LOSS_RATES="${LOSS_RATES:-0 5 10}"
+FILE_SIZES_MB="${FILE_SIZES_MB:-100}"
+OUTPUT_JSON="${OUTPUT_JSON:-}"
+SSH_PORT="2222"
 
 # ── tmpdir ────────────────────────────────────────────────────────────────────
 TMPDIR_TEST="$(mktemp -d /dev/shm/yip-scp-compare.XXXXXX 2>/dev/null || mktemp -d /tmp/yip-scp-compare.XXXXXX)"
 chmod 777 "$TMPDIR_TEST"
 
-# ── yip netns/veth ───────────────────────────────────────────────────────────
-NS_A="yipA"
-NS_B="yipB"
-VETH_A="vethA"
-VETH_B="vethB"
-VETH_A_IP="10.0.0.1"
-VETH_B_IP="10.0.0.2"
-TUN_A_IP="10.9.0.1"
-TUN_B_IP="10.9.0.2"
-TUN_PREFIX="24"
-VETH_PREFIX="24"
-PORT_A="443"
-PORT_B="443"
-TUN_DEV="yip0"
+# ── IP and namespace configuration ───────────────────────────────────────────
+# yip
+NS_YA="yipA"; NS_YB="yipB"
+VETH_YA="vethYA"; VETH_YB="vethYB"
+VETH_YA_IP="10.0.0.1"; VETH_YB_IP="10.0.0.2"
+TUN_YA_IP="10.9.0.1"; TUN_YB_IP="10.9.0.2"
+YIP_PORT_A="443"; YIP_PORT_B="443"
+YIP_TUN_DEV="yip0"
+YIP_MTU="${YIP_MTU:-1184}"
+YIP_SHARDS="${YIP_SHARDS:-1}"
+PID_YA=""; PID_YB=""
 
-PID_A=""
-PID_B=""
+# WireGuard
+NS_WGA="wgA"; NS_WGB="wgB"
+VETH_WA="vethWA"; VETH_WB="vethWB"
+VETH_WA_IP="10.1.0.1"; VETH_WB_IP="10.1.0.2"
+WG_A_TUN_IP="10.99.0.1"; WG_B_TUN_IP="10.99.0.2"
+WG_PORT_A="51830"; WG_PORT_B="51831"
 
-# ── WireGuard netns/veth ──────────────────────────────────────────────────────
-NS_WGA="wgA"
-NS_WGB="wgB"
-VETH_C="vethC"
-VETH_D="vethD"
-VETH_C_IP="10.1.0.1"
-VETH_D_IP="10.1.0.2"
-WG_A_TUN_IP="10.99.0.1"
-WG_B_TUN_IP="10.99.0.2"
-WG_PREFIX="24"
-WG_VETH_PREFIX="24"
-WG_PORT_A="51830"
-WG_PORT_B="51831"
-
-WG_AVAILABLE=true
+# OpenVPN
+NS_OA="ovpnA"; NS_OB="ovpnB"
+VETH_OA="vethOA"; VETH_OB="vethOB"
+VETH_OA_IP="10.2.0.1"; VETH_OB_IP="10.2.0.2"
+TUN_OA_IP="10.8.0.1"; TUN_OB_IP="10.8.0.2"
+PID_OA=""; PID_OB=""
 
 # ── cleanup ───────────────────────────────────────────────────────────────────
 cleanup() {
-    echo "[cleanup] killing daemons and removing namespaces"
-    # Kill sshd by pidfile (may already be gone — suppress errors)
-    for _pidfile in "$TMPDIR_TEST/sshd-yip.pid" "$TMPDIR_TEST/sshd-wg.pid"; do
+    echo "[cleanup] cleaning up active processes and namespaces"
+    # Kill any active sshd
+    for _pidfile in "$TMPDIR_TEST"/sshd-*.pid; do
         [ -f "$_pidfile" ] || continue
-        _pid="$(cat "$_pidfile" 2>/dev/null)" || continue
-        [ -n "$_pid" ] || continue
-        kill "$_pid" 2>/dev/null || true
+        _pid="$(cat "$_pidfile" 2>/dev/null || true)"
+        [ -n "$_pid" ] && kill -9 "$_pid" 2>/dev/null || true
     done
-    sleep 0.2
-    for _pidfile in "$TMPDIR_TEST/sshd-yip.pid" "$TMPDIR_TEST/sshd-wg.pid"; do
-        [ -f "$_pidfile" ] || continue
-        _pid="$(cat "$_pidfile" 2>/dev/null)" || continue
-        [ -n "$_pid" ] || continue
-        kill -9 "$_pid" 2>/dev/null || true
+    # Kill any active daemons
+    [ -n "$PID_YA" ] && kill -9 "$PID_YA" 2>/dev/null || true
+    [ -n "$PID_YB" ] && kill -9 "$PID_YB" 2>/dev/null || true
+    [ -n "$PID_OA" ] && kill -9 "$PID_OA" 2>/dev/null || true
+    [ -n "$PID_OB" ] && kill -9 "$PID_OB" 2>/dev/null || true
+    # Remove interfaces and namespaces
+    for ns in "$NS_YA" "$NS_YB" "$NS_WGA" "$NS_WGB" "$NS_OA" "$NS_OB"; do
+        ip netns exec "$ns" ip link del wg0 2>/dev/null || true
+        ip netns del "$ns" 2>/dev/null || true
     done
-    [ -n "$PID_A" ] && kill "$PID_A" 2>/dev/null || true
-    [ -n "$PID_B" ] && kill "$PID_B" 2>/dev/null || true
-    sleep 0.2
-    [ -n "$PID_A" ] && kill -9 "$PID_A" 2>/dev/null || true
-    [ -n "$PID_B" ] && kill -9 "$PID_B" 2>/dev/null || true
-    # Remove WG interfaces inside namespaces before deleting namespaces
-    ip netns exec "$NS_WGA" ip link del wg0 2>/dev/null || true
-    ip netns exec "$NS_WGB" ip link del wg0 2>/dev/null || true
-    ip netns del "$NS_A"   2>/dev/null || true
-    ip netns del "$NS_B"   2>/dev/null || true
-    ip netns del "$NS_WGA" 2>/dev/null || true
-    ip netns del "$NS_WGB" 2>/dev/null || true
     rm -rf "$TMPDIR_TEST"
 }
 trap cleanup EXIT
@@ -122,259 +103,15 @@ ssh-keygen -t ed25519 -f "$TMPDIR_TEST/client" -N '' -q
 cat "$TMPDIR_TEST/client.pub" > "$TMPDIR_TEST/authkeys"
 chmod 600 "$TMPDIR_TEST/authkeys" "$TMPDIR_TEST/host"
 
-# ── payload ───────────────────────────────────────────────────────────────────
-echo "[payload] generating 20 MB test file"
-dd if=/dev/zero of="$TMPDIR_TEST/payload" bs=1M count=20 status=none
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PART 1: yip tunnel setup
-# ══════════════════════════════════════════════════════════════════════════════
-
-echo "[yip] generating keypairs"
-GENKEY_A="$("$YIPD" --genkey)"
-GENKEY_B="$("$YIPD" --genkey)"
-
-PRIV_A="$(echo "$GENKEY_A" | grep '^private=' | cut -d= -f2)"
-PUB_A="$(echo "$GENKEY_A"  | grep '^public='  | cut -d= -f2)"
-PRIV_B="$(echo "$GENKEY_B" | grep '^private=' | cut -d= -f2)"
-PUB_B="$(echo "$GENKEY_B"  | grep '^public='  | cut -d= -f2)"
-
-CFG_A="$TMPDIR_TEST/yipA.conf"
-CFG_B="$TMPDIR_TEST/yipB.conf"
-
-cat > "$CFG_A" <<EOF
-# yipA — responder
-local_private=${PRIV_A}
-local_public=${PUB_A}
-peer_public=${PUB_B}
-listen=${VETH_A_IP}:${PORT_A}
-peer_endpoint=${VETH_B_IP}:${PORT_B}
-device=${TUN_DEV}
-initiate=false
-EOF
-
-cat > "$CFG_B" <<EOF
-# yipB — initiator
-local_private=${PRIV_B}
-local_public=${PUB_B}
-peer_public=${PUB_A}
-listen=${VETH_B_IP}:${PORT_B}
-peer_endpoint=${VETH_A_IP}:${PORT_A}
-device=${TUN_DEV}
-initiate=true
-EOF
-
-echo "[yip] creating namespaces and veth pair"
-ip netns add "$NS_A"
-ip netns add "$NS_B"
-
-ip link add "$VETH_A" type veth peer name "$VETH_B"
-ip link set "$VETH_A" netns "$NS_A"
-ip link set "$VETH_B" netns "$NS_B"
-
-ip netns exec "$NS_A" ip addr add "${VETH_A_IP}/${VETH_PREFIX}" dev "$VETH_A"
-ip netns exec "$NS_A" ip link set "$VETH_A" up
-ip netns exec "$NS_A" ip link set lo up
-
-ip netns exec "$NS_B" ip addr add "${VETH_B_IP}/${VETH_PREFIX}" dev "$VETH_B"
-ip netns exec "$NS_B" ip link set "$VETH_B" up
-ip netns exec "$NS_B" ip link set lo up
-
-LOG_A="$TMPDIR_TEST/yipA.log"
-LOG_B="$TMPDIR_TEST/yipB.log"
-
-echo "[yip] starting daemons"
-ip netns exec "$NS_A" "$YIPD" "$CFG_A" >"$LOG_A" 2>&1 &
-PID_A=$!
-ip netns exec "$NS_B" "$YIPD" "$CFG_B" >"$LOG_B" 2>&1 &
-PID_B=$!
-
-echo "[yip] waiting for TUN devices (up to 20s)"
-TUN_WAIT=20
-INTERVAL=0.25
-elapsed=0
-while true; do
-    A_UP=0
-    B_UP=0
-    ip netns exec "$NS_A" ip link show "$TUN_DEV" >/dev/null 2>&1 && A_UP=1 || true
-    ip netns exec "$NS_B" ip link show "$TUN_DEV" >/dev/null 2>&1 && B_UP=1 || true
-
-    if [ "$A_UP" -eq 1 ] && [ "$B_UP" -eq 1 ]; then
-        echo "[yip] both TUN devices are up"
-        break
-    fi
-
-    if ! kill -0 "$PID_A" 2>/dev/null; then
-        echo "[error] yipA daemon died unexpectedly"
-        cat "$LOG_A" || true
-        exit 1
-    fi
-    if ! kill -0 "$PID_B" 2>/dev/null; then
-        echo "[error] yipB daemon died unexpectedly"
-        cat "$LOG_B" || true
-        exit 1
-    fi
-
-    elapsed=$(awk "BEGIN {print $elapsed + $INTERVAL}")
-    if awk "BEGIN {exit ($elapsed >= $TUN_WAIT) ? 0 : 1}"; then
-        echo "[error] timed out waiting for yip TUN devices"
-        cat "$LOG_A" || true
-        cat "$LOG_B" || true
-        exit 1
-    fi
-    sleep "$INTERVAL"
-done
-
-echo "[yip] assigning tunnel IPs"
-ip netns exec "$NS_A" ip addr add "${TUN_A_IP}/${TUN_PREFIX}" dev "$TUN_DEV"
-ip netns exec "$NS_B" ip addr add "${TUN_B_IP}/${TUN_PREFIX}" dev "$TUN_DEV"
-
-ip netns exec "$NS_A" ip link show "$TUN_DEV" | grep -q "UP" || \
-    ip netns exec "$NS_A" ip link set "$TUN_DEV" up
-ip netns exec "$NS_B" ip link show "$TUN_DEV" | grep -q "UP" || \
-    ip netns exec "$NS_B" ip link set "$TUN_DEV" up
-
-# ── set the yip0 tunnel MTU ────────────────────────────────────────────────────
-# The default 1500 TUN MTU is wrong for yip's data path.  Each inner packet is
-# AEAD-sealed (+16-byte tag) and then FEC-encoded into fixed 1200-byte symbols
-# (yip-transport symbol_size = 1200).  A full 1500-byte inner segment seals to
-# 1516 bytes, which exceeds one symbol and is split into TWO source symbols (plus
-# proactive repair) — i.e. every full-size TCP segment fans out into 2+ UDP
-# datagrams through the single mutex-locked data path, collapsing throughput even
-# at 0% loss.  Capping the inner MTU so the sealed packet fits one symbol
-# (inner + 16 <= 1200  =>  inner <= 1184) keeps each TCP segment to one source
-# symbol.  This is yip's analogue of WireGuard auto-setting wg0 to MTU 1420.
-YIP_MTU=1184
-echo "[yip] setting ${TUN_DEV} MTU to ${YIP_MTU} (fit sealed inner packet in one FEC symbol)"
-ip netns exec "$NS_A" ip link set "$TUN_DEV" mtu "$YIP_MTU"
-ip netns exec "$NS_B" ip link set "$TUN_DEV" mtu "$YIP_MTU"
-
-sleep 0.5
-
-echo "[yip] baseline connectivity check"
-ip netns exec "$NS_B" ping -c 3 -W 5 "$TUN_A_IP" || {
-    echo "[error] yip baseline ping failed"
-    cat "$LOG_A" || true
-    cat "$LOG_B" || true
-    exit 1
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PART 2: kernel WireGuard tunnel setup
-# ══════════════════════════════════════════════════════════════════════════════
-
-setup_wg() {
-    # Check prerequisites
-    if ! command -v wg >/dev/null 2>&1; then
-        echo "[wg] SKIP: 'wg' command not found"
-        WG_AVAILABLE=false
-        return
-    fi
-
-    # Ensure kernel module is loaded
-    if ! modprobe wireguard 2>/dev/null; then
-        echo "[wg] SKIP: modprobe wireguard failed"
-        WG_AVAILABLE=false
-        return
-    fi
-
-    echo "[wg] generating keypairs"
-    WG_PRIV_A="$(wg genkey)"
-    WG_PUB_A="$(echo "$WG_PRIV_A" | wg pubkey)"
-    WG_PRIV_B="$(wg genkey)"
-    WG_PUB_B="$(echo "$WG_PRIV_B" | wg pubkey)"
-
-    echo "[wg] creating namespaces and veth pair"
-    ip netns add "$NS_WGA"
-    ip netns add "$NS_WGB"
-
-    ip link add "$VETH_C" type veth peer name "$VETH_D"
-    ip link set "$VETH_C" netns "$NS_WGA"
-    ip link set "$VETH_D" netns "$NS_WGB"
-
-    ip netns exec "$NS_WGA" ip addr add "${VETH_C_IP}/${WG_VETH_PREFIX}" dev "$VETH_C"
-    ip netns exec "$NS_WGA" ip link set "$VETH_C" up
-    ip netns exec "$NS_WGA" ip link set lo up
-
-    ip netns exec "$NS_WGB" ip addr add "${VETH_D_IP}/${WG_VETH_PREFIX}" dev "$VETH_D"
-    ip netns exec "$NS_WGB" ip link set "$VETH_D" up
-    ip netns exec "$NS_WGB" ip link set lo up
-
-    echo "[wg] creating WireGuard interfaces inside namespaces"
-    ip netns exec "$NS_WGA" ip link add wg0 type wireguard
-    ip netns exec "$NS_WGB" ip link add wg0 type wireguard
-
-    WG_PRIV_A_FILE="$TMPDIR_TEST/wg_priv_a"
-    WG_PRIV_B_FILE="$TMPDIR_TEST/wg_priv_b"
-    printf '%s' "$WG_PRIV_A" > "$WG_PRIV_A_FILE"
-    printf '%s' "$WG_PRIV_B" > "$WG_PRIV_B_FILE"
-    chmod 644 "$WG_PRIV_A_FILE" "$WG_PRIV_B_FILE"
-
-    echo "[wg] configuring wgA (listen-port ${WG_PORT_A}, peer = wgB)"
-    ip netns exec "$NS_WGA" wg set wg0 \
-        private-key "$WG_PRIV_A_FILE" \
-        listen-port "$WG_PORT_A" \
-        peer "$WG_PUB_B" \
-            allowed-ips "10.99.0.0/24" \
-            endpoint "${VETH_D_IP}:${WG_PORT_B}"
-
-    echo "[wg] configuring wgB (listen-port ${WG_PORT_B}, peer = wgA)"
-    ip netns exec "$NS_WGB" wg set wg0 \
-        private-key "$WG_PRIV_B_FILE" \
-        listen-port "$WG_PORT_B" \
-        peer "$WG_PUB_A" \
-            allowed-ips "10.99.0.0/24" \
-            endpoint "${VETH_C_IP}:${WG_PORT_A}"
-
-    echo "[wg] assigning tunnel IPs and bringing up wg0"
-    ip netns exec "$NS_WGA" ip addr add "${WG_A_TUN_IP}/${WG_PREFIX}" dev wg0
-    ip netns exec "$NS_WGA" ip link set wg0 up
-
-    ip netns exec "$NS_WGB" ip addr add "${WG_B_TUN_IP}/${WG_PREFIX}" dev wg0
-    ip netns exec "$NS_WGB" ip link set wg0 up
-
-    sleep 0.5
-
-    echo "[wg] baseline connectivity check"
-    if ! ip netns exec "$NS_WGB" ping -c 3 -W 5 "$WG_A_TUN_IP"; then
-        echo "[wg] SKIP: baseline WG ping failed — WG column will be omitted"
-        WG_AVAILABLE=false
-        return
-    fi
-
-    echo "[wg] WireGuard tunnel is up and reachable"
-}
-
-setup_wg
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PART 3: scp throughput sweep
-# ══════════════════════════════════════════════════════════════════════════════
-
-LOSS_RATES="0 5 10"
-
-# Helper: start sshd in a namespace on port 2222
-# Usage: start_sshd <netns> <pidfile> <logfile>
+# ── Helper: sshd lifecycle ────────────────────────────────────────────────────
 start_sshd() {
     local ns="$1"
     local pidfile="$2"
     local logfile="$3"
-    # Remove stale pidfile
     rm -f "$pidfile"
-    # sshd refuses to start without its privilege-separation directory
-    # ("Missing privilege separation directory: /run/sshd", exit 255). The
-    # package's postinst normally creates it, but the CI runner image
-    # (catthehacker/ubuntu:act-22.04) ships sshd without ever having run it,
-    # and /run is a fresh tmpfs each container. Root here already — the whole
-    # harness runs under sudo for netns.
     mkdir -p /run/sshd && chmod 0755 /run/sshd
-    # `-E "$logfile"` routes sshd's own diagnostics to a file, so a failed start
-    # under `set -e` aborted the whole harness with nothing on stdout but
-    # "[yip] starting sshd in yipA" — the reason sealed in a file the cleanup
-    # trap then removed. That is how CI reported only "harness failed". Surface
-    # it: on failure dump sshd's log and exit status before propagating.
     local rc=0
-    ip netns exec "$ns" /usr/sbin/sshd -p 2222 -h "$TMPDIR_TEST/host" \
+    ip netns exec "$ns" /usr/sbin/sshd -p "$SSH_PORT" -h "$TMPDIR_TEST/host" \
         -o "PidFile=$pidfile" \
         -o "AuthorizedKeysFile=$TMPDIR_TEST/authkeys" \
         -o "UsePAM=no" \
@@ -384,18 +121,9 @@ start_sshd() {
         -E "$logfile" || rc=$?
     if [ "$rc" -ne 0 ]; then
         echo "[error] sshd failed to start in netns $ns (exit $rc)" >&2
-        # Test for content, not for cat's exit status: an existing-but-empty
-        # log makes `cat` succeed silently, reproducing the blank wall this
-        # whole branch exists to remove.
-        if [ -s "$logfile" ]; then
-            echo "[error] sshd log follows:" >&2
-            cat "$logfile" >&2
-        else
-            echo "[error] sshd wrote no log at $logfile" >&2
-        fi
+        [ -s "$logfile" ] && cat "$logfile" >&2
         return "$rc"
     fi
-    # Brief wait for sshd to write its pidfile
     local wait=0
     while [ ! -f "$pidfile" ] && [ "$wait" -lt 50 ]; do
         sleep 0.1
@@ -403,8 +131,6 @@ start_sshd() {
     done
 }
 
-# Helper: stop sshd by pidfile
-# Usage: stop_sshd <pidfile>
 stop_sshd() {
     local pidfile="$1"
     if [ -f "$pidfile" ]; then
@@ -412,122 +138,391 @@ stop_sshd() {
         pid="$(cat "$pidfile" 2>/dev/null)" || return 0
         [ -n "$pid" ] || return 0
         kill "$pid" 2>/dev/null || true
-        sleep 0.3
+        wait "$pid" 2>/dev/null || true
         kill -9 "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
         rm -f "$pidfile"
     fi
 }
 
-YIP_RESULTS=""
-WG_RESULTS=""
+make_pair() {
+    local ns1="$1" ns2="$2" v1="$3" v2="$4" ip1="$5" ip2="$6"
+    ip netns add "$ns1"
+    ip netns add "$ns2"
+    ip link add "$v1" type veth peer name "$v2"
+    ip link set "$v1" netns "$ns1"
+    ip link set "$v2" netns "$ns2"
+    ip netns exec "$ns1" ip addr add "${ip1}/24" dev "$v1"
+    ip netns exec "$ns1" ip link set "$v1" up
+    ip netns exec "$ns1" ip link set lo up
+    ip netns exec "$ns2" ip addr add "${ip2}/24" dev "$v2"
+    ip netns exec "$ns2" ip link set "$v2" up
+    ip netns exec "$ns2" ip link set lo up
+}
 
-echo ""
-echo "=========================================================="
-echo "  yip vs WireGuard — scp throughput under netem loss"
-echo "  20 MB file via scp; netem: loss X% delay 5ms (symmetric)"
-echo "  sshd on port 2222; scp timeout 120 s per transfer"
-echo "=========================================================="
+# ── Contender: Yip ────────────────────────────────────────────────────────────
+start_yip() {
+    echo "[yip] setting up yip tunnel"
+    local GENKEY_A GENKEY_B PRIV_A PUB_A PRIV_B PUB_B CFG_A CFG_B LOG_A LOG_B
+    GENKEY_A="$("$YIPD" --genkey)"
+    GENKEY_B="$("$YIPD" --genkey)"
+    PRIV_A="$(echo "$GENKEY_A" | grep '^private=' | cut -d= -f2)"
+    PUB_A="$(echo "$GENKEY_A"  | grep '^public='  | cut -d= -f2)"
+    PRIV_B="$(echo "$GENKEY_B" | grep '^private=' | cut -d= -f2)"
+    PUB_B="$(echo "$GENKEY_B"  | grep '^public='  | cut -d= -f2)"
 
-for LOSS in $LOSS_RATES; do
-    echo ""
-    echo "[netem] applying loss=${LOSS}% delay=5ms to all veth pairs"
+    CFG_A="$TMPDIR_TEST/yipA.conf"
+    CFG_B="$TMPDIR_TEST/yipB.conf"
+    cat > "$CFG_A" <<EOF
+local_private=${PRIV_A}
+local_public=${PUB_A}
+peer_public=${PUB_B}
+listen=${VETH_YA_IP}:${YIP_PORT_A}
+peer_endpoint=${VETH_YB_IP}:${YIP_PORT_B}
+device=${YIP_TUN_DEV}
+initiate=false
+shards=${YIP_SHARDS}
+EOF
 
-    # Apply netem on yip veth pair
-    ip netns exec "$NS_A" tc qdisc replace dev "$VETH_A" root netem \
-        loss "${LOSS}%" delay 5ms
-    ip netns exec "$NS_B" tc qdisc replace dev "$VETH_B" root netem \
-        loss "${LOSS}%" delay 5ms
+    cat > "$CFG_B" <<EOF
+local_private=${PRIV_B}
+local_public=${PUB_B}
+peer_public=${PUB_A}
+listen=${VETH_YB_IP}:${YIP_PORT_B}
+peer_endpoint=${VETH_YA_IP}:${YIP_PORT_A}
+device=${YIP_TUN_DEV}
+initiate=true
+shards=${YIP_SHARDS}
+EOF
 
-    # Apply netem on wg veth pair
-    if [ "$WG_AVAILABLE" = true ]; then
-        ip netns exec "$NS_WGA" tc qdisc replace dev "$VETH_C" root netem \
-            loss "${LOSS}%" delay 5ms
-        ip netns exec "$NS_WGB" tc qdisc replace dev "$VETH_D" root netem \
-            loss "${LOSS}%" delay 5ms
-    fi
+    make_pair "$NS_YA" "$NS_YB" "$VETH_YA" "$VETH_YB" "$VETH_YA_IP" "$VETH_YB_IP"
 
-    # ── yip scp measurement ───────────────────────────────────────────────────
-    echo "[yip] starting sshd in $NS_A"
-    start_sshd "$NS_A" "$TMPDIR_TEST/sshd-yip.pid" "$TMPDIR_TEST/sshd-yip.log"
+    LOG_A="$TMPDIR_TEST/yipA.log"
+    LOG_B="$TMPDIR_TEST/yipB.log"
+    ip netns exec "$NS_YA" "$YIPD" "$CFG_A" >"$LOG_A" 2>&1 &
+    PID_YA=$!
+    ip netns exec "$NS_YB" "$YIPD" "$CFG_B" >"$LOG_B" 2>&1 &
+    PID_YB=$!
 
-    echo "[yip] transferring 20 MB via scp at loss=${LOSS}%"
-    t_start=$(date +%s.%N)
-    ip netns exec "$NS_B" timeout 120 scp -q -P 2222 \
-        -i "$TMPDIR_TEST/client" \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        "$TMPDIR_TEST/payload" \
-        "root@${TUN_A_IP}:/tmp/payload-yip.copy" || true
-    t_end=$(date +%s.%N)
-
-    yip_elapsed=$(awk "BEGIN {print $t_end - $t_start}")
-    yip_mbps=$(awk "BEGIN { if ($yip_elapsed > 0) printf \"%.2f\", 20.0/$yip_elapsed; else print \"0.00\" }")
-    echo "[yip] loss=${LOSS}%: elapsed=${yip_elapsed}s throughput=${yip_mbps} MB/s"
-
-    # Integrity check at 0% loss
-    if [ "$LOSS" -eq 0 ]; then
-        echo "[yip] integrity check at 0% loss"
-        if ip netns exec "$NS_A" cmp "$TMPDIR_TEST/payload" /tmp/payload-yip.copy 2>/dev/null; then
-            echo "[yip] integrity OK: files match"
-        else
-            echo "[yip] WARNING: integrity check failed at 0% loss"
+    local elapsed=0 interval=0.25 max_wait=20
+    while true; do
+        local a_up=0 b_up=0
+        ip netns exec "$NS_YA" ip link show "$YIP_TUN_DEV" >/dev/null 2>&1 && a_up=1 || true
+        ip netns exec "$NS_YB" ip link show "$YIP_TUN_DEV" >/dev/null 2>&1 && b_up=1 || true
+        if [ "$a_up" -eq 1 ] && [ "$b_up" -eq 1 ]; then break; fi
+        if ! kill -0 "$PID_YA" 2>/dev/null || ! kill -0 "$PID_YB" 2>/dev/null; then
+            echo "[error] yip daemon died during startup" >&2
+            cat "$LOG_A" "$LOG_B" || true
+            return 1
         fi
+        elapsed=$(awk "BEGIN {print $elapsed + $interval}")
+        if awk "BEGIN {exit ($elapsed >= $max_wait) ? 0 : 1}"; then
+            echo "[error] timed out waiting for yip TUN devices" >&2
+            cat "$LOG_A" "$LOG_B" || true
+            return 1
+        fi
+        sleep "$interval"
+    done
+
+    ip netns exec "$NS_YA" ip addr add "${TUN_YA_IP}/24" dev "$YIP_TUN_DEV"
+    ip netns exec "$NS_YB" ip addr add "${TUN_YB_IP}/24" dev "$YIP_TUN_DEV"
+    ip netns exec "$NS_YA" ip link set "$YIP_TUN_DEV" up
+    ip netns exec "$NS_YB" ip link set "$YIP_TUN_DEV" up
+    ip netns exec "$NS_YA" ip link set "$YIP_TUN_DEV" mtu "$YIP_MTU"
+    ip netns exec "$NS_YB" ip link set "$YIP_TUN_DEV" mtu "$YIP_MTU"
+    sleep 0.5
+    ip netns exec "$NS_YB" ping -c 3 -W 5 "$TUN_YA_IP" >/dev/null 2>&1
+}
+
+stop_yip() {
+    [ -n "$PID_YA" ] && kill "$PID_YA" 2>/dev/null || true
+    [ -n "$PID_YB" ] && kill "$PID_YB" 2>/dev/null || true
+    wait "$PID_YA" 2>/dev/null || true
+    wait "$PID_YB" 2>/dev/null || true
+    [ -n "$PID_YA" ] && kill -9 "$PID_YA" 2>/dev/null || true
+    [ -n "$PID_YB" ] && kill -9 "$PID_YB" 2>/dev/null || true
+    wait "$PID_YA" 2>/dev/null || true
+    wait "$PID_YB" 2>/dev/null || true
+    PID_YA=""; PID_YB=""
+    ip netns del "$NS_YA" 2>/dev/null || true
+    ip netns del "$NS_YB" 2>/dev/null || true
+}
+
+# ── Contender: WireGuard ──────────────────────────────────────────────────────
+start_wg() {
+    if ! command -v wg >/dev/null 2>&1 || ! modprobe wireguard 2>/dev/null; then
+        echo "[wg] SKIP: wg or wireguard kernel module not available"
+        return 1
+    fi
+    echo "[wg] setting up WireGuard tunnel"
+    make_pair "$NS_WGA" "$NS_WGB" "$VETH_WA" "$VETH_WB" "$VETH_WA_IP" "$VETH_WB_IP"
+    local WG_PRIV_A WG_PUB_A WG_PRIV_B WG_PUB_B
+    WG_PRIV_A="$(wg genkey)"; WG_PUB_A="$(echo "$WG_PRIV_A" | wg pubkey)"
+    WG_PRIV_B="$(wg genkey)"; WG_PUB_B="$(echo "$WG_PRIV_B" | wg pubkey)"
+    printf '%s' "$WG_PRIV_A" > "$TMPDIR_TEST/wg_priv_a"
+    printf '%s' "$WG_PRIV_B" > "$TMPDIR_TEST/wg_priv_b"
+
+    ip netns exec "$NS_WGA" ip link add wg0 type wireguard
+    ip netns exec "$NS_WGB" ip link add wg0 type wireguard
+    ip netns exec "$NS_WGA" wg set wg0 private-key "$TMPDIR_TEST/wg_priv_a" listen-port "$WG_PORT_A" \
+        peer "$WG_PUB_B" allowed-ips "10.99.0.0/24" endpoint "${VETH_WB_IP}:${WG_PORT_B}"
+    ip netns exec "$NS_WGB" wg set wg0 private-key "$TMPDIR_TEST/wg_priv_b" listen-port "$WG_PORT_B" \
+        peer "$WG_PUB_A" allowed-ips "10.99.0.0/24" endpoint "${VETH_WA_IP}:${WG_PORT_A}"
+
+    ip netns exec "$NS_WGA" ip addr add "${WG_A_TUN_IP}/24" dev wg0
+    ip netns exec "$NS_WGA" ip link set wg0 up
+    ip netns exec "$NS_WGB" ip addr add "${WG_B_TUN_IP}/24" dev wg0
+    ip netns exec "$NS_WGB" ip link set wg0 up
+    sleep 0.5
+    ip netns exec "$NS_WGB" ping -c 3 -W 5 "$WG_A_TUN_IP" >/dev/null 2>&1
+}
+
+stop_wg() {
+    ip netns exec "$NS_WGA" ip link del wg0 2>/dev/null || true
+    ip netns exec "$NS_WGB" ip link del wg0 2>/dev/null || true
+    ip netns del "$NS_WGA" 2>/dev/null || true
+    ip netns del "$NS_WGB" 2>/dev/null || true
+}
+
+# ── Contender: OpenVPN ────────────────────────────────────────────────────────
+start_ovpn() {
+    if ! command -v openvpn >/dev/null 2>&1; then
+        echo "[ovpn] SKIP: openvpn not found"
+        return 1
+    fi
+    echo "[ovpn] setting up OpenVPN tunnel"
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -keyout "$TMPDIR_TEST/ovpn-a.key" -out "$TMPDIR_TEST/ovpn-a.crt" \
+        -days 1 -nodes -subj "/CN=ovpn-a" >/dev/null 2>&1
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -keyout "$TMPDIR_TEST/ovpn-b.key" -out "$TMPDIR_TEST/ovpn-b.crt" \
+        -days 1 -nodes -subj "/CN=ovpn-b" >/dev/null 2>&1
+    chmod 600 "$TMPDIR_TEST/ovpn-a.key" "$TMPDIR_TEST/ovpn-b.key"
+    local FA FB
+    FA="$(openssl x509 -in "$TMPDIR_TEST/ovpn-a.crt" -noout -fingerprint -sha256 | cut -d= -f2)"
+    FB="$(openssl x509 -in "$TMPDIR_TEST/ovpn-b.crt" -noout -fingerprint -sha256 | cut -d= -f2)"
+
+    make_pair "$NS_OA" "$NS_OB" "$VETH_OA" "$VETH_OB" "$VETH_OA_IP" "$VETH_OB_IP"
+    ip netns exec "$NS_OA" openvpn \
+        --dev tun0 --dev-type tun \
+        --local "$VETH_OA_IP" --port 1194 --ifconfig "$TUN_OA_IP" "$TUN_OB_IP" \
+        --tls-server --cert "$TMPDIR_TEST/ovpn-a.crt" --key "$TMPDIR_TEST/ovpn-a.key" \
+        --peer-fingerprint "$FB" --data-ciphers AES-256-GCM \
+        --proto udp --verb 1 --ping 10 --ping-restart 0 \
+        >"$TMPDIR_TEST/ovpn-a.log" 2>&1 &
+    PID_OA=$!
+
+    ip netns exec "$NS_OB" openvpn \
+        --dev tun0 --dev-type tun \
+        --remote "$VETH_OA_IP" --rport 1194 --ifconfig "$TUN_OB_IP" "$TUN_OA_IP" \
+        --tls-client --cert "$TMPDIR_TEST/ovpn-b.crt" --key "$TMPDIR_TEST/ovpn-b.key" \
+        --peer-fingerprint "$FA" --data-ciphers AES-256-GCM \
+        --proto udp --verb 1 --ping 10 --ping-restart 0 \
+        >"$TMPDIR_TEST/ovpn-b.log" 2>&1 &
+    PID_OB=$!
+
+    local i
+    for i in $(seq 1 40); do
+        if ip netns exec "$NS_OB" ping -c 1 -W 1 "$TUN_OA_IP" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.25
+    done
+    echo "[ovpn] baseline ping failed" >&2
+    return 1
+}
+
+stop_ovpn() {
+    [ -n "$PID_OA" ] && kill "$PID_OA" 2>/dev/null || true
+    [ -n "$PID_OB" ] && kill "$PID_OB" 2>/dev/null || true
+    wait "$PID_OA" 2>/dev/null || true
+    wait "$PID_OB" 2>/dev/null || true
+    [ -n "$PID_OA" ] && kill -9 "$PID_OA" 2>/dev/null || true
+    [ -n "$PID_OB" ] && kill -9 "$PID_OB" 2>/dev/null || true
+    wait "$PID_OA" 2>/dev/null || true
+    wait "$PID_OB" 2>/dev/null || true
+    PID_OA=""; PID_OB=""
+    ip netns del "$NS_OA" 2>/dev/null || true
+    ip netns del "$NS_OB" 2>/dev/null || true
+}
+
+# ── Benchmark execution loop ──────────────────────────────────────────────────
+declare -A RESULT_TIME
+declare -A RESULT_MBPS
+declare -A RESULT_INTEGRITY
+
+echo "=========================================================="
+echo "  SCP File Transfer Benchmark under netem packet loss"
+echo "  Payloads: ${FILE_SIZES_MB} MB | Loss: ${LOSS_RATES}% | Delay: 5ms"
+echo "  Contenders: ${CONTENDERS}"
+echo "=========================================================="
+
+for CONTENDER in $CONTENDERS; do
+    echo ""
+    echo "── Running contender: $CONTENDER ──"
+
+    START_FN="start_${CONTENDER}"
+    STOP_FN="stop_${CONTENDER}"
+
+    case "$CONTENDER" in
+        yip)
+            SRV_NS="$NS_YA"; CLI_NS="$NS_YB"
+            SRV_IP="$TUN_YA_IP"; CLI_IP="$TUN_YB_IP"
+            VETH_SRV="$VETH_YA"; VETH_CLI="$VETH_YB"
+            ;;
+        wg|wireguard)
+            SRV_NS="$NS_WGA"; CLI_NS="$NS_WGB"
+            SRV_IP="$WG_A_TUN_IP"; CLI_IP="$WG_B_TUN_IP"
+            VETH_SRV="$VETH_WA"; VETH_CLI="$VETH_WB"
+            ;;
+        ovpn|openvpn)
+            SRV_NS="$NS_OA"; CLI_NS="$NS_OB"
+            SRV_IP="$TUN_OA_IP"; CLI_IP="$TUN_OB_IP"
+            VETH_SRV="$VETH_OA"; VETH_CLI="$VETH_OB"
+            ;;
+        *)
+            echo "[skip] unknown contender $CONTENDER"
+            continue
+            ;;
+    esac
+
+    if ! "$START_FN"; then
+        echo "[$CONTENDER] startup skipped or failed"
+        "$STOP_FN" 2>/dev/null || true
+        continue
     fi
 
-    stop_sshd "$TMPDIR_TEST/sshd-yip.pid"
+    for SIZE_MB in $FILE_SIZES_MB; do
+        PAYLOAD="$TMPDIR_TEST/payload_${SIZE_MB}MB"
+        if [ ! -f "$PAYLOAD" ]; then
+            echo "[payload] generating ${SIZE_MB} MB payload file"
+            dd if=/dev/zero of="$PAYLOAD" bs=1M count="$SIZE_MB" status=none
+        fi
 
-    # ── WireGuard scp measurement ─────────────────────────────────────────────
-    wg_mbps="N/A"
-    if [ "$WG_AVAILABLE" = true ]; then
-        echo "[wg] starting sshd in $NS_WGA"
-        start_sshd "$NS_WGA" "$TMPDIR_TEST/sshd-wg.pid" "$TMPDIR_TEST/sshd-wg.log"
+        for LOSS in $LOSS_RATES; do
+            echo "[$CONTENDER] applying loss=${LOSS}% delay=5ms (payload=${SIZE_MB}MB)"
+            ip netns exec "$SRV_NS" tc qdisc replace dev "$VETH_SRV" root netem loss "${LOSS}%" delay 5ms
+            ip netns exec "$CLI_NS" tc qdisc replace dev "$VETH_CLI" root netem loss "${LOSS}%" delay 5ms
 
-        echo "[wg] transferring 20 MB via scp at loss=${LOSS}%"
-        t_start=$(date +%s.%N)
-        ip netns exec "$NS_WGB" timeout 120 scp -q -P 2222 \
-            -i "$TMPDIR_TEST/client" \
-            -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
-            "$TMPDIR_TEST/payload" \
-            "root@${WG_A_TUN_IP}:/tmp/payload-wg.copy" || true
-        t_end=$(date +%s.%N)
+            SSHD_PID="$TMPDIR_TEST/sshd-${CONTENDER}.pid"
+            SSHD_LOG="$TMPDIR_TEST/sshd-${CONTENDER}.log"
+            start_sshd "$SRV_NS" "$SSHD_PID" "$SSHD_LOG"
 
-        wg_elapsed=$(awk "BEGIN {print $t_end - $t_start}")
-        wg_mbps=$(awk "BEGIN { if ($wg_elapsed > 0) printf \"%.2f\", 20.0/$wg_elapsed; else print \"0.00\" }")
-        echo "[wg] loss=${LOSS}%: elapsed=${wg_elapsed}s throughput=${wg_mbps} MB/s"
+            # Timeout scaled: 60s base + 3s per MB
+            TIMEOUT_SEC=$(( 60 + SIZE_MB * 3 ))
+            REMOTE_DEST="/tmp/payload-${CONTENDER}-${SIZE_MB}.copy"
+            ip netns exec "$SRV_NS" rm -f "$REMOTE_DEST"
 
-        stop_sshd "$TMPDIR_TEST/sshd-wg.pid"
-    fi
+            echo "[$CONTENDER] transferring ${SIZE_MB}MB via scp (timeout: ${TIMEOUT_SEC}s)..."
+            t_start=$(date +%s.%N)
+            transfer_ok=0
+            if ip netns exec "$CLI_NS" timeout "$TIMEOUT_SEC" scp -q -P "$SSH_PORT" \
+                -i "$TMPDIR_TEST/client" \
+                -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -o ConnectTimeout=10 \
+                "$PAYLOAD" "root@${SRV_IP}:${REMOTE_DEST}"; then
+                transfer_ok=1
+            fi
+            t_end=$(date +%s.%N)
 
-    YIP_RESULTS="${YIP_RESULTS}${LOSS} ${yip_mbps}"$'\n'
-    WG_RESULTS="${WG_RESULTS}${LOSS} ${wg_mbps}"$'\n'
+            stop_sshd "$SSHD_PID"
+
+            KEY="${CONTENDER}:${SIZE_MB}:${LOSS}"
+            if [ "$transfer_ok" -eq 1 ]; then
+                elapsed=$(awk "BEGIN {print $t_end - $t_start}")
+                mbps=$(awk "BEGIN { if ($elapsed > 0) printf \"%.2f\", $SIZE_MB / $elapsed; else print \"0.00\" }")
+                RESULT_TIME["$KEY"]="$elapsed"
+                RESULT_MBPS["$KEY"]="$mbps"
+
+                integrity="OK"
+                if [ "$LOSS" -eq 0 ]; then
+                    if ! ip netns exec "$SRV_NS" cmp -s "$PAYLOAD" "$REMOTE_DEST"; then
+                        integrity="FAIL"
+                    fi
+                fi
+                RESULT_INTEGRITY["$KEY"]="$integrity"
+                echo "[$CONTENDER] size=${SIZE_MB}MB loss=${LOSS}%: time=${elapsed}s throughput=${mbps} MB/s integrity=${integrity}"
+            else
+                RESULT_TIME["$KEY"]="TIMEOUT"
+                RESULT_MBPS["$KEY"]="0.00"
+                RESULT_INTEGRITY["$KEY"]="FAIL"
+                echo "[$CONTENDER] size=${SIZE_MB}MB loss=${LOSS}%: TIMEOUT/FAILED"
+            fi
+            ip netns exec "$SRV_NS" rm -f "$REMOTE_DEST" 2>/dev/null || true
+        done
+    done
+
+    "$STOP_FN"
 done
 
-# ── emit final table ──────────────────────────────────────────────────────────
+# ── Summary Markdown Table ────────────────────────────────────────────────────
 echo ""
 echo "=========================================================="
-echo "  Results"
+echo "  SCP Transfer Benchmark Summary"
 echo "=========================================================="
 echo ""
-echo "| loss% | yip_MBps | wg_MBps |"
-echo "|-------|----------|---------|"
 
-# Parse results into table rows
-while IFS= read -r yip_line; do
-    [ -z "$yip_line" ] && continue
-    loss_pct="${yip_line%% *}"
-    y_mbps="${yip_line##* }"
-    # Find matching WG result
-    w_mbps="N/A"
-    if [ "$WG_AVAILABLE" = true ]; then
-        w_mbps=$(echo "$WG_RESULTS" | awk -v loss="$loss_pct" '$1 == loss { print $2 }')
-    fi
-    printf "| %-5s | %-8s | %-7s |\n" "$loss_pct" "$y_mbps" "$w_mbps"
-done <<< "$YIP_RESULTS"
+for SIZE_MB in $FILE_SIZES_MB; do
+    echo "### Payload: ${SIZE_MB} MB"
+    echo ""
+    echo "| contender | loss% | transfer_time(s) | throughput(MB/s) | integrity |"
+    echo "|-----------|-------|------------------|------------------|-----------|"
+    for CONTENDER in $CONTENDERS; do
+        for LOSS in $LOSS_RATES; do
+            KEY="${CONTENDER}:${SIZE_MB}:${LOSS}"
+            t="${RESULT_TIME["$KEY"]:-N/A}"
+            mb="${RESULT_MBPS["$KEY"]:-N/A}"
+            integ="${RESULT_INTEGRITY["$KEY"]:-N/A}"
+            printf "| %-9s | %-5s | %-16s | %-16s | %-9s |\n" "$CONTENDER" "$LOSS" "$t" "$mb" "$integ"
+        done
+    done
+    echo ""
+done
 
-echo ""
-echo "[done] scp throughput sweep complete"
-
-if [ "$WG_AVAILABLE" = false ]; then
-    echo "[note] WireGuard column skipped (module or baseline ping unavailable in this environment)"
+# ── JSON Telemetry Export ─────────────────────────────────────────────────────
+if [ -n "$OUTPUT_JSON" ]; then
+    echo "[telemetry] exporting JSON to $OUTPUT_JSON"
+    mkdir -p "$(dirname "$OUTPUT_JSON")" 2>/dev/null || true
+    cat > "$OUTPUT_JSON" <<EOF
+{
+  "benchmark": "scp-transfer",
+  "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "file_sizes_mb": [$(echo "$FILE_SIZES_MB" | sed 's/  */, /g')],
+  "loss_rates": [$(echo "$LOSS_RATES" | sed 's/  */, /g')],
+  "results": [
+EOF
+    first=1
+    for SIZE_MB in $FILE_SIZES_MB; do
+        for CONTENDER in $CONTENDERS; do
+            for LOSS in $LOSS_RATES; do
+                KEY="${CONTENDER}:${SIZE_MB}:${LOSS}"
+                [ -n "${RESULT_TIME["$KEY"]:-}" ] || continue
+                t="${RESULT_TIME["$KEY"]}"
+                mb="${RESULT_MBPS["$KEY"]}"
+                integ="${RESULT_INTEGRITY["$KEY"]}"
+                if [ "$first" -eq 0 ]; then
+                    echo "    ," >> "$OUTPUT_JSON"
+                fi
+                first=0
+                cat >> "$OUTPUT_JSON" <<EOF
+    {
+      "contender": "$CONTENDER",
+      "file_size_mb": $SIZE_MB,
+      "loss_percent": $LOSS,
+      "transfer_time_sec": $([ "$t" = "TIMEOUT" ] && echo "null" || echo "$t"),
+      "throughput_mb_s": $mb,
+      "integrity": "$integ"
+    }
+EOF
+            done
+        done
+    done
+    cat >> "$OUTPUT_JSON" <<EOF
+  ]
+}
+EOF
+    echo "[telemetry] export complete"
 fi
+
+echo "[done] scp benchmark sweep complete"
