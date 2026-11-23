@@ -88,7 +88,7 @@ VWA_IP="10.12.0.1"; VWB_IP="10.12.0.2"
 TUN_WA_IP="10.13.0.1"; TUN_WB_IP="10.13.0.2"
 TUN_WA_IP6="fd00:13::1"; TUN_WB_IP6="fd00:13::2"
 WPORT_A="51860"; WPORT_B="51861"
-WG_AVAILABLE=true
+WG_AVAILABLE=""
 
 # ── WireGuard-Go ──────────────────────────────────────────────────────────────
 NS_GGA="ipfGGA"; NS_GGB="ipfGGB"; VGGA="ipfvGGA"; VGGB="ipfvGGB"
@@ -96,7 +96,7 @@ VGGA_IP="10.26.0.1"; VGGB_IP="10.26.0.2"
 TUN_GGA_IP="10.27.0.1"; TUN_GGB_IP="10.27.0.2"
 TUN_GGA_IP6="fd00:27::1"; TUN_GGB_IP6="fd00:27::2"
 GGPORT_A="51880"; GGPORT_B="51881"
-WGGO_AVAILABLE=true
+WGGO_AVAILABLE=""
 PID_GGA=""; PID_GGB=""
 
 # ── OpenVPN ───────────────────────────────────────────────────────────────────
@@ -104,7 +104,8 @@ NS_OA="ipfOA"; NS_OB="ipfOB"; VOA="ipfvOA"; VOB="ipfvOB"
 VOA_IP="10.14.0.1"; VOB_IP="10.14.0.2"
 TUN_OA_IP="10.15.0.1"; TUN_OB_IP="10.15.0.2"
 TUN_OA_IP6="fd00:15::1"; TUN_OB_IP6="fd00:15::2"
-OVPN_AVAILABLE=true
+OVPN_AVAILABLE=""
+PID_OA=""; PID_OB=""
 
 # ── n2n ───────────────────────────────────────────────────────────────────────
 NS_NA="ipfNA"; NS_NB="ipfNB"; VNA="ipfvNA"; VNB="ipfvNB"
@@ -112,7 +113,8 @@ VNA_IP="10.16.0.1"; VNB_IP="10.16.0.2"
 OVL_NA_IP="10.17.0.1"; OVL_NB_IP="10.17.0.2"
 OVL_NA_IP6="fd00:17::1"; OVL_NB_IP6="fd00:17::2"
 N2N_PORT="7654"
-N2N_AVAILABLE=true
+N2N_AVAILABLE=""
+PID_N2N_SN=""; PID_N2N_EA=""; PID_N2N_EB=""
 
 # ── AmneziaWG ─────────────────────────────────────────────────────────────────
 NS_AA="ipfAA"; NS_AB="ipfAB"; VAA="ipfvAA"; VAB="ipfvAB"
@@ -120,7 +122,7 @@ VAA_IP="10.18.0.1"; VAB_IP="10.18.0.2"
 TUN_AA_IP="10.19.0.1"; TUN_AB_IP="10.19.0.2"
 TUN_AA_IP6="fd00:19::1"; TUN_AB_IP6="fd00:19::2"
 APORT_A="51870"; APORT_B="51871"
-AWG_AVAILABLE=true
+AWG_AVAILABLE=""
 PID_AA=""; PID_AB=""
 
 # ── ZeroTier ──────────────────────────────────────────────────────────────────
@@ -128,21 +130,42 @@ NS_ZA="ipfZA"; NS_ZB="ipfZB"; VZA="ipfvZA"; VZB="ipfvZB"
 VZA_IP="10.20.0.1"; VZB_IP="10.20.0.2"
 TUN_ZA_IP="10.21.0.1"; TUN_ZB_IP="10.21.0.2"
 TUN_ZA_IP6="fd00:21::1"; TUN_ZB_IP6="fd00:21::2"
-ZT_AVAILABLE=true
+ZT_AVAILABLE=""
+PID_ZT_A=""; PID_ZT_B=""
 
 # ── Tailscale ─────────────────────────────────────────────────────────────────
 NS_TA="ipfTA"; NS_TB="ipfTB"; VTA="ipfvTA"; VTB="ipfvTB"
 VTA_IP="10.22.0.1"; VTB_IP="10.22.0.2"
 TUN_TA_IP="10.23.0.1"; TUN_TB_IP="10.23.0.2"
 TUN_TA_IP6="fd00:23::1"; TUN_TB_IP6="fd00:23::2"
-TS_AVAILABLE=true
+TS_AVAILABLE=""
+PID_TS_HS=""; PID_TS_DA=""; PID_TS_DB=""
 
 # ── NetBird ───────────────────────────────────────────────────────────────────
 NS_BA="ipfBA"; NS_BB="ipfBB"; VBA="ipfvBA"; VBB="ipfvBB"
 VBA_IP="10.24.0.1"; VBB_IP="10.24.0.2"
 TUN_BA_IP="10.25.0.1"; TUN_BB_IP="10.25.0.2"
 TUN_BA_IP6="fd00:25::1"; TUN_BB_IP6="fd00:25::2"
-NB_AVAILABLE=true
+NB_AVAILABLE=""
+PID_NB_SIG=""; PID_NB_MGMT=""; PID_NB_SA=""; PID_NB_SB=""
+
+# ── lifecycle and performance thresholds ──────────────────────────────────────
+CONTENDER_ISOLATION="${CONTENDER_ISOLATION:-true}"
+ASSERT_THRESHOLDS="${ASSERT_THRESHOLDS:-true}"
+
+THRESH_YIP_TCP_MIN_MBPS_0="${THRESH_YIP_TCP_MIN_MBPS_0:-1500}"
+THRESH_YIP_UDP_MIN_MBPS_0="${THRESH_YIP_UDP_MIN_MBPS_0:-1500}"
+THRESH_YIP_PING_MAX_LOSS_0="${THRESH_YIP_PING_MAX_LOSS_0:-1.0}"
+
+THRESH_YIP_TCP_MIN_MBPS_5="${THRESH_YIP_TCP_MIN_MBPS_5:-700}"
+THRESH_YIP_UDP_MIN_MBPS_5="${THRESH_YIP_UDP_MIN_MBPS_5:-1000}"
+THRESH_YIP_PING_MAX_LOSS_5="${THRESH_YIP_PING_MAX_LOSS_5:-8.0}"
+
+THRESH_YIP_TCP_MIN_MBPS_10="${THRESH_YIP_TCP_MIN_MBPS_10:-150}"
+THRESH_YIP_UDP_MIN_MBPS_10="${THRESH_YIP_UDP_MIN_MBPS_10:-800}"
+THRESH_YIP_PING_MAX_LOSS_10="${THRESH_YIP_PING_MAX_LOSS_10:-15.0}"
+
+THRESHOLD_FAILED=false
 
 # ── cleanup ───────────────────────────────────────────────────────────────────
 cleanup() {
@@ -155,38 +178,8 @@ cleanup() {
         echo "=== yipB log ==="
         tail -n 50 "$LOG_B" || true
     fi
-    [ -n "$PID_YA" ] && kill "$PID_YA" 2>/dev/null || true
-    [ -n "$PID_YB" ] && kill "$PID_YB" 2>/dev/null || true
-    [ -n "$PID_GGA" ] && kill "$PID_GGA" 2>/dev/null || true
-    [ -n "$PID_GGB" ] && kill "$PID_GGB" 2>/dev/null || true
-    [ -n "$PID_AA" ] && kill "$PID_AA" 2>/dev/null || true
-    [ -n "$PID_AB" ] && kill "$PID_AB" 2>/dev/null || true
-    sleep 0.2
-    [ -n "$PID_YA" ] && kill -9 "$PID_YA" 2>/dev/null || true
-    [ -n "$PID_YB" ] && kill -9 "$PID_YB" 2>/dev/null || true
-    [ -n "$PID_GGA" ] && kill -9 "$PID_GGA" 2>/dev/null || true
-    [ -n "$PID_GGB" ] && kill -9 "$PID_GGB" 2>/dev/null || true
-    [ -n "$PID_AA" ] && kill -9 "$PID_AA" 2>/dev/null || true
-    [ -n "$PID_AB" ] && kill -9 "$PID_AB" 2>/dev/null || true
-    killall -9 netbird netbird-mgmt netbird-signal edge supernode 2>/dev/null || true
-    # Remove virtual interfaces before deleting namespaces
-    ip netns exec "$NS_WA" ip link del wg0 2>/dev/null || true
-    ip netns exec "$NS_WB" ip link del wg0 2>/dev/null || true
-    rm -f /etc/wireguard/wg_a /etc/wireguard/wg_b 2>/dev/null || true
-    ip netns exec "$NS_GGA" ip link del wggo0 2>/dev/null || true
-    ip netns exec "$NS_GGB" ip link del wggo0 2>/dev/null || true
-    rm -rf "/etc/netns/$NS_GGA" "/etc/netns/$NS_GGB" /etc/wireguard-run 2>/dev/null || true
-    if [ -L /run/wireguard ]; then
-        rm -f /run/wireguard 2>/dev/null || true
-    fi
-    ip netns exec "$NS_AA" ip link del awg0 2>/dev/null || true
-    ip netns exec "$NS_AB" ip link del awg0 2>/dev/null || true
-    rm -rf "/etc/netns/$NS_AA" "/etc/netns/$NS_AB" /etc/amneziawg-run 2>/dev/null || true
-    if [ -L /run/amneziawg ]; then
-        rm -f /run/amneziawg 2>/dev/null || true
-    fi
-    if [ -L /var/run/amneziawg ]; then
-        rm -f /var/run/amneziawg 2>/dev/null || true
+    if type stop_all_contenders >/dev/null 2>&1; then
+        stop_all_contenders
     fi
     for ns in "$NS_YA" "$NS_YB" "$NS_WA" "$NS_WB" "$NS_GGA" "$NS_GGB" "$NS_OA" "$NS_OB" "$NS_NA" "$NS_NB" \
               "$NS_AA" "$NS_AB" "$NS_ZA" "$NS_ZB" "$NS_TA" "$NS_TB" "$NS_BA" "$NS_BB"; do
@@ -196,7 +189,6 @@ cleanup() {
     rm -rf "$TMPDIR_TEST"
 }
 trap cleanup EXIT
-
 # ── helper: two-netns veth pair ───────────────────────────────────────────────
 make_pair() {
     local nsR="$1" nsS="$2" vR="$3" vS="$4" ipR="$5" ipS="$6"
@@ -531,18 +523,247 @@ measure_iperf_udp() {
     echo "N/A N/A N/A N/A"
 }
 measure_iperf_udp_v6() { measure_iperf_udp "$@"; }
+# ── helper: threshold evaluation ──────────────────────────────────────────────
+check_threshold() {
+    local contender="$1" ip_ver="$2" metric="$3" val="$4" loss="$5"
+    if [ "${ASSERT_THRESHOLDS:-true}" != "true" ]; then
+        return 0
+    fi
+    if [ "$val" = "N/A" ] || [ -z "$val" ]; then
+        return 0
+    fi
+
+    local c_upper; c_upper="$(echo "$contender" | tr '[:lower:]-' '[:upper:]_')"
+    local m_upper; m_upper="$(echo "$metric" | tr '[:lower:]-' '[:upper:]_')"
+    local v_upper; v_upper="$(echo "$ip_ver" | tr '[:lower:]' '[:upper:]')"
+
+    local var_specific="THRESH_${c_upper}_${v_upper}_${m_upper}_${loss}"
+    local var_general="THRESH_${c_upper}_${m_upper}_${loss}"
+
+    local thresh=""
+    if [ -n "${!var_specific:-}" ]; then
+        thresh="${!var_specific}"
+    elif [ -n "${!var_general:-}" ]; then
+        thresh="${!var_general}"
+    fi
+
+    if [ -z "$thresh" ]; then
+        return 0
+    fi
+
+    local failed=false
+    if [[ "$metric" == *"max"* ]]; then
+        if [ "$(awk "BEGIN {print ($val > $thresh)}")" = "1" ]; then
+            failed=true
+            echo "[fail] threshold violation: $contender [$ip_ver] $metric at loss=${loss}% was ${val}, expected <= ${thresh}"
+        fi
+    else
+        if [ "$(awk "BEGIN {print ($val < $thresh)}")" = "1" ]; then
+            failed=true
+            echo "[fail] threshold violation: $contender [$ip_ver] $metric at loss=${loss}% was ${val}, expected >= ${thresh}"
+        fi
+    fi
+
+    if [ "$failed" = true ]; then
+        THRESHOLD_FAILED=true
+    fi
+}
+
+# ── helper: single-contender dual-stack measurement ───────────────────────────
+measure_contender() {
+    local tag="$1" ns_srv="$2" ns_cli="$3" tun_ip4="$4" tun_ip6="$5" loss="$6"
+
+    M_LOSS="N/A"; M_RTT="N/A"; M_TCP="N/A"; M_TCP_LOSS="N/A"; M_UDP_MBPS="N/A"; M_UDP_LOSS="N/A"; M_CPU="N/A"; M_EFF="N/A"; M_RAM="N/A"; M_RAM_EFF="N/A"
+    M6_LOSS="N/A"; M6_RTT="N/A"; M6_TCP="N/A"; M6_TCP_LOSS="N/A"; M6_UDP_MBPS="N/A"; M6_UDP_LOSS="N/A"; M6_CPU="N/A"; M6_EFF="N/A"; M6_RAM="N/A"; M6_RAM_EFF="N/A"
+
+    if [ -n "$tun_ip4" ] && [ "$tun_ip4" != "N/A" ]; then
+        read -r M_LOSS M_RTT <<< "$(measure_ping "$ns_cli" "$tun_ip4")"
+        read -r M_TCP M_TCP_LOSS <<< "$(measure_iperf "$ns_srv" "$tun_ip4" "$ns_cli")"
+        read -r M_UDP_MBPS M_UDP_LOSS M_CPU M_EFF <<< "$(measure_iperf_udp "$ns_srv" "$tun_ip4" "$ns_cli")"
+        M_RAM="$(get_ns_ram_mb "$ns_srv")"
+        M_RAM_EFF="$(calc_ram_efficiency "$M_RAM" "$M_UDP_MBPS")"
+        echo "[$tag] [ipv4] ping_loss=${M_LOSS}% rtt=${M_RTT}ms tcp=${M_TCP}Mbit/s tcp_loss=${M_TCP_LOSS}% udp=${M_UDP_MBPS}Mbit/s udp_loss=${M_UDP_LOSS}% cpu=${M_CPU}% eff=${M_EFF} ram=${M_RAM}MB ram_eff=${M_RAM_EFF}"
+        check_threshold "$tag" "ipv4" "ping_max_loss" "$M_LOSS" "$loss"
+        check_threshold "$tag" "ipv4" "tcp_min_mbps" "$M_TCP" "$loss"
+        check_threshold "$tag" "ipv4" "udp_min_mbps" "$M_UDP_MBPS" "$loss"
+        sleep 0.5
+    fi
+
+    if [ -n "$tun_ip6" ] && [ "$tun_ip6" != "N/A" ]; then
+        read -r M6_LOSS M6_RTT <<< "$(measure_ping "$ns_cli" "$tun_ip6")"
+        read -r M6_TCP M6_TCP_LOSS <<< "$(measure_iperf "$ns_srv" "$tun_ip6" "$ns_cli")"
+        read -r M6_UDP_MBPS M6_UDP_LOSS M6_CPU M6_EFF <<< "$(measure_iperf_udp "$ns_srv" "$tun_ip6" "$ns_cli")"
+        M6_RAM="$(get_ns_ram_mb "$ns_srv")"
+        M6_RAM_EFF="$(calc_ram_efficiency "$M6_RAM" "$M6_UDP_MBPS")"
+        echo "[$tag] [ipv6] ping_loss=${M6_LOSS}% rtt=${M6_RTT}ms tcp=${M6_TCP}Mbit/s tcp_loss=${M6_TCP_LOSS}% udp=${M6_UDP_MBPS}Mbit/s udp_loss=${M6_UDP_LOSS}% cpu=${M6_CPU}% eff=${M6_EFF} ram=${M6_RAM}MB ram_eff=${M6_RAM_EFF}"
+        check_threshold "$tag" "ipv6" "ping_max_loss" "$M6_LOSS" "$loss"
+        check_threshold "$tag" "ipv6" "tcp_min_mbps" "$M6_TCP" "$loss"
+        check_threshold "$tag" "ipv6" "udp_min_mbps" "$M6_UDP_MBPS" "$loss"
+        sleep 0.5
+    fi
+}
+
+# ── helper: resource cleanup verification ─────────────────────────────────────
+verify_isolation() {
+    local name="$1"
+    local ns_list
+    ns_list="$(ip netns list 2>/dev/null | awk '{print $1}')"
+    local leaked_ns=()
+    local leaked_pids=()
+
+    case "$name" in
+        yip)
+            for ns in "$NS_YA" "$NS_YB"; do
+                if echo "$ns_list" | grep -qx "$ns"; then leaked_ns+=("$ns"); fi
+            done
+            if [ -n "$PID_YA" ] && kill -0 "$PID_YA" 2>/dev/null; then leaked_pids+=("$PID_YA(yipA)"); fi
+            if [ -n "$PID_YB" ] && kill -0 "$PID_YB" 2>/dev/null; then leaked_pids+=("$PID_YB(yipB)"); fi
+            ;;
+        wireguard|wg)
+            for ns in "$NS_WA" "$NS_WB"; do
+                if echo "$ns_list" | grep -qx "$ns"; then leaked_ns+=("$ns"); fi
+            done
+            ;;
+        wireguard-go|wggo)
+            for ns in "$NS_GGA" "$NS_GGB"; do
+                if echo "$ns_list" | grep -qx "$ns"; then leaked_ns+=("$ns"); fi
+            done
+            if [ -n "$PID_GGA" ] && kill -0 "$PID_GGA" 2>/dev/null; then leaked_pids+=("$PID_GGA(wggoA)"); fi
+            if [ -n "$PID_GGB" ] && kill -0 "$PID_GGB" 2>/dev/null; then leaked_pids+=("$PID_GGB(wggoB)"); fi
+            for p in $(pgrep -x wireguard-go 2>/dev/null || true); do
+                if [ "$p" != "$$" ] && [ -d "/proc/$p" ] && grep -q "$TMPDIR_TEST" "/proc/$p/cmdline" 2>/dev/null; then
+                    leaked_pids+=("$p(wireguard-go)")
+                fi
+            done
+            ;;
+        amneziawg|awg)
+            for ns in "$NS_AA" "$NS_AB"; do
+                if echo "$ns_list" | grep -qx "$ns"; then leaked_ns+=("$ns"); fi
+            done
+            if [ -n "$PID_AA" ] && kill -0 "$PID_AA" 2>/dev/null; then leaked_pids+=("$PID_AA(awgA)"); fi
+            if [ -n "$PID_AB" ] && kill -0 "$PID_AB" 2>/dev/null; then leaked_pids+=("$PID_AB(awgB)"); fi
+            for p in $(pgrep -x amneziawg-go 2>/dev/null || true); do
+                if [ "$p" != "$$" ] && [ -d "/proc/$p" ] && grep -q "$TMPDIR_TEST" "/proc/$p/cmdline" 2>/dev/null; then
+                    leaked_pids+=("$p(amneziawg-go)")
+                fi
+            done
+            ;;
+        openvpn|ovpn)
+            for ns in "$NS_OA" "$NS_OB"; do
+                if echo "$ns_list" | grep -qx "$ns"; then leaked_ns+=("$ns"); fi
+            done
+            if [ -n "$PID_OA" ] && kill -0 "$PID_OA" 2>/dev/null; then leaked_pids+=("$PID_OA(ovpnA)"); fi
+            if [ -n "$PID_OB" ] && kill -0 "$PID_OB" 2>/dev/null; then leaked_pids+=("$PID_OB(ovpnB)"); fi
+            for p in $(pgrep -x openvpn 2>/dev/null || true); do
+                if [ "$p" != "$$" ] && [ -d "/proc/$p" ] && grep -q "$TMPDIR_TEST" "/proc/$p/cmdline" 2>/dev/null; then
+                    leaked_pids+=("$p(openvpn)")
+                fi
+            done
+            ;;
+        n2n)
+            for ns in "$NS_NA" "$NS_NB"; do
+                if echo "$ns_list" | grep -qx "$ns"; then leaked_ns+=("$ns"); fi
+            done
+            if [ -n "$PID_N2N_SN" ] && kill -0 "$PID_N2N_SN" 2>/dev/null; then leaked_pids+=("$PID_N2N_SN(n2n_sn)"); fi
+            if [ -n "$PID_N2N_EA" ] && kill -0 "$PID_N2N_EA" 2>/dev/null; then leaked_pids+=("$PID_N2N_EA(n2n_ea)"); fi
+            if [ -n "$PID_N2N_EB" ] && kill -0 "$PID_N2N_EB" 2>/dev/null; then leaked_pids+=("$PID_N2N_EB(n2n_eb)"); fi
+            for p in $(pgrep -x edge 2>/dev/null || true); do
+                if [ "$p" != "$$" ] && [ -d "/proc/$p" ] && grep -q "$TMPDIR_TEST" "/proc/$p/cmdline" 2>/dev/null; then
+                    leaked_pids+=("$p(edge)")
+                fi
+            done
+            for p in $(pgrep -x supernode 2>/dev/null || true); do
+                if [ "$p" != "$$" ] && [ -d "/proc/$p" ] && grep -q "$TMPDIR_TEST" "/proc/$p/cmdline" 2>/dev/null; then
+                    leaked_pids+=("$p(supernode)")
+                fi
+            done
+            ;;
+        zerotier|zt)
+            for ns in "$NS_ZA" "$NS_ZB"; do
+                if echo "$ns_list" | grep -qx "$ns"; then leaked_ns+=("$ns"); fi
+            done
+            if [ -n "$PID_ZT_A" ] && kill -0 "$PID_ZT_A" 2>/dev/null; then leaked_pids+=("$PID_ZT_A(ztA)"); fi
+            if [ -n "$PID_ZT_B" ] && kill -0 "$PID_ZT_B" 2>/dev/null; then leaked_pids+=("$PID_ZT_B(ztB)"); fi
+            for p in $(pgrep -x zerotier-one 2>/dev/null || true); do
+                if [ "$p" != "$$" ] && [ -d "/proc/$p" ] && grep -q "$TMPDIR_TEST" "/proc/$p/cmdline" 2>/dev/null; then
+                    leaked_pids+=("$p(zerotier-one)")
+                fi
+            done
+            ;;
+        tailscale|ts)
+            for ns in "$NS_TA" "$NS_TB"; do
+                if echo "$ns_list" | grep -qx "$ns"; then leaked_ns+=("$ns"); fi
+            done
+            if [ -n "$PID_TS_HS" ] && kill -0 "$PID_TS_HS" 2>/dev/null; then leaked_pids+=("$PID_TS_HS(headscale)"); fi
+            if [ -n "$PID_TS_DA" ] && kill -0 "$PID_TS_DA" 2>/dev/null; then leaked_pids+=("$PID_TS_DA(tailscaledA)"); fi
+            if [ -n "$PID_TS_DB" ] && kill -0 "$PID_TS_DB" 2>/dev/null; then leaked_pids+=("$PID_TS_DB(tailscaledB)"); fi
+            for p in $(pgrep -x tailscaled 2>/dev/null || true); do
+                if [ "$p" != "$$" ] && [ -d "/proc/$p" ] && grep -q "$TMPDIR_TEST" "/proc/$p/cmdline" 2>/dev/null; then
+                    leaked_pids+=("$p(tailscaled)")
+                fi
+            done
+            for p in $(pgrep -x headscale 2>/dev/null || true); do
+                if [ "$p" != "$$" ] && [ -d "/proc/$p" ] && grep -q "$TMPDIR_TEST" "/proc/$p/cmdline" 2>/dev/null; then
+                    leaked_pids+=("$p(headscale)")
+                fi
+            done
+            ;;
+        netbird|nb)
+            for ns in "$NS_BA" "$NS_BB"; do
+                if echo "$ns_list" | grep -qx "$ns"; then leaked_ns+=("$ns"); fi
+            done
+            if [ -n "$PID_NB_SIG" ] && kill -0 "$PID_NB_SIG" 2>/dev/null; then leaked_pids+=("$PID_NB_SIG(nb_sig)"); fi
+            if [ -n "$PID_NB_MGMT" ] && kill -0 "$PID_NB_MGMT" 2>/dev/null; then leaked_pids+=("$PID_NB_MGMT(nb_mgmt)"); fi
+            if [ -n "$PID_NB_SA" ] && kill -0 "$PID_NB_SA" 2>/dev/null; then leaked_pids+=("$PID_NB_SA(nb_svcA)"); fi
+            if [ -n "$PID_NB_SB" ] && kill -0 "$PID_NB_SB" 2>/dev/null; then leaked_pids+=("$PID_NB_SB(nb_svcB)"); fi
+            for p in $(pgrep -x netbird 2>/dev/null || true); do
+                if [ "$p" != "$$" ] && [ -d "/proc/$p" ] && grep -q "$TMPDIR_TEST" "/proc/$p/cmdline" 2>/dev/null; then
+                    leaked_pids+=("$p(netbird)")
+                fi
+            done
+            for p in $(pgrep -x netbird-mgmt 2>/dev/null || true); do
+                if [ "$p" != "$$" ] && [ -d "/proc/$p" ] && grep -q "$TMPDIR_TEST" "/proc/$p/cmdline" 2>/dev/null; then
+                    leaked_pids+=("$p(netbird-mgmt)")
+                fi
+            done
+            for p in $(pgrep -x netbird-signal 2>/dev/null || true); do
+                if [ "$p" != "$$" ] && [ -d "/proc/$p" ] && grep -q "$TMPDIR_TEST" "/proc/$p/cmdline" 2>/dev/null; then
+                    leaked_pids+=("$p(netbird-signal)")
+                fi
+            done
+            ;;
+    esac
+
+    if [ ${#leaked_ns[@]} -gt 0 ] || [ ${#leaked_pids[@]} -gt 0 ]; then
+        echo "[warn] isolation leak detected after stopping $name:"
+        [ ${#leaked_ns[@]} -gt 0 ] && echo "  leaked namespaces: ${leaked_ns[*]}"
+        [ ${#leaked_pids[@]} -gt 0 ] && echo "  leaked pids: ${leaked_pids[*]}"
+        for ns in "${leaked_ns[@]}"; do
+            ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+            ip netns del "$ns" 2>/dev/null || true
+        done
+        for p in "${leaked_pids[@]}"; do
+            local pid="${p%%(*}"
+            kill -9 "$pid" 2>/dev/null || true
+        done
+        return 1
+    fi
+    return 0
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# yip setup (always)
+# Lifecycle: yip
 # ══════════════════════════════════════════════════════════════════════════════
-echo "[yip] generating keypairs"
-GENKEY_A="$("$YIPD" --genkey)"; GENKEY_B="$("$YIPD" --genkey)"
-PRIV_A="$(echo "$GENKEY_A" | grep '^private=' | cut -d= -f2)"
-PUB_A="$(echo "$GENKEY_A"  | grep '^public='  | cut -d= -f2)"
-PRIV_B="$(echo "$GENKEY_B" | grep '^private=' | cut -d= -f2)"
-PUB_B="$(echo "$GENKEY_B"  | grep '^public='  | cut -d= -f2)"
-CFG_A="$TMPDIR_TEST/yipA.conf"; CFG_B="$TMPDIR_TEST/yipB.conf"
-cat > "$CFG_A" <<EOF
+start_yip() {
+    echo "[yip] generating keypairs"
+    local GENKEY_A GENKEY_B PRIV_A PUB_A PRIV_B PUB_B
+    GENKEY_A="$("$YIPD" --genkey)"; GENKEY_B="$("$YIPD" --genkey)"
+    PRIV_A="$(echo "$GENKEY_A" | grep '^private=' | cut -d= -f2)"
+    PUB_A="$(echo "$GENKEY_A"  | grep '^public='  | cut -d= -f2)"
+    PRIV_B="$(echo "$GENKEY_B" | grep '^private=' | cut -d= -f2)"
+    PUB_B="$(echo "$GENKEY_B"  | grep '^public='  | cut -d= -f2)"
+    CFG_A="$TMPDIR_TEST/yipA.conf"; CFG_B="$TMPDIR_TEST/yipB.conf"
+    cat > "$CFG_A" <<EOF
 local_private=${PRIV_A}
 local_public=${PUB_A}
 peer_public=${PUB_B}
@@ -556,7 +777,7 @@ ${YIP_XDP:+xdp=$YIP_XDP}
 ${YIP_XDP:+xdp_ifname=${YIP_XDP_IFNAME:-$VYA}}
 ${YIP_XDP_MODE:+xdp_mode=$YIP_XDP_MODE}
 EOF
-cat > "$CFG_B" <<EOF
+    cat > "$CFG_B" <<EOF
 local_private=${PRIV_B}
 local_public=${PUB_B}
 peer_public=${PUB_A}
@@ -571,62 +792,77 @@ ${YIP_XDP:+xdp_ifname=${YIP_XDP_IFNAME:-$VYB}}
 ${YIP_XDP_MODE:+xdp_mode=$YIP_XDP_MODE}
 EOF
 
-echo "[yip] creating namespaces and veth pair"
-make_pair "$NS_YA" "$NS_YB" "$VYA" "$VYB" "$VYA_IP" "$VYB_IP"
-LOG_A="$TMPDIR_TEST/yipA.log"; LOG_B="$TMPDIR_TEST/yipB.log"
-echo "[yip] starting daemons"
-ip netns exec "$NS_YA" "$YIPD" "$CFG_A" >"$LOG_A" 2>&1 &
-PID_YA=$!
-ip netns exec "$NS_YB" "$YIPD" "$CFG_B" >"$LOG_B" 2>&1 &
-PID_YB=$!
+    echo "[yip] creating namespaces and veth pair"
+    make_pair "$NS_YA" "$NS_YB" "$VYA" "$VYB" "$VYA_IP" "$VYB_IP"
+    LOG_A="$TMPDIR_TEST/yipA.log"; LOG_B="$TMPDIR_TEST/yipB.log"
+    echo "[yip] starting daemons"
+    ip netns exec "$NS_YA" "$YIPD" "$CFG_A" >"$LOG_A" 2>&1 &
+    PID_YA=$!
+    ip netns exec "$NS_YB" "$YIPD" "$CFG_B" >"$LOG_B" 2>&1 &
+    PID_YB=$!
 
-echo "[yip] waiting for TUN devices (up to 20s)"
-elapsed=0
-while true; do
-    A_UP=0; B_UP=0
-    ip netns exec "$NS_YA" ip link show "$TUN_DEV" >/dev/null 2>&1 && A_UP=1 || true
-    ip netns exec "$NS_YB" ip link show "$TUN_DEV" >/dev/null 2>&1 && B_UP=1 || true
-    [ "$A_UP" -eq 1 ] && [ "$B_UP" -eq 1 ] && { echo "[yip] both TUN up"; break; }
-    if ! kill -0 "$PID_YA" 2>/dev/null; then echo "[error] yipA died"; cat "$LOG_A" || true; exit 1; fi
-    if ! kill -0 "$PID_YB" 2>/dev/null; then echo "[error] yipB died"; cat "$LOG_B" || true; exit 1; fi
-    elapsed=$(awk "BEGIN {print $elapsed + 0.25}")
-    if awk "BEGIN {exit ($elapsed >= 20) ? 0 : 1}"; then
-        echo "[error] timed out waiting for yip TUN"; cat "$LOG_A" "$LOG_B" || true; exit 1
-    fi
-    sleep 0.25
-done
-# yipd configures its own device MTU via config 'mtu=' on interface creation
-ip netns exec "$NS_YA" ip link set dev "$TUN_DEV" txqueuelen 10000
-ip netns exec "$NS_YB" ip link set dev "$TUN_DEV" txqueuelen 10000
-ip netns exec "$NS_YA" ip link set "$TUN_DEV" up
-ip netns exec "$NS_YB" ip link set "$TUN_DEV" up
-ip netns exec "$NS_YA" sysctl -qw net.ipv6.conf."$TUN_DEV".disable_ipv6=0 net.ipv6.conf."$TUN_DEV".accept_dad=0 2>/dev/null || true
-ip netns exec "$NS_YB" sysctl -qw net.ipv6.conf."$TUN_DEV".disable_ipv6=0 net.ipv6.conf."$TUN_DEV".accept_dad=0 2>/dev/null || true
-ip netns exec "$NS_YA" ip addr add "${TUN_YA_IP}/24" dev "$TUN_DEV"
-ip netns exec "$NS_YB" ip addr add "${TUN_YB_IP}/24" dev "$TUN_DEV"
-ip netns exec "$NS_YA" ip -6 addr add "${TUN_YA_IP6}/64" dev "$TUN_DEV" nodad
-ip netns exec "$NS_YB" ip -6 addr add "${TUN_YB_IP6}/64" dev "$TUN_DEV" nodad
-sleep 0.5
-echo "[yip] baseline connectivity check"
-ip netns exec "$NS_YB" ping -c 3 -W 5 "$TUN_YA_IP" >/dev/null || {
-    echo "[error] yip baseline IPv4 ping failed"; cat "$LOG_A" "$LOG_B" || true; exit 1
+    echo "[yip] waiting for TUN devices (up to 20s)"
+    local elapsed=0
+    while true; do
+        local A_UP=0 B_UP=0
+        ip netns exec "$NS_YA" ip link show "$TUN_DEV" >/dev/null 2>&1 && A_UP=1 || true
+        ip netns exec "$NS_YB" ip link show "$TUN_DEV" >/dev/null 2>&1 && B_UP=1 || true
+        [ "$A_UP" -eq 1 ] && [ "$B_UP" -eq 1 ] && { echo "[yip] both TUN up"; break; }
+        if ! kill -0 "$PID_YA" 2>/dev/null; then echo "[error] yipA died"; cat "$LOG_A" || true; exit 1; fi
+        if ! kill -0 "$PID_YB" 2>/dev/null; then echo "[error] yipB died"; cat "$LOG_B" || true; exit 1; fi
+        elapsed=$(awk "BEGIN {print $elapsed + 0.25}")
+        if awk "BEGIN {exit ($elapsed >= 20) ? 0 : 1}"; then
+            echo "[error] timed out waiting for yip TUN"; cat "$LOG_A" "$LOG_B" || true; exit 1
+        fi
+        sleep 0.25
+    done
+    ip netns exec "$NS_YA" ip link set dev "$TUN_DEV" txqueuelen 10000 2>/dev/null || true
+    ip netns exec "$NS_YB" ip link set dev "$TUN_DEV" txqueuelen 10000 2>/dev/null || true
+    ip netns exec "$NS_YA" ip link set "$TUN_DEV" up 2>/dev/null || true
+    ip netns exec "$NS_YB" ip link set "$TUN_DEV" up 2>/dev/null || true
+    ip netns exec "$NS_YA" sysctl -qw net.ipv6.conf."$TUN_DEV".disable_ipv6=0 net.ipv6.conf."$TUN_DEV".accept_dad=0 2>/dev/null || true
+    ip netns exec "$NS_YB" sysctl -qw net.ipv6.conf."$TUN_DEV".disable_ipv6=0 net.ipv6.conf."$TUN_DEV".accept_dad=0 2>/dev/null || true
+    ip netns exec "$NS_YA" ip addr add "${TUN_YA_IP}/24" dev "$TUN_DEV" 2>/dev/null || true
+    ip netns exec "$NS_YB" ip addr add "${TUN_YB_IP}/24" dev "$TUN_DEV" 2>/dev/null || true
+    ip netns exec "$NS_YA" ip -6 addr add "${TUN_YA_IP6}/64" dev "$TUN_DEV" nodad 2>/dev/null || true
+    ip netns exec "$NS_YB" ip -6 addr add "${TUN_YB_IP6}/64" dev "$TUN_DEV" nodad 2>/dev/null || true
+    sleep 0.5
+    echo "[yip] baseline connectivity check"
+    ip netns exec "$NS_YB" ping -c 3 -W 5 "$TUN_YA_IP" >/dev/null || {
+        echo "[error] yip baseline IPv4 ping failed"; cat "$LOG_A" "$LOG_B" || true; exit 1
+    }
+    ip netns exec "$NS_YB" ping -6 -c 3 -W 5 "$TUN_YA_IP6" >/dev/null || {
+        echo "[error] yip baseline IPv6 ping failed"; cat "$LOG_A" "$LOG_B" || true; exit 1
+    }
+    return 0
 }
-ip netns exec "$NS_YB" ping -6 -c 3 -W 5 "$TUN_YA_IP6" >/dev/null || {
-    echo "[error] yip baseline IPv6 ping failed"; cat "$LOG_A" "$LOG_B" || true; exit 1
+
+stop_yip() {
+    [ -n "$PID_YA" ] && kill "$PID_YA" 2>/dev/null || true
+    [ -n "$PID_YB" ] && kill "$PID_YB" 2>/dev/null || true
+    sleep 0.1
+    [ -n "$PID_YA" ] && kill -9 "$PID_YA" 2>/dev/null || true
+    [ -n "$PID_YB" ] && kill -9 "$PID_YB" 2>/dev/null || true
+    PID_YA=""; PID_YB=""
+    for ns in "$NS_YA" "$NS_YB"; do
+        ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+        ip netns del "$ns" 2>/dev/null || true
+    done
+    rm -f "$CFG_A" "$CFG_B" 2>/dev/null || true
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# WireGuard setup
+# Lifecycle: WireGuard
 # ══════════════════════════════════════════════════════════════════════════════
-setup_wg() {
-    if ! contender_wanted "wireguard" && ! contender_wanted "wg"; then WG_AVAILABLE=false; return; fi
+start_wg() {
+    if ! contender_wanted "wireguard" && ! contender_wanted "wg"; then WG_AVAILABLE=false; return 1; fi
+    if [ "${WG_AVAILABLE:-}" = false ]; then return 1; fi
     if ! command -v wg >/dev/null 2>&1; then
-        echo "[wg] SKIP: 'wg' command not found"; WG_AVAILABLE=false; return
+        echo "[wg] SKIP: 'wg' command not found"; WG_AVAILABLE=false; return 1
     fi
     if ! modprobe wireguard 2>/dev/null; then
-        echo "[wg] SKIP: modprobe wireguard failed"; WG_AVAILABLE=false; return
+        echo "[wg] SKIP: modprobe wireguard failed"; WG_AVAILABLE=false; return 1
     fi
-    # If Ubuntu AppArmor confines /usr/bin/wg, unload or complain so it can read keys
     apparmor_parser -R /etc/apparmor.d/wg 2>/dev/null || true
     apparmor_parser -R /etc/apparmor.d/usr.bin.wg 2>/dev/null || true
     echo "[wg] generating keypairs"
@@ -634,13 +870,13 @@ setup_wg() {
     privA="$(wg genkey 2>/dev/null || true)"; pubA="$(echo "$privA" | wg pubkey 2>/dev/null || true)"
     privB="$(wg genkey 2>/dev/null || true)"; pubB="$(echo "$privB" | wg pubkey 2>/dev/null || true)"
     if [ -z "$privA" ] || [ -z "$privB" ]; then
-        echo "[wg] SKIP: key generation failed"; WG_AVAILABLE=false; return
+        echo "[wg] SKIP: key generation failed"; WG_AVAILABLE=false; return 1
     fi
     echo "[wg] creating namespaces and veth pair"
     make_pair "$NS_WA" "$NS_WB" "$VWA" "$VWB" "$VWA_IP" "$VWB_IP"
     if ! ip netns exec "$NS_WA" ip link add wg0 type wireguard 2>/dev/null || \
        ! ip netns exec "$NS_WB" ip link add wg0 type wireguard 2>/dev/null; then
-        echo "[wg] SKIP: wireguard interface creation failed"; WG_AVAILABLE=false; return
+        echo "[wg] SKIP: wireguard interface creation failed"; WG_AVAILABLE=false; return 1
     fi
     local wg_dir="/etc/wireguard"
     if [ ! -d "$wg_dir" ]; then
@@ -656,46 +892,58 @@ setup_wg() {
             peer "$pubB" endpoint "${VWB_IP}:${WPORT_B}" allowed-ips "${TUN_WB_IP}/32,fd00:13::/64" 2>&1)" || \
        ! wg_err="$(ip netns exec "$NS_WB" wg set wg0 private-key "$keyB" listen-port "$WPORT_B" \
             peer "$pubA" endpoint "${VWA_IP}:${WPORT_A}" allowed-ips "${TUN_WA_IP}/32,fd00:13::/64" 2>&1)"; then
-        echo "[wg] SKIP: wg set configuration failed: $wg_err"; WG_AVAILABLE=false; return
+        echo "[wg] SKIP: wg set configuration failed: $wg_err"; WG_AVAILABLE=false; return 1
     fi
     if ! ip netns exec "$NS_WA" ip addr add "${TUN_WA_IP}/24" dev wg0 2>/dev/null || \
        ! ip netns exec "$NS_WB" ip addr add "${TUN_WB_IP}/24" dev wg0 2>/dev/null || \
        ! ip netns exec "$NS_WA" ip -6 addr add "${TUN_WA_IP6}/64" dev wg0 nodad 2>/dev/null || \
        ! ip netns exec "$NS_WB" ip -6 addr add "${TUN_WB_IP6}/64" dev wg0 nodad 2>/dev/null; then
-        echo "[wg] SKIP: interface setup failed"; WG_AVAILABLE=false; return
+        echo "[wg] SKIP: interface setup failed"; WG_AVAILABLE=false; return 1
     fi
     ip netns exec "$NS_WA" ip link set dev wg0 txqueuelen 10000 2>/dev/null || true
     ip netns exec "$NS_WB" ip link set dev wg0 txqueuelen 10000 2>/dev/null || true
     if ! ip netns exec "$NS_WA" ip link set wg0 up 2>/dev/null || \
        ! ip netns exec "$NS_WB" ip link set wg0 up 2>/dev/null; then
-        echo "[wg] SKIP: interface setup failed"; WG_AVAILABLE=false; return
+        echo "[wg] SKIP: interface setup failed"; WG_AVAILABLE=false; return 1
     fi
     sleep 0.5
     if ! ip netns exec "$NS_WB" ping -c 3 -W 5 "$TUN_WA_IP" >/dev/null 2>&1; then
-        echo "[wg] SKIP: baseline IPv4 ping failed"; WG_AVAILABLE=false; return
+        echo "[wg] SKIP: baseline IPv4 ping failed"; WG_AVAILABLE=false; return 1
     fi
     if ! ip netns exec "$NS_WB" ping -6 -c 3 -W 5 "$TUN_WA_IP6" >/dev/null 2>&1; then
-        echo "[wg] SKIP: baseline IPv6 ping failed"; WG_AVAILABLE=false; return
+        echo "[wg] SKIP: baseline IPv6 ping failed"; WG_AVAILABLE=false; return 1
     fi
     echo "[wg] tunnel up"
+    WG_AVAILABLE=true
+    return 0
 }
-setup_wg
+
+stop_wg() {
+    ip netns exec "$NS_WA" ip link del wg0 2>/dev/null || true
+    ip netns exec "$NS_WB" ip link del wg0 2>/dev/null || true
+    rm -f /etc/wireguard/wg_a /etc/wireguard/wg_b "$TMPDIR_TEST/wg_a" "$TMPDIR_TEST/wg_b" 2>/dev/null || true
+    for ns in "$NS_WA" "$NS_WB"; do
+        ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+        ip netns del "$ns" 2>/dev/null || true
+    done
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# WireGuard-Go setup
+# Lifecycle: WireGuard-Go
 # ══════════════════════════════════════════════════════════════════════════════
-setup_wireguard_go() {
-    if ! contender_wanted "wireguard-go" && ! contender_wanted "wggo"; then WGGO_AVAILABLE=false; return; fi
+start_wireguard_go() {
+    if ! contender_wanted "wireguard-go" && ! contender_wanted "wggo"; then WGGO_AVAILABLE=false; return 1; fi
+    if [ "${WGGO_AVAILABLE:-}" = false ]; then return 1; fi
     local wggo_bin="wireguard-go"
     if ! command -v "$wggo_bin" >/dev/null 2>&1; then
         if command -v wireguard >/dev/null 2>&1; then
             wggo_bin="wireguard"
         else
-            echo "[wggo] SKIP: 'wireguard-go' command not found"; WGGO_AVAILABLE=false; return
+            echo "[wggo] SKIP: 'wireguard-go' command not found"; WGGO_AVAILABLE=false; return 1
         fi
     fi
     if ! command -v wg >/dev/null 2>&1; then
-        echo "[wggo] SKIP: 'wg' command not found"; WGGO_AVAILABLE=false; return
+        echo "[wggo] SKIP: 'wg' command not found"; WGGO_AVAILABLE=false; return 1
     fi
     apparmor_parser -R /etc/apparmor.d/wg 2>/dev/null || true
     apparmor_parser -R /etc/apparmor.d/usr.bin.wg 2>/dev/null || true
@@ -704,10 +952,9 @@ setup_wireguard_go() {
     privA="$(wg genkey 2>/dev/null || true)"; pubA="$(echo "$privA" | wg pubkey 2>/dev/null || true)"
     privB="$(wg genkey 2>/dev/null || true)"; pubB="$(echo "$privB" | wg pubkey 2>/dev/null || true)"
     if [ -z "$privA" ] || [ -z "$privB" ]; then
-        echo "[wggo] SKIP: key generation failed"; WGGO_AVAILABLE=false; return
+        echo "[wggo] SKIP: key generation failed"; WGGO_AVAILABLE=false; return 1
     fi
 
-    # Set up per-namespace UAPI directory so wireguard-go instances do not collide
     mkdir -p /etc/wireguard-run
     mkdir -p "/etc/netns/$NS_GGA/wireguard-run" "/etc/netns/$NS_GGB/wireguard-run"
     if [ ! -L /run/wireguard ]; then
@@ -736,7 +983,7 @@ setup_wireguard_go() {
     if [ "$wggo_up" = false ]; then
         echo "[wggo] SKIP: wggo0 interface creation failed or timed out"
         tail -5 "$TMPDIR_TEST/wggo-a.log" "$TMPDIR_TEST/wggo-b.log" 2>/dev/null || true
-        WGGO_AVAILABLE=false; return
+        WGGO_AVAILABLE=false; return 1
     fi
 
     local keyA="$TMPDIR_TEST/wggo_a"
@@ -750,14 +997,14 @@ setup_wireguard_go() {
             peer "$pubB" endpoint "${VGGB_IP}:${GGPORT_B}" allowed-ips "${TUN_GGB_IP}/32,fd00:27::/64" 2>&1)" || \
        ! wg_err="$(ip netns exec "$NS_GGB" wg set wggo0 private-key "$keyB" listen-port "$GGPORT_B" \
             peer "$pubA" endpoint "${VGGA_IP}:${GGPORT_A}" allowed-ips "${TUN_GGA_IP}/32,fd00:27::/64" 2>&1)"; then
-        echo "[wggo] SKIP: wg set configuration failed: $wg_err"; WGGO_AVAILABLE=false; return
+        echo "[wggo] SKIP: wg set configuration failed: $wg_err"; WGGO_AVAILABLE=false; return 1
     fi
 
     if ! ip netns exec "$NS_GGA" ip addr add "${TUN_GGA_IP}/24" dev wggo0 2>/dev/null || \
        ! ip netns exec "$NS_GGB" ip addr add "${TUN_GGB_IP}/24" dev wggo0 2>/dev/null || \
        ! ip netns exec "$NS_GGA" ip -6 addr add "${TUN_GGA_IP6}/64" dev wggo0 nodad 2>/dev/null || \
        ! ip netns exec "$NS_GGB" ip -6 addr add "${TUN_GGB_IP6}/64" dev wggo0 nodad 2>/dev/null; then
-        echo "[wggo] SKIP: interface setup failed"; WGGO_AVAILABLE=false; return
+        echo "[wggo] SKIP: interface setup failed"; WGGO_AVAILABLE=false; return 1
     fi
 
     ip netns exec "$NS_GGA" ip link set dev wggo0 txqueuelen 10000 2>/dev/null || true
@@ -767,27 +1014,49 @@ setup_wireguard_go() {
 
     if ! ip netns exec "$NS_GGA" ip link set wggo0 up 2>/dev/null || \
        ! ip netns exec "$NS_GGB" ip link set wggo0 up 2>/dev/null; then
-        echo "[wggo] SKIP: interface set up failed"; WGGO_AVAILABLE=false; return
+        echo "[wggo] SKIP: interface set up failed"; WGGO_AVAILABLE=false; return 1
     fi
 
     sleep 0.5
     if ! ip netns exec "$NS_GGB" ping -c 3 -W 5 "$TUN_GGA_IP" >/dev/null 2>&1; then
-        echo "[wggo] SKIP: baseline IPv4 ping failed"; WGGO_AVAILABLE=false; return
+        echo "[wggo] SKIP: baseline IPv4 ping failed"; WGGO_AVAILABLE=false; return 1
     fi
     if ! ip netns exec "$NS_GGB" ping -6 -c 3 -W 5 "$TUN_GGA_IP6" >/dev/null 2>&1; then
-        echo "[wggo] SKIP: baseline IPv6 ping failed"; WGGO_AVAILABLE=false; return
+        echo "[wggo] SKIP: baseline IPv6 ping failed"; WGGO_AVAILABLE=false; return 1
     fi
     echo "[wggo] tunnel up"
+    WGGO_AVAILABLE=true
+    return 0
 }
-setup_wireguard_go
+
+stop_wireguard_go() {
+    [ -n "$PID_GGA" ] && kill "$PID_GGA" 2>/dev/null || true
+    [ -n "$PID_GGB" ] && kill "$PID_GGB" 2>/dev/null || true
+    sleep 0.1
+    [ -n "$PID_GGA" ] && kill -9 "$PID_GGA" 2>/dev/null || true
+    [ -n "$PID_GGB" ] && kill -9 "$PID_GGB" 2>/dev/null || true
+    PID_GGA=""; PID_GGB=""
+    ip netns exec "$NS_GGA" ip link del wggo0 2>/dev/null || true
+    ip netns exec "$NS_GGB" ip link del wggo0 2>/dev/null || true
+    rm -rf "/etc/netns/$NS_GGA" "/etc/netns/$NS_GGB" /etc/wireguard-run 2>/dev/null || true
+    if [ -L /run/wireguard ]; then
+        rm -f /run/wireguard 2>/dev/null || true
+    fi
+    rm -f "$TMPDIR_TEST/wggo_a" "$TMPDIR_TEST/wggo_b" 2>/dev/null || true
+    for ns in "$NS_GGA" "$NS_GGB"; do
+        ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+        ip netns del "$ns" 2>/dev/null || true
+    done
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AmneziaWG setup (kernel module or amneziawg-go)
+# Lifecycle: AmneziaWG
 # ══════════════════════════════════════════════════════════════════════════════
-setup_awg() {
-    if ! contender_wanted "amneziawg" && ! contender_wanted "awg"; then AWG_AVAILABLE=false; return; fi
+start_awg() {
+    if ! contender_wanted "amneziawg" && ! contender_wanted "awg"; then AWG_AVAILABLE=false; return 1; fi
+    if [ "${AWG_AVAILABLE:-}" = false ]; then return 1; fi
     if ! command -v awg >/dev/null 2>&1; then
-        echo "[awg] SKIP: 'awg' command not found"; AWG_AVAILABLE=false; return
+        echo "[awg] SKIP: 'awg' command not found"; AWG_AVAILABLE=false; return 1
     fi
     local use_go=false
     if ! modprobe amneziawg 2>/dev/null; then
@@ -795,7 +1064,7 @@ setup_awg() {
             use_go=true
         else
             echo "[awg] SKIP: neither amneziawg kernel module nor amneziawg-go found"
-            AWG_AVAILABLE=false; return
+            AWG_AVAILABLE=false; return 1
         fi
     fi
     echo "[awg] generating keypairs"
@@ -803,7 +1072,7 @@ setup_awg() {
     privA="$(awg genkey 2>/dev/null || true)"; pubA="$(echo "$privA" | awg pubkey 2>/dev/null || true)"
     privB="$(awg genkey 2>/dev/null || true)"; pubB="$(echo "$privB" | awg pubkey 2>/dev/null || true)"
     if [ -z "$privA" ] || [ -z "$privB" ]; then
-        echo "[awg] SKIP: key generation failed"; AWG_AVAILABLE=false; return
+        echo "[awg] SKIP: key generation failed"; AWG_AVAILABLE=false; return 1
     fi
     echo "[awg] creating namespaces and veth pair"
     make_pair "$NS_AA" "$NS_AB" "$VAA" "$VAB" "$VAA_IP" "$VAB_IP"
@@ -826,7 +1095,7 @@ setup_awg() {
     else
         if ! ip netns exec "$NS_AA" ip link add awg0 type amneziawg 2>/dev/null || \
            ! ip netns exec "$NS_AB" ip link add awg0 type amneziawg 2>/dev/null; then
-            echo "[awg] SKIP: amneziawg link add failed"; AWG_AVAILABLE=false; return
+            echo "[awg] SKIP: amneziawg link add failed"; AWG_AVAILABLE=false; return 1
         fi
     fi
 
@@ -842,14 +1111,14 @@ setup_awg() {
     if [ "$awg_up" = false ]; then
         echo "[awg] SKIP: awg0 interface creation failed or timed out"
         tail -5 "$TMPDIR_TEST/awg-go-a.log" "$TMPDIR_TEST/awg-go-b.log" 2>/dev/null || true
-        AWG_AVAILABLE=false; return
+        AWG_AVAILABLE=false; return 1
     fi
 
     if ! ip netns exec "$NS_AA" ip addr add "${TUN_AA_IP}/24" dev awg0 2>/dev/null || \
        ! ip netns exec "$NS_AB" ip addr add "${TUN_AB_IP}/24" dev awg0 2>/dev/null || \
        ! ip netns exec "$NS_AA" ip -6 addr add "${TUN_AA_IP6}/64" dev awg0 nodad 2>/dev/null || \
        ! ip netns exec "$NS_AB" ip -6 addr add "${TUN_AB_IP6}/64" dev awg0 nodad 2>/dev/null; then
-        echo "[awg] SKIP: ip addr add failed"; AWG_AVAILABLE=false; return
+        echo "[awg] SKIP: ip addr add failed"; AWG_AVAILABLE=false; return 1
     fi
 
     local CFG_AA="$TMPDIR_TEST/awgA.conf"; local CFG_AB="$TMPDIR_TEST/awgB.conf"
@@ -896,32 +1165,53 @@ EOF
 
     if ! ip netns exec "$NS_AA" awg setconf awg0 "$CFG_AA" 2>/dev/null || \
        ! ip netns exec "$NS_AB" awg setconf awg0 "$CFG_AB" 2>/dev/null; then
-        echo "[awg] SKIP: awg setconf failed"; AWG_AVAILABLE=false; return
+        echo "[awg] SKIP: awg setconf failed"; AWG_AVAILABLE=false; return 1
     fi
     ip netns exec "$NS_AA" ip link set dev awg0 txqueuelen 10000 2>/dev/null || true
     ip netns exec "$NS_AB" ip link set dev awg0 txqueuelen 10000 2>/dev/null || true
     if ! ip netns exec "$NS_AA" ip link set awg0 up 2>/dev/null || \
        ! ip netns exec "$NS_AB" ip link set awg0 up 2>/dev/null; then
-        echo "[awg] SKIP: ip link set up failed"; AWG_AVAILABLE=false; return
+        echo "[awg] SKIP: ip link set up failed"; AWG_AVAILABLE=false; return 1
     fi
     sleep 0.5
     if ! ip netns exec "$NS_AB" ping -c 3 -W 5 "$TUN_AA_IP" >/dev/null 2>&1; then
-        echo "[awg] SKIP: baseline IPv4 ping failed"; AWG_AVAILABLE=false; return
+        echo "[awg] SKIP: baseline IPv4 ping failed"; AWG_AVAILABLE=false; return 1
     fi
     if ! ip netns exec "$NS_AB" ping -6 -c 3 -W 5 "$TUN_AA_IP6" >/dev/null 2>&1; then
-        echo "[awg] SKIP: baseline IPv6 ping failed"; AWG_AVAILABLE=false; return
+        echo "[awg] SKIP: baseline IPv6 ping failed"; AWG_AVAILABLE=false; return 1
     fi
     echo "[awg] tunnel up"
+    AWG_AVAILABLE=true
+    return 0
 }
-setup_awg
+
+stop_awg() {
+    [ -n "$PID_AA" ] && kill "$PID_AA" 2>/dev/null || true
+    [ -n "$PID_AB" ] && kill "$PID_AB" 2>/dev/null || true
+    sleep 0.1
+    [ -n "$PID_AA" ] && kill -9 "$PID_AA" 2>/dev/null || true
+    [ -n "$PID_AB" ] && kill -9 "$PID_AB" 2>/dev/null || true
+    PID_AA=""; PID_AB=""
+    ip netns exec "$NS_AA" ip link del awg0 2>/dev/null || true
+    ip netns exec "$NS_AB" ip link del awg0 2>/dev/null || true
+    rm -rf "/etc/netns/$NS_AA" "/etc/netns/$NS_AB" /etc/amneziawg-run 2>/dev/null || true
+    if [ -L /run/amneziawg ]; then rm -f /run/amneziawg 2>/dev/null || true; fi
+    if [ -L /var/run/amneziawg ]; then rm -f /var/run/amneziawg 2>/dev/null || true; fi
+    rm -f "$TMPDIR_TEST/awgA.conf" "$TMPDIR_TEST/awgB.conf" 2>/dev/null || true
+    for ns in "$NS_AA" "$NS_AB"; do
+        ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+        ip netns del "$ns" 2>/dev/null || true
+    done
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# OpenVPN setup (peer-fingerprint, UDP, AES-256-GCM)
+# Lifecycle: OpenVPN
 # ══════════════════════════════════════════════════════════════════════════════
-setup_ovpn() {
-    if ! contender_wanted "openvpn" && ! contender_wanted "ovpn"; then OVPN_AVAILABLE=false; return; fi
+start_ovpn() {
+    if ! contender_wanted "openvpn" && ! contender_wanted "ovpn"; then OVPN_AVAILABLE=false; return 1; fi
+    if [ "${OVPN_AVAILABLE:-}" = false ]; then return 1; fi
     if ! command -v openvpn >/dev/null 2>&1; then
-        echo "[ovpn] SKIP: 'openvpn' not found"; OVPN_AVAILABLE=false; return
+        echo "[ovpn] SKIP: 'openvpn' not found"; OVPN_AVAILABLE=false; return 1
     fi
     echo "[ovpn] generating self-signed certificates"
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
@@ -947,6 +1237,7 @@ setup_ovpn() {
         --peer-fingerprint "$FB" --data-ciphers AES-256-GCM \
         --proto udp --verb 1 --ping 10 --ping-restart 0 \
         >"$TMPDIR_TEST/ovpn-a.log" 2>&1 &
+    PID_OA=$!
     ip netns exec "$NS_OB" openvpn \
         --dev tun0 --dev-type tun \
         --remote "$VOA_IP" --rport 1194 --ifconfig "$TUN_OB_IP" "$TUN_OA_IP" \
@@ -955,6 +1246,7 @@ setup_ovpn() {
         --peer-fingerprint "$FA" --data-ciphers AES-256-GCM \
         --proto udp --verb 1 --ping 10 --ping-restart 0 \
         >"$TMPDIR_TEST/ovpn-b.log" 2>&1 &
+    PID_OB=$!
     local i
     for i in $(seq 1 60); do
         ip netns exec "$NS_OA" ip link show tun0 >/dev/null 2>&1 \
@@ -976,34 +1268,55 @@ setup_ovpn() {
     if [ "$ovpn_up" = false ]; then
         echo "[ovpn] SKIP: baseline IPv4 ping failed"
         tail -5 "$TMPDIR_TEST/ovpn-a.log" "$TMPDIR_TEST/ovpn-b.log" 2>/dev/null || true
-        OVPN_AVAILABLE=false; return
+        OVPN_AVAILABLE=false; return 1
     fi
     if ! ip netns exec "$NS_OB" ping -6 -c 3 -W 5 "$TUN_OA_IP6" >/dev/null 2>&1; then
         echo "[ovpn] SKIP: baseline IPv6 ping failed"
         tail -5 "$TMPDIR_TEST/ovpn-a.log" "$TMPDIR_TEST/ovpn-b.log" 2>/dev/null || true
-        OVPN_AVAILABLE=false; return
+        OVPN_AVAILABLE=false; return 1
     fi
     echo "[ovpn] tunnel up"
+    OVPN_AVAILABLE=true
+    return 0
 }
-setup_ovpn
+
+stop_ovpn() {
+    [ -n "$PID_OA" ] && kill "$PID_OA" 2>/dev/null || true
+    [ -n "$PID_OB" ] && kill "$PID_OB" 2>/dev/null || true
+    sleep 0.1
+    [ -n "$PID_OA" ] && kill -9 "$PID_OA" 2>/dev/null || true
+    [ -n "$PID_OB" ] && kill -9 "$PID_OB" 2>/dev/null || true
+    PID_OA=""; PID_OB=""
+    ip netns exec "$NS_OA" ip link del tun0 2>/dev/null || true
+    ip netns exec "$NS_OB" ip link del tun0 2>/dev/null || true
+    for ns in "$NS_OA" "$NS_OB"; do
+        ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+        ip netns del "$ns" 2>/dev/null || true
+    done
+    rm -f "$TMPDIR_TEST/ovpn-a."* "$TMPDIR_TEST/ovpn-b."* 2>/dev/null || true
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# n2n setup (supernode + 2 edges; TAP L2 overlay, also carries L3)
+# Lifecycle: n2n
 # ══════════════════════════════════════════════════════════════════════════════
-setup_n2n() {
-    if ! contender_wanted "n2n"; then N2N_AVAILABLE=false; return; fi
+start_n2n() {
+    if ! contender_wanted "n2n"; then N2N_AVAILABLE=false; return 1; fi
+    if [ "${N2N_AVAILABLE:-}" = false ]; then return 1; fi
     if ! command -v supernode >/dev/null 2>&1 || ! command -v edge >/dev/null 2>&1; then
-        echo "[n2n] SKIP: 'supernode'/'edge' not found"; N2N_AVAILABLE=false; return
+        echo "[n2n] SKIP: 'supernode'/'edge' not found"; N2N_AVAILABLE=false; return 1
     fi
     killall -9 edge supernode 2>/dev/null || true
     echo "[n2n] creating namespaces and veth pair"
     make_pair "$NS_NA" "$NS_NB" "$VNA" "$VNB" "$VNA_IP" "$VNB_IP"
     ip netns exec "$NS_NA" supernode -p "$N2N_PORT" -f -M >"$TMPDIR_TEST/n2-sn.log" 2>&1 &
+    PID_N2N_SN=$!
     sleep 0.5
     ip netns exec "$NS_NA" edge -c bench -k benchkey -a "${OVL_NA_IP}/24" -l "$VNA_IP":"$N2N_PORT" \
         -d n2n0 -f -r -E >"$TMPDIR_TEST/n2-eA.log" 2>&1 &
+    PID_N2N_EA=$!
     ip netns exec "$NS_NB" edge -c bench -k benchkey -a "${OVL_NB_IP}/24" -l "$VNA_IP":"$N2N_PORT" \
         -d n2n0 -f -r -E >"$TMPDIR_TEST/n2-eB.log" 2>&1 &
+    PID_N2N_EB=$!
     local i
     for i in $(seq 1 60); do
         ip netns exec "$NS_NA" ip link show n2n0 >/dev/null 2>&1 \
@@ -1029,7 +1342,7 @@ setup_n2n() {
     if [ "$n2n_up" = false ]; then
         echo "[n2n] SKIP: baseline overlay IPv4 ping failed"
         tail -5 "$TMPDIR_TEST/n2-sn.log" "$TMPDIR_TEST/n2-eA.log" "$TMPDIR_TEST/n2-eB.log" 2>/dev/null || true
-        N2N_AVAILABLE=false; return
+        N2N_AVAILABLE=false; return 1
     fi
     local n2n_v6_up=false
     for i in $(seq 1 10); do
@@ -1044,16 +1357,36 @@ setup_n2n() {
         OVL_NB_IP6=""
     fi
     echo "[n2n] overlay up"
+    N2N_AVAILABLE=true
+    return 0
 }
-setup_n2n
+
+stop_n2n() {
+    [ -n "$PID_N2N_SN" ] && kill "$PID_N2N_SN" 2>/dev/null || true
+    [ -n "$PID_N2N_EA" ] && kill "$PID_N2N_EA" 2>/dev/null || true
+    [ -n "$PID_N2N_EB" ] && kill "$PID_N2N_EB" 2>/dev/null || true
+    sleep 0.1
+    [ -n "$PID_N2N_SN" ] && kill -9 "$PID_N2N_SN" 2>/dev/null || true
+    [ -n "$PID_N2N_EA" ] && kill -9 "$PID_N2N_EA" 2>/dev/null || true
+    [ -n "$PID_N2N_EB" ] && kill -9 "$PID_N2N_EB" 2>/dev/null || true
+    PID_N2N_SN=""; PID_N2N_EA=""; PID_N2N_EB=""
+    killall -9 edge supernode 2>/dev/null || true
+    ip netns exec "$NS_NA" ip link del n2n0 2>/dev/null || true
+    ip netns exec "$NS_NB" ip link del n2n0 2>/dev/null || true
+    for ns in "$NS_NA" "$NS_NB"; do
+        ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+        ip netns del "$ns" 2>/dev/null || true
+    done
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ZeroTier setup (local netns controller)
+# Lifecycle: ZeroTier
 # ══════════════════════════════════════════════════════════════════════════════
-setup_zerotier() {
-    if ! contender_wanted "zerotier" && ! contender_wanted "zt"; then ZT_AVAILABLE=false; return; fi
+start_zerotier() {
+    if ! contender_wanted "zerotier" && ! contender_wanted "zt"; then ZT_AVAILABLE=false; return 1; fi
+    if [ "${ZT_AVAILABLE:-}" = false ]; then return 1; fi
     if ! command -v zerotier-one >/dev/null 2>&1; then
-        echo "[zerotier] SKIP: 'zerotier-one' not found"; ZT_AVAILABLE=false; return
+        echo "[zerotier] SKIP: 'zerotier-one' not found"; ZT_AVAILABLE=false; return 1
     fi
     echo "[zerotier] creating namespaces and veth pair"
     make_pair "$NS_ZA" "$NS_ZB" "$VZA" "$VZB" "$VZA_IP" "$VZB_IP"
@@ -1086,7 +1419,9 @@ with open('$zt_dir_a/moon.json', 'w') as f:
     fi
 
     ip netns exec "$NS_ZA" zerotier-one "$zt_dir_a" >"$TMPDIR_TEST/zt-a.log" 2>&1 &
+    PID_ZT_A=$!
     ip netns exec "$NS_ZB" zerotier-one "$zt_dir_b" >"$TMPDIR_TEST/zt-b.log" 2>&1 &
+    PID_ZT_B=$!
     local i token_a="" node_a="" node_b=""
     for i in $(seq 1 40); do
         if [ -f "$zt_dir_a/authtoken.secret" ] && [ -f "$zt_dir_b/authtoken.secret" ]; then
@@ -1096,7 +1431,7 @@ with open('$zt_dir_a/moon.json', 'w') as f:
         sleep 0.25
     done
     if [ -z "$token_a" ]; then
-        echo "[zerotier] SKIP: daemon failed to initialize"; ZT_AVAILABLE=false; return
+        echo "[zerotier] SKIP: daemon failed to initialize"; ZT_AVAILABLE=false; return 1
     fi
     for i in $(seq 1 40); do
         node_a="$(ip netns exec "$NS_ZA" zerotier-cli -D"$zt_dir_a" info 2>/dev/null | awk '$1=="200" && $3!="OFFLINE" && length($3)>=10 {print $3}' || true)"
@@ -1113,7 +1448,7 @@ with open('$zt_dir_a/moon.json', 'w') as f:
         sleep 0.25
     done
     if [ -z "$node_a" ] || [ -z "$node_b" ]; then
-        echo "[zerotier] SKIP: failed to get node identity"; ZT_AVAILABLE=false; return
+        echo "[zerotier] SKIP: failed to get node identity"; ZT_AVAILABLE=false; return 1
     fi
     local net_id="${node_a}ffffff"
     ip netns exec "$NS_ZA" curl -s -H "X-ZT1-Auth: $token_a" -X POST \
@@ -1133,7 +1468,7 @@ with open('$zt_dir_a/moon.json', 'w') as f:
         sleep 0.5
     done
     if [ "$found" = false ]; then
-        echo "[zerotier] SKIP: overlay assignment timed out"; ZT_AVAILABLE=false; return
+        echo "[zerotier] SKIP: overlay assignment timed out"; ZT_AVAILABLE=false; return 1
     fi
     local zt_a_if zt_b_if
     zt_a_if="$(ip netns exec "$NS_ZA" ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^zt' | head -1 || true)"
@@ -1156,19 +1491,35 @@ with open('$zt_dir_a/moon.json', 'w') as f:
         sleep 0.5
     done
     if [ "$zt_up" = false ]; then
-        echo "[zerotier] SKIP: overlay ping failed"; ZT_AVAILABLE=false; return
+        echo "[zerotier] SKIP: overlay ping failed"; ZT_AVAILABLE=false; return 1
     fi
     echo "[zerotier] network up"
+    ZT_AVAILABLE=true
+    return 0
 }
-setup_zerotier
+
+stop_zerotier() {
+    [ -n "$PID_ZT_A" ] && kill "$PID_ZT_A" 2>/dev/null || true
+    [ -n "$PID_ZT_B" ] && kill "$PID_ZT_B" 2>/dev/null || true
+    sleep 0.1
+    [ -n "$PID_ZT_A" ] && kill -9 "$PID_ZT_A" 2>/dev/null || true
+    [ -n "$PID_ZT_B" ] && kill -9 "$PID_ZT_B" 2>/dev/null || true
+    PID_ZT_A=""; PID_ZT_B=""
+    for ns in "$NS_ZA" "$NS_ZB"; do
+        ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+        ip netns del "$ns" 2>/dev/null || true
+    done
+    rm -rf "$TMPDIR_TEST/zt_a" "$TMPDIR_TEST/zt_b" 2>/dev/null || true
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tailscale setup (local headscale coordinator)
+# Lifecycle: Tailscale
 # ══════════════════════════════════════════════════════════════════════════════
-setup_tailscale() {
-    if ! contender_wanted "tailscale" && ! contender_wanted "ts"; then TS_AVAILABLE=false; return; fi
+start_tailscale() {
+    if ! contender_wanted "tailscale" && ! contender_wanted "ts"; then TS_AVAILABLE=false; return 1; fi
+    if [ "${TS_AVAILABLE:-}" = false ]; then return 1; fi
     if ! command -v tailscaled >/dev/null 2>&1 || ! command -v headscale >/dev/null 2>&1; then
-        echo "[tailscale] SKIP: 'tailscaled' or 'headscale' not found"; TS_AVAILABLE=false; return
+        echo "[tailscale] SKIP: 'tailscaled' or 'headscale' not found"; TS_AVAILABLE=false; return 1
     fi
     echo "[tailscale] creating namespaces and veth pair"
     make_pair "$NS_TA" "$NS_TB" "$VTA" "$VTB" "$VTA_IP" "$VTB_IP"
@@ -1212,6 +1563,7 @@ noise:
 unix_socket: $hs_dir/headscale.sock
 EOF
     ip netns exec "$NS_TA" headscale serve -c "$hs_dir/config.yaml" >"$TMPDIR_TEST/headscale.log" 2>&1 &
+    PID_TS_HS=$!
     local i
     for i in $(seq 1 30); do
         if [ -S "$hs_dir/headscale.sock" ]; then
@@ -1228,12 +1580,14 @@ EOF
     if [ -z "$auth_key" ]; then
         echo "[tailscale] SKIP: headscale preauthkey creation failed"
         tail -5 "$TMPDIR_TEST/headscale.log" 2>/dev/null || true
-        TS_AVAILABLE=false; return
+        TS_AVAILABLE=false; return 1
     fi
     local ts_dir_a="$TMPDIR_TEST/ts_a"; local ts_dir_b="$TMPDIR_TEST/ts_b"
     mkdir -p "$ts_dir_a" "$ts_dir_b"
     ip netns exec "$NS_TA" tailscaled --state="$ts_dir_a/tailscaled.state" --socket="$ts_dir_a/tailscaled.sock" --tun=tailscale0 >"$TMPDIR_TEST/ts-a.log" 2>&1 &
+    PID_TS_DA=$!
     ip netns exec "$NS_TB" tailscaled --state="$ts_dir_b/tailscaled.state" --socket="$ts_dir_b/tailscaled.sock" --tun=tailscale0 >"$TMPDIR_TEST/ts-b.log" 2>&1 &
+    PID_TS_DB=$!
     sleep 1
     ip netns exec "$NS_TA" tailscale --socket="$ts_dir_a/tailscaled.sock" up --login-server="http://${VTA_IP}:8080" --auth-key="$auth_key" --accept-dns=false --accept-routes=false >/dev/null 2>&1 || true
     ip netns exec "$NS_TB" tailscale --socket="$ts_dir_b/tailscaled.sock" up --login-server="http://${VTA_IP}:8080" --auth-key="$auth_key" --accept-dns=false --accept-routes=false >/dev/null 2>&1 || true
@@ -1250,7 +1604,7 @@ EOF
         sleep 0.5
     done
     if [ "$found" = false ]; then
-        echo "[tailscale] SKIP: tailscale tunnel activation timed out"; TS_AVAILABLE=false; return
+        echo "[tailscale] SKIP: tailscale tunnel activation timed out"; TS_AVAILABLE=false; return 1
     fi
     TUN_TA_IP="$ts_dyn_a"
     TUN_TB_IP="$ts_dyn_b"
@@ -1268,19 +1622,37 @@ EOF
         sleep 0.5
     done
     if [ "$ts_up" = false ]; then
-        echo "[tailscale] SKIP: baseline ping failed"; TS_AVAILABLE=false; return
+        echo "[tailscale] SKIP: baseline ping failed"; TS_AVAILABLE=false; return 1
     fi
     echo "[tailscale] tunnel up"
+    TS_AVAILABLE=true
+    return 0
 }
-setup_tailscale
+
+stop_tailscale() {
+    [ -n "$PID_TS_DA" ] && kill "$PID_TS_DA" 2>/dev/null || true
+    [ -n "$PID_TS_DB" ] && kill "$PID_TS_DB" 2>/dev/null || true
+    [ -n "$PID_TS_HS" ] && kill "$PID_TS_HS" 2>/dev/null || true
+    sleep 0.1
+    [ -n "$PID_TS_DA" ] && kill -9 "$PID_TS_DA" 2>/dev/null || true
+    [ -n "$PID_TS_DB" ] && kill -9 "$PID_TS_DB" 2>/dev/null || true
+    [ -n "$PID_TS_HS" ] && kill -9 "$PID_TS_HS" 2>/dev/null || true
+    PID_TS_DA=""; PID_TS_DB=""; PID_TS_HS=""
+    for ns in "$NS_TA" "$NS_TB"; do
+        ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+        ip netns del "$ns" 2>/dev/null || true
+    done
+    rm -rf "$TMPDIR_TEST/headscale" "$TMPDIR_TEST/ts_a" "$TMPDIR_TEST/ts_b" 2>/dev/null || true
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NetBird setup (management coordinator)
+# Lifecycle: NetBird
 # ══════════════════════════════════════════════════════════════════════════════
-setup_netbird() {
-    if ! contender_wanted "netbird" && ! contender_wanted "nb"; then NB_AVAILABLE=false; return; fi
+start_netbird() {
+    if ! contender_wanted "netbird" && ! contender_wanted "nb"; then NB_AVAILABLE=false; return 1; fi
+    if [ "${NB_AVAILABLE:-}" = false ]; then return 1; fi
     if ! command -v netbird >/dev/null 2>&1; then
-        echo "[netbird] SKIP: 'netbird' not found"; NB_AVAILABLE=false; return
+        echo "[netbird] SKIP: 'netbird' not found"; NB_AVAILABLE=false; return 1
     fi
     killall -9 netbird netbird-mgmt netbird-signal 2>/dev/null || true
     local mgmt_url="${NETBIRD_MGMT_URL:-}"
@@ -1291,7 +1663,7 @@ setup_netbird() {
 
     if [ -z "$mgmt_url" ] || [ -z "$setup_key" ]; then
         if ! command -v netbird-mgmt >/dev/null 2>&1 || ! command -v netbird-signal >/dev/null 2>&1; then
-            echo "[netbird] SKIP: 'netbird-mgmt' or 'netbird-signal' not found (run setup-contenders.sh --netbird)"; NB_AVAILABLE=false; return
+            echo "[netbird] SKIP: 'netbird-mgmt' or 'netbird-signal' not found (run setup-contenders.sh --netbird)"; NB_AVAILABLE=false; return 1
         fi
         local geo_dir="/usr/local/share/netbird-geo"
         mkdir -p "$geo_dir" 2>/dev/null || true
@@ -1336,7 +1708,7 @@ EOF
 }
 EOF
         ip netns exec "$NS_BA" netbird-signal run --port 10000 --log-file "$TMPDIR_TEST/nb-signal.log" >/dev/null 2>&1 &
-        local pid_sig=$!
+        PID_NB_SIG=$!
         ip netns exec "$NS_BA" netbird-mgmt management --config "$nb_dir/management.json" --datadir "$nb_dir/data" --port 8080 --metrics-port 9099 --log-file "$TMPDIR_TEST/nb-mgmt.log" >/dev/null 2>&1 &
         local pid_mgmt=$!
         for i in $(seq 1 40); do
@@ -1346,7 +1718,7 @@ EOF
             sleep 0.2
         done
         if [ ! -f "$nb_dir/data/store.db" ]; then
-            echo "[netbird] SKIP: store.db initialization timed out"; NB_AVAILABLE=false; return
+            echo "[netbird] SKIP: store.db initialization timed out"; NB_AVAILABLE=false; return 1
         fi
         kill $pid_mgmt 2>/dev/null || true
         wait $pid_mgmt 2>/dev/null || true
@@ -1370,7 +1742,7 @@ INSERT INTO setup_keys (id, account_id, key, key_secret, name, type, created_at,
 VALUES ('key_bench', 'acc_bench', 'mewqgKYulb4neyT85tvUyw1QzCAhxDjA9+5h7WeAysw=', 'A1B2C****', 'Bench Key', 'reusable', datetime('now'), datetime('now', '+10 years'), 0, 0, 0, '["grp_all"]');
 SQL
         ip netns exec "$NS_BA" netbird-mgmt management --config "$nb_dir/management.json" --datadir "$nb_dir/data" --port 8080 --metrics-port 9099 --log-file "$TMPDIR_TEST/nb-mgmt.log" >/dev/null 2>&1 &
-        local pid_mgmt2=$!
+        PID_NB_MGMT=$!
         local mgmt_ok=false
         for i in $(seq 1 60); do
             if ip netns exec "$NS_BA" ss -tlpn 2>/dev/null | grep -q ":8080"; then
@@ -1382,7 +1754,7 @@ SQL
         if [ "$mgmt_ok" = false ]; then
             echo "[netbird] SKIP: netbird-mgmt port 8080 not listening"
             tail -15 "$TMPDIR_TEST/nb-mgmt.log" 2>/dev/null || true
-            NB_AVAILABLE=false; return
+            NB_AVAILABLE=false; return 1
         fi
         mgmt_url="http://${VBA_IP}:8080"
         setup_key="A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
@@ -1391,7 +1763,9 @@ SQL
     local nb_dir_a="$TMPDIR_TEST/nb_a"; local nb_dir_b="$TMPDIR_TEST/nb_b"
     mkdir -p "$nb_dir_a" "$nb_dir_b"
     ip netns exec "$NS_BA" netbird service run --config "$nb_dir_a/config.json" --daemon-addr "unix://$nb_dir_a/daemon.sock" --log-file "$TMPDIR_TEST/nb-a.log" >/dev/null 2>&1 &
+    PID_NB_SA=$!
     ip netns exec "$NS_BB" netbird service run --config "$nb_dir_b/config.json" --daemon-addr "unix://$nb_dir_b/daemon.sock" --log-file "$TMPDIR_TEST/nb-b.log" >/dev/null 2>&1 &
+    PID_NB_SB=$!
     for i in $(seq 1 40); do
         if [ -S "$nb_dir_a/daemon.sock" ] && [ -S "$nb_dir_b/daemon.sock" ]; then
             break
@@ -1415,7 +1789,7 @@ SQL
     if [ "$found" = false ]; then
         echo "[netbird] SKIP: wt0 interface creation timed out"
         tail -15 "$TMPDIR_TEST/nb-mgmt.log" "$TMPDIR_TEST/nb-a.log" "$TMPDIR_TEST/nb-b.log" 2>/dev/null || true
-        NB_AVAILABLE=false; return
+        NB_AVAILABLE=false; return 1
     fi
     local nb_dyn_a="" nb_dyn_b="" nb_dyn6_a="" nb_dyn6_b=""
     for i in $(seq 1 40); do
@@ -1452,7 +1826,7 @@ SQL
         sleep 0.5
     done
     if [ "$nb_up" = false ]; then
-        echo "[netbird] SKIP: baseline ping failed"; NB_AVAILABLE=false; return
+        echo "[netbird] SKIP: baseline ping failed"; NB_AVAILABLE=false; return 1
     fi
     if [ -n "$TUN_BA_IP6" ]; then
         for i in $(seq 1 30); do
@@ -1463,8 +1837,87 @@ SQL
         done
     fi
     echo "[netbird] tunnel up"
+    NB_AVAILABLE=true
+    return 0
 }
-setup_netbird
+
+stop_netbird() {
+    [ -n "$PID_NB_SA" ] && kill "$PID_NB_SA" 2>/dev/null || true
+    [ -n "$PID_NB_SB" ] && kill "$PID_NB_SB" 2>/dev/null || true
+    [ -n "$PID_NB_MGMT" ] && kill "$PID_NB_MGMT" 2>/dev/null || true
+    [ -n "$PID_NB_SIG" ] && kill "$PID_NB_SIG" 2>/dev/null || true
+    sleep 0.1
+    [ -n "$PID_NB_SA" ] && kill -9 "$PID_NB_SA" 2>/dev/null || true
+    [ -n "$PID_NB_SB" ] && kill -9 "$PID_NB_SB" 2>/dev/null || true
+    [ -n "$PID_NB_MGMT" ] && kill -9 "$PID_NB_MGMT" 2>/dev/null || true
+    [ -n "$PID_NB_SIG" ] && kill -9 "$PID_NB_SIG" 2>/dev/null || true
+    PID_NB_SA=""; PID_NB_SB=""; PID_NB_MGMT=""; PID_NB_SIG=""
+    killall -9 netbird netbird-mgmt netbird-signal 2>/dev/null || true
+    for ns in "$NS_BA" "$NS_BB"; do
+        ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+        ip netns del "$ns" 2>/dev/null || true
+    done
+    rm -rf "$TMPDIR_TEST/nb_coord" "$TMPDIR_TEST/nb_a" "$TMPDIR_TEST/nb_b" 2>/dev/null || true
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Lifecycle Dispatchers
+# ══════════════════════════════════════════════════════════════════════════════
+start_contender() {
+    local name="$1"
+    case "$name" in
+        yip) start_yip ;;
+        wireguard|wg) start_wg ;;
+        wireguard-go|wggo) start_wireguard_go ;;
+        amneziawg|awg) start_awg ;;
+        openvpn|ovpn) start_ovpn ;;
+        n2n) start_n2n ;;
+        zerotier|zt) start_zerotier ;;
+        tailscale|ts) start_tailscale ;;
+        netbird|nb) start_netbird ;;
+        *) echo "[error] unknown contender: $name" >&2; return 1 ;;
+    esac
+}
+
+stop_contender() {
+    local name="$1"
+    case "$name" in
+        yip) stop_yip ;;
+        wireguard|wg) stop_wg ;;
+        wireguard-go|wggo) stop_wireguard_go ;;
+        amneziawg|awg) stop_awg ;;
+        openvpn|ovpn) stop_ovpn ;;
+        n2n) stop_n2n ;;
+        zerotier|zt) stop_zerotier ;;
+        tailscale|ts) stop_tailscale ;;
+        netbird|nb) stop_netbird ;;
+        *) echo "[error] unknown contender: $name" >&2; return 1 ;;
+    esac
+}
+
+start_all_contenders() {
+    contender_wanted "yip" && start_yip || true
+    (contender_wanted "wireguard" || contender_wanted "wg") && start_wg || true
+    (contender_wanted "wireguard-go" || contender_wanted "wggo") && start_wireguard_go || true
+    (contender_wanted "amneziawg" || contender_wanted "awg") && start_awg || true
+    (contender_wanted "openvpn" || contender_wanted "ovpn") && start_ovpn || true
+    contender_wanted "n2n" && start_n2n || true
+    (contender_wanted "zerotier" || contender_wanted "zt") && start_zerotier || true
+    (contender_wanted "tailscale" || contender_wanted "ts") && start_tailscale || true
+    (contender_wanted "netbird" || contender_wanted "nb") && start_netbird || true
+}
+
+stop_all_contenders() {
+    stop_yip
+    stop_wg
+    stop_wireguard_go
+    stop_awg
+    stop_ovpn
+    stop_n2n
+    stop_zerotier
+    stop_tailscale
+    stop_netbird
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Sweep
@@ -1478,196 +1931,213 @@ echo "  dual-stack IPv4 & IPv6 with CPU telemetry from /proc/stat"
 echo "  ping -c ${PING_COUNT} -i ${PING_INTERVAL}; iperf3 -t 8; netem: loss X% delay 5ms (symmetric) limit 50000"
 echo "  TCP cc: ${TCP_CC}, streams: ${IPERF_STREAMS}"
 echo "  UDP rate: ${UDP_RATE}, len: ${UDP_LEN}"
+echo "  contender isolation: ${CONTENDER_ISOLATION}"
 echo "=========================================================="
+
+if [ "$CONTENDER_ISOLATION" = false ]; then
+    echo "[info] starting all wanted contenders concurrently (CONTENDER_ISOLATION=false)"
+    start_all_contenders
+fi
 
 for LOSS in $LOSS_RATES; do
     echo ""
     echo "[netem] loss=${LOSS}% delay=5ms on all active pairs"
-    apply_netem "$NS_YA" "$NS_YB" "$VYA" "$VYB" "$LOSS"
-    [ "$WG_AVAILABLE"   = true ] && apply_netem "$NS_WA" "$NS_WB" "$VWA" "$VWB" "$LOSS"
-    [ "$WGGO_AVAILABLE" = true ] && apply_netem "$NS_GGA" "$NS_GGB" "$VGGA" "$VGGB" "$LOSS"
-    [ "$AWG_AVAILABLE"  = true ] && apply_netem "$NS_AA" "$NS_AB" "$VAA" "$VAB" "$LOSS"
-    [ "$OVPN_AVAILABLE" = true ] && apply_netem "$NS_OA" "$NS_OB" "$VOA" "$VOB" "$LOSS"
-    [ "$N2N_AVAILABLE"  = true ] && apply_netem "$NS_NA" "$NS_NB" "$VNA" "$VNB" "$LOSS"
-    [ "$ZT_AVAILABLE"   = true ] && apply_netem "$NS_ZA" "$NS_ZB" "$VZA" "$VZB" "$LOSS"
-    [ "$TS_AVAILABLE"   = true ] && apply_netem "$NS_TA" "$NS_TB" "$VTA" "$VTB" "$LOSS"
-    [ "$NB_AVAILABLE"   = true ] && apply_netem "$NS_BA" "$NS_BB" "$VBA" "$VBB" "$LOSS"
 
-    # yip (IPv4 & IPv6)
-    read -r Y_LOSS Y_RTT <<< "$(measure_ping "$NS_YB" "$TUN_YA_IP")"
-    read -r Y_TCP Y_TCP_LOSS <<< "$(measure_iperf "$NS_YA" "$TUN_YA_IP" "$NS_YB")"
-    read -r Y_UDP_MBPS Y_UDP_LOSS Y_CPU Y_EFF <<< "$(measure_iperf_udp "$NS_YA" "$TUN_YA_IP" "$NS_YB")"
-    Y_RAM="$(get_ns_ram_mb "$NS_YA")"
-    Y_RAM_EFF="$(calc_ram_efficiency "$Y_RAM" "$Y_UDP_MBPS")"
-    echo "[yip] [ipv4] ping_loss=${Y_LOSS}% rtt=${Y_RTT}ms tcp=${Y_TCP}Mbit/s tcp_loss=${Y_TCP_LOSS}% udp=${Y_UDP_MBPS}Mbit/s udp_loss=${Y_UDP_LOSS}% cpu=${Y_CPU}% eff=${Y_EFF} ram=${Y_RAM}MB ram_eff=${Y_RAM_EFF}"
-    sleep 0.5
-
-    read -r Y6_LOSS Y6_RTT <<< "$(measure_ping "$NS_YB" "$TUN_YA_IP6")"
-    read -r Y6_TCP Y6_TCP_LOSS <<< "$(measure_iperf "$NS_YA" "$TUN_YA_IP6" "$NS_YB")"
-    read -r Y6_UDP_MBPS Y6_UDP_LOSS Y6_CPU Y6_EFF <<< "$(measure_iperf_udp "$NS_YA" "$TUN_YA_IP6" "$NS_YB")"
-    Y6_RAM="$(get_ns_ram_mb "$NS_YA")"
-    Y6_RAM_EFF="$(calc_ram_efficiency "$Y6_RAM" "$Y6_UDP_MBPS")"
-    echo "[yip] [ipv6] ping_loss=${Y6_LOSS}% rtt=${Y6_RTT}ms tcp=${Y6_TCP}Mbit/s tcp_loss=${Y6_TCP_LOSS}% udp=${Y6_UDP_MBPS}Mbit/s udp_loss=${Y6_UDP_LOSS}% cpu=${Y6_CPU}% eff=${Y6_EFF} ram=${Y6_RAM}MB ram_eff=${Y6_RAM_EFF}"
-    sleep 0.5
-
-    if [ "$Y_TCP" = "0.0" ] || [ "$Y_TCP" = "N/A" ] || \
-       [ "$Y6_TCP" = "0.0" ] || [ "$Y6_TCP" = "N/A" ] || \
-       [ "$Y_UDP_MBPS" = "0.0" ] || [ "$Y_UDP_MBPS" = "N/A" ] || \
-       [ "$Y6_UDP_MBPS" = "0.0" ] || [ "$Y6_UDP_MBPS" = "N/A" ]; then
-        echo "[error] yip throughput failure detected at loss=${LOSS}% (v4_tcp=$Y_TCP v6_tcp=$Y6_TCP v4_udp=$Y_UDP_MBPS v6_udp=$Y6_UDP_MBPS)"
-        YIP_FAILED=true
+    if [ "$CONTENDER_ISOLATION" = false ]; then
+        apply_netem "$NS_YA" "$NS_YB" "$VYA" "$VYB" "$LOSS"
+        [ "$WG_AVAILABLE"   = true ] && apply_netem "$NS_WA" "$NS_WB" "$VWA" "$VWB" "$LOSS"
+        [ "$WGGO_AVAILABLE" = true ] && apply_netem "$NS_GGA" "$NS_GGB" "$VGGA" "$VGGB" "$LOSS"
+        [ "$AWG_AVAILABLE"  = true ] && apply_netem "$NS_AA" "$NS_AB" "$VAA" "$VAB" "$LOSS"
+        [ "$OVPN_AVAILABLE" = true ] && apply_netem "$NS_OA" "$NS_OB" "$VOA" "$VOB" "$LOSS"
+        [ "$N2N_AVAILABLE"  = true ] && apply_netem "$NS_NA" "$NS_NB" "$VNA" "$VNB" "$LOSS"
+        [ "$ZT_AVAILABLE"   = true ] && apply_netem "$NS_ZA" "$NS_ZB" "$VZA" "$VZB" "$LOSS"
+        [ "$TS_AVAILABLE"   = true ] && apply_netem "$NS_TA" "$NS_TB" "$VTA" "$VTB" "$LOSS"
+        [ "$NB_AVAILABLE"   = true ] && apply_netem "$NS_BA" "$NS_BB" "$VBA" "$VBB" "$LOSS"
     fi
 
-    # WireGuard (IPv4 & IPv6)
+    # ── yip ───────────────────────────────────────────────────────────────────
+    Y_LOSS="N/A"; Y_RTT="N/A"; Y_TCP="N/A"; Y_TCP_LOSS="N/A"; Y_UDP_MBPS="N/A"; Y_UDP_LOSS="N/A"; Y_CPU="N/A"; Y_EFF="N/A"; Y_RAM="N/A"; Y_RAM_EFF="N/A"
+    Y6_LOSS="N/A"; Y6_RTT="N/A"; Y6_TCP="N/A"; Y6_TCP_LOSS="N/A"; Y6_UDP_MBPS="N/A"; Y6_UDP_LOSS="N/A"; Y6_CPU="N/A"; Y6_EFF="N/A"; Y6_RAM="N/A"; Y6_RAM_EFF="N/A"
+    if contender_wanted "yip"; then
+        if [ "$CONTENDER_ISOLATION" = true ]; then
+            start_yip
+            apply_netem "$NS_YA" "$NS_YB" "$VYA" "$VYB" "$LOSS"
+        fi
+        measure_contender "yip" "$NS_YA" "$NS_YB" "$TUN_YA_IP" "$TUN_YA_IP6" "$LOSS"
+        Y_LOSS="$M_LOSS"; Y_RTT="$M_RTT"; Y_TCP="$M_TCP"; Y_TCP_LOSS="$M_TCP_LOSS"; Y_UDP_MBPS="$M_UDP_MBPS"; Y_UDP_LOSS="$M_UDP_LOSS"; Y_CPU="$M_CPU"; Y_EFF="$M_EFF"; Y_RAM="$M_RAM"; Y_RAM_EFF="$M_RAM_EFF"
+        Y6_LOSS="$M6_LOSS"; Y6_RTT="$M6_RTT"; Y6_TCP="$M6_TCP"; Y6_TCP_LOSS="$M6_TCP_LOSS"; Y6_UDP_MBPS="$M6_UDP_MBPS"; Y6_UDP_LOSS="$M6_UDP_LOSS"; Y6_CPU="$M6_CPU"; Y6_EFF="$M6_EFF"; Y6_RAM="$M6_RAM"; Y6_RAM_EFF="$M6_RAM_EFF"
+
+        if [ "$Y_TCP" = "0.0" ] || [ "$Y_TCP" = "N/A" ] || \
+           [ "$Y6_TCP" = "0.0" ] || [ "$Y6_TCP" = "N/A" ] || \
+           [ "$Y_UDP_MBPS" = "0.0" ] || [ "$Y_UDP_MBPS" = "N/A" ] || \
+           [ "$Y6_UDP_MBPS" = "0.0" ] || [ "$Y6_UDP_MBPS" = "N/A" ]; then
+            echo "[error] yip throughput failure detected at loss=${LOSS}% (v4_tcp=$Y_TCP v6_tcp=$Y6_TCP v4_udp=$Y_UDP_MBPS v6_udp=$Y6_UDP_MBPS)"
+            YIP_FAILED=true
+        fi
+        if [ "$CONTENDER_ISOLATION" = true ]; then
+            stop_yip
+            verify_isolation "yip"
+        fi
+    fi
+
+    # ── WireGuard ─────────────────────────────────────────────────────────────
     W_LOSS="N/A"; W_RTT="N/A"; W_TCP="N/A"; W_TCP_LOSS="N/A"; W_UDP_MBPS="N/A"; W_UDP_LOSS="N/A"; W_CPU="N/A"; W_EFF="N/A"; W_RAM="N/A"; W_RAM_EFF="N/A"
     W6_LOSS="N/A"; W6_RTT="N/A"; W6_TCP="N/A"; W6_TCP_LOSS="N/A"; W6_UDP_MBPS="N/A"; W6_UDP_LOSS="N/A"; W6_CPU="N/A"; W6_EFF="N/A"; W6_RAM="N/A"; W6_RAM_EFF="N/A"
-    if [ "$WG_AVAILABLE" = true ]; then
-        read -r W_LOSS W_RTT <<< "$(measure_ping "$NS_WB" "$TUN_WA_IP")"
-        read -r W_TCP W_TCP_LOSS <<< "$(measure_iperf "$NS_WA" "$TUN_WA_IP" "$NS_WB")"
-        read -r W_UDP_MBPS W_UDP_LOSS W_CPU W_EFF <<< "$(measure_iperf_udp "$NS_WA" "$TUN_WA_IP" "$NS_WB")"
-        W_RAM="$(get_ns_ram_mb "$NS_WA")"
-        W_RAM_EFF="$(calc_ram_efficiency "$W_RAM" "$W_UDP_MBPS")"
-        echo "[wg] [ipv4] ping_loss=${W_LOSS}% rtt=${W_RTT}ms tcp=${W_TCP}Mbit/s tcp_loss=${W_TCP_LOSS}% udp=${W_UDP_MBPS}Mbit/s udp_loss=${W_UDP_LOSS}% cpu=${W_CPU}% eff=${W_EFF} ram=${W_RAM}MB ram_eff=${W_RAM_EFF}"
-
-        read -r W6_LOSS W6_RTT <<< "$(measure_ping "$NS_WB" "$TUN_WA_IP6")"
-        read -r W6_TCP W6_TCP_LOSS <<< "$(measure_iperf "$NS_WA" "$TUN_WA_IP6" "$NS_WB")"
-        read -r W6_UDP_MBPS W6_UDP_LOSS W6_CPU W6_EFF <<< "$(measure_iperf_udp "$NS_WA" "$TUN_WA_IP6" "$NS_WB")"
-        W6_RAM="$(get_ns_ram_mb "$NS_WA")"
-        W6_RAM_EFF="$(calc_ram_efficiency "$W6_RAM" "$W6_UDP_MBPS")"
-        echo "[wg] [ipv6] ping_loss=${W6_LOSS}% rtt=${W6_RTT}ms tcp=${W6_TCP}Mbit/s tcp_loss=${W6_TCP_LOSS}% udp=${W6_UDP_MBPS}Mbit/s udp_loss=${W6_UDP_LOSS}% cpu=${W6_CPU}% eff=${W6_EFF} ram=${W6_RAM}MB ram_eff=${W6_RAM_EFF}"
+    if (contender_wanted "wireguard" || contender_wanted "wg") && [ "${WG_AVAILABLE:-true}" != false ]; then
+        if [ "$CONTENDER_ISOLATION" = true ]; then
+            if start_wg; then
+                apply_netem "$NS_WA" "$NS_WB" "$VWA" "$VWB" "$LOSS"
+                measure_contender "wg" "$NS_WA" "$NS_WB" "$TUN_WA_IP" "$TUN_WA_IP6" "$LOSS"
+                W_LOSS="$M_LOSS"; W_RTT="$M_RTT"; W_TCP="$M_TCP"; W_TCP_LOSS="$M_TCP_LOSS"; W_UDP_MBPS="$M_UDP_MBPS"; W_UDP_LOSS="$M_UDP_LOSS"; W_CPU="$M_CPU"; W_EFF="$M_EFF"; W_RAM="$M_RAM"; W_RAM_EFF="$M_RAM_EFF"
+                W6_LOSS="$M6_LOSS"; W6_RTT="$M6_RTT"; W6_TCP="$M6_TCP"; W6_TCP_LOSS="$M6_TCP_LOSS"; W6_UDP_MBPS="$M6_UDP_MBPS"; W6_UDP_LOSS="$M6_UDP_LOSS"; W6_CPU="$M6_CPU"; W6_EFF="$M6_EFF"; W6_RAM="$M6_RAM"; W6_RAM_EFF="$M6_RAM_EFF"
+                stop_wg
+                verify_isolation "wireguard"
+            fi
+        elif [ "$WG_AVAILABLE" = true ]; then
+            measure_contender "wg" "$NS_WA" "$NS_WB" "$TUN_WA_IP" "$TUN_WA_IP6" "$LOSS"
+            W_LOSS="$M_LOSS"; W_RTT="$M_RTT"; W_TCP="$M_TCP"; W_TCP_LOSS="$M_TCP_LOSS"; W_UDP_MBPS="$M_UDP_MBPS"; W_UDP_LOSS="$M_UDP_LOSS"; W_CPU="$M_CPU"; W_EFF="$M_EFF"; W_RAM="$M_RAM"; W_RAM_EFF="$M_RAM_EFF"
+            W6_LOSS="$M6_LOSS"; W6_RTT="$M6_RTT"; W6_TCP="$M6_TCP"; W6_TCP_LOSS="$M6_TCP_LOSS"; W6_UDP_MBPS="$M6_UDP_MBPS"; W6_UDP_LOSS="$M6_UDP_LOSS"; W6_CPU="$M6_CPU"; W6_EFF="$M6_EFF"; W6_RAM="$M6_RAM"; W6_RAM_EFF="$M6_RAM_EFF"
+        fi
     fi
 
-    # WireGuard-Go (IPv4 & IPv6)
+    # ── WireGuard-Go ──────────────────────────────────────────────────────────
     GG_LOSS="N/A"; GG_RTT="N/A"; GG_TCP="N/A"; GG_TCP_LOSS="N/A"; GG_UDP_MBPS="N/A"; GG_UDP_LOSS="N/A"; GG_CPU="N/A"; GG_EFF="N/A"; GG_RAM="N/A"; GG_RAM_EFF="N/A"
     GG6_LOSS="N/A"; GG6_RTT="N/A"; GG6_TCP="N/A"; GG6_TCP_LOSS="N/A"; GG6_UDP_MBPS="N/A"; GG6_UDP_LOSS="N/A"; GG6_CPU="N/A"; GG6_EFF="N/A"; GG6_RAM="N/A"; GG6_RAM_EFF="N/A"
-    if [ "$WGGO_AVAILABLE" = true ]; then
-        read -r GG_LOSS GG_RTT <<< "$(measure_ping "$NS_GGB" "$TUN_GGA_IP")"
-        read -r GG_TCP GG_TCP_LOSS <<< "$(measure_iperf "$NS_GGA" "$TUN_GGA_IP" "$NS_GGB")"
-        read -r GG_UDP_MBPS GG_UDP_LOSS GG_CPU GG_EFF <<< "$(measure_iperf_udp "$NS_GGA" "$TUN_GGA_IP" "$NS_GGB")"
-        GG_RAM="$(get_ns_ram_mb "$NS_GGA")"
-        GG_RAM_EFF="$(calc_ram_efficiency "$GG_RAM" "$GG_UDP_MBPS")"
-        echo "[wggo] [ipv4] ping_loss=${GG_LOSS}% rtt=${GG_RTT}ms tcp=${GG_TCP}Mbit/s tcp_loss=${GG_TCP_LOSS}% udp=${GG_UDP_MBPS}Mbit/s udp_loss=${GG_UDP_LOSS}% cpu=${GG_CPU}% eff=${GG_EFF} ram=${GG_RAM}MB ram_eff=${GG_RAM_EFF}"
-
-        read -r GG6_LOSS GG6_RTT <<< "$(measure_ping "$NS_GGB" "$TUN_GGA_IP6")"
-        read -r GG6_TCP GG6_TCP_LOSS <<< "$(measure_iperf "$NS_GGA" "$TUN_GGA_IP6" "$NS_GGB")"
-        read -r GG6_UDP_MBPS GG6_UDP_LOSS GG6_CPU GG6_EFF <<< "$(measure_iperf_udp "$NS_GGA" "$TUN_GGA_IP6" "$NS_GGB")"
-        GG6_RAM="$(get_ns_ram_mb "$NS_GGA")"
-        GG6_RAM_EFF="$(calc_ram_efficiency "$GG6_RAM" "$GG6_UDP_MBPS")"
-        echo "[wggo] [ipv6] ping_loss=${GG6_LOSS}% rtt=${GG6_RTT}ms tcp=${GG6_TCP}Mbit/s tcp_loss=${GG6_TCP_LOSS}% udp=${GG6_UDP_MBPS}Mbit/s udp_loss=${GG6_UDP_LOSS}% cpu=${GG6_CPU}% eff=${GG6_EFF} ram=${GG6_RAM}MB ram_eff=${GG6_RAM_EFF}"
+    if (contender_wanted "wireguard-go" || contender_wanted "wggo") && [ "${WGGO_AVAILABLE:-true}" != false ]; then
+        if [ "$CONTENDER_ISOLATION" = true ]; then
+            if start_wireguard_go; then
+                apply_netem "$NS_GGA" "$NS_GGB" "$VGGA" "$VGGB" "$LOSS"
+                measure_contender "wggo" "$NS_GGA" "$NS_GGB" "$TUN_GGA_IP" "$TUN_GGA_IP6" "$LOSS"
+                GG_LOSS="$M_LOSS"; GG_RTT="$M_RTT"; GG_TCP="$M_TCP"; GG_TCP_LOSS="$M_TCP_LOSS"; GG_UDP_MBPS="$M_UDP_MBPS"; GG_UDP_LOSS="$M_UDP_LOSS"; GG_CPU="$M_CPU"; GG_EFF="$M_EFF"; GG_RAM="$M_RAM"; GG_RAM_EFF="$M_RAM_EFF"
+                GG6_LOSS="$M6_LOSS"; GG6_RTT="$M6_RTT"; GG6_TCP="$M6_TCP"; GG6_TCP_LOSS="$M6_TCP_LOSS"; GG6_UDP_MBPS="$M6_UDP_MBPS"; GG6_UDP_LOSS="$M6_UDP_LOSS"; GG6_CPU="$M6_CPU"; GG6_EFF="$M6_EFF"; GG6_RAM="$M6_RAM"; GG6_RAM_EFF="$M6_RAM_EFF"
+                stop_wireguard_go
+                verify_isolation "wireguard-go"
+            fi
+        elif [ "$WGGO_AVAILABLE" = true ]; then
+            measure_contender "wggo" "$NS_GGA" "$NS_GGB" "$TUN_GGA_IP" "$TUN_GGA_IP6" "$LOSS"
+            GG_LOSS="$M_LOSS"; GG_RTT="$M_RTT"; GG_TCP="$M_TCP"; GG_TCP_LOSS="$M_TCP_LOSS"; GG_UDP_MBPS="$M_UDP_MBPS"; GG_UDP_LOSS="$M_UDP_LOSS"; GG_CPU="$M_CPU"; GG_EFF="$M_EFF"; GG_RAM="$M_RAM"; GG_RAM_EFF="$M_RAM_EFF"
+            GG6_LOSS="$M6_LOSS"; GG6_RTT="$M6_RTT"; GG6_TCP="$M6_TCP"; GG6_TCP_LOSS="$M6_TCP_LOSS"; GG6_UDP_MBPS="$M6_UDP_MBPS"; GG6_UDP_LOSS="$M6_UDP_LOSS"; GG6_CPU="$M6_CPU"; GG6_EFF="$M6_EFF"; GG6_RAM="$M6_RAM"; GG6_RAM_EFF="$M6_RAM_EFF"
+        fi
     fi
 
-    # AmneziaWG (IPv4 & IPv6)
+    # ── AmneziaWG ─────────────────────────────────────────────────────────────
     A_LOSS="N/A"; A_RTT="N/A"; A_TCP="N/A"; A_TCP_LOSS="N/A"; A_UDP_MBPS="N/A"; A_UDP_LOSS="N/A"; A_CPU="N/A"; A_EFF="N/A"; A_RAM="N/A"; A_RAM_EFF="N/A"
     A6_LOSS="N/A"; A6_RTT="N/A"; A6_TCP="N/A"; A6_TCP_LOSS="N/A"; A6_UDP_MBPS="N/A"; A6_UDP_LOSS="N/A"; A6_CPU="N/A"; A6_EFF="N/A"; A6_RAM="N/A"; A6_RAM_EFF="N/A"
-    if [ "$AWG_AVAILABLE" = true ]; then
-        read -r A_LOSS A_RTT <<< "$(measure_ping "$NS_AB" "$TUN_AA_IP")"
-        read -r A_TCP A_TCP_LOSS <<< "$(measure_iperf "$NS_AA" "$TUN_AA_IP" "$NS_AB")"
-        read -r A_UDP_MBPS A_UDP_LOSS A_CPU A_EFF <<< "$(measure_iperf_udp "$NS_AA" "$TUN_AA_IP" "$NS_AB")"
-        A_RAM="$(get_ns_ram_mb "$NS_AA")"
-        A_RAM_EFF="$(calc_ram_efficiency "$A_RAM" "$A_UDP_MBPS")"
-        echo "[awg] [ipv4] ping_loss=${A_LOSS}% rtt=${A_RTT}ms tcp=${A_TCP}Mbit/s tcp_loss=${A_TCP_LOSS}% udp=${A_UDP_MBPS}Mbit/s udp_loss=${A_UDP_LOSS}% cpu=${A_CPU}% eff=${A_EFF} ram=${A_RAM}MB ram_eff=${A_RAM_EFF}"
-
-        read -r A6_LOSS A6_RTT <<< "$(measure_ping "$NS_AB" "$TUN_AA_IP6")"
-        read -r A6_TCP A6_TCP_LOSS <<< "$(measure_iperf "$NS_AA" "$TUN_AA_IP6" "$NS_AB")"
-        read -r A6_UDP_MBPS A6_UDP_LOSS A6_CPU A6_EFF <<< "$(measure_iperf_udp "$NS_AA" "$TUN_AA_IP6" "$NS_AB")"
-        A6_RAM="$(get_ns_ram_mb "$NS_AA")"
-        A6_RAM_EFF="$(calc_ram_efficiency "$A6_RAM" "$A6_UDP_MBPS")"
-        echo "[awg] [ipv6] ping_loss=${A6_LOSS}% rtt=${A6_RTT}ms tcp=${A6_TCP}Mbit/s tcp_loss=${A6_TCP_LOSS}% udp=${A6_UDP_MBPS}Mbit/s udp_loss=${A6_UDP_LOSS}% cpu=${A6_CPU}% eff=${A6_EFF} ram=${A6_RAM}MB ram_eff=${A6_RAM_EFF}"
+    if (contender_wanted "amneziawg" || contender_wanted "awg") && [ "${AWG_AVAILABLE:-true}" != false ]; then
+        if [ "$CONTENDER_ISOLATION" = true ]; then
+            if start_awg; then
+                apply_netem "$NS_AA" "$NS_AB" "$VAA" "$VAB" "$LOSS"
+                measure_contender "awg" "$NS_AA" "$NS_AB" "$TUN_AA_IP" "$TUN_AA_IP6" "$LOSS"
+                A_LOSS="$M_LOSS"; A_RTT="$M_RTT"; A_TCP="$M_TCP"; A_TCP_LOSS="$M_TCP_LOSS"; A_UDP_MBPS="$M_UDP_MBPS"; A_UDP_LOSS="$M_UDP_LOSS"; A_CPU="$M_CPU"; A_EFF="$M_EFF"; A_RAM="$M_RAM"; A_RAM_EFF="$M_RAM_EFF"
+                A6_LOSS="$M6_LOSS"; A6_RTT="$M6_RTT"; A6_TCP="$M6_TCP"; A6_TCP_LOSS="$M6_TCP_LOSS"; A6_UDP_MBPS="$M6_UDP_MBPS"; A6_UDP_LOSS="$M6_UDP_LOSS"; A6_CPU="$M6_CPU"; A6_EFF="$M6_EFF"; A6_RAM="$M6_RAM"; A6_RAM_EFF="$M6_RAM_EFF"
+                stop_awg
+                verify_isolation "amneziawg"
+            fi
+        elif [ "$AWG_AVAILABLE" = true ]; then
+            measure_contender "awg" "$NS_AA" "$NS_AB" "$TUN_AA_IP" "$TUN_AA_IP6" "$LOSS"
+            A_LOSS="$M_LOSS"; A_RTT="$M_RTT"; A_TCP="$M_TCP"; A_TCP_LOSS="$M_TCP_LOSS"; A_UDP_MBPS="$M_UDP_MBPS"; A_UDP_LOSS="$M_UDP_LOSS"; A_CPU="$M_CPU"; A_EFF="$M_EFF"; A_RAM="$M_RAM"; A_RAM_EFF="$M_RAM_EFF"
+            A6_LOSS="$M6_LOSS"; A6_RTT="$M6_RTT"; A6_TCP="$M6_TCP"; A6_TCP_LOSS="$M6_TCP_LOSS"; A6_UDP_MBPS="$M6_UDP_MBPS"; A6_UDP_LOSS="$M6_UDP_LOSS"; A6_CPU="$M6_CPU"; A6_EFF="$M6_EFF"; A6_RAM="$M6_RAM"; A6_RAM_EFF="$M6_RAM_EFF"
+        fi
     fi
 
-    # OpenVPN (IPv4 & IPv6)
+    # ── OpenVPN ───────────────────────────────────────────────────────────────
     O_LOSS="N/A"; O_RTT="N/A"; O_TCP="N/A"; O_TCP_LOSS="N/A"; O_UDP_MBPS="N/A"; O_UDP_LOSS="N/A"; O_CPU="N/A"; O_EFF="N/A"; O_RAM="N/A"; O_RAM_EFF="N/A"
     O6_LOSS="N/A"; O6_RTT="N/A"; O6_TCP="N/A"; O6_TCP_LOSS="N/A"; O6_UDP_MBPS="N/A"; O6_UDP_LOSS="N/A"; O6_CPU="N/A"; O6_EFF="N/A"; O6_RAM="N/A"; O6_RAM_EFF="N/A"
-    if [ "$OVPN_AVAILABLE" = true ]; then
-        read -r O_LOSS O_RTT <<< "$(measure_ping "$NS_OB" "$TUN_OA_IP")"
-        read -r O_TCP O_TCP_LOSS <<< "$(measure_iperf "$NS_OA" "$TUN_OA_IP" "$NS_OB")"
-        read -r O_UDP_MBPS O_UDP_LOSS O_CPU O_EFF <<< "$(measure_iperf_udp "$NS_OA" "$TUN_OA_IP" "$NS_OB")"
-        O_RAM="$(get_ns_ram_mb "$NS_OA")"
-        O_RAM_EFF="$(calc_ram_efficiency "$O_RAM" "$O_UDP_MBPS")"
-        echo "[ovpn] [ipv4] ping_loss=${O_LOSS}% rtt=${O_RTT}ms tcp=${O_TCP}Mbit/s tcp_loss=${O_TCP_LOSS}% udp=${O_UDP_MBPS}Mbit/s udp_loss=${O_UDP_LOSS}% cpu=${O_CPU}% eff=${O_EFF} ram=${O_RAM}MB ram_eff=${O_RAM_EFF}"
-
-        read -r O6_LOSS O6_RTT <<< "$(measure_ping "$NS_OB" "$TUN_OA_IP6")"
-        read -r O6_TCP O6_TCP_LOSS <<< "$(measure_iperf "$NS_OA" "$TUN_OA_IP6" "$NS_OB")"
-        read -r O6_UDP_MBPS O6_UDP_LOSS O6_CPU O6_EFF <<< "$(measure_iperf_udp "$NS_OA" "$TUN_OA_IP6" "$NS_OB")"
-        O6_RAM="$(get_ns_ram_mb "$NS_OA")"
-        O6_RAM_EFF="$(calc_ram_efficiency "$O6_RAM" "$O6_UDP_MBPS")"
-        echo "[ovpn] [ipv6] ping_loss=${O6_LOSS}% rtt=${O6_RTT}ms tcp=${O6_TCP}Mbit/s tcp_loss=${O6_TCP_LOSS}% udp=${O6_UDP_MBPS}Mbit/s udp_loss=${O6_UDP_LOSS}% cpu=${O6_CPU}% eff=${O6_EFF} ram=${O6_RAM}MB ram_eff=${O6_RAM_EFF}"
+    if (contender_wanted "openvpn" || contender_wanted "ovpn") && [ "${OVPN_AVAILABLE:-true}" != false ]; then
+        if [ "$CONTENDER_ISOLATION" = true ]; then
+            if start_ovpn; then
+                apply_netem "$NS_OA" "$NS_OB" "$VOA" "$VOB" "$LOSS"
+                measure_contender "ovpn" "$NS_OA" "$NS_OB" "$TUN_OA_IP" "$TUN_OA_IP6" "$LOSS"
+                O_LOSS="$M_LOSS"; O_RTT="$M_RTT"; O_TCP="$M_TCP"; O_TCP_LOSS="$M_TCP_LOSS"; O_UDP_MBPS="$M_UDP_MBPS"; O_UDP_LOSS="$M_UDP_LOSS"; O_CPU="$M_CPU"; O_EFF="$M_EFF"; O_RAM="$M_RAM"; O_RAM_EFF="$M_RAM_EFF"
+                O6_LOSS="$M6_LOSS"; O6_RTT="$M6_RTT"; O6_TCP="$M6_TCP"; O6_TCP_LOSS="$M6_TCP_LOSS"; O6_UDP_MBPS="$M6_UDP_MBPS"; O6_UDP_LOSS="$M6_UDP_LOSS"; O6_CPU="$M6_CPU"; O6_EFF="$M6_EFF"; O6_RAM="$M6_RAM"; O6_RAM_EFF="$M6_RAM_EFF"
+                stop_ovpn
+                verify_isolation "openvpn"
+            fi
+        elif [ "$OVPN_AVAILABLE" = true ]; then
+            measure_contender "ovpn" "$NS_OA" "$NS_OB" "$TUN_OA_IP" "$TUN_OA_IP6" "$LOSS"
+            O_LOSS="$M_LOSS"; O_RTT="$M_RTT"; O_TCP="$M_TCP"; O_TCP_LOSS="$M_TCP_LOSS"; O_UDP_MBPS="$M_UDP_MBPS"; O_UDP_LOSS="$M_UDP_LOSS"; O_CPU="$M_CPU"; O_EFF="$M_EFF"; O_RAM="$M_RAM"; O_RAM_EFF="$M_RAM_EFF"
+            O6_LOSS="$M6_LOSS"; O6_RTT="$M6_RTT"; O6_TCP="$M6_TCP"; O6_TCP_LOSS="$M6_TCP_LOSS"; O6_UDP_MBPS="$M6_UDP_MBPS"; O6_UDP_LOSS="$M6_UDP_LOSS"; O6_CPU="$M6_CPU"; O6_EFF="$M6_EFF"; O6_RAM="$M6_RAM"; O6_RAM_EFF="$M6_RAM_EFF"
+        fi
     fi
 
-    # n2n (IPv4 & IPv6)
+    # ── n2n ───────────────────────────────────────────────────────────────────
     N_LOSS="N/A"; N_RTT="N/A"; N_TCP="N/A"; N_TCP_LOSS="N/A"; N_UDP_MBPS="N/A"; N_UDP_LOSS="N/A"; N_CPU="N/A"; N_EFF="N/A"; N_RAM="N/A"; N_RAM_EFF="N/A"
     N6_LOSS="N/A"; N6_RTT="N/A"; N6_TCP="N/A"; N6_TCP_LOSS="N/A"; N6_UDP_MBPS="N/A"; N6_UDP_LOSS="N/A"; N6_CPU="N/A"; N6_EFF="N/A"; N6_RAM="N/A"; N6_RAM_EFF="N/A"
-    if [ "$N2N_AVAILABLE" = true ]; then
-        read -r N_LOSS N_RTT <<< "$(measure_ping "$NS_NB" "$OVL_NA_IP")"
-        read -r N_TCP N_TCP_LOSS <<< "$(measure_iperf "$NS_NA" "$OVL_NA_IP" "$NS_NB")"
-        read -r N_UDP_MBPS N_UDP_LOSS N_CPU N_EFF <<< "$(measure_iperf_udp "$NS_NA" "$OVL_NA_IP" "$NS_NB")"
-        N_RAM="$(get_ns_ram_mb "$NS_NA")"
-        N_RAM_EFF="$(calc_ram_efficiency "$N_RAM" "$N_UDP_MBPS")"
-        echo "[n2n] [ipv4] ping_loss=${N_LOSS}% rtt=${N_RTT}ms tcp=${N_TCP}Mbit/s tcp_loss=${N_TCP_LOSS}% udp=${N_UDP_MBPS}Mbit/s udp_loss=${N_UDP_LOSS}% cpu=${N_CPU}% eff=${N_EFF} ram=${N_RAM}MB ram_eff=${N_RAM_EFF}"
-
-        read -r N6_LOSS N6_RTT <<< "$(measure_ping "$NS_NB" "$OVL_NA_IP6")"
-        read -r N6_TCP N6_TCP_LOSS <<< "$(measure_iperf "$NS_NA" "$OVL_NA_IP6" "$NS_NB")"
-        read -r N6_UDP_MBPS N6_UDP_LOSS N6_CPU N6_EFF <<< "$(measure_iperf_udp "$NS_NA" "$OVL_NA_IP6" "$NS_NB")"
-        N6_RAM="$(get_ns_ram_mb "$NS_NA")"
-        N6_RAM_EFF="$(calc_ram_efficiency "$N6_RAM" "$N6_UDP_MBPS")"
-        echo "[n2n] [ipv6] ping_loss=${N6_LOSS}% rtt=${N6_RTT}ms tcp=${N6_TCP}Mbit/s tcp_loss=${N6_TCP_LOSS}% udp=${N6_UDP_MBPS}Mbit/s udp_loss=${N6_UDP_LOSS}% cpu=${N6_CPU}% eff=${N6_EFF} ram=${N6_RAM}MB ram_eff=${N6_RAM_EFF}"
+    if contender_wanted "n2n" && [ "${N2N_AVAILABLE:-true}" != false ]; then
+        if [ "$CONTENDER_ISOLATION" = true ]; then
+            if start_n2n; then
+                apply_netem "$NS_NA" "$NS_NB" "$VNA" "$VNB" "$LOSS"
+                measure_contender "n2n" "$NS_NA" "$NS_NB" "$OVL_NA_IP" "$OVL_NA_IP6" "$LOSS"
+                N_LOSS="$M_LOSS"; N_RTT="$M_RTT"; N_TCP="$M_TCP"; N_TCP_LOSS="$M_TCP_LOSS"; N_UDP_MBPS="$M_UDP_MBPS"; N_UDP_LOSS="$M_UDP_LOSS"; N_CPU="$M_CPU"; N_EFF="$M_EFF"; N_RAM="$M_RAM"; N_RAM_EFF="$M_RAM_EFF"
+                N6_LOSS="$M6_LOSS"; N6_RTT="$M6_RTT"; N6_TCP="$M6_TCP"; N6_TCP_LOSS="$M6_TCP_LOSS"; N6_UDP_MBPS="$M6_UDP_MBPS"; N6_UDP_LOSS="$M6_UDP_LOSS"; N6_CPU="$M6_CPU"; N6_EFF="$M6_EFF"; N6_RAM="$M6_RAM"; N6_RAM_EFF="$M6_RAM_EFF"
+                stop_n2n
+                verify_isolation "n2n"
+            fi
+        elif [ "$N2N_AVAILABLE" = true ]; then
+            measure_contender "n2n" "$NS_NA" "$NS_NB" "$OVL_NA_IP" "$OVL_NA_IP6" "$LOSS"
+            N_LOSS="$M_LOSS"; N_RTT="$M_RTT"; N_TCP="$M_TCP"; N_TCP_LOSS="$M_TCP_LOSS"; N_UDP_MBPS="$M_UDP_MBPS"; N_UDP_LOSS="$M_UDP_LOSS"; N_CPU="$M_CPU"; N_EFF="$M_EFF"; N_RAM="$M_RAM"; N_RAM_EFF="$M_RAM_EFF"
+            N6_LOSS="$M6_LOSS"; N6_RTT="$M6_RTT"; N6_TCP="$M6_TCP"; N6_TCP_LOSS="$M6_TCP_LOSS"; N6_UDP_MBPS="$M6_UDP_MBPS"; N6_UDP_LOSS="$M6_UDP_LOSS"; N6_CPU="$M6_CPU"; N6_EFF="$M6_EFF"; N6_RAM="$M6_RAM"; N6_RAM_EFF="$M6_RAM_EFF"
+        fi
     fi
 
-    # ZeroTier (IPv4 & IPv6)
+    # ── ZeroTier ──────────────────────────────────────────────────────────────
     Z_LOSS="N/A"; Z_RTT="N/A"; Z_TCP="N/A"; Z_TCP_LOSS="N/A"; Z_UDP_MBPS="N/A"; Z_UDP_LOSS="N/A"; Z_CPU="N/A"; Z_EFF="N/A"; Z_RAM="N/A"; Z_RAM_EFF="N/A"
     Z6_LOSS="N/A"; Z6_RTT="N/A"; Z6_TCP="N/A"; Z6_TCP_LOSS="N/A"; Z6_UDP_MBPS="N/A"; Z6_UDP_LOSS="N/A"; Z6_CPU="N/A"; Z6_EFF="N/A"; Z6_RAM="N/A"; Z6_RAM_EFF="N/A"
-    if [ "$ZT_AVAILABLE" = true ]; then
-        read -r Z_LOSS Z_RTT <<< "$(measure_ping "$NS_ZB" "$TUN_ZA_IP")"
-        read -r Z_TCP Z_TCP_LOSS <<< "$(measure_iperf "$NS_ZA" "$TUN_ZA_IP" "$NS_ZB")"
-        read -r Z_UDP_MBPS Z_UDP_LOSS Z_CPU Z_EFF <<< "$(measure_iperf_udp "$NS_ZA" "$TUN_ZA_IP" "$NS_ZB")"
-        Z_RAM="$(get_ns_ram_mb "$NS_ZA")"
-        Z_RAM_EFF="$(calc_ram_efficiency "$Z_RAM" "$Z_UDP_MBPS")"
-        echo "[zerotier] [ipv4] ping_loss=${Z_LOSS}% rtt=${Z_RTT}ms tcp=${Z_TCP}Mbit/s tcp_loss=${Z_TCP_LOSS}% udp=${Z_UDP_MBPS}Mbit/s udp_loss=${Z_UDP_LOSS}% cpu=${Z_CPU}% eff=${Z_EFF} ram=${Z_RAM}MB ram_eff=${Z_RAM_EFF}"
-
-        read -r Z6_LOSS Z6_RTT <<< "$(measure_ping "$NS_ZB" "$TUN_ZA_IP6")"
-        read -r Z6_TCP Z6_TCP_LOSS <<< "$(measure_iperf "$NS_ZA" "$TUN_ZA_IP6" "$NS_ZB")"
-        read -r Z6_UDP_MBPS Z6_UDP_LOSS Z6_CPU Z6_EFF <<< "$(measure_iperf_udp "$NS_ZA" "$TUN_ZA_IP6" "$NS_ZB")"
-        Z6_RAM="$(get_ns_ram_mb "$NS_ZA")"
-        Z6_RAM_EFF="$(calc_ram_efficiency "$Z6_RAM" "$Z6_UDP_MBPS")"
-        echo "[zerotier] [ipv6] ping_loss=${Z6_LOSS}% rtt=${Z6_RTT}ms tcp=${Z6_TCP}Mbit/s tcp_loss=${Z6_TCP_LOSS}% udp=${Z6_UDP_MBPS}Mbit/s udp_loss=${Z6_UDP_LOSS}% cpu=${Z6_CPU}% eff=${Z6_EFF} ram=${Z6_RAM}MB ram_eff=${Z6_RAM_EFF}"
+    if (contender_wanted "zerotier" || contender_wanted "zt") && [ "${ZT_AVAILABLE:-true}" != false ]; then
+        if [ "$CONTENDER_ISOLATION" = true ]; then
+            if start_zerotier; then
+                apply_netem "$NS_ZA" "$NS_ZB" "$VZA" "$VZB" "$LOSS"
+                measure_contender "zerotier" "$NS_ZA" "$NS_ZB" "$TUN_ZA_IP" "$TUN_ZA_IP6" "$LOSS"
+                Z_LOSS="$M_LOSS"; Z_RTT="$M_RTT"; Z_TCP="$M_TCP"; Z_TCP_LOSS="$M_TCP_LOSS"; Z_UDP_MBPS="$M_UDP_MBPS"; Z_UDP_LOSS="$M_UDP_LOSS"; Z_CPU="$M_CPU"; Z_EFF="$M_EFF"; Z_RAM="$M_RAM"; Z_RAM_EFF="$M_RAM_EFF"
+                Z6_LOSS="$M6_LOSS"; Z6_RTT="$M6_RTT"; Z6_TCP="$M6_TCP"; Z6_TCP_LOSS="$M6_TCP_LOSS"; Z6_UDP_MBPS="$M6_UDP_MBPS"; Z6_UDP_LOSS="$M6_UDP_LOSS"; Z6_CPU="$M6_CPU"; Z6_EFF="$M6_EFF"; Z6_RAM="$M6_RAM"; Z6_RAM_EFF="$M6_RAM_EFF"
+                stop_zerotier
+                verify_isolation "zerotier"
+            fi
+        elif [ "$ZT_AVAILABLE" = true ]; then
+            measure_contender "zerotier" "$NS_ZA" "$NS_ZB" "$TUN_ZA_IP" "$TUN_ZA_IP6" "$LOSS"
+            Z_LOSS="$M_LOSS"; Z_RTT="$M_RTT"; Z_TCP="$M_TCP"; Z_TCP_LOSS="$M_TCP_LOSS"; Z_UDP_MBPS="$M_UDP_MBPS"; Z_UDP_LOSS="$M_UDP_LOSS"; Z_CPU="$M_CPU"; Z_EFF="$M_EFF"; Z_RAM="$M_RAM"; Z_RAM_EFF="$M_RAM_EFF"
+            Z6_LOSS="$M6_LOSS"; Z6_RTT="$M6_RTT"; Z6_TCP="$M6_TCP"; Z6_TCP_LOSS="$M6_TCP_LOSS"; Z6_UDP_MBPS="$M6_UDP_MBPS"; Z6_UDP_LOSS="$M6_UDP_LOSS"; Z6_CPU="$M6_CPU"; Z6_EFF="$M6_EFF"; Z6_RAM="$M6_RAM"; Z6_RAM_EFF="$M6_RAM_EFF"
+        fi
     fi
 
-    # Tailscale (IPv4 & IPv6)
+    # ── Tailscale ─────────────────────────────────────────────────────────────
     T_LOSS="N/A"; T_RTT="N/A"; T_TCP="N/A"; T_TCP_LOSS="N/A"; T_UDP_MBPS="N/A"; T_UDP_LOSS="N/A"; T_CPU="N/A"; T_EFF="N/A"; T_RAM="N/A"; T_RAM_EFF="N/A"
     T6_LOSS="N/A"; T6_RTT="N/A"; T6_TCP="N/A"; T6_TCP_LOSS="N/A"; T6_UDP_MBPS="N/A"; T6_UDP_LOSS="N/A"; T6_CPU="N/A"; T6_EFF="N/A"; T6_RAM="N/A"; T6_RAM_EFF="N/A"
-    if [ "$TS_AVAILABLE" = true ]; then
-        read -r T_LOSS T_RTT <<< "$(measure_ping "$NS_TB" "$TUN_TA_IP")"
-        read -r T_TCP T_TCP_LOSS <<< "$(measure_iperf "$NS_TA" "$TUN_TA_IP" "$NS_TB")"
-        read -r T_UDP_MBPS T_UDP_LOSS T_CPU T_EFF <<< "$(measure_iperf_udp "$NS_TA" "$TUN_TA_IP" "$NS_TB")"
-        T_RAM="$(get_ns_ram_mb "$NS_TA")"
-        T_RAM_EFF="$(calc_ram_efficiency "$T_RAM" "$T_UDP_MBPS")"
-        echo "[tailscale] [ipv4] ping_loss=${T_LOSS}% rtt=${T_RTT}ms tcp=${T_TCP}Mbit/s tcp_loss=${T_TCP_LOSS}% udp=${T_UDP_MBPS}Mbit/s udp_loss=${T_UDP_LOSS}% cpu=${T_CPU}% eff=${T_EFF} ram=${T_RAM}MB ram_eff=${T_RAM_EFF}"
-
-        read -r T6_LOSS T6_RTT <<< "$(measure_ping "$NS_TB" "$TUN_TA_IP6")"
-        read -r T6_TCP T6_TCP_LOSS <<< "$(measure_iperf "$NS_TA" "$TUN_TA_IP6" "$NS_TB")"
-        read -r T6_UDP_MBPS T6_UDP_LOSS T6_CPU T6_EFF <<< "$(measure_iperf_udp "$NS_TA" "$TUN_TA_IP6" "$NS_TB")"
-        T6_RAM="$(get_ns_ram_mb "$NS_TA")"
-        T6_RAM_EFF="$(calc_ram_efficiency "$T6_RAM" "$T6_UDP_MBPS")"
-        echo "[tailscale] [ipv6] ping_loss=${T6_LOSS}% rtt=${T6_RTT}ms tcp=${T6_TCP}Mbit/s tcp_loss=${T6_TCP_LOSS}% udp=${T6_UDP_MBPS}Mbit/s udp_loss=${T6_UDP_LOSS}% cpu=${T6_CPU}% eff=${T6_EFF} ram=${T6_RAM}MB ram_eff=${T6_RAM_EFF}"
+    if (contender_wanted "tailscale" || contender_wanted "ts") && [ "${TS_AVAILABLE:-true}" != false ]; then
+        if [ "$CONTENDER_ISOLATION" = true ]; then
+            if start_tailscale; then
+                apply_netem "$NS_TA" "$NS_TB" "$VTA" "$VTB" "$LOSS"
+                measure_contender "tailscale" "$NS_TA" "$NS_TB" "$TUN_TA_IP" "$TUN_TA_IP6" "$LOSS"
+                T_LOSS="$M_LOSS"; T_RTT="$M_RTT"; T_TCP="$M_TCP"; T_TCP_LOSS="$M_TCP_LOSS"; T_UDP_MBPS="$M_UDP_MBPS"; T_UDP_LOSS="$M_UDP_LOSS"; T_CPU="$M_CPU"; T_EFF="$M_EFF"; T_RAM="$M_RAM"; T_RAM_EFF="$M_RAM_EFF"
+                T6_LOSS="$M6_LOSS"; T6_RTT="$M6_RTT"; T6_TCP="$M6_TCP"; T6_TCP_LOSS="$M6_TCP_LOSS"; T6_UDP_MBPS="$M6_UDP_MBPS"; T6_UDP_LOSS="$M6_UDP_LOSS"; T6_CPU="$M6_CPU"; T6_EFF="$M6_EFF"; T6_RAM="$M6_RAM"; T6_RAM_EFF="$M6_RAM_EFF"
+                stop_tailscale
+                verify_isolation "tailscale"
+            fi
+        elif [ "$TS_AVAILABLE" = true ]; then
+            measure_contender "tailscale" "$NS_TA" "$NS_TB" "$TUN_TA_IP" "$TUN_TA_IP6" "$LOSS"
+            T_LOSS="$M_LOSS"; T_RTT="$M_RTT"; T_TCP="$M_TCP"; T_TCP_LOSS="$M_TCP_LOSS"; T_UDP_MBPS="$M_UDP_MBPS"; T_UDP_LOSS="$M_UDP_LOSS"; T_CPU="$M_CPU"; T_EFF="$M_EFF"; T_RAM="$M_RAM"; T_RAM_EFF="$M_RAM_EFF"
+            T6_LOSS="$M6_LOSS"; T6_RTT="$M6_RTT"; T6_TCP="$M6_TCP"; T6_TCP_LOSS="$M6_TCP_LOSS"; T6_UDP_MBPS="$M6_UDP_MBPS"; T6_UDP_LOSS="$M6_UDP_LOSS"; T6_CPU="$M6_CPU"; T6_EFF="$M6_EFF"; T6_RAM="$M6_RAM"; T6_RAM_EFF="$M6_RAM_EFF"
+        fi
     fi
 
-    # NetBird (IPv4 & IPv6)
+    # ── NetBird ───────────────────────────────────────────────────────────────
     B_LOSS="N/A"; B_RTT="N/A"; B_TCP="N/A"; B_TCP_LOSS="N/A"; B_UDP_MBPS="N/A"; B_UDP_LOSS="N/A"; B_CPU="N/A"; B_EFF="N/A"; B_RAM="N/A"; B_RAM_EFF="N/A"
     B6_LOSS="N/A"; B6_RTT="N/A"; B6_TCP="N/A"; B6_TCP_LOSS="N/A"; B6_UDP_MBPS="N/A"; B6_UDP_LOSS="N/A"; B6_CPU="N/A"; B6_EFF="N/A"; B6_RAM="N/A"; B6_RAM_EFF="N/A"
-    if [ "$NB_AVAILABLE" = true ]; then
-        read -r B_LOSS B_RTT <<< "$(measure_ping "$NS_BB" "$TUN_BA_IP")"
-        read -r B_TCP B_TCP_LOSS <<< "$(measure_iperf "$NS_BA" "$TUN_BA_IP" "$NS_BB")"
-        read -r B_UDP_MBPS B_UDP_LOSS B_CPU B_EFF <<< "$(measure_iperf_udp "$NS_BA" "$TUN_BA_IP" "$NS_BB")"
-        B_RAM="$(get_ns_ram_mb "$NS_BA")"
-        B_RAM_EFF="$(calc_ram_efficiency "$B_RAM" "$B_UDP_MBPS")"
-        echo "[netbird] [ipv4] ping_loss=${B_LOSS}% rtt=${B_RTT}ms tcp=${B_TCP}Mbit/s tcp_loss=${B_TCP_LOSS}% udp=${B_UDP_MBPS}Mbit/s udp_loss=${B_UDP_LOSS}% cpu=${B_CPU}% eff=${B_EFF} ram=${B_RAM}MB ram_eff=${B_RAM_EFF}"
-
-        read -r B6_LOSS B6_RTT <<< "$(measure_ping "$NS_BB" "$TUN_BA_IP6")"
-        read -r B6_TCP B6_TCP_LOSS <<< "$(measure_iperf "$NS_BA" "$TUN_BA_IP6" "$NS_BB")"
-        read -r B6_UDP_MBPS B6_UDP_LOSS B6_CPU B6_EFF <<< "$(measure_iperf_udp "$NS_BA" "$TUN_BA_IP6" "$NS_BB")"
-        B6_RAM="$(get_ns_ram_mb "$NS_BA")"
-        B6_RAM_EFF="$(calc_ram_efficiency "$B6_RAM" "$B6_UDP_MBPS")"
-        echo "[netbird] [ipv6] ping_loss=${B6_LOSS}% rtt=${B6_RTT}ms tcp=${B6_TCP}Mbit/s tcp_loss=${B6_TCP_LOSS}% udp=${B6_UDP_MBPS}Mbit/s udp_loss=${B6_UDP_LOSS}% cpu=${B6_CPU}% eff=${B6_EFF} ram=${B6_RAM}MB ram_eff=${B6_RAM_EFF}"
+    if (contender_wanted "netbird" || contender_wanted "nb") && [ "${NB_AVAILABLE:-true}" != false ]; then
+        if [ "$CONTENDER_ISOLATION" = true ]; then
+            if start_netbird; then
+                apply_netem "$NS_BA" "$NS_BB" "$VBA" "$VBB" "$LOSS"
+                measure_contender "netbird" "$NS_BA" "$NS_BB" "$TUN_BA_IP" "$TUN_BA_IP6" "$LOSS"
+                B_LOSS="$M_LOSS"; B_RTT="$M_RTT"; B_TCP="$M_TCP"; B_TCP_LOSS="$M_TCP_LOSS"; B_UDP_MBPS="$M_UDP_MBPS"; B_UDP_LOSS="$M_UDP_LOSS"; B_CPU="$M_CPU"; B_EFF="$M_EFF"; B_RAM="$M_RAM"; B_RAM_EFF="$M_RAM_EFF"
+                B6_LOSS="$M6_LOSS"; B6_RTT="$M6_RTT"; B6_TCP="$M6_TCP"; B6_TCP_LOSS="$M6_TCP_LOSS"; B6_UDP_MBPS="$M6_UDP_MBPS"; B6_UDP_LOSS="$M6_UDP_LOSS"; B6_CPU="$M6_CPU"; B6_EFF="$M6_EFF"; B6_RAM="$M6_RAM"; B6_RAM_EFF="$M6_RAM_EFF"
+                stop_netbird
+                verify_isolation "netbird"
+            fi
+        elif [ "$NB_AVAILABLE" = true ]; then
+            measure_contender "netbird" "$NS_BA" "$NS_BB" "$TUN_BA_IP" "$TUN_BA_IP6" "$LOSS"
+            B_LOSS="$M_LOSS"; B_RTT="$M_RTT"; B_TCP="$M_TCP"; B_TCP_LOSS="$M_TCP_LOSS"; B_UDP_MBPS="$M_UDP_MBPS"; B_UDP_LOSS="$M_UDP_LOSS"; B_CPU="$M_CPU"; B_EFF="$M_EFF"; B_RAM="$M_RAM"; B_RAM_EFF="$M_RAM_EFF"
+            B6_LOSS="$M6_LOSS"; B6_RTT="$M6_RTT"; B6_TCP="$M6_TCP"; B6_TCP_LOSS="$M6_TCP_LOSS"; B6_UDP_MBPS="$M6_UDP_MBPS"; B6_UDP_LOSS="$M6_UDP_LOSS"; B6_CPU="$M6_CPU"; B6_EFF="$M6_EFF"; B6_RAM="$M6_RAM"; B6_RAM_EFF="$M6_RAM_EFF"
+        fi
     fi
 
     # ── emit per-loss-rate tables ─────────────────────────────────────────────
@@ -1707,6 +2177,11 @@ for LOSS in $LOSS_RATES; do
     printf "  | %-12s | %-9s | %-6s | %-10s | %-9s | %-10s | %-9s | %-4s | %-15s | %-6s | %-16s |\n" "netbird"   "$B6_LOSS" "$B6_RTT" "$B6_TCP" "$B6_TCP_LOSS" "$B6_UDP_MBPS" "$B6_UDP_LOSS" "$B6_CPU" "$B6_EFF" "$B6_RAM" "$B6_RAM_EFF"
 done
 
+if [ "$CONTENDER_ISOLATION" = false ]; then
+    echo "[info] stopping all contenders (CONTENDER_ISOLATION=false)"
+    stop_all_contenders
+fi
+
 echo ""
 echo "[done] iperf compare sweep complete"
 [ "$WG_AVAILABLE"   = false ] && echo "[note] WireGuard skipped (module/CLI absent)"
@@ -1720,6 +2195,11 @@ echo "[done] iperf compare sweep complete"
 
 if [ "$YIP_FAILED" = true ]; then
     echo "[fail] benchmark sweep failed: yip did not maintain healthy throughput across all loss conditions"
+    exit 1
+fi
+
+if [ "$THRESHOLD_FAILED" = true ]; then
+    echo "[fail] benchmark sweep failed: one or more performance thresholds were violated"
     exit 1
 fi
 true
