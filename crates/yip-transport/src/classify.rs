@@ -79,10 +79,6 @@ impl Classifier {
     pub fn classify(&mut self, inner: &[u8], l2: bool, now_ms: u64) -> FlowClass {
         // 0. stateless pure TCP ACK detection
         if is_pure_tcp_ack(inner, l2) {
-            if let Some(p) = parse_ip(inner, l2) {
-                let canonical = p.key.canonical();
-                self.flows.observe(&canonical, inner.len(), now_ms);
-            }
             return FlowClass::Ack;
         }
 
@@ -111,6 +107,10 @@ impl Classifier {
                 return class;
             }
         }
+        // ICMP (IPv4 proto 1) and ICMPv6 (IPv6 proto 58) are latency-critical network diagnostics
+        if p.key.proto == 1 || p.key.proto == 58 {
+            return FlowClass::Realtime;
+        }
         // 4. default
         FlowClass::Default
     }
@@ -118,6 +118,9 @@ impl Classifier {
     /// Observe an ingress packet arriving from a peer to update the bidirectional
     /// flow heuristic state without emitting a classification decision.
     pub fn observe_ingress(&mut self, inner: &[u8], l2: bool, now_ms: u64) {
+        if is_pure_tcp_ack(inner, l2) {
+            return;
+        }
         if let Some(p) = parse_ip(inner, l2) {
             if p.key.proto == 6 || p.key.proto == 17 {
                 let canonical = p.key.canonical();
@@ -466,6 +469,80 @@ mod tests {
     }
 
     #[test]
+    fn test_tcp_data_stream_classification_with_reverse_acks() {
+        let make_tcp_v4 =
+            |src_ip: [u8; 4], dst_ip: [u8; 4], sport: u16, dport: u16, size: usize| {
+                let mut p = vec![0u8; size];
+                p[0] = 0x45;
+                p[2..4].copy_from_slice(&(size as u16).to_be_bytes());
+                p[9] = 6;
+                p[12..16].copy_from_slice(&src_ip);
+                p[16..20].copy_from_slice(&dst_ip);
+                p[20..22].copy_from_slice(&sport.to_be_bytes());
+                p[22..24].copy_from_slice(&dport.to_be_bytes());
+                p[32] = 0x50; // data offset 5 (20 bytes)
+                p
+            };
+        let make_tcp_v6 =
+            |src_ip: [u8; 16], dst_ip: [u8; 16], sport: u16, dport: u16, size: usize| {
+                let mut p = vec![0u8; size];
+                p[0] = 0x60;
+                let payload_len = (size - 40) as u16;
+                p[4..6].copy_from_slice(&payload_len.to_be_bytes());
+                p[6] = 6; // Next header: TCP
+                p[8..24].copy_from_slice(&src_ip);
+                p[24..40].copy_from_slice(&dst_ip);
+                p[40..42].copy_from_slice(&sport.to_be_bytes());
+                p[42..44].copy_from_slice(&dport.to_be_bytes());
+                p[52] = 0x80; // data offset 8 (32 bytes with options)
+                p
+            };
+
+        // Test IPv4: TCP data stream with reverse ACKs must stay Bulk
+        let mut c4 = Classifier::new(vec![]);
+        let fwd4_data = make_tcp_v4([10, 0, 0, 1], [10, 0, 0, 2], 1234, 5201, 1400);
+        let mut rev4_ack = make_tcp_v4([10, 0, 0, 2], [10, 0, 0, 1], 5201, 1234, 52);
+        rev4_ack[32] = 0x80;
+        rev4_ack[33] = 0x10; // ACK flag
+
+        for i in 0..10 {
+            c4.classify(&fwd4_data, false, i * 10);
+        }
+        for i in 11..20 {
+            c4.observe_ingress(&rev4_ack, false, i * 10);
+            let cls = c4.classify(&fwd4_data, false, i * 10 + 5);
+            assert_eq!(
+                cls,
+                FlowClass::Bulk,
+                "IPv4 packet {i} must remain Bulk despite reverse ACKs"
+            );
+        }
+
+        // Test IPv6: TCP data stream with reverse ACKs must stay Bulk
+        let mut c6 = Classifier::new(vec![]);
+        let mut src6 = [0u8; 16];
+        src6[15] = 1;
+        let mut dst6 = [0u8; 16];
+        dst6[15] = 2;
+        let fwd6_data = make_tcp_v6(src6, dst6, 1234, 5201, 1400);
+        let mut rev6_ack = make_tcp_v6(dst6, src6, 5201, 1234, 72);
+        rev6_ack[53] = 0x10; // ACK flag
+
+        for i in 0..10 {
+            c6.classify(&fwd6_data, false, i * 10);
+        }
+        for i in 11..20 {
+            c6.observe_ingress(&rev6_ack, false, i * 10);
+            let cls = c6.classify(&fwd6_data, false, i * 10 + 5);
+            assert_eq!(
+                cls,
+                FlowClass::Bulk,
+                "IPv6 packet {i} must remain Bulk despite reverse ACKs"
+            );
+        }
+    }
+
+    #[test]
     fn icmpv6_and_multicast_do_not_populate_flow_table() {
         let mut c = Classifier::new(vec![]);
         let make_ipv6 = |proto: u8, dst: [u8; 16]| {
@@ -482,7 +559,7 @@ mod tests {
             58,
             [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
         );
-        assert_eq!(c.classify(&icmpv6, false, 0), FlowClass::Default);
+        assert_eq!(c.classify(&icmpv6, false, 0), FlowClass::Realtime);
         assert!(c.flows.is_empty(), "ICMPv6 must not populate flow table");
 
         // IPv6 multicast discovery (ff02::1, all-nodes)
@@ -491,7 +568,7 @@ mod tests {
         mcast_dst[1] = 0x02;
         mcast_dst[15] = 0x01;
         let mcast_icmp = make_ipv6(58, mcast_dst);
-        assert_eq!(c.classify(&mcast_icmp, false, 10), FlowClass::Default);
+        assert_eq!(c.classify(&mcast_icmp, false, 10), FlowClass::Realtime);
         assert!(
             c.flows.is_empty(),
             "multicast ICMPv6 must not populate flow table"
@@ -698,5 +775,48 @@ mod tests {
         assert!(!is_pure_tcp_ack(&[], false));
         assert!(!is_pure_tcp_ack(&[0x45], false));
         assert!(!is_pure_tcp_ack(&[0x45, 0, 0, 40], false));
+    }
+
+    #[test]
+    fn test_tcp_handshake_and_immediate_bulk_data() {
+        let make_tcp =
+            |src_ip: [u8; 4], dst_ip: [u8; 4], sport: u16, dport: u16, size: usize, flags: u8| {
+                let mut p = vec![0u8; size];
+                p[0] = 0x45;
+                p[2..4].copy_from_slice(&(size as u16).to_be_bytes());
+                p[9] = 6;
+                p[12..16].copy_from_slice(&src_ip);
+                p[16..20].copy_from_slice(&dst_ip);
+                p[20..22].copy_from_slice(&sport.to_be_bytes());
+                p[22..24].copy_from_slice(&dport.to_be_bytes());
+                p[32] = 0x80; // data offset 8 (32 bytes)
+                p[33] = flags;
+                p
+            };
+
+        let mut c = Classifier::new(vec![]);
+        let syn = make_tcp([10, 0, 0, 1], [10, 0, 0, 2], 50000, 5201, 60, 0x02);
+        let syn_ack = make_tcp([10, 0, 0, 2], [10, 0, 0, 1], 5201, 50000, 60, 0x12);
+        let ack = make_tcp([10, 0, 0, 1], [10, 0, 0, 2], 50000, 5201, 52, 0x10);
+        let data = make_tcp([10, 0, 0, 1], [10, 0, 0, 2], 50000, 5201, 1400, 0x18);
+
+        // 1. SYN packet
+        let cls_syn = c.classify(&syn, false, 0);
+        assert_eq!(cls_syn, FlowClass::Default);
+
+        // 2. Ingress SYN-ACK
+        c.observe_ingress(&syn_ack, false, 5);
+
+        // 3. Client pure ACK
+        let cls_ack = c.classify(&ack, false, 10);
+        assert_eq!(cls_ack, FlowClass::Ack);
+
+        // 4. Very first bulk data segment (> 1000B) MUST immediately be Bulk (not stalled in Default)
+        let cls_data1 = c.classify(&data, false, 15);
+        assert_eq!(
+            cls_data1,
+            FlowClass::Bulk,
+            "First data segment must be classified as Bulk immediately"
+        );
     }
 }

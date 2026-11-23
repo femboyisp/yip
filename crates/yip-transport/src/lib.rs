@@ -109,7 +109,7 @@ impl FlowClass {
             },
             FlowClass::Default => FlowParams {
                 symbol_size: 1200,
-                initial_repair_ratio: 0.10,
+                initial_repair_ratio: 0.0,
                 deadline: Duration::from_millis(100),
                 arq: false,
             },
@@ -437,14 +437,17 @@ mod tests {
 
     #[test]
     fn retransmitted_repair_completes_a_missing_object() {
+        // Bulk is the reactive ARQ class that uses retransmission
         let mut tx = Transport::new(vec![], 1200);
         let ct = vec![0x33u8; 2400]; // 2 source symbols
-        let (cls, syms) = tx.encode(&ct, &ct, false, 0);
+        let mut inner = vec![0u8; 24];
+        inner[0] = 0x45; // IPv4, IHL 5 (20 bytes)
+        inner[1] = 8 << 2; // DSCP 8 -> Bulk
+        inner[9] = 6; // TCP
+        let (cls, syms) = tx.encode(&ct, &inner, false, 0);
+        assert_eq!(cls, FlowClass::Bulk);
         let oid = syms[0].object_id; // the original object's identity
                                      // Deliver only ONE symbol of a 2-source-symbol object; decode stalls.
-                                     // (The class emits 3 symbols — 2 source + 1 proactive repair — so
-                                     // skipping a single symbol would still leave enough to decode; feed
-                                     // exactly one to guarantee the object is genuinely incomplete.)
         let mut rx = Transport::new(vec![], 1200);
         let mut out = None;
         for s in syms.iter().take(1) {
@@ -610,11 +613,20 @@ mod tests {
     }
 
     #[test]
-    fn test_transport_default_flow_class_decays_to_zero_on_clean_link() {
+    fn test_transport_default_flow_class_starts_at_zero_parity_and_decays() {
         let mut t = Transport::new(vec![], 1200);
         let default_idx = class_index(FlowClass::Default);
         assert_eq!(t.controllers[default_idx].min_ratio(), 0.0);
-        assert!((t.controllers[default_idx].ratio() - 0.10).abs() < 1e-5);
+        assert_eq!(t.controllers[default_idx].ratio(), 0.0);
+        assert_eq!(t.controllers[default_idx].repair_count(1), 0);
+        assert_eq!(t.controllers[default_idx].repair_count(10), 0);
+
+        // Loss increases ratio and parity
+        t.controllers[default_idx].observe_loss(0.10);
+        assert!(t.controllers[default_idx].ratio() >= 0.10);
+        assert_eq!(t.controllers[default_idx].repair_count(10), 3);
+
+        // Clean link decays back to zero
         for _ in 0..200 {
             t.controllers[default_idx].observe_loss(0.0);
         }
@@ -663,7 +675,8 @@ mod tests {
         // Sweep both objects past deadline by decoding a single-symbol object at 100_000ms
         let small = vec![0xaau8; 100];
         let (class3, syms3) = tx.encode(&small, &small, false, 100_000);
-        assert_eq!(syms3.len(), 2);
+        // Small 1-symbol object under FlowClass::Default (initial repair ratio = 0.0) has 0 repair symbols
+        assert_eq!(syms3.len(), 1);
         let dec3 = rx.decode(u64::from(syms3[0].object_id), &syms3[0], class3, 100_000);
         assert!(dec3.is_some());
         assert_eq!(rx.fec_unrecoverable_count(), 2);

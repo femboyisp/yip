@@ -9,7 +9,7 @@
 use crate::classify::FlowKey;
 
 /// Maximum number of out-of-order slots buffered per flow.
-pub const MAX_FLOW_REORDER_SLOTS: usize = 64;
+pub const MAX_FLOW_REORDER_SLOTS: usize = 128;
 
 /// Maximum number of concurrent flows actively tracked in the reorder table.
 pub const MAX_CONCURRENT_TRACKED_FLOWS: usize = 16;
@@ -21,7 +21,7 @@ pub const MAX_SLOT_PACKET_LEN: usize = 2048;
 pub const ETHERNET_HEADER_LEN: usize = 14;
 
 /// Default micro-reorder eviction deadline in milliseconds for typical network paths.
-pub const DEFAULT_REORDER_DEADLINE_MS: u64 = 10;
+pub const DEFAULT_REORDER_DEADLINE_MS: u64 = 25;
 
 const EMPTY_FLOW_KEY: FlowKey = FlowKey {
     src: [0u8; 16],
