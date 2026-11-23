@@ -11,7 +11,7 @@
 #![allow(dead_code)]
 
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 
 use crate::mode::TunnelMode;
 use yip_membership::{Cert, RootSet};
@@ -290,6 +290,20 @@ pub(crate) fn hex_to_16(hex: &str) -> io::Result<[u8; 16]> {
     Ok(out)
 }
 
+/// Parse a network id: if 32 hex digits, decode directly; otherwise, hash
+/// the string with BLAKE3 to produce a deterministic 16-byte network id.
+pub(crate) fn parse_network_id(val: &str) -> io::Result<[u8; 16]> {
+    let clean = val.trim_matches('"').trim();
+    if clean.len() == 32 && clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        hex_to_16(clean)
+    } else {
+        let hash = blake3::hash(clean.as_bytes());
+        let mut nid = [0u8; 16];
+        nid.copy_from_slice(&hash.as_bytes()[..16]);
+        Ok(nid)
+    }
+}
+
 /// Decode a 16-char hex string into 8 bytes (REALITY `sid=<hex16>`).
 pub(crate) fn hex_to_8(hex: &str) -> io::Result<[u8; 8]> {
     if hex.len() != 16 {
@@ -327,28 +341,34 @@ fn hex_decode_vec(hex: &str) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Load and decode a `cert=<path>` file: one line of hex-encoded
-/// `Cert::encode` bytes.
-fn load_cert_file(path: &str) -> io::Result<Cert> {
-    let contents = std::fs::read_to_string(path)?;
-    let bytes = hex_decode_vec(contents.trim())?;
+/// Load and decode a `cert=<path_or_hex>` value: either a path to a file
+/// containing a hex-encoded `Cert::encode` blob, or the hex-encoded blob inline.
+fn load_cert_file(val: &str) -> io::Result<Cert> {
+    let clean = val.trim();
+    let bytes = match std::fs::read_to_string(clean) {
+        Ok(contents) => hex_decode_vec(contents.trim())?,
+        Err(_) => hex_decode_vec(clean)?,
+    };
     Cert::decode(&bytes).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("failed to decode cert file {path}"),
+            format!("failed to decode cert from {clean}"),
         )
     })
 }
 
-/// Load and decode a `roots=<path>` file: one line of hex-encoded
-/// `RootSet::encode` bytes.
-fn load_roots_file(path: &str) -> io::Result<RootSet> {
-    let contents = std::fs::read_to_string(path)?;
-    let bytes = hex_decode_vec(contents.trim())?;
+/// Load and decode a `roots=<path_or_hex>` value: either a path to a file
+/// containing a hex-encoded `RootSet::encode` blob, or the hex-encoded blob inline.
+fn load_roots_file(val: &str) -> io::Result<RootSet> {
+    let clean = val.trim();
+    let bytes = match std::fs::read_to_string(clean) {
+        Ok(contents) => hex_decode_vec(contents.trim())?,
+        Err(_) => hex_decode_vec(clean)?,
+    };
     RootSet::decode(&bytes).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("failed to decode roots file {path}"),
+            format!("failed to decode roots from {clean}"),
         )
     })
 }
@@ -638,12 +658,14 @@ impl Config {
                 continue;
             }
 
-            // Check for [peer] block header
-            if line == "[peer]" {
-                flush_peer_block(cur_pk, cur_ep, cur_alias, &mut peers)?;
-                cur_pk = None;
-                cur_ep = None;
-                cur_alias = None;
+            // Check for section headers (e.g. [peer], [mesh], [node], [general])
+            if line.starts_with('[') && line.ends_with(']') {
+                if line == "[peer]" {
+                    flush_peer_block(cur_pk, cur_ep, cur_alias, &mut peers)?;
+                    cur_pk = None;
+                    cur_ep = None;
+                    cur_alias = None;
+                }
                 continue;
             }
 
@@ -654,7 +676,7 @@ impl Config {
                 )
             })?;
             let key = key.trim();
-            let val = val.trim();
+            let val = val.trim().trim_matches('"').trim();
             match key {
                 "local_private" => local_private = Some(hex_to_32(val)?),
                 "local_public" => local_public = Some(hex_to_32(val)?),
@@ -714,17 +736,34 @@ impl Config {
                             io::Error::new(io::ErrorKind::InvalidData, e.to_string())
                         })?;
                         Rendezvous::Tls { host, port }
-                    } else {
-                        Rendezvous::Udp(val.parse::<SocketAddr>().map_err(|e| {
+                    } else if let Ok(sa) = val.parse::<SocketAddr>() {
+                        Rendezvous::Udp(sa)
+                    } else if let Ok(mut addrs) = val.to_socket_addrs() {
+                        if let Some(sa) = addrs.next() {
+                            Rendezvous::Udp(sa)
+                        } else {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("could not resolve rendezvous host: {val}"),
+                            ));
+                        }
+                    } else if let Ok((host, port_str)) = parse_rendezvous_host_port(val, "") {
+                        let port = port_str.parse::<u16>().map_err(|e| {
                             io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-                        })?)
+                        })?;
+                        Rendezvous::Tls { host, port }
+                    } else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid rendezvous address: {val}"),
+                        ));
                     });
                 }
                 "ca_public" => ca_public.push(hex_to_32(val)?),
                 "cert" => cert = Some(load_cert_file(val)?),
                 "roots" => roots = Some(load_roots_file(val)?),
                 "member_sign_private" => member_sign_private = Some(hex_to_32(val)?),
-                "network_id" => network_id = Some(hex_to_16(val)?),
+                "network_id" => network_id = Some(parse_network_id(val)?),
                 "ca_server" | "threshold_ca_server" => {
                     let addr = val
                         .parse::<SocketAddr>()
@@ -2159,6 +2198,57 @@ peer_public=0000000000000000000000000000000000000000000000000000000000000003
 
         let _ = std::fs::remove_file(&cert_path);
         let _ = std::fs::remove_file(&roots_path);
+    }
+
+    #[test]
+    fn zero_peers_with_full_mesh_config_inline_hex_parses() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use yip_membership::cert::{cert_signing_body, rootset_signing_body};
+
+        let ca = SigningKey::from_bytes(&[9u8; 32]);
+        let mut cert = Cert {
+            version: 1,
+            member_pubkey: [2u8; 32],
+            member_sign_pubkey: [3u8; 32],
+            network_id: [4u8; 16],
+            not_before: 0,
+            not_after: 1_000_000,
+            tags: vec![],
+            ca_sig: [0u8; 64],
+        };
+        cert.ca_sig = ca.sign(&cert_signing_body(&cert)).to_bytes();
+        let mut cert_bytes = Vec::new();
+        cert.encode(&mut cert_bytes);
+
+        let mut roots = RootSet {
+            roots: vec![],
+            version: 1,
+            ca_sig: [0u8; 64],
+        };
+        roots.ca_sig = ca.sign(&rootset_signing_body(&roots)).to_bytes();
+        let mut roots_bytes = Vec::new();
+        roots.encode(&mut roots_bytes);
+
+        let text = format!(
+            "device=yip0\n\
+             listen=0.0.0.0:443\n\
+             local_private=0000000000000000000000000000000000000000000000000000000000000001\n\
+             local_public=0000000000000000000000000000000000000000000000000000000000000002\n\
+             ca_public={}\n\
+             member_sign_private={}\n\
+             network_id={}\n\
+             cert={}\n\
+             roots={}\n",
+            hex_encode_bytes(&ca.verifying_key().to_bytes()),
+            hex_encode_bytes(&[0x33u8; 32]),
+            hex_encode_bytes(&[0x44u8; 16]),
+            hex_encode_bytes(&cert_bytes),
+            hex_encode_bytes(&roots_bytes),
+        );
+        let cfg = Config::parse(&text).expect("zero-peer full-mesh inline hex config parses");
+        assert!(cfg.peers.is_empty());
+        assert_eq!(cfg.cert, Some(cert));
+        assert_eq!(cfg.roots, Some(roots));
     }
 
     // ── root set signature verification (2c Task 7 F1) ─────────────────
