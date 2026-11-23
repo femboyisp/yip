@@ -82,6 +82,9 @@ cleanup() {
 trap cleanup EXIT INT TERM HUP
 
 # ── SSH key generation ────────────────────────────────────────────────────────
+# Pre-sweep: clean any leftover namespaces or orphaned processes from previous runs
+clean_netns "${ALL_NETNS_LIST[@]}"
+
 echo "[ssh] generating host and client keys"
 ssh-keygen -t ed25519 -f "$TMPDIR_TEST/host" -N '' -q
 ssh-keygen -t ed25519 -f "$TMPDIR_TEST/client" -N '' -q
@@ -114,6 +117,10 @@ start_sshd() {
         sleep 0.1
         wait=$((wait + 1))
     done
+    if [ ! -f "$pidfile" ]; then
+        echo "[error] sshd failed to create pidfile within 5s" >&2
+        return 1
+    fi
 }
 
 stop_sshd() {
@@ -122,12 +129,14 @@ stop_sshd() {
         local pid
         pid="$(cat "$pidfile" 2>/dev/null || true)"
         if [ -n "$pid" ]; then
+            pkill -P "$pid" 2>/dev/null || true
             kill "$pid" 2>/dev/null || true
             for _ in $(seq 1 10); do
                 kill -0 "$pid" 2>/dev/null || break
                 sleep 0.05
             done
             kill -9 "$pid" 2>/dev/null || true
+            pkill -9 -P "$pid" 2>/dev/null || true
         fi
         rm -f "$pidfile"
     fi
@@ -137,6 +146,7 @@ stop_sshd() {
 declare -A RESULT_TIME
 declare -A RESULT_MBPS
 declare -A RESULT_INTEGRITY
+BENCH_FAILED=false
 
 echo "=========================================================="
 echo "  SCP File Transfer Benchmark under netem packet loss"
@@ -190,6 +200,7 @@ for CONTENDER in $CONTENDERS; do
             transfer_ok=0
             if ip netns exec "$CLI_NS" timeout "$TIMEOUT_SEC" scp -q -P "$SSH_PORT" \
                 -i "$TMPDIR_TEST/client" \
+                -o BatchMode=yes \
                 -o StrictHostKeyChecking=no \
                 -o UserKnownHostsFile=/dev/null \
                 -o ConnectTimeout=10 \
@@ -210,6 +221,8 @@ for CONTENDER in $CONTENDERS; do
                 integrity="OK"
                 if ! ip netns exec "$SRV_NS" cmp -s "$PAYLOAD" "$REMOTE_DEST"; then
                     integrity="FAIL"
+                    BENCH_FAILED=true
+                    echo "[error] [$CONTENDER_CANONICAL] payload integrity mismatch!" >&2
                 fi
                 RESULT_INTEGRITY["$KEY"]="$integrity"
                 echo "[$CONTENDER_CANONICAL] size=${SIZE_MB}MB loss=${LOSS}%: time=${elapsed}s throughput=${mbps} MB/s integrity=${integrity}"
@@ -218,6 +231,10 @@ for CONTENDER in $CONTENDERS; do
                 RESULT_MBPS["$KEY"]="0.00"
                 RESULT_INTEGRITY["$KEY"]="FAIL"
                 echo "[$CONTENDER_CANONICAL] size=${SIZE_MB}MB loss=${LOSS}%: TIMEOUT/FAILED"
+                if [ "$CONTENDER_CANONICAL" = "yip" ]; then
+                    BENCH_FAILED=true
+                    echo "[error] yip failed to complete scp transfer within ${TIMEOUT_SEC}s" >&2
+                fi
             fi
             ip netns exec "$SRV_NS" rm -f "$REMOTE_DEST" 2>/dev/null || true
         done
@@ -305,3 +322,14 @@ EOF
 fi
 
 echo "[done] scp benchmark sweep complete"
+
+if [ "$BENCH_FAILED" = true ]; then
+    echo "[fail] scp benchmark sweep failed: yip transfer failed or payload integrity mismatch detected" >&2
+    exit 1
+fi
+
+if [ "$ISOLATION_FAILED" = true ]; then
+    echo "[fail] scp benchmark sweep failed: resource leak detected during isolation verification" >&2
+    exit 1
+fi
+true

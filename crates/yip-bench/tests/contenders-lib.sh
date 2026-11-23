@@ -1453,7 +1453,7 @@ tun:
   dev: neb0
   drop_local_broadcast: false
   drop_multicast: false
-  tx_queue: 1000
+  tx_queue: 10000
   mtu: 1300
 firewall:
   conntrack:
@@ -1494,7 +1494,7 @@ tun:
   dev: neb0
   drop_local_broadcast: false
   drop_multicast: false
-  tx_queue: 1000
+  tx_queue: 10000
   mtu: 1300
 firewall:
   conntrack:

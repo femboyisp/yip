@@ -766,7 +766,7 @@ Sweep executed across all ten contenders under isolated network namespaces (`run
 | `zerotier` | 0 | 10.220 | 1,180.4 | 0.0 | 1,790.2 | 0.0 | 57.9 | 32.3 | 16.8 | 9.4 |
 | `tailscale` | 0 | 10.511 | 10,601.6 | 0.0 | 2,918.3 | 0.0 | 84.2 | 28.9 | 28.5 | 9.8 |
 | `netbird` | 0 | 10.420 | 2,089.1 | 0.0 | 1,354.5 | 0.0 | 78.8 | 58.2 | 42.1 | 31.1 |
-| `nebula` (v1.12.0) | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `nebula` (v1.12.0) | 0 | 10.341 | 656.5 | 0.2 | 581.6 | 0.0 | 35.1 | 22.8 | 16.2 | 10.8 |
 
 ---
 
