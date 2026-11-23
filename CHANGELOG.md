@@ -6,6 +6,11 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **Public Rendezvous Deployment Assets & Inline Hex Mesh Config (`deploy/rendezvous`, `bin/yipd`, #264).**
+  - Added hardened systemd unit `deploy/rendezvous/yip-rendezvous.service` binding UDP and TCP port 443 with `AmbientCapabilities=CAP_NET_BIND_SERVICE` and strict process isolation.
+  - Added setup script `deploy/rendezvous/setup-rendezvous.sh`, verification probe `deploy/rendezvous/verify-rendezvous.sh`, and operational guide `deploy/rendezvous/README.md`.
+  - Added fallback inline hex decoding for `cert` and `roots` keys in `bin/yipd/src/config.rs`, allowing single-file zero-peer mesh configuration without auxiliary file dependencies.
+  - Added support for TOML section headers (`[mesh]`, `[node]`), quoted configuration values, BLAKE3 deterministic network ID hashing for human-readable names, and offline rendezvous hostname parsing.
 - **Data Plane Driver Matrix & Multi-Shard Workload Benchmark (`crates/yip-bench`, `crates/yip-io`, `bin/yipd`, #279).**
   - Added `crates/yip-bench/tests/run-driver-matrix.sh` systematically benchmarking and comparing `epoll`, `io_uring`, and `AF_XDP` drivers across 1, 2, 4, and `auto` shard configurations.
   - Implemented `IoUring::builder().setup_sqpoll(...)` submission queue polling in `UringDriver` (opt-in via `YIP_URING_SQPOLL=1`) to eliminate syscall context switching during high-rate I/O.
