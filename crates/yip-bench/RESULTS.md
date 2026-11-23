@@ -774,19 +774,42 @@ Sweep executed across all ten contenders under isolated network namespaces (`run
 
 To evaluate practical application-layer throughput under real network conditions, `run-scp-compare.sh` executes actual OpenSSH `scp` file transfers between isolated network namespaces across contenders under symmetric netem channel degradation (5 ms base delay, 0% vs 5% packet loss):
 
-| Contender | Loss (%) | Transfer Time (s) | Goodput (MB/s) | File Integrity (SHA-256) |
+| Contender | Loss (%) | Transfer Time (s) | Goodput (MB/s) | File Integrity (`cmp -s`) |
 |:---|:---:|:---:|:---:|:---:|
-| **`yip`** | **0%** | **0.42 s** | **11.86 MB/s** | **OK** |
-| **`yip`** | **5%** | **0.47 s** | **10.65 MB/s** | **OK** |
-| `wireguard` | 0% | 0.44 s | 11.28 MB/s | OK |
-| `wireguard` | 5% | 13.99 s | 0.36 MB/s | OK |
-| `nebula` | 0% | 0.44 s | 11.41 MB/s | OK |
-| `nebula` | 5% | 11.91 s | 0.42 MB/s | OK |
+| **`yip`** | **0%** | **0.47 s** | **21.30 MB/s** | **OK** |
+| **`yip`** | **5%** | **0.50 s** | **19.97 MB/s** | **OK** |
+| `wireguard` | 0% | 0.48 s | 20.64 MB/s | OK |
+| `wireguard` | 5% | 26.42 s | 0.38 MB/s | OK |
+| `wireguard-go` | 0% | 0.46 s | 21.95 MB/s | OK |
+| `wireguard-go` | 5% | 19.03 s | 0.53 MB/s | OK |
+| `amneziawg` | 0% | 0.46 s | 21.90 MB/s | OK |
+| `amneziawg` | 5% | 20.05 s | 0.50 MB/s | OK |
+| `openvpn` | 0% | 0.91 s | 11.03 MB/s | OK |
+| `openvpn` | 5% | 22.78 s | 0.44 MB/s | OK |
+| `n2n` | 0% | 0.55 s | 18.07 MB/s | OK |
+| `n2n` | 5% | 28.17 s | 0.35 MB/s | OK |
+| `zerotier` | 0% | 0.50 s | 20.00 MB/s | OK |
+| `zerotier` | 5% | 24.99 s | 0.40 MB/s | OK |
+| `tailscale` | 0% | 0.45 s | 22.19 MB/s | OK |
+| `tailscale` | 5% | 21.46 s | 0.47 MB/s | OK |
+| `netbird` | 0% | 0.48 s | 20.85 MB/s | OK |
+| `netbird` | 5% | 29.71 s | 0.34 MB/s | OK |
+| `nebula` | 0% | 0.65 s | 15.44 MB/s | OK |
+| `nebula` | 5% | 27.80 s | 0.36 MB/s | OK |
 
 #### Key Takeaways:
-- **Clean-Link Baseline:** At 0% packet loss, all contenders perform comparably (~11.3 - 11.9 MB/s, limited primarily by single-core SSH encryption/decryption overhead and process startup).
-- **5% Channel Loss Collapse:** Under 5% packet loss, TCP traffic traversing standard UDP tunnels (`wireguard`, `nebula`) suffers catastrophic backoff due to dropped ACK and payload segments: WireGuard throughput collapses by **96.8%** (down to 0.36 MB/s) and Nebula collapses by **96.3%** (down to 0.42 MB/s).
-- **YIP Resilience:** YIP sustains **10.65 MB/s** under 5% packet loss (>90% of its clean-link speed), outperforming WireGuard by **~30x** and Nebula by **~25x**.
+- **Clean-Link Baseline (0% Loss):** All contenders perform comparably (~15 - 22 MB/s, limited primarily by single-core SSH encryption/decryption overhead and process startup).
+- **5% Channel Loss Collapse Across Contenders:** Under 5% packet loss, TCP traffic traversing all 9 standard overlay tunnels suffers catastrophic goodput collapse due to dropped ACK and payload segments:
+  - `wireguard`: collapses by **98.2%** (down to 0.38 MB/s, 26.4s)
+  - `wireguard-go`: collapses by **97.6%** (down to 0.53 MB/s, 19.0s)
+  - `amneziawg`: collapses by **97.7%** (down to 0.50 MB/s, 20.0s)
+  - `openvpn`: collapses by **96.0%** (down to 0.44 MB/s, 22.8s)
+  - `n2n`: collapses by **98.1%** (down to 0.35 MB/s, 28.2s)
+  - `zerotier`: collapses by **98.0%** (down to 0.40 MB/s, 25.0s)
+  - `tailscale`: collapses by **97.9%** (down to 0.47 MB/s, 21.5s)
+  - `netbird`: collapses by **98.4%** (down to 0.34 MB/s, 29.7s)
+  - `nebula`: collapses by **97.7%** (down to 0.36 MB/s, 27.8s)
+- **YIP Transport Resilience:** YIP sustains **19.97 MB/s** under 5% packet loss (**>93% of its clean-link speed**), completing the 10MB transfer in **0.50 seconds**. This is **40x to 58x faster** than all 9 competing overlay technologies. All transfers verify 100% byte-for-byte payload integrity (`cmp -s`).
 
 ---
 

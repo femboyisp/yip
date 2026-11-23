@@ -45,6 +45,9 @@ WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 # ── configuration ─────────────────────────────────────────────────────────────
 CONTENDERS="${CONTENDERS:-yip wireguard wireguard-go amneziawg openvpn n2n zerotier tailscale netbird nebula}"
+if [ "$CONTENDERS" = "all" ]; then
+    CONTENDERS="yip wireguard wireguard-go amneziawg openvpn n2n zerotier tailscale netbird nebula"
+fi
 LOSS_RATES="${LOSS_RATES:-0 5 10}"
 FILE_SIZES_MB="${FILE_SIZES_MB:-100}"
 OUTPUT_JSON="${OUTPUT_JSON:-}"
