@@ -108,7 +108,7 @@ PID_NB_SIG=""; PID_NB_MGMT=""; PID_NB_SA=""; PID_NB_SB=""
 NS_EA="${NS_EA:-ipfEA}"; NS_EB="${NS_EB:-ipfEB}"; VEA="${VEA:-ipfvEA}"; VEB="${VEB:-ipfvEB}"
 VEA_IP="${VEA_IP:-10.28.0.1}"; VEB_IP="${VEB_IP:-10.28.0.2}"
 TUN_EA_IP="${TUN_EA_IP:-10.29.0.1}"; TUN_EB_IP="${TUN_EB_IP:-10.29.0.2}"
-TUN_EA_IP6="${TUN_EA_IP6:-}"; TUN_EB_IP6="${TUN_EB_IP6:-}"
+TUN_EA_IP6="${TUN_EA_IP6:-fd00:29::1}"; TUN_EB_IP6="${TUN_EB_IP6:-fd00:29::2}"
 NEB_PORT="4242"
 NEB_AVAILABLE=""
 PID_NEB_A=""; PID_NEB_B=""
@@ -748,14 +748,14 @@ start_n2n() {
     make_pair "$NS_NA" "$NS_NB" "$VNA" "$VNB" "$VNA_IP" "$VNB_IP"
 
     echo "[n2n] launching supernode on Node A"
-    ip netns exec "$NS_NA" supernode -f -p "$N2N_PORT" -l 1 >"$TMPDIR_TEST/n2n_sn.log" 2>&1 &
+    ip netns exec "$NS_NA" supernode -f -M -p "$N2N_PORT" >"$TMPDIR_TEST/n2n_sn.log" 2>&1 &
     PID_N2N_SN=$!
     sleep 0.3
 
     echo "[n2n] launching edge daemons on Node A and Node B"
-    ip netns exec "$NS_NA" edge -f -d n2n0 -a "${OVL_NA_IP}" -c yipbench -k benchpass -l "${VNA_IP}:${N2N_PORT}" >"$TMPDIR_TEST/n2n_ea.log" 2>&1 &
+    ip netns exec "$NS_NA" edge -f -d n2n0 -a "${OVL_NA_IP}" -c yipbench -k benchpass -l "${VNA_IP}:${N2N_PORT}" -E -r >"$TMPDIR_TEST/n2n_ea.log" 2>&1 &
     PID_N2N_EA=$!
-    ip netns exec "$NS_NB" edge -f -d n2n0 -a "${OVL_NB_IP}" -c yipbench -k benchpass -l "${VNA_IP}:${N2N_PORT}" >"$TMPDIR_TEST/n2n_eb.log" 2>&1 &
+    ip netns exec "$NS_NB" edge -f -d n2n0 -a "${OVL_NB_IP}" -c yipbench -k benchpass -l "${VNA_IP}:${N2N_PORT}" -E -r >"$TMPDIR_TEST/n2n_eb.log" 2>&1 &
     PID_N2N_EB=$!
 
     local i
@@ -873,11 +873,11 @@ start_awg() {
 
     local awg_err=""
     if ! awg_err="$(ip netns exec "$NS_AA" awg set awg0 private-key "$keyA" listen-port "$APORT_A" \
-            peer "$pubB" endpoint "${VAB_IP}:${APORT_B}" allowed-ips "${TUN_AB_IP}/32,fd00:19::/64" \
-            jc 4 jmin 40 jmax 70 s1 15 s2 20 h1 1000000001 h2 1000000002 h3 1000000003 h4 1000000004 2>&1)" || \
+            jc 4 jmin 40 jmax 70 s1 15 s2 20 h1 1000000001 h2 1000000002 h3 1000000003 h4 1000000004 \
+            peer "$pubB" endpoint "${VAB_IP}:${APORT_B}" allowed-ips "${TUN_AB_IP}/32,fd00:19::/64" 2>&1)" || \
        ! awg_err="$(ip netns exec "$NS_AB" awg set awg0 private-key "$keyB" listen-port "$APORT_B" \
-            peer "$pubA" endpoint "${VAA_IP}:${APORT_A}" allowed-ips "${TUN_AA_IP}/32,fd00:19::/64" \
-            jc 4 jmin 40 jmax 70 s1 15 s2 20 h1 1000000001 h2 1000000002 h3 1000000003 h4 1000000004 2>&1)"; then
+            jc 4 jmin 40 jmax 70 s1 15 s2 20 h1 1000000001 h2 1000000002 h3 1000000003 h4 1000000004 \
+            peer "$pubA" endpoint "${VAA_IP}:${APORT_A}" allowed-ips "${TUN_AA_IP}/32,fd00:19::/64" 2>&1)"; then
         echo "[awg] SKIP: awg set configuration failed: $awg_err"
         stop_awg
         AWG_AVAILABLE=false
@@ -1431,8 +1431,8 @@ start_nebula() {
     mkdir -p "$neb_dir"
 
     nebula-cert ca -name "yip-bench-ca" -out-crt "$neb_dir/ca.crt" -out-key "$neb_dir/ca.key" -duration "24h" >/dev/null 2>&1
-    nebula-cert sign -name "node-a" -ip "${TUN_EA_IP}/24" -ca-crt "$neb_dir/ca.crt" -ca-key "$neb_dir/ca.key" -out-crt "$neb_dir/a.crt" -out-key "$neb_dir/a.key" >/dev/null 2>&1
-    nebula-cert sign -name "node-b" -ip "${TUN_EB_IP}/24" -ca-crt "$neb_dir/ca.crt" -ca-key "$neb_dir/ca.key" -out-crt "$neb_dir/b.crt" -out-key "$neb_dir/b.key" >/dev/null 2>&1
+    nebula-cert sign -name "node-a" -networks "${TUN_EA_IP}/24,${TUN_EA_IP6}/64" -ca-crt "$neb_dir/ca.crt" -ca-key "$neb_dir/ca.key" -out-crt "$neb_dir/a.crt" -out-key "$neb_dir/a.key" >/dev/null 2>&1
+    nebula-cert sign -name "node-b" -networks "${TUN_EB_IP}/24,${TUN_EB_IP6}/64" -ca-crt "$neb_dir/ca.crt" -ca-key "$neb_dir/ca.key" -out-crt "$neb_dir/b.crt" -out-key "$neb_dir/b.key" >/dev/null 2>&1
 
     cat > "$neb_dir/a.yaml" <<EOF
 pki:
@@ -1446,14 +1446,20 @@ lighthouse:
 listen:
   host: 0.0.0.0
   port: ${NEB_PORT}
+punchy:
+  punch: true
 tun:
   disabled: false
   dev: neb0
   drop_local_broadcast: false
   drop_multicast: false
   tx_queue: 1000
-  mtu: 1400
+  mtu: 1300
 firewall:
+  conntrack:
+    tcp_timeout: 12m
+    udp_timeout: 3m
+    default_timeout: 10m
   outbound:
     - port: any
       proto: any
@@ -1471,22 +1477,30 @@ pki:
   key: $neb_dir/b.key
 static_host_map:
   "${TUN_EA_IP}": ["${VEA_IP}:${NEB_PORT}"]
+  "${TUN_EA_IP6}": ["${VEA_IP}:${NEB_PORT}"]
 lighthouse:
   am_lighthouse: false
   interval: 10
   hosts:
     - "${TUN_EA_IP}"
+    - "${TUN_EA_IP6}"
 listen:
   host: 0.0.0.0
   port: ${NEB_PORT}
+punchy:
+  punch: true
 tun:
   disabled: false
   dev: neb0
   drop_local_broadcast: false
   drop_multicast: false
   tx_queue: 1000
-  mtu: 1400
+  mtu: 1300
 firewall:
+  conntrack:
+    tcp_timeout: 12m
+    udp_timeout: 3m
+    default_timeout: 10m
   outbound:
     - port: any
       proto: any
@@ -1505,7 +1519,8 @@ EOF
     # Wait for handshake
     local elapsed=0 interval=0.5 max_wait=15
     while true; do
-        if ip netns exec "$NS_EB" ping -c 1 -W 1 "$TUN_EA_IP" >/dev/null 2>&1; then
+        if ip netns exec "$NS_EB" ping -c 1 -W 1 "$TUN_EA_IP" >/dev/null 2>&1 && \
+           ip netns exec "$NS_EB" ping -6 -c 1 -W 1 "$TUN_EA_IP6" >/dev/null 2>&1; then
             break
         fi
         if ! kill -0 "$PID_NEB_A" 2>/dev/null || ! kill -0 "$PID_NEB_B" 2>/dev/null; then
