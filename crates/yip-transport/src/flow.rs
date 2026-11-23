@@ -97,13 +97,13 @@ impl FlowTable {
     /// here so they fall through to `FlowClass::Default` without destructive ARQ amplification.
     pub fn classify(&self, key: &FlowKey) -> Option<FlowClass> {
         let stat = self.map.get(key)?;
-        if stat.packets < MIN_PACKETS {
-            return None;
-        }
         if stat.ewma_size > LARGE_BYTES {
             if key.proto == 6 {
                 return Some(FlowClass::Bulk);
             }
+            return None;
+        }
+        if stat.packets < MIN_PACKETS {
             return None;
         }
         if stat.ewma_size < SMALL_BYTES {
@@ -209,6 +209,15 @@ mod tests {
         let k = key(7000);
         t.observe(&k, 80, 0); // only 1 packet < MIN_PACKETS
         assert_eq!(t.classify(&k), None);
+    }
+
+    #[test]
+    fn large_tcp_packet_classifies_as_bulk_on_first_packet() {
+        let mut t = FlowTable::new(1024, 10_000);
+        let mut k = key(6003);
+        k.proto = 6; // TCP
+        t.observe(&k, 1400, 0); // 1st packet > LARGE_BYTES
+        assert_eq!(t.classify(&k), Some(FlowClass::Bulk));
     }
 
     #[test]
