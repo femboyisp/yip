@@ -776,4 +776,47 @@ mod tests {
         assert!(!is_pure_tcp_ack(&[0x45], false));
         assert!(!is_pure_tcp_ack(&[0x45, 0, 0, 40], false));
     }
+
+    #[test]
+    fn test_tcp_handshake_and_immediate_bulk_data() {
+        let make_tcp =
+            |src_ip: [u8; 4], dst_ip: [u8; 4], sport: u16, dport: u16, size: usize, flags: u8| {
+                let mut p = vec![0u8; size];
+                p[0] = 0x45;
+                p[2..4].copy_from_slice(&(size as u16).to_be_bytes());
+                p[9] = 6;
+                p[12..16].copy_from_slice(&src_ip);
+                p[16..20].copy_from_slice(&dst_ip);
+                p[20..22].copy_from_slice(&sport.to_be_bytes());
+                p[22..24].copy_from_slice(&dport.to_be_bytes());
+                p[32] = 0x80; // data offset 8 (32 bytes)
+                p[33] = flags;
+                p
+            };
+
+        let mut c = Classifier::new(vec![]);
+        let syn = make_tcp([10, 0, 0, 1], [10, 0, 0, 2], 50000, 5201, 60, 0x02);
+        let syn_ack = make_tcp([10, 0, 0, 2], [10, 0, 0, 1], 5201, 50000, 60, 0x12);
+        let ack = make_tcp([10, 0, 0, 1], [10, 0, 0, 2], 50000, 5201, 52, 0x10);
+        let data = make_tcp([10, 0, 0, 1], [10, 0, 0, 2], 50000, 5201, 1400, 0x18);
+
+        // 1. SYN packet
+        let cls_syn = c.classify(&syn, false, 0);
+        assert_eq!(cls_syn, FlowClass::Default);
+
+        // 2. Ingress SYN-ACK
+        c.observe_ingress(&syn_ack, false, 5);
+
+        // 3. Client pure ACK
+        let cls_ack = c.classify(&ack, false, 10);
+        assert_eq!(cls_ack, FlowClass::Ack);
+
+        // 4. Very first bulk data segment (> 1000B) MUST immediately be Bulk (not stalled in Default)
+        let cls_data1 = c.classify(&data, false, 15);
+        assert_eq!(
+            cls_data1,
+            FlowClass::Bulk,
+            "First data segment must be classified as Bulk immediately"
+        );
+    }
 }

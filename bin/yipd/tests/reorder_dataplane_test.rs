@@ -211,7 +211,7 @@ fn test_dataplane_tcp_packet_reordering_and_timeout() {
         ),
     }
 
-    // Advance time past micro-deadline (100 + DEFAULT_REORDER_DEADLINE_MS = 110ms deadline; advance past deadline)
+    // Advance time past micro-deadline (100 + DEFAULT_REORDER_DEADLINE_MS = 125ms deadline; advance past deadline)
     let _ = receiver.tick(100 + yip_transport::reorder::DEFAULT_REORDER_DEADLINE_MS + 1);
     let mut drained = Vec::new();
     receiver.drain_tun(&mut drained);
@@ -275,7 +275,7 @@ fn test_peermanager_tcp_packet_reordering_and_drain() {
     let out5 = pm_b.on_udp(ep_a, &dg5, 100);
     assert!(matches!(out5, DispatchOut::None));
 
-    // Advance time past micro-deadline (100 + DEFAULT_REORDER_DEADLINE_MS = 110ms; advance past deadline)
+    // Advance time past micro-deadline (100 + DEFAULT_REORDER_DEADLINE_MS = 125ms; advance past deadline)
     let _ = pm_b.tick(100 + yip_transport::reorder::DEFAULT_REORDER_DEADLINE_MS + 1);
     let mut drained = Vec::new();
     pm_b.drain_tun(&mut drained);

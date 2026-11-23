@@ -129,7 +129,9 @@ impl AdaptiveController {
                 decayed
             };
         } else {
-            let mut target: f32 = if effective_loss >= 0.10 {
+            let mut target: f32 = if effective_loss >= 0.50 {
+                0.50
+            } else if effective_loss >= 0.10 {
                 0.30
             } else if effective_loss >= 0.05 {
                 0.20
@@ -330,7 +332,8 @@ mod tests {
         assert_eq!(c.repair_count(10), 3);
 
         // Under severe >=50% loss: K=1 emits 1 repair packet (packet replication fallback)
-        c.set_ratio(0.55);
+        c.observe_loss(0.52);
+        assert!(c.ratio() >= 0.50);
         assert_eq!(
             c.repair_count(1),
             1,

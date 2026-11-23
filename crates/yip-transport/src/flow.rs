@@ -59,7 +59,18 @@ impl FlowTable {
             .unwrap_or(f32::from(u16::MAX));
         match self.map.get_mut(key) {
             Some(stat) => {
-                stat.ewma_size = EWMA_ALPHA * size_f + (1.0 - EWMA_ALPHA) * stat.ewma_size;
+                if key.proto == 6
+                    && size_f > LARGE_BYTES
+                    && stat.packets <= 3
+                    && stat.ewma_size < 150.0
+                {
+                    // Fast initialization: previous packets were small TCP handshake
+                    // segments (SYN/SYN-ACK). Jump straight to full data segment size
+                    // so TCP slow start is immediately classified as Bulk.
+                    stat.ewma_size = size_f;
+                } else {
+                    stat.ewma_size = EWMA_ALPHA * size_f + (1.0 - EWMA_ALPHA) * stat.ewma_size;
+                }
                 stat.packets = stat.packets.saturating_add(1);
                 stat.last_ms = now_ms;
             }
