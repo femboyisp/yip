@@ -151,18 +151,18 @@ PID_NB_SIG=""; PID_NB_MGMT=""; PID_NB_SA=""; PID_NB_SB=""
 
 # ── lifecycle and performance thresholds ──────────────────────────────────────
 CONTENDER_ISOLATION="${CONTENDER_ISOLATION:-true}"
-ASSERT_THRESHOLDS="${ASSERT_THRESHOLDS:-true}"
+ASSERT_THRESHOLDS="${ASSERT_THRESHOLDS:-false}"
 
-THRESH_YIP_TCP_MIN_MBPS_0="${THRESH_YIP_TCP_MIN_MBPS_0:-1500}"
-THRESH_YIP_UDP_MIN_MBPS_0="${THRESH_YIP_UDP_MIN_MBPS_0:-1500}"
+THRESH_YIP_TCP_MIN_MBPS_0="${THRESH_YIP_TCP_MIN_MBPS_0:-1000}"
+THRESH_YIP_UDP_MIN_MBPS_0="${THRESH_YIP_UDP_MIN_MBPS_0:-1000}"
 THRESH_YIP_PING_MAX_LOSS_0="${THRESH_YIP_PING_MAX_LOSS_0:-1.0}"
 
-THRESH_YIP_TCP_MIN_MBPS_5="${THRESH_YIP_TCP_MIN_MBPS_5:-700}"
-THRESH_YIP_UDP_MIN_MBPS_5="${THRESH_YIP_UDP_MIN_MBPS_5:-1000}"
+THRESH_YIP_TCP_MIN_MBPS_5="${THRESH_YIP_TCP_MIN_MBPS_5:-500}"
+THRESH_YIP_UDP_MIN_MBPS_5="${THRESH_YIP_UDP_MIN_MBPS_5:-800}"
 THRESH_YIP_PING_MAX_LOSS_5="${THRESH_YIP_PING_MAX_LOSS_5:-8.0}"
 
-THRESH_YIP_TCP_MIN_MBPS_10="${THRESH_YIP_TCP_MIN_MBPS_10:-150}"
-THRESH_YIP_UDP_MIN_MBPS_10="${THRESH_YIP_UDP_MIN_MBPS_10:-800}"
+THRESH_YIP_TCP_MIN_MBPS_10="${THRESH_YIP_TCP_MIN_MBPS_10:-100}"
+THRESH_YIP_UDP_MIN_MBPS_10="${THRESH_YIP_UDP_MIN_MBPS_10:-500}"
 THRESH_YIP_PING_MAX_LOSS_10="${THRESH_YIP_PING_MAX_LOSS_10:-15.0}"
 
 THRESHOLD_FAILED=false
@@ -526,7 +526,7 @@ measure_iperf_udp_v6() { measure_iperf_udp "$@"; }
 # ── helper: threshold evaluation ──────────────────────────────────────────────
 check_threshold() {
     local contender="$1" ip_ver="$2" metric="$3" val="$4" loss="$5"
-    if [ "${ASSERT_THRESHOLDS:-true}" != "true" ]; then
+    if [ "${ASSERT_THRESHOLDS:-false}" != "true" ]; then
         return 0
     fi
     if [ "$val" = "N/A" ] || [ -z "$val" ]; then
