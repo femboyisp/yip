@@ -99,14 +99,20 @@ ASSERT_THRESHOLDS="${ASSERT_THRESHOLDS:-false}"
 THRESH_YIP_TCP_MIN_MBPS_0="${THRESH_YIP_TCP_MIN_MBPS_0:-1000}"
 THRESH_YIP_UDP_MIN_MBPS_0="${THRESH_YIP_UDP_MIN_MBPS_0:-1000}"
 THRESH_YIP_PING_MAX_LOSS_0="${THRESH_YIP_PING_MAX_LOSS_0:-1.0}"
+THRESH_YIP_TCP_MAX_LOSS_0="${THRESH_YIP_TCP_MAX_LOSS_0:-1.0}"
+THRESH_YIP_UDP_MAX_LOSS_0="${THRESH_YIP_UDP_MAX_LOSS_0:-1.0}"
 
 THRESH_YIP_TCP_MIN_MBPS_5="${THRESH_YIP_TCP_MIN_MBPS_5:-500}"
 THRESH_YIP_UDP_MIN_MBPS_5="${THRESH_YIP_UDP_MIN_MBPS_5:-800}"
 THRESH_YIP_PING_MAX_LOSS_5="${THRESH_YIP_PING_MAX_LOSS_5:-8.0}"
+THRESH_YIP_TCP_MAX_LOSS_5="${THRESH_YIP_TCP_MAX_LOSS_5:-2.0}"
+THRESH_YIP_UDP_MAX_LOSS_5="${THRESH_YIP_UDP_MAX_LOSS_5:-3.0}"
 
 THRESH_YIP_TCP_MIN_MBPS_10="${THRESH_YIP_TCP_MIN_MBPS_10:-100}"
 THRESH_YIP_UDP_MIN_MBPS_10="${THRESH_YIP_UDP_MIN_MBPS_10:-500}"
 THRESH_YIP_PING_MAX_LOSS_10="${THRESH_YIP_PING_MAX_LOSS_10:-15.0}"
+THRESH_YIP_TCP_MAX_LOSS_10="${THRESH_YIP_TCP_MAX_LOSS_10:-5.0}"
+THRESH_YIP_UDP_MAX_LOSS_10="${THRESH_YIP_UDP_MAX_LOSS_10:-8.0}"
 
 THRESHOLD_FAILED=false
 
@@ -485,7 +491,9 @@ measure_contender() {
         echo "[$tag] [ipv4] ping_loss=${M_LOSS}% rtt=${M_RTT}ms tcp=${M_TCP}Mbit/s tcp_loss=${M_TCP_LOSS}% udp=${M_UDP_MBPS}Mbit/s udp_loss=${M_UDP_LOSS}% cpu=${M_CPU}% eff=${M_EFF} ram=${M_RAM}MB ram_eff=${M_RAM_EFF}"
         check_threshold "$tag" "ipv4" "ping_max_loss" "$M_LOSS" "$loss"
         check_threshold "$tag" "ipv4" "tcp_min_mbps" "$M_TCP" "$loss"
+        check_threshold "$tag" "ipv4" "tcp_max_loss" "$M_TCP_LOSS" "$loss"
         check_threshold "$tag" "ipv4" "udp_min_mbps" "$M_UDP_MBPS" "$loss"
+        check_threshold "$tag" "ipv4" "udp_max_loss" "$M_UDP_LOSS" "$loss"
         sleep 0.5
     fi
 
@@ -498,7 +506,9 @@ measure_contender() {
         echo "[$tag] [ipv6] ping_loss=${M6_LOSS}% rtt=${M6_RTT}ms tcp=${M6_TCP}Mbit/s tcp_loss=${M6_TCP_LOSS}% udp=${M6_UDP_MBPS}Mbit/s udp_loss=${M6_UDP_LOSS}% cpu=${M6_CPU}% eff=${M6_EFF} ram=${M6_RAM}MB ram_eff=${M6_RAM_EFF}"
         check_threshold "$tag" "ipv6" "ping_max_loss" "$M6_LOSS" "$loss"
         check_threshold "$tag" "ipv6" "tcp_min_mbps" "$M6_TCP" "$loss"
+        check_threshold "$tag" "ipv6" "tcp_max_loss" "$M6_TCP_LOSS" "$loss"
         check_threshold "$tag" "ipv6" "udp_min_mbps" "$M6_UDP_MBPS" "$loss"
+        check_threshold "$tag" "ipv6" "udp_max_loss" "$M6_UDP_LOSS" "$loss"
         sleep 0.5
     fi
 }
@@ -558,6 +568,15 @@ for LOSS in $LOSS_RATES; do
            [ "$Y6_UDP_MBPS" = "0.0" ] || [ "$Y6_UDP_MBPS" = "N/A" ]; then
             echo "[error] yip throughput failure detected at loss=${LOSS}% (v4_tcp=$Y_TCP v6_tcp=$Y6_TCP v4_udp=$Y_UDP_MBPS v6_udp=$Y6_UDP_MBPS)"
             YIP_FAILED=true
+        fi
+        if [ "$LOSS" -eq 0 ]; then
+            if [ "$Y_TCP_LOSS" != "N/A" ] && [ "$(awk "BEGIN {print ($Y_TCP_LOSS > 5.0)}")" = "1" ] || \
+               [ "$Y6_TCP_LOSS" != "N/A" ] && [ "$(awk "BEGIN {print ($Y6_TCP_LOSS > 5.0)}")" = "1" ] || \
+               [ "$Y_UDP_LOSS" != "N/A" ] && [ "$(awk "BEGIN {print ($Y_UDP_LOSS > 5.0)}")" = "1" ] || \
+               [ "$Y6_UDP_LOSS" != "N/A" ] && [ "$(awk "BEGIN {print ($Y6_UDP_LOSS > 5.0)}")" = "1" ]; then
+                echo "[error] yip clean-link (0% netem) packet loss failure detected (v4_tcp_loss=$Y_TCP_LOSS% v6_tcp_loss=$Y6_TCP_LOSS% v4_udp_loss=$Y_UDP_LOSS% v6_udp_loss=$Y6_UDP_LOSS%)"
+                YIP_FAILED=true
+            fi
         fi
         if [ "$CONTENDER_ISOLATION" = true ]; then
             stop_contender "yip"

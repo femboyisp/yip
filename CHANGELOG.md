@@ -6,6 +6,12 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **Data Plane Driver Matrix & Multi-Shard Workload Benchmark (`crates/yip-bench`, `crates/yip-io`, `bin/yipd`, #279).**
+  - Added `crates/yip-bench/tests/run-driver-matrix.sh` systematically benchmarking and comparing `epoll`, `io_uring`, and `AF_XDP` drivers across 1, 2, 4, and `auto` shard configurations.
+  - Implemented `IoUring::builder().setup_sqpoll(...)` submission queue polling in `UringDriver` (opt-in via `YIP_URING_SQPOLL=1`) to eliminate syscall context switching during high-rate I/O.
+  - Added `--driver <epoll|uring|xdp>` CLI flag and `driver = "epoll" | "uring" | "xdp"` config file support in `yipd`, allowing seamless data plane engine selection.
+  - Added CLI flag `--shards <N|auto>` in `yipd` to dynamically override configured worker shard count.
+  - Added automated pass/fail assertion gating for TCP retransmit loss (`tcp_max_loss`) and UDP packet loss (`udp_max_loss`) across loss tiers in `run-iperf-compare.sh`, alongside clean-link 0% packet loss regression assertions.
 - **Nebula Contender & Full 10-Contender SCP Transfer Suite (`crates/yip-bench`, #289).**
   - Added Slack's Nebula (`nebula` and `nebula-cert` v1.12.0) to `crates/yip-bench/setup-contenders.sh` (`setup_nebula()`, `--nebula`, `--all`, and `--check`).
   - Created `crates/yip-bench/tests/contenders-lib.sh` unifying network topologies, process cleanup, netem delay/loss injection, and lifecycle dispatchers (`start_contender`, `stop_contender`, `get_contender_info`, `verify_isolation`) across all 10 contenders: `yip`, `wireguard`, `wireguard-go`, `amneziawg`, `openvpn`, `n2n`, `zerotier`, `tailscale`, `netbird`, and `nebula`.

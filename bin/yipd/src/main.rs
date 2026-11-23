@@ -61,6 +61,8 @@ fn print_daemon_usage() {
     println!("  -c, --control <SOCKET>  UNIX domain control socket path");
     println!("      --mtu <BYTES>       TUN device MTU (576-65535, default: 1400)");
     println!("      --metrics-listen <ADDR> Prometheus/OTEL HTTP metrics listen address (e.g. 127.0.0.1:9184)");
+    println!("      --shards <N|auto>   Worker shards for multi-core scaling (default: 1)");
+    println!("      --driver <DRIVER>   I/O engine driver: epoll, uring, xdp");
     println!("      --xdp               Enable AF_XDP (XSK) zero-copy kernel bypass");
     println!("      --xdp-ifname <DEV>  Underlay network interface for AF_XDP binding");
     println!("      --xdp-mode <MODE>   XDP driver mode: auto, generic, native, offload");
@@ -973,6 +975,8 @@ pub(crate) struct DaemonOverrides {
     pub control: Option<std::path::PathBuf>,
     pub mtu: Option<u32>,
     pub metrics_listen: Option<std::net::SocketAddr>,
+    pub shards: Option<usize>,
+    pub driver: Option<String>,
     pub xdp: Option<bool>,
     pub xdp_ifname: Option<String>,
     pub xdp_mode: Option<String>,
@@ -1025,6 +1029,54 @@ pub(crate) fn parse_daemon_flags(
                 )
             })?;
             overrides.metrics_listen = Some(addr);
+        } else if arg == "--shards" {
+            let sstr = args.next().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--shards requires a count or 'auto'",
+                )
+            })?;
+            let n = if sstr.eq_ignore_ascii_case("auto") {
+                std::thread::available_parallelism()
+                    .map(|p| p.get().min(8))
+                    .unwrap_or(1)
+            } else {
+                let parsed: usize = sstr.parse().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid shards count '{sstr}': must be integer or 'auto'"),
+                    )
+                })?;
+                if parsed == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "shards must be at least 1",
+                    ));
+                }
+                parsed
+            };
+            overrides.shards = Some(n);
+        } else if arg == "--driver" {
+            let dstr = args.next().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--driver requires a driver name (epoll, uring, xdp)",
+                )
+            })?;
+            match dstr.to_ascii_lowercase().as_str() {
+                "epoll" | "poll" => overrides.driver = Some("epoll".to_string()),
+                "uring" | "io_uring" => overrides.driver = Some("uring".to_string()),
+                "xdp" | "af_xdp" => {
+                    overrides.driver = Some("xdp".to_string());
+                    overrides.xdp = Some(true);
+                }
+                other => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid driver '{other}', expected one of: epoll, uring, xdp"),
+                    ));
+                }
+            }
         } else if arg == "--xdp" {
             overrides.xdp = Some(true);
         } else if arg == "--no-xdp" {
@@ -1221,6 +1273,12 @@ fn main() -> std::io::Result<()> {
             if let Some(maddr) = overrides.metrics_listen {
                 config.metrics_listen = Some(maddr);
             }
+            if let Some(shards) = overrides.shards {
+                config.shards = shards;
+            }
+            if let Some(driver) = overrides.driver {
+                config.driver = Some(driver);
+            }
             if let Some(xdp) = overrides.xdp {
                 config.xdp = xdp;
             }
@@ -1284,6 +1342,10 @@ mod tests {
             "127.0.0.1:9184".to_string(),
             "--control".to_string(),
             "/run/yipd.sock".to_string(),
+            "--shards".to_string(),
+            "4".to_string(),
+            "--driver".to_string(),
+            "uring".to_string(),
             "--mtu".to_string(),
             "1420".to_string(),
             "--xdp".to_string(),
@@ -1301,6 +1363,8 @@ mod tests {
             overrides.control,
             Some(std::path::PathBuf::from("/run/yipd.sock"))
         );
+        assert_eq!(overrides.shards, Some(4));
+        assert_eq!(overrides.driver.as_deref(), Some("uring"));
         assert_eq!(overrides.mtu, Some(1420));
         assert_eq!(overrides.xdp, Some(true));
         assert_eq!(overrides.xdp_ifname.as_deref(), Some("eth0"));

@@ -229,6 +229,8 @@ pub struct Config {
     pub mtu: Option<u32>,
     /// Optional Prometheus/OpenTelemetry HTTP metrics scraping endpoint (`metrics_listen=<ip:port>`).
     pub metrics_listen: Option<SocketAddr>,
+    /// Data plane I/O driver engine (`driver=epoll|uring|xdp`, defaulting to epoll).
+    pub driver: Option<String>,
     /// Whether AF_XDP (XSK) kernel bypass is enabled (`xdp=true|false` or `--xdp`).
     pub xdp: bool,
     /// Underlay network interface name for AF_XDP socket binding (`xdp_ifname=<ifname>` or `--xdp-ifname <ifname>`).
@@ -625,6 +627,7 @@ impl Config {
         let mut control_socket: Option<std::path::PathBuf> = None;
         let mut mtu: Option<u32> = None;
         let mut metrics_listen: Option<SocketAddr> = None;
+        let mut driver: Option<String> = None;
         let mut xdp = false;
         let mut xdp_ifname: Option<String> = None;
         let mut xdp_mode: Option<String> = None;
@@ -893,6 +896,20 @@ impl Config {
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                     metrics_listen = Some(addr);
                 }
+                "driver" | "io_driver" | "engine" => match val.to_ascii_lowercase().as_str() {
+                    "epoll" | "poll" => driver = Some("epoll".to_string()),
+                    "uring" | "io_uring" => driver = Some("uring".to_string()),
+                    "xdp" | "af_xdp" => {
+                        driver = Some("xdp".to_string());
+                        xdp = true;
+                    }
+                    other => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid driver '{other}', expected one of: epoll, uring, xdp"),
+                        ));
+                    }
+                },
                 "xdp" => {
                     xdp = val.eq_ignore_ascii_case("true")
                         || val == "1"
@@ -1181,6 +1198,7 @@ impl Config {
             control_socket,
             mtu,
             metrics_listen,
+            driver,
             xdp,
             xdp_ifname,
             xdp_mode,
@@ -1229,6 +1247,33 @@ mod tests {
 
         let text_bad_mode = format!("{base}xdp=true\nxdp_mode=invalid\n");
         assert!(Config::parse(&text_bad_mode).is_err());
+    }
+
+    #[test]
+    fn parse_config_driver_options() {
+        let base = "device=yip0\nlisten=0.0.0.0:443\n\
+                    local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
+                    local_public=00000000000000000000000000000000000000000000000000000000000000aa\n\
+                    peer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    peer_endpoint=10.0.0.2:443\n";
+
+        let text_epoll = format!("{base}driver=epoll\n");
+        let c_epoll = Config::parse(&text_epoll).unwrap();
+        assert_eq!(c_epoll.driver.as_deref(), Some("epoll"));
+        assert!(!c_epoll.xdp);
+
+        let text_uring = format!("{base}driver=uring\n");
+        let c_uring = Config::parse(&text_uring).unwrap();
+        assert_eq!(c_uring.driver.as_deref(), Some("uring"));
+        assert!(!c_uring.xdp);
+
+        let text_xdp = format!("{base}driver=xdp\n");
+        let c_xdp = Config::parse(&text_xdp).unwrap();
+        assert_eq!(c_xdp.driver.as_deref(), Some("xdp"));
+        assert!(c_xdp.xdp);
+
+        let text_invalid = format!("{base}driver=custom_nonexistent\n");
+        assert!(Config::parse(&text_invalid).is_err());
     }
 
     #[test]

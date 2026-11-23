@@ -699,6 +699,9 @@ sudo YIP_SHARDS=4 bash crates/yip-bench/tests/run-iperf-compare.sh
 
 # Run real-world OpenSSH SCP file transfer benchmark across contenders:
 sudo CONTENDERS="yip wireguard nebula" FILE_SIZES_MB="5 50" LOSS_RATES="0 5 10" bash crates/yip-bench/tests/run-scp-compare.sh
+
+# Run systematic data plane driver matrix benchmark (epoll vs io_uring vs AF_XDP across shards):
+sudo bash crates/yip-bench/tests/run-driver-matrix.sh
 ```
 
 ### Contender Coverage

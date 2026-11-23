@@ -241,7 +241,13 @@ pub fn run(config: Config) -> io::Result<()> {
         TunnelMode::L3Tun => DeviceKind::Tun,
         TunnelMode::L2Tap => DeviceKind::Tap,
     };
-    let use_uring = std::env::var_os("YIP_USE_URING").is_some() && yip_io::uring::uring_available();
+    let driver_is_uring = config
+        .driver
+        .as_deref()
+        .map(|d| d.eq_ignore_ascii_case("uring"))
+        .unwrap_or(false);
+    let use_uring = (driver_is_uring || std::env::var_os("YIP_USE_URING").is_some())
+        && yip_io::uring::uring_available();
     let want_vnet_hdr = !use_uring && config.transport != crate::config::TransportMode::Quic;
     let tun =
         TunTap::create(&config.device, device_kind, want_vnet_hdr).map_err(io::Error::other)?;
