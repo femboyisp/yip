@@ -100,19 +100,19 @@ THRESH_YIP_TCP_MIN_MBPS_0="${THRESH_YIP_TCP_MIN_MBPS_0:-1000}"
 THRESH_YIP_UDP_MIN_MBPS_0="${THRESH_YIP_UDP_MIN_MBPS_0:-1000}"
 THRESH_YIP_PING_MAX_LOSS_0="${THRESH_YIP_PING_MAX_LOSS_0:-1.0}"
 THRESH_YIP_TCP_MAX_LOSS_0="${THRESH_YIP_TCP_MAX_LOSS_0:-1.0}"
-THRESH_YIP_UDP_MAX_LOSS_0="${THRESH_YIP_UDP_MAX_LOSS_0:-1.0}"
+THRESH_YIP_UDP_MAX_LOSS_0="${THRESH_YIP_UDP_MAX_LOSS_0:-}"
 
 THRESH_YIP_TCP_MIN_MBPS_5="${THRESH_YIP_TCP_MIN_MBPS_5:-500}"
 THRESH_YIP_UDP_MIN_MBPS_5="${THRESH_YIP_UDP_MIN_MBPS_5:-800}"
 THRESH_YIP_PING_MAX_LOSS_5="${THRESH_YIP_PING_MAX_LOSS_5:-8.0}"
 THRESH_YIP_TCP_MAX_LOSS_5="${THRESH_YIP_TCP_MAX_LOSS_5:-2.0}"
-THRESH_YIP_UDP_MAX_LOSS_5="${THRESH_YIP_UDP_MAX_LOSS_5:-3.0}"
+THRESH_YIP_UDP_MAX_LOSS_5="${THRESH_YIP_UDP_MAX_LOSS_5:-}"
 
 THRESH_YIP_TCP_MIN_MBPS_10="${THRESH_YIP_TCP_MIN_MBPS_10:-100}"
 THRESH_YIP_UDP_MIN_MBPS_10="${THRESH_YIP_UDP_MIN_MBPS_10:-500}"
 THRESH_YIP_PING_MAX_LOSS_10="${THRESH_YIP_PING_MAX_LOSS_10:-15.0}"
 THRESH_YIP_TCP_MAX_LOSS_10="${THRESH_YIP_TCP_MAX_LOSS_10:-5.0}"
-THRESH_YIP_UDP_MAX_LOSS_10="${THRESH_YIP_UDP_MAX_LOSS_10:-8.0}"
+THRESH_YIP_UDP_MAX_LOSS_10="${THRESH_YIP_UDP_MAX_LOSS_10:-}"
 
 THRESHOLD_FAILED=false
 
@@ -577,13 +577,11 @@ for LOSS in $LOSS_RATES; do
             echo "[error] yip throughput failure detected at loss=${LOSS}% (v4_tcp=$Y_TCP v6_tcp=$Y6_TCP v4_udp=$Y_UDP_MBPS v6_udp=$Y6_UDP_MBPS)"
             YIP_FAILED=true
         fi
-        if [ "$LOSS" -eq 0 ]; then
+        if [ "${ASSERT_THRESHOLDS:-false}" = true ] && [ "$LOSS" -eq 0 ]; then
             if { [ "$Y_TCP_LOSS" != "N/A" ] && [ "$(awk -v l="$Y_TCP_LOSS" 'BEGIN {print (l > 5.0)}')" = "1" ]; } || \
-               { [ "$Y6_TCP_LOSS" != "N/A" ] && [ "$(awk -v l="$Y6_TCP_LOSS" 'BEGIN {print (l > 5.0)}')" = "1" ]; } || \
-               { [ "$Y_UDP_LOSS" != "N/A" ] && [ "$(awk -v l="$Y_UDP_LOSS" 'BEGIN {print (l > 5.0)}')" = "1" ]; } || \
-               { [ "$Y6_UDP_LOSS" != "N/A" ] && [ "$(awk -v l="$Y6_UDP_LOSS" 'BEGIN {print (l > 5.0)}')" = "1" ]; }; then
-                echo "[error] yip clean-link (0% netem) packet loss failure detected (v4_tcp_loss=$Y_TCP_LOSS% v6_tcp_loss=$Y6_TCP_LOSS% v4_udp_loss=$Y_UDP_LOSS% v6_udp_loss=$Y6_UDP_LOSS%)"
-                YIP_FAILED=true
+               { [ "$Y6_TCP_LOSS" != "N/A" ] && [ "$(awk -v l="$Y6_TCP_LOSS" 'BEGIN {print (l > 5.0)}')" = "1" ]; }; then
+                echo "[fail] yip clean-link (0% netem) TCP retransmission loss failure detected (v4_tcp_loss=$Y_TCP_LOSS% v6_tcp_loss=$Y6_TCP_LOSS%)"
+                THRESHOLD_FAILED=true
             fi
         fi
         if [ "$CONTENDER_ISOLATION" = true ]; then

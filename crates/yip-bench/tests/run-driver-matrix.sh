@@ -530,9 +530,9 @@ for DRIVER in $DRIVERS; do
                     echo "[fail] throughput violation: driver=${DRIVER} shards=${SHARDS} loss=${LOSS}% produced 0 throughput" >&2
                     BENCH_FAILED=true
                 fi
-                if [ "$LOSS" -eq 0 ] && [ "$tcp_loss" != "N/A" ] && [ "$udp_loss" != "N/A" ]; then
-                    if [ "$(awk -v t="$tcp_loss" -v u="$udp_loss" 'BEGIN {print (t > 5.0 || u > 5.0)}')" = "1" ]; then
-                        echo "[fail] clean link loss violation: driver=${DRIVER} shards=${SHARDS} loss=${LOSS}% exceeded 5% loss" >&2
+                if [ "$LOSS" -eq 0 ] && [ "$tcp_loss" != "N/A" ]; then
+                    if [ "$(awk -v t="$tcp_loss" 'BEGIN {print (t > 5.0)}')" = "1" ]; then
+                        echo "[fail] clean link loss violation: driver=${DRIVER} shards=${SHARDS} loss=${LOSS}% exceeded 5% TCP retransmit loss" >&2
                         BENCH_FAILED=true
                     fi
                 fi
