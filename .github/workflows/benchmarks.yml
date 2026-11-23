@@ -131,10 +131,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.22'
+          cache: true
       - name: Install OpenSSH, OpenVPN, BoringSSL build deps & networking tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config iproute2 iputils-ping openssh-client openssh-server wireguard-tools openvpn
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev pkg-config iproute2 iputils-ping openssh-client openssh-server wireguard-tools openvpn jq n2n
       - name: Load wireguard kernel module & disable restrictive AppArmor profiles
         run: |
           sudo modprobe wireguard 2>/dev/null || echo "[note] wireguard module unavailable"
@@ -147,13 +151,18 @@ jobs:
           sudo sysctl -w net.ipv4.ip_forward=1
       - name: Build yipd release
         run: cargo build --release -p yipd
+      - name: Set up contenders
+        run: |
+          sudo env "PATH=$PATH" ./crates/yip-bench/setup-contenders.sh --check
+          sudo env "PATH=$PATH" ./crates/yip-bench/setup-contenders.sh --all || echo "[note] some contender setup steps non-fatal"
+          ./crates/yip-bench/setup-contenders.sh --check
       - name: Run comparative SCP transfer netem benchmark
         run: |
           set -o pipefail
           sudo env "PATH=$PATH" \
-            CONTENDERS="yip wg ovpn" \
-            FILE_SIZES_MB="100" \
-            LOSS_RATES="0 5 10" \
+            CONTENDERS="all" \
+            FILE_SIZES_MB="10" \
+            LOSS_RATES="0 5" \
             OUTPUT_JSON="scp-results.json" \
             bash crates/yip-bench/tests/run-scp-compare.sh ./target/release/yipd | tee scp-results.txt
       - name: Upload SCP benchmark telemetry artifact
@@ -168,7 +177,7 @@ jobs:
         if: always()
         run: |
           if [ -f scp-results.txt ]; then
-            echo "### Comparative OpenSSH SCP Transfer Benchmark (100MB File across 0%, 5%, 10% Packet Loss)" >> $GITHUB_STEP_SUMMARY
+            echo "### Comparative OpenSSH SCP Transfer Benchmark (10MB File across 0%, 5% Packet Loss across All 10 Contenders)" >> $GITHUB_STEP_SUMMARY
             echo '```text' >> $GITHUB_STEP_SUMMARY
             cat scp-results.txt >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY

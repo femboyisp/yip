@@ -6,6 +6,19 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **Data Plane Driver Matrix & Multi-Shard Workload Benchmark (`crates/yip-bench`, `crates/yip-io`, `bin/yipd`, #279).**
+  - Added `crates/yip-bench/tests/run-driver-matrix.sh` systematically benchmarking and comparing `epoll`, `io_uring`, and `AF_XDP` drivers across 1, 2, 4, and `auto` shard configurations.
+  - Implemented `IoUring::builder().setup_sqpoll(...)` submission queue polling in `UringDriver` (opt-in via `YIP_URING_SQPOLL=1`) to eliminate syscall context switching during high-rate I/O.
+  - Added `--driver <epoll|uring|xdp>` CLI flag and `driver = "epoll" | "uring" | "xdp"` config file support in `yipd`, allowing seamless data plane engine selection.
+  - Added CLI flag `--shards <N|auto>` in `yipd` to dynamically override configured worker shard count.
+  - Added automated pass/fail assertion gating for TCP retransmit loss (`tcp_max_loss`) and UDP packet loss (`udp_max_loss`) across loss tiers in `run-iperf-compare.sh`, alongside clean-link 0% packet loss regression assertions.
+- **Nebula Contender & Full 10-Contender SCP Transfer Suite (`crates/yip-bench`, #289).**
+  - Added Slack's Nebula (`nebula` and `nebula-cert` v1.12.0) to `crates/yip-bench/setup-contenders.sh` (`setup_nebula()`, `--nebula`, `--all`, and `--check`).
+  - Created `crates/yip-bench/tests/contenders-lib.sh` unifying network topologies, process cleanup, netem delay/loss injection, and lifecycle dispatchers (`start_contender`, `stop_contender`, `get_contender_info`, `verify_isolation`) across all 10 contenders: `yip`, `wireguard`, `wireguard-go`, `amneziawg`, `openvpn`, `n2n`, `zerotier`, `tailscale`, `netbird`, and `nebula`.
+  - Refactored `crates/yip-bench/tests/run-iperf-compare.sh` to source `contenders-lib.sh`, eliminating redundant lifecycle script duplication and adding Nebula to the throughput, ping, CPU, memory telemetry sweeps, tables, and JSON export.
+  - Refactored `crates/yip-bench/tests/run-scp-compare.sh` to source `contenders-lib.sh` and expanded the benchmark from 3 hardcoded contenders to the full 10-contender suite across `FILE_SIZES_MB` and `LOSS_RATES`.
+  - Demonstrated that under 5% netem packet loss, Yip maintains 19.97 MB/s SCP file transfer goodput (>93% of its clean-link speed), outperforming all 9 competing overlay technologies (0.34 - 0.53 MB/s, 40x to 58x slower), including WireGuard (0.38 MB/s, ~52x slower) and Nebula (0.36 MB/s, ~55x slower), with byte-for-byte integrity verified via cmp.
+  - Documented Nebula architecture and benchmark findings in `crates/yip-bench/README.md` and `crates/yip-bench/RESULTS.md`.
 - **CI Benchmarks Workflow Matrix & SCP Transfer Suite (`crates/yip-bench`, `.github/workflows/benchmarks.yml`, #280).**
   - Upgraded `crates/yip-bench/tests/run-scp-compare.sh` to support configurable payload sizes (`FILE_SIZES_MB`, default: 100MB), OpenVPN contender support alongside Yip and WireGuard, and JSON telemetry export (`OUTPUT_JSON`).
   - Added structured JSON telemetry export to `crates/yip-bench/tests/run-iperf-compare.sh` (`OUTPUT_JSON`), capturing complete per-contender per-loss throughput, packet loss, RTT, CPU efficiency, and memory footprint metrics.

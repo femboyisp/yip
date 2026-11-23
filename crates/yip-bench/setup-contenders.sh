@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-contenders.sh — Turnkey helper to install or build optional benchmark contenders:
-#   wireguard-go, AmneziaWG, ZeroTier, Tailscale (with Headscale coordinator), and NetBird.
+#   wireguard-go, AmneziaWG, ZeroTier, Tailscale (with Headscale coordinator), NetBird, and Nebula.
 #
 # Usage:
 #   sudo ./setup-contenders.sh --all
@@ -9,6 +9,7 @@
 #   sudo ./setup-contenders.sh --zerotier
 #   sudo ./setup-contenders.sh --tailscale
 #   sudo ./setup-contenders.sh --netbird
+#   sudo ./setup-contenders.sh --nebula
 #   ./setup-contenders.sh --check
 set -euo pipefail
 
@@ -46,6 +47,8 @@ check_status() {
     (command -v tailscaled >/dev/null 2>&1 && command -v headscale >/dev/null 2>&1) && echo "INSTALLED" || echo "MISSING"
     printf "  %-12s : " "NetBird"
     (command -v netbird >/dev/null 2>&1 && command -v netbird-mgmt >/dev/null 2>&1 && command -v netbird-signal >/dev/null 2>&1) && echo "INSTALLED ($(which netbird))" || (command -v netbird >/dev/null 2>&1 && echo "CLIENT-ONLY ($(which netbird))" || echo "MISSING")
+    printf "  %-12s : " "Nebula"
+    (command -v nebula >/dev/null 2>&1 && command -v nebula-cert >/dev/null 2>&1) && echo "INSTALLED ($(which nebula))" || echo "MISSING"
 }
 
 setup_wireguard_go() {
@@ -255,6 +258,32 @@ EOF
     log "NetBird setup step complete."
 }
 
+setup_nebula() {
+    log "Setting up Nebula (nebula & nebula-cert)..."
+    if ! command -v nebula >/dev/null 2>&1 || ! command -v nebula-cert >/dev/null 2>&1; then
+        log "Fetching prebuilt nebula & nebula-cert..."
+        local neb_tag neb_url neb_tmp neb_arch
+        neb_tag="$(curl -sIL https://github.com/slackhq/nebula/releases/latest | grep -i location | tail -1 | tr -d '\r' | awk -F'/' '{print $NF}' || true)"
+        if [ -n "$neb_tag" ]; then
+            neb_arch="amd64"
+            [ "$(uname -m)" = "aarch64" ] && neb_arch="arm64"
+            neb_url="https://github.com/slackhq/nebula/releases/download/${neb_tag}/nebula-linux-${neb_arch}.tar.gz"
+            neb_tmp="$(mktemp -d /tmp/nebula.XXXXXX)"
+            if curl -fsSL "$neb_url" 2>/dev/null | tar -xz -C "$neb_tmp" 2>/dev/null; then
+                install -m 755 "$neb_tmp/nebula" "$TARGET_BIN_DIR/nebula" 2>/dev/null || true
+                install -m 755 "$neb_tmp/nebula-cert" "$TARGET_BIN_DIR/nebula-cert" 2>/dev/null || true
+            fi
+            rm -rf "$neb_tmp"
+        fi
+    fi
+    if (! command -v nebula >/dev/null 2>&1 || ! command -v nebula-cert >/dev/null 2>&1) && command -v go >/dev/null 2>&1; then
+        log "Compiling nebula & nebula-cert via Go toolchain..."
+        GOBIN="$TARGET_BIN_DIR" go install github.com/slackhq/nebula/cmd/nebula@latest || warn "nebula build failed"
+        GOBIN="$TARGET_BIN_DIR" go install github.com/slackhq/nebula/cmd/nebula-cert@latest || warn "nebula-cert build failed"
+    fi
+    log "Nebula setup step complete."
+}
+
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 if [ $# -eq 0 ] || [ "${1:-}" = "--check" ]; then
     check_status
@@ -270,6 +299,7 @@ while [ $# -gt 0 ]; do
             setup_zerotier
             setup_tailscale
             setup_netbird
+            setup_nebula
             ;;
         --wireguard-go)
             setup_wireguard_go
@@ -289,12 +319,15 @@ while [ $# -gt 0 ]; do
         --netbird)
             setup_netbird
             ;;
+        --nebula)
+            setup_nebula
+            ;;
         --check)
             check_status
             ;;
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 [--all | --wireguard-go | --amneziawg | --n2n | --zerotier | --tailscale | --netbird | --check]"
+            echo "Usage: $0 [--all | --wireguard-go | --amneziawg | --n2n | --zerotier | --tailscale | --netbird | --nebula | --check]"
             exit 1
             ;;
     esac

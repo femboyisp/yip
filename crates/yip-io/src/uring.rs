@@ -273,7 +273,14 @@ pub struct UringDriver {
 impl UringDriver {
     /// Build and arm a ring over the provided UDP and TUN file descriptors.
     pub fn new(udp_fd: RawFd, tun_fd: RawFd) -> io::Result<Self> {
-        let ring = IoUring::new(RING_ENTRIES)?;
+        let ring = if std::env::var_os("YIP_URING_SQPOLL").is_some() {
+            IoUring::builder()
+                .setup_sqpoll(2000)
+                .build(RING_ENTRIES)
+                .or_else(|_| IoUring::new(RING_ENTRIES))?
+        } else {
+            IoUring::new(RING_ENTRIES)?
+        };
         let ext_arg = ring.params().is_feature_ext_arg();
         let recv_pool = Box::new([[0_u8; MAX_WIRE_DATAGRAM]; RING_BUFS]);
 
