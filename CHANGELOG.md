@@ -6,6 +6,11 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **CI Benchmarks Workflow Matrix & SCP Transfer Suite (`crates/yip-bench`, `.github/workflows/benchmarks.yml`, #280).**
+  - Upgraded `crates/yip-bench/tests/run-scp-compare.sh` to support configurable payload sizes (`FILE_SIZES_MB`, default: 100MB), OpenVPN contender support alongside Yip and WireGuard, and JSON telemetry export (`OUTPUT_JSON`).
+  - Added structured JSON telemetry export to `crates/yip-bench/tests/run-iperf-compare.sh` (`OUTPUT_JSON`), capturing complete per-contender per-loss throughput, packet loss, RTT, CPU efficiency, and memory footprint metrics.
+  - Expanded `.github/workflows/benchmarks.yml` with a new `scp-netem-bench` job measuring real-world OpenSSH file transfers across packet loss conditions with artifact upload and GitHub step summaries.
+  - Parameterized `iperf-netem-bench` with a concurrent matrix strategy supporting single-stream (`streams=1`, `shards=1`), multi-stream concurrency (`-P 4`, `-P 8`), and multi-shard auto scaling (`shards=auto`).
 - **Lazy Contender Lifecycle, Process Isolation & CI Threshold Assertions (`crates/yip-bench`, #281).**
   - Implemented lazy contender lifecycle (`start_contender`, `stop_contender`) in `crates/yip-bench/tests/run-iperf-compare.sh`, starting each tunnel daemon on demand and tearing down its processes and network namespaces upon test completion.
   - Enabled `CONTENDER_ISOLATION=true` by default, running contenders sequentially through all loss tiers and verifying complete process cleanup (`verify_isolation`) to eliminate multi-daemon memory (e.g. WireGuard-Go 1.8GB, AmneziaWG 1.8GB) and CPU scheduling contention.
