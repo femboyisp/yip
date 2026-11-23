@@ -107,6 +107,10 @@ impl Classifier {
                 return class;
             }
         }
+        // ICMP (IPv4 proto 1) and ICMPv6 (IPv6 proto 58) are latency-critical network diagnostics
+        if p.key.proto == 1 || p.key.proto == 58 {
+            return FlowClass::Realtime;
+        }
         // 4. default
         FlowClass::Default
     }
@@ -555,7 +559,7 @@ mod tests {
             58,
             [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
         );
-        assert_eq!(c.classify(&icmpv6, false, 0), FlowClass::Default);
+        assert_eq!(c.classify(&icmpv6, false, 0), FlowClass::Realtime);
         assert!(c.flows.is_empty(), "ICMPv6 must not populate flow table");
 
         // IPv6 multicast discovery (ff02::1, all-nodes)
@@ -564,7 +568,7 @@ mod tests {
         mcast_dst[1] = 0x02;
         mcast_dst[15] = 0x01;
         let mcast_icmp = make_ipv6(58, mcast_dst);
-        assert_eq!(c.classify(&mcast_icmp, false, 10), FlowClass::Default);
+        assert_eq!(c.classify(&mcast_icmp, false, 10), FlowClass::Realtime);
         assert!(
             c.flows.is_empty(),
             "multicast ICMPv6 must not populate flow table"
