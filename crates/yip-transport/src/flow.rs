@@ -232,6 +232,90 @@ mod tests {
     }
 
     #[test]
+    fn tcp_handshake_fast_initialization_exact_boundaries() {
+        let mut t = FlowTable::new(1024, 10_000);
+
+        // 1. TCP handshake fast init happy path: SYN (60B) -> Data (1400B)
+        let mut k1 = key(6010);
+        k1.proto = 6;
+        t.observe(&k1, 60, 0);
+        t.observe(&k1, 1400, 10);
+        let s1 = t.map.get(&k1).expect("k1 present");
+        assert_eq!(
+            s1.ewma_size, 1400.0,
+            "fast init jumps directly to data size"
+        );
+        assert_eq!(t.classify(&k1), Some(FlowClass::Bulk));
+
+        // 2. Kills mutant `&&` -> `||`: multi-packet small TCP flow must NOT fast-init
+        let mut k2 = key(6011);
+        k2.proto = 6;
+        t.observe(&k2, 100, 0);
+        t.observe(&k2, 200, 10); // 200 is not > LARGE_BYTES
+        let s2 = t.map.get(&k2).expect("k2 present");
+        let expected_ewma_2 = EWMA_ALPHA * 200.0 + (1.0 - EWMA_ALPHA) * 100.0; // 125.0
+        assert!(
+            (s2.ewma_size - expected_ewma_2).abs() < 1e-4,
+            "small TCP flow must follow normal EWMA, got {}",
+            s2.ewma_size
+        );
+
+        // 3. Kills mutant `&&` -> `||`: UDP flow (proto 17) must NOT fast-init even if large
+        let mut k3 = key(6012);
+        k3.proto = 17; // UDP
+        t.observe(&k3, 60, 0);
+        t.observe(&k3, 1400, 10);
+        let s3 = t.map.get(&k3).expect("k3 present");
+        let expected_ewma_3 = EWMA_ALPHA * 1400.0 + (1.0 - EWMA_ALPHA) * 60.0; // 395.0
+        assert!(
+            (s3.ewma_size - expected_ewma_3).abs() < 1e-4,
+            "UDP flow must follow normal EWMA, got {}",
+            s3.ewma_size
+        );
+
+        // 4. Kills mutant `>` -> `>=`: exact LARGE_BYTES boundary (1000B) must NOT fast-init
+        let mut k4 = key(6013);
+        k4.proto = 6;
+        t.observe(&k4, 60, 0);
+        t.observe(&k4, 1000, 10); // exact boundary 1000.0
+        let s4 = t.map.get(&k4).expect("k4 present");
+        let expected_ewma_4 = EWMA_ALPHA * 1000.0 + (1.0 - EWMA_ALPHA) * 60.0; // 295.0
+        assert!(
+            (s4.ewma_size - expected_ewma_4).abs() < 1e-4,
+            "1000B packet must not fast-init, got {}",
+            s4.ewma_size
+        );
+
+        // 5. Kills mutant `<` -> `<=`: exact 150.0B ewma boundary must NOT fast-init
+        let mut k5 = key(6014);
+        k5.proto = 6;
+        t.observe(&k5, 150, 0); // initial ewma = 150.0
+        t.observe(&k5, 1400, 10);
+        let s5 = t.map.get(&k5).expect("k5 present");
+        let expected_ewma_5 = EWMA_ALPHA * 1400.0 + (1.0 - EWMA_ALPHA) * 150.0; // 462.5
+        assert!(
+            (s5.ewma_size - expected_ewma_5).abs() < 1e-4,
+            "150B initial EWMA must not fast-init, got {}",
+            s5.ewma_size
+        );
+
+        // 6. Packet count boundary: 5th packet (stat.packets == 4 > 3) must NOT fast-init
+        let mut k6 = key(6015);
+        k6.proto = 6;
+        for i in 0..4 {
+            t.observe(&k6, 60, i * 10);
+        }
+        t.observe(&k6, 1400, 40); // 5th packet
+        let s6 = t.map.get(&k6).expect("k6 present");
+        let expected_ewma_6 = EWMA_ALPHA * 1400.0 + (1.0 - EWMA_ALPHA) * 60.0; // 395.0
+        assert!(
+            (s6.ewma_size - expected_ewma_6).abs() < 1e-4,
+            "packet 5 must not fast-init, got {}",
+            s6.ewma_size
+        );
+    }
+
+    #[test]
     fn table_evicts_to_stay_bounded() {
         let mut t = FlowTable::new(2, 10_000); // cap 2
         for p in 0..5u16 {
