@@ -19,6 +19,9 @@ set -euo pipefail
 
 TMPDIR_TEST="${TMPDIR_TEST:-$(mktemp -d /dev/shm/yip-bench.XXXXXX 2>/dev/null || mktemp -d /tmp/yip-bench.XXXXXX)}"
 mkdir -p "$TMPDIR_TEST"
+YIPD="${YIPD:-yipd}"
+LOG_A="$TMPDIR_TEST/yipA.log"
+LOG_B="$TMPDIR_TEST/yipB.log"
 LAST_CHECK_PIDS=()
 ISOLATION_FAILED="${ISOLATION_FAILED:-false}"
 
@@ -131,13 +134,13 @@ is_pid_alive() {
     local pid="$1"
     [ -z "$pid" ] && return 1
     [ "$pid" = "$$" ] && return 1
-    wait "$pid" 2>/dev/null || true
     if [ ! -d "/proc/$pid" ]; then
         return 1
     fi
     local state
     state="$(awk '/^State:/ {print $2}' "/proc/$pid/status" 2>/dev/null || true)"
     if [ -z "$state" ] || [ "$state" = "Z" ] || [ "$state" = "X" ]; then
+        wait "$pid" 2>/dev/null || true
         return 1
     fi
     return 0
@@ -373,6 +376,7 @@ verify_isolation() {
         done
         ISOLATION_FAILED=true
     fi
+    LAST_CHECK_PIDS=()
     return 0
 }
 
@@ -383,7 +387,7 @@ verify_isolation() {
 # ── 1. Yip ────────────────────────────────────────────────────────────────────
 start_yip() {
     echo "[yip] setting up yip tunnel"
-    local GENKEY_A GENKEY_B PRIV_A PUB_A PRIV_B PUB_B CFG_A CFG_B LOG_A LOG_B
+    local GENKEY_A GENKEY_B PRIV_A PUB_A PRIV_B PUB_B CFG_A CFG_B
     GENKEY_A="$("$YIPD" --genkey)"
     GENKEY_B="$("$YIPD" --genkey)"
     PRIV_A="$(echo "$GENKEY_A" | grep '^private=' | cut -d= -f2)"
@@ -514,6 +518,7 @@ start_wg() {
 }
 
 stop_wg() {
+    LAST_CHECK_PIDS=()
     ip netns exec "$NS_WA" ip link del dev wg0 2>/dev/null || true
     ip netns exec "$NS_WB" ip link del dev wg0 2>/dev/null || true
     clean_netns "$NS_WA" "$NS_WB"
@@ -560,9 +565,9 @@ start_wireguard_go() {
     make_pair "$NS_GGA" "$NS_GGB" "$VGGA" "$VGGB" "$VGGA_IP" "$VGGB_IP"
 
     echo "[wggo] launching wireguard-go daemons"
-    ip netns exec "$NS_GGA" "$wggo_bin" wggo0 >"$TMPDIR_TEST/wggo-a.log" 2>&1 &
+    ip netns exec "$NS_GGA" "$wggo_bin" -f wggo0 >"$TMPDIR_TEST/wggo-a.log" 2>&1 &
     PID_GGA=$!
-    ip netns exec "$NS_GGB" "$wggo_bin" wggo0 >"$TMPDIR_TEST/wggo-b.log" 2>&1 &
+    ip netns exec "$NS_GGB" "$wggo_bin" -f wggo0 >"$TMPDIR_TEST/wggo-b.log" 2>&1 &
     PID_GGB=$!
 
     local wggo_up=false
@@ -743,14 +748,14 @@ start_n2n() {
     make_pair "$NS_NA" "$NS_NB" "$VNA" "$VNB" "$VNA_IP" "$VNB_IP"
 
     echo "[n2n] launching supernode on Node A"
-    ip netns exec "$NS_NA" supernode -p "$N2N_PORT" -l 1 >"$TMPDIR_TEST/n2n_sn.log" 2>&1 &
+    ip netns exec "$NS_NA" supernode -f -p "$N2N_PORT" -l 1 >"$TMPDIR_TEST/n2n_sn.log" 2>&1 &
     PID_N2N_SN=$!
     sleep 0.3
 
     echo "[n2n] launching edge daemons on Node A and Node B"
-    ip netns exec "$NS_NA" edge -d n2n0 -a "${OVL_NA_IP}" -c yipbench -k benchpass -l "${VNA_IP}:${N2N_PORT}" >"$TMPDIR_TEST/n2n_ea.log" 2>&1 &
+    ip netns exec "$NS_NA" edge -f -d n2n0 -a "${OVL_NA_IP}" -c yipbench -k benchpass -l "${VNA_IP}:${N2N_PORT}" >"$TMPDIR_TEST/n2n_ea.log" 2>&1 &
     PID_N2N_EA=$!
-    ip netns exec "$NS_NB" edge -d n2n0 -a "${OVL_NB_IP}" -c yipbench -k benchpass -l "${VNA_IP}:${N2N_PORT}" >"$TMPDIR_TEST/n2n_eb.log" 2>&1 &
+    ip netns exec "$NS_NB" edge -f -d n2n0 -a "${OVL_NB_IP}" -c yipbench -k benchpass -l "${VNA_IP}:${N2N_PORT}" >"$TMPDIR_TEST/n2n_eb.log" 2>&1 &
     PID_N2N_EB=$!
 
     local i
@@ -1204,7 +1209,8 @@ start_netbird() {
         NB_AVAILABLE=false
         return 1
     fi
-    killall -9 netbird netbird-mgmt netbird-signal 2>/dev/null || true
+    ip netns pids "$NS_BA" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    ip netns pids "$NS_BB" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
     local mgmt_url="${NETBIRD_MGMT_URL:-}"
     local setup_key="${NETBIRD_SETUP_KEY:-}"
 
@@ -1407,7 +1413,6 @@ stop_netbird() {
     LAST_CHECK_PIDS=("$PID_NB_SA:nb_svcA" "$PID_NB_SB:nb_svcB" "$PID_NB_MGMT:nb_mgmt" "$PID_NB_SIG:nb_sig")
     reap_pids "$PID_NB_SA" "$PID_NB_SB" "$PID_NB_MGMT" "$PID_NB_SIG"
     PID_NB_SA=""; PID_NB_SB=""; PID_NB_MGMT=""; PID_NB_SIG=""
-    killall -9 netbird netbird-mgmt netbird-signal 2>/dev/null || true
     clean_netns "$NS_BA" "$NS_BB"
     rm -rf "$TMPDIR_TEST/nb_coord" "$TMPDIR_TEST/nb_a" "$TMPDIR_TEST/nb_b" 2>/dev/null || true
 }

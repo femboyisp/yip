@@ -205,10 +205,8 @@ for CONTENDER in $CONTENDERS; do
                 RESULT_MBPS["$KEY"]="$mbps"
 
                 integrity="OK"
-                if [ "$LOSS" -eq 0 ]; then
-                    if ! ip netns exec "$SRV_NS" cmp -s "$PAYLOAD" "$REMOTE_DEST"; then
-                        integrity="FAIL"
-                    fi
+                if ! ip netns exec "$SRV_NS" cmp -s "$PAYLOAD" "$REMOTE_DEST"; then
+                    integrity="FAIL"
                 fi
                 RESULT_INTEGRITY["$KEY"]="$integrity"
                 echo "[$CONTENDER_CANONICAL] size=${SIZE_MB}MB loss=${LOSS}%: time=${elapsed}s throughput=${mbps} MB/s integrity=${integrity}"

@@ -30,8 +30,11 @@ sysctl -qw net.ipv6.conf.all.accept_dad=0 \
     net.ipv4.tcp_wmem="4096 65536 67108864" \
     net.ipv4.tcp_reordering=20 2>/dev/null || true
 
-# Pre-sweep: kill any orphaned contender daemons from previous runs
-killall -9 netbird netbird-mgmt netbird-signal edge supernode nebula 2>/dev/null || true
+# Pre-sweep: clean any orphaned contender namespaces from previous test runs
+for _pre_ns in ipfYA ipfYB ipfWA ipfWB ipfGGA ipfGGB ipfOA ipfOB ipfNA ipfNB ipfAA ipfAB ipfZA ipfZB ipfTA ipfTB ipfBA ipfBB ipfEA ipfEB; do
+    ip netns pids "$_pre_ns" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    ip netns del "$_pre_ns" 2>/dev/null || true
+done
 
 # ── binary ────────────────────────────────────────────────────────────────────
 if [ $# -ge 1 ] && [ -n "${1:-}" ]; then
