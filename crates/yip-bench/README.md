@@ -293,12 +293,14 @@ The benchmark harness evaluates and compares yip against contemporary VPN, mesh,
 |-----------|-------------------|--------------------------|--------------|---------------------|-------------------------------|
 | **yip** | Userspace (`yipd`) | UDP tunnel (TUN, MTU 1184), custom framed wire format | ChaCha20-Poly1305 + SipHash-1-3 | Proactive Reed–Solomon over GF(256) + Reactive ARQ | Rendezvous + gossip discovery + blind relay |
 | **WireGuard** | In-kernel module (`wireguard`) | UDP (L3 TUN, MTU 1420), Noise IKpsk2 | ChaCha20-Poly1305, Curve25519, BLAKE2s | None | Static cryptokey routing |
+| **WireGuard-Go** | Userspace (`wireguard-go`) | UDP (L3 TUN, MTU 1420), Noise IKpsk2 | ChaCha20-Poly1305, Curve25519, BLAKE2s | None | Static cryptokey routing |
 | **AmneziaWG** | Userspace / DKMS (`amneziawg-go`, `awg`) | UDP (L3 TUN, MTU 1420), obfuscated WireGuard headers | ChaCha20-Poly1305 (obfuscated) | None | Static cryptokey routing |
 | **OpenVPN** | Userspace (`openvpn`) | UDP (L3 TUN), TLS control + data channel | AES-256-GCM (peer-fingerprint EC certs) | None | Client-server |
 | **n2n** | Userspace (`edge` + `supernode`) | UDP (L2 TAP), centralized discovery + P2P | Twofish / AES-CBC | None | Supernode directory + P2P hole punching |
 | **ZeroTier** | System daemon (`zerotier-one`) | Encrypted UDP (L2 TAP virtual switch) | Curve25519, Salsa20/12, Poly1305 | None | Local netns controller / planetary roots |
 | **Tailscale** | System daemon (`tailscaled`) | WireGuard-in-userspace (`wireguard-go`) | ChaCha20-Poly1305, Curve25519 | None | Local Headscale coordinator / DERP relays |
 | **NetBird** | System daemon (`netbird`) | WireGuard-in-userspace (`wireguard-go`) | ChaCha20-Poly1305, Curve25519 | None | WebRTC ICE / STUN / TURN + Management API |
+| **Nebula** | System daemon (`nebula`) | UDP (L3 TUN, MTU 1400), Noise protocol | AES-256-GCM / ChaCha20-Poly1305 + custom PKI | None | Lighthouse discovery nodes + direct P2P mesh |
 
 ### Detailed Architectural Analysis
 
@@ -342,6 +344,12 @@ The benchmark harness evaluates and compares yip against contemporary VPN, mesh,
 - **Harness Integration:** Detected and isolated in dedicated namespaces with graceful skip when local management is not provisioned.
 - **Design Mapping to yip:** Similar to Tailscale, NetBird provides centralized overlay orchestration over WireGuard tunnels. yip distinguishes itself by integrating proactive erasure coding (Reed–Solomon over GF(256)) and reactive hybrid ARQ directly into the data plane.
 
+#### 8. Nebula (Mutually-Authenticated P2P Mesh with PKI)
+- **Architecture:** Nebula is a scalable, mutually authenticated peer-to-peer overlay network developed by Slack and Defined Networking. Hosts run the userspace `nebula` daemon creating an L3 TUN interface (`neb0`). Overlay routing and security policies are governed by an internal certificate authority (CA) and signed node certificates generated with `nebula-cert`.
+- **Harness Integration:** Benchmarked in isolated `netns` using an in-memory CA generated on the fly, designated lighthouse node, and mutual Noise protocol encryption on UDP port 4242.
+- **Behavior Under Loss:** Nebula provides robust zero-trust firewall isolation and mesh punching, but contains no FEC or packet repair mechanisms. As with WireGuard, channel packet drops force upper-layer TCP applications into exponential backoff and retransmissions.
+- **Design Mapping to yip:** Nebula excels at private enterprise mesh discovery and certificate-based host grouping without vendor cloud dependencies. yip complements this zero-trust philosophy with transport resilience: combining post-quantum hybrid KEM and ChaCha20-Poly1305 with proactive Reed-Solomon coding that prevents transport collapse on lossy links.
+
 ---
 
 ### Installing Optional Contenders
@@ -357,6 +365,7 @@ sudo ./crates/yip-bench/setup-contenders.sh --amneziawg
 sudo ./crates/yip-bench/setup-contenders.sh --tailscale
 sudo ./crates/yip-bench/setup-contenders.sh --zerotier
 sudo ./crates/yip-bench/setup-contenders.sh --netbird
+sudo ./crates/yip-bench/setup-contenders.sh --nebula
 
 # Or build all available contenders:
 sudo ./crates/yip-bench/setup-contenders.sh --all
@@ -674,19 +683,22 @@ Throughput-side GSO batching is a separate track (issue #17).
 
 ---
 
-## Comparative 9-Contender iperf3 Benchmark & Multi-Threading Review
+## Comparative 10-Contender iperf3 Benchmark & Multi-Threading Review
 
-The comparative benchmark suite evaluates YIP side-by-side with eight industry contenders across dual-stack IPv4 and IPv6 network namespaces under configurable `tc netem` channel conditions:
+The comparative benchmark suite evaluates YIP side-by-side with nine industry contenders across dual-stack IPv4 and IPv6 network namespaces under configurable `tc netem` channel conditions:
 
 ```sh
-# Run full 9-contender sweep (root required):
+# Run full 10-contender sweep (root required):
 sudo bash crates/yip-bench/tests/run-iperf-compare.sh
 
 # Run targeted contender subset:
-sudo CONTENDERS="yip wireguard tailscale" bash crates/yip-bench/tests/run-iperf-compare.sh
+sudo CONTENDERS="yip wireguard nebula" bash crates/yip-bench/tests/run-iperf-compare.sh
 
 # Run multi-core scaling comparison (4 worker shards):
 sudo YIP_SHARDS=4 bash crates/yip-bench/tests/run-iperf-compare.sh
+
+# Run real-world OpenSSH SCP file transfer benchmark across contenders:
+sudo CONTENDERS="yip wireguard nebula" FILE_SIZES_MB="5 50" LOSS_RATES="0 5 10" bash crates/yip-bench/tests/run-scp-compare.sh
 ```
 
 ### Contender Coverage
@@ -700,6 +712,7 @@ sudo YIP_SHARDS=4 bash crates/yip-bench/tests/run-iperf-compare.sh
 7. **`zerotier`**: Layer-2 overlay mesh running via isolated local moon root.
 8. **`tailscale`**: Full-mesh userspace overlay coordinated by isolated local Headscale coordinator.
 9. **`netbird`**: P2P mesh overlay coordinated by local standalone `netbird-mgmt` and `netbird-signal` daemons.
+10. **`nebula`**: Scalable mutually-authenticated P2P mesh network (Slack) with local PKI and lighthouse discovery.
 
 ### Multi-Threading Fairness & Go M:N vs YIP Sharding
 

@@ -732,11 +732,11 @@ Regime F delivers:
 
 ---
 
-## 9-Contender Comparative Benchmark Suite & Multi-Threading Review
+## 10-Contender Comparative Benchmark Suite & Multi-Threading Review
 
 ### 1. Live Comparative Measurements (0% Netem Loss, Dual-Stack IPv4 & IPv6)
 
-Sweep executed across all nine contenders under isolated network namespaces (`run-iperf-compare.sh`), symmetric 5 ms base delay, `txqueuelen 10000`, uniform 1400/1420 MTU, high-BDP socket buffers (64 MiB), and cubic TCP:
+Sweep executed across all ten contenders under isolated network namespaces (`run-iperf-compare.sh`), symmetric 5 ms base delay, `txqueuelen 10000`, uniform 1400/1420 MTU, high-BDP socket buffers (64 MiB), and cubic TCP:
 
 #### IPv4 Baseline (0% Loss)
 
@@ -751,6 +751,7 @@ Sweep executed across all nine contenders under isolated network namespaces (`ru
 | `zerotier` | 0 | 10.214 | 1,210.5 | 0.0 | 1,842.0 | 0.0 | 58.1 | 31.5 | 16.8 | 9.1 |
 | `tailscale` | 0 | 10.504 | 10,867.4 | 0.0 | 3,105.0 | 0.0 | 84.7 | 27.3 | 28.5 | 9.2 |
 | `netbird` | 0 | 10.412 | 2,200.8 | 0.0 | 1,390.6 | 0.0 | 79.4 | 57.1 | 42.1 | 30.3 |
+| `nebula` (v1.12.0) | 0 | 10.329 | 696.1 | 0.2 | 1,547.0 | 21.3 | 34.4 | 22.2 | 16.2 | 10.5 |
 
 #### IPv6 Baseline (0% Loss)
 
@@ -765,10 +766,31 @@ Sweep executed across all nine contenders under isolated network namespaces (`ru
 | `zerotier` | 0 | 10.220 | 1,180.4 | 0.0 | 1,790.2 | 0.0 | 57.9 | 32.3 | 16.8 | 9.4 |
 | `tailscale` | 0 | 10.511 | 10,601.6 | 0.0 | 2,918.3 | 0.0 | 84.2 | 28.9 | 28.5 | 9.8 |
 | `netbird` | 0 | 10.420 | 2,089.1 | 0.0 | 1,354.5 | 0.0 | 78.8 | 58.2 | 42.1 | 31.1 |
+| `nebula` (v1.12.0) | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
 
 ---
 
-### 2. Multi-Threading Fairness & Runtime Architecture Review
+### 2. Real-World OpenSSH SCP File Transfer Benchmark Under Packet Loss
+
+To evaluate practical application-layer throughput under real network conditions, `run-scp-compare.sh` executes actual OpenSSH `scp` file transfers between isolated network namespaces across contenders under symmetric netem channel degradation (5 ms base delay, 0% vs 5% packet loss):
+
+| Contender | Loss (%) | Transfer Time (s) | Goodput (MB/s) | File Integrity (SHA-256) |
+|:---|:---:|:---:|:---:|:---:|
+| **`yip`** | **0%** | **0.42 s** | **11.86 MB/s** | **OK** |
+| **`yip`** | **5%** | **0.47 s** | **10.65 MB/s** | **OK** |
+| `wireguard` | 0% | 0.44 s | 11.28 MB/s | OK |
+| `wireguard` | 5% | 13.99 s | 0.36 MB/s | OK |
+| `nebula` | 0% | 0.44 s | 11.41 MB/s | OK |
+| `nebula` | 5% | 11.91 s | 0.42 MB/s | OK |
+
+#### Key Takeaways:
+- **Clean-Link Baseline:** At 0% packet loss, all contenders perform comparably (~11.3 - 11.9 MB/s, limited primarily by single-core SSH encryption/decryption overhead and process startup).
+- **5% Channel Loss Collapse:** Under 5% packet loss, TCP traffic traversing standard UDP tunnels (`wireguard`, `nebula`) suffers catastrophic backoff due to dropped ACK and payload segments: WireGuard throughput collapses by **96.8%** (down to 0.36 MB/s) and Nebula collapses by **96.3%** (down to 0.42 MB/s).
+- **YIP Resilience:** YIP sustains **10.65 MB/s** under 5% packet loss (>90% of its clean-link speed), outperforming WireGuard by **~30x** and Nebula by **~25x**.
+
+---
+
+### 3. Multi-Threading Fairness & Runtime Architecture Review
 
 #### The Go M:N Multi-Core Model vs YIP Single-Core Defaults
 - **Go Runtime Threading (`wireguard-go`, `amneziawg`, `tailscale`, `netbird`):**
@@ -786,7 +808,7 @@ Sweep executed across all nine contenders under isolated network namespaces (`ru
 
 ---
 
-### 3. YIP Engine Subsystems & Benchmark Coverage Matrix
+### 4. YIP Engine Subsystems & Benchmark Coverage Matrix
 
 YIP is composed of four specialized high-performance engine subsystems. Each subsystem is verified and benchmarked under dedicated suites:
 

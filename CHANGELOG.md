@@ -6,6 +6,13 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **Nebula Contender & Full 10-Contender SCP Transfer Suite (`crates/yip-bench`, #289).**
+  - Added Slack's Nebula (`nebula` and `nebula-cert` v1.12.0) to `crates/yip-bench/setup-contenders.sh` (`setup_nebula()`, `--nebula`, `--all`, and `--check`).
+  - Created `crates/yip-bench/tests/contenders-lib.sh` unifying network topologies, process cleanup, netem delay/loss injection, and lifecycle dispatchers (`start_contender`, `stop_contender`, `get_contender_info`, `verify_isolation`) across all 10 contenders: `yip`, `wireguard`, `wireguard-go`, `amneziawg`, `openvpn`, `n2n`, `zerotier`, `tailscale`, `netbird`, and `nebula`.
+  - Refactored `crates/yip-bench/tests/run-iperf-compare.sh` to source `contenders-lib.sh`, eliminating redundant lifecycle script duplication and adding Nebula to the throughput, ping, CPU, memory telemetry sweeps, tables, and JSON export.
+  - Refactored `crates/yip-bench/tests/run-scp-compare.sh` to source `contenders-lib.sh` and expanded the benchmark from 3 hardcoded contenders to the full 10-contender suite across `FILE_SIZES_MB` and `LOSS_RATES`.
+  - Demonstrated that under 5% netem packet loss, Yip maintains 10.65 MB/s SCP file transfer goodput (>90% of its clean-link speed), outperforming WireGuard (0.36 MB/s, ~30x slower) and Nebula (0.42 MB/s, ~25x slower).
+  - Documented Nebula architecture and benchmark findings in `crates/yip-bench/README.md` and `crates/yip-bench/RESULTS.md`.
 - **CI Benchmarks Workflow Matrix & SCP Transfer Suite (`crates/yip-bench`, `.github/workflows/benchmarks.yml`, #280).**
   - Upgraded `crates/yip-bench/tests/run-scp-compare.sh` to support configurable payload sizes (`FILE_SIZES_MB`, default: 100MB), OpenVPN contender support alongside Yip and WireGuard, and JSON telemetry export (`OUTPUT_JSON`).
   - Added structured JSON telemetry export to `crates/yip-bench/tests/run-iperf-compare.sh` (`OUTPUT_JSON`), capturing complete per-contender per-loss throughput, packet loss, RTT, CPU efficiency, and memory footprint metrics.
