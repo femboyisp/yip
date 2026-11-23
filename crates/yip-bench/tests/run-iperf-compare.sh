@@ -606,11 +606,29 @@ measure_contender() {
 }
 
 # ── helper: resource cleanup verification ─────────────────────────────────────
+is_pid_alive() {
+    local pid="$1"
+    [ -z "$pid" ] && return 1
+    [ "$pid" = "$$" ] && return 1
+    wait "$pid" 2>/dev/null || true
+    if [ ! -d "/proc/$pid" ]; then
+        return 1
+    fi
+    local state
+    state="$(awk '/^State:/ {print $2}' "/proc/$pid/status" 2>/dev/null || true)"
+    if [ -z "$state" ] || [ "$state" = "Z" ] || [ "$state" = "X" ]; then
+        return 1
+    fi
+    return 0
+}
+
 is_test_pid() {
     local pid="$1"
     [ -z "$pid" ] && return 1
     [ "$pid" = "$$" ] && return 1
-    [ ! -d "/proc/$pid" ] && return 1
+    if ! is_pid_alive "$pid"; then
+        return 1
+    fi
     if grep -Fq "$TMPDIR_TEST" "/proc/$pid/cmdline" 2>/dev/null; then
         return 0
     fi
@@ -631,8 +649,19 @@ verify_isolation() {
     for entry in "${LAST_CHECK_PIDS[@]}"; do
         local p="${entry%%:*}"
         local desc="${entry#*:}"
-        if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
-            leaked_pids+=("$p($desc)")
+        if [ -n "$p" ] && is_pid_alive "$p"; then
+            local alive=false
+            for _ in 1 2 3 4 5; do
+                sleep 0.1
+                if ! is_pid_alive "$p"; then
+                    alive=false
+                    break
+                fi
+                alive=true
+            done
+            if [ "$alive" = true ]; then
+                leaked_pids+=("$p($desc)")
+            fi
         fi
     done
 
@@ -655,7 +684,7 @@ verify_isolation() {
                 if echo "$ns_list" | grep -qx "$ns"; then leaked_ns+=("$ns"); fi
             done
             for p in $(pgrep -x wireguard-go 2>/dev/null || pgrep -x wireguard 2>/dev/null || true); do
-                if is_test_pid "$p" || grep -q "wggo0" "/proc/$p/cmdline" 2>/dev/null; then
+                if is_pid_alive "$p" && { is_test_pid "$p" || grep -q "wggo0" "/proc/$p/cmdline" 2>/dev/null; }; then
                     [ "$p" != "$$" ] && leaked_pids+=("$p(wireguard-go)")
                 fi
             done
@@ -665,7 +694,7 @@ verify_isolation() {
                 if echo "$ns_list" | grep -qx "$ns"; then leaked_ns+=("$ns"); fi
             done
             for p in $(pgrep -x amneziawg-go 2>/dev/null || true); do
-                if is_test_pid "$p" || grep -q "awg0" "/proc/$p/cmdline" 2>/dev/null; then
+                if is_pid_alive "$p" && { is_test_pid "$p" || grep -q "awg0" "/proc/$p/cmdline" 2>/dev/null; }; then
                     [ "$p" != "$$" ] && leaked_pids+=("$p(amneziawg-go)")
                 fi
             done
@@ -740,9 +769,9 @@ verify_isolation() {
         for p in "${leaked_pids[@]}"; do
             local pid="${p%%(*}"
             kill -9 "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
         done
         ISOLATION_FAILED=true
-        return 1
     fi
     return 0
 }
@@ -840,6 +869,8 @@ stop_yip() {
     sleep 0.1
     [ -n "$PID_YA" ] && kill -9 "$PID_YA" 2>/dev/null || true
     [ -n "$PID_YB" ] && kill -9 "$PID_YB" 2>/dev/null || true
+    [ -n "$PID_YA" ] && wait "$PID_YA" 2>/dev/null || true
+    [ -n "$PID_YB" ] && wait "$PID_YB" 2>/dev/null || true
     PID_YA=""; PID_YB=""
     for ns in "$NS_YA" "$NS_YB"; do
         ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
@@ -1034,6 +1065,8 @@ stop_wireguard_go() {
     sleep 0.1
     [ -n "$PID_GGA" ] && kill -9 "$PID_GGA" 2>/dev/null || true
     [ -n "$PID_GGB" ] && kill -9 "$PID_GGB" 2>/dev/null || true
+    [ -n "$PID_GGA" ] && wait "$PID_GGA" 2>/dev/null || true
+    [ -n "$PID_GGB" ] && wait "$PID_GGB" 2>/dev/null || true
     PID_GGA=""; PID_GGB=""
     ip netns exec "$NS_GGA" ip link del wggo0 2>/dev/null || true
     ip netns exec "$NS_GGB" ip link del wggo0 2>/dev/null || true
@@ -1191,6 +1224,8 @@ stop_awg() {
     sleep 0.1
     [ -n "$PID_AA" ] && kill -9 "$PID_AA" 2>/dev/null || true
     [ -n "$PID_AB" ] && kill -9 "$PID_AB" 2>/dev/null || true
+    [ -n "$PID_AA" ] && wait "$PID_AA" 2>/dev/null || true
+    [ -n "$PID_AB" ] && wait "$PID_AB" 2>/dev/null || true
     PID_AA=""; PID_AB=""
     ip netns exec "$NS_AA" ip link del awg0 2>/dev/null || true
     ip netns exec "$NS_AB" ip link del awg0 2>/dev/null || true
@@ -1287,6 +1322,8 @@ stop_ovpn() {
     sleep 0.1
     [ -n "$PID_OA" ] && kill -9 "$PID_OA" 2>/dev/null || true
     [ -n "$PID_OB" ] && kill -9 "$PID_OB" 2>/dev/null || true
+    [ -n "$PID_OA" ] && wait "$PID_OA" 2>/dev/null || true
+    [ -n "$PID_OB" ] && wait "$PID_OB" 2>/dev/null || true
     PID_OA=""; PID_OB=""
     ip netns exec "$NS_OA" ip link del tun0 2>/dev/null || true
     ip netns exec "$NS_OB" ip link del tun0 2>/dev/null || true
@@ -1371,6 +1408,9 @@ stop_n2n() {
     [ -n "$PID_N2N_SN" ] && kill -9 "$PID_N2N_SN" 2>/dev/null || true
     [ -n "$PID_N2N_EA" ] && kill -9 "$PID_N2N_EA" 2>/dev/null || true
     [ -n "$PID_N2N_EB" ] && kill -9 "$PID_N2N_EB" 2>/dev/null || true
+    [ -n "$PID_N2N_SN" ] && wait "$PID_N2N_SN" 2>/dev/null || true
+    [ -n "$PID_N2N_EA" ] && wait "$PID_N2N_EA" 2>/dev/null || true
+    [ -n "$PID_N2N_EB" ] && wait "$PID_N2N_EB" 2>/dev/null || true
     PID_N2N_SN=""; PID_N2N_EA=""; PID_N2N_EB=""
     killall -9 edge supernode 2>/dev/null || true
     ip netns exec "$NS_NA" ip link del n2n0 2>/dev/null || true
@@ -1507,6 +1547,8 @@ stop_zerotier() {
     sleep 0.1
     [ -n "$PID_ZT_A" ] && kill -9 "$PID_ZT_A" 2>/dev/null || true
     [ -n "$PID_ZT_B" ] && kill -9 "$PID_ZT_B" 2>/dev/null || true
+    [ -n "$PID_ZT_A" ] && wait "$PID_ZT_A" 2>/dev/null || true
+    [ -n "$PID_ZT_B" ] && wait "$PID_ZT_B" 2>/dev/null || true
     PID_ZT_A=""; PID_ZT_B=""
     for ns in "$NS_ZA" "$NS_ZB"; do
         ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
@@ -1641,6 +1683,9 @@ stop_tailscale() {
     [ -n "$PID_TS_DA" ] && kill -9 "$PID_TS_DA" 2>/dev/null || true
     [ -n "$PID_TS_DB" ] && kill -9 "$PID_TS_DB" 2>/dev/null || true
     [ -n "$PID_TS_HS" ] && kill -9 "$PID_TS_HS" 2>/dev/null || true
+    [ -n "$PID_TS_DA" ] && wait "$PID_TS_DA" 2>/dev/null || true
+    [ -n "$PID_TS_DB" ] && wait "$PID_TS_DB" 2>/dev/null || true
+    [ -n "$PID_TS_HS" ] && wait "$PID_TS_HS" 2>/dev/null || true
     PID_TS_DA=""; PID_TS_DB=""; PID_TS_HS=""
     for ns in "$NS_TA" "$NS_TB"; do
         ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
@@ -1856,6 +1901,10 @@ stop_netbird() {
     [ -n "$PID_NB_SB" ] && kill -9 "$PID_NB_SB" 2>/dev/null || true
     [ -n "$PID_NB_MGMT" ] && kill -9 "$PID_NB_MGMT" 2>/dev/null || true
     [ -n "$PID_NB_SIG" ] && kill -9 "$PID_NB_SIG" 2>/dev/null || true
+    [ -n "$PID_NB_SA" ] && wait "$PID_NB_SA" 2>/dev/null || true
+    [ -n "$PID_NB_SB" ] && wait "$PID_NB_SB" 2>/dev/null || true
+    [ -n "$PID_NB_MGMT" ] && wait "$PID_NB_MGMT" 2>/dev/null || true
+    [ -n "$PID_NB_SIG" ] && wait "$PID_NB_SIG" 2>/dev/null || true
     PID_NB_SA=""; PID_NB_SB=""; PID_NB_MGMT=""; PID_NB_SIG=""
     killall -9 netbird netbird-mgmt netbird-signal 2>/dev/null || true
     for ns in "$NS_BA" "$NS_BB"; do
