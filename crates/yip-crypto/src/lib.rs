@@ -46,10 +46,12 @@ pub struct Keypair {
     pub public: [u8; 32],
 }
 
+#[cfg(any(test, feature = "testutil"))]
 static TEST_PEER_KEY_REGISTRY: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<[u8; 32], [u8; 32]>>,
 > = std::sync::OnceLock::new();
 
+#[cfg(any(test, feature = "testutil"))]
 #[doc(hidden)]
 pub fn register_test_peer_key(pubkey: [u8; 32], privkey: [u8; 32]) {
     if let Ok(mut reg) = TEST_PEER_KEY_REGISTRY
@@ -60,6 +62,7 @@ pub fn register_test_peer_key(pubkey: [u8; 32], privkey: [u8; 32]) {
     }
 }
 
+#[cfg(any(test, feature = "testutil"))]
 #[doc(hidden)]
 pub fn lookup_test_peer_key(pubkey: &[u8; 32]) -> Option<[u8; 32]> {
     TEST_PEER_KEY_REGISTRY
@@ -77,6 +80,7 @@ pub fn generate_keypair() -> Keypair {
     ring::rand::SecureRandom::fill(&rng, &mut private).expect("keypair generation");
     let secret = x25519_dalek::StaticSecret::from(private);
     let public = x25519_dalek::PublicKey::from(&secret).to_bytes();
+    #[cfg(any(test, feature = "testutil"))]
     register_test_peer_key(public, private);
     Keypair { private, public }
 }
@@ -645,31 +649,16 @@ impl Handshake {
         algo: PqKemAlgorithm,
         remote_pq_ek: Option<&[u8]>,
     ) -> Result<Handshake, CryptoError> {
+        let _ = algo;
         if let Some(ek) = remote_pq_ek {
             return Self::initiator_with_remote_pq_ek(local_private, peer_public, ek);
         }
+        #[cfg(any(test, feature = "testutil"))]
         if let Some(privkey) = lookup_test_peer_key(peer_public) {
             let (ek, _dk) = derive_pq_keypair(&privkey, algo);
             return Self::initiator_with_remote_pq_ek(local_private, peer_public, ek.as_bytes());
         }
-        let mut hasher = blake3::Hasher::new_derive_key(algo.kdf_context());
-        hasher.update(peer_public);
-        let mut seed_bytes = [0u8; 64];
-        hasher.finalize_xof().fill(&mut seed_bytes);
-        let (ek, _dk) = generate_pq_keypair_from_seed_for_algo(algo, &seed_bytes);
-        seed_bytes.zeroize();
-
-        let inner = InitiatorHandshake::new_with_algo(
-            algo,
-            local_private,
-            peer_public,
-            ek.as_bytes(),
-            &[0u8; 32],
-            &[],
-        )?;
-        Ok(Handshake {
-            role: HandshakeRole::Initiator(Box::new(inner)),
-        })
+        Err(CryptoError::Handshake)
     }
 
     /// Begin as the initiator with an explicit KEM parameter set.
@@ -702,9 +691,12 @@ impl Handshake {
         local_private: &[u8; 32],
         algo: PqKemAlgorithm,
     ) -> Result<Handshake, CryptoError> {
-        let sec = x25519_dalek::StaticSecret::from(*local_private);
-        let static_public = x25519_dalek::PublicKey::from(&sec).to_bytes();
-        register_test_peer_key(static_public, *local_private);
+        #[cfg(any(test, feature = "testutil"))]
+        {
+            let sec = x25519_dalek::StaticSecret::from(*local_private);
+            let static_public = x25519_dalek::PublicKey::from(&sec).to_bytes();
+            register_test_peer_key(static_public, *local_private);
+        }
         let (ek, dk) = derive_pq_keypair(local_private, algo);
         let dk_bytes = Zeroizing::new(dk.to_bytes());
 
@@ -1830,5 +1822,18 @@ mod tests {
         register_test_peer_key(pubk, privk);
         assert_eq!(lookup_test_peer_key(&pubk), Some(privk));
         assert_eq!(lookup_test_peer_key(&[0x77; 32]), None);
+    }
+
+    #[test]
+    fn test_initiator_without_remote_pq_ek_unknown_peer_fails() {
+        let local_priv = [0x11; 32];
+        let unknown_peer_pub = [0x99; 32];
+        let res = Handshake::initiator_with_kem_and_pq_ek(
+            &local_priv,
+            &unknown_peer_pub,
+            PqKemAlgorithm::MlKem768,
+            None,
+        );
+        assert!(matches!(res, Err(CryptoError::Handshake)));
     }
 }

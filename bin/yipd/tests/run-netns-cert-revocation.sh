@@ -166,18 +166,19 @@ gen_node() {
     local gk sk
     gk="$("$YIPD" --genkey)"
     sk="$("$YIPCA" genkey)"
-    local priv pub signpriv signpub
+    local priv pub signpriv signpub pq_pub
     priv="$(echo "$gk" | grep '^private=' | cut -d= -f2)"
     pub="$(echo "$gk" | grep '^public=' | cut -d= -f2)"
+    pq_pub="$(echo "$gk" | grep '^pq_public=' | cut -d= -f2)"
     signpriv="$(echo "$sk" | grep '^ca_private=' | cut -d= -f2)"
     signpub="$(echo "$sk" | grep '^ca_public=' | cut -d= -f2)"
-    echo "$priv $pub $signpriv $signpub"
+    echo "$priv $pub $signpriv $signpub $pq_pub"
 }
 
 echo "[setup] generating per-node data-plane + record-signing keypairs"
-read -r PRIV_A PUB_A SIGNPRIV_A SIGNPUB_A <<<"$(gen_node)"
-read -r PRIV_B PUB_B SIGNPRIV_B SIGNPUB_B <<<"$(gen_node)"
-read -r PRIV_R PUB_R SIGNPRIV_R SIGNPUB_R <<<"$(gen_node)"
+read -r PRIV_A PUB_A SIGNPRIV_A SIGNPUB_A PQ_PUB_A <<<"$(gen_node)"
+read -r PRIV_B PUB_B SIGNPRIV_B SIGNPUB_B PQ_PUB_B <<<"$(gen_node)"
+read -r PRIV_R PUB_R SIGNPRIV_R SIGNPUB_R PQ_PUB_R <<<"$(gen_node)"
 
 ADDR_A="$("$YIPD" --addr "$PUB_A")"
 ADDR_B="$("$YIPD" --addr "$PUB_B")"
@@ -189,12 +190,12 @@ echo "[setup] node_addr A=$ADDR_A B=$ADDR_B R=$ADDR_R"
 CERT_R_FILE="$TMPDIR_TEST/certR.hex"
 echo "$CA_PRIV" | "$YIPCA" sign-cert \
     --member "$PUB_R" --member-sign "$SIGNPUB_R" \
-    --network "$NETWORK_ID" --days 30 > "$CERT_R_FILE"
+    --network "$NETWORK_ID" --days 30 --pq-key "$PQ_PUB_R" > "$CERT_R_FILE"
 
 CERT_B_FILE="$TMPDIR_TEST/certB.hex"
 echo "$CA_PRIV" | "$YIPCA" sign-cert \
     --member "$PUB_B" --member-sign "$SIGNPUB_B" \
-    --network "$NETWORK_ID" --days 30 > "$CERT_B_FILE"
+    --network "$NETWORK_ID" --days 30 --pq-key "$PQ_PUB_B" > "$CERT_B_FILE"
 
 # A's cert: short-validity (`--secs`), minted last so as little of its
 # window as possible is spent before daemons even start. MINT_TIME anchors
@@ -202,7 +203,7 @@ echo "$CA_PRIV" | "$YIPCA" sign-cert \
 CERT_A_FILE="$TMPDIR_TEST/certA.hex"
 echo "$CA_PRIV" | "$YIPCA" sign-cert \
     --member "$PUB_A" --member-sign "$SIGNPUB_A" \
-    --network "$NETWORK_ID" --secs "$CERT_A_SECS" > "$CERT_A_FILE"
+    --network "$NETWORK_ID" --secs "$CERT_A_SECS" --pq-key "$PQ_PUB_A" > "$CERT_A_FILE"
 MINT_TIME=$(date +%s)
 EXPIRY_TIME=$((MINT_TIME + CERT_A_SECS))
 DROP_CHECK_TIME=$((EXPIRY_TIME + CLOCK_SKEW_SECS + REKEY_INTERVAL_SECS + DROP_MARGIN_SECS))

@@ -49,6 +49,7 @@ ed25519-dalek = { version = "3" }
 [dev-dependencies]
 ed25519-dalek = { version = "3", default-features = false }
 yip-verify = { workspace = true }
+yip-crypto = { workspace = true, features = ["testutil"] }
 
 [lints]
 workspace = true

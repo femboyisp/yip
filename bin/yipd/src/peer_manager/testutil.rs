@@ -13,12 +13,19 @@ use yip_membership::{Record, RootSet};
 pub(super) const TEST_NET: [u8; 16] = [7u8; 16];
 
 pub(super) fn peer_cfg(tag_byte: u8, endpoint: &str) -> PeerConfig {
+    let dummy_priv = [tag_byte; 32];
+    let (ek, _) = yip_crypto::derive_pq_keypair(&dummy_priv, yip_crypto::PqKemAlgorithm::MlKem768);
+    peer_test_key_registry()
+        .lock()
+        .unwrap()
+        .insert([tag_byte; 32], (dummy_priv, [0u8; 32]));
+    yip_crypto::register_test_peer_key([tag_byte; 32], dummy_priv);
     PeerConfig {
         public_key: [tag_byte; 32],
         endpoint: Some(endpoint.parse().unwrap()),
         alias: None,
         kem: None,
-        pq_public_key: None,
+        pq_public_key: Some(ek.as_bytes().to_vec()),
     }
 }
 

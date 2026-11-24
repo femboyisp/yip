@@ -26,6 +26,8 @@ pub enum ControlCmd {
         transport: Option<String>,
         #[serde(default)]
         alias: Option<String>,
+        #[serde(default)]
+        pq_public_key: Option<String>,
     },
     #[serde(rename = "remove_peer")]
     RemovePeer { public_key: String },
@@ -357,6 +359,8 @@ pub struct PeerConfigEntry {
     pub transport: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kem: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_public_key: Option<String>,
 }
 
 /// Supported Reed-Solomon dynamic FEC presets.
@@ -918,6 +922,7 @@ mod tests {
             endpoint: None,
             transport: None,
             alias: None,
+            pq_public_key: None,
         }
         .is_privileged());
         assert!(ControlCmd::RemovePeer {

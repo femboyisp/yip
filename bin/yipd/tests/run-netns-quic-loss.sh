@@ -62,8 +62,10 @@ GENKEY_B="$("$YIPD" --genkey)"
 
 PRIV_A="$(echo "$GENKEY_A" | grep '^private=' | cut -d= -f2)"
 PUB_A="$(echo "$GENKEY_A" | grep '^public=' | cut -d= -f2)"
+PQ_PUB_A="$(echo "$GENKEY_A" | grep '^pq_public=' | cut -d= -f2)"
 PRIV_B="$(echo "$GENKEY_B" | grep '^private=' | cut -d= -f2)"
 PUB_B="$(echo "$GENKEY_B" | grep '^public=' | cut -d= -f2)"
+PQ_PUB_B="$(echo "$GENKEY_B" | grep '^pq_public=' | cut -d= -f2)"
 
 # ── 2. write config files (transport=quic, NO obf_psk/cover_traffic_ms) ──────
 CFG_A="$TMPDIR_TEST/yipA.conf"
@@ -74,6 +76,7 @@ cat > "$CFG_A" <<EOF
 local_private=${PRIV_A}
 local_public=${PUB_A}
 peer_public=${PUB_B}
+pq_public_key=${PQ_PUB_B}
 listen=${VETH_A_IP}:${PORT_A}
 peer_endpoint=${VETH_B_IP}:${PORT_B}
 device=${TUN_DEV}
@@ -86,6 +89,7 @@ cat > "$CFG_B" <<EOF
 local_private=${PRIV_B}
 local_public=${PUB_B}
 peer_public=${PUB_A}
+pq_public_key=${PQ_PUB_A}
 listen=${VETH_B_IP}:${PORT_B}
 peer_endpoint=${VETH_A_IP}:${PORT_A}
 device=${TUN_DEV}

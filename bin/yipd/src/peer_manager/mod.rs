@@ -2123,6 +2123,7 @@ impl PeerManager {
                 alias: p.alias.clone(),
                 transport: p.transport_name.clone(),
                 kem: Some(p.kem.as_str().to_string()),
+                pq_public_key: p.pq_public_key.as_deref().map(crate::config::hex_encode),
             })
             .collect();
 

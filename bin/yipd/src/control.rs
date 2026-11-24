@@ -4,7 +4,7 @@
 //! for querying daemon status, listing peer telemetry, and dynamically adding/removing peers.
 #![allow(dead_code)]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::SocketAddr;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -361,16 +361,7 @@ fn is_caller_privileged(caller_uid: Option<u32>) -> bool {
         Some(uid) => uid == yip_io::get_current_uid(),
         #[cfg(not(unix))]
         Some(_) => false,
-        None => {
-            #[cfg(not(target_os = "linux"))]
-            {
-                true
-            }
-            #[cfg(target_os = "linux")]
-            {
-                false
-            }
-        }
+        None => false,
     }
 }
 
@@ -380,7 +371,9 @@ fn run_listener(listener: UnixListener, req_tx: Sender<ControlRequest>) {
         let Ok(stream) = stream else {
             break;
         };
-        if ACTIVE_CLIENTS.load(Ordering::Relaxed) >= MAX_CONCURRENT_CLIENTS {
+        let prev = ACTIVE_CLIENTS.fetch_add(1, Ordering::SeqCst);
+        if prev >= MAX_CONCURRENT_CLIENTS {
+            ACTIVE_CLIENTS.fetch_sub(1, Ordering::SeqCst);
             let mut writer = stream;
             let err_resp = ControlResponse::Err {
                 ok: false,
@@ -395,10 +388,9 @@ fn run_listener(listener: UnixListener, req_tx: Sender<ControlRequest>) {
             struct ActiveGuard;
             impl Drop for ActiveGuard {
                 fn drop(&mut self) {
-                    ACTIVE_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+                    ACTIVE_CLIENTS.fetch_sub(1, Ordering::SeqCst);
                 }
             }
-            ACTIVE_CLIENTS.fetch_add(1, Ordering::Relaxed);
             let _guard = ActiveGuard;
 
             handle_client(stream, tx);
@@ -422,7 +414,8 @@ fn handle_client(stream: UnixStream, req_tx: Sender<ControlRequest>) {
 
     loop {
         line.clear();
-        match reader.read_line(&mut line) {
+        let mut take_reader = (&mut reader).take((MAX_REQUEST_LINE_BYTES + 1) as u64);
+        match take_reader.read_line(&mut line) {
             Ok(0) => break,
             Ok(n) => {
                 if n > MAX_REQUEST_LINE_BYTES {
@@ -539,6 +532,7 @@ pub fn dispatch_cmd(
             endpoint,
             transport,
             alias,
+            pq_public_key,
         } => {
             let pk = match crate::config::hex_to_32(&public_key) {
                 Ok(k) => k,
@@ -565,12 +559,24 @@ pub fn dispatch_cmd(
                 Some(s) if !s.is_empty() => Some(s.to_string()),
                 _ => None,
             };
+            let parsed_pq_pk = match pq_public_key {
+                Some(ref s) => match crate::config::hex_decode_vec(s.trim()) {
+                    Ok(bytes) => Some(bytes),
+                    Err(_) => {
+                        return ControlResponse::Err {
+                            ok: false,
+                            error: "invalid pq_public_key hex".into(),
+                        };
+                    }
+                },
+                None => None,
+            };
             let cfg = PeerConfig {
                 public_key: pk,
                 endpoint: ep,
                 alias: normalized_alias,
                 kem: None,
-                pq_public_key: None,
+                pq_public_key: parsed_pq_pk,
             };
             if let Some(tr) = transport {
                 match pm.add_peer_with_transport(cfg, Some(tr)) {
@@ -1461,6 +1467,7 @@ pub fn run_cli_peer_add(
         endpoint: endpoint.map(|s| s.into()),
         transport: transport.map(|s| s.into()),
         alias: alias.map(|s| s.into()),
+        pq_public_key: None,
     };
     match client_query(socket_path, cmd)? {
         ControlResponse::Ack { message, .. } => {
@@ -2674,6 +2681,7 @@ mod tests {
             endpoint: Some("198.51.100.2:51820".into()),
             transport: None,
             alias: Some("peer2".into()),
+            pq_public_key: None,
         };
         let resp = dispatch_cmd(&mut pm, add_cmd, "yip0", start);
         assert_eq!(
@@ -2719,6 +2727,7 @@ mod tests {
             endpoint: Some("198.51.100.5:51820".into()),
             transport: None,
             alias: Some("office-relay".into()),
+            pq_public_key: None,
         };
         let resp = dispatch_cmd(&mut pm, add_cmd, "yip0", start);
         assert_eq!(
@@ -2949,6 +2958,7 @@ mod tests {
             endpoint: None,
             transport: None,
             alias: None,
+            pq_public_key: None,
         };
         assert!(matches!(
             dispatch_cmd(&mut pm, bad_add, "yip0", start),
@@ -2961,6 +2971,7 @@ mod tests {
             endpoint: Some("not_an_ip".into()),
             transport: None,
             alias: None,
+            pq_public_key: None,
         };
         assert!(matches!(
             dispatch_cmd(&mut pm, bad_ep, "yip0", start),
@@ -2974,9 +2985,39 @@ mod tests {
             endpoint: Some("127.0.0.1:51820".into()),
             transport: Some("Holepunched UDP".into()),
             alias: Some("peer3".into()),
+            pq_public_key: None,
         };
         assert_eq!(
             dispatch_cmd(&mut pm, ok_add, "yip0", start),
+            ControlResponse::Ack {
+                ok: true,
+                message: "peer added".into()
+            }
+        );
+
+        // AddPeer with valid and invalid pq_public_key
+        let pk4 = "04".repeat(32);
+        let bad_pq = ControlCmd::AddPeer {
+            public_key: pk4.clone(),
+            endpoint: None,
+            transport: None,
+            alias: None,
+            pq_public_key: Some("not_hex".into()),
+        };
+        assert!(matches!(
+            dispatch_cmd(&mut pm, bad_pq, "yip0", start),
+            ControlResponse::Err { .. }
+        ));
+
+        let good_pq = ControlCmd::AddPeer {
+            public_key: pk4,
+            endpoint: None,
+            transport: None,
+            alias: Some("peer4".into()),
+            pq_public_key: Some("aabbccdd".into()),
+        };
+        assert_eq!(
+            dispatch_cmd(&mut pm, good_pq, "yip0", start),
             ControlResponse::Ack {
                 ok: true,
                 message: "peer added".into()
@@ -4248,6 +4289,7 @@ mod tests {
                                     alias: Some("peer-b".into()),
                                     transport: Some("raw".into()),
                                     kem: None,
+                                    pq_public_key: None,
                                 }],
                                 fec: Some(yip_proto::control::FecConfig::default()),
                                 daita: Some(yip_proto::control::DaitaConfig::default()),

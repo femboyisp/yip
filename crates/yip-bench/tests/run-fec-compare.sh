@@ -155,9 +155,11 @@ echo "[yip] generating keypairs"
 GENKEY_A="$("$YIPD" --genkey)"
 GENKEY_B="$("$YIPD" --genkey)"
 PRIV_A="$(echo "$GENKEY_A" | grep '^private=' | cut -d= -f2)"
-PUB_A="$(echo "$GENKEY_A"  | grep '^public='  | cut -d= -f2)"
+PUB_A="$(echo "$GENKEY_A" | grep \'^public=\' | cut -d= -f2)"
+PQ_PUB_A="$(echo "$GENKEY_A" | grep \'^pq_public=\' | cut -d= -f2)"
 PRIV_B="$(echo "$GENKEY_B" | grep '^private=' | cut -d= -f2)"
-PUB_B="$(echo "$GENKEY_B"  | grep '^public='  | cut -d= -f2)"
+PUB_B="$(echo "$GENKEY_B" | grep \'^public=\' | cut -d= -f2)"
+PQ_PUB_B="$(echo "$GENKEY_B" | grep \'^pq_public=\' | cut -d= -f2)"
 
 CFG_A="$TMPDIR_TEST/yipA.conf"
 CFG_B="$TMPDIR_TEST/yipB.conf"
@@ -165,6 +167,7 @@ cat > "$CFG_A" <<EOF
 local_private=${PRIV_A}
 local_public=${PUB_A}
 peer_public=${PUB_B}
+pq_public_key=${PQ_PUB_B}
 listen=${VYA_IP}:${YPORT_A}
 peer_endpoint=${VYB_IP}:${YPORT_B}
 device=${TUN_DEV}
@@ -174,6 +177,7 @@ cat > "$CFG_B" <<EOF
 local_private=${PRIV_B}
 local_public=${PUB_B}
 peer_public=${PUB_A}
+pq_public_key=${PQ_PUB_A}
 listen=${VYB_IP}:${YPORT_B}
 peer_endpoint=${VYA_IP}:${YPORT_A}
 device=${TUN_DEV}

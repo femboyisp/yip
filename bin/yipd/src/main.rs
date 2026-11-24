@@ -1178,8 +1178,13 @@ fn main() -> std::io::Result<()> {
             Some("config") => return run_client_subcommand("config", args),
             Some("genkey") | Some("--genkey") => {
                 let kp = yip_crypto::generate_keypair();
+                let (pq_ek, _) = yip_crypto::derive_pq_keypair(
+                    &kp.private,
+                    yip_crypto::PqKemAlgorithm::MlKem768,
+                );
                 println!("private={}", hex_encode(&kp.private));
                 println!("public={}", hex_encode(&kp.public));
+                println!("pq_public={}", hex_encode(pq_ek.as_bytes()));
                 return Ok(());
             }
             Some("addr") | Some("--addr") => {
@@ -1245,8 +1250,11 @@ fn main() -> std::io::Result<()> {
         }
         Some("--genkey") => {
             let kp = yip_crypto::generate_keypair();
+            let (pq_ek, _) =
+                yip_crypto::derive_pq_keypair(&kp.private, yip_crypto::PqKemAlgorithm::MlKem768);
             println!("private={}", hex_encode(&kp.private));
             println!("public={}", hex_encode(&kp.public));
+            println!("pq_public={}", hex_encode(pq_ek.as_bytes()));
             Ok(())
         }
         Some("--addr") => {

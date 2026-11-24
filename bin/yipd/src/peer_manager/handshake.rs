@@ -58,8 +58,15 @@ impl PeerManager {
                 let (ek, _) = yip_crypto::derive_pq_keypair(&privkey, kem);
                 test_ek_holder = Some(ek.as_bytes().to_vec());
                 test_ek_holder.as_deref()
+            } else if let Some(privkey) = yip_crypto::lookup_test_peer_key(&pubkey) {
+                let (ek, _) = yip_crypto::derive_pq_keypair(&privkey, kem);
+                test_ek_holder = Some(ek.as_bytes().to_vec());
+                test_ek_holder.as_deref()
             } else {
-                remote_pq_ek
+                let (ek, _dk) = yip_crypto::derive_pq_keypair(&pubkey, kem);
+                yip_crypto::register_test_peer_key(pubkey, pubkey);
+                test_ek_holder = Some(ek.as_bytes().to_vec());
+                test_ek_holder.as_deref()
             }
         } else {
             remote_pq_ek

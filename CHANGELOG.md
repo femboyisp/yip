@@ -10,7 +10,7 @@ All notable changes to this project are documented here, following
   - Derived the static post-quantum ML-KEM decapsulation key strictly from secret local private key material (`local_private`) via `PQ_KEM_STATIC_KEY_CONTEXT_V2`, closing a critical vulnerability where passive observers could compute the responder's decapsulation key from public identity.
   - Bound post-quantum public encapsulation keys to node certificates via extension tag `TAG_PQ_ENCAPS_KEY = 1` and enabled explicit static peer configuration via `pq_public_key`.
 - **Harden Control Socket Permissions, Authorization & Resource Limits (GHSA-x5x4-5r44-qpfq, `bin/yipd`, `crates/yip-io`).**
-  - Restriced `yipd` UNIX control socket permissions from world-writable `0666` to `0600` (owner read/write only).
+  - Restricted `yipd` UNIX control socket permissions from world-writable `0666` to `0600` (owner read/write only).
   - Enforced caller UID verification via `SO_PEERCRED` on Linux, requiring privileged operations to match the daemon's running UID.
   - Implemented DoS defenses: 64 KiB line limit, 5-second read/write timeouts, and a maximum of 64 concurrent client connections.
 - **Prevent Rootless UDP Rendezvous Endpoint Hijacking (GHSA-6h6h-828v-rr2w, `crates/yip-rendezvous`).**

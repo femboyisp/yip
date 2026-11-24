@@ -66,10 +66,13 @@ GENKEY_C="$("$YIPD" --genkey)"
 
 PRIV_A="$(echo "$GENKEY_A" | grep '^private=' | cut -d= -f2)"
 PUB_A="$(echo "$GENKEY_A" | grep '^public=' | cut -d= -f2)"
+PQ_PUB_A="$(echo "$GENKEY_A" | grep '^pq_public=' | cut -d= -f2)"
 PRIV_B="$(echo "$GENKEY_B" | grep '^private=' | cut -d= -f2)"
 PUB_B="$(echo "$GENKEY_B" | grep '^public=' | cut -d= -f2)"
+PQ_PUB_B="$(echo "$GENKEY_B" | grep '^pq_public=' | cut -d= -f2)"
 PRIV_C="$(echo "$GENKEY_C" | grep '^private=' | cut -d= -f2)"
 PUB_C="$(echo "$GENKEY_C" | grep '^public=' | cut -d= -f2)"
+PQ_PUB_C="$(echo "$GENKEY_C" | grep '^pq_public=' | cut -d= -f2)"
 
 # ── 2. compute each node's self-certifying mesh address ───────────────────────
 ADDR_A="$("$YIPD" --addr "$PUB_A")"
@@ -91,9 +94,11 @@ device=${TUN_DEV}
 device_kind=tun
 [peer]
 public_key=${PUB_B}
+pq_public_key=${PQ_PUB_B}
 endpoint=${IP_B}:${PORT}
 [peer]
 public_key=${PUB_C}
+pq_public_key=${PQ_PUB_C}
 endpoint=${IP_C}:${PORT}
 EOF
 
@@ -106,9 +111,11 @@ device=${TUN_DEV}
 device_kind=tun
 [peer]
 public_key=${PUB_A}
+pq_public_key=${PQ_PUB_A}
 endpoint=${IP_A}:${PORT}
 [peer]
 public_key=${PUB_C}
+pq_public_key=${PQ_PUB_C}
 endpoint=${IP_C}:${PORT}
 EOF
 
@@ -121,9 +128,11 @@ device=${TUN_DEV}
 device_kind=tun
 [peer]
 public_key=${PUB_A}
+pq_public_key=${PQ_PUB_A}
 endpoint=${IP_A}:${PORT}
 [peer]
 public_key=${PUB_B}
+pq_public_key=${PQ_PUB_B}
 endpoint=${IP_B}:${PORT}
 EOF
 

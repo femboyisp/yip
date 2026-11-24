@@ -278,9 +278,11 @@ capture_raw_obf() {
     genkey_a="$("$yipd_bin" --genkey)"
     genkey_b="$("$yipd_bin" --genkey)"
     priv_a="$(echo "$genkey_a" | grep '^private=' | cut -d= -f2)"
-    pub_a="$(echo "$genkey_a" | grep '^public=' | cut -d= -f2)"
+    pub_a="$(echo "$genkey_a" | grep \'^public=\' | cut -d= -f2)"
+pq_pub_a="$(echo "$genkey_a" | grep \'^pq_public=\' | cut -d= -f2)"
     priv_b="$(echo "$genkey_b" | grep '^private=' | cut -d= -f2)"
-    pub_b="$(echo "$genkey_b" | grep '^public=' | cut -d= -f2)"
+    pub_b="$(echo "$genkey_b" | grep \'^public=\' | cut -d= -f2)"
+pq_pub_b="$(echo "$genkey_b" | grep \'^pq_public=\' | cut -d= -f2)"
 
     local cfg_a="$tmp_dir/yipA.conf"
     local cfg_b="$tmp_dir/yipB.conf"
@@ -289,6 +291,7 @@ capture_raw_obf() {
 local_private=${priv_a}
 local_public=${pub_a}
 peer_public=${pub_b}
+pq_public_key=${pq_pub_b}
 listen=${veth_a_ip}:${port}
 peer_endpoint=${veth_b_ip}:${port}
 device=${tun_dev}
@@ -300,6 +303,7 @@ EOF
 local_private=${priv_b}
 local_public=${pub_b}
 peer_public=${pub_a}
+pq_public_key=${pq_pub_a}
 listen=${veth_b_ip}:${port}
 peer_endpoint=${veth_a_ip}:${port}
 device=${tun_dev}
@@ -434,9 +438,11 @@ capture_quic() {
     genkey_a="$("$yipd_bin" --genkey)"
     genkey_b="$("$yipd_bin" --genkey)"
     priv_a="$(echo "$genkey_a" | grep '^private=' | cut -d= -f2)"
-    pub_a="$(echo "$genkey_a" | grep '^public=' | cut -d= -f2)"
+    pub_a="$(echo "$genkey_a" | grep \'^public=\' | cut -d= -f2)"
+pq_pub_a="$(echo "$genkey_a" | grep \'^pq_public=\' | cut -d= -f2)"
     priv_b="$(echo "$genkey_b" | grep '^private=' | cut -d= -f2)"
-    pub_b="$(echo "$genkey_b" | grep '^public=' | cut -d= -f2)"
+    pub_b="$(echo "$genkey_b" | grep \'^public=\' | cut -d= -f2)"
+pq_pub_b="$(echo "$genkey_b" | grep \'^pq_public=\' | cut -d= -f2)"
 
     local cfg_a="$tmp_dir/yipA.conf"
     local cfg_b="$tmp_dir/yipB.conf"
@@ -445,6 +451,7 @@ capture_quic() {
 local_private=${priv_a}
 local_public=${pub_a}
 peer_public=${pub_b}
+pq_public_key=${pq_pub_b}
 listen=${veth_a_ip}:${port}
 peer_endpoint=${veth_b_ip}:${port}
 device=${tun_dev}
@@ -455,6 +462,7 @@ EOF
 local_private=${priv_b}
 local_public=${pub_b}
 peer_public=${pub_a}
+pq_public_key=${pq_pub_a}
 listen=${veth_b_ip}:${port}
 peer_endpoint=${veth_a_ip}:${port}
 device=${tun_dev}
@@ -589,9 +597,11 @@ capture_tls() {
     genkey_a="$("$yipd_bin" --genkey)"
     genkey_b="$("$yipd_bin" --genkey)"
     priv_a="$(echo "$genkey_a" | grep '^private=' | cut -d= -f2)"
-    pub_a="$(echo "$genkey_a" | grep '^public=' | cut -d= -f2)"
+    pub_a="$(echo "$genkey_a" | grep \'^public=\' | cut -d= -f2)"
+pq_pub_a="$(echo "$genkey_a" | grep \'^pq_public=\' | cut -d= -f2)"
     priv_b="$(echo "$genkey_b" | grep '^private=' | cut -d= -f2)"
-    pub_b="$(echo "$genkey_b" | grep '^public=' | cut -d= -f2)"
+    pub_b="$(echo "$genkey_b" | grep \'^public=\' | cut -d= -f2)"
+pq_pub_b="$(echo "$genkey_b" | grep \'^pq_public=\' | cut -d= -f2)"
 
     local cfg_a="$tmp_dir/yipA.conf"
     local cfg_b="$tmp_dir/yipB.conf"
@@ -600,6 +610,7 @@ capture_tls() {
 local_private=${priv_a}
 local_public=${pub_a}
 peer_public=${pub_b}
+pq_public_key=${pq_pub_b}
 listen=${veth_a_ip}:${port}
 peer_endpoint=${veth_b_ip}:${port}
 device=${tun_dev}
@@ -611,6 +622,7 @@ EOF
 local_private=${priv_b}
 local_public=${pub_b}
 peer_public=${pub_a}
+pq_public_key=${pq_pub_a}
 listen=${veth_b_ip}:${port}
 peer_endpoint=${veth_a_ip}:${port}
 device=${tun_dev}
@@ -779,9 +791,11 @@ capture_relay() {
     genkey_a="$("$yipd_bin" --genkey)"
     genkey_b="$("$yipd_bin" --genkey)"
     priv_a="$(echo "$genkey_a" | grep '^private=' | cut -d= -f2)"
-    pub_a="$(echo "$genkey_a" | grep '^public=' | cut -d= -f2)"
+    pub_a="$(echo "$genkey_a" | grep \'^public=\' | cut -d= -f2)"
+pq_pub_a="$(echo "$genkey_a" | grep \'^pq_public=\' | cut -d= -f2)"
     priv_b="$(echo "$genkey_b" | grep '^private=' | cut -d= -f2)"
-    pub_b="$(echo "$genkey_b" | grep '^public=' | cut -d= -f2)"
+    pub_b="$(echo "$genkey_b" | grep \'^public=\' | cut -d= -f2)"
+pq_pub_b="$(echo "$genkey_b" | grep \'^pq_public=\' | cut -d= -f2)"
     obf_psk="$(openssl rand -hex 32)"
     addr_a="$("$yipd_bin" --addr "$pub_a")"
     addr_b="$("$yipd_bin" --addr "$pub_b")"
@@ -799,6 +813,7 @@ rendezvous=tls://${ip_r_a}:${rdv_tcp_port}
 obf_psk=${obf_psk}
 [peer]
 public_key=${pub_b}
+pq_public_key=${pq_pub_b}
 EOF
 
     cat > "$cfg_b" <<EOF
@@ -811,6 +826,7 @@ rendezvous=tls://${ip_r_b}:${rdv_tcp_port}
 obf_psk=${obf_psk}
 [peer]
 public_key=${pub_a}
+pq_public_key=${pq_pub_a}
 EOF
 
     ip netns add "$ns_a"
