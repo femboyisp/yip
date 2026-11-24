@@ -29,6 +29,7 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             musl_cross_url: https://github.com/xmake-mirror/musl.cc/releases/download/20210202/x86_64-linux-musl-cross.linux.tgz
+            musl_cross_sha256: 37ef7b69d4c4a20bb2c5e7e01ec7c60c1ac7de2c33b029eaa6c0d8b9e1869c6b
             musl_cross_dir: x86_64-linux-musl-cross
             linker: x86_64-linux-musl-gcc
             cc: x86_64-linux-musl-gcc
@@ -36,6 +37,7 @@ jobs:
             ar: x86_64-linux-musl-ar
           - target: aarch64-unknown-linux-musl
             musl_cross_url: https://github.com/xmake-mirror/musl.cc/releases/download/20210202/aarch64-linux-musl-cross.linux.tgz
+            musl_cross_sha256: 7e237ecd528d31cb3eadc48a95f4779467f588a89444c43276c77cdfe93787de
             musl_cross_dir: aarch64-linux-musl-cross
             linker: aarch64-linux-musl-gcc
             cc: aarch64-linux-musl-gcc
@@ -59,7 +61,11 @@ jobs:
       - name: Set up musl cross-compilation toolchain
         run: |
           echo "Fetching ${{ matrix.target }} musl toolchain..."
-          curl -fsSL --retry 3 --retry-connrefused "${{ matrix.musl_cross_url }}" | sudo tar -xz -C /opt
+          TMP_TGZ="$(mktemp --suffix=.tgz)"
+          curl -fsSL --retry 3 --retry-connrefused "${{ matrix.musl_cross_url }}" -o "$TMP_TGZ"
+          echo "${{ matrix.musl_cross_sha256 }}  $TMP_TGZ" | sha256sum -c -
+          sudo tar -xz -f "$TMP_TGZ" -C /opt
+          rm -f "$TMP_TGZ"
           echo "/opt/${{ matrix.musl_cross_dir }}/bin" >> $GITHUB_PATH
           UPPER_TARGET="$(echo "${{ matrix.target }}" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
           echo "CARGO_TARGET_${UPPER_TARGET}_LINKER=/opt/${{ matrix.musl_cross_dir }}/bin/${{ matrix.linker }}" >> $GITHUB_ENV
