@@ -1657,7 +1657,7 @@ impl PeerManager {
         let endpoint = self.peers[idx].endpoint;
         if let PeerSessionState::Established(ref mut epochs) = self.peers[idx].state {
             if self.num_shards > 1 {
-                epochs
+                let _ = epochs
                     .current_mut()
                     .session_mut()
                     .set_stride(self.shard_id as u64, self.num_shards as u64);

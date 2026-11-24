@@ -1318,23 +1318,54 @@ mod tests {
         assert_eq!(a.send_counter(), 0);
         assert_ne!(a.send_counter(), 1);
 
-        a.set_stride(5, 4);
+        a.set_stride(5, 4).unwrap();
         assert_eq!(a.stride(), 4);
         assert_eq!(a.send_counter(), 5);
 
-        a.set_stride(10, 0);
+        a.set_stride(10, 0).unwrap();
         assert_eq!(a.stride(), 1);
         assert_eq!(a.send_counter(), 5);
 
-        a.set_stride(3, 4);
+        a.set_stride(3, 4).unwrap();
         assert_eq!(a.stride(), 4);
         assert_eq!(a.send_counter(), 7);
         assert_eq!(a.send_counter() % 4, 3);
 
-        a.set_stride(1, 8);
+        a.set_stride(1, 8).unwrap();
         assert_eq!(a.stride(), 8);
         assert_eq!(a.send_counter(), 9);
         assert_eq!(a.send_counter() % 8, 1);
+    }
+
+    #[test]
+    fn test_session_set_stride_rejected_after_traffic() {
+        let (mut a, mut b) = crate::test_session_pair();
+        assert!(!a.started());
+        assert!(!b.started());
+
+        // Stride configuration succeeds before any traffic
+        assert!(a.set_stride(0, 2).is_ok());
+        assert!(b.set_stride(0, 2).is_ok());
+
+        // Seal a frame from a
+        let sealed = a.seal(b"hello world").expect("seals frame");
+        assert!(a.started());
+
+        // Reconfiguring stride on a after sealing must fail (GHSA-c9px-46f5-763p)
+        assert!(matches!(a.set_stride(1, 4), Err(CryptoError::Replay)));
+
+        // b has not received yet, stride configuration still succeeds
+        assert!(!b.started());
+
+        // b opens the frame
+        let plain = b
+            .open(sealed.counter, &sealed.ciphertext)
+            .expect("opens frame");
+        assert_eq!(plain, b"hello world");
+        assert!(b.started());
+
+        // Reconfiguring stride on b after opening must fail (GHSA-c9px-46f5-763p)
+        assert!(matches!(b.set_stride(1, 4), Err(CryptoError::Replay)));
     }
 
     #[test]
