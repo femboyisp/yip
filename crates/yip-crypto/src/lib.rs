@@ -1836,4 +1836,65 @@ mod tests {
         );
         assert!(matches!(res, Err(CryptoError::Handshake)));
     }
+
+    #[test]
+    fn test_session_reserve_counters_advances_and_prevents_mutation() {
+        let (k_send, k_recv) = ([0x33u8; 32], [0x44u8; 32]);
+        let mut session = Session::from_raw_keys(&k_send, &k_recv, 10, 2).unwrap();
+        assert_eq!(session.send_counter(), 10);
+        assert!(!session.started());
+
+        // First reservation of 5 counters with stride 2:
+        // Expected start: 10, advances by 5 * 2 = 10, new send_counter: 20
+        let start1 = session.reserve_counters(5).unwrap();
+        assert_eq!(start1, 10);
+        assert_ne!(start1, 0);
+        assert_ne!(start1, 1);
+        assert_eq!(session.send_counter(), 20);
+        assert!(session.started());
+
+        // Second reservation of 3 counters:
+        // Expected start: 20, advances by 3 * 2 = 6, new send_counter: 26
+        let start2 = session.reserve_counters(3).unwrap();
+        assert_eq!(start2, 20);
+        assert_ne!(start2, 0);
+        assert_ne!(start2, 1);
+        assert_eq!(session.send_counter(), 26);
+
+        // Counter overflow test
+        let mut overflow_session =
+            Session::from_raw_keys(&k_send, &k_recv, u64::MAX - 2, 2).unwrap();
+        assert!(matches!(
+            overflow_session.reserve_counters(2),
+            Err(CryptoError::Decrypt)
+        ));
+    }
+
+    #[test]
+    fn test_session_commit_replay_updates_window_and_rejects_replays() {
+        let (k_send, k_recv) = ([0x55u8; 32], [0x66u8; 32]);
+        let mut session = Session::from_raw_keys(&k_send, &k_recv, 0, 1).unwrap();
+
+        // Check before commit: should be accepted
+        assert!(session.check_replay(42));
+        assert!(session.check_replay(100));
+
+        // Commit 42 into the window
+        session.commit_replay(42);
+
+        // Immediately after commit: 42 MUST be rejected as replay
+        assert!(
+            !session.check_replay(42),
+            "counter 42 must be rejected after commit_replay"
+        );
+        assert_eq!(session.replay_latest(), 42);
+
+        // Commit 100 into the window
+        session.commit_replay(100);
+        assert!(
+            !session.check_replay(100),
+            "counter 100 must be rejected after commit_replay"
+        );
+        assert_eq!(session.replay_latest(), 100);
+    }
 }
