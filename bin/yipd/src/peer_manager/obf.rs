@@ -65,6 +65,7 @@ impl PeerManager {
                         }
                         if ptype == PacketType::Data as u8
                             || ptype == PacketType::Control as u8
+                            || ptype == PacketType::EncryptedControl as u8
                             || ptype == PacketType::Gossip as u8
                         {
                             if let Some(engine) = &mut self.peers[idx].daita_engine {
@@ -105,6 +106,7 @@ impl PeerManager {
                         }
                         if ptype == PacketType::Data as u8
                             || ptype == PacketType::Control as u8
+                            || ptype == PacketType::EncryptedControl as u8
                             || ptype == PacketType::Gossip as u8
                         {
                             if let Some(engine) = &mut self.peers[idx].daita_engine {

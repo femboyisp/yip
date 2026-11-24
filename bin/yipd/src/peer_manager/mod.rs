@@ -2605,6 +2605,8 @@ impl PeerManager {
                 }
                 _ => DispatchOut::None,
             }
+        } else if dg[0] == PacketType::EncryptedControl as u8 {
+            self.on_encrypted_control(src, dg, now_ms)
         } else if self.membership.is_some() && dg[0] == PacketType::Gossip as u8 {
             // Membership anti-entropy: a self-verifying gossip datagram. Only
             // reached with membership configured — a pure-2a/2b deployment never

@@ -23,6 +23,92 @@ pub(super) fn seal_gossip_reply<S: ControlSession + ?Sized>(
 impl PeerManager {
     // ── membership gossip ─────────────────────────────────────────────────
 
+    /// Process an authenticated inbound encrypted control frame (#207) for peer `peer_idx`.
+    ///
+    /// Verifies that the peer is in `Established` state, opens and authenticates the frame
+    /// against `ctrl_codec` and anti-replay sliding window `ctrl_replay`, validates that the
+    /// inner payload type is `INNER_TYPE_GOSSIP`, decodes `GossipMsg`, passes it to
+    /// `Membership::on_gossip`, and emits replies sealed as `PacketType::EncryptedControl`
+    /// uniformly padded to `OBF_MTU_BUDGET`.
+    pub(super) fn process_encrypted_control(
+        &mut self,
+        peer_idx: usize,
+        dg: &[u8],
+    ) -> DispatchOut<'_> {
+        let (inner_type, payload) = {
+            let Some(est) = self.peers[peer_idx].state.as_established_mut() else {
+                return DispatchOut::None;
+            };
+            match est.ctrl_codec.open(&mut est.ctrl_replay, dg) {
+                Ok(res) => res,
+                Err(_) => return DispatchOut::None,
+            }
+        };
+
+        if inner_type != crate::control_codec::INNER_TYPE_GOSSIP {
+            return DispatchOut::None;
+        }
+
+        let Some(msg) = GossipMsg::decode(&payload) else {
+            return DispatchOut::None;
+        };
+
+        let replies = match self.membership.as_mut() {
+            Some(m) => m.on_gossip(msg, now_secs()),
+            None => return DispatchOut::None,
+        };
+        if replies.is_empty() {
+            return DispatchOut::None;
+        }
+
+        let relay = self.peers[peer_idx].relay;
+        let peer_ep = self.peers[peer_idx].endpoint;
+        self.egress.clear();
+        let target_bucket = OBF_MTU_BUDGET;
+        for reply in replies.iter().take(MAX_GOSSIP_REPLIES) {
+            let bytes = {
+                let Some(est) = self.peers[peer_idx].state.as_established_mut() else {
+                    break;
+                };
+                seal_gossip_reply(est, reply, target_bucket)
+            };
+            if relay {
+                if let Some(d) = self.relay_wrap(peer_idx, bytes) {
+                    self.egress.push(d);
+                }
+            } else if let Some(dst) = peer_ep {
+                self.egress.push(EgressDatagram {
+                    fate: 0,
+                    dst,
+                    bytes,
+                });
+            }
+        }
+
+        if self.egress.is_empty() {
+            DispatchOut::None
+        } else {
+            DispatchOut::Udp(&self.egress)
+        }
+    }
+
+    /// Handle an inbound `[EncryptedControl]` datagram from `src`: source-restricted to
+    /// `Established` peers ONLY.
+    pub(super) fn on_encrypted_control(
+        &mut self,
+        src: SocketAddr,
+        dg: &[u8],
+        _now_ms: u64,
+    ) -> DispatchOut<'_> {
+        let Some(peer_idx) = self.peers.iter().position(|p| {
+            p.endpoint == Some(src) && matches!(p.state, PeerSessionState::Established(_))
+        }) else {
+            return DispatchOut::None;
+        };
+
+        self.process_encrypted_control(peer_idx, dg)
+    }
+
     /// Handle an inbound `[Gossip]` datagram from `src`: decode the
     /// [`GossipMsg`], feed it to `Membership::on_gossip` (which verifies every
     /// record's CA→cert→record-sig chain, so a forged/injected record is
@@ -188,9 +274,11 @@ impl PeerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_codec::{derive_control_keys, ControlCodec, INNER_TYPE_GOSSIP};
     use crate::peer_manager::testutil::*;
+    use crate::wire_glue::derive_wire_keys;
     use ed25519_dalek::SigningKey;
-    use yip_crypto::generate_keypair;
+    use yip_crypto::{generate_keypair, Handshake, ReplayWindow};
 
     /// (e) A `PacketType::Gossip` datagram with a valid record ingests into the
     /// directory (a subsequent `resolve` finds it); a forged record (untrusted
@@ -344,10 +432,6 @@ mod tests {
     /// datagrams uniformly padded to `OBF_MTU_BUDGET` (1420 bytes) (#207).
     #[test]
     fn test_gossip_emits_encrypted() {
-        use crate::control_codec::{derive_control_keys, ControlCodec, INNER_TYPE_GOSSIP};
-        use crate::wire_glue::derive_wire_keys;
-        use yip_crypto::{Handshake, ReplayWindow};
-
         let ca = test_ca();
         let local = generate_keypair();
         let peer = generate_keypair();
@@ -468,5 +552,128 @@ mod tests {
             let decoded = GossipMsg::decode(&payload).expect("payload decodes to GossipMsg");
             assert!(matches!(decoded, GossipMsg::Records(_)));
         }
+    }
+
+    #[test]
+    fn test_encrypted_control_ingress() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let peer = generate_keypair();
+        let peer_ep: SocketAddr = "10.0.0.5:51820".parse().unwrap();
+        let cfg = PeerConfig {
+            public_key: peer.public,
+            endpoint: Some(peer_ep),
+            alias: None,
+            kem: None,
+            pq_public_key: None,
+        };
+        let mut pm = PeerManager::new(
+            local.private,
+            local.public,
+            &[cfg],
+            TunnelMode::L3Tun,
+            None,
+            Some(membership_for(&ca, local.public)),
+            false,
+        );
+
+        // Derive mutual control keys
+        let mut ini = Handshake::initiator(&local.private, &peer.public).unwrap();
+        let mut res = Handshake::responder(&peer.private).unwrap();
+        let init_msg = ini.write_message(&[]).unwrap();
+        res.read_message(&init_msg).unwrap();
+        let resp_msg = res.write_message(&[]).unwrap();
+        ini.read_message(&resp_msg).unwrap();
+        let cb = ini.channel_binding();
+        let (auth_key, hp_key) = derive_wire_keys(&cb);
+        let (ini_send_k, ini_recv_k) = ini.raw_split_keys();
+        let (init_ctrl, resp_ctrl) = derive_control_keys(&auth_key);
+
+        let local_est = Established {
+            session: ini.into_session().unwrap(),
+            auth_key,
+            hp_key,
+            raw_send_key: ini_send_k,
+            raw_recv_key: ini_recv_k,
+            ctrl_codec: ControlCodec::new(init_ctrl, resp_ctrl),
+            ctrl_send_nonce: 0,
+            ctrl_replay: ReplayWindow::new(),
+        };
+        let peer_codec = ControlCodec::new(resp_ctrl, init_ctrl);
+        let mut peer_replay = ReplayWindow::new();
+
+        const TAG: u64 = 0x2468_ace0_1357_9bdf;
+        let dp = DataPlane::new(local_est, TAG, TunnelMode::L3Tun, peer_ep, false, 1200);
+        pm.peers[0].state =
+            PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+        pm.by_tag.insert(TAG, 0);
+
+        // Populate a record for another member in pm so PullRequest returns a record reply
+        let other = generate_keypair();
+        let other_ep: SocketAddr = "192.0.2.88:6000".parse().unwrap();
+        let other_rec = mk_record(&ca, 201, other.public, vec![other_ep], 1);
+        assert!(pm
+            .membership
+            .as_mut()
+            .unwrap()
+            .ingest_record(other_rec.clone(), now_secs()));
+
+        // 1. Peer sends sealed PullRequest
+        let pull = GossipMsg::PullRequest(vec![yip_membership::node_id(&other.public)]);
+        let mut pull_raw = Vec::new();
+        pull.encode(&mut pull_raw);
+
+        let sealed_dg = peer_codec.seal(0, INNER_TYPE_GOSSIP, &pull_raw, OBF_MTU_BUDGET);
+        assert_eq!(sealed_dg[0], PacketType::EncryptedControl as u8);
+
+        let out = pm.on_udp(peer_ep, &sealed_dg, 0);
+        let reply_dgs = match out {
+            DispatchOut::Udp(e) => e,
+            _ => panic!("expected DispatchOut::Udp from on_encrypted_control"),
+        };
+        assert!(!reply_dgs.is_empty(), "must emit replies");
+        for dg in reply_dgs {
+            assert_eq!(dg.bytes[0], PacketType::EncryptedControl as u8);
+            assert_eq!(dg.bytes.len(), OBF_MTU_BUDGET);
+            let (inner_type, payload) = peer_codec
+                .open(&mut peer_replay, &dg.bytes)
+                .expect("peer must open reply");
+            assert_eq!(inner_type, INNER_TYPE_GOSSIP);
+            let decoded = GossipMsg::decode(&payload).expect("payload decodes to GossipMsg");
+            assert!(matches!(decoded, GossipMsg::Records(_)));
+        }
+
+        // 2. Replay rejection: ingesting identical datagram again must be dropped
+        let replay_out = pm.on_udp(peer_ep, &sealed_dg, 0);
+        assert!(
+            matches!(replay_out, DispatchOut::None),
+            "replayed control datagram must be dropped"
+        );
+
+        // 3. Tamper rejection: modified ciphertext must be dropped
+        let mut tampered = peer_codec.seal(1, INNER_TYPE_GOSSIP, &pull_raw, OBF_MTU_BUDGET);
+        tampered[20] ^= 0x01;
+        let tamper_out = pm.on_udp(peer_ep, &tampered, 0);
+        assert!(
+            matches!(tamper_out, DispatchOut::None),
+            "tampered control datagram must be dropped"
+        );
+
+        // 4. Source isolation: sealed datagram from unknown/spoofed address must be dropped
+        let spoofed_ep: SocketAddr = "198.51.100.99:51820".parse().unwrap();
+        let fresh_dg = peer_codec.seal(2, INNER_TYPE_GOSSIP, &pull_raw, OBF_MTU_BUDGET);
+        let spoof_out = pm.on_udp(spoofed_ep, &fresh_dg, 0);
+        assert!(
+            matches!(spoof_out, DispatchOut::None),
+            "control datagram from non-established source must be dropped"
+        );
+
+        // 5. Inner type validation: sealed datagram with non-gossip inner type must be dropped
+        let invalid_inner_dg = peer_codec.seal(3, 0x99, &pull_raw, OBF_MTU_BUDGET);
+        let invalid_out = pm.on_udp(peer_ep, &invalid_inner_dg, 0);
+        assert!(
+            matches!(invalid_out, DispatchOut::None),
+            "control datagram with invalid inner type must be dropped"
+        );
     }
 }
