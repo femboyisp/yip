@@ -2525,7 +2525,10 @@ impl PeerManager {
         } else if dg[0] == PacketType::HandshakeResp as u8 {
             self.handle_handshake_resp(src, dg, now_ms)
         } else if dg[0] == PacketType::HandshakeFrag as u8 {
-            match self.handshake_reassembler.process_datagram(dg) {
+            match self
+                .handshake_reassembler
+                .process_datagram_from(Some(src), dg)
+            {
                 Ok(Some(assembled)) => {
                     if assembled.is_empty() {
                         DispatchOut::None

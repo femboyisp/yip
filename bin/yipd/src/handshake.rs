@@ -391,9 +391,20 @@ pub fn tai64n_sub_duration(
     out
 }
 
+/// Maximum length of an initiator's cert payload (280 bytes).
+/// Keeps Flight 1 length well within the 320-byte gap between ML-KEM-512 (base 864 B)
+/// and ML-KEM-768 (base 1184 B), ensuring length-based KEM algorithm deduction remains unambiguous.
+pub const MAX_INIT_CERT_LEN: usize = 280;
+
 /// Build the msg1 Noise payload: the anti-replay TAI64N label followed by the
 /// (optional) membership cert. Empty `cert` (2a/2b) yields a 12-byte payload.
 pub fn frame_init_payload(cert: &[u8]) -> Vec<u8> {
+    assert!(
+        cert.len() <= MAX_INIT_CERT_LEN,
+        "initiator cert payload exceeds MAX_INIT_CERT_LEN ({} > {})",
+        cert.len(),
+        MAX_INIT_CERT_LEN
+    );
     let mut out = Vec::with_capacity(TAI64N_LEN + cert.len());
     out.extend_from_slice(&now_tai64n());
     out.extend_from_slice(cert);
@@ -475,6 +486,13 @@ impl HandshakeState {
             return Err(io::Error::other("expected HandshakeInit packet"));
         }
         let msg_len = init_pkt.len() - 1;
+        // Flight 1 base lengths (without application payload or MAC):
+        // - ML-KEM-512:  1 (type) + 32 (e) + 48 (s) +  768 (ct) + 16 (tag) = 865 B  (msg_len = 864)
+        // - ML-KEM-768:  1 (type) + 32 (e) + 48 (s) + 1088 (ct) + 16 (tag) = 1185 B (msg_len = 1184)
+        // - ML-KEM-1024: 1 (type) + 32 (e) + 48 (s) + 1568 (ct) + 16 (tag) = 1665 B (msg_len = 1664)
+        // With MAX_INIT_CERT_LEN = 280 B and TAI64N_LEN = 12 B, max payload is 292 B, strictly less
+        // than the 320 B delta between ML-KEM-512 and ML-KEM-768, and the 480 B delta between
+        // ML-KEM-768 and ML-KEM-1024.
         let kem = if msg_len >= 1664 {
             yip_crypto::PqKemAlgorithm::MlKem1024
         } else if msg_len >= 1184 {
@@ -754,6 +772,13 @@ mod tests {
             later > earlier,
             "TAI64N must increase with wall-clock and byte-compare"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "initiator cert payload exceeds MAX_INIT_CERT_LEN")]
+    fn frame_init_payload_enforces_max_cert_len() {
+        let oversized = vec![0x42; MAX_INIT_CERT_LEN + 1];
+        let _ = frame_init_payload(&oversized);
     }
 
     #[test]

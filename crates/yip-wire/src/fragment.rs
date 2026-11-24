@@ -4,6 +4,7 @@
 //! exceed standard Ethernet MTU (1500 bytes) or constrained path MTUs.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use crate::WireError;
@@ -133,7 +134,11 @@ pub fn chunk_handshake_datagram(
     };
 
     let max_chunk_payload = max_packet_len.saturating_sub(FRAGMENT_HEADER_LEN).max(64);
-    let total_frags = payload.len().div_ceil(max_chunk_payload) as u8;
+    let frags_needed = payload.len().div_ceil(max_chunk_payload);
+    if frags_needed > 64 {
+        return vec![full_datagram.to_vec()];
+    }
+    let total_frags = frags_needed as u8;
 
     let mut frags = Vec::with_capacity(total_frags as usize);
     for (i, chunk) in payload.chunks(max_chunk_payload).enumerate() {
@@ -159,7 +164,7 @@ pub const MAX_REASSEMBLY_SESSIONS: usize = 256;
 /// Manages in-progress reassembly of fragmented handshake messages.
 #[derive(Debug, Clone)]
 pub struct HandshakeReassembler {
-    sessions: HashMap<u32, InProgressReassembly>,
+    sessions: HashMap<(Option<SocketAddr>, u32), InProgressReassembly>,
     ttl: Duration,
 }
 
@@ -197,7 +202,7 @@ impl HandshakeReassembler {
         }
     }
 
-    /// Process a received datagram.
+    /// Process a received datagram without source address binding.
     ///
     /// - If it is a fragment (first byte is [`PACKET_TYPE_HANDSHAKE_FRAG`]):
     ///   Decodes the fragment and records it. When all fragments for the message arrive,
@@ -205,6 +210,18 @@ impl HandshakeReassembler {
     ///   Otherwise returns `Ok(None)` while waiting for remaining fragments.
     /// - If it is not a fragment: returns `Ok(Some(datagram.to_vec()))` immediately.
     pub fn process_datagram(&mut self, datagram: &[u8]) -> Result<Option<Vec<u8>>, WireError> {
+        self.process_datagram_from(None, datagram)
+    }
+
+    /// Process a received datagram associated with an optional remote source address.
+    ///
+    /// Keying reassembly sessions by `(src, message_id)` prevents cross-peer ID collisions
+    /// and ensures unauthenticated third parties cannot hijack or corrupt in-flight handshakes.
+    pub fn process_datagram_from(
+        &mut self,
+        src: Option<SocketAddr>,
+        datagram: &[u8],
+    ) -> Result<Option<Vec<u8>>, WireError> {
         if datagram.is_empty() {
             return Err(WireError::Malformed);
         }
@@ -213,11 +230,20 @@ impl HandshakeReassembler {
         }
 
         let frag = HandshakeFragment::decode(datagram)?;
-        self.add_fragment(&frag)
+        self.add_fragment_from(src, &frag)
     }
 
-    /// Ingest a decoded [`HandshakeFragment`].
+    /// Ingest a decoded [`HandshakeFragment`] without source address binding.
     pub fn add_fragment(&mut self, frag: &HandshakeFragment) -> Result<Option<Vec<u8>>, WireError> {
+        self.add_fragment_from(None, frag)
+    }
+
+    /// Ingest a decoded [`HandshakeFragment`] associated with an optional remote source address.
+    pub fn add_fragment_from(
+        &mut self,
+        src: Option<SocketAddr>,
+        frag: &HandshakeFragment,
+    ) -> Result<Option<Vec<u8>>, WireError> {
         let now = Instant::now();
         self.sessions
             .retain(|_, s| now.duration_since(s.updated_at) < self.ttl);
@@ -226,17 +252,16 @@ impl HandshakeReassembler {
             return Err(WireError::Malformed);
         }
 
-        if !self.sessions.contains_key(&frag.message_id)
-            && self.sessions.len() >= MAX_REASSEMBLY_SESSIONS
-        {
-            if let Some((&oldest_id, _)) = self.sessions.iter().min_by_key(|(_, s)| s.updated_at) {
-                self.sessions.remove(&oldest_id);
+        let key = (src, frag.message_id);
+        if !self.sessions.contains_key(&key) && self.sessions.len() >= MAX_REASSEMBLY_SESSIONS {
+            if let Some((&oldest_key, _)) = self.sessions.iter().min_by_key(|(_, s)| s.updated_at) {
+                self.sessions.remove(&oldest_key);
             }
         }
 
         let entry = self
             .sessions
-            .entry(frag.message_id)
+            .entry(key)
             .or_insert_with(|| InProgressReassembly {
                 target_packet_type: frag.target_packet_type,
                 total_len: frag.total_len,
@@ -268,7 +293,7 @@ impl HandshakeReassembler {
         }
 
         if entry.received_count == entry.total_frags {
-            let completed = self.sessions.remove(&frag.message_id).unwrap();
+            let completed = self.sessions.remove(&key).unwrap();
             let mut out = Vec::with_capacity(1 + completed.buffer.len());
             out.push(completed.target_packet_type);
             out.extend_from_slice(&completed.buffer);
@@ -590,8 +615,8 @@ mod tests {
         assert_eq!(reassembler.process_datagram(&enc2).unwrap(), None);
         // Session 999 was pruned, only 1000 remains
         assert_eq!(reassembler.sessions.len(), 1);
-        assert!(reassembler.sessions.contains_key(&1000));
-        assert!(!reassembler.sessions.contains_key(&999));
+        assert!(reassembler.sessions.contains_key(&(None, 1000)));
+        assert!(!reassembler.sessions.contains_key(&(None, 999)));
     }
 
     #[test]
@@ -608,13 +633,13 @@ mod tests {
             payload: vec![0xEE; 10],
         };
         assert_eq!(reassembler.add_fragment(&frag63).unwrap(), None);
-        let entry = reassembler.sessions.get(&777).unwrap();
+        let entry = reassembler.sessions.get(&(None, 777)).unwrap();
         assert_eq!(entry.received_mask, 1u64 << 63);
         assert_eq!(entry.received_count, 1);
 
         // Duplicate frag 63 does nothing
         assert_eq!(reassembler.add_fragment(&frag63).unwrap(), None);
-        let entry2 = reassembler.sessions.get(&777).unwrap();
+        let entry2 = reassembler.sessions.get(&(None, 777)).unwrap();
         assert_eq!(entry2.received_mask, 1u64 << 63);
         assert_eq!(entry2.received_count, 1);
 
@@ -694,5 +719,95 @@ mod tests {
         assert!(completed.is_some());
         // Message 0 removed on completion, remaining is MAX_REASSEMBLY_SESSIONS - 1
         assert_eq!(reassembler.sessions.len(), MAX_REASSEMBLY_SESSIONS - 1);
+    }
+
+    #[test]
+    fn test_reassembler_different_sources_do_not_collide() {
+        use std::net::SocketAddr;
+        let mut reassembler = HandshakeReassembler::new();
+        let src1: SocketAddr = "192.0.2.1:51820".parse().unwrap();
+        let src2: SocketAddr = "192.0.2.2:51820".parse().unwrap();
+
+        let frag1_peer1 = HandshakeFragment {
+            target_packet_type: 0,
+            message_id: 42,
+            frag_index: 0,
+            total_frags: 2,
+            total_len: 200,
+            offset: 0,
+            payload: vec![0xaa; 100],
+        };
+        let frag1_peer2 = HandshakeFragment {
+            target_packet_type: 1,
+            message_id: 42,
+            frag_index: 0,
+            total_frags: 2,
+            total_len: 200,
+            offset: 0,
+            payload: vec![0xbb; 100],
+        };
+
+        // Ingest first fragments for each peer under same message_id
+        assert_eq!(
+            reassembler
+                .add_fragment_from(Some(src1), &frag1_peer1)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            reassembler
+                .add_fragment_from(Some(src2), &frag1_peer2)
+                .unwrap(),
+            None
+        );
+        assert_eq!(reassembler.sessions.len(), 2);
+
+        // Ingest second fragment for peer 1
+        let frag2_peer1 = HandshakeFragment {
+            target_packet_type: 0,
+            message_id: 42,
+            frag_index: 1,
+            total_frags: 2,
+            total_len: 200,
+            offset: 100,
+            payload: vec![0xcc; 100],
+        };
+        let res1 = reassembler
+            .add_fragment_from(Some(src1), &frag2_peer1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(res1[0], 0);
+        assert_eq!(&res1[1..101], &vec![0xaa; 100][..]);
+        assert_eq!(&res1[101..], &vec![0xcc; 100][..]);
+        // Peer 2 session still in progress
+        assert_eq!(reassembler.sessions.len(), 1);
+
+        // Ingest second fragment for peer 2
+        let frag2_peer2 = HandshakeFragment {
+            target_packet_type: 1,
+            message_id: 42,
+            frag_index: 1,
+            total_frags: 2,
+            total_len: 200,
+            offset: 100,
+            payload: vec![0xdd; 100],
+        };
+        let res2 = reassembler
+            .add_fragment_from(Some(src2), &frag2_peer2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(res2[0], 1);
+        assert_eq!(&res2[1..101], &vec![0xbb; 100][..]);
+        assert_eq!(&res2[101..], &vec![0xdd; 100][..]);
+        assert_eq!(reassembler.sessions.len(), 0);
+    }
+
+    #[test]
+    fn test_chunk_handshake_datagram_oversized_fallback() {
+        // If chunking would exceed 64 fragments, fallback to unfragmented datagram.
+        let large_payload = vec![0x42; 65 * 64 + 1];
+        let frags = chunk_handshake_datagram(&large_payload, 76, 123);
+        assert_eq!(frags.len(), 1);
+        assert_eq!(frags[0], large_payload);
     }
 }
