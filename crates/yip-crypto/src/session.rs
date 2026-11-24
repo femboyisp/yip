@@ -541,6 +541,18 @@ impl Session {
         self.send_counter
     }
 
+    /// Reserve a contiguous block of `count` send counters, returning the starting counter.
+    pub fn reserve_counters(&mut self, count: u64) -> Result<u64, CryptoError> {
+        self.sealed_any = true;
+        let start = self.send_counter;
+        let advance = count.checked_mul(self.stride).ok_or(CryptoError::Decrypt)?;
+        self.send_counter = self
+            .send_counter
+            .checked_add(advance)
+            .ok_or(CryptoError::Decrypt)?;
+        Ok(start)
+    }
+
     /// Seal one inner frame, assigning it the next send counter.
     pub fn seal(&mut self, plaintext: &[u8]) -> Result<Sealed, CryptoError> {
         self.sealed_any = true;
@@ -587,6 +599,13 @@ impl Session {
     #[inline]
     pub fn check_replay(&self, counter: u64) -> bool {
         self.replay_window_for(counter).check(counter)
+    }
+
+    /// Commit `counter` into the anti-replay window.
+    #[inline]
+    pub fn commit_replay(&mut self, counter: u64) {
+        let idx = self.replay_idx(counter);
+        self.replays[idx].commit(counter);
     }
 
     /// Returns the greatest counter seen by the anti-replay window.

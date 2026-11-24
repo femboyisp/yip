@@ -229,6 +229,7 @@ pub fn run(config: Config) -> io::Result<()> {
     if let Some(fec) = config.fec {
         manager.set_fec_config(fec);
     }
+    manager.set_crypto_workers(config.crypto_workers);
     let control_handle = if let Some(ref path) = config.control_socket {
         Some(crate::control::ControlHandle::bind(path)?)
     } else {

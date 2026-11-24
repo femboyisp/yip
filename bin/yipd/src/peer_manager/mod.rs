@@ -538,6 +538,8 @@ pub struct PeerManager {
     shard_id: usize,
     /// Number of worker shards for multi-core scaling.
     num_shards: usize,
+    /// Number of dedicated parallel crypto worker threads.
+    pub crypto_workers: usize,
     /// Newly established session epochs queued for cross-shard broadcast.
     new_epochs: Vec<crate::sharding::SessionEpochMsg>,
     /// Peer removals queued for cross-shard broadcast.
@@ -743,6 +745,7 @@ impl PeerManager {
             ),
             shard_id: 0,
             num_shards: 1,
+            crypto_workers: 0,
             new_epochs: Vec::new(),
             peer_removals: Vec::new(),
             config_reloads: Vec::new(),
@@ -1685,6 +1688,19 @@ impl PeerManager {
         self.shard_id = shard_id;
     }
 
+    /// Configure dedicated parallel worker pool threads for AEAD cryptographic operations.
+    pub fn set_crypto_workers(&mut self, workers: usize) {
+        self.crypto_workers = workers;
+        for peer in &mut self.peers {
+            if let PeerSessionState::Established(ref mut epochs) = peer.state {
+                epochs.current_mut().set_crypto_workers(workers);
+                if let Some(prev) = epochs.previous_mut() {
+                    prev.set_crypto_workers(workers);
+                }
+            }
+        }
+    }
+
     /// Get total worker shards count.
     #[expect(dead_code, reason = "helper for inspecting configured shard count")]
     pub fn num_shards(&self) -> usize {
@@ -1813,6 +1829,9 @@ impl PeerManager {
         ));
         if self.num_shards > 1 {
             dp.set_shard(self.shard_id, self.num_shards);
+        }
+        if self.crypto_workers > 0 {
+            dp.set_crypto_workers(self.crypto_workers);
         }
 
         self.by_tag.insert(conn_tag, idx);

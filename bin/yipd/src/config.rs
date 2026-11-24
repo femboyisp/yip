@@ -243,6 +243,9 @@ pub struct Config {
     /// Number of worker shards for multi-core throughput scaling (`shards=N` or `threads=N`).
     /// Defaults to 1 (single-threaded).
     pub shards: usize,
+    /// Dedicated parallel worker crypto threads (`crypto_workers=N|auto` or `--crypto-workers <N|auto>`).
+    /// Defaults to 0 (inline crypto).
+    pub crypto_workers: usize,
     /// Optional path to UNIX domain control socket (`control_socket=<path>` or `--control <path>`).
     pub control_socket: Option<std::path::PathBuf>,
     /// Configured TUN device MTU (`mtu=<576..=65535>`).
@@ -700,6 +703,7 @@ impl Config {
         let mut transport = TransportMode::default();
         let mut tls_sni: Option<String> = None;
         let mut shards: Option<usize> = None;
+        let mut crypto_workers: Option<usize> = None;
         let mut control_socket: Option<std::path::PathBuf> = None;
         let mut mtu: Option<u32> = None;
         let mut metrics_listen: Option<SocketAddr> = None;
@@ -961,6 +965,28 @@ impl Config {
                         parsed
                     };
                     shards = Some(n);
+                }
+                "crypto_workers" | "crypto_threads" => {
+                    let n = if val.eq_ignore_ascii_case("auto") {
+                        std::thread::available_parallelism()
+                            .map(|p| {
+                                let count = p.get();
+                                if count > 2 {
+                                    (count / 2).min(4)
+                                } else {
+                                    0
+                                }
+                            })
+                            .unwrap_or(0)
+                    } else {
+                        val.parse::<usize>().map_err(|e| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("invalid crypto_workers count: {e}"),
+                            )
+                        })?
+                    };
+                    crypto_workers = Some(n);
                 }
                 "control_socket" | "control" => {
                     control_socket = Some(std::path::PathBuf::from(val));
@@ -1327,6 +1353,7 @@ impl Config {
             transport,
             tls_sni: tls_sni.unwrap_or_else(|| DEFAULT_TLS_SNI.to_owned()),
             shards: shards.unwrap_or(1),
+            crypto_workers: crypto_workers.unwrap_or(0),
             control_socket,
             mtu,
             metrics_listen,

@@ -544,6 +544,15 @@ impl PeerManager {
         if self.num_shards > 1 {
             dp.set_shard(self.shard_id, self.num_shards);
         }
+        if self.crypto_workers > 0 {
+            dp.set_crypto_workers(self.crypto_workers);
+        }
+        if self.num_shards > 1 {
+            dp.set_shard(self.shard_id, self.num_shards);
+        }
+        if self.crypto_workers > 0 {
+            dp.set_crypto_workers(self.crypto_workers);
+        }
         let PeerSessionState::Established(epochs) = &mut self.peers[idx].state else {
             unreachable!("state cannot change between the two borrows above")
         };
@@ -683,6 +692,12 @@ impl PeerManager {
             self.obf_key.is_some(),
             self.data_symbol_size,
         ));
+        if self.num_shards > 1 {
+            dp.set_shard(self.shard_id, self.num_shards);
+        }
+        if self.crypto_workers > 0 {
+            dp.set_crypto_workers(self.crypto_workers);
+        }
 
         // Prime the new epoch (BEFORE `dp` moves into `promote_from_rekey`
         // below), emitting via the helper. Clone the FULL `EgressDatagram`s

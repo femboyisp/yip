@@ -8,11 +8,14 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use yip_crypto::session::ChaCha20Poly1305Cipher;
 use yip_transport::{
     ControlFrame, FlowClass, LossDetector, PlpmtuController, PmtuManager, RetxBuffer, Transport,
 };
 use yip_wire::{Codec, WireCodec as _};
 
+use crate::crypto_pool::inbound::{DecryptTask, InboundCryptoPool};
+use crate::crypto_pool::outbound::{EncryptTask, OutboundCryptoPool};
 use crate::handshake::{Established, PacketType};
 use crate::mac_table::{
     LearnOrigin, MacTable, DEFAULT_MAC_TABLE_CAPACITY, DEFAULT_MAC_TABLE_TTL_MS,
@@ -305,6 +308,71 @@ pub struct DataPlane {
     tun_drained_count: usize,
     tick_tun_drained: Vec<Vec<u8>>,
     tick_tun_drained_count: usize,
+    pub send_cipher: Arc<ChaCha20Poly1305Cipher>,
+    pub recv_cipher: Arc<ChaCha20Poly1305Cipher>,
+    pub outbound_pool: Option<OutboundCryptoPool>,
+    pub inbound_pool: Option<InboundCryptoPool>,
+    pub crypto_workers: usize,
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "disjoint field borrows for zero-allocation framing"
+)]
+fn frame_symbols_into(
+    transport: &mut Transport,
+    sent_log: &mut SentLog,
+    retx: &mut RetxBuffer,
+    retx_buf_pool: &mut Vec<Vec<u8>>,
+    egress_pool: &mut Vec<yip_io::poll::EgressDatagram>,
+    wire_payload_scratch: &mut Vec<u8>,
+    codec: &Codec,
+    conn_tag: u64,
+    l2: bool,
+    peer_addr: SocketAddr,
+    counter: u64,
+    ciphertext: &[u8],
+    effective_inner: &[u8],
+    now_ms: u64,
+    out: &mut Vec<yip_io::poll::EgressDatagram>,
+) {
+    let (class, symbols) = transport.encode_scratch(ciphertext, effective_inner, l2, now_ms);
+    let pkt_wire_len = u16::try_from(ciphertext.len()).unwrap_or(u16::MAX);
+    sent_log.insert(counter, class, pkt_wire_len);
+
+    if class.params().arq {
+        if let Some(oid) = symbols.first().map(|s| s.object_id) {
+            let mut buf = retx_buf_pool
+                .pop()
+                .unwrap_or_else(|| Vec::with_capacity(ciphertext.len()));
+            buf.clear();
+            buf.extend_from_slice(ciphertext);
+            if let Some(mut recycled) = retx.put(counter, buf, class, oid, now_ms) {
+                recycled.clear();
+                if retx_buf_pool.len() < 512 {
+                    retx_buf_pool.push(recycled);
+                }
+            }
+        }
+    }
+
+    for sym in symbols {
+        let mut dg = egress_pool
+            .pop()
+            .unwrap_or_else(|| yip_io::poll::EgressDatagram {
+                fate: sym.object_id,
+                dst: peer_addr,
+                bytes: Vec::with_capacity(1500),
+            });
+        dg.fate = sym.object_id;
+        dg.dst = peer_addr;
+        dg.bytes.clear();
+        dg.bytes.push(PacketType::Data as u8);
+        let frame =
+            wire_glue::symbol_to_frame_into(conn_tag, sym, counter, class, wire_payload_scratch);
+        codec.frame_ref_into(&frame, &mut dg.bytes);
+        out.push(dg);
+    }
 }
 
 impl DataPlane {
@@ -410,6 +478,8 @@ impl DataPlane {
         let hp_key = established.hp_key;
         let raw_send_key = established.raw_send_key;
         let raw_recv_key = established.raw_recv_key;
+        let send_cipher = Arc::new(ChaCha20Poly1305Cipher::new(*established.session.send_key()));
+        let recv_cipher = Arc::new(ChaCha20Poly1305Cipher::new(*established.session.recv_key()));
         let codec = Codec::new(auth_key, hp_key);
         Self {
             counters: Arc::default(),
@@ -464,6 +534,11 @@ impl DataPlane {
                 .map(|_| Vec::with_capacity(2048))
                 .collect(),
             tick_tun_drained_count: 0,
+            send_cipher,
+            recv_cipher,
+            outbound_pool: None,
+            inbound_pool: None,
+            crypto_workers: 0,
         }
     }
 
@@ -529,6 +604,28 @@ impl DataPlane {
         self.detector.set_stride(num_shards as u64);
     }
 
+    /// Configure dedicated parallel worker pool threads for AEAD operations.
+    pub fn set_crypto_workers(&mut self, workers: usize) {
+        self.crypto_workers = workers;
+        if workers > 0 {
+            self.outbound_pool = Some(OutboundCryptoPool::new(
+                workers,
+                self.session.send_counter(),
+            ));
+            self.inbound_pool = Some(InboundCryptoPool::new(
+                workers,
+                self.session.replay_latest(),
+            ));
+        } else {
+            if let Some(pool) = self.outbound_pool.take() {
+                pool.shutdown();
+            }
+            if let Some(pool) = self.inbound_pool.take() {
+                pool.shutdown();
+            }
+        }
+    }
+
     /// Seal `inner`, FEC-encode, frame each symbol, and return the resulting
     /// egress datagrams as a borrow of an internal reused scratch buffer.
     ///
@@ -559,63 +656,78 @@ impl DataPlane {
             inner
         };
 
+        if let Some(ref mut pool) = self.outbound_pool {
+            let counter = match self.session.reserve_counters(1) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let task = EncryptTask {
+                peer_id: 0,
+                counter,
+                dst: self.peer_addr,
+                fate: 0,
+                conn_tag: self.conn_tag,
+                cipher: Arc::clone(&self.send_cipher),
+                payload: effective_inner.to_vec(),
+            };
+            if pool.dispatch_encrypt(task).is_ok() {
+                let mut completed_items = Vec::new();
+                let start = std::time::Instant::now();
+                while completed_items.is_empty()
+                    && start.elapsed() < std::time::Duration::from_millis(50)
+                {
+                    pool.drain_completed(|dg| {
+                        completed_items.push(dg);
+                    });
+                    if completed_items.is_empty() {
+                        std::thread::yield_now();
+                    }
+                }
+                for dg in completed_items {
+                    frame_symbols_into(
+                        &mut self.transport,
+                        &mut self.sent_log,
+                        &mut self.retx,
+                        &mut self.retx_buf_pool,
+                        &mut self.egress_pool,
+                        &mut self.wire_payload_scratch,
+                        &self.codec,
+                        self.conn_tag,
+                        self.l2,
+                        self.peer_addr,
+                        dg.counter,
+                        &dg.bytes,
+                        effective_inner,
+                        now_ms,
+                        out,
+                    );
+                }
+                return;
+            }
+        }
+
         // ── 1. Seal (no-alloc: writes into the reused `seal_buf`) ──────────────
         let counter = match self.session.seal_into(effective_inner, &mut self.seal_buf) {
             Ok(c) => c,
             Err(_) => return,
         };
-
-        // ── 2. FEC-encode (zero-allocation encode using transport arena) ──────
-        let (class, symbols) =
-            self.transport
-                .encode_scratch(&self.seal_buf, effective_inner, self.l2, now_ms);
-
-        // ── 3. Auxiliary bookkeeping ──────────────────────────────────────────
-        let pkt_wire_len = u16::try_from(self.seal_buf.len()).unwrap_or(u16::MAX);
-        self.sent_log.insert(counter, class, pkt_wire_len);
-
-        if class.params().arq {
-            if let Some(oid) = symbols.first().map(|s| s.object_id) {
-                let mut buf = self
-                    .retx_buf_pool
-                    .pop()
-                    .unwrap_or_else(|| Vec::with_capacity(self.seal_buf.len()));
-                buf.clear();
-                buf.extend_from_slice(&self.seal_buf);
-                if let Some(mut recycled) = self.retx.put(counter, buf, class, oid, now_ms) {
-                    recycled.clear();
-                    if self.retx_buf_pool.len() < 512 {
-                        self.retx_buf_pool.push(recycled);
-                    }
-                }
-            }
-        }
-
-        // ── 4. Frame each symbol into caller's out buffer ────────────────────
-        let peer_addr = self.peer_addr;
-        for sym in symbols {
-            let mut dg = self
-                .egress_pool
-                .pop()
-                .unwrap_or_else(|| yip_io::poll::EgressDatagram {
-                    fate: sym.object_id,
-                    dst: peer_addr,
-                    bytes: Vec::with_capacity(1500),
-                });
-            dg.fate = sym.object_id;
-            dg.dst = peer_addr;
-            dg.bytes.clear();
-            dg.bytes.push(PacketType::Data as u8);
-            let frame = wire_glue::symbol_to_frame_into(
-                self.conn_tag,
-                sym,
-                counter,
-                class,
-                &mut self.wire_payload_scratch,
-            );
-            self.codec.frame_ref_into(&frame, &mut dg.bytes);
-            out.push(dg);
-        }
+        frame_symbols_into(
+            &mut self.transport,
+            &mut self.sent_log,
+            &mut self.retx,
+            &mut self.retx_buf_pool,
+            &mut self.egress_pool,
+            &mut self.wire_payload_scratch,
+            &self.codec,
+            self.conn_tag,
+            self.l2,
+            self.peer_addr,
+            counter,
+            &self.seal_buf,
+            effective_inner,
+            now_ms,
+            out,
+        );
     }
 
     /// Recycle flushed datagram buffers back into the pool to preserve capacities.
@@ -719,16 +831,59 @@ impl DataPlane {
                 self.detector.on_delivered(counter);
 
                 // Open the AEAD ciphertext directly into inner_scratch.
-                self.inner_scratch.clear();
-                if self
-                    .session
-                    .open_into(counter, ciphertext, &mut self.inner_scratch)
-                    .is_err()
-                {
-                    self.counters
-                        .ingress_open_errors
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Outcome::None;
+                if let Some(ref mut pool) = self.inbound_pool {
+                    if !self.session.check_replay(counter) {
+                        return Outcome::None;
+                    }
+                    let task = DecryptTask {
+                        peer_id: 0,
+                        counter,
+                        cipher: Arc::clone(&self.recv_cipher),
+                        ciphertext: ciphertext.to_vec(),
+                    };
+                    let mut success = false;
+                    if pool.dispatch_decrypt(task).is_ok() {
+                        let mut decrypted_payload: Option<
+                            Result<Vec<u8>, yip_crypto::CryptoError>,
+                        > = None;
+                        let start = std::time::Instant::now();
+                        while decrypted_payload.is_none()
+                            && start.elapsed() < std::time::Duration::from_millis(50)
+                        {
+                            pool.drain_completed(|pkt| {
+                                if pkt.counter == counter {
+                                    decrypted_payload = Some(pkt.result);
+                                }
+                            });
+                            if decrypted_payload.is_none() {
+                                std::thread::yield_now();
+                            }
+                        }
+                        if let Some(Ok(plain)) = decrypted_payload {
+                            self.session.commit_replay(counter);
+                            self.inner_scratch.clear();
+                            self.inner_scratch.extend_from_slice(&plain);
+                            success = true;
+                        }
+                    }
+                    if !success {
+                        self.counters
+                            .ingress_open_errors
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Outcome::None;
+                    }
+                } else {
+                    self.inner_scratch.clear();
+                    if self
+                        .session
+                        .open_into(counter, ciphertext, &mut self.inner_scratch)
+                        .is_err()
+                    {
+                        self.counters
+                            .ingress_open_errors
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Outcome::None;
+                    }
                 }
 
                 self.transport
@@ -1303,6 +1458,17 @@ fn fraction_f32(numerator: u32, denominator: u32) -> f32 {
     let n = f32::from(u16::try_from(numerator).unwrap_or(u16::MAX));
     let d = f32::from(u16::try_from(denominator).unwrap_or(u16::MAX));
     (n / d).clamp(0.0_f32, 1.0_f32)
+}
+
+impl Drop for DataPlane {
+    fn drop(&mut self) {
+        if let Some(pool) = self.outbound_pool.take() {
+            pool.shutdown();
+        }
+        if let Some(pool) = self.inbound_pool.take() {
+            pool.shutdown();
+        }
+    }
 }
 
 #[inline]

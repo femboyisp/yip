@@ -393,6 +393,9 @@ impl PeerManager {
                 if self.num_shards > 1 {
                     dp.set_shard(self.shard_id, self.num_shards);
                 }
+                if self.crypto_workers > 0 {
+                    dp.set_crypto_workers(self.crypto_workers);
+                }
 
                 self.peers[idx].session_obf_key = sess_obf;
                 self.peers[idx].endpoint = Some(src); // learn the observed endpoint
@@ -497,6 +500,9 @@ impl PeerManager {
                 ));
                 if self.num_shards > 1 {
                     dp.set_shard(self.shard_id, self.num_shards);
+                }
+                if self.crypto_workers > 0 {
+                    dp.set_crypto_workers(self.crypto_workers);
                 }
                 self.by_tag.insert(dp.conn_tag(), idx);
                 self.peers[idx].session_obf_key = sess_obf;

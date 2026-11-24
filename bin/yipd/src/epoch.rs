@@ -147,6 +147,10 @@ impl EpochSet {
         &mut self.current
     }
 
+    pub fn previous_mut(&mut self) -> Option<&mut DataPlane> {
+        self.previous.as_deref_mut()
+    }
+
     pub fn bulk_repair_ratio(&self) -> f32 {
         self.current.bulk_repair_ratio()
     }

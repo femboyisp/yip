@@ -8,6 +8,7 @@ mod addr;
 mod config;
 mod control;
 pub mod control_codec;
+pub mod crypto_pool;
 mod dataplane;
 mod epoch;
 pub(crate) mod flow;
@@ -64,6 +65,7 @@ fn print_daemon_usage() {
     println!("      --mtu <BYTES>       TUN device MTU (576-65535, default: 1400)");
     println!("      --metrics-listen <ADDR> Prometheus/OTEL HTTP metrics listen address (e.g. 127.0.0.1:9184)");
     println!("      --shards <N|auto>   Worker shards for multi-core scaling (default: 1)");
+    println!("      --crypto-workers <N|auto> Dedicated crypto workers (default: 0)");
     println!("      --driver <DRIVER>   I/O engine driver: epoll, uring, xdp");
     println!("      --xdp               Enable AF_XDP (XSK) zero-copy kernel bypass");
     println!("      --xdp-ifname <DEV>  Underlay network interface for AF_XDP binding");
@@ -979,6 +981,7 @@ pub(crate) struct DaemonOverrides {
     pub mtu: Option<u32>,
     pub metrics_listen: Option<std::net::SocketAddr>,
     pub shards: Option<usize>,
+    pub crypto_workers: Option<usize>,
     pub driver: Option<String>,
     pub xdp: Option<bool>,
     pub xdp_ifname: Option<String>,
@@ -1073,6 +1076,33 @@ pub(crate) fn parse_daemon_flags(
                 parsed
             };
             overrides.shards = Some(n);
+        } else if arg == "--crypto-workers" {
+            let cstr = args.next().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--crypto-workers requires a count or 'auto'",
+                )
+            })?;
+            let n = if cstr.eq_ignore_ascii_case("auto") {
+                std::thread::available_parallelism()
+                    .map(|p| {
+                        let count = p.get();
+                        if count > 2 {
+                            (count / 2).min(4)
+                        } else {
+                            0
+                        }
+                    })
+                    .unwrap_or(0)
+            } else {
+                cstr.parse::<usize>().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid crypto-workers count '{cstr}': must be integer or 'auto'"),
+                    )
+                })?
+            };
+            overrides.crypto_workers = Some(n);
         } else if arg == "--driver" {
             let dstr = args.next().ok_or_else(|| {
                 std::io::Error::new(
@@ -1309,6 +1339,9 @@ fn main() -> std::io::Result<()> {
             }
             if let Some(shards) = overrides.shards {
                 config.shards = shards;
+            }
+            if let Some(cw) = overrides.crypto_workers {
+                config.crypto_workers = cw;
             }
             if let Some(driver) = overrides.driver {
                 config.driver = Some(driver);
