@@ -745,7 +745,13 @@ mod tests {
     #[test]
     fn test_enable_udp_gro_succeeds_or_graceful_fallback() {
         use std::net::UdpSocket;
-        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sock = match UdpSocket::bind("127.0.0.1:0") {
+            Ok(s) => s,
+            Err(_) => match UdpSocket::bind("0.0.0.0:0") {
+                Ok(s) => s,
+                Err(e) => panic!("failed to bind test udp socket: {e}"),
+            },
+        };
         let result = enable_udp_gro(&sock);
         assert!(
             result.is_ok(),
