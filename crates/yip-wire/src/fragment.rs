@@ -810,4 +810,15 @@ mod tests {
         assert_eq!(frags.len(), 1);
         assert_eq!(frags[0], large_payload);
     }
+
+    #[test]
+    fn test_chunk_handshake_datagram_exact_64_fragments() {
+        // Exactly 64 fragments must be chunked (not fall back to unfragmented).
+        // 1 byte discriminant + 64 * 64 payload bytes = 4097 bytes.
+        // With max_packet_len = 76 (chunk_payload = 64), 64 * 64 = 4096 bytes gives exactly 64 frags.
+        let mut payload = vec![0x00];
+        payload.extend_from_slice(&vec![0x42; 64 * 64]);
+        let frags = chunk_handshake_datagram(&payload, 76, 123);
+        assert_eq!(frags.len(), 64);
+    }
 }
