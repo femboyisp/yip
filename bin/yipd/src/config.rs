@@ -101,6 +101,8 @@ pub struct PeerConfig {
     pub alias: Option<String>,
     /// Optional post-quantum KEM algorithm override for this peer.
     pub kem: Option<yip_crypto::PqKemAlgorithm>,
+    /// Optional post-quantum public encapsulation key for this peer (GHSA-cw9q-4c58-hv9p).
+    pub pq_public_key: Option<Vec<u8>>,
 }
 
 impl PeerConfig {
@@ -111,6 +113,7 @@ impl PeerConfig {
             endpoint,
             alias: None,
             kem: None,
+            pq_public_key: None,
         }
     }
 
@@ -120,6 +123,12 @@ impl PeerConfig {
         if !a.is_empty() {
             self.alias = Some(a);
         }
+        self
+    }
+
+    /// Attach an optional post-quantum public encapsulation key to this peer configuration.
+    pub fn with_pq_public_key(mut self, key: impl Into<Vec<u8>>) -> Self {
+        self.pq_public_key = Some(key.into());
         self
     }
 
@@ -338,7 +347,7 @@ pub(crate) fn hex_to_8(hex: &str) -> io::Result<[u8; 8]> {
 /// variable-length `cert=<path>`/`roots=<path>` file contents (a
 /// `Cert`/`RootSet` encodes to a variable number of bytes, unlike the
 /// fixed-size 32/16-byte keys `hex_to_32`/`hex_to_16` handle).
-fn hex_decode_vec(hex: &str) -> io::Result<Vec<u8>> {
+pub(crate) fn hex_decode_vec(hex: &str) -> io::Result<Vec<u8>> {
     if !hex.len().is_multiple_of(2) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -594,6 +603,7 @@ fn flush_peer_block(
     cur_ep: Option<SocketAddr>,
     cur_alias: Option<String>,
     cur_kem: Option<yip_crypto::PqKemAlgorithm>,
+    cur_pq_pk: Option<Vec<u8>>,
     peers: &mut Vec<PeerConfig>,
 ) -> io::Result<()> {
     match cur_pk {
@@ -621,12 +631,18 @@ fn flush_peer_block(
                 endpoint: cur_ep,
                 alias: cur_alias,
                 kem: cur_kem,
+                pq_public_key: cur_pq_pk,
             });
         }
-        None if cur_ep.is_some() || cur_alias.is_some() || cur_kem.is_some() => {
+        None if cur_ep.is_some()
+            || cur_alias.is_some()
+            || cur_kem.is_some()
+            || cur_pq_pk.is_some() =>
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "peer block has an endpoint, alias, or kem but no public_key".to_string(),
+                "peer block has an endpoint, alias, kem, or pq_public_key but no public_key"
+                    .to_string(),
             ));
         }
         None => {}
@@ -651,9 +667,12 @@ impl Config {
         let mut cur_ep: Option<SocketAddr> = None;
         let mut cur_alias: Option<String> = None;
         let mut cur_kem: Option<yip_crypto::PqKemAlgorithm> = None;
+        let mut cur_pq_pk: Option<Vec<u8>> = None;
+        let mut in_peer_block = false;
         let mut global_kem: Option<yip_crypto::PqKemAlgorithm> = None;
         let mut legacy_peer_public: Option<[u8; 32]> = None;
         let mut legacy_peer_endpoint: Option<SocketAddr> = None;
+        let mut legacy_pq_public: Option<Vec<u8>> = None;
         let mut listen: Option<SocketAddr> = None;
         let mut listen_port_auto = false;
         let mut device: Option<String> = None;
@@ -695,11 +714,13 @@ impl Config {
 
             // Check for section headers (e.g. [peer], [mesh], [node], [general])
             if line.starts_with('[') && line.ends_with(']') {
-                flush_peer_block(cur_pk, cur_ep, cur_alias, cur_kem, &mut peers)?;
+                flush_peer_block(cur_pk, cur_ep, cur_alias, cur_kem, cur_pq_pk, &mut peers)?;
                 cur_pk = None;
                 cur_ep = None;
                 cur_alias = None;
                 cur_kem = None;
+                cur_pq_pk = None;
+                in_peer_block = line.eq_ignore_ascii_case("[peer]");
                 continue;
             }
 
@@ -1009,10 +1030,18 @@ impl Config {
                             format!("invalid kem '{val}': {e}"),
                         )
                     })?;
-                    if cur_pk.is_some() {
+                    if in_peer_block || cur_pk.is_some() {
                         cur_kem = Some(k);
                     } else {
                         global_kem = Some(k);
+                    }
+                }
+                "pq_public_key" | "pq_key" | "pq_pk" => {
+                    let bytes = hex_decode_vec(val)?;
+                    if in_peer_block || cur_pk.is_some() {
+                        cur_pq_pk = Some(bytes);
+                    } else {
+                        legacy_pq_public = Some(bytes);
                     }
                 }
                 // Silently ignore unknown keys for forward-compatibility. The
@@ -1026,16 +1055,17 @@ impl Config {
         }
 
         // Flush any trailing peer block
-        flush_peer_block(cur_pk, cur_ep, cur_alias, cur_kem, &mut peers)?;
+        flush_peer_block(cur_pk, cur_ep, cur_alias, cur_kem, cur_pq_pk, &mut peers)?;
 
         // If no [peer] blocks, try legacy single-peer format
         if peers.is_empty() {
-            if let (Some(pk), Some(ep)) = (legacy_peer_public, legacy_peer_endpoint) {
+            if let Some(pk) = legacy_peer_public {
                 peers.push(PeerConfig {
                     public_key: pk,
-                    endpoint: Some(ep),
+                    endpoint: legacy_peer_endpoint,
                     alias: None,
-                    kem: None,
+                    kem: global_kem,
+                    pq_public_key: legacy_pq_public,
                 });
             }
         }
@@ -1314,6 +1344,44 @@ mod tests {
         assert!(!c.xdp);
         assert_eq!(c.xdp_ifname, None);
         assert_eq!(c.xdp_mode, None);
+    }
+
+    #[test]
+    fn parse_config_legacy_peer_with_pq_public_key() {
+        let text = "device=yip0\nlisten=0.0.0.0:443\npeer_endpoint=10.0.0.2:443\n\
+                    local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
+                    local_public=00000000000000000000000000000000000000000000000000000000000000aa\n\
+                    peer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    pq_public_key=deadbeef\n";
+        let c = Config::parse(text).unwrap();
+        assert_eq!(c.peers.len(), 1);
+        assert_eq!(c.peers[0].public_key[31], 0xbb);
+        assert_eq!(c.peers[0].endpoint, Some("10.0.0.2:443".parse().unwrap()));
+        assert_eq!(
+            c.peers[0].pq_public_key.as_deref(),
+            Some(&[0xde, 0xad, 0xbe, 0xef][..])
+        );
+    }
+
+    #[test]
+    fn parse_config_peer_block_order_independent_with_pq_key() {
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
+                    local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
+                    local_public=00000000000000000000000000000000000000000000000000000000000000aa\n\
+                    [peer]\n\
+                    endpoint=10.0.0.2:443\n\
+                    pq_public_key=cafebabe\n\
+                    kem=mlkem768\n\
+                    public_key=00000000000000000000000000000000000000000000000000000000000000bb\n";
+        let c = Config::parse(text).unwrap();
+        assert_eq!(c.peers.len(), 1);
+        assert_eq!(c.peers[0].public_key[31], 0xbb);
+        assert_eq!(c.peers[0].endpoint, Some("10.0.0.2:443".parse().unwrap()));
+        assert_eq!(
+            c.peers[0].pq_public_key.as_deref(),
+            Some(&[0xca, 0xfe, 0xba, 0xbe][..])
+        );
+        assert_eq!(c.peers[0].kem, Some(yip_crypto::PqKemAlgorithm::MlKem768));
     }
 
     #[test]
@@ -3030,5 +3098,29 @@ local_public=0000000000000000000000000000000000000000000000000000000000000002
         // Invalid KEM
         let text_invalid = format!("{base}kem=kyber999\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\npeer_endpoint=10.0.0.2:443\n");
         assert!(Config::parse(&text_invalid).is_err());
+    }
+
+    #[test]
+    fn test_config_pq_public_key_parsing() {
+        let base =
+            "local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
+             local_public=00000000000000000000000000000000000000000000000000000000000000aa\n\
+             listen=0.0.0.0:443\ndevice=yip0\n";
+        let text = format!(
+            "{base}\
+             [peer]\n\
+             public_key=00000000000000000000000000000000000000000000000000000000000000b1\n\
+             endpoint=10.0.0.1:443\n\
+             pq_public_key=0102030405060708\n\
+             [peer]\n\
+             public_key=00000000000000000000000000000000000000000000000000000000000000b2\n\
+             endpoint=10.0.0.2:443\n"
+        );
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(
+            cfg.peers[0].pq_public_key,
+            Some(vec![1, 2, 3, 4, 5, 6, 7, 8])
+        );
+        assert_eq!(cfg.peers[1].pq_public_key, None);
     }
 }

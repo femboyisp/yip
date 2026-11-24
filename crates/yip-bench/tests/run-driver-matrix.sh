@@ -348,9 +348,11 @@ start_yip_driver() {
     genkey_a="$("$YIPD" --genkey)"
     genkey_b="$("$YIPD" --genkey)"
     priv_a="$(echo "$genkey_a" | grep '^private=' | cut -d= -f2)"
-    pub_a="$(echo "$genkey_a"  | grep '^public='  | cut -d= -f2)"
+    pub_a="$(echo "$genkey_a" | grep '^public=' | cut -d= -f2)"
+pq_pub_a="$(echo "$genkey_a" | grep '^pq_public=' | cut -d= -f2)"
     priv_b="$(echo "$genkey_b" | grep '^private=' | cut -d= -f2)"
-    pub_b="$(echo "$genkey_b"  | grep '^public='  | cut -d= -f2)"
+    pub_b="$(echo "$genkey_b" | grep '^public=' | cut -d= -f2)"
+pq_pub_b="$(echo "$genkey_b" | grep '^pq_public=' | cut -d= -f2)"
 
     cfg_a="$TMPDIR_TEST/yipA.conf"
     cfg_b="$TMPDIR_TEST/yipB.conf"
@@ -375,6 +377,7 @@ xdp_mode=generic"
 local_private=${priv_a}
 local_public=${pub_a}
 peer_public=${pub_b}
+pq_public_key=${pq_pub_b}
 listen=${VDA_IP}:${PORT_A}
 peer_endpoint=${VDB_IP}:${PORT_B}
 device=${TUN_DEV}
@@ -402,6 +405,7 @@ xdp_mode=generic"
 local_private=${priv_b}
 local_public=${pub_b}
 peer_public=${pub_a}
+pq_public_key=${pq_pub_a}
 listen=${VDB_IP}:${PORT_B}
 peer_endpoint=${VDA_IP}:${PORT_A}
 device=${TUN_DEV}

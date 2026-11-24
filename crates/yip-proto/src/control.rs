@@ -26,6 +26,8 @@ pub enum ControlCmd {
         transport: Option<String>,
         #[serde(default)]
         alias: Option<String>,
+        #[serde(default)]
+        pq_public_key: Option<String>,
     },
     #[serde(rename = "remove_peer")]
     RemovePeer { public_key: String },
@@ -127,6 +129,27 @@ pub enum ControlCmd {
     },
     #[serde(rename = "get_config")]
     GetConfig,
+}
+
+impl ControlCmd {
+    /// Returns true if this command performs daemon state mutations or active network probing
+    /// requiring root or daemon-owner credentials.
+    pub fn is_privileged(&self) -> bool {
+        !matches!(
+            self,
+            Self::Status
+                | Self::ListPeers
+                | Self::CertStatus
+                | Self::GetFecStatus
+                | Self::GetDaitaStatus
+                | Self::GetRoutes
+                | Self::GetTopology
+                | Self::GetSplitTunnelStatus
+                | Self::GetMetrics { .. }
+                | Self::GetXdpStatus
+                | Self::GetConfig
+        )
+    }
 }
 
 const fn default_ping_count() -> u32 {
@@ -336,6 +359,8 @@ pub struct PeerConfigEntry {
     pub transport: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kem: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_public_key: Option<String>,
 }
 
 /// Supported Reed-Solomon dynamic FEC presets.
@@ -876,5 +901,41 @@ mod tests {
             }
             other => panic!("expected ControlResponse::Status, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_control_cmd_privilege_classification() {
+        assert!(!ControlCmd::Status.is_privileged());
+        assert!(!ControlCmd::ListPeers.is_privileged());
+        assert!(!ControlCmd::CertStatus.is_privileged());
+        assert!(!ControlCmd::GetFecStatus.is_privileged());
+        assert!(!ControlCmd::GetDaitaStatus.is_privileged());
+        assert!(!ControlCmd::GetRoutes.is_privileged());
+        assert!(!ControlCmd::GetTopology.is_privileged());
+        assert!(!ControlCmd::GetSplitTunnelStatus.is_privileged());
+        assert!(!ControlCmd::GetMetrics { peer: None }.is_privileged());
+        assert!(!ControlCmd::GetXdpStatus.is_privileged());
+        assert!(!ControlCmd::GetConfig.is_privileged());
+
+        assert!(ControlCmd::AddPeer {
+            public_key: "abc".into(),
+            endpoint: None,
+            transport: None,
+            alias: None,
+            pq_public_key: None,
+        }
+        .is_privileged());
+        assert!(ControlCmd::RemovePeer {
+            public_key: "abc".into(),
+        }
+        .is_privileged());
+        assert!(ControlCmd::Reload { path: None }.is_privileged());
+        assert!(ControlCmd::CertRenew.is_privileged());
+        assert!(ControlCmd::CreateTicket {
+            name: None,
+            route_mode: None,
+            endpoint: None,
+        }
+        .is_privileged());
     }
 }

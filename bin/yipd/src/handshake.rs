@@ -454,15 +454,17 @@ impl HandshakeState {
         )
     }
 
-    /// Start the initiator role with an explicit post-quantum KEM algorithm.
-    pub fn start_initiator_with_kem(
+    /// Start the initiator role with an explicit post-quantum KEM algorithm and optional remote encapsulation key.
+    pub fn start_initiator_with_kem_and_pq_ek(
         local_priv: &[u8; 32],
         peer_pub: &[u8; 32],
         payload: &[u8],
         kem: yip_crypto::PqKemAlgorithm,
+        peer_pq_ek: Option<&[u8]>,
     ) -> io::Result<(Self, Vec<u8>)> {
         let mut handshake =
-            Handshake::initiator_with_kem(local_priv, peer_pub, kem).map_err(crypto_err)?;
+            Handshake::initiator_with_kem_and_pq_ek(local_priv, peer_pub, kem, peer_pq_ek)
+                .map_err(crypto_err)?;
 
         let msg1 = handshake.write_message(payload).map_err(crypto_err)?;
         let mut init_pkt = Vec::with_capacity(1 + msg1.len());
@@ -470,6 +472,16 @@ impl HandshakeState {
         init_pkt.extend_from_slice(&msg1);
 
         Ok((Self { handshake }, init_pkt))
+    }
+
+    /// Start the initiator role with an explicit post-quantum KEM algorithm.
+    pub fn start_initiator_with_kem(
+        local_priv: &[u8; 32],
+        peer_pub: &[u8; 32],
+        payload: &[u8],
+        kem: yip_crypto::PqKemAlgorithm,
+    ) -> io::Result<(Self, Vec<u8>)> {
+        Self::start_initiator_with_kem_and_pq_ek(local_priv, peer_pub, payload, kem, None)
     }
 
     /// Run the responder role to completion in a single step: read

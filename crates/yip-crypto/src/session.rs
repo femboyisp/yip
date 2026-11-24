@@ -91,6 +91,11 @@ impl ReplayWindow {
         self.profile
     }
 
+    /// Returns true if this replay window has committed at least one counter.
+    pub fn started(&self) -> bool {
+        self.started
+    }
+
     /// Dynamically promote window capacity to `HighThroughput` (16 KB / 131,072 bits).
     /// Preserves all previously seen counters without dropping replay protection.
     pub fn promote_to_high_throughput(&mut self) {
@@ -408,6 +413,7 @@ pub struct Session {
     send_counter: u64,
     stride: u64,
     replays: Vec<ReplayWindow>,
+    sealed_any: bool,
 }
 
 impl Session {
@@ -433,6 +439,7 @@ impl Session {
             send_counter: start_counter,
             stride,
             replays,
+            sealed_any: false,
         }
     }
 
@@ -491,8 +498,20 @@ impl Session {
         self.pair.rekey();
     }
 
+    /// Returns true if this session has processed traffic (sent or received frames).
+    pub fn started(&self) -> bool {
+        self.sealed_any || self.replays.iter().any(|w| w.started())
+    }
+
     /// Reconfigure the send counter and stride increment for this session.
-    pub fn set_stride(&mut self, start_counter: u64, stride: u64) {
+    ///
+    /// # Errors
+    /// Returns `Err(CryptoError::Replay)` if this session has already processed traffic,
+    /// preventing replay protection corruption (GHSA-c9px-46f5-763p).
+    pub fn set_stride(&mut self, start_counter: u64, stride: u64) -> Result<(), CryptoError> {
+        if self.started() {
+            return Err(CryptoError::Replay);
+        }
         let stride = if stride == 0 { 1 } else { stride };
         if self.send_counter == 0 {
             self.send_counter = start_counter;
@@ -509,6 +528,7 @@ impl Session {
         self.stride = stride;
         let replays_count = stride.clamp(1, 64) as usize;
         self.replays.resize_with(replays_count, ReplayWindow::new);
+        Ok(())
     }
 
     /// The current nonce stride increment.
@@ -523,6 +543,7 @@ impl Session {
 
     /// Seal one inner frame, assigning it the next send counter.
     pub fn seal(&mut self, plaintext: &[u8]) -> Result<Sealed, CryptoError> {
+        self.sealed_any = true;
         let counter = self.send_counter;
         let mut buf = plaintext.to_vec();
         let total_len = plaintext
@@ -580,6 +601,7 @@ impl Session {
 
     /// Seal into a caller-owned reusable buffer (no per-call allocation).
     pub fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> Result<u64, CryptoError> {
+        self.sealed_any = true;
         let counter = self.send_counter;
         let total_len = plaintext
             .len()
@@ -711,6 +733,7 @@ impl Session {
         buf: &mut [u8],
         plaintext_len: usize,
     ) -> Result<u64, CryptoError> {
+        self.sealed_any = true;
         let counter = self.send_counter;
         self.pair.send.seal_in_place(counter, buf, plaintext_len)?;
         self.send_counter = self

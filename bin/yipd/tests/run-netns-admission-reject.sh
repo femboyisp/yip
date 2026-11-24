@@ -69,6 +69,7 @@ PUB_X="$(echo "$GENKEY_X" | grep '^public=' | cut -d= -f2)"
 GENKEY_Y="$("$YIPD" --genkey)"
 PRIV_Y="$(echo "$GENKEY_Y" | grep '^private=' | cut -d= -f2)"
 PUB_Y="$(echo "$GENKEY_Y" | grep '^public=' | cut -d= -f2)"
+PQ_PUB_Y="$(echo "$GENKEY_Y" | grep '^pq_public=' | cut -d= -f2)"
 SIGNKEY_Y="$("$YIPCA" genkey)"
 SIGNPRIV_Y="$(echo "$SIGNKEY_Y" | grep '^ca_private=' | cut -d= -f2)"
 SIGNPUB_Y="$(echo "$SIGNKEY_Y" | grep '^ca_public=' | cut -d= -f2)"
@@ -101,6 +102,7 @@ device=${TUN_DEV}
 device_kind=tun
 [peer]
 public_key=${PUB_Y}
+pq_public_key=${PQ_PUB_Y}
 endpoint=${IP_Y}:${PORT}
 EOF
 

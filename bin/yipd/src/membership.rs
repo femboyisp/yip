@@ -202,6 +202,12 @@ impl Membership {
         &self.own_cert
     }
 
+    /// Return the registered membership record for a member's public key, if known.
+    pub fn record_for(&self, pubkey: &[u8; 32]) -> Option<&Record> {
+        let nid = node_id(pubkey);
+        self.directory.get(&nid)
+    }
+
     /// Returns this node's record-signing private key.
     pub fn own_sign_priv(&self) -> &[u8; 32] {
         &self.sign_priv

@@ -175,7 +175,9 @@ for _attempt in $(seq 1 50); do
     GENKEY_A="$("$YIPD" --genkey)"
     GENKEY_B="$("$YIPD" --genkey)"
     CAND_PUB_A="$(echo "$GENKEY_A" | grep '^public=' | cut -d= -f2)"
+PQ_PUB_A="$(echo "$GENKEY_A" | grep '^pq_public=' | cut -d= -f2)"
     CAND_PUB_B="$(echo "$GENKEY_B" | grep '^public=' | cut -d= -f2)"
+PQ_PUB_B="$(echo "$GENKEY_B" | grep '^pq_public=' | cut -d= -f2)"
     if [[ "$CAND_PUB_A" < "$CAND_PUB_B" ]]; then
         PRIV_A="$(echo "$GENKEY_A" | grep '^private=' | cut -d= -f2)"
         PUB_A="$CAND_PUB_A"
@@ -207,6 +209,7 @@ device_kind=tun
 rendezvous=${IP_R_A}:${RDV_PORT}
 [peer]
 public_key=${PUB_B}
+pq_public_key=${PQ_PUB_B}
 EOF
 
 cat > "$CFG_B" <<EOF
@@ -219,6 +222,7 @@ device_kind=tun
 rendezvous=${IP_R_B}:${RDV_PORT}
 [peer]
 public_key=${PUB_A}
+pq_public_key=${PQ_PUB_A}
 EOF
 
 # ── 3. create namespaces + point-to-point veths into R ────────────────────────

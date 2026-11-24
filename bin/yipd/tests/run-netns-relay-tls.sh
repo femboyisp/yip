@@ -108,8 +108,10 @@ GENKEY_B="$("$YIPD" --genkey)"
 
 PRIV_A="$(echo "$GENKEY_A" | grep '^private=' | cut -d= -f2)"
 PUB_A="$(echo "$GENKEY_A" | grep '^public=' | cut -d= -f2)"
+PQ_PUB_A="$(echo "$GENKEY_A" | grep '^pq_public=' | cut -d= -f2)"
 PRIV_B="$(echo "$GENKEY_B" | grep '^private=' | cut -d= -f2)"
 PUB_B="$(echo "$GENKEY_B" | grep '^public=' | cut -d= -f2)"
+PQ_PUB_B="$(echo "$GENKEY_B" | grep '^pq_public=' | cut -d= -f2)"
 OBF_PSK="$(openssl rand -hex 32)"
 
 ADDR_A="$("$YIPD" --addr "$PUB_A")"
@@ -131,6 +133,7 @@ rendezvous=tls://${IP_R_A}:${RDV_TCP_PORT}
 obf_psk=${OBF_PSK}
 [peer]
 public_key=${PUB_B}
+pq_public_key=${PQ_PUB_B}
 EOF
 
 cat > "$CFG_B" <<EOF
@@ -144,6 +147,7 @@ rendezvous=tls://${IP_R_B}:${RDV_TCP_PORT}
 obf_psk=${OBF_PSK}
 [peer]
 public_key=${PUB_A}
+pq_public_key=${PQ_PUB_A}
 EOF
 
 # ── 3. create namespaces + point-to-point veths into R ────────────────────

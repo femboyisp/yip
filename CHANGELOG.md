@@ -5,6 +5,22 @@ All notable changes to this project are documented here, following
 
 ## [Unreleased]
 
+### Security
+- **Mitigate Post-Quantum ML-KEM Private Key Derivation from Public Identity (GHSA-cw9q-4c58-hv9p, `crates/yip-crypto`, `crates/yip-membership`, `bin/yipd`).**
+  - Derived the static post-quantum ML-KEM decapsulation key strictly from secret local private key material (`local_private`) via `PQ_KEM_STATIC_KEY_CONTEXT_V2`, closing a critical vulnerability where passive observers could compute the responder's decapsulation key from public identity.
+  - Bound post-quantum public encapsulation keys to node certificates via extension tag `TAG_PQ_ENCAPS_KEY = 1` and enabled explicit static peer configuration via `pq_public_key`.
+- **Harden Control Socket Permissions, Authorization & Resource Limits (GHSA-x5x4-5r44-qpfq, `bin/yipd`, `crates/yip-io`).**
+  - Restricted `yipd` UNIX control socket permissions from world-writable `0666` to `0600` (owner read/write only).
+  - Enforced caller UID verification via `SO_PEERCRED` on Linux, requiring privileged operations to match the daemon's running UID.
+  - Implemented DoS defenses: 64 KiB line limit, 5-second read/write timeouts, and a maximum of 64 concurrent client connections.
+- **Prevent Rootless UDP Rendezvous Endpoint Hijacking (GHSA-6h6h-828v-rr2w, `crates/yip-rendezvous`).**
+  - Prevented forged node registration takeovers in rootless rendezvous mode by rejecting unauthenticated registration overwrites from conflicting source addresses.
+  - Validated claimed sender addresses on relayed messages against active registrations.
+- **Enforce Replay Window Nonce Stride Immutability After Session Start (GHSA-c9px-46f5-763p, `crates/yip-crypto`).**
+  - Disallowed modifying nonce stride on active sessions once packet sealing or opening has started, preventing window desynchronization.
+- **Pin Release Pipeline Musl Toolchains with SHA-256 Checksums (GHSA-q2p4-m8v8-g5qg, `.github/workflows/release.yml`).**
+  - Added strict SHA-256 verification before extracting `musl.cc` cross-compilation toolchains in the release workflow.
+
 ### Added
 - **Post-Quantum ML-KEM-768 Handshake Upgrade, ML-KEM-1024 Support & Wire Fragmentation (`crates/yip-crypto`, `crates/yip-wire`, `crates/yip-proto`, `bin/yipd`, `crates/yip-bench`, #246).**
   - Upgraded the default post-quantum hybrid handshake protocol from ML-KEM-512 to ML-KEM-768 (`PQNoise_IKpsk2_25519_MLKEM768_ChaChaPoly_BLAKE3`), offering NIST Category 3 post-quantum security by default while maintaining single-RTT sub-1400B datagram sizes fitting within standard 1500B Ethernet frames.

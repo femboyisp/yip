@@ -176,8 +176,10 @@ GEN_B="$("$YIPD_BIN" --genkey)"
 
 PRIV_A="$(echo "$GEN_A" | grep '^private=' | cut -d= -f2)"
 PUB_A="$(echo "$GEN_A" | grep '^public=' | cut -d= -f2)"
+PQ_PUB_A="$(echo "$GEN_A" | grep '^pq_public=' | cut -d= -f2)"
 PRIV_B="$(echo "$GEN_B" | grep '^private=' | cut -d= -f2)"
 PUB_B="$(echo "$GEN_B" | grep '^public=' | cut -d= -f2)"
+PQ_PUB_B="$(echo "$GEN_B" | grep '^pq_public=' | cut -d= -f2)"
 
 ADDR_A="$("$YIPD_BIN" --addr "$PUB_A")"
 ADDR_B="$("$YIPD_BIN" --addr "$PUB_B")"
@@ -194,6 +196,7 @@ device_kind=tun
 control_socket=/tmp/yipA.sock
 [peer]
 public_key=${PUB_B}
+pq_public_key=${PQ_PUB_B}
 endpoint=${IP_B}:51821
 EOF
 
@@ -206,6 +209,7 @@ device_kind=tun
 control_socket=/tmp/yipB.sock
 [peer]
 public_key=${PUB_A}
+pq_public_key=${PQ_PUB_A}
 endpoint=${IP_A}:51821
 EOF
 

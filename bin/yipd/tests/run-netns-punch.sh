@@ -79,8 +79,10 @@ GENKEY_B="$("$YIPD" --genkey)"
 
 PRIV_A="$(echo "$GENKEY_A" | grep '^private=' | cut -d= -f2)"
 PUB_A="$(echo "$GENKEY_A" | grep '^public=' | cut -d= -f2)"
+PQ_PUB_A="$(echo "$GENKEY_A" | grep '^pq_public=' | cut -d= -f2)"
 PRIV_B="$(echo "$GENKEY_B" | grep '^private=' | cut -d= -f2)"
 PUB_B="$(echo "$GENKEY_B" | grep '^public=' | cut -d= -f2)"
+PQ_PUB_B="$(echo "$GENKEY_B" | grep '^pq_public=' | cut -d= -f2)"
 
 ADDR_A="$("$YIPD" --addr "$PUB_A")"
 ADDR_B="$("$YIPD" --addr "$PUB_B")"
@@ -100,6 +102,7 @@ device_kind=tun
 rendezvous=${IP_T_A}:${RDV_PORT}
 [peer]
 public_key=${PUB_B}
+pq_public_key=${PQ_PUB_B}
 EOF
 [ -n "${OBF_PSK:-}" ] && echo "obf_psk=${OBF_PSK}" >> "$CFG_A"
 
@@ -113,6 +116,7 @@ device_kind=tun
 rendezvous=${IP_T_B}:${RDV_PORT}
 [peer]
 public_key=${PUB_A}
+pq_public_key=${PQ_PUB_A}
 EOF
 [ -n "${OBF_PSK:-}" ] && echo "obf_psk=${OBF_PSK}" >> "$CFG_B"
 

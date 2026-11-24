@@ -309,6 +309,9 @@ impl PeerManager {
                     self.obf_key.is_some(),
                     self.data_symbol_size,
                 ));
+                if self.num_shards > 1 {
+                    dp.set_shard(self.shard_id, self.num_shards);
+                }
 
                 self.peers[idx].session_obf_key = sess_obf;
                 self.peers[idx].cached_resp = Some(resp_pkt.clone());
@@ -395,6 +398,9 @@ impl PeerManager {
                     self.obf_key.is_some(),
                     self.data_symbol_size,
                 ));
+                if self.num_shards > 1 {
+                    dp.set_shard(self.shard_id, self.num_shards);
+                }
                 self.by_tag.insert(dp.conn_tag(), idx);
                 self.peers[idx].session_obf_key = sess_obf;
                 self.peers[idx].admitted_cert_not_after =
@@ -617,6 +623,7 @@ mod tests {
             endpoint: None,
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let (mut pm, _sent) = pm_with_mock_rdv(&local, &[cfg_peer]);
 
@@ -687,6 +694,7 @@ mod tests {
             endpoint: Some(endpoint),
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
 
@@ -757,6 +765,7 @@ mod tests {
             endpoint: Some(endpoint),
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
 
@@ -1204,6 +1213,7 @@ mod tests {
             endpoint: None,
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let mut pm = PeerManager::new(
             local.private,
@@ -1273,6 +1283,7 @@ mod tests {
             endpoint: None,
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let rdv: Box<dyn Rendezvous> = Box::new(MockRdv {
@@ -1345,6 +1356,7 @@ mod tests {
             endpoint: None,
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let membership = membership_trusting_ca_via_roots(&ca, local.public);
         let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[peer], membership);
@@ -1394,6 +1406,7 @@ mod tests {
             endpoint: None,
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let membership = membership_trusting_ca_via_roots(&ca, local.public);
         let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[peer], membership);
@@ -1560,6 +1573,7 @@ mod tests {
             endpoint: None,
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let (mut pm, _sent) = pm_with_mock_rdv(&local, &[cfg_peer]);
 
@@ -1599,6 +1613,7 @@ mod tests {
             endpoint: None,
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let mem = membership_for(&ca, local.public);
         let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[cfg_peer], mem);
@@ -1680,6 +1695,7 @@ mod tests {
             endpoint: None,
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let mem = membership_for(&ca, local.public);
         let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[cfg_peer], mem);
@@ -1703,6 +1719,7 @@ mod tests {
             endpoint: None,
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let mem = membership_for(&ca, local.public);
         let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[cfg_peer], mem);

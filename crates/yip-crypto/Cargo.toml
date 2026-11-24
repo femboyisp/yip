@@ -25,5 +25,9 @@ zeroize = { version = "1.8", features = ["derive"] }
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[features]
+default = []
+testutil = []
+
 [lints]
 workspace = true

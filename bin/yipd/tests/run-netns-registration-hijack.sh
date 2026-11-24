@@ -189,32 +189,33 @@ gen_node() {
     local gk sk
     gk="$("$YIPD" --genkey)"
     sk="$("$YIPCA" genkey)"
-    local priv pub signpriv signpub
+    local priv pub signpriv signpub pq_pub
     priv="$(echo "$gk" | grep '^private=' | cut -d= -f2)"
     pub="$(echo "$gk" | grep '^public=' | cut -d= -f2)"
+    pq_pub="$(echo "$gk" | grep '^pq_public=' | cut -d= -f2)"
     signpriv="$(echo "$sk" | grep '^ca_private=' | cut -d= -f2)"
     signpub="$(echo "$sk" | grep '^ca_public=' | cut -d= -f2)"
-    echo "$priv $pub $signpriv $signpub"
+    echo "$priv $pub $signpriv $signpub $pq_pub"
 }
 
 echo "[setup] generating per-node data-plane + record-signing keypairs"
-read -r PRIV_A PUB_A SIGNPRIV_A SIGNPUB_A <<<"$(gen_node)"
-read -r PRIV_B PUB_B SIGNPRIV_B SIGNPUB_B <<<"$(gen_node)"
+read -r PRIV_A PUB_A SIGNPRIV_A SIGNPUB_A PQ_PUB_A <<<"$(gen_node)"
+read -r PRIV_B PUB_B SIGNPRIV_B SIGNPUB_B PQ_PUB_B <<<"$(gen_node)"
 
 ADDR_A="$("$YIPD" --addr "$PUB_A")"
 ADDR_B="$("$YIPD" --addr "$PUB_B")"
 echo "[setup] node_addr A=$ADDR_A B=$ADDR_B"
 
 sign_cert() {
-    local member_pub="$1" member_sign_pub="$2"
+    local member_pub="$1" member_sign_pub="$2" pq_pub="$3"
     echo "$CA_PRIV" | "$YIPCA" sign-cert \
         --member "$member_pub" --member-sign "$member_sign_pub" \
-        --network "$NETWORK_ID" --days 30
+        --network "$NETWORK_ID" --days 30 --pq-key "$pq_pub"
 }
 CERT_A_FILE="$TMPDIR_TEST/certA.hex"
 CERT_B_FILE="$TMPDIR_TEST/certB.hex"
-sign_cert "$PUB_A" "$SIGNPUB_A" > "$CERT_A_FILE"
-sign_cert "$PUB_B" "$SIGNPUB_B" > "$CERT_B_FILE"
+sign_cert "$PUB_A" "$SIGNPUB_A" "$PQ_PUB_A" > "$CERT_A_FILE"
+sign_cert "$PUB_B" "$SIGNPUB_B" "$PQ_PUB_B" > "$CERT_B_FILE"
 
 # The roots file's pubkey entry is the CA's OWN key (see header comment) --
 # NOT a bootstrap peer's data-plane key. The address half is unused by this
@@ -230,7 +231,7 @@ CFG_A="$TMPDIR_TEST/yipA.conf"
 CFG_B="$TMPDIR_TEST/yipB.conf"
 
 write_cfg() {
-    local file="$1" priv="$2" pub="$3" ip="$4" certfile="$5" signpriv="$6" peer_pub="$7"
+    local file="$1" priv="$2" pub="$3" ip="$4" certfile="$5" signpriv="$6" peer_pub="$7" peer_pq_pub="$8"
     cat > "$file" <<EOF
 local_private=${priv}
 local_public=${pub}
@@ -245,10 +246,11 @@ roots=${ROOTS_FILE}
 rendezvous=${IP_R}:${RDV_PORT}
 [peer]
 public_key=${peer_pub}
+pq_public_key=${peer_pq_pub}
 EOF
 }
-write_cfg "$CFG_A" "$PRIV_A" "$PUB_A" "$IP_A" "$CERT_A_FILE" "$SIGNPRIV_A" "$PUB_B"
-write_cfg "$CFG_B" "$PRIV_B" "$PUB_B" "$IP_B" "$CERT_B_FILE" "$SIGNPRIV_B" "$PUB_A"
+write_cfg "$CFG_A" "$PRIV_A" "$PUB_A" "$IP_A" "$CERT_A_FILE" "$SIGNPRIV_A" "$PUB_B" "$PQ_PUB_B"
+write_cfg "$CFG_B" "$PRIV_B" "$PUB_B" "$IP_B" "$CERT_B_FILE" "$SIGNPRIV_B" "$PUB_A" "$PQ_PUB_A"
 
 # ── 3. create namespaces + shared bridge underlay ─────────────────────────────
 echo "[setup] creating network namespaces"

@@ -559,8 +559,14 @@ fn test_high_level_handshake_rejects_corrupted_ml_kem_ciphertext() {
     let init_kp = generate_keypair();
     let resp_kp = generate_keypair();
 
-    let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
     let mut res = Handshake::responder(&resp_kp.private).unwrap();
+    let resp_ek = res.local_pq_ek().unwrap();
+    let mut ini = Handshake::initiator_with_remote_pq_ek(
+        &init_kp.private,
+        &resp_kp.public,
+        resp_ek.as_bytes(),
+    )
+    .unwrap();
 
     let payload = b"high-level-handshake-test-payload";
     let mut msg1 = ini.write_message(payload).unwrap();

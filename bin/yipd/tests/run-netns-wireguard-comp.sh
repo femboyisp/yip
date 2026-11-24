@@ -160,8 +160,10 @@ GENKEY_A="$("$YIPD" --genkey)"
 GENKEY_B="$("$YIPD" --genkey)"
 PRIV_YIP_A="$(echo "$GENKEY_A" | grep '^private=' | cut -d= -f2)"
 PUB_YIP_A="$(echo "$GENKEY_A" | grep '^public=' | cut -d= -f2)"
+PQ_PUB_YIP_A="$(echo "$GENKEY_A" | grep '^pq_public=' | cut -d= -f2)"
 PRIV_YIP_B="$(echo "$GENKEY_B" | grep '^private=' | cut -d= -f2)"
 PUB_YIP_B="$(echo "$GENKEY_B" | grep '^public=' | cut -d= -f2)"
+PQ_PUB_YIP_B="$(echo "$GENKEY_B" | grep '^pq_public=' | cut -d= -f2)"
 
 CFG_YIP_A="$TMPDIR_TEST/yip_a.conf"
 CFG_YIP_B="$TMPDIR_TEST/yip_b.conf"
@@ -173,6 +175,7 @@ cat > "$CFG_YIP_A" <<EOF
 local_private=${PRIV_YIP_A}
 local_public=${PUB_YIP_A}
 peer_public=${PUB_YIP_B}
+pq_public_key=${PQ_PUB_YIP_B}
 listen=${VETH_A_IP}:${YIP_PORT_A}
 peer_endpoint=${VETH_B_IP}:${YIP_PORT_B}
 device=${YIP_DEV}
@@ -185,6 +188,7 @@ cat > "$CFG_YIP_B" <<EOF
 local_private=${PRIV_YIP_B}
 local_public=${PUB_YIP_B}
 peer_public=${PUB_YIP_A}
+pq_public_key=${PQ_PUB_YIP_A}
 listen=${VETH_B_IP}:${YIP_PORT_B}
 peer_endpoint=${VETH_A_IP}:${YIP_PORT_A}
 device=${YIP_DEV}

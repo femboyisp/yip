@@ -60,6 +60,55 @@ pub fn find_default_gateway_interface() -> Option<String> {
     None
 }
 
+/// Query the effective UID of a peer connected to a UNIX domain socket via `SO_PEERCRED`.
+#[cfg(target_os = "linux")]
+pub fn get_unix_peer_uid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u32> {
+    use std::os::unix::io::AsRawFd;
+    let mut ucred: libc::ucred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: getsockopt called with valid raw file descriptor and properly sized ucred buffer.
+    let res = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &raw mut ucred as *mut libc::c_void,
+            &raw mut len,
+        )
+    };
+    if res == 0 {
+        Ok(ucred.uid)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Query the effective UID of a peer connected to a UNIX domain socket.
+#[cfg(not(target_os = "linux"))]
+pub fn get_unix_peer_uid(_stream: &std::os::unix::net::UnixStream) -> std::io::Result<u32> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "SO_PEERCRED is only supported on Linux",
+    ))
+}
+
+/// Query the process current effective UID.
+#[cfg(unix)]
+pub fn get_current_uid() -> u32 {
+    // SAFETY: geteuid is a safe, thread-safe POSIX syscall with no side effects.
+    unsafe { libc::geteuid() }
+}
+
+/// Query the process current effective UID.
+#[cfg(not(unix))]
+pub fn get_current_uid() -> u32 {
+    0
+}
+
 #[inline]
 pub(crate) fn empty_msghdr() -> libc::msghdr {
     // SAFETY: msghdr contains only pointers, lengths, and integer flags, which

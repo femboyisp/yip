@@ -53,6 +53,7 @@ fn test_control_response_config_and_reload_serde() {
             alias: Some("peer-b".to_string()),
             transport: Some("raw_udp".to_string()),
             kem: None,
+            pq_public_key: None,
         }],
         fec: Some(FecPreset::Adaptive.default_config()),
         daita: Some(DaitaPreset::Balanced.default_config()),
@@ -94,6 +95,7 @@ fn test_all_existing_control_cmd_variants_round_trip() {
             endpoint: Some("1.2.3.4:51820".to_string()),
             transport: Some("raw".to_string()),
             alias: Some("alpha".to_string()),
+            pq_public_key: None,
         },
         ControlCmd::RemovePeer {
             public_key: "abc".to_string(),

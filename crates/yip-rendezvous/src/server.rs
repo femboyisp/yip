@@ -210,9 +210,40 @@ impl RendezvousServer {
         src: SocketAddr,
         now_ms: u64,
     ) -> bool {
+        self.register_if_fresh_inner(node, counter, src, now_ms, false)
+    }
+
+    /// Freshness gate for signed registrations. A verified cryptographic signature
+    /// permits legitimate roaming across source addresses.
+    pub fn register_if_fresh_signed(
+        &mut self,
+        node: NodeId,
+        counter: u64,
+        src: SocketAddr,
+        now_ms: u64,
+    ) -> bool {
+        self.register_if_fresh_inner(node, counter, src, now_ms, true)
+    }
+
+    fn register_if_fresh_inner(
+        &mut self,
+        node: NodeId,
+        counter: u64,
+        src: SocketAddr,
+        now_ms: u64,
+        is_signed: bool,
+    ) -> bool {
         if let Some(existing) = self.regs.get(&node) {
-            if existing.expiry_ms > now_ms && counter <= existing.last_counter {
-                return false; // stale / replay
+            if existing.expiry_ms > now_ms {
+                if counter <= existing.last_counter {
+                    return false; // stale / replay
+                }
+                // GHSA-6h6h-828v-rr2w: For unauthenticated registrations,
+                // prevent remote endpoint hijacking by requiring that counter-advancing updates
+                // come from the currently bound source address unless authenticated by a signed record.
+                if !is_signed && existing.addr != src {
+                    return false; // unauthenticated endpoint takeover rejected
+                }
             }
         }
         if self.regs.len() >= MAX_REGISTRATIONS && !self.regs.contains_key(&node) {
@@ -291,7 +322,7 @@ impl RendezvousServer {
                 }
 
                 let node = record.node_id;
-                if self.register_if_fresh(node, record.seq, src, now_ms) {
+                if self.register_if_fresh_signed(node, record.seq, src, now_ms) {
                     if let Some(reg) = self.regs.get_mut(&node) {
                         reg.record = Some(record);
                     }
@@ -328,19 +359,27 @@ impl RendezvousServer {
                 src: sender,
                 dst,
                 payload,
-            } => match self.regs.get(&dst) {
-                Some(reg) if reg.expiry_ms > now_ms => {
-                    self.record_relay_forward();
-                    vec![(
-                        reg.addr,
-                        Message::RelayDeliver {
-                            src: sender,
-                            payload,
-                        },
-                    )]
+            } => {
+                // GHSA-6h6h-828v-rr2w: Validate RelaySend's claimed source node against sender's registered endpoint.
+                if let Some(sender_reg) = self.regs.get(&sender) {
+                    if sender_reg.expiry_ms > now_ms && sender_reg.addr != src {
+                        return Vec::new();
+                    }
                 }
-                _ => Vec::new(), // dst unknown: drop
-            },
+                match self.regs.get(&dst) {
+                    Some(reg) if reg.expiry_ms > now_ms => {
+                        self.record_relay_forward();
+                        vec![(
+                            reg.addr,
+                            Message::RelayDeliver {
+                                src: sender,
+                                payload,
+                            },
+                        )]
+                    }
+                    _ => Vec::new(), // dst unknown: drop
+                }
+            }
             // Server never receives these (they are server->client); ignore.
             Message::PeerInfo { .. }
             | Message::NotFound { .. }
@@ -573,7 +612,7 @@ mod tests {
             Message::PeerInfo { reflexive, .. } => assert_eq!(*reflexive, a),
             other => panic!("expected PeerInfo, got {other:?}"),
         }
-        // A greater counter is accepted and updates the addr.
+        // Unauthenticated different source with a greater counter is rejected (GHSA-6h6h-828v-rr2w).
         s.handle(
             a2,
             Message::Register {
@@ -585,7 +624,23 @@ mod tests {
         );
         let out = s.handle(a, Message::Lookup { node: n }, 4, now_secs(4));
         match &out[0].1 {
-            Message::PeerInfo { reflexive, .. } => assert_eq!(*reflexive, a2),
+            Message::PeerInfo { reflexive, .. } => assert_eq!(*reflexive, a),
+            other => panic!("expected PeerInfo, got {other:?}"),
+        }
+
+        // Legitimate source advancing counter is accepted.
+        s.handle(
+            a,
+            Message::Register {
+                node: n,
+                counter: 6,
+            },
+            5,
+            now_secs(5),
+        );
+        let out = s.handle(a, Message::Lookup { node: n }, 6, now_secs(6));
+        match &out[0].1 {
+            Message::PeerInfo { reflexive, .. } => assert_eq!(*reflexive, a),
             other => panic!("expected PeerInfo, got {other:?}"),
         }
     }
@@ -1049,6 +1104,113 @@ mod tests {
     }
 
     #[test]
+    fn test_rootless_register_prevents_unauthenticated_takeover_and_relay_spoofing() {
+        let mut s = RendezvousServer::new(0);
+        let victim = [0x55u8; 16];
+        let legitimate_addr = addr("198.51.100.10:41000");
+        let attacker_addr = addr("203.0.113.99:55555");
+        let dest_addr = addr("192.0.2.20:50000");
+        let dest_node = [0x77u8; 16];
+
+        // 1. Legitimate node registers identity `victim`
+        let _ = s.handle(
+            legitimate_addr,
+            Message::Register {
+                node: victim,
+                counter: 1,
+            },
+            0,
+            now_secs(0),
+        );
+        // Destination node registers
+        let _ = s.handle(
+            dest_addr,
+            Message::Register {
+                node: dest_node,
+                counter: 1,
+            },
+            0,
+            now_secs(0),
+        );
+
+        // Lookup confirms legitimate address
+        let lookup_orig = s.handle(
+            attacker_addr,
+            Message::Lookup { node: victim },
+            1,
+            now_secs(1),
+        );
+        assert!(lookup_orig.iter().any(|(_, m)| matches!(
+            m,
+            Message::PeerInfo {
+                node,
+                reflexive,
+                ..
+            } if *node == victim && *reflexive == legitimate_addr
+        )));
+
+        // 2. Attacker attempts to overwrite `victim` registration with higher counter (GHSA-6h6h-828v-rr2w)
+        let hijack_resp = s.handle(
+            attacker_addr,
+            Message::Register {
+                node: victim,
+                counter: 999999,
+            },
+            2,
+            now_secs(2),
+        );
+        assert!(hijack_resp.is_empty());
+
+        // Lookup still returns the legitimate node address, NOT the attacker address
+        let lookup_after = s.handle(dest_addr, Message::Lookup { node: victim }, 3, now_secs(3));
+        assert!(lookup_after.iter().any(|(_, m)| matches!(
+            m,
+            Message::PeerInfo {
+                node,
+                reflexive,
+                ..
+            } if *node == victim && *reflexive == legitimate_addr
+        )));
+
+        // 3. Attacker attempts to spoof RelaySend claiming src=victim from attacker_addr
+        let spoofed_relay = s.handle(
+            attacker_addr,
+            Message::RelaySend {
+                src: victim,
+                dst: dest_node,
+                payload: b"forged payload".to_vec(),
+            },
+            4,
+            now_secs(4),
+        );
+        assert!(
+            spoofed_relay.is_empty(),
+            "spoofed RelaySend from unverified endpoint must be dropped"
+        );
+
+        // Legitimate relay from legitimate_addr succeeds
+        let legit_relay = s.handle(
+            legitimate_addr,
+            Message::RelaySend {
+                src: victim,
+                dst: dest_node,
+                payload: b"legitimate payload".to_vec(),
+            },
+            5,
+            now_secs(5),
+        );
+        assert_eq!(legit_relay.len(), 1);
+        assert_eq!(legit_relay[0].0, dest_addr);
+        assert_eq!(
+            legit_relay[0].1,
+            Message::RelayDeliver {
+                src: victim,
+                payload: b"legitimate payload".to_vec()
+            }
+        );
+    }
+
+    #[test]
     fn register_signed_rejects_historical_stale_record() {
         let (ca_pub, network_id, _rec, member_src) = valid_registration();
         let mut s = RendezvousServer::new_with_roots(0, vec![ca_pub], network_id);
@@ -1451,5 +1613,44 @@ mod tests {
             61,
         );
         assert!(relay_exp.is_empty());
+
+        // Test exact expiry boundary for claimed sender address validation:
+        let sender_node = [7u8; 16];
+        let target_node = [8u8; 16];
+        // Register sender expiring at 61_000 at address A
+        s.handle(
+            addr("192.0.2.10:5000"),
+            Message::Register {
+                node: sender_node,
+                counter: 1,
+            },
+            1_000,
+            1,
+        );
+        // Register target expiring at 70_000 at address B
+        s.handle(
+            addr("192.0.2.20:5000"),
+            Message::Register {
+                node: target_node,
+                counter: 1,
+            },
+            10_000,
+            10,
+        );
+        // At 61_000, sender_reg has expiry_ms == 61_000. It is expired (> 61_000 is false).
+        // A packet claiming sender_node from a different IP (192.0.2.30:5000) must not be dropped by the anti-hijack check,
+        // and should be successfully forwarded to target_node.
+        let fwd = s.handle(
+            addr("192.0.2.30:5000"),
+            Message::RelaySend {
+                src: sender_node,
+                dst: target_node,
+                payload: vec![9, 9],
+            },
+            61_000,
+            61,
+        );
+        assert_eq!(fwd.len(), 1);
+        assert_eq!(fwd[0].0, addr("192.0.2.20:5000"));
     }
 }

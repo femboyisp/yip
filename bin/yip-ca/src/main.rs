@@ -47,7 +47,7 @@ fn usage() -> String {
     "usage: yip-ca <genkey|sign-cert|sign-roots|dealer-gen|serve|enroll> [args]\n\
      \n\
      yip-ca genkey\n\
-     yip-ca sign-cert --member <hex32> --member-sign <hex32> --network <hex16> (--days <N> | --secs <N>) [--ca-private <hex>]\n\
+     yip-ca sign-cert --member <hex32> --member-sign <hex32> --network <hex16> (--days <N> | --secs <N>) [--ca-private <hex>] [--pq-key <hex>]\n\
      yip-ca sign-roots --roots <file> --version <N> [--ca-private <hex>]\n\
      yip-ca dealer-gen --threshold <T> --signers <N> --out-dir <DIR>\n\
      yip-ca serve --role <coordinator|signer> ...\n\
@@ -258,6 +258,12 @@ fn cmd_sign_cert(args: &[String]) -> Result<(), String> {
         .checked_add(validity)
         .ok_or_else(|| "validity window too large: overflow computing not_after".to_string())?;
 
+    let mut tags = Vec::new();
+    if let Some(pq_hex) = flags.get("pq-key") {
+        let pq_bytes = hex_decode(pq_hex)?;
+        tags.push((yip_membership::cert::TAG_PQ_ENCAPS_KEY, pq_bytes));
+    }
+
     let mut cert = Cert {
         version: 1,
         member_pubkey,
@@ -265,7 +271,7 @@ fn cmd_sign_cert(args: &[String]) -> Result<(), String> {
         network_id,
         not_before,
         not_after,
-        tags: vec![],
+        tags,
         ca_sig: [0u8; 64],
     };
     let sig = ca_key.sign(&cert_signing_body(&cert));

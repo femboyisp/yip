@@ -1002,6 +1002,24 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                                 continue;
                                             }
 
+                                            let is_ctrl = !payload.is_empty()
+                                                && payload[0] == crate::handshake::PacketType::Control as u8;
+                                            if num_shards > 1 && is_ctrl {
+                                                for k in 0..num_shards {
+                                                    if k != shard_id {
+                                                        if let Some(Some(ref tx)) = tx_channels.get(k) {
+                                                            push_spsc(
+                                                                tx,
+                                                                ShardMsg::ArqFeedback(
+                                                                    payload.to_vec(),
+                                                                    dg.src,
+                                                                ),
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+
                                             let out =
                                                 manager.on_udp(dg.src, payload, cached_now_ms);
                                             handle_dispatch_out(
@@ -1061,6 +1079,23 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                                 );
                                             }
                                         } else {
+                                            let is_ctrl = !payload.is_empty()
+                                                && payload[0] == crate::handshake::PacketType::Control as u8;
+                                            if num_shards > 1 && is_ctrl {
+                                                for k in 0..num_shards {
+                                                    if k != shard_id {
+                                                        if let Some(Some(ref tx)) = tx_channels.get(k) {
+                                                            push_spsc(
+                                                                tx,
+                                                                ShardMsg::ArqFeedback(
+                                                                    payload.to_vec(),
+                                                                    cfg.listen,
+                                                                ),
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             let out = manager.on_udp(cfg.listen, payload, cached_now_ms);
                                             handle_dispatch_out(
                                                 out,

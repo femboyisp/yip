@@ -49,7 +49,18 @@ pub fn cert_signing_body(c: &Cert) -> Vec<u8> {
     out
 }
 
+/// Certificate tag carrying a member's post-quantum encapsulation public key (ML-KEM).
+pub const TAG_PQ_ENCAPS_KEY: u8 = 1;
+
 impl Cert {
+    /// Retrieve the member's post-quantum encapsulation key from `tags` if present.
+    pub fn pq_encaps_key(&self) -> Option<&[u8]> {
+        self.tags
+            .iter()
+            .find(|(tag, _)| *tag == TAG_PQ_ENCAPS_KEY)
+            .map(|(_, val)| val.as_slice())
+    }
+
     /// Serialize `self` onto `out` (appends; caller clears if reusing):
     /// the signing body followed by the 64-byte `ca_sig`.
     pub fn encode(&self, out: &mut Vec<u8>) {
@@ -477,5 +488,17 @@ mod tests {
         let mut tampered = rs.clone();
         tampered.roots[0].1 = "192.0.2.200:6000".parse::<SocketAddr>().unwrap();
         assert!(!tampered.verify_rootset(&[ca_pub]));
+    }
+
+    #[test]
+    fn test_cert_pq_encaps_key_retrieval() {
+        let mut cert = make_cert(&ca(), [1u8; 32], [2u8; 16], 0, 100);
+        assert_eq!(cert.pq_encaps_key(), None);
+        cert.tags.push((99, vec![1, 2, 3]));
+        assert_eq!(cert.pq_encaps_key(), None);
+        cert.tags.push((TAG_PQ_ENCAPS_KEY, vec![0x42; 800]));
+        assert_eq!(cert.pq_encaps_key(), Some(&[0x42; 800][..]));
+        cert.tags.retain(|(tag, _)| *tag != TAG_PQ_ENCAPS_KEY);
+        assert_eq!(cert.pq_encaps_key(), None);
     }
 }

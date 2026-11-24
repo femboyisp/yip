@@ -220,6 +220,8 @@ struct Peer {
     kem: yip_crypto::PqKemAlgorithm,
     /// Whether `kem` was explicitly configured for this peer (vs inherited from default).
     explicit_kem: bool,
+    /// Optional post-quantum encapsulation public key for this peer (GHSA-cw9q-4c58-hv9p).
+    pq_public_key: Option<Vec<u8>>,
 
     /// This peer's UDP endpoint: the configured value until a `HandshakeInit`
     /// admission *learns* the actual observed source address (see
@@ -614,6 +616,7 @@ impl PeerManager {
                 addr,
                 kem: peer_kem,
                 explicit_kem,
+                pq_public_key: p.pq_public_key.clone(),
                 endpoint: p.endpoint,
                 state: PeerSessionState::Idle,
                 pending_tun: Vec::new(),
@@ -746,6 +749,7 @@ impl PeerManager {
             addr,
             kem: self.default_kem,
             explicit_kem: false,
+            pq_public_key: None,
             endpoint: endpoints.first().copied(),
             state: PeerSessionState::Idle,
             pending_tun: Vec::new(),
@@ -1657,7 +1661,7 @@ impl PeerManager {
         let endpoint = self.peers[idx].endpoint;
         if let PeerSessionState::Established(ref mut epochs) = self.peers[idx].state {
             if self.num_shards > 1 {
-                epochs
+                let _ = epochs
                     .current_mut()
                     .session_mut()
                     .set_stride(self.shard_id as u64, self.num_shards as u64);
@@ -1861,6 +1865,7 @@ impl PeerManager {
             addr,
             kem: peer_kem,
             explicit_kem,
+            pq_public_key: cfg.pq_public_key,
             endpoint: cfg.endpoint,
             state: PeerSessionState::Idle,
             pending_tun: Vec::new(),
@@ -2118,6 +2123,7 @@ impl PeerManager {
                 alias: p.alias.clone(),
                 transport: p.transport_name.clone(),
                 kem: Some(p.kem.as_str().to_string()),
+                pq_public_key: p.pq_public_key.as_deref().map(crate::config::hex_encode),
             })
             .collect();
 
