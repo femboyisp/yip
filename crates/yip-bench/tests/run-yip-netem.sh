@@ -64,11 +64,11 @@ GENKEY_A="$("$YIPD" --genkey)"
 GENKEY_B="$("$YIPD" --genkey)"
 
 PRIV_A="$(echo "$GENKEY_A" | grep '^private=' | cut -d= -f2)"
-PUB_A="$(echo "$GENKEY_A" | grep \'^public=\' | cut -d= -f2)"
-PQ_PUB_A="$(echo "$GENKEY_A" | grep \'^pq_public=\' | cut -d= -f2)"
+PUB_A="$(echo "$GENKEY_A" | grep '^public=' | cut -d= -f2)"
+PQ_PUB_A="$(echo "$GENKEY_A" | grep '^pq_public=' | cut -d= -f2)"
 PRIV_B="$(echo "$GENKEY_B" | grep '^private=' | cut -d= -f2)"
-PUB_B="$(echo "$GENKEY_B" | grep \'^public=\' | cut -d= -f2)"
-PQ_PUB_B="$(echo "$GENKEY_B" | grep \'^pq_public=\' | cut -d= -f2)"
+PUB_B="$(echo "$GENKEY_B" | grep '^public=' | cut -d= -f2)"
+PQ_PUB_B="$(echo "$GENKEY_B" | grep '^pq_public=' | cut -d= -f2)"
 
 # ── 2. write config files ─────────────────────────────────────────────────────
 CFG_A="$TMPDIR_TEST/yipA.conf"

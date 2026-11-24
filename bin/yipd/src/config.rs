@@ -671,6 +671,7 @@ impl Config {
         let mut global_kem: Option<yip_crypto::PqKemAlgorithm> = None;
         let mut legacy_peer_public: Option<[u8; 32]> = None;
         let mut legacy_peer_endpoint: Option<SocketAddr> = None;
+        let mut legacy_pq_public: Option<Vec<u8>> = None;
         let mut listen: Option<SocketAddr> = None;
         let mut listen_port_auto = false;
         let mut device: Option<String> = None;
@@ -1034,7 +1035,12 @@ impl Config {
                     }
                 }
                 "pq_public_key" | "pq_key" | "pq_pk" => {
-                    cur_pq_pk = Some(hex_decode_vec(val)?);
+                    let bytes = hex_decode_vec(val)?;
+                    if cur_pk.is_some() {
+                        cur_pq_pk = Some(bytes);
+                    } else {
+                        legacy_pq_public = Some(bytes);
+                    }
                 }
                 // Silently ignore unknown keys for forward-compatibility. The
                 // netns config files still contain `initiate=true|false` from
@@ -1051,13 +1057,13 @@ impl Config {
 
         // If no [peer] blocks, try legacy single-peer format
         if peers.is_empty() {
-            if let (Some(pk), Some(ep)) = (legacy_peer_public, legacy_peer_endpoint) {
+            if let Some(pk) = legacy_peer_public {
                 peers.push(PeerConfig {
                     public_key: pk,
-                    endpoint: Some(ep),
+                    endpoint: legacy_peer_endpoint,
                     alias: None,
-                    kem: None,
-                    pq_public_key: None,
+                    kem: global_kem,
+                    pq_public_key: legacy_pq_public,
                 });
             }
         }
@@ -1336,6 +1342,23 @@ mod tests {
         assert!(!c.xdp);
         assert_eq!(c.xdp_ifname, None);
         assert_eq!(c.xdp_mode, None);
+    }
+
+    #[test]
+    fn parse_config_legacy_peer_with_pq_public_key() {
+        let text = "device=yip0\nlisten=0.0.0.0:443\npeer_endpoint=10.0.0.2:443\n\
+                    local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
+                    local_public=00000000000000000000000000000000000000000000000000000000000000aa\n\
+                    peer_public=00000000000000000000000000000000000000000000000000000000000000bb\n\
+                    pq_public_key=deadbeef\n";
+        let c = Config::parse(text).unwrap();
+        assert_eq!(c.peers.len(), 1);
+        assert_eq!(c.peers[0].public_key[31], 0xbb);
+        assert_eq!(c.peers[0].endpoint, Some("10.0.0.2:443".parse().unwrap()));
+        assert_eq!(
+            c.peers[0].pq_public_key.as_deref(),
+            Some(&[0xde, 0xad, 0xbe, 0xef][..])
+        );
     }
 
     #[test]
