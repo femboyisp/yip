@@ -672,6 +672,9 @@ fn create_peer_manager(
         membership,
         relay_only,
     );
+    if let Some(allow) = config.allow_plaintext_gossip {
+        manager.allow_plaintext_gossip = allow;
+    }
     manager.set_obf_psk(config.obf_psk);
     manager.set_cover_traffic_ms(config.cover_traffic_ms);
     manager.set_traffic_defense(config.traffic_defense.clone());

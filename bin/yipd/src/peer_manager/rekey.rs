@@ -155,6 +155,7 @@ impl PeerManager {
                 retry_ms,
                 target,
             });
+            epochs.force_rekey = false;
             let pkts = if init_pkt.len() > 1400 {
                 yip_wire::fragment::chunk_handshake_datagram(
                     &init_pkt,

@@ -45,6 +45,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 yip-ca = { workspace = true }
 ed25519-dalek = { version = "3" }
+zeroize = "1.8"
 
 [dev-dependencies]
 ed25519-dalek = { version = "3", default-features = false }

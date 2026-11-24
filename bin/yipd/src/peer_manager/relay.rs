@@ -142,7 +142,11 @@ impl PeerManager {
         } else if payload[0] == PacketType::EncryptedControl as u8 {
             self.relayed_encrypted_control(idx, payload, now_ms)
         } else if self.membership.is_some() && payload[0] == PacketType::Gossip as u8 {
-            self.relayed_gossip(idx, payload, now_ms)
+            if self.allow_plaintext_gossip {
+                self.relayed_gossip(idx, payload, now_ms)
+            } else {
+                DispatchOut::None
+            }
         } else {
             self.relayed_data(idx, payload, now_ms)
         }
@@ -162,12 +166,7 @@ impl PeerManager {
             .map(Membership::own_cert_bytes)
             .unwrap_or_default();
         let (established, resp_pkt, remote_static, initiator_payload) =
-            match HandshakeState::start_responder_with_kem(
-                &self.local_priv,
-                dg,
-                &resp_payload,
-                self.default_kem,
-            ) {
+            match HandshakeState::start_responder(&self.local_priv, dg, &resp_payload) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("peer_manager: relayed start_responder failed: {e}");
@@ -608,7 +607,10 @@ impl PeerManager {
                 let Some(est) = self.peers[idx].state.as_established_mut() else {
                     break;
                 };
-                seal_gossip_reply(est, reply, target_bucket)
+                match seal_gossip_reply(est, reply, target_bucket) {
+                    Some(b) => b,
+                    None => continue,
+                }
             };
             if let Some(d) = self.relay_wrap(idx, bytes) {
                 self.egress.push(d);

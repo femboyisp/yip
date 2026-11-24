@@ -3,6 +3,7 @@
 
 use crate::handshake::PacketType;
 use yip_crypto::{ChaCha20Poly1305Cipher, ReplayWindow};
+use zeroize::Zeroize;
 
 /// Inner payload type for gossip anti-entropy records.
 pub const INNER_TYPE_GOSSIP: u8 = 0x01;
@@ -76,6 +77,13 @@ impl std::fmt::Debug for ControlCodec {
     }
 }
 
+impl Drop for ControlCodec {
+    fn drop(&mut self) {
+        self.send_key.zeroize();
+        self.recv_key.zeroize();
+    }
+}
+
 impl Clone for ControlCodec {
     fn clone(&self) -> Self {
         Self::new(self.send_key, self.recv_key)
@@ -111,20 +119,19 @@ impl ControlCodec {
         );
         let min_plain_len = 3 + inner_len;
         let plain_len = min_plain_len.max(target_bucket.saturating_sub(1 + 8 + 16));
-        let mut buf = vec![0u8; plain_len + 16];
-        buf[0] = inner_type;
-        buf[1..3].copy_from_slice(&(inner_len as u16).to_be_bytes());
-        buf[3..3 + inner_len].copy_from_slice(payload);
-        // Trailing bytes in buf[3 + inner_len..plain_len] remain 0x00 padding
+        let total_len = 1 + 8 + plain_len + 16;
+        let mut out = vec![0u8; total_len];
+        out[0] = PacketType::EncryptedControl as u8;
+        out[1..9].copy_from_slice(&nonce.to_le_bytes());
+        out[9] = inner_type;
+        out[10..12].copy_from_slice(&(inner_len as u16).to_be_bytes());
+        out[12..12 + inner_len].copy_from_slice(payload);
+        // Trailing bytes in out[12 + inner_len..9 + plain_len] remain 0x00 padding
 
         self.send_cipher
-            .seal_in_place(nonce, &mut buf, plain_len)
+            .seal_in_place(nonce, &mut out[9..], plain_len)
             .expect("seal buffer capacity is sufficient");
 
-        let mut out = Vec::with_capacity(1 + 8 + buf.len());
-        out.push(PacketType::EncryptedControl as u8);
-        out.extend_from_slice(&nonce.to_le_bytes());
-        out.extend_from_slice(&buf);
         out
     }
 

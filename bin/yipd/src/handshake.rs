@@ -410,7 +410,7 @@ pub fn tai64n_sub_duration(
 /// Maximum length of an initiator's cert payload (280 bytes).
 /// Keeps Flight 1 length well within the 320-byte gap between ML-KEM-512 (base 864 B)
 /// and ML-KEM-768 (base 1184 B), ensuring length-based KEM algorithm deduction remains unambiguous.
-pub const MAX_INIT_CERT_LEN: usize = 2048;
+pub const MAX_INIT_CERT_LEN: usize = 280;
 
 /// Build the msg1 Noise payload: the anti-replay TAI64N label followed by the
 /// (optional) membership cert. Empty `cert` (2a/2b) yields a 12-byte payload.

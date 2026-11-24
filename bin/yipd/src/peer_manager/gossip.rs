@@ -1,23 +1,36 @@
 //! Mesh gossip: digest targets, periodic gossip tick, inbound gossip handling.
 use super::*;
 
+/// Maximum send nonce before refusing to seal control frames to avoid nonce reuse.
+pub const CTRL_NONCE_REKEY_THRESHOLD: u64 = u64::MAX - 1024;
+
 /// Seal an inner gossip message into an authenticated, uniformly-padded
 /// encrypted control datagram (#207).
+///
+/// Returns `None` if the control send nonce has saturated (`>= u64::MAX - 1024`),
+/// logging a warning and triggering a session rekey to prevent nonce reuse in ChaCha20-Poly1305.
 pub(super) fn seal_gossip_reply<S: ControlSession + ?Sized>(
     est: &mut S,
     msg: &GossipMsg,
     target_bucket: usize,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
+    let nonce = est.ctrl_send_nonce();
+    if nonce >= CTRL_NONCE_REKEY_THRESHOLD {
+        eprintln!(
+            "peer_manager: control send nonce saturated ({nonce}), refusing to seal and triggering rekey"
+        );
+        est.trigger_rekey();
+        return None;
+    }
+    est.set_ctrl_send_nonce(nonce.saturating_add(1));
     let mut raw = Vec::new();
     msg.encode(&mut raw);
-    let nonce = est.ctrl_send_nonce();
-    est.set_ctrl_send_nonce(nonce.saturating_add(1));
-    est.ctrl_codec().seal(
+    Some(est.ctrl_codec().seal(
         nonce,
         crate::control_codec::INNER_TYPE_GOSSIP,
         &raw,
         target_bucket,
-    )
+    ))
 }
 
 impl PeerManager {
@@ -39,7 +52,8 @@ impl PeerManager {
             let Some(est) = self.peers[peer_idx].state.as_established_mut() else {
                 return DispatchOut::None;
             };
-            match est.ctrl_codec.open(&mut est.ctrl_replay, dg) {
+            let dp = &mut est.current;
+            match dp.ctrl_codec.open(&mut dp.ctrl_replay, dg) {
                 Ok(res) => res,
                 Err(_) => return DispatchOut::None,
             }
@@ -70,7 +84,10 @@ impl PeerManager {
                 let Some(est) = self.peers[peer_idx].state.as_established_mut() else {
                     break;
                 };
-                seal_gossip_reply(est, reply, target_bucket)
+                match seal_gossip_reply(est, reply, target_bucket) {
+                    Some(b) => b,
+                    None => continue,
+                }
             };
             if relay {
                 if let Some(d) = self.relay_wrap(peer_idx, bytes) {
@@ -162,7 +179,10 @@ impl PeerManager {
                 let Some(est) = self.peers[peer_idx].state.as_established_mut() else {
                     break;
                 };
-                seal_gossip_reply(est, reply, target_bucket)
+                match seal_gossip_reply(est, reply, target_bucket) {
+                    Some(b) => b,
+                    None => continue,
+                }
             };
             if relay {
                 if let Some(d) = self.relay_wrap(peer_idx, bytes) {
@@ -232,7 +252,10 @@ impl PeerManager {
                     let Some(est) = self.peers[peer_idx].state.as_established_mut() else {
                         continue;
                     };
-                    seal_gossip_reply(est, &digest, target_bucket)
+                    match seal_gossip_reply(est, &digest, target_bucket) {
+                        Some(b) => b,
+                        None => continue,
+                    }
                 };
                 if relay {
                     if let Some(d) = self.relay_wrap(peer_idx, bytes) {
@@ -674,6 +697,125 @@ mod tests {
         assert!(
             matches!(invalid_out, DispatchOut::None),
             "control datagram with invalid inner type must be dropped"
+        );
+    }
+
+    #[test]
+    fn test_seal_gossip_reply_nonce_saturation_triggers_rekey() {
+        let auth_key = [0x55u8; 16];
+        let (init_ctrl, resp_ctrl) = derive_control_keys(&auth_key);
+        let ctrl_codec = ControlCodec::new(init_ctrl, resp_ctrl);
+
+        let local_est = crate::handshake::Established {
+            session: yip_crypto::Session::from_raw_keys(&[1u8; 32], &[2u8; 32], 0, 1).unwrap(),
+            auth_key,
+            hp_key: [0u8; 16],
+            raw_send_key: [1u8; 32],
+            raw_recv_key: [2u8; 32],
+            ctrl_codec,
+            ctrl_send_nonce: CTRL_NONCE_REKEY_THRESHOLD - 1,
+            ctrl_replay: ReplayWindow::new(),
+        };
+
+        const TAG: u64 = 0x9988_7766_5544_3322;
+        let peer_ep: SocketAddr = "192.0.2.11:51820".parse().unwrap();
+        let dp = DataPlane::new(local_est, TAG, TunnelMode::L3Tun, peer_ep, false, 1200);
+        let mut epochs = crate::epoch::EpochSet::new(Box::new(dp), 0);
+
+        let msg = GossipMsg::PullRequest(vec![]);
+
+        // 1. Nonce just below threshold: sealing succeeds, nonce increments
+        assert_eq!(epochs.ctrl_send_nonce(), CTRL_NONCE_REKEY_THRESHOLD - 1);
+        let sealed_ok = seal_gossip_reply(&mut epochs, &msg, 128);
+        assert!(sealed_ok.is_some());
+        assert_eq!(epochs.ctrl_send_nonce(), CTRL_NONCE_REKEY_THRESHOLD);
+        assert!(!epochs.is_rekey_forced());
+
+        // 2. Nonce reaches threshold: sealing refused, returns None, nonce not reused, rekey triggered
+        let sealed_fail = seal_gossip_reply(&mut epochs, &msg, 128);
+        assert!(sealed_fail.is_none());
+        assert_eq!(epochs.ctrl_send_nonce(), CTRL_NONCE_REKEY_THRESHOLD);
+        assert!(epochs.is_rekey_forced());
+        assert!(epochs.needs_rekey(0, false, 30_000));
+
+        // 3. Nonce at u64::MAX: sealing refused, returns None, rekey still forced
+        epochs.set_ctrl_send_nonce(u64::MAX);
+        let sealed_max = seal_gossip_reply(&mut epochs, &msg, 128);
+        assert!(sealed_max.is_none());
+        assert_eq!(epochs.ctrl_send_nonce(), u64::MAX);
+        assert!(epochs.is_rekey_forced());
+    }
+
+    #[test]
+    fn test_allow_plaintext_gossip_flag_enforcement() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let peer = generate_keypair();
+        let peer_ep: SocketAddr = "192.0.2.40:5000".parse().unwrap();
+
+        let cfg = PeerConfig {
+            public_key: peer.public,
+            endpoint: Some(peer_ep),
+            alias: None,
+            kem: None,
+            pq_public_key: None,
+        };
+        let mut pm = PeerManager::new(
+            local.private,
+            local.public,
+            &[cfg],
+            TunnelMode::L3Tun,
+            None,
+            Some(membership_for(&ca, local.public)),
+            false,
+        );
+
+        let auth_key = [0x33u8; 16];
+        let (init_ctrl, resp_ctrl) = derive_control_keys(&auth_key);
+        let local_est = crate::handshake::Established {
+            session: yip_crypto::Session::from_raw_keys(&[1u8; 32], &[2u8; 32], 0, 1).unwrap(),
+            auth_key,
+            hp_key: [0u8; 16],
+            raw_send_key: [1u8; 32],
+            raw_recv_key: [2u8; 32],
+            ctrl_codec: ControlCodec::new(init_ctrl, resp_ctrl),
+            ctrl_send_nonce: 0,
+            ctrl_replay: ReplayWindow::new(),
+        };
+
+        const TAG: u64 = 0x1234_5678_9abc_def0;
+        let dp = DataPlane::new(local_est, TAG, TunnelMode::L3Tun, peer_ep, false, 1200);
+        pm.peers[0].state =
+            PeerSessionState::Established(Box::new(crate::epoch::EpochSet::new(Box::new(dp), 0)));
+        pm.by_tag.insert(TAG, 0);
+
+        // Populate a member record to return
+        let other = generate_keypair();
+        let other_rec = mk_record(&ca, 202, other.public, vec![peer_ep], 1);
+        assert!(pm
+            .membership
+            .as_mut()
+            .unwrap()
+            .ingest_record(other_rec.clone(), now_secs()));
+
+        let pull = GossipMsg::PullRequest(vec![yip_membership::node_id(&other.public)]);
+        let mut gossip_dg = vec![PacketType::Gossip as u8];
+        pull.encode(&mut gossip_dg);
+
+        // 1. With allow_plaintext_gossip = true (default), unencrypted gossip is processed
+        assert!(pm.allow_plaintext_gossip);
+        let out_allowed = pm.on_udp(peer_ep, &gossip_dg, 0);
+        assert!(
+            matches!(out_allowed, DispatchOut::Udp(_)),
+            "plaintext gossip must be processed when allow_plaintext_gossip is true"
+        );
+
+        // 2. With allow_plaintext_gossip = false, unencrypted gossip is dropped
+        pm.allow_plaintext_gossip = false;
+        let out_dropped = pm.on_udp(peer_ep, &gossip_dg, 0);
+        assert!(
+            matches!(out_dropped, DispatchOut::None),
+            "plaintext gossip must be dropped when allow_plaintext_gossip is false"
         );
     }
 }

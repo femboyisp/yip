@@ -77,6 +77,7 @@ pub struct EpochSet {
     pub(crate) previous: Option<Box<DataPlane>>,
     pub(crate) previous_retire_ms: u64,
     pub(crate) rekey: Option<RekeyInFlight>,
+    pub(crate) force_rekey: bool,
     pub(crate) epoch: u64,
 }
 
@@ -89,6 +90,7 @@ impl EpochSet {
             previous: None,
             previous_retire_ms: 0,
             rekey: None,
+            force_rekey: false,
             epoch: 1,
         }
     }
@@ -296,6 +298,7 @@ impl EpochSet {
         self.previous = Some(old);
         self.previous_retire_ms = now_ms.saturating_add(PREVIOUS_EPOCH_GRACE_MS);
         self.rekey = None;
+        self.force_rekey = false;
         self.epoch = self.epoch.saturating_add(1);
     }
 
@@ -337,12 +340,26 @@ impl EpochSet {
         }
     }
 
+    /// Trigger an immediate session rekey at the next scheduler opportunity.
+    pub fn trigger_rekey(&mut self) {
+        self.force_rekey = true;
+    }
+
+    /// Whether an immediate rekey has been triggered.
+    pub fn is_rekey_forced(&self) -> bool {
+        self.force_rekey
+    }
+
     /// Initiator schedule: rekey when `current` is old enough, none in flight,
     /// and this side is the glare-winner — OR the loser-fallback fires
-    /// (`current` aged past 2× the interval and the winner never rekeyed).
+    /// (`current` aged past 2× the interval and the winner never rekeyed),
+    /// OR a forced rekey was requested (e.g. control nonce saturation).
     pub fn needs_rekey(&self, now_ms: u64, is_glare_winner: bool, interval_ms: u64) -> bool {
         if self.rekey.is_some() {
             return false;
+        }
+        if self.force_rekey {
+            return true;
         }
         let age = now_ms.saturating_sub(self.current_created_ms);
         if is_glare_winner {

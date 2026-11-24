@@ -3327,6 +3327,7 @@ dependencies = [
  "yip-utls",
  "yip-verify",
  "yip-wire",
+ "zeroize",
 ]
 
 [[package]]

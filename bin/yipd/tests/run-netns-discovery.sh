@@ -121,17 +121,17 @@ ADDR_R="$("$YIPD" --addr "$PUB_R")"
 echo "[setup] node_addr A=$ADDR_A B=$ADDR_B R=$ADDR_R"
 
 sign_cert() {
-    local member_pub="$1" member_sign_pub="$2" pq_pub="$3"
+    local member_pub="$1" member_sign_pub="$2"
     echo "$CA_PRIV" | "$YIPCA" sign-cert \
         --member "$member_pub" --member-sign "$member_sign_pub" \
-        --network "$NETWORK_ID" --days 30 --pq-key "$pq_pub"
+        --network "$NETWORK_ID" --days 30
 }
 CERT_A_FILE="$TMPDIR_TEST/certA.hex"
 CERT_B_FILE="$TMPDIR_TEST/certB.hex"
 CERT_R_FILE="$TMPDIR_TEST/certR.hex"
-sign_cert "$PUB_A" "$SIGNPUB_A" "$PQ_PUB_A" > "$CERT_A_FILE"
-sign_cert "$PUB_B" "$SIGNPUB_B" "$PQ_PUB_B" > "$CERT_B_FILE"
-sign_cert "$PUB_R" "$SIGNPUB_R" "$PQ_PUB_R" > "$CERT_R_FILE"
+sign_cert "$PUB_A" "$SIGNPUB_A" > "$CERT_A_FILE"
+sign_cert "$PUB_B" "$SIGNPUB_B" > "$CERT_B_FILE"
+sign_cert "$PUB_R" "$SIGNPUB_R" > "$CERT_R_FILE"
 
 ROOTS_IN="$TMPDIR_TEST/roots.in"
 echo "$PUB_R ${IP_R}:${PORT}" > "$ROOTS_IN"

@@ -208,9 +208,9 @@ enum PeerSessionState {
 }
 
 impl PeerSessionState {
-    pub(crate) fn as_established_mut(&mut self) -> Option<&mut crate::dataplane::DataPlane> {
+    pub(crate) fn as_established_mut(&mut self) -> Option<&mut crate::epoch::EpochSet> {
         match self {
-            PeerSessionState::Established(epochs) => Some(&mut epochs.current),
+            PeerSessionState::Established(epochs) => Some(epochs),
             _ => None,
         }
     }
@@ -221,6 +221,7 @@ pub(crate) trait ControlSession {
     fn ctrl_codec(&self) -> &crate::control_codec::ControlCodec;
     fn ctrl_send_nonce(&self) -> u64;
     fn set_ctrl_send_nonce(&mut self, nonce: u64);
+    fn trigger_rekey(&mut self);
 }
 
 impl ControlSession for crate::handshake::Established {
@@ -233,6 +234,7 @@ impl ControlSession for crate::handshake::Established {
     fn set_ctrl_send_nonce(&mut self, nonce: u64) {
         self.ctrl_send_nonce = nonce;
     }
+    fn trigger_rekey(&mut self) {}
 }
 
 impl ControlSession for crate::dataplane::DataPlane {
@@ -245,6 +247,7 @@ impl ControlSession for crate::dataplane::DataPlane {
     fn set_ctrl_send_nonce(&mut self, nonce: u64) {
         self.ctrl_send_nonce = nonce;
     }
+    fn trigger_rekey(&mut self) {}
 }
 
 impl ControlSession for crate::epoch::EpochSet {
@@ -256,6 +259,9 @@ impl ControlSession for crate::epoch::EpochSet {
     }
     fn set_ctrl_send_nonce(&mut self, nonce: u64) {
         self.current.ctrl_send_nonce = nonce;
+    }
+    fn trigger_rekey(&mut self) {
+        self.trigger_rekey();
     }
 }
 
@@ -565,6 +571,8 @@ pub struct PeerManager {
     config_path: Option<std::path::PathBuf>,
     /// Configured TUN device MTU.
     mtu: u32,
+    /// Whether unencrypted plaintext gossip is permitted (#207).
+    pub allow_plaintext_gossip: bool,
 }
 
 /// Summary report returned after a dynamic configuration reload.
@@ -752,6 +760,7 @@ impl PeerManager {
             last_metrics_update_ms: 0,
             config_path: None,
             mtu: 1420,
+            allow_plaintext_gossip: true,
         };
 
         // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
@@ -2611,7 +2620,11 @@ impl PeerManager {
             // Membership anti-entropy: a self-verifying gossip datagram. Only
             // reached with membership configured — a pure-2a/2b deployment never
             // sees `Gossip` traffic, so this branch is byte-identical there.
-            self.on_gossip(src, dg, now_ms)
+            if self.allow_plaintext_gossip {
+                self.on_gossip(src, dg, now_ms)
+            } else {
+                DispatchOut::None
+            }
         } else {
             self.handle_data_or_control(src, dg, now_ms)
         }
