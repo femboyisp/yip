@@ -129,6 +129,11 @@ network_id=${NETWORK_ID}
 cert=${certfile}
 roots=${ROOTS_FILE}
 EOF
+    if [ "$file" != "$CFG_R" ]; then
+        echo "peer_public=${PUB_R}" >> "$file"
+        echo "peer_endpoint=${IP_R}:${PORT}" >> "$file"
+        echo "pq_public_key=${PQ_PUB_R}" >> "$file"
+    fi
 }
 write_mesh_cfg "$CFG_A" "$PRIV_A" "$PUB_A" "$IP_A" "$CERT_A_FILE" "$SIGNPRIV_A"
 write_mesh_cfg "$CFG_B" "$PRIV_B" "$PUB_B" "$IP_B" "$CERT_B_FILE" "$SIGNPRIV_B"
