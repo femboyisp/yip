@@ -409,12 +409,16 @@ fn test_session_epoch_replication_across_shards() {
     assert_eq!(ini_recv_k, res_send_k);
 
     let num_shards = 4;
+    let (init_ctrl, resp_ctrl) = yipd::control_codec::derive_control_keys(&[1u8; 16]);
     let base_est = Established {
         session: ini.into_session().unwrap(),
         auth_key: [1u8; 16],
         hp_key: [2u8; 16],
         raw_send_key: ini_send_k,
         raw_recv_key: ini_recv_k,
+        ctrl_codec: yipd::control_codec::ControlCodec::new(init_ctrl, resp_ctrl),
+        ctrl_send_nonce: 0,
+        ctrl_replay: yip_crypto::ReplayWindow::new(),
     };
 
     // Replicate across shards

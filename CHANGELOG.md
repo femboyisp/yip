@@ -22,6 +22,10 @@ All notable changes to this project are documented here, following
   - Added strict SHA-256 verification before extracting `musl.cc` cross-compilation toolchains in the release workflow.
 
 ### Added
+- **In-Session Authenticated Encryption for Anti-Entropy Gossip (`bin/yipd`, #207).**
+  - Implemented authenticated encryption for membership anti-entropy gossip control frames using `PacketType::EncryptedControl` (type 6), eliminating plaintext gossip and directory metadata leakage across established sessions.
+  - Added `ControlCodec` with ChaCha20-Poly1305 authenticated encryption, independent directional keys derived from session authentication secrets, monotonic 64-bit anti-replay window tracking, and uniform padding to `OBF_MTU_BUDGET` (1420 bytes).
+  - Integrated encrypted control frame dispatch into `PeerManager`, supporting direct and relayed gossip emission, sharded worker dispatch to Shard 0, and netns integration verification.
 - **Post-Quantum ML-KEM-768 Handshake Upgrade, ML-KEM-1024 Support & Wire Fragmentation (`crates/yip-crypto`, `crates/yip-wire`, `crates/yip-proto`, `bin/yipd`, `crates/yip-bench`, #246).**
   - Upgraded the default post-quantum hybrid handshake protocol from ML-KEM-512 to ML-KEM-768 (`PQNoise_IKpsk2_25519_MLKEM768_ChaChaPoly_BLAKE3`), offering NIST Category 3 post-quantum security by default while maintaining single-RTT sub-1400B datagram sizes fitting within standard 1500B Ethernet frames.
   - Added full support for NIST Category 5 `ML-KEM-1024` and NIST Category 1 `ML-KEM-512` parameter sets, configured via global or per-peer `kem = "mlkem768" | "mlkem1024" | "mlkem512"` in configuration files and `--kem` CLI option.

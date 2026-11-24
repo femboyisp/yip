@@ -207,6 +207,64 @@ enum PeerSessionState {
     Established(Box<crate::epoch::EpochSet>),
 }
 
+impl PeerSessionState {
+    pub(crate) fn as_established_mut(&mut self) -> Option<&mut crate::epoch::EpochSet> {
+        match self {
+            PeerSessionState::Established(epochs) => Some(epochs),
+            _ => None,
+        }
+    }
+}
+
+/// In-session control channel accessor for sealing encrypted control frames.
+pub(crate) trait ControlSession {
+    fn ctrl_codec(&self) -> &crate::control_codec::ControlCodec;
+    fn ctrl_send_nonce(&self) -> u64;
+    fn set_ctrl_send_nonce(&mut self, nonce: u64);
+    fn trigger_rekey(&mut self);
+}
+
+impl ControlSession for crate::handshake::Established {
+    fn ctrl_codec(&self) -> &crate::control_codec::ControlCodec {
+        &self.ctrl_codec
+    }
+    fn ctrl_send_nonce(&self) -> u64 {
+        self.ctrl_send_nonce
+    }
+    fn set_ctrl_send_nonce(&mut self, nonce: u64) {
+        self.ctrl_send_nonce = nonce;
+    }
+    fn trigger_rekey(&mut self) {}
+}
+
+impl ControlSession for crate::dataplane::DataPlane {
+    fn ctrl_codec(&self) -> &crate::control_codec::ControlCodec {
+        &self.ctrl_codec
+    }
+    fn ctrl_send_nonce(&self) -> u64 {
+        self.ctrl_send_nonce
+    }
+    fn set_ctrl_send_nonce(&mut self, nonce: u64) {
+        self.ctrl_send_nonce = nonce;
+    }
+    fn trigger_rekey(&mut self) {}
+}
+
+impl ControlSession for crate::epoch::EpochSet {
+    fn ctrl_codec(&self) -> &crate::control_codec::ControlCodec {
+        &self.current.ctrl_codec
+    }
+    fn ctrl_send_nonce(&self) -> u64 {
+        self.current.ctrl_send_nonce
+    }
+    fn set_ctrl_send_nonce(&mut self, nonce: u64) {
+        self.current.ctrl_send_nonce = nonce;
+    }
+    fn trigger_rekey(&mut self) {
+        self.trigger_rekey();
+    }
+}
+
 /// One configured remote peer plus its live handshake/session state.
 struct Peer {
     pubkey: [u8; 32],
@@ -513,6 +571,8 @@ pub struct PeerManager {
     config_path: Option<std::path::PathBuf>,
     /// Configured TUN device MTU.
     mtu: u32,
+    /// Whether unencrypted plaintext gossip is permitted (#207).
+    pub allow_plaintext_gossip: bool,
 }
 
 /// Summary report returned after a dynamic configuration reload.
@@ -700,6 +760,7 @@ impl PeerManager {
             last_metrics_update_ms: 0,
             config_path: None,
             mtu: 1420,
+            allow_plaintext_gossip: true,
         };
 
         // Roots are pre-vetted (CA-signed root set) and therefore always-admit,
@@ -1770,6 +1831,11 @@ impl PeerManager {
         self.fec_config
     }
 
+    #[cfg(test)]
+    pub(crate) fn drain_tick_egress(&mut self) -> Vec<EgressDatagram> {
+        std::mem::take(&mut self.tick_egress)
+    }
+
     /// Dynamically update the FEC configuration across all established sessions.
     pub fn set_fec_config(&mut self, config: crate::control::FecConfig) {
         self.fec_config = config;
@@ -2548,11 +2614,17 @@ impl PeerManager {
                 }
                 _ => DispatchOut::None,
             }
+        } else if dg[0] == PacketType::EncryptedControl as u8 {
+            self.on_encrypted_control(src, dg, now_ms)
         } else if self.membership.is_some() && dg[0] == PacketType::Gossip as u8 {
             // Membership anti-entropy: a self-verifying gossip datagram. Only
             // reached with membership configured — a pure-2a/2b deployment never
             // sees `Gossip` traffic, so this branch is byte-identical there.
-            self.on_gossip(src, dg, now_ms)
+            if self.allow_plaintext_gossip {
+                self.on_gossip(src, dg, now_ms)
+            } else {
+                DispatchOut::None
+            }
         } else {
             self.handle_data_or_control(src, dg, now_ms)
         }
@@ -2997,16 +3069,27 @@ impl PeerManager {
                         } else {
                             HANDSHAKE_RETRY_MS
                         };
-                        if relay {
-                            if let Some(d) = self.relay_wrap(i, handshaking.init_pkt.clone()) {
-                                self.tick_egress.push(d);
-                            }
+                        let pkts = if handshaking.init_pkt.len() > 1400 {
+                            yip_wire::fragment::chunk_handshake_datagram(
+                                &handshaking.init_pkt,
+                                1400,
+                                self.junk_rng.next_u64() as u32,
+                            )
                         } else {
-                            self.tick_egress.push(EgressDatagram {
-                                fate: 0,
-                                dst: handshaking.target,
-                                bytes: handshaking.init_pkt.clone(),
-                            });
+                            vec![handshaking.init_pkt.clone()]
+                        };
+                        for pkt in pkts {
+                            if relay {
+                                if let Some(d) = self.relay_wrap(i, pkt) {
+                                    self.tick_egress.push(d);
+                                }
+                            } else {
+                                self.tick_egress.push(EgressDatagram {
+                                    fate: 0,
+                                    dst: handshaking.target,
+                                    bytes: pkt,
+                                });
+                            }
                         }
                         PeerSessionState::Handshaking(handshaking)
                     }

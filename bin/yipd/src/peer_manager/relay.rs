@@ -1,4 +1,5 @@
 //! Relay/rendezvous path: relay-wrapping egress, rendezvous events, relayed handshake/data handling.
+use super::gossip::seal_gossip_reply;
 use super::*;
 
 impl PeerManager {
@@ -138,8 +139,14 @@ impl PeerManager {
             self.relayed_handshake_init(idx, payload, now_ms)
         } else if payload[0] == PacketType::HandshakeResp as u8 {
             self.relayed_handshake_resp(idx, payload, now_ms)
+        } else if payload[0] == PacketType::EncryptedControl as u8 {
+            self.relayed_encrypted_control(idx, payload, now_ms)
         } else if self.membership.is_some() && payload[0] == PacketType::Gossip as u8 {
-            self.relayed_gossip(idx, payload, now_ms)
+            if self.allow_plaintext_gossip {
+                self.relayed_gossip(idx, payload, now_ms)
+            } else {
+                DispatchOut::None
+            }
         } else {
             self.relayed_data(idx, payload, now_ms)
         }
@@ -159,7 +166,12 @@ impl PeerManager {
             .map(Membership::own_cert_bytes)
             .unwrap_or_default();
         let (established, resp_pkt, remote_static, initiator_payload) =
-            match HandshakeState::start_responder(&self.local_priv, dg, &resp_payload) {
+            match HandshakeState::start_responder_with_kem(
+                &self.local_priv,
+                dg,
+                &resp_payload,
+                self.default_kem,
+            ) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("peer_manager: relayed start_responder failed: {e}");
@@ -559,10 +571,24 @@ impl PeerManager {
         }
     }
 
+    /// Relay-path counterpart of `on_encrypted_control`: handle an inbound relayed
+    /// `[EncryptedControl]` datagram from peer `idx`.
+    fn relayed_encrypted_control(
+        &mut self,
+        idx: usize,
+        payload: &[u8],
+        _now_ms: u64,
+    ) -> DispatchOut<'_> {
+        if !matches!(self.peers[idx].state, PeerSessionState::Established(_)) {
+            return DispatchOut::None;
+        }
+        self.process_encrypted_control(idx, payload)
+    }
+
     /// Relay-path counterpart of `on_gossip`: handle an inbound relayed `[Gossip]`
     /// datagram from peer `idx`. Feeds the decoded `GossipMsg` to
     /// `Membership::on_gossip` and emits bounded reply datagrams relay-wrapped
-    /// back through the server.
+    /// back through the server sealed as encrypted control frames (#207).
     ///
     /// Fail-closed gate: strictly restricted to peers in `PeerSessionState::Established`.
     fn relayed_gossip(&mut self, idx: usize, dg: &[u8], _now_ms: u64) -> DispatchOut<'_> {
@@ -580,10 +606,16 @@ impl PeerManager {
             return DispatchOut::None;
         }
         self.egress.clear();
+        let target_bucket = OBF_MTU_BUDGET;
         for reply in replies.iter().take(MAX_GOSSIP_REPLIES) {
-            let mut bytes = Vec::new();
-            bytes.push(PacketType::Gossip as u8);
-            reply.encode(&mut bytes);
+            let Some(bytes) = ({
+                let Some(est) = self.peers[idx].state.as_established_mut() else {
+                    break;
+                };
+                seal_gossip_reply(est, reply, target_bucket)
+            }) else {
+                continue;
+            };
             if let Some(d) = self.relay_wrap(idx, bytes) {
                 self.egress.push(d);
             }
@@ -1625,19 +1657,36 @@ mod tests {
 
         // Establish a session over relay
         let t1 = crate::handshake::now_tai64n();
-        let (_hs1, init_pkt_1) = HandshakeState::start_initiator(
+        let (hs1, init_pkt_1) = HandshakeState::start_initiator(
             &peer_kp.private,
             &local.public,
             &init_payload_with_ts(t1, &peer_cert_bytes),
         )
         .unwrap();
-        let out1 = pm.on_udp(mock_server(), &relay_deliver(&peer_kp, init_pkt_1), 0);
-        assert!(has_relayed_handshake_resp(&out1));
+        let resp_payload = {
+            let out1 = pm.on_udp(mock_server(), &relay_deliver(&peer_kp, init_pkt_1), 0);
+            assert!(has_relayed_handshake_resp(&out1));
+            match &out1 {
+                DispatchOut::Udp(e) => {
+                    let msg =
+                        yip_rendezvous::decode(&e[0].bytes).expect("must decode rendezvous msg");
+                    match msg {
+                        yip_rendezvous::Message::RelaySend { payload, .. } => payload.clone(),
+                        _ => panic!("expected RelaySend message"),
+                    }
+                }
+                _ => panic!("expected DispatchOut::Udp"),
+            }
+        };
         assert!(pm.peers[0].relay);
         assert!(matches!(
             pm.peers[0].state,
             PeerSessionState::Established(_)
         ));
+
+        let (mut peer_est, _) = hs1
+            .read_response(&resp_payload)
+            .expect("handshake completes");
 
         // Ingest a record for another member into pm so a PullRequest has something to return
         let other_kp = generate_keypair();
@@ -1649,7 +1698,7 @@ mod tests {
             .unwrap()
             .ingest_record(other_rec.clone(), now_secs()));
 
-        // Peer sends PullRequest for other_kp
+        // 1. Peer sends legacy Gossip PullRequest for other_kp over relay -> produces encrypted reply
         let pull = GossipMsg::PullRequest(vec![yip_membership::node_id(&other_kp.public)]);
         let mut gossip_bytes = vec![PacketType::Gossip as u8];
         pull.encode(&mut gossip_bytes);
@@ -1661,15 +1710,21 @@ mod tests {
         };
         assert!(!egress.is_empty());
         assert_eq!(egress[0].dst, mock_server());
-        // Verify it is relay-wrapped RelaySend containing a Gossip packet
+        // Verify it is relay-wrapped RelaySend containing an EncryptedControl packet
         let decoded_msg =
             yip_rendezvous::decode(&egress[0].bytes).expect("must decode rendezvous msg");
         match decoded_msg {
             yip_rendezvous::Message::RelaySend { dst, payload, .. } => {
                 assert_eq!(dst, node_id(&peer_kp.public));
-                assert_eq!(payload[0], PacketType::Gossip as u8);
+                assert_eq!(payload[0], PacketType::EncryptedControl as u8);
+                assert_eq!(payload.len(), OBF_MTU_BUDGET);
+                let (inner_type, inner_payload) = peer_est
+                    .ctrl_codec
+                    .open(&mut peer_est.ctrl_replay, &payload)
+                    .expect("peer must open reply");
+                assert_eq!(inner_type, crate::control_codec::INNER_TYPE_GOSSIP);
                 let gossip_reply =
-                    GossipMsg::decode(&payload[1..]).expect("must decode gossip msg");
+                    GossipMsg::decode(&inner_payload).expect("must decode gossip msg");
                 match gossip_reply {
                     GossipMsg::Records(records) => {
                         assert_eq!(records.len(), 1);
@@ -1683,6 +1738,52 @@ mod tests {
             }
             _ => panic!("expected RelaySend message"),
         }
+
+        // 2. Peer sends sealed EncryptedControl PullRequest over relay
+        let mut pull_raw = Vec::new();
+        pull.encode(&mut pull_raw);
+        let sealed_ctrl = peer_est.ctrl_codec.seal(
+            peer_est.ctrl_send_nonce,
+            crate::control_codec::INNER_TYPE_GOSSIP,
+            &pull_raw,
+            OBF_MTU_BUDGET,
+        );
+        peer_est.ctrl_send_nonce += 1;
+
+        let out3 = pm.on_udp(
+            mock_server(),
+            &relay_deliver(&peer_kp, sealed_ctrl.clone()),
+            20,
+        );
+        let egress3: &[EgressDatagram] = match &out3 {
+            DispatchOut::Udp(e) => e,
+            _ => panic!("expected DispatchOut::Udp with relay-wrapped reply for EncryptedControl"),
+        };
+        assert!(!egress3.is_empty());
+        let decoded_msg3 =
+            yip_rendezvous::decode(&egress3[0].bytes).expect("must decode rendezvous msg");
+        match decoded_msg3 {
+            yip_rendezvous::Message::RelaySend { dst, payload, .. } => {
+                assert_eq!(dst, node_id(&peer_kp.public));
+                assert_eq!(payload[0], PacketType::EncryptedControl as u8);
+                let (inner_type, inner_payload) = peer_est
+                    .ctrl_codec
+                    .open(&mut peer_est.ctrl_replay, &payload)
+                    .expect("peer must open reply");
+                assert_eq!(inner_type, crate::control_codec::INNER_TYPE_GOSSIP);
+                let gossip_reply =
+                    GossipMsg::decode(&inner_payload).expect("must decode gossip msg");
+                assert!(matches!(gossip_reply, GossipMsg::Records(_)));
+            }
+            _ => panic!("expected RelaySend message"),
+        }
+
+        // 3. Replay rejection over relay: same control datagram must be dropped
+        let out_replayed = pm.on_udp(mock_server(), &relay_deliver(&peer_kp, sealed_ctrl), 25);
+        assert!(
+            matches!(out_replayed, DispatchOut::None),
+            "replayed control datagram over relay must be dropped"
+        );
     }
 
     #[test]

@@ -214,6 +214,9 @@ pub fn run(config: Config) -> io::Result<()> {
     manager.set_obf_psk(config.obf_psk);
     // Opt-in idle cover traffic (3b Task 4): a no-op unless obf is also on
     // (`PeerManager::tick_dispatch` gates cover emission on both).
+    if let Some(allow) = config.allow_plaintext_gossip {
+        manager.allow_plaintext_gossip = allow;
+    }
     manager.set_cover_traffic_ms(config.cover_traffic_ms);
     manager.set_kem(config.kem);
     manager.set_traffic_defense(config.traffic_defense.clone());

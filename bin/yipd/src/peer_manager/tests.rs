@@ -345,6 +345,44 @@ fn initiator_retransmits_same_init_within_total_window_then_gives_up() {
 }
 
 #[test]
+fn handshaking_retransmit_chunks_large_init_datagram() {
+    let kp_local = generate_keypair();
+    let peer = PeerConfig {
+        public_key: [7u8; 32],
+        endpoint: Some("10.0.0.9:9000".parse().unwrap()),
+        alias: None,
+        kem: None,
+        pq_public_key: None,
+    };
+    let mut pm = PeerManager::new(
+        kp_local.private,
+        kp_local.public,
+        &[peer],
+        TunnelMode::L3Tun,
+        None,
+        None,
+        false,
+    );
+    let _ = pm.on_tun(&dummy_tun_pkt(), 0);
+    let large_pkt = vec![PacketType::HandshakeInit as u8; 2500];
+    if let PeerSessionState::Handshaking(ref mut h) = pm.peers[0].state {
+        h.init_pkt = large_pkt.clone();
+    } else {
+        panic!("expected Handshaking state");
+    }
+
+    let out = pm
+        .tick(HANDSHAKE_RETRY_MS)
+        .map(<[_]>::to_vec)
+        .unwrap_or_default();
+    assert!(out.len() > 1, "large init must be chunked on retransmit");
+    for dg in &out {
+        assert_eq!(dg.bytes[0], PacketType::HandshakeFrag as u8);
+        assert!(dg.bytes.len() <= 1400);
+    }
+}
+
+#[test]
 fn pending_tun_is_capped_while_handshaking() {
     let kp_local = generate_keypair();
     let peer = PeerConfig {
@@ -1423,6 +1461,7 @@ fn established_pair(resp_peer_addr: SocketAddr) -> (DataPlane, DataPlane, [u8; 1
     let (auth_key, hp_key) = derive_wire_keys(&cb);
     let (ini_send_k, ini_recv_k) = ini.raw_split_keys();
     let (res_send_k, res_recv_k) = res.raw_split_keys();
+    let (init_ctrl, resp_ctrl) = crate::control_codec::derive_control_keys(&auth_key);
     let conn_tag = conn_tag_from_keys(&auth_key, &hp_key);
     let est_i = Established {
         session: ini.into_session().unwrap(),
@@ -1430,6 +1469,9 @@ fn established_pair(resp_peer_addr: SocketAddr) -> (DataPlane, DataPlane, [u8; 1
         hp_key,
         raw_send_key: ini_send_k,
         raw_recv_key: ini_recv_k,
+        ctrl_codec: crate::control_codec::ControlCodec::new(init_ctrl, resp_ctrl),
+        ctrl_send_nonce: 0,
+        ctrl_replay: yip_crypto::ReplayWindow::new(),
     };
     let est_r = Established {
         session: res.into_session().unwrap(),
@@ -1437,6 +1479,9 @@ fn established_pair(resp_peer_addr: SocketAddr) -> (DataPlane, DataPlane, [u8; 1
         hp_key,
         raw_send_key: res_send_k,
         raw_recv_key: res_recv_k,
+        ctrl_codec: crate::control_codec::ControlCodec::new(resp_ctrl, init_ctrl),
+        ctrl_send_nonce: 0,
+        ctrl_replay: yip_crypto::ReplayWindow::new(),
     };
     let any: SocketAddr = "0.0.0.0:0".parse().unwrap();
     (

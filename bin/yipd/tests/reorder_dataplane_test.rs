@@ -61,6 +61,7 @@ fn test_dataplane_pair() -> (DataPlane, DataPlane) {
     let (auth_key, hp_key) = derive_wire_keys(&cb_i);
     let (ini_send_k, ini_recv_k) = ini.raw_split_keys();
     let (res_send_k, res_recv_k) = res.raw_split_keys();
+    let (init_ctrl, resp_ctrl) = yipd::control_codec::derive_control_keys(&auth_key);
 
     let est_i = Established {
         session: ini.into_session().unwrap(),
@@ -68,6 +69,9 @@ fn test_dataplane_pair() -> (DataPlane, DataPlane) {
         hp_key,
         raw_send_key: ini_send_k,
         raw_recv_key: ini_recv_k,
+        ctrl_codec: yipd::control_codec::ControlCodec::new(init_ctrl, resp_ctrl),
+        ctrl_send_nonce: 0,
+        ctrl_replay: yip_crypto::ReplayWindow::new(),
     };
     let est_r = Established {
         session: res.into_session().unwrap(),
@@ -75,6 +79,9 @@ fn test_dataplane_pair() -> (DataPlane, DataPlane) {
         hp_key,
         raw_send_key: res_send_k,
         raw_recv_key: res_recv_k,
+        ctrl_codec: yipd::control_codec::ControlCodec::new(resp_ctrl, init_ctrl),
+        ctrl_send_nonce: 0,
+        ctrl_replay: yip_crypto::ReplayWindow::new(),
     };
 
     let conn_tag = conn_tag_from_keys(&auth_key, &hp_key);

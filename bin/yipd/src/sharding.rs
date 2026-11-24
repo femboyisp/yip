@@ -149,6 +149,39 @@ pub fn shard_for_fec_control(payload: &[u8], num_shards: usize) -> Option<usize>
     }
 }
 
+/// Returns true if the outer datagram payload is a peer control frame destined
+/// for Shard 0 (HandshakeInit, HandshakeResp, Gossip, or EncryptedControl).
+#[inline]
+pub fn is_peer_control(payload: &[u8]) -> bool {
+    if payload.is_empty() {
+        return false;
+    }
+    let pt = payload[0];
+    pt == crate::handshake::PacketType::HandshakeInit as u8
+        || pt == crate::handshake::PacketType::HandshakeResp as u8
+        || pt == crate::handshake::PacketType::Gossip as u8
+        || pt == crate::handshake::PacketType::EncryptedControl as u8
+}
+
+/// Route an inbound outer datagram received on a worker shard.
+///
+/// On non-zero shards (`shard_id != 0`), peer control frames must be forwarded to Shard 0
+/// via [`ShardMsg::PeerDatagram`] rather than processed on the worker core's local dataplane or dropped.
+///
+/// Returns `Some(ShardMsg::PeerDatagram(payload, src))` if the datagram should be forwarded to Shard 0,
+/// or `None` if it should be processed locally or treated as dataplane traffic.
+pub fn forward_peer_datagram_to_shard0(
+    shard_id: usize,
+    payload: &[u8],
+    src: std::net::SocketAddr,
+) -> Option<ShardMsg> {
+    if shard_id != 0 && is_peer_control(payload) {
+        Some(ShardMsg::PeerDatagram(payload.to_vec(), src))
+    } else {
+        None
+    }
+}
+
 use std::io;
 use std::net::ToSocketAddrs;
 use std::os::fd::{AsRawFd, RawFd};
@@ -161,12 +194,14 @@ use yip_io::af_xdp::{
 use crate::config::Config;
 
 /// Message passed across worker shards via lock-free SPSC ring buffers.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShardMsg {
     /// Inner TUN/TAP packet to be processed or routed.
     Packet(Vec<u8>),
     /// Session epoch replication message broadcast from Shard 0 to worker shards.
     SessionEpoch(SessionEpochMsg),
+    /// Peer datagram (handshake, gossip, encrypted control) received on non-0 worker forwarded to Shard 0.
+    PeerDatagram(Vec<u8>, std::net::SocketAddr),
     /// Handshake/control datagram received on non-0 worker forwarded to Shard 0.
     HandshakeForward(Vec<u8>, std::net::SocketAddr),
     /// ARQ loss feedback datagram forwarded to the target worker shard owning the FEC block.
@@ -182,7 +217,7 @@ pub enum ShardMsg {
 }
 
 /// Established session epoch parameters replicated across worker shards.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEpochMsg {
     pub peer_pk: [u8; 32],
     pub send_key: [u8; 32],
@@ -637,6 +672,9 @@ fn create_peer_manager(
         membership,
         relay_only,
     );
+    if let Some(allow) = config.allow_plaintext_gossip {
+        manager.allow_plaintext_gossip = allow;
+    }
     manager.set_obf_psk(config.obf_psk);
     manager.set_cover_traffic_ms(config.cover_traffic_ms);
     manager.set_traffic_defense(config.traffic_defense.clone());
@@ -986,14 +1024,16 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                             let dg = &rx_datagrams[i];
                                             let payload = &rx_buffers[i][..dg.len];
 
-                                            let is_hs = !payload.is_empty()
+                                            let is_peer_control = !payload.is_empty()
                                                 && (payload[0] == crate::handshake::PacketType::HandshakeInit as u8
-                                                    || payload[0] == crate::handshake::PacketType::HandshakeResp as u8);
-                                            if shard_id != 0 && is_hs {
+                                                    || payload[0] == crate::handshake::PacketType::HandshakeResp as u8
+                                                    || payload[0] == crate::handshake::PacketType::Gossip as u8
+                                                    || payload[0] == crate::handshake::PacketType::EncryptedControl as u8);
+                                            if shard_id != 0 && is_peer_control {
                                                 if let Some(Some(ref tx)) = tx_channels.first() {
                                                     push_spsc(
                                                         tx,
-                                                        ShardMsg::HandshakeForward(
+                                                        ShardMsg::PeerDatagram(
                                                             payload.to_vec(),
                                                             dg.src,
                                                         ),
@@ -1065,14 +1105,16 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                     if (desc.len as usize) <= s.chunk_size() {
                                         let payload =
                                             s.chunk_slice(desc.addr, desc.len as usize);
-                                        let is_hs = !payload.is_empty()
+                                        let is_peer_control = !payload.is_empty()
                                             && (payload[0] == crate::handshake::PacketType::HandshakeInit as u8
-                                                || payload[0] == crate::handshake::PacketType::HandshakeResp as u8);
-                                        if shard_id != 0 && is_hs {
+                                                || payload[0] == crate::handshake::PacketType::HandshakeResp as u8
+                                                || payload[0] == crate::handshake::PacketType::Gossip as u8
+                                                || payload[0] == crate::handshake::PacketType::EncryptedControl as u8);
+                                        if shard_id != 0 && is_peer_control {
                                             if let Some(Some(ref tx)) = tx_channels.first() {
                                                 push_spsc(
                                                     tx,
-                                                    ShardMsg::HandshakeForward(
+                                                    ShardMsg::PeerDatagram(
                                                         payload.to_vec(),
                                                         cfg.listen,
                                                     ),
@@ -1344,12 +1386,19 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                             shard_id as u64,
                                             num_shards as u64,
                                         ) {
+                                            let (init_ctrl, resp_ctrl) =
+                                                crate::control_codec::derive_control_keys(&epoch.auth_key);
                                             let established = crate::handshake::Established {
                                                 session: shard_session,
                                                 auth_key: epoch.auth_key,
                                                 hp_key: epoch.hp_key,
                                                 raw_send_key: epoch.send_key,
                                                 raw_recv_key: epoch.recv_key,
+                                                ctrl_codec: crate::control_codec::ControlCodec::new(
+                                                    init_ctrl, resp_ctrl,
+                                                ),
+                                                ctrl_send_nonce: 0,
+                                                ctrl_replay: yip_crypto::ReplayWindow::new(),
                                             };
                                             manager.install_established_session(
                                                 &epoch.peer_pk,
@@ -1358,7 +1407,8 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                             );
                                         }
                                     }
-                                    ShardMsg::HandshakeForward(bytes, src) => {
+                                    ShardMsg::PeerDatagram(bytes, src)
+                                    | ShardMsg::HandshakeForward(bytes, src) => {
                                         let out = manager.on_udp(*src, bytes, cached_now_ms);
                                         handle_dispatch_out(
                                             out,
@@ -2217,5 +2267,94 @@ mod tests {
             SPSC_QUEUE_DROPS.load(Ordering::Relaxed),
             initial_drops.saturating_add(3)
         );
+    }
+
+    #[test]
+    fn test_sharded_encrypted_control_routing() {
+        let worker_shard_id = 1;
+        let src_addr: SocketAddr = "192.0.2.1:51820".parse().unwrap();
+
+        // 1. PacketType::EncryptedControl on worker shard must be forwarded to Shard 0 as PeerDatagram
+        let encrypted_ctrl_dg = vec![
+            crate::handshake::PacketType::EncryptedControl as u8,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+        ];
+        let forwarded =
+            forward_peer_datagram_to_shard0(worker_shard_id, &encrypted_ctrl_dg, src_addr);
+        assert_eq!(
+            forwarded,
+            Some(ShardMsg::PeerDatagram(encrypted_ctrl_dg.clone(), src_addr)),
+            "EncryptedControl on worker shard must be forwarded to Shard 0 as PeerDatagram"
+        );
+
+        // 2. HandshakeInit, HandshakeResp, and Gossip on worker shard must also be forwarded to Shard 0
+        for pt in [
+            crate::handshake::PacketType::HandshakeInit,
+            crate::handshake::PacketType::HandshakeResp,
+            crate::handshake::PacketType::Gossip,
+        ] {
+            let dg = vec![pt as u8, 10, 20, 30];
+            assert_eq!(
+                forward_peer_datagram_to_shard0(worker_shard_id, &dg, src_addr),
+                Some(ShardMsg::PeerDatagram(dg.clone(), src_addr)),
+                "PacketType::{pt:?} on worker shard must be forwarded to Shard 0 as PeerDatagram"
+            );
+        }
+
+        // 3. Shard 0 receiving peer control datagram does not forward to itself
+        assert_eq!(
+            forward_peer_datagram_to_shard0(0, &encrypted_ctrl_dg, src_addr),
+            None,
+            "Shard 0 must process EncryptedControl locally, not forward"
+        );
+
+        // 4. Data packet (PacketType::Data) must not be classified as peer control
+        let data_dg = vec![
+            crate::handshake::PacketType::Data as u8,
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+        ];
+        assert_eq!(
+            forward_peer_datagram_to_shard0(worker_shard_id, &data_dg, src_addr),
+            None,
+            "Data packet must not be forwarded as peer control"
+        );
+
+        // 5. Verify lock-free SPSC channel forwarding and delivery to Shard 0
+        let (tx_to_0, rx_on_0) = yip_io::spsc::spsc_pair::<ShardMsg, 8192>();
+        let msg = forward_peer_datagram_to_shard0(worker_shard_id, &encrypted_ctrl_dg, src_addr)
+            .expect("should produce ShardMsg::PeerDatagram");
+        assert!(push_spsc(&tx_to_0, msg));
+
+        let mut drained = Vec::with_capacity(16);
+        let count = rx_on_0.drain_batch(&mut drained, 16);
+        assert_eq!(count, 1);
+        match &drained[0] {
+            ShardMsg::PeerDatagram(bytes, addr) => {
+                assert_eq!(bytes, &encrypted_ctrl_dg);
+                assert_eq!(*addr, src_addr);
+                assert_eq!(
+                    bytes[0],
+                    crate::handshake::PacketType::EncryptedControl as u8
+                );
+            }
+            other => panic!("expected ShardMsg::PeerDatagram, got {other:?}"),
+        }
     }
 }

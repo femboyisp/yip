@@ -228,6 +228,12 @@ pub struct DataPlane {
     raw_recv_key: [u8; 32],
     auth_key: [u8; 16],
     hp_key: [u8; 16],
+    /// In-session encrypted control codec (#207).
+    pub ctrl_codec: crate::control_codec::ControlCodec,
+    /// Outbound control frame sequence nonce (#207).
+    pub ctrl_send_nonce: u64,
+    /// Anti-replay sliding window for inbound control frames (#207).
+    pub ctrl_replay: yip_crypto::ReplayWindow,
     transport: Transport,
     codec: Codec,
     conn_tag: u64,
@@ -412,6 +418,9 @@ impl DataPlane {
             raw_recv_key,
             auth_key,
             hp_key,
+            ctrl_codec: established.ctrl_codec,
+            ctrl_send_nonce: established.ctrl_send_nonce,
+            ctrl_replay: established.ctrl_replay,
             transport: Transport::new(vec![], symbol_size),
             codec,
             conn_tag,
@@ -1385,6 +1394,8 @@ pub fn test_dataplane_pair(mode: crate::mode::TunnelMode, obf_on: bool) -> (Data
     let (ini_send_k, ini_recv_k) = ini.raw_split_keys();
     let (res_send_k, res_recv_k) = res.raw_split_keys();
 
+    let (init_ctrl, resp_ctrl) = crate::control_codec::derive_control_keys(&auth_key);
+
     // Build Established structs directly (mirrors what handshake.rs does).
     let est_i = crate::handshake::Established {
         session: ini.into_session().unwrap(),
@@ -1392,6 +1403,9 @@ pub fn test_dataplane_pair(mode: crate::mode::TunnelMode, obf_on: bool) -> (Data
         hp_key,
         raw_send_key: ini_send_k,
         raw_recv_key: ini_recv_k,
+        ctrl_codec: crate::control_codec::ControlCodec::new(init_ctrl, resp_ctrl),
+        ctrl_send_nonce: 0,
+        ctrl_replay: yip_crypto::ReplayWindow::new(),
     };
     let est_r = crate::handshake::Established {
         session: res.into_session().unwrap(),
@@ -1399,6 +1413,9 @@ pub fn test_dataplane_pair(mode: crate::mode::TunnelMode, obf_on: bool) -> (Data
         hp_key,
         raw_send_key: res_send_k,
         raw_recv_key: res_recv_k,
+        ctrl_codec: crate::control_codec::ControlCodec::new(resp_ctrl, init_ctrl),
+        ctrl_send_nonce: 0,
+        ctrl_replay: yip_crypto::ReplayWindow::new(),
     };
 
     // Both peers derive the same conn_tag from the same keys.
@@ -1686,6 +1703,7 @@ mod tests {
         let cb_i = ini.channel_binding();
         let (auth_key, hp_key) = derive_wire_keys(&cb_i);
         let (ini_send_k, ini_recv_k) = ini.raw_split_keys();
+        let (init_ctrl, resp_ctrl) = crate::control_codec::derive_control_keys(&auth_key);
 
         Established {
             session: ini.into_session().unwrap(),
@@ -1693,6 +1711,9 @@ mod tests {
             hp_key,
             raw_send_key: ini_send_k,
             raw_recv_key: ini_recv_k,
+            ctrl_codec: crate::control_codec::ControlCodec::new(init_ctrl, resp_ctrl),
+            ctrl_send_nonce: 0,
+            ctrl_replay: yip_crypto::ReplayWindow::new(),
         }
     }
 

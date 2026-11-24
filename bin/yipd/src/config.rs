@@ -263,6 +263,8 @@ pub struct Config {
     pub kem: yip_crypto::PqKemAlgorithm,
     /// Optional filesystem path from which this configuration was loaded.
     pub config_path: Option<std::path::PathBuf>,
+    /// Whether unencrypted plaintext gossip is permitted (#207).
+    pub allow_plaintext_gossip: Option<bool>,
 }
 
 // ── hex decode helper ─────────────────────────────────────────────────────────
@@ -705,6 +707,7 @@ impl Config {
         let mut xdp = false;
         let mut xdp_ifname: Option<String> = None;
         let mut xdp_mode: Option<String> = None;
+        let mut allow_plaintext_gossip: Option<bool> = None;
 
         for line in text.lines() {
             let line = line.trim();
@@ -1044,6 +1047,21 @@ impl Config {
                         legacy_pq_public = Some(bytes);
                     }
                 }
+                "allow_plaintext_gossip" => {
+                    let b = match val.to_ascii_lowercase().as_str() {
+                        "true" | "1" | "yes" | "on" => true,
+                        "false" | "0" | "no" | "off" => false,
+                        other => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "invalid boolean value for allow_plaintext_gossip: {other}"
+                                ),
+                            ));
+                        }
+                    };
+                    allow_plaintext_gossip = Some(b);
+                }
                 // Silently ignore unknown keys for forward-compatibility. The
                 // netns config files still contain `initiate=true|false` from
                 // before Task 5 removed the field; this is intentional so
@@ -1319,6 +1337,7 @@ impl Config {
             fec,
             kem: global_kem.unwrap_or(yip_crypto::PqKemAlgorithm::MlKem768),
             config_path: None,
+            allow_plaintext_gossip,
         })
     }
 }

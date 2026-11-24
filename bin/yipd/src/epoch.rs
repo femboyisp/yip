@@ -77,6 +77,7 @@ pub struct EpochSet {
     pub(crate) previous: Option<Box<DataPlane>>,
     pub(crate) previous_retire_ms: u64,
     pub(crate) rekey: Option<RekeyInFlight>,
+    pub(crate) force_rekey: bool,
     pub(crate) epoch: u64,
 }
 
@@ -89,6 +90,7 @@ impl EpochSet {
             previous: None,
             previous_retire_ms: 0,
             rekey: None,
+            force_rekey: false,
             epoch: 1,
         }
     }
@@ -296,6 +298,7 @@ impl EpochSet {
         self.previous = Some(old);
         self.previous_retire_ms = now_ms.saturating_add(PREVIOUS_EPOCH_GRACE_MS);
         self.rekey = None;
+        self.force_rekey = false;
         self.epoch = self.epoch.saturating_add(1);
     }
 
@@ -337,12 +340,26 @@ impl EpochSet {
         }
     }
 
+    /// Trigger an immediate session rekey at the next scheduler opportunity.
+    pub fn trigger_rekey(&mut self) {
+        self.force_rekey = true;
+    }
+
+    /// Whether an immediate rekey has been triggered.
+    pub fn is_rekey_forced(&self) -> bool {
+        self.force_rekey
+    }
+
     /// Initiator schedule: rekey when `current` is old enough, none in flight,
     /// and this side is the glare-winner — OR the loser-fallback fires
-    /// (`current` aged past 2× the interval and the winner never rekeyed).
+    /// (`current` aged past 2× the interval and the winner never rekeyed),
+    /// OR a forced rekey was requested (e.g. control nonce saturation).
     pub fn needs_rekey(&self, now_ms: u64, is_glare_winner: bool, interval_ms: u64) -> bool {
         if self.rekey.is_some() {
             return false;
+        }
+        if self.force_rekey {
+            return true;
         }
         let age = now_ms.saturating_sub(self.current_created_ms);
         if is_glare_winner {
@@ -350,6 +367,20 @@ impl EpochSet {
         } else {
             age >= interval_ms.saturating_mul(2)
         }
+    }
+}
+
+impl std::ops::Deref for EpochSet {
+    type Target = DataPlane;
+
+    fn deref(&self) -> &Self::Target {
+        &self.current
+    }
+}
+
+impl std::ops::DerefMut for EpochSet {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.current
     }
 }
 
@@ -386,6 +417,7 @@ mod tests {
         let (auth_key, hp_key) = derive_wire_keys(&cb_i);
         let (ini_send_k, ini_recv_k) = ini.raw_split_keys();
         let (res_send_k, res_recv_k) = res.raw_split_keys();
+        let (init_ctrl, resp_ctrl) = crate::control_codec::derive_control_keys(&auth_key);
 
         let est_i = Established {
             session: ini.into_session().unwrap(),
@@ -393,6 +425,9 @@ mod tests {
             hp_key,
             raw_send_key: ini_send_k,
             raw_recv_key: ini_recv_k,
+            ctrl_codec: crate::control_codec::ControlCodec::new(init_ctrl, resp_ctrl),
+            ctrl_send_nonce: 0,
+            ctrl_replay: yip_crypto::ReplayWindow::new(),
         };
         let est_r = Established {
             session: res.into_session().unwrap(),
@@ -400,6 +435,9 @@ mod tests {
             hp_key,
             raw_send_key: res_send_k,
             raw_recv_key: res_recv_k,
+            ctrl_codec: crate::control_codec::ControlCodec::new(resp_ctrl, init_ctrl),
+            ctrl_send_nonce: 0,
+            ctrl_replay: yip_crypto::ReplayWindow::new(),
         };
 
         let conn_tag = conn_tag_from_keys(&auth_key, &hp_key);
