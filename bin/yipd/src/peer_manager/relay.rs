@@ -166,7 +166,12 @@ impl PeerManager {
             .map(Membership::own_cert_bytes)
             .unwrap_or_default();
         let (established, resp_pkt, remote_static, initiator_payload) =
-            match HandshakeState::start_responder(&self.local_priv, dg, &resp_payload) {
+            match HandshakeState::start_responder_with_kem(
+                &self.local_priv,
+                dg,
+                &resp_payload,
+                self.default_kem,
+            ) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("peer_manager: relayed start_responder failed: {e}");
@@ -603,14 +608,13 @@ impl PeerManager {
         self.egress.clear();
         let target_bucket = OBF_MTU_BUDGET;
         for reply in replies.iter().take(MAX_GOSSIP_REPLIES) {
-            let bytes = {
+            let Some(bytes) = ({
                 let Some(est) = self.peers[idx].state.as_established_mut() else {
                     break;
                 };
-                match seal_gossip_reply(est, reply, target_bucket) {
-                    Some(b) => b,
-                    None => continue,
-                }
+                seal_gossip_reply(est, reply, target_bucket)
+            }) else {
+                continue;
             };
             if let Some(d) = self.relay_wrap(idx, bytes) {
                 self.egress.push(d);
