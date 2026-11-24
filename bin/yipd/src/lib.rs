@@ -5,6 +5,7 @@
 mod addr;
 pub mod config;
 pub mod control;
+pub mod control_codec;
 pub mod dataplane;
 mod epoch;
 pub mod flow;
