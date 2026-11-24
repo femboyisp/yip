@@ -189,6 +189,7 @@ mod tests {
             public_key: gossip_peer.public,
             endpoint: Some(src),
             alias: None,
+            kem: None,
         };
         let mut pm = PeerManager::new(
             local.private,
@@ -267,6 +268,7 @@ mod tests {
             public_key: peer.public,
             endpoint: Some(peer_ep),
             alias: None,
+            kem: None,
         };
         let mut pm = PeerManager::new(
             local.private,

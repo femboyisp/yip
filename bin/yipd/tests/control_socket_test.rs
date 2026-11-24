@@ -12,6 +12,7 @@ fn control_socket_tick_integration() {
         public_key: [1u8; 32],
         endpoint: Some("10.0.0.1:1000".parse().unwrap()),
         alias: None,
+        kem: None,
     };
     let mut pm = yipd::peer_manager::PeerManager::new(
         kp.private,

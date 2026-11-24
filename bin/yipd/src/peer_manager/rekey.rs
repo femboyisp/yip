@@ -97,14 +97,19 @@ impl PeerManager {
                 .unwrap_or_default();
             // #34: frame the msg1 payload as [ts || cert] (see begin_handshake).
             let payload = crate::handshake::frame_init_payload(&cert);
-            let (hs, init_pkt) =
-                match HandshakeState::start_initiator(&self.local_priv, &pubkey, &payload) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        eprintln!("peer_manager: failed to start rekey handshake: {e}");
-                        return;
-                    }
-                };
+            let kem = self.peers[idx].kem;
+            let (hs, init_pkt) = match HandshakeState::start_initiator_with_kem(
+                &self.local_priv,
+                &pubkey,
+                &payload,
+                kem,
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("peer_manager: failed to start rekey handshake: {e}");
+                    return;
+                }
+            };
             let retry_ms = if self.obf_key.is_some() {
                 jitter_ms(HANDSHAKE_RETRY_MS)
             } else {
@@ -118,20 +123,27 @@ impl PeerManager {
                 retry_ms,
                 target,
             });
-            if relay {
-                // A `None` (no rendezvous configured — should not happen for
-                // a peer marked `relay`) skips this send only: the round
-                // stays installed above and retries on the next tick's
-                // retransmit arm.
-                if let Some(d) = self.relay_wrap(idx, init_pkt) {
-                    self.tick_egress.push(d);
-                }
+            let pkts = if init_pkt.len() > 1400 {
+                yip_wire::fragment::chunk_handshake_datagram(
+                    &init_pkt,
+                    1400,
+                    self.junk_rng.next_u64() as u32,
+                )
             } else {
-                self.tick_egress.push(EgressDatagram {
-                    fate: 0,
-                    dst: target,
-                    bytes: init_pkt,
-                });
+                vec![init_pkt]
+            };
+            for p in pkts {
+                if relay {
+                    if let Some(d) = self.relay_wrap(idx, p) {
+                        self.tick_egress.push(d);
+                    }
+                } else {
+                    self.tick_egress.push(EgressDatagram {
+                        fate: 0,
+                        dst: target,
+                        bytes: p,
+                    });
+                }
             }
             return;
         }
@@ -166,16 +178,27 @@ impl PeerManager {
         // Resend the SAME `init_pkt` verbatim, relay-wrapped when `relay`
         // (a `relay_wrap` `None` skips this send only — the round stays in
         // flight and retries again next tick), else direct to `target`.
-        if relay {
-            if let Some(d) = self.relay_wrap(idx, pkt) {
-                self.tick_egress.push(d);
-            }
+        let pkts = if pkt.len() > 1400 {
+            yip_wire::fragment::chunk_handshake_datagram(
+                &pkt,
+                1400,
+                self.junk_rng.next_u64() as u32,
+            )
         } else {
-            self.tick_egress.push(EgressDatagram {
-                fate: 0,
-                dst: target,
-                bytes: pkt,
-            });
+            vec![pkt]
+        };
+        for p in pkts {
+            if relay {
+                if let Some(d) = self.relay_wrap(idx, p) {
+                    self.tick_egress.push(d);
+                }
+            } else {
+                self.tick_egress.push(EgressDatagram {
+                    fate: 0,
+                    dst: target,
+                    bytes: p,
+                });
+            }
         }
         let new_retry_ms = if self.obf_key.is_some() {
             jitter_ms(HANDSHAKE_RETRY_MS)
@@ -236,8 +259,10 @@ impl PeerManager {
             .map(Membership::own_cert_bytes)
             .unwrap_or_default();
         let payload = crate::handshake::frame_init_payload(&cert);
-        let (hs, init_pkt) = HandshakeState::start_initiator(&self.local_priv, &pubkey, &payload)
-            .map_err(|e| format!("failed to start rekey handshake: {e}"))?;
+        let kem = self.peers[idx].kem;
+        let (hs, init_pkt) =
+            HandshakeState::start_initiator_with_kem(&self.local_priv, &pubkey, &payload, kem)
+                .map_err(|e| format!("failed to start rekey handshake: {e}"))?;
 
         let retry_ms = if self.obf_key.is_some() {
             jitter_ms(HANDSHAKE_RETRY_MS)
@@ -260,16 +285,27 @@ impl PeerManager {
             _ => unreachable!(),
         };
 
-        if relay {
-            if let Some(d) = self.relay_wrap(idx, init_pkt) {
-                self.tick_egress.push(d);
-            }
+        let pkts = if init_pkt.len() > 1400 {
+            yip_wire::fragment::chunk_handshake_datagram(
+                &init_pkt,
+                1400,
+                self.junk_rng.next_u64() as u32,
+            )
         } else {
-            self.tick_egress.push(EgressDatagram {
-                fate: 0,
-                dst: target_ep,
-                bytes: init_pkt,
-            });
+            vec![init_pkt]
+        };
+        for p in pkts {
+            if relay {
+                if let Some(d) = self.relay_wrap(idx, p) {
+                    self.tick_egress.push(d);
+                }
+            } else {
+                self.tick_egress.push(EgressDatagram {
+                    fate: 0,
+                    dst: target_ep,
+                    bytes: p,
+                });
+            }
         }
 
         Ok(format!(
@@ -1283,6 +1319,7 @@ mod tests {
             public_key: kp_i.public,
             endpoint: Some(ep_i),
             alias: None,
+            kem: None,
         };
         let mut pm_r = PeerManager::new(
             kp_r.private,

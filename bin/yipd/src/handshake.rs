@@ -21,6 +21,7 @@ use crate::wire_glue::derive_wire_keys;
 /// replace them with randomised header protection so no fixed prefix appears
 /// on the wire.
 #[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketType {
     /// First Noise message (initiator → responder).
     HandshakeInit = 0,
@@ -37,6 +38,8 @@ pub enum PacketType {
     /// ENCRYPTION of gossip (metadata privacy) is an explicit 2c non-goal,
     /// deferred to the anonymity milestone.
     Gossip = 4,
+    /// Handshake message fragment (for flights exceeding MTU).
+    HandshakeFrag = 5,
 }
 
 // ── established session ───────────────────────────────────────────────────────
@@ -123,7 +126,32 @@ pub fn run_initiator(
     local_priv: &[u8; 32],
     peer_pub: &[u8; 32],
 ) -> io::Result<Established> {
-    let mut handshake = Handshake::initiator(local_priv, peer_pub).map_err(crypto_err)?;
+    run_initiator_with_kem(
+        sock,
+        peer,
+        local_priv,
+        peer_pub,
+        yip_crypto::PqKemAlgorithm::MlKem768,
+    )
+}
+
+/// Run the Noise-IK initiator role over `sock` with a specific post-quantum KEM algorithm.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "superseded by HandshakeState's step-functions; kept for its own unit tests"
+    )
+)]
+pub fn run_initiator_with_kem(
+    sock: &UdpSocket,
+    peer: SocketAddr,
+    local_priv: &[u8; 32],
+    peer_pub: &[u8; 32],
+    kem: yip_crypto::PqKemAlgorithm,
+) -> io::Result<Established> {
+    let mut handshake =
+        Handshake::initiator_with_kem(local_priv, peer_pub, kem).map_err(crypto_err)?;
 
     // Build the outgoing init message once; we may send it multiple times.
     let msg1 = handshake.write_message(&[]).map_err(crypto_err)?;
@@ -135,49 +163,70 @@ pub fn run_initiator(
 
     let mut buf = [0u8; MAX_DATAGRAM];
     let mut last_err: io::Error = io::Error::other("no attempts made");
+    let mut reassembler = yip_wire::fragment::HandshakeReassembler::new();
+
+    let packets_to_send = if init_pkt.len() > 1400 {
+        yip_wire::fragment::chunk_handshake_datagram(&init_pkt, 1400, 1)
+    } else {
+        vec![init_pkt]
+    };
 
     for _ in 0..MAX_RETRIES {
-        sock.send_to(&init_pkt, peer)?;
+        for pkt in &packets_to_send {
+            sock.send_to(pkt, peer)?;
+        }
 
-        let (n, _from) = match sock.recv_from(&mut buf) {
-            Ok(v) => v,
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
-            {
-                last_err = e;
+        loop {
+            let (n, _from) = match sock.recv_from(&mut buf) {
+                Ok(v) => v,
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    last_err = e;
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
+
+            let pkt = &buf[..n];
+            if pkt.is_empty() {
                 continue;
             }
-            Err(e) => return Err(e),
-        };
 
-        let pkt = &buf[..n];
-        if pkt.is_empty() {
-            last_err = io::Error::other("empty datagram");
-            continue;
+            let full_pkt = if pkt[0] == PacketType::HandshakeFrag as u8 {
+                match reassembler.process_datagram(pkt) {
+                    Ok(Some(assembled)) => assembled,
+                    Ok(None) => continue,
+                    Err(_) => continue,
+                }
+            } else {
+                pkt.to_vec()
+            };
+
+            if full_pkt[0] != PacketType::HandshakeResp as u8 {
+                continue;
+            }
+
+            let _ = handshake.read_message(&full_pkt[1..]).map_err(crypto_err)?;
+
+            // Capture channel binding and raw split keys BEFORE consuming the handshake.
+            let cb = handshake.channel_binding();
+            let (raw_send_key, raw_recv_key) = handshake.raw_split_keys();
+            let session = handshake.into_session().map_err(crypto_err)?;
+            let (auth_key, hp_key) = derive_wire_keys(&cb);
+
+            // Restore blocking mode so the socket is left in a sensible state.
+            sock.set_read_timeout(None)?;
+
+            return Ok(Established {
+                session,
+                auth_key,
+                hp_key,
+                raw_send_key,
+                raw_recv_key,
+            });
         }
-        if pkt[0] != PacketType::HandshakeResp as u8 {
-            last_err = io::Error::other("unexpected packet type");
-            continue;
-        }
-
-        let _ = handshake.read_message(&pkt[1..]).map_err(crypto_err)?;
-
-        // Capture channel binding and raw split keys BEFORE consuming the handshake.
-        let cb = handshake.channel_binding();
-        let (raw_send_key, raw_recv_key) = handshake.raw_split_keys();
-        let session = handshake.into_session().map_err(crypto_err)?;
-        let (auth_key, hp_key) = derive_wire_keys(&cb);
-
-        // Restore blocking mode so the socket is left in a sensible state.
-        sock.set_read_timeout(None)?;
-
-        return Ok(Established {
-            session,
-            auth_key,
-            hp_key,
-            raw_send_key,
-            raw_recv_key,
-        });
     }
 
     Err(last_err)
@@ -202,39 +251,41 @@ pub fn run_responder(
     sock: &UdpSocket,
     local_priv: &[u8; 32],
 ) -> io::Result<(Established, SocketAddr)> {
-    let mut handshake = Handshake::responder(local_priv).map_err(crypto_err)?;
-
     let mut buf = [0u8; MAX_DATAGRAM];
-    let (n, peer_addr) = sock.recv_from(&mut buf)?;
+    let mut reassembler = yip_wire::fragment::HandshakeReassembler::new();
 
-    let pkt = &buf[..n];
-    if pkt.is_empty() || pkt[0] != PacketType::HandshakeInit as u8 {
-        return Err(io::Error::other("expected HandshakeInit packet"));
+    let (full_pkt, peer_addr) = loop {
+        let (n, peer_addr) = sock.recv_from(&mut buf)?;
+        let pkt = &buf[..n];
+        if pkt.is_empty() {
+            continue;
+        }
+        if pkt[0] == PacketType::HandshakeFrag as u8 {
+            match reassembler.process_datagram(pkt) {
+                Ok(Some(assembled)) => break (assembled, peer_addr),
+                Ok(None) => continue,
+                Err(e) => return Err(io::Error::other(e)),
+            }
+        } else if pkt[0] == PacketType::HandshakeInit as u8 {
+            break (pkt.to_vec(), peer_addr);
+        } else {
+            return Err(io::Error::other("expected HandshakeInit packet"));
+        }
+    };
+
+    let (est, resp_pkt, _static_key, _payload) =
+        HandshakeState::start_responder(local_priv, &full_pkt, &[])?;
+
+    let packets_to_send = if resp_pkt.len() > 1400 {
+        yip_wire::fragment::chunk_handshake_datagram(&resp_pkt, 1400, 2)
+    } else {
+        vec![resp_pkt]
+    };
+    for pkt in &packets_to_send {
+        sock.send_to(pkt, peer_addr)?;
     }
-    let _ = handshake.read_message(&pkt[1..]).map_err(crypto_err)?;
 
-    let msg2 = handshake.write_message(&[]).map_err(crypto_err)?;
-    let mut resp_pkt = Vec::with_capacity(1 + msg2.len());
-    resp_pkt.push(PacketType::HandshakeResp as u8);
-    resp_pkt.extend_from_slice(&msg2);
-    sock.send_to(&resp_pkt, peer_addr)?;
-
-    // Capture channel binding and raw split keys BEFORE consuming the handshake.
-    let cb = handshake.channel_binding();
-    let (raw_send_key, raw_recv_key) = handshake.raw_split_keys();
-    let session = handshake.into_session().map_err(crypto_err)?;
-    let (auth_key, hp_key) = derive_wire_keys(&cb);
-
-    Ok((
-        Established {
-            session,
-            auth_key,
-            hp_key,
-            raw_send_key,
-            raw_recv_key,
-        },
-        peer_addr,
-    ))
+    Ok((est, peer_addr))
 }
 
 /// The initiator's Noise ephemeral public key: the raw, unencrypted first 32
@@ -340,9 +391,20 @@ pub fn tai64n_sub_duration(
     out
 }
 
+/// Maximum length of an initiator's cert payload (280 bytes).
+/// Keeps Flight 1 length well within the 320-byte gap between ML-KEM-512 (base 864 B)
+/// and ML-KEM-768 (base 1184 B), ensuring length-based KEM algorithm deduction remains unambiguous.
+pub const MAX_INIT_CERT_LEN: usize = 280;
+
 /// Build the msg1 Noise payload: the anti-replay TAI64N label followed by the
 /// (optional) membership cert. Empty `cert` (2a/2b) yields a 12-byte payload.
 pub fn frame_init_payload(cert: &[u8]) -> Vec<u8> {
+    assert!(
+        cert.len() <= MAX_INIT_CERT_LEN,
+        "initiator cert payload exceeds MAX_INIT_CERT_LEN ({} > {})",
+        cert.len(),
+        MAX_INIT_CERT_LEN
+    );
     let mut out = Vec::with_capacity(TAI64N_LEN + cert.len());
     out.extend_from_slice(&now_tai64n());
     out.extend_from_slice(cert);
@@ -375,7 +437,7 @@ pub struct HandshakeState {
 type StartResponderResult = io::Result<(Established, Vec<u8>, [u8; 32], Vec<u8>)>;
 
 impl HandshakeState {
-    /// Start the initiator role: build `[HandshakeInit] ++ msg1`.
+    /// Start the initiator role: build `[HandshakeInit] ++ msg1` using the default ML-KEM-768 parameter set.
     ///
     /// Returns the in-progress state (to be resumed via [`Self::read_response`])
     /// together with the framed bytes to send to the peer.
@@ -384,7 +446,23 @@ impl HandshakeState {
         peer_pub: &[u8; 32],
         payload: &[u8],
     ) -> io::Result<(Self, Vec<u8>)> {
-        let mut handshake = Handshake::initiator(local_priv, peer_pub).map_err(crypto_err)?;
+        Self::start_initiator_with_kem(
+            local_priv,
+            peer_pub,
+            payload,
+            yip_crypto::PqKemAlgorithm::MlKem768,
+        )
+    }
+
+    /// Start the initiator role with an explicit post-quantum KEM algorithm.
+    pub fn start_initiator_with_kem(
+        local_priv: &[u8; 32],
+        peer_pub: &[u8; 32],
+        payload: &[u8],
+        kem: yip_crypto::PqKemAlgorithm,
+    ) -> io::Result<(Self, Vec<u8>)> {
+        let mut handshake =
+            Handshake::initiator_with_kem(local_priv, peer_pub, kem).map_err(crypto_err)?;
 
         let msg1 = handshake.write_message(payload).map_err(crypto_err)?;
         let mut init_pkt = Vec::with_capacity(1 + msg1.len());
@@ -395,29 +473,46 @@ impl HandshakeState {
     }
 
     /// Run the responder role to completion in a single step: read
-    /// `[HandshakeInit] ++ msg1` from `init_pkt`, and return the
-    /// `[HandshakeResp] ++ msg2` reply bytes, the completed [`Established`]
-    /// session (Noise-IK completes for the responder as soon as it has read
-    /// msg1 and written msg2), the initiator's recovered static public key,
-    /// and the app payload the initiator carried in msg1 (the 2c cert seam;
-    /// `Task 6` will populate/consume it — this task only plumbs it).
-    ///
-    /// `resp_payload` is written into msg2's Noise payload (the responder's
-    /// own cert in 2c; empty for now).
-    ///
-    /// The static key is required by `PeerManager`'s admission check: a
-    /// `HandshakeInit` must only be admitted (and a peer transitioned to
-    /// `Established`) if the recovered static key matches a *configured*
-    /// peer — otherwise any UDP sender could get a `DataPlane` allocated for
-    /// it. The key is captured from `handshake.remote_static()` before
-    /// `into_session()` consumes the handshake (the transport-mode
-    /// conversion drops the handshake state that holds it).
+    /// `[HandshakeInit] ++ msg1` from `init_pkt`, automatically inferring the KEM parameter
+    /// set from the Flight 1 length, and return the `[HandshakeResp] ++ msg2` reply bytes,
+    /// the completed [`Established`] session, the initiator's recovered static public key,
+    /// and the app payload the initiator carried in msg1.
     pub fn start_responder(
         local_priv: &[u8; 32],
         init_pkt: &[u8],
         resp_payload: &[u8],
     ) -> StartResponderResult {
-        let mut handshake = Handshake::responder(local_priv).map_err(crypto_err)?;
+        if init_pkt.is_empty() || init_pkt[0] != PacketType::HandshakeInit as u8 {
+            return Err(io::Error::other("expected HandshakeInit packet"));
+        }
+        let msg_len = init_pkt.len() - 1;
+        // Flight 1 base lengths (without application payload or MAC):
+        // - ML-KEM-512:  1 (type) + 32 (e) + 48 (s) +  768 (ct) + 16 (tag) = 865 B  (msg_len = 864)
+        // - ML-KEM-768:  1 (type) + 32 (e) + 48 (s) + 1088 (ct) + 16 (tag) = 1185 B (msg_len = 1184)
+        // - ML-KEM-1024: 1 (type) + 32 (e) + 48 (s) + 1568 (ct) + 16 (tag) = 1665 B (msg_len = 1664)
+        // With MAX_INIT_CERT_LEN = 280 B and TAI64N_LEN = 12 B, max payload is 292 B, strictly less
+        // than the 320 B delta between ML-KEM-512 and ML-KEM-768, and the 480 B delta between
+        // ML-KEM-768 and ML-KEM-1024.
+        let kem = if msg_len >= 1664 {
+            yip_crypto::PqKemAlgorithm::MlKem1024
+        } else if msg_len >= 1184 {
+            yip_crypto::PqKemAlgorithm::MlKem768
+        } else if msg_len >= 864 {
+            yip_crypto::PqKemAlgorithm::MlKem512
+        } else {
+            yip_crypto::PqKemAlgorithm::MlKem768
+        };
+        Self::start_responder_with_kem(local_priv, init_pkt, resp_payload, kem)
+    }
+
+    /// Run the responder role with an explicit post-quantum KEM algorithm.
+    pub fn start_responder_with_kem(
+        local_priv: &[u8; 32],
+        init_pkt: &[u8],
+        resp_payload: &[u8],
+        kem: yip_crypto::PqKemAlgorithm,
+    ) -> StartResponderResult {
+        let mut handshake = Handshake::responder_with_kem(local_priv, kem).map_err(crypto_err)?;
 
         if init_pkt.is_empty() || init_pkt[0] != PacketType::HandshakeInit as u8 {
             return Err(io::Error::other("expected HandshakeInit packet"));
@@ -680,6 +775,13 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "initiator cert payload exceeds MAX_INIT_CERT_LEN")]
+    fn frame_init_payload_enforces_max_cert_len() {
+        let oversized = vec![0x42; MAX_INIT_CERT_LEN + 1];
+        let _ = frame_init_payload(&oversized);
+    }
+
+    #[test]
     fn parse_init_payload_rejects_short_payload() {
         assert!(parse_init_payload(&[0u8; TAI64N_LEN - 1]).is_none());
         assert!(parse_init_payload(&[]).is_none());
@@ -698,5 +800,63 @@ mod tests {
         // Clamping at UNIX epoch base
         let zero_dur = std::time::Duration::from_secs(0);
         assert_eq!(tai64n_sub_duration(base, zero_dur), base);
+    }
+
+    #[test]
+    fn test_step_handshake_all_kem_variants() {
+        for kem in [
+            yip_crypto::PqKemAlgorithm::MlKem512,
+            yip_crypto::PqKemAlgorithm::MlKem768,
+            yip_crypto::PqKemAlgorithm::MlKem1024,
+        ] {
+            let a = generate_keypair();
+            let b = generate_keypair();
+
+            let (ha, init_pkt) =
+                HandshakeState::start_initiator_with_kem(&a.private, &b.public, b"hello", kem)
+                    .unwrap();
+            let (b_est, resp_pkt, initiator_static, initiator_payload) =
+                HandshakeState::start_responder(&b.private, &init_pkt, b"world").unwrap();
+            let (a_est, responder_payload) = ha.read_response(&resp_pkt).unwrap();
+
+            assert_eq!(a_est.auth_key, b_est.auth_key);
+            assert_eq!(a_est.hp_key, b_est.hp_key);
+            assert_eq!(initiator_static, a.public);
+            assert_eq!(initiator_payload, b"hello");
+            assert_eq!(responder_payload, b"world");
+        }
+    }
+
+    #[test]
+    fn test_handshake_over_udp_all_kems_including_fragmentation() {
+        for kem in [
+            yip_crypto::PqKemAlgorithm::MlKem512,
+            yip_crypto::PqKemAlgorithm::MlKem768,
+            yip_crypto::PqKemAlgorithm::MlKem1024,
+        ] {
+            let rkp = generate_keypair();
+            let ikp = generate_keypair();
+            let resp_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let resp_addr = resp_sock.local_addr().unwrap();
+            let init_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+            let r_priv = rkp.private;
+            let resp = std::thread::spawn(move || run_responder(&resp_sock, &r_priv).unwrap());
+            let est_i =
+                run_initiator_with_kem(&init_sock, resp_addr, &ikp.private, &rkp.public, kem)
+                    .unwrap();
+            let (est_r, _peer) = resp.join().unwrap();
+
+            assert_eq!(est_i.auth_key, est_r.auth_key);
+            assert_eq!(est_i.hp_key, est_r.hp_key);
+
+            let mut si = est_i.session;
+            let mut sr = est_r.session;
+            let sealed = si.seal(b"encrypted with pq session").unwrap();
+            assert_eq!(
+                sr.open(sealed.counter, &sealed.ciphertext).unwrap(),
+                b"encrypted with pq session"
+            );
+        }
     }
 }

@@ -39,24 +39,43 @@ impl PeerManager {
         // reject stale replays (Task 3 adds the freshness gate; this task
         // only establishes the wire format).
         let payload = crate::handshake::frame_init_payload(&cert);
-        let (hs, init_pkt) =
-            match HandshakeState::start_initiator(&self.local_priv, &pubkey, &payload) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("peer_manager: failed to start handshake: {e}");
-                    self.metrics.record_handshake_failure();
-                    return None;
-                }
-            };
-        let dg = if via_relay {
-            self.relay_wrap(idx, init_pkt.clone())?
-        } else {
-            EgressDatagram {
-                fate: 0,
-                dst: target,
-                bytes: init_pkt.clone(),
+        let kem = self.peers[idx].kem;
+        let (hs, init_pkt) = match HandshakeState::start_initiator_with_kem(
+            &self.local_priv,
+            &pubkey,
+            &payload,
+            kem,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("peer_manager: failed to start handshake: {e}");
+                self.metrics.record_handshake_failure();
+                return None;
             }
         };
+        let pkts = if init_pkt.len() > 1400 {
+            yip_wire::fragment::chunk_handshake_datagram(
+                &init_pkt,
+                1400,
+                self.junk_rng.next_u64() as u32,
+            )
+        } else {
+            vec![init_pkt.clone()]
+        };
+        let mut dgs_init = Vec::with_capacity(pkts.len());
+        for pkt in pkts {
+            if via_relay {
+                if let Some(wrapped) = self.relay_wrap(idx, pkt) {
+                    dgs_init.push(wrapped);
+                }
+            } else {
+                dgs_init.push(EgressDatagram {
+                    fate: 0,
+                    dst: target,
+                    bytes: pkt,
+                });
+            }
+        }
         if via_relay {
             self.peers[idx].relay = true;
         } else {
@@ -85,7 +104,7 @@ impl PeerManager {
         if !via_relay && self.obf_key.is_some() {
             let jc = self.junk_rng.gen_range(JUNK_BURST_MIN, JUNK_BURST_MAX);
             let jc = usize::try_from(jc).expect("JUNK_BURST_MAX fits usize");
-            let mut dgs = Vec::with_capacity(jc + 1);
+            let mut dgs = Vec::with_capacity(jc + dgs_init.len());
             for _ in 0..jc {
                 dgs.push(EgressDatagram {
                     fate: 0,
@@ -93,10 +112,10 @@ impl PeerManager {
                     bytes: self.build_junk(),
                 });
             }
-            dgs.push(dg);
+            dgs.extend(dgs_init);
             return Some(dgs);
         }
-        Some(vec![dg])
+        Some(dgs_init)
     }
 
     /// Whether a handshake `payload` carries a cert that admits the peer whose
@@ -546,6 +565,7 @@ mod tests {
             public_key: kp_i.public,
             endpoint: Some(ep_i),
             alias: None,
+            kem: None,
         };
         let mut pm_r = PeerManager::new(
             kp_r.private,
@@ -639,6 +659,7 @@ mod tests {
             public_key: kp_i.public,
             endpoint: Some(ep_i),
             alias: None,
+            kem: None,
         };
         let mut pm_r = PeerManager::new(
             kp_r.private,
@@ -734,11 +755,13 @@ mod tests {
             public_key: kp_b.public,
             endpoint: Some(ep_b),
             alias: None,
+            kem: None,
         };
         let cfg_a = PeerConfig {
             public_key: kp_a.public,
             endpoint: Some(ep_a),
             alias: None,
+            kem: None,
         };
         let mut pm_a = PeerManager::new(
             kp_a.private,
@@ -814,6 +837,7 @@ mod tests {
             public_key: peer_pubkey,
             endpoint: Some(ep),
             alias: None,
+            kem: None,
         };
         let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
         pm.on_tun(&dummy_tun_pkt(), started_ms);
@@ -1330,6 +1354,7 @@ mod tests {
             public_key: peer.public,
             endpoint: Some(peer_ep),
             alias: None,
+            kem: None,
         };
         let mut pm = PeerManager::new(
             local.private,
@@ -1394,6 +1419,7 @@ mod tests {
             public_key: peer_kp.public,
             endpoint: Some(peer_ep),
             alias: None,
+            kem: None,
         };
 
         // ── absent cert in msg2 → rejected ──
@@ -1483,6 +1509,7 @@ mod tests {
             public_key: root.public,
             endpoint: Some(root_ep),
             alias: None,
+            kem: None,
         };
         let roots = RootSet {
             roots: vec![(root.public, root_ep)],
@@ -1668,6 +1695,7 @@ mod tests {
             public_key: peer_kp.public,
             endpoint: None,
             alias: None,
+            kem: None,
         };
         let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
         pm.set_obf_psk(Some([0xBBu8; 32]));

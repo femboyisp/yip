@@ -30,12 +30,12 @@ fn test_handshake_roundtrip_empty_payload() {
     .expect("responder handshake creation");
 
     // Flight 1: Initiator -> Responder (empty payload)
-    let mut msg1 = [0u8; 1024];
+    let mut msg1 = [0u8; 2048];
     let n1 = initiator
         .write_message_1(&[], &mut msg1)
         .expect("write_message_1");
     assert_eq!(n1, FLIGHT_1_BASE_LEN);
-    assert_eq!(n1, 864);
+    assert_eq!(n1, 1184);
 
     let mut payload1_out = [0u8; 64];
     let p1_len = responder
@@ -107,7 +107,7 @@ fn test_handshake_roundtrip_with_payload() {
     .expect("responder handshake creation");
 
     let payload_f1 = b"client_auth_ticket:xyz123";
-    let mut msg1 = [0u8; 1024];
+    let mut msg1 = [0u8; 2048];
     let n1 = initiator
         .write_message_1(payload_f1, &mut msg1)
         .expect("write_message_1");
@@ -174,7 +174,7 @@ fn test_corruption_static_key_tag_fails_read_message_1() {
         ResponderHandshake::new(&responder_static.private, &responder_pq_ek.0, &psk, &[])
             .expect("responder handshake creation");
 
-    let mut msg1 = [0u8; 1024];
+    let mut msg1 = [0u8; 2048];
     let n1 = initiator
         .write_message_1(b"test", &mut msg1)
         .expect("write_message_1");
@@ -213,7 +213,7 @@ fn test_corruption_kem_ciphertext_fails_read_message_1() {
         ResponderHandshake::new(&responder_static.private, &responder_pq_ek.0, &psk, &[])
             .expect("responder handshake creation");
 
-    let mut msg1 = [0u8; 1024];
+    let mut msg1 = [0u8; 2048];
     let n1 = initiator
         .write_message_1(b"test", &mut msg1)
         .expect("write_message_1");
@@ -250,7 +250,7 @@ fn test_corruption_payload_mac_fails_read_message_1() {
         ResponderHandshake::new(&responder_static.private, &responder_pq_ek.0, &psk, &[])
             .expect("responder handshake creation");
 
-    let mut msg1 = [0u8; 1024];
+    let mut msg1 = [0u8; 2048];
     let n1 = initiator
         .write_message_1(b"test", &mut msg1)
         .expect("write_message_1");
@@ -284,7 +284,7 @@ fn test_corruption_flight_2_fails_read_message_2() {
         ResponderHandshake::new(&responder_static.private, &responder_pq_ek.0, &psk, &[])
             .expect("responder handshake creation");
 
-    let mut msg1 = [0u8; 1024];
+    let mut msg1 = [0u8; 2048];
     let n1 = initiator
         .write_message_1(&[], &mut msg1)
         .expect("write_message_1");
@@ -326,7 +326,7 @@ fn test_low_order_x25519_point_rejected() {
     )
     .expect("initiator handshake creation");
 
-    let mut msg1 = [0u8; 1024];
+    let mut msg1 = [0u8; 2048];
     let res = initiator.write_message_1(&[], &mut msg1);
     assert_eq!(res, Err(CryptoError::InvalidKey));
 }
@@ -352,7 +352,7 @@ fn test_truncated_message_rejected() {
         ResponderHandshake::new(&responder_static.private, &responder_pq_ek.0, &psk, &[])
             .expect("responder handshake creation");
 
-    let mut msg1 = [0u8; 1024];
+    let mut msg1 = [0u8; 2048];
     let n1 = initiator
         .write_message_1(&[], &mut msg1)
         .expect("write_message_1");
@@ -384,7 +384,7 @@ fn test_responder_rejects_low_order_ephemeral_point() {
         ResponderHandshake::new(&responder_static.private, &responder_pq_ek.0, &psk, &[])
             .expect("responder handshake creation");
 
-    let mut msg1 = [0u8; 1024];
+    let mut msg1 = [0u8; 2048];
     let n1 = initiator
         .write_message_1(&[], &mut msg1)
         .expect("write_message_1");
@@ -418,7 +418,7 @@ fn test_initiator_rejects_low_order_ephemeral_point() {
         ResponderHandshake::new(&responder_static.private, &responder_pq_ek.0, &psk, &[])
             .expect("responder handshake creation");
 
-    let mut msg1 = [0u8; 1024];
+    let mut msg1 = [0u8; 2048];
     let n1 = initiator
         .write_message_1(&[], &mut msg1)
         .expect("write_message_1");
@@ -466,7 +466,7 @@ fn test_prologue_mismatch_fails_handshake() {
     )
     .expect("responder handshake creation");
 
-    let mut msg1 = [0u8; 1024];
+    let mut msg1 = [0u8; 2048];
     let n1 = initiator
         .write_message_1(&[], &mut msg1)
         .expect("write_message_1");
@@ -498,14 +498,14 @@ fn test_buffer_too_small_errors() {
         ResponderHandshake::new(&responder_static.private, &responder_pq_ek.0, &psk, &[])
             .expect("responder handshake creation");
 
-    // Output buffer smaller than FLIGHT_1_BASE_LEN (864)
-    let mut small_buf = [0u8; 800];
+    // Output buffer smaller than FLIGHT_1_BASE_LEN
+    let mut small_buf = [0u8; FLIGHT_1_BASE_LEN - 1];
     assert_eq!(
         initiator.write_message_1(&[], &mut small_buf),
         Err(CryptoError::Handshake)
     );
 
-    let mut ok_buf = [0u8; 1024];
+    let mut ok_buf = [0u8; 2048];
     let n1 = initiator
         .write_message_1(b"four", &mut ok_buf)
         .expect("write_message_1");
@@ -609,7 +609,7 @@ fn test_abort_clears_transport_keys() {
     )
     .expect("responder handshake creation");
 
-    let mut msg1 = [0u8; 1024];
+    let mut msg1 = [0u8; 2048];
     let n1 = initiator
         .write_message_1(&[], &mut msg1)
         .expect("write_message_1");
@@ -644,4 +644,78 @@ fn test_abort_clears_transport_keys() {
     responder.abort();
     assert_eq!(responder.split(), Err(CryptoError::Handshake));
     assert_eq!(responder.transport_keys(), Err(CryptoError::Handshake));
+}
+
+#[test]
+fn test_handshake_roundtrip_all_kem_variants() {
+    use yip_crypto::{generate_pq_keypair_for_algo, PqKemAlgorithm};
+
+    for algo in [
+        PqKemAlgorithm::MlKem512,
+        PqKemAlgorithm::MlKem768,
+        PqKemAlgorithm::MlKem1024,
+    ] {
+        let initiator_static = generate_keypair();
+        let responder_static = generate_keypair();
+        let (responder_pq_ek, responder_pq_dk) = generate_pq_keypair_for_algo(algo);
+        let responder_dk_bytes = responder_pq_dk.to_bytes();
+        let psk = [0x99u8; 32];
+        let prologue = b"all-kem-test-prologue";
+
+        let mut initiator = InitiatorHandshake::new(
+            &initiator_static.private,
+            &responder_static.public,
+            &responder_pq_ek.0,
+            &psk,
+            prologue,
+        )
+        .expect("initiator handshake creation");
+        assert_eq!(initiator.algorithm(), algo);
+
+        let mut responder = ResponderHandshake::new(
+            &responder_static.private,
+            &responder_pq_ek.0,
+            &psk,
+            prologue,
+        )
+        .expect("responder handshake creation");
+        assert_eq!(responder.algorithm(), algo);
+
+        let payload_1 = b"flight 1 app payload";
+        let mut msg1 = vec![0u8; algo.flight_1_base_len() + payload_1.len()];
+        let n1 = initiator
+            .write_message_1(payload_1, &mut msg1)
+            .expect("write_message_1");
+        assert_eq!(n1, algo.flight_1_base_len() + payload_1.len());
+
+        let mut payload_1_recv = vec![0u8; payload_1.len()];
+        let n1_recv = responder
+            .read_message_1(&msg1[..n1], &responder_dk_bytes, &mut payload_1_recv)
+            .expect("read_message_1");
+        assert_eq!(n1_recv, payload_1.len());
+        assert_eq!(payload_1_recv, payload_1);
+
+        let payload_2 = b"flight 2 app payload";
+        let mut msg2 = vec![0u8; FLIGHT_2_BASE_LEN + payload_2.len()];
+        let n2 = responder
+            .write_message_2(payload_2, &mut msg2)
+            .expect("write_message_2");
+        assert_eq!(n2, FLIGHT_2_BASE_LEN + payload_2.len());
+
+        let mut payload_2_recv = vec![0u8; payload_2.len()];
+        let n2_recv = initiator
+            .read_message_2(&msg2[..n2], &mut payload_2_recv)
+            .expect("read_message_2");
+        assert_eq!(n2_recv, payload_2.len());
+        assert_eq!(payload_2_recv, payload_2);
+
+        assert!(initiator.is_finished());
+        assert!(responder.is_finished());
+        assert_eq!(initiator.channel_binding(), responder.channel_binding());
+
+        let pair_i = initiator.into_session_pair().expect("session pair");
+        let pair_r = responder.into_session_pair().expect("session pair");
+        assert_eq!(pair_i.send_key(), pair_r.recv_key());
+        assert_eq!(pair_i.recv_key(), pair_r.send_key());
+    }
 }

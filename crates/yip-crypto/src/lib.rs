@@ -11,8 +11,13 @@ pub mod session;
 pub mod symmetric;
 
 pub use handshake::{
-    InitiatorHandshake, ResponderHandshake, FLIGHT_1_BASE_LEN, FLIGHT_2_BASE_LEN, POLY1305_TAG_LEN,
-    PROTOCOL_NAME, X25519_PUBLIC_KEY_LEN,
+    InitiatorHandshake, PqKemAlgorithm, ResponderHandshake, FLIGHT_1_BASE_LEN, FLIGHT_2_BASE_LEN,
+    MLKEM1024_CIPHERTEXT_LEN, MLKEM1024_DECAPS_KEY_LEN, MLKEM1024_ENCAPS_KEY_LEN,
+    MLKEM1024_FLIGHT_1_BASE_LEN, MLKEM512_CIPHERTEXT_LEN, MLKEM512_DECAPS_KEY_LEN,
+    MLKEM512_ENCAPS_KEY_LEN, MLKEM512_FLIGHT_1_BASE_LEN, MLKEM768_CIPHERTEXT_LEN,
+    MLKEM768_DECAPS_KEY_LEN, MLKEM768_ENCAPS_KEY_LEN, MLKEM768_FLIGHT_1_BASE_LEN, POLY1305_TAG_LEN,
+    PROTOCOL_NAME, PROTOCOL_NAME_MLKEM1024, PROTOCOL_NAME_MLKEM512, PROTOCOL_NAME_MLKEM768,
+    X25519_PUBLIC_KEY_LEN,
 };
 pub use session::{
     noise_nonce, rekey_transport_key, ChaCha20Poly1305Cipher, ReplayProfile, ReplayWindow, Sealed,
@@ -26,7 +31,9 @@ use ml_kem::ExpandedKeyEncoding;
 use ml_kem::{
     array::Array,
     kem::{Decapsulate, Kem, KeyExport},
+    ml_kem_1024::{self, MlKem1024},
     ml_kem_512::{self, MlKem512},
+    ml_kem_768::{self, MlKem768},
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -49,30 +56,93 @@ pub fn generate_keypair() -> Keypair {
     Keypair { private, public }
 }
 
-/// ML-KEM-512 encapsulation key length in bytes (FIPS 203).
-pub const PQ_ENCAPS_KEY_LEN: usize = 800;
+/// Default ML-KEM-768 encapsulation key length in bytes (FIPS 203).
+pub const PQ_ENCAPS_KEY_LEN: usize = MLKEM768_ENCAPS_KEY_LEN;
 
-/// ML-KEM-512 ciphertext length in bytes (FIPS 203).
-pub const PQ_CIPHERTEXT_LEN: usize = 768;
+/// Default ML-KEM-768 ciphertext length in bytes (FIPS 203).
+pub const PQ_CIPHERTEXT_LEN: usize = MLKEM768_CIPHERTEXT_LEN;
 
-/// ML-KEM-512 shared secret length in bytes (FIPS 203).
+/// ML-KEM shared secret length in bytes (FIPS 203).
 pub const PQ_SHARED_SECRET_LEN: usize = 32;
 
-/// ML-KEM-512 decapsulation key length in bytes (FIPS 203).
-pub const PQ_DECAPS_KEY_LEN: usize = 1632;
+/// Default ML-KEM-768 decapsulation key length in bytes (FIPS 203).
+pub const PQ_DECAPS_KEY_LEN: usize = MLKEM768_DECAPS_KEY_LEN;
 
-/// An ML-KEM-512 public encapsulation key.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PqEncapsKey(pub [u8; PQ_ENCAPS_KEY_LEN]);
+/// A post-quantum public encapsulation key (ML-KEM-512, ML-KEM-768, or ML-KEM-1024).
+#[derive(Clone, PartialEq, Eq)]
+pub struct PqEncapsKey(pub Vec<u8>);
 
-/// An ML-KEM-512 private decapsulation key wrapped in zeroizing memory.
-pub struct PqDecapsKey(pub(crate) Option<Box<ml_kem_512::DecapsulationKey>>);
+impl PqEncapsKey {
+    /// Create encapsulation key from raw bytes.
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
+        Self(bytes.into())
+    }
+
+    /// Detect or validate the ML-KEM parameter set from the key length.
+    pub fn algorithm(&self) -> Result<PqKemAlgorithm, CryptoError> {
+        match self.0.len() {
+            MLKEM512_ENCAPS_KEY_LEN => Ok(PqKemAlgorithm::MlKem512),
+            MLKEM768_ENCAPS_KEY_LEN => Ok(PqKemAlgorithm::MlKem768),
+            MLKEM1024_ENCAPS_KEY_LEN => Ok(PqKemAlgorithm::MlKem1024),
+            _ => Err(CryptoError::InvalidKey),
+        }
+    }
+
+    /// Access raw key bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl<const N: usize> From<[u8; N]> for PqEncapsKey {
+    fn from(arr: [u8; N]) -> Self {
+        Self(arr.to_vec())
+    }
+}
+
+impl From<&[u8]> for PqEncapsKey {
+    fn from(slice: &[u8]) -> Self {
+        Self(slice.to_vec())
+    }
+}
+
+impl std::ops::Deref for PqEncapsKey {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for PqEncapsKey {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl std::fmt::Debug for PqEncapsKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PqEncapsKey({} bytes, {:?})",
+            self.0.len(),
+            self.algorithm().ok()
+        )
+    }
+}
+
+/// Inner variants of decapsulation keys wrapped in zeroizing memory.
+pub(crate) enum PqDecapsKeyInner {
+    MlKem512(ml_kem_512::DecapsulationKey),
+    MlKem768(ml_kem_768::DecapsulationKey),
+    MlKem1024(ml_kem_1024::DecapsulationKey),
+}
+
+/// A private decapsulation key wrapped in zeroizing memory.
+pub struct PqDecapsKey(pub(crate) Option<Box<PqDecapsKeyInner>>);
 
 impl Drop for PqDecapsKey {
     fn drop(&mut self) {
-        if let Some(inner) = self.0.take() {
-            drop(inner);
-        }
+        self.zeroize();
     }
 }
 
@@ -87,25 +157,66 @@ impl zeroize::Zeroize for PqDecapsKey {
 impl zeroize::ZeroizeOnDrop for PqDecapsKey {}
 
 impl PqDecapsKey {
-    /// Export the 1632-byte expanded ML-KEM-512 decapsulation key bytes.
-    #[expect(deprecated)]
-    pub fn to_bytes(&self) -> [u8; PQ_DECAPS_KEY_LEN] {
-        use ml_kem::ExpandedKeyEncoding;
-        let dk = self.0.as_ref().expect("PqDecapsKey uninitialized");
-        let arr = dk.to_expanded_bytes();
-        let mut out = [0u8; PQ_DECAPS_KEY_LEN];
-        out.copy_from_slice(arr.as_slice());
-        out
+    /// Return the algorithm associated with this decapsulation key.
+    pub fn algorithm(&self) -> Result<PqKemAlgorithm, CryptoError> {
+        match self.0.as_deref() {
+            Some(PqDecapsKeyInner::MlKem512(_)) => Ok(PqKemAlgorithm::MlKem512),
+            Some(PqDecapsKeyInner::MlKem768(_)) => Ok(PqKemAlgorithm::MlKem768),
+            Some(PqDecapsKeyInner::MlKem1024(_)) => Ok(PqKemAlgorithm::MlKem1024),
+            None => Err(CryptoError::Handshake),
+        }
     }
 
-    /// Import an expanded ML-KEM-512 decapsulation key from 1632 bytes.
+    /// Export expanded decapsulation key bytes.
     #[expect(deprecated)]
-    pub fn from_bytes(bytes: &[u8; PQ_DECAPS_KEY_LEN]) -> Result<Self, CryptoError> {
+    pub fn to_bytes(&self) -> Vec<u8> {
         use ml_kem::ExpandedKeyEncoding;
-        let arr = ml_kem::array::Array::from(*bytes);
-        let dk = ml_kem_512::DecapsulationKey::from_expanded_bytes(&arr)
-            .map_err(|_| CryptoError::Handshake)?;
-        Ok(Self(Some(Box::new(dk))))
+        match self.0.as_deref().expect("PqDecapsKey uninitialized") {
+            PqDecapsKeyInner::MlKem512(dk) => dk.to_expanded_bytes().as_slice().to_vec(),
+            PqDecapsKeyInner::MlKem768(dk) => dk.to_expanded_bytes().as_slice().to_vec(),
+            PqDecapsKeyInner::MlKem1024(dk) => dk.to_expanded_bytes().as_slice().to_vec(),
+        }
+    }
+
+    /// Import an expanded ML-KEM decapsulation key from bytes.
+    #[expect(deprecated)]
+    pub fn from_bytes(algo: PqKemAlgorithm, bytes: &[u8]) -> Result<Self, CryptoError> {
+        use ml_kem::ExpandedKeyEncoding;
+        match algo {
+            PqKemAlgorithm::MlKem512 => {
+                if bytes.len() != MLKEM512_DECAPS_KEY_LEN {
+                    return Err(CryptoError::Handshake);
+                }
+                let mut arr = [0u8; MLKEM512_DECAPS_KEY_LEN];
+                arr.copy_from_slice(bytes);
+                let arr = ml_kem::array::Array::from(arr);
+                let dk = ml_kem_512::DecapsulationKey::from_expanded_bytes(&arr)
+                    .map_err(|_| CryptoError::Handshake)?;
+                Ok(Self(Some(Box::new(PqDecapsKeyInner::MlKem512(dk)))))
+            }
+            PqKemAlgorithm::MlKem768 => {
+                if bytes.len() != MLKEM768_DECAPS_KEY_LEN {
+                    return Err(CryptoError::Handshake);
+                }
+                let mut arr = [0u8; MLKEM768_DECAPS_KEY_LEN];
+                arr.copy_from_slice(bytes);
+                let arr = ml_kem::array::Array::from(arr);
+                let dk = ml_kem_768::DecapsulationKey::from_expanded_bytes(&arr)
+                    .map_err(|_| CryptoError::Handshake)?;
+                Ok(Self(Some(Box::new(PqDecapsKeyInner::MlKem768(dk)))))
+            }
+            PqKemAlgorithm::MlKem1024 => {
+                if bytes.len() != MLKEM1024_DECAPS_KEY_LEN {
+                    return Err(CryptoError::Handshake);
+                }
+                let mut arr = [0u8; MLKEM1024_DECAPS_KEY_LEN];
+                arr.copy_from_slice(bytes);
+                let arr = ml_kem::array::Array::from(arr);
+                let dk = ml_kem_1024::DecapsulationKey::from_expanded_bytes(&arr)
+                    .map_err(|_| CryptoError::Handshake)?;
+                Ok(Self(Some(Box::new(PqDecapsKeyInner::MlKem1024(dk)))))
+            }
+        }
     }
 }
 
@@ -115,41 +226,159 @@ impl std::fmt::Debug for PqDecapsKey {
     }
 }
 
-/// An ML-KEM-512 encapsulated ciphertext.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PqCiphertext(pub [u8; PQ_CIPHERTEXT_LEN]);
+/// An ML-KEM encapsulated ciphertext.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PqCiphertext(pub Vec<u8>);
 
-/// Generate a fresh ML-KEM-512 keypair.
+impl PqCiphertext {
+    /// Create ciphertext from raw bytes.
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
+        Self(bytes.into())
+    }
+
+    /// Detect or validate the ML-KEM parameter set from ciphertext length.
+    pub fn algorithm(&self) -> Result<PqKemAlgorithm, CryptoError> {
+        match self.0.len() {
+            MLKEM512_CIPHERTEXT_LEN => Ok(PqKemAlgorithm::MlKem512),
+            MLKEM768_CIPHERTEXT_LEN => Ok(PqKemAlgorithm::MlKem768),
+            MLKEM1024_CIPHERTEXT_LEN => Ok(PqKemAlgorithm::MlKem1024),
+            _ => Err(CryptoError::Handshake),
+        }
+    }
+
+    /// Access raw ciphertext bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl<const N: usize> From<[u8; N]> for PqCiphertext {
+    fn from(arr: [u8; N]) -> Self {
+        Self(arr.to_vec())
+    }
+}
+
+impl From<&[u8]> for PqCiphertext {
+    fn from(slice: &[u8]) -> Self {
+        Self(slice.to_vec())
+    }
+}
+
+impl std::ops::Deref for PqCiphertext {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for PqCiphertext {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl std::fmt::Debug for PqCiphertext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PqCiphertext({} bytes, {:?})",
+            self.0.len(),
+            self.algorithm().ok()
+        )
+    }
+}
+
+/// Generate a fresh default ML-KEM-768 keypair.
 pub fn generate_pq_keypair() -> (PqEncapsKey, PqDecapsKey) {
-    let (dk, ek) = MlKem512::generate_keypair();
-    let ek_bytes = ek.to_bytes();
-    let mut ek_arr = [0u8; PQ_ENCAPS_KEY_LEN];
-    ek_arr.copy_from_slice(ek_bytes.as_slice());
-    (PqEncapsKey(ek_arr), PqDecapsKey(Some(Box::new(dk))))
+    generate_pq_keypair_for_algo(PqKemAlgorithm::MlKem768)
 }
 
-/// Generate an ML-KEM-512 keypair from a 64-byte seed.
+/// Generate a fresh ML-KEM keypair for a specific algorithm.
+pub fn generate_pq_keypair_for_algo(algo: PqKemAlgorithm) -> (PqEncapsKey, PqDecapsKey) {
+    match algo {
+        PqKemAlgorithm::MlKem512 => {
+            let (dk, ek) = MlKem512::generate_keypair();
+            (
+                PqEncapsKey(ek.to_bytes().as_slice().to_vec()),
+                PqDecapsKey(Some(Box::new(PqDecapsKeyInner::MlKem512(dk)))),
+            )
+        }
+        PqKemAlgorithm::MlKem768 => {
+            let (dk, ek) = MlKem768::generate_keypair();
+            (
+                PqEncapsKey(ek.to_bytes().as_slice().to_vec()),
+                PqDecapsKey(Some(Box::new(PqDecapsKeyInner::MlKem768(dk)))),
+            )
+        }
+        PqKemAlgorithm::MlKem1024 => {
+            let (dk, ek) = MlKem1024::generate_keypair();
+            (
+                PqEncapsKey(ek.to_bytes().as_slice().to_vec()),
+                PqDecapsKey(Some(Box::new(PqDecapsKeyInner::MlKem1024(dk)))),
+            )
+        }
+    }
+}
+
+/// Generate default ML-KEM-768 keypair from a 64-byte seed.
 pub fn generate_pq_keypair_from_seed(seed: &[u8; 64]) -> (PqEncapsKey, PqDecapsKey) {
-    let arr = Array::from(*seed);
-    let dk = ml_kem_512::DecapsulationKey::from_seed(arr);
-    let ek = dk.encapsulation_key();
-    let ek_bytes = ek.to_bytes();
-    let mut ek_arr = [0u8; PQ_ENCAPS_KEY_LEN];
-    ek_arr.copy_from_slice(ek_bytes.as_slice());
-    (PqEncapsKey(ek_arr), PqDecapsKey(Some(Box::new(dk))))
+    generate_pq_keypair_from_seed_for_algo(PqKemAlgorithm::MlKem768, seed)
 }
 
-/// Encapsulate a shared secret toward `ek` using a deterministic 32-byte seed `m`,
-/// producing `(ciphertext, shared_secret)`.
+/// Generate an ML-KEM keypair for a specific algorithm from a 64-byte seed.
+pub fn generate_pq_keypair_from_seed_for_algo(
+    algo: PqKemAlgorithm,
+    seed: &[u8; 64],
+) -> (PqEncapsKey, PqDecapsKey) {
+    let arr = Array::from(*seed);
+    match algo {
+        PqKemAlgorithm::MlKem512 => {
+            let dk = ml_kem_512::DecapsulationKey::from_seed(arr);
+            let ek = dk.encapsulation_key();
+            (
+                PqEncapsKey(ek.to_bytes().as_slice().to_vec()),
+                PqDecapsKey(Some(Box::new(PqDecapsKeyInner::MlKem512(dk)))),
+            )
+        }
+        PqKemAlgorithm::MlKem768 => {
+            let dk = ml_kem_768::DecapsulationKey::from_seed(arr);
+            let ek = dk.encapsulation_key();
+            (
+                PqEncapsKey(ek.to_bytes().as_slice().to_vec()),
+                PqDecapsKey(Some(Box::new(PqDecapsKeyInner::MlKem768(dk)))),
+            )
+        }
+        PqKemAlgorithm::MlKem1024 => {
+            let dk = ml_kem_1024::DecapsulationKey::from_seed(arr);
+            let ek = dk.encapsulation_key();
+            (
+                PqEncapsKey(ek.to_bytes().as_slice().to_vec()),
+                PqDecapsKey(Some(Box::new(PqDecapsKeyInner::MlKem1024(dk)))),
+            )
+        }
+    }
+}
+
+/// Encapsulate a shared secret against `ek_bytes` using deterministic 32-byte seed `m`,
+/// writing the ciphertext into `ct_out` and shared secret into `ss_out`.
 ///
-/// Explicitly validates FIPS 203 Section 7.2 ByteDecode_12 (all 12-bit coefficients < 3329)
-/// across the first 768 bytes before invoking key encapsulation.
-pub fn pq_encapsulate_deterministic(
-    ek: &PqEncapsKey,
+/// Operates entirely on stack buffers with zero heap allocations.
+/// Validates FIPS 203 Section 7.2 ByteDecode_12 (all 12-bit coefficients < 3329).
+pub fn pq_encapsulate_to_slice(
+    algo: PqKemAlgorithm,
+    ek_bytes: &[u8],
     m: &[u8; 32],
-) -> Result<(PqCiphertext, Zeroizing<[u8; PQ_SHARED_SECRET_LEN]>), CryptoError> {
-    // FIPS 203 Section 7.2: ByteDecode_12 modulus check (all 12-bit coeffs < 3329)
-    for chunk in ek.0[..768].as_chunks::<3>().0 {
+    ct_out: &mut [u8],
+    ss_out: &mut [u8; 32],
+) -> Result<(), CryptoError> {
+    if ek_bytes.len() != algo.encaps_key_len() || ct_out.len() < algo.ciphertext_len() {
+        return Err(CryptoError::Handshake);
+    }
+    let poly_bytes = algo.bytedecode12_bytes_len();
+    if ek_bytes.len() < poly_bytes {
+        return Err(CryptoError::Handshake);
+    }
+    for chunk in ek_bytes[..poly_bytes].as_chunks::<3>().0 {
         let d0 = u16::from(chunk[0]) | ((u16::from(chunk[1]) & 0x0F) << 8);
         let d1 = (u16::from(chunk[1]) >> 4) | (u16::from(chunk[2]) << 4);
         if d0 >= 3329 || d1 >= 3329 {
@@ -157,22 +386,121 @@ pub fn pq_encapsulate_deterministic(
         }
     }
 
-    let ek_arr = Array::from(ek.0);
-    let key = ml_kem_512::EncapsulationKey::new(&ek_arr).map_err(|_| CryptoError::Handshake)?;
     let m_arr = Array::from(*m);
-    let (ct, ss) = key.encapsulate_deterministic(&m_arr);
-    let ss = Zeroizing::new(ss);
-    let mut ct_arr = [0u8; PQ_CIPHERTEXT_LEN];
-    ct_arr.copy_from_slice(ct.as_slice());
-    let mut ss_arr = Zeroizing::new([0u8; PQ_SHARED_SECRET_LEN]);
-    ss_arr.copy_from_slice(ss.as_slice());
-    Ok((PqCiphertext(ct_arr), ss_arr))
+    match algo {
+        PqKemAlgorithm::MlKem512 => {
+            let mut ek_arr = [0u8; MLKEM512_ENCAPS_KEY_LEN];
+            ek_arr.copy_from_slice(ek_bytes);
+            let ek_arr = Array::from(ek_arr);
+            let key =
+                ml_kem_512::EncapsulationKey::new(&ek_arr).map_err(|_| CryptoError::Handshake)?;
+            let (ct, ss) = key.encapsulate_deterministic(&m_arr);
+            ct_out[..MLKEM512_CIPHERTEXT_LEN].copy_from_slice(ct.as_slice());
+            ss_out.copy_from_slice(ss.as_slice());
+            Ok(())
+        }
+        PqKemAlgorithm::MlKem768 => {
+            let mut ek_arr = [0u8; MLKEM768_ENCAPS_KEY_LEN];
+            ek_arr.copy_from_slice(ek_bytes);
+            let ek_arr = Array::from(ek_arr);
+            let key =
+                ml_kem_768::EncapsulationKey::new(&ek_arr).map_err(|_| CryptoError::Handshake)?;
+            let (ct, ss) = key.encapsulate_deterministic(&m_arr);
+            ct_out[..MLKEM768_CIPHERTEXT_LEN].copy_from_slice(ct.as_slice());
+            ss_out.copy_from_slice(ss.as_slice());
+            Ok(())
+        }
+        PqKemAlgorithm::MlKem1024 => {
+            let mut ek_arr = [0u8; MLKEM1024_ENCAPS_KEY_LEN];
+            ek_arr.copy_from_slice(ek_bytes);
+            let ek_arr = Array::from(ek_arr);
+            let key =
+                ml_kem_1024::EncapsulationKey::new(&ek_arr).map_err(|_| CryptoError::Handshake)?;
+            let (ct, ss) = key.encapsulate_deterministic(&m_arr);
+            ct_out[..MLKEM1024_CIPHERTEXT_LEN].copy_from_slice(ct.as_slice());
+            ss_out.copy_from_slice(ss.as_slice());
+            Ok(())
+        }
+    }
+}
+
+/// Decapsulate `ct_bytes` using expanded decapsulation key bytes `dk_bytes`,
+/// writing the recovered 32-byte shared secret into `ss_out`.
+///
+/// Operates entirely on stack buffers with zero heap allocations.
+#[expect(deprecated)]
+pub fn pq_decapsulate_to_slice(
+    algo: PqKemAlgorithm,
+    dk_bytes: &[u8],
+    ct_bytes: &[u8],
+    ss_out: &mut [u8; 32],
+) -> Result<(), CryptoError> {
+    if dk_bytes.len() != algo.decaps_key_len() || ct_bytes.len() != algo.ciphertext_len() {
+        return Err(CryptoError::Handshake);
+    }
+    match algo {
+        PqKemAlgorithm::MlKem512 => {
+            let mut dk_arr = [0u8; MLKEM512_DECAPS_KEY_LEN];
+            dk_arr.copy_from_slice(dk_bytes);
+            let dk = ml_kem_512::DecapsulationKey::from_expanded_bytes(&Array::from(dk_arr))
+                .map_err(|_| CryptoError::Handshake)?;
+            let mut ct_arr = [0u8; MLKEM512_CIPHERTEXT_LEN];
+            ct_arr.copy_from_slice(ct_bytes);
+            let ss = dk.decapsulate(&Array::from(ct_arr));
+            ss_out.copy_from_slice(ss.as_slice());
+            dk_arr.zeroize();
+            ct_arr.zeroize();
+            Ok(())
+        }
+        PqKemAlgorithm::MlKem768 => {
+            let mut dk_arr = [0u8; MLKEM768_DECAPS_KEY_LEN];
+            dk_arr.copy_from_slice(dk_bytes);
+            let dk = ml_kem_768::DecapsulationKey::from_expanded_bytes(&Array::from(dk_arr))
+                .map_err(|_| CryptoError::Handshake)?;
+            let mut ct_arr = [0u8; MLKEM768_CIPHERTEXT_LEN];
+            ct_arr.copy_from_slice(ct_bytes);
+            let ss = dk.decapsulate(&Array::from(ct_arr));
+            ss_out.copy_from_slice(ss.as_slice());
+            dk_arr.zeroize();
+            ct_arr.zeroize();
+            Ok(())
+        }
+        PqKemAlgorithm::MlKem1024 => {
+            let mut dk_arr = [0u8; MLKEM1024_DECAPS_KEY_LEN];
+            dk_arr.copy_from_slice(dk_bytes);
+            let dk = ml_kem_1024::DecapsulationKey::from_expanded_bytes(&Array::from(dk_arr))
+                .map_err(|_| CryptoError::Handshake)?;
+            let mut ct_arr = [0u8; MLKEM1024_CIPHERTEXT_LEN];
+            ct_arr.copy_from_slice(ct_bytes);
+            let ss = dk.decapsulate(&Array::from(ct_arr));
+            ss_out.copy_from_slice(ss.as_slice());
+            dk_arr.zeroize();
+            ct_arr.zeroize();
+            Ok(())
+        }
+    }
+}
+
+/// Encapsulate a shared secret toward `ek` using a deterministic 32-byte seed `m`,
+/// producing `(ciphertext, shared_secret)`.
+///
+/// Explicitly validates FIPS 203 Section 7.2 ByteDecode_12 (all 12-bit coefficients < 3329)
+/// across the polynomial vector before invoking key encapsulation.
+pub fn pq_encapsulate_deterministic(
+    ek: &PqEncapsKey,
+    m: &[u8; 32],
+) -> Result<(PqCiphertext, Zeroizing<[u8; PQ_SHARED_SECRET_LEN]>), CryptoError> {
+    let algo = ek.algorithm()?;
+    let mut ct = vec![0u8; algo.ciphertext_len()];
+    let mut ss = Zeroizing::new([0u8; 32]);
+    pq_encapsulate_to_slice(algo, ek.as_bytes(), m, &mut ct, &mut ss)?;
+    Ok((PqCiphertext(ct), ss))
 }
 
 /// Encapsulate a shared secret toward `ek`, producing `(ciphertext, shared_secret)`.
 ///
 /// Explicitly validates FIPS 203 Section 7.2 ByteDecode_12 (all 12-bit coefficients < 3329)
-/// across the first 768 bytes before invoking key encapsulation.
+/// across the polynomial vector before invoking key encapsulation.
 pub fn pq_encapsulate(
     ek: &PqEncapsKey,
 ) -> Result<(PqCiphertext, Zeroizing<[u8; PQ_SHARED_SECRET_LEN]>), CryptoError> {
@@ -189,12 +517,14 @@ pub fn pq_decapsulate(
     dk: &PqDecapsKey,
     ct: &PqCiphertext,
 ) -> Result<Zeroizing<[u8; PQ_SHARED_SECRET_LEN]>, CryptoError> {
-    let ct_arr = Array::from(ct.0);
-    let dk_box = dk.0.as_ref().ok_or(CryptoError::Handshake)?;
-    let ss = Zeroizing::new(dk_box.decapsulate(&ct_arr));
-    let mut ss_arr = Zeroizing::new([0u8; PQ_SHARED_SECRET_LEN]);
-    ss_arr.copy_from_slice(ss.as_slice());
-    Ok(ss_arr)
+    let algo = dk.algorithm()?;
+    if algo != ct.algorithm()? {
+        return Err(CryptoError::Handshake);
+    }
+    let mut ss = Zeroizing::new([0u8; 32]);
+    let dk_bytes = dk.to_bytes();
+    pq_decapsulate_to_slice(algo, &dk_bytes, ct.as_bytes(), &mut ss)?;
+    Ok(ss)
 }
 
 /// Errors from the crypto layer.
@@ -221,53 +551,77 @@ pub struct Handshake {
 
 enum HandshakeRole {
     Initiator(Box<InitiatorHandshake>),
-    Responder(Box<(ResponderHandshake, [u8; PQ_DECAPS_KEY_LEN])>),
+    Responder(Box<(ResponderHandshake, Zeroizing<Vec<u8>>)>),
 }
 
 impl Handshake {
-    /// Begin as the initiator, which knows the responder's static public key.
+    /// Return the ML-KEM algorithm used by this handshake.
+    pub fn algorithm(&self) -> PqKemAlgorithm {
+        match &self.role {
+            HandshakeRole::Initiator(ini) => ini.algorithm(),
+            HandshakeRole::Responder(boxed) => boxed.0.algorithm(),
+        }
+    }
+
+    /// Begin as the initiator, defaulting to ML-KEM-768.
     pub fn initiator(
         local_private: &[u8; 32],
         peer_public: &[u8; 32],
     ) -> Result<Handshake, CryptoError> {
-        let mut hasher = blake3::Hasher::new_derive_key("yip-compat-mlkem512-v1");
+        Self::initiator_with_kem(local_private, peer_public, PqKemAlgorithm::MlKem768)
+    }
+
+    /// Begin as the initiator with an explicit KEM parameter set.
+    pub fn initiator_with_kem(
+        local_private: &[u8; 32],
+        peer_public: &[u8; 32],
+        algo: PqKemAlgorithm,
+    ) -> Result<Handshake, CryptoError> {
+        let mut hasher = blake3::Hasher::new_derive_key(algo.kdf_context());
         hasher.update(peer_public);
         let mut seed_bytes = [0u8; 64];
         hasher.finalize_xof().fill(&mut seed_bytes);
-        let seed = ml_kem::Seed::from(seed_bytes);
-        let dk = ml_kem_512::DecapsulationKey::from_seed(seed);
-        let ek_bytes = dk.encapsulation_key().to_bytes();
-        let mut ek = [0u8; PQ_ENCAPS_KEY_LEN];
-        ek.copy_from_slice(ek_bytes.as_slice());
+        let (ek, _dk) = generate_pq_keypair_from_seed_for_algo(algo, &seed_bytes);
+        seed_bytes.zeroize();
 
-        let inner = InitiatorHandshake::new(local_private, peer_public, &ek, &[0u8; 32], &[])?;
+        let inner = InitiatorHandshake::new_with_algo(
+            algo,
+            local_private,
+            peer_public,
+            ek.as_bytes(),
+            &[0u8; 32],
+            &[],
+        )?;
         Ok(Handshake {
             role: HandshakeRole::Initiator(Box::new(inner)),
         })
     }
 
-    /// Begin as the responder; learns the initiator's static key during the handshake.
+    /// Begin as the responder, defaulting to ML-KEM-768.
     pub fn responder(local_private: &[u8; 32]) -> Result<Handshake, CryptoError> {
+        Self::responder_with_kem(local_private, PqKemAlgorithm::MlKem768)
+    }
+
+    /// Begin as the responder with an explicit KEM parameter set.
+    pub fn responder_with_kem(
+        local_private: &[u8; 32],
+        algo: PqKemAlgorithm,
+    ) -> Result<Handshake, CryptoError> {
         let sec = x25519_dalek::StaticSecret::from(*local_private);
         let local_public = x25519_dalek::PublicKey::from(&sec).to_bytes();
 
-        let mut hasher = blake3::Hasher::new_derive_key("yip-compat-mlkem512-v1");
+        let mut hasher = blake3::Hasher::new_derive_key(algo.kdf_context());
         hasher.update(&local_public);
         let mut seed_bytes = [0u8; 64];
         hasher.finalize_xof().fill(&mut seed_bytes);
-        let seed = ml_kem::Seed::from(seed_bytes);
-        let dk = ml_kem_512::DecapsulationKey::from_seed(seed);
-        let ek_bytes = dk.encapsulation_key().to_bytes();
-        let mut ek = [0u8; PQ_ENCAPS_KEY_LEN];
-        ek.copy_from_slice(ek_bytes.as_slice());
-        #[expect(deprecated)]
-        let dk_bytes = dk.to_expanded_bytes();
-        let mut dk_arr = [0u8; PQ_DECAPS_KEY_LEN];
-        dk_arr.copy_from_slice(dk_bytes.as_slice());
+        let (ek, dk) = generate_pq_keypair_from_seed_for_algo(algo, &seed_bytes);
+        seed_bytes.zeroize();
+        let dk_bytes = Zeroizing::new(dk.to_bytes());
 
-        let inner = ResponderHandshake::new(local_private, &ek, &[0u8; 32], &[])?;
+        let inner =
+            ResponderHandshake::new_with_algo(algo, local_private, ek.as_bytes(), &[0u8; 32], &[])?;
         Ok(Handshake {
-            role: HandshakeRole::Responder(Box::new((inner, dk_arr))),
+            role: HandshakeRole::Responder(Box::new((inner, dk_bytes))),
         })
     }
 
@@ -275,7 +629,7 @@ impl Handshake {
     pub fn write_message(&mut self, payload: &[u8]) -> Result<Vec<u8>, CryptoError> {
         match &mut self.role {
             HandshakeRole::Initiator(ini) => {
-                let mut out = vec![0u8; FLIGHT_1_BASE_LEN + payload.len()];
+                let mut out = vec![0u8; ini.algorithm().flight_1_base_len() + payload.len()];
                 let n = ini.write_message_1(payload, &mut out)?;
                 out.truncate(n);
                 Ok(out)
@@ -296,7 +650,7 @@ impl Handshake {
             HandshakeRole::Responder(boxed) => {
                 let (res, dk) = &mut **boxed;
                 let mut out = vec![0u8; msg.len()];
-                let n = res.read_message_1(msg, dk, &mut out)?;
+                let n = res.read_message_1(msg, dk.as_slice(), &mut out)?;
                 out.truncate(n);
                 Ok(out)
             }
@@ -1178,5 +1532,119 @@ mod tests {
         use zeroize::Zeroize;
         dk.zeroize();
         assert!(dk.0.is_none());
+    }
+
+    #[test]
+    fn test_pq_encaps_and_ciphertext_debug_and_from_bytes() {
+        use std::str::FromStr;
+
+        let (ek, dk) = generate_pq_keypair();
+        let dbg_ek = format!("{:?}", ek);
+        assert!(dbg_ek.contains("PqEncapsKey"));
+
+        let ct_vec = vec![0x77u8; PqKemAlgorithm::MlKem768.ciphertext_len()];
+        let ct = PqCiphertext::from(ct_vec.as_slice());
+        let dbg_ct = format!("{:?}", ct);
+        assert!(dbg_ct.contains("PqCiphertext"));
+
+        // Test PqDecapsKey::from_bytes length checks
+        assert!(PqDecapsKey::from_bytes(PqKemAlgorithm::MlKem512, &[0u8; 10]).is_err());
+        assert!(PqDecapsKey::from_bytes(PqKemAlgorithm::MlKem768, &[0u8; 10]).is_err());
+        assert!(PqDecapsKey::from_bytes(PqKemAlgorithm::MlKem1024, &[0u8; 10]).is_err());
+
+        // Test PqDecapsKey::from_bytes exact length works
+        let dk_bytes = dk.to_bytes();
+        assert!(PqDecapsKey::from_bytes(PqKemAlgorithm::MlKem768, &dk_bytes).is_ok());
+
+        // Test pq_decapsulate_to_slice length checks
+        let mut ss_out = [0u8; 32];
+        let correct_ct = vec![0u8; PqKemAlgorithm::MlKem768.ciphertext_len()];
+        let wrong_ct = vec![0u8; 10];
+        let wrong_dk = vec![0u8; 10];
+
+        // wrong dk, right ct
+        assert_eq!(
+            pq_decapsulate_to_slice(
+                PqKemAlgorithm::MlKem768,
+                &wrong_dk,
+                &correct_ct,
+                &mut ss_out
+            ),
+            Err(CryptoError::Handshake)
+        );
+        // right dk, wrong ct
+        assert_eq!(
+            pq_decapsulate_to_slice(PqKemAlgorithm::MlKem768, &dk_bytes, &wrong_ct, &mut ss_out),
+            Err(CryptoError::Handshake)
+        );
+        // both wrong
+        assert_eq!(
+            pq_decapsulate_to_slice(PqKemAlgorithm::MlKem768, &wrong_dk, &wrong_ct, &mut ss_out),
+            Err(CryptoError::Handshake)
+        );
+
+        // Test PqKemAlgorithm methods & traits
+        assert_eq!(
+            PqKemAlgorithm::MlKem512.kdf_context(),
+            "yip-compat-mlkem512-v1"
+        );
+        assert_eq!(
+            PqKemAlgorithm::MlKem768.kdf_context(),
+            "yip-compat-mlkem768-v1"
+        );
+        assert_eq!(
+            PqKemAlgorithm::MlKem1024.kdf_context(),
+            "yip-compat-mlkem1024-v1"
+        );
+
+        assert_eq!(PqKemAlgorithm::MlKem512.as_str(), "mlkem512");
+        assert_eq!(PqKemAlgorithm::MlKem768.as_str(), "mlkem768");
+        assert_eq!(PqKemAlgorithm::MlKem1024.as_str(), "mlkem1024");
+
+        assert_eq!(format!("{}", PqKemAlgorithm::MlKem512), "mlkem512");
+        assert_eq!(format!("{}", PqKemAlgorithm::MlKem768), "mlkem768");
+        assert_eq!(format!("{}", PqKemAlgorithm::MlKem1024), "mlkem1024");
+
+        assert_eq!(
+            PqKemAlgorithm::from_str("mlkem512").unwrap(),
+            PqKemAlgorithm::MlKem512
+        );
+        assert_eq!(
+            PqKemAlgorithm::from_str("mlkem768").unwrap(),
+            PqKemAlgorithm::MlKem768
+        );
+        assert_eq!(
+            PqKemAlgorithm::from_str("mlkem1024").unwrap(),
+            PqKemAlgorithm::MlKem1024
+        );
+        assert!(PqKemAlgorithm::from_str("unknown").is_err());
+
+        // Handshake algorithm getter & remote_pq_ek
+        let kp1 = generate_keypair();
+        let kp2 = generate_keypair();
+        let hs_512 =
+            Handshake::initiator_with_kem(&kp1.private, &kp2.public, PqKemAlgorithm::MlKem512)
+                .unwrap();
+        assert_eq!(hs_512.algorithm(), PqKemAlgorithm::MlKem512);
+        let hs_768 =
+            Handshake::initiator_with_kem(&kp1.private, &kp2.public, PqKemAlgorithm::MlKem768)
+                .unwrap();
+        assert_eq!(hs_768.algorithm(), PqKemAlgorithm::MlKem768);
+        let hs_1024 =
+            Handshake::initiator_with_kem(&kp1.private, &kp2.public, PqKemAlgorithm::MlKem1024)
+                .unwrap();
+        assert_eq!(hs_1024.algorithm(), PqKemAlgorithm::MlKem1024);
+
+        let ek_resp = vec![0x33u8; PqKemAlgorithm::MlKem768.encaps_key_len()];
+        let init_inner = InitiatorHandshake::new_with_algo(
+            PqKemAlgorithm::MlKem768,
+            &kp1.private,
+            &kp2.public,
+            &ek_resp,
+            &[0u8; 32],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(init_inner.remote_pq_ek(), &ek_resp[..]);
     }
 }

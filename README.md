@@ -2,8 +2,6 @@
 
 <img src="assets/yip.png" alt="yip logo" width="340" />
 
-# 🦊 yip
-
 **Low-latency P2P mesh VPN in Rust.**<br/>
 *Reed-Solomon FEC loss immunity • 40 Gbps AF_XDP multi-core scaling • Decentralized threshold PKI • Anti-DPI TLS mimicry*
 
@@ -32,7 +30,7 @@ Standard VPNs collapse the moment a physical link drops packets. WireGuard deliv
 
 **yip fixes this at the root.** It is a high-performance peer-to-peer mesh VPN in Rust that bakes Reed-Solomon forward error correction (FEC) directly into the datapath. Missing packets are reconstructed in-flight before the kernel TCP stack or user applications ever realize a drop occurred.
 
-Under the hood, yip pairs proactive loss recovery with **40 Gbps AF_XDP zero-copy scaling**, post-quantum **ML-KEM-512 handshakes**, an online ***t*-of-*n* Decentralized Threshold CA** (RFC 9591 FROST), and authentic **Chrome TLS mimicry** to glide past aggressive DPI firewalls unnoticed.
+Under the hood, yip pairs proactive loss recovery with **40 Gbps AF_XDP zero-copy scaling**, post-quantum **ML-KEM-768 handshakes** (with ML-KEM-1024 and ML-KEM-512 support), an online ***t*-of-*n* Decentralized Threshold CA** (RFC 9591 FROST), and authentic **Chrome TLS mimicry** to glide past aggressive DPI firewalls unnoticed.
 
 > [!TIP]
 > **Decentralized Threshold CA Hero Feature**:
@@ -80,7 +78,7 @@ Because throughput is inversely proportional to the square root of loss probabil
 | **Zero-trust mesh networks** requiring decentralized *t*-of-*n* threshold signing and automated certificate renewal | **Simple point-to-point home VPNs** where static public keys are easily managed manually |
 | **High-packet-rate 40G/100G edge infrastructure** scaling across multiple CPU cores via zero-copy AF_XDP | **Anonymity or mix-net routing** without trusted direct peering (peers authenticate directly) |
 | **Hostile network environments** monitored by active-probing Deep Packet Inspection (DPI) firewalls | **Desktop platforms other than Linux** (macOS and Windows desktop clients are not currently supported) |
-| **Future-proof quantum resistance** via NIST FIPS 203 ML-KEM-512 hybrid handshakes | Environments where legacy unencrypted protocols or centralized proprietary controllers are required |
+| **Future-proof quantum resistance** via NIST FIPS 203 ML-KEM-768 hybrid handshakes (with ML-KEM-1024 and ML-KEM-512 support) | Environments where legacy unencrypted protocols or centralized proprietary controllers are required |
 
 ---
 
@@ -234,7 +232,7 @@ flowchart TD
 - **Flat Open-Addressing Tables**: Replaces dynamic pointer maps with bounded flat slot tables using SplitMix64 fast hashing and backward-shift deletion with zero tombstones.
 
 ### 4. Post-Quantum Cryptography & Identity
-- **Single-RTT Hybrid Handshake**: Blends native zero-allocation PQNoise_IKpsk2 (Curve25519) with NIST FIPS 203 ML-KEM-512 (Kyber) within compact datagrams strictly under the 1200-byte internet MTU floor.
+- **Single-RTT Hybrid Handshake**: Blends native zero-allocation PQNoise_IKpsk2 (Curve25519) with NIST FIPS 203 ML-KEM-768 (Kyber) by default, supporting ML-KEM-1024 and ML-KEM-512 with sub-microsecond wire chunking and reassembly.
 - **120-Second Epoch Ratcheting**: Automated forward-secrecy key rotation with a 20-second dual-receive grace window prevents dropped packets during rekey transitions.
 - **Rigorous Memory Hygiene**: Cryptographic secrets implement explicit `Zeroize` traits to purge private key material from memory buffers immediately upon drop.
 - **Self-Certifying IPv6 Addressing**: Cryptographic BLAKE3 key derivation derives immutable, anti-spoofing overlay addresses in the `fd00::/8` ULA space directly from node public keys.
@@ -305,7 +303,7 @@ Full methodology and reproducible test harnesses are documented in [`crates/yip-
 ├───────────────────────────────────────┼───────────────────────────────────────┤
 │ ✔ Payload Confidentiality & Integrity │ ✘ Physical Peer IP Concealment        │
 │   ChaCha20-Poly1305 with post-quantum │   Peers authenticate directly and     │
-│   hybrid ML-KEM-512 forward secrecy   │   exchange traffic peer-to-peer       │
+│   hybrid ML-KEM-768 forward secrecy   │   exchange traffic peer-to-peer       │
 ├───────────────────────────────────────┼───────────────────────────────────────┤
 │ ✔ Single-Point-of-Failure CA Defense  │ ✘ Mix-Net Anonymity                   │
 │   t-of-n FROST quorum ensures master  │   yip is not Tor; it does not route   │

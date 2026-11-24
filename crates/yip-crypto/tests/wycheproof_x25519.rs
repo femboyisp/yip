@@ -510,7 +510,7 @@ fn test_handshake_rejects_low_order_points() {
         )
         .expect("initiator creation");
 
-        let mut msg1 = [0u8; 1024];
+        let mut msg1 = [0u8; 2048];
         let res = initiator.write_message_1(&[], &mut msg1);
         assert_eq!(
             res,
@@ -540,7 +540,7 @@ fn test_responder_rejects_low_order_ephemeral_points() {
     )
     .expect("initiator creation");
 
-    let mut valid_msg1 = [0u8; 1024];
+    let mut valid_msg1 = [0u8; 2048];
     let n1 = initiator
         .write_message_1(&[], &mut valid_msg1)
         .expect("write_message_1");

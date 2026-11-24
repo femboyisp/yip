@@ -52,6 +52,7 @@ fn test_control_response_config_and_reload_serde() {
             endpoint: Some("198.51.100.2:51820".to_string()),
             alias: Some("peer-b".to_string()),
             transport: Some("raw_udp".to_string()),
+            kem: None,
         }],
         fec: Some(FecPreset::Adaptive.default_config()),
         daita: Some(DaitaPreset::Balanced.default_config()),
@@ -62,6 +63,7 @@ fn test_control_response_config_and_reload_serde() {
             domains: vec!["internal.corp".to_string()],
             apps: vec!["curl".to_string()],
         }),
+        kem: None,
     };
 
     let resp_config = ControlResponse::Config {

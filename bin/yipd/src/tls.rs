@@ -1428,6 +1428,7 @@ mod tests {
             public_key: peer_pub,
             endpoint: Some(addr),
             alias: None,
+            kem: None,
         };
         let mut manager = PeerManager::new(
             local_priv,
@@ -1523,6 +1524,7 @@ mod tests {
             public_key: peer_pub,
             endpoint: Some(addr),
             alias: None,
+            kem: None,
         };
         let mut manager = PeerManager::new(
             local_priv,
