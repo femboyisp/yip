@@ -60,7 +60,7 @@ The table below summarizes the core cryptographic primitives employed across `yi
 
 | Layer | Protocol / Primitive | Standard / Specification | Key / State Size | Security Objective |
 | :--- | :--- | :--- | :--- | :--- |
-| **PQ Hybrid Handshake** | Noise-IKpsk2 + ML-KEM-512 | [Noise Protocol Framework](https://noiseprotocol.org/), [NIST FIPS 203](https://doi.org/10.6028/NIST.FIPS.203) | X25519: 32 B, ML-KEM: 800 B / 768 B | 1-RTT mutual authentication, PFS, HNDL quantum resistance |
+| **PQ Hybrid Handshake** | Noise-IKpsk2 + ML-KEM-768 (Default) | [Noise Protocol Framework](https://noiseprotocol.org/), [NIST FIPS 203](https://doi.org/10.6028/NIST.FIPS.203) | X25519: 32 B, ML-KEM-768: 1184 B / 1088 B | 1-RTT mutual authentication, PFS, HNDL quantum resistance |
 | **Symmetric AEAD** | ChaCha20-Poly1305 | [RFC 8439](https://www.rfc-editor.org/rfc/rfc8439) | Key: 32 B, Nonce: 12 B, Tag: 16 B | Data-plane confidentiality, integrity, and authenticity |
 | **Anti-Replay Window** | Sliding Bitmap Ring | Ring Buffer (131,072 bits) | HighThroughput: 16 KB, Standard: 1 KB | Zero false positives, monotonic upper bound tracking |
 | **Session Ratchet** | Epoch Rekeying (120s) | In-band ephemeral rekey | 20s dual-receive grace window | Bounded key lifetime, forward secrecy against late compromise |
@@ -75,7 +75,7 @@ The table below summarizes the core cryptographic primitives employed across `yi
 
 The architecture enforces five fundamental security invariants across all implementations:
 
-1. **Defense in Depth via Hybrid Construction**: Every session derivation combines classical elliptic-curve Diffie-Hellman (X25519) with lattice-based post-quantum encapsulation (ML-KEM-512). Breaking forward secrecy requires breaking **both** hardness assumptions simultaneously.
+1. **Defense in Depth via Hybrid Construction**: Every session derivation combines classical elliptic-curve Diffie-Hellman (X25519) with lattice-based post-quantum encapsulation (ML-KEM-768 by default, supporting ML-KEM-1024 and ML-KEM-512). Breaking forward secrecy requires breaking **both** hardness assumptions simultaneously.
 2. **Zero Fixed Wire Signatures**: No static magic numbers, unencrypted packet-type tags, constant protocol identifiers, or deterministic byte sequences exist anywhere on the wire. All headers are keystream-masked.
 3. **Fail-Closed Processing**: Any packet failing authentication, tampering checks, modulus verification, or anti-replay validation is discarded immediately with zero error responses emitted to the network, preventing oracle side-channels.
 4. **Denial-of-Service Asymmetry Protection**: Inexpensive operations always precede expensive operations. Cheap 64-bit SipHash-1-3 verification (16.76 ns) and read-only anti-replay checks reject unauthorized probes before triggering costly AEAD decryptions or cryptographic state allocations.
@@ -85,12 +85,12 @@ The architecture enforces five fundamental security invariants across all implem
 
 ## 2. Post-Quantum Hybrid Handshake Architecture
 
-### Protocol Composition: Noise-IKpsk2 + ML-KEM-512
+### Protocol Composition: Noise-IKpsk2 + ML-KEM-768
 
-The control plane implements a post-quantum hybrid cryptographic handshake implemented in [`crates/yip-crypto/src/lib.rs`](../crates/yip-crypto/src/lib.rs). It integrates the bespoke post-quantum extended **PQNoise-IKpsk2** protocol (`PQNoise_IKpsk2_25519_MLKEM512_ChaChaPoly_BLAKE3`) with NIST FIPS 203 **ML-KEM-512** (Kyber-512) and native BLAKE3 keyed XOF ratchets:
+The control plane implements a post-quantum hybrid cryptographic handshake implemented in [`crates/yip-crypto/src/lib.rs`](../crates/yip-crypto/src/lib.rs). It integrates the bespoke post-quantum extended **PQNoise-IKpsk2** protocol (`PQNoise_IKpsk2_25519_MLKEM768_ChaChaPoly_BLAKE3`, also supporting `MLKEM1024` and `MLKEM512`) with NIST FIPS 203 **ML-KEM** and native BLAKE3 keyed XOF ratchets:
 
 - **IK (Initiator knows Responder static key beforehand)**: The initiator possesses the responder's static public key prior to initiating the handshake (configured via certificate or rendezvous record). The initiator encrypts its own static identity key in the first flight, preserving initiator identity confidentiality against passive eavesdroppers.
-- **psk2 (Pre-Shared Key slot 2)**: Noise provides designated points in its token sequences where external entropy can be injected into the running symmetric chaining key ($ck$) and handshake hash ($h$). `yip` utilizes PSK slot 2 to inject the 32-byte post-quantum shared secret ($ss_{pq}$) derived from ML-KEM-512.
+- **psk2 (Pre-Shared Key slot 2)**: Noise provides designated points in its token sequences where external entropy can be injected into the running symmetric chaining key ($ck$) and handshake hash ($h$). `yip` utilizes PSK slot 2 to inject the 32-byte post-quantum shared secret ($ss_{pq}$) derived from ML-KEM.
 
 ```
 Initiator (Node A)                                        Responder (Node B)
@@ -132,11 +132,12 @@ Both peers derive identical session transport keys (k_send, k_recv)
 |   - Public Key Size:             32 bytes                                     |
 |   - Private Key Size:            32 bytes                                     |
 +-------------------------------------------------------------------------------+
-| Post-Quantum KEM:                NIST FIPS 203 ML-KEM-512 (Kyber-512)         |
-|   - Encapsulation Key (ek_A):    800 bytes                                    |
-|   - Decapsulation Key (dk_A):    1,632 bytes (held in Zeroizing memory)       |
-|   - Ciphertext (ct):             768 bytes                                    |
+| Post-Quantum KEM:                NIST FIPS 203 ML-KEM-768 (Default)           |
+|   - Encapsulation Key (ek_A):    1,184 bytes (ML-KEM-768)                     |
+|   - Decapsulation Key (dk_A):    2,400 bytes (held in Zeroizing memory)       |
+|   - Ciphertext (ct):             1,088 bytes                                  |
 |   - Shared Secret (ss_pq):       32 bytes                                     |
+|   - Supported Variants:          ML-KEM-1024 (Cat 5), ML-KEM-512 (Cat 1)      |
 +-------------------------------------------------------------------------------+
 | Symmetric Cipher & Hash:         ChaCha20-Poly1305 AEAD + BLAKE3 Hash         |
 |   - Handshake Cipher:            ChaCha20-Poly1305 (RFC 8439)                 |

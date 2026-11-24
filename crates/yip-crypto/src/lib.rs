@@ -1533,4 +1533,118 @@ mod tests {
         dk.zeroize();
         assert!(dk.0.is_none());
     }
+
+    #[test]
+    fn test_pq_encaps_and_ciphertext_debug_and_from_bytes() {
+        use std::str::FromStr;
+
+        let (ek, dk) = generate_pq_keypair();
+        let dbg_ek = format!("{:?}", ek);
+        assert!(dbg_ek.contains("PqEncapsKey"));
+
+        let ct_vec = vec![0x77u8; PqKemAlgorithm::MlKem768.ciphertext_len()];
+        let ct = PqCiphertext::from(ct_vec.as_slice());
+        let dbg_ct = format!("{:?}", ct);
+        assert!(dbg_ct.contains("PqCiphertext"));
+
+        // Test PqDecapsKey::from_bytes length checks
+        assert!(PqDecapsKey::from_bytes(PqKemAlgorithm::MlKem512, &[0u8; 10]).is_err());
+        assert!(PqDecapsKey::from_bytes(PqKemAlgorithm::MlKem768, &[0u8; 10]).is_err());
+        assert!(PqDecapsKey::from_bytes(PqKemAlgorithm::MlKem1024, &[0u8; 10]).is_err());
+
+        // Test PqDecapsKey::from_bytes exact length works
+        let dk_bytes = dk.to_bytes();
+        assert!(PqDecapsKey::from_bytes(PqKemAlgorithm::MlKem768, &dk_bytes).is_ok());
+
+        // Test pq_decapsulate_to_slice length checks
+        let mut ss_out = [0u8; 32];
+        let correct_ct = vec![0u8; PqKemAlgorithm::MlKem768.ciphertext_len()];
+        let wrong_ct = vec![0u8; 10];
+        let wrong_dk = vec![0u8; 10];
+
+        // wrong dk, right ct
+        assert_eq!(
+            pq_decapsulate_to_slice(
+                PqKemAlgorithm::MlKem768,
+                &wrong_dk,
+                &correct_ct,
+                &mut ss_out
+            ),
+            Err(CryptoError::Handshake)
+        );
+        // right dk, wrong ct
+        assert_eq!(
+            pq_decapsulate_to_slice(PqKemAlgorithm::MlKem768, &dk_bytes, &wrong_ct, &mut ss_out),
+            Err(CryptoError::Handshake)
+        );
+        // both wrong
+        assert_eq!(
+            pq_decapsulate_to_slice(PqKemAlgorithm::MlKem768, &wrong_dk, &wrong_ct, &mut ss_out),
+            Err(CryptoError::Handshake)
+        );
+
+        // Test PqKemAlgorithm methods & traits
+        assert_eq!(
+            PqKemAlgorithm::MlKem512.kdf_context(),
+            "yip-compat-mlkem512-v1"
+        );
+        assert_eq!(
+            PqKemAlgorithm::MlKem768.kdf_context(),
+            "yip-compat-mlkem768-v1"
+        );
+        assert_eq!(
+            PqKemAlgorithm::MlKem1024.kdf_context(),
+            "yip-compat-mlkem1024-v1"
+        );
+
+        assert_eq!(PqKemAlgorithm::MlKem512.as_str(), "mlkem512");
+        assert_eq!(PqKemAlgorithm::MlKem768.as_str(), "mlkem768");
+        assert_eq!(PqKemAlgorithm::MlKem1024.as_str(), "mlkem1024");
+
+        assert_eq!(format!("{}", PqKemAlgorithm::MlKem512), "mlkem512");
+        assert_eq!(format!("{}", PqKemAlgorithm::MlKem768), "mlkem768");
+        assert_eq!(format!("{}", PqKemAlgorithm::MlKem1024), "mlkem1024");
+
+        assert_eq!(
+            PqKemAlgorithm::from_str("mlkem512").unwrap(),
+            PqKemAlgorithm::MlKem512
+        );
+        assert_eq!(
+            PqKemAlgorithm::from_str("mlkem768").unwrap(),
+            PqKemAlgorithm::MlKem768
+        );
+        assert_eq!(
+            PqKemAlgorithm::from_str("mlkem1024").unwrap(),
+            PqKemAlgorithm::MlKem1024
+        );
+        assert!(PqKemAlgorithm::from_str("unknown").is_err());
+
+        // Handshake algorithm getter & remote_pq_ek
+        let kp1 = generate_keypair();
+        let kp2 = generate_keypair();
+        let hs_512 =
+            Handshake::initiator_with_kem(&kp1.private, &kp2.public, PqKemAlgorithm::MlKem512)
+                .unwrap();
+        assert_eq!(hs_512.algorithm(), PqKemAlgorithm::MlKem512);
+        let hs_768 =
+            Handshake::initiator_with_kem(&kp1.private, &kp2.public, PqKemAlgorithm::MlKem768)
+                .unwrap();
+        assert_eq!(hs_768.algorithm(), PqKemAlgorithm::MlKem768);
+        let hs_1024 =
+            Handshake::initiator_with_kem(&kp1.private, &kp2.public, PqKemAlgorithm::MlKem1024)
+                .unwrap();
+        assert_eq!(hs_1024.algorithm(), PqKemAlgorithm::MlKem1024);
+
+        let ek_resp = vec![0x33u8; PqKemAlgorithm::MlKem768.encaps_key_len()];
+        let init_inner = InitiatorHandshake::new_with_algo(
+            PqKemAlgorithm::MlKem768,
+            &kp1.private,
+            &kp2.public,
+            &ek_resp,
+            &[0u8; 32],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(init_inner.remote_pq_ek(), &ek_resp[..]);
+    }
 }

@@ -8,7 +8,7 @@ Generates:
 
 Visualizes four key architectural pillars of yip:
   1. Panel A: Data-Plane Datagram Framing (Anti-DPI Keyed Header Protection & SipHash-1-3 MAC)
-  2. Panel B: Post-Quantum Hybrid Handshake Framing (Noise-IKpsk2 + ML-KEM-512 Kyber)
+  2. Panel B: Post-Quantum Hybrid Handshake Framing (Noise-IKpsk2 + ML-KEM-768 Kyber)
   3. Panel C: 120-Second Epoch Ratchet Overlap (Zero-Loss Rekey Rotation)
   4. Panel D: Cryptographic Self-Certifying Node Addressing (fd00::/8 ULA via BLAKE3)
 
@@ -44,7 +44,7 @@ COLOR_NOISE = "#38bdf8"         # Sky Blue
 COLOR_NOISE_LIGHT = "#818cf8"   # Indigo / Light Sky
 COLOR_NOISE_BG = "#1e1b4b"      # Deep Indigo
 
-# Post-Quantum ML-KEM-512
+# Post-Quantum ML-KEM-768
 COLOR_PQ = "#10b981"            # Emerald Green
 COLOR_PQ_LIGHT = "#34d399"      # Mint Green
 COLOR_PQ_BG = "#064e3b"         # Deep Emerald
@@ -228,7 +228,7 @@ def generate_wire_format_svg() -> str:
     canvas.text(112.0, 35.0, "yip Wire Protocol & Cryptographic Ceremony", fill=COLOR_TEXT_MAIN, font_size=18.0, font_weight="700")
     canvas.text(
         112.0, 52.0,
-        "Zero-Fixed-Signature Keyed Header Protection • Noise-IKpsk2 + ML-KEM-512 PQ Hybrid • 120s Ratchet Overlap • Self-Certifying IPv6",
+        "Zero-Fixed-Signature Keyed Header Protection • Noise-IKpsk2 + ML-KEM-768 PQ Hybrid • 120s Ratchet Overlap • Self-Certifying IPv6",
         fill=COLOR_TEXT_MUTED, font_size=11.0
     )
 
@@ -316,7 +316,7 @@ def generate_wire_format_svg() -> str:
     canvas.text(267.0, ob_y + 16.0, "DPI Resistance: Pass (0 signatures detected across 4-Engine Oracle)", fill=COLOR_PQ_LIGHT, font_size=9.5, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
 
     # =========================================================================
-    # PANEL B: POST-QUANTUM HYBRID HANDSHAKE (NOISE-IKPSK2 + ML-KEM-512)
+    # PANEL B: POST-QUANTUM HYBRID HANDSHAKE (NOISE-IKPSK2 + ML-KEM-768)
     # =========================================================================
     canvas.rect(p2_x, p2_y, p2_w, p2_h, rx=8.0, fill="url(#grad-panel-b)", stroke=COLOR_CANVAS_BORDER, stroke_width=1.0)
 
@@ -324,18 +324,18 @@ def generate_wire_format_svg() -> str:
     canvas.rect(546.0, 84.0, 82.0, 20.0, rx=4.0, fill=COLOR_PQ_BG, stroke=COLOR_PQ, stroke_width=1.0)
     canvas.text(587.0, 98.0, "PANEL B", fill=COLOR_PQ_LIGHT, font_size=9.5, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
     canvas.text(638.0, 98.0, "Post-Quantum Hybrid Handshake", fill=COLOR_TEXT_MAIN, font_size=13.0, font_weight="700")
-    canvas.text(546.0, 118.0, "Noise-IKpsk2 + ML-KEM-512 (Kyber) • Sub-1200B Single-RTT", fill=COLOR_TEXT_MUTED, font_size=10.5)
+    canvas.text(546.0, 118.0, "Noise-IKpsk2 + ML-KEM-768 (Kyber) • Sub-1400B Single-RTT", fill=COLOR_TEXT_MUTED, font_size=10.5)
 
-    # Message 1 Breakdown (1,028 Bytes)
-    canvas.text(546.0, 137.0, "Message 1 (Initiator → Responder) — 1,028 Bytes:", fill=COLOR_PQ_LIGHT, font_size=9.5, font_family=FONT_MONO, font_weight="700")
+    # Message 1 Breakdown (1,348 Bytes)
+    canvas.text(546.0, 137.0, "Message 1 (Initiator → Responder) — 1,348 Bytes:", fill=COLOR_PQ_LIGHT, font_size=9.5, font_family=FONT_MONO, font_weight="700")
     m1_y = 144.0
-    # Segments: Hdr(4B): 44px, ek_A(800B): 182px, e_A(32B): 76px, Enc(s_A||Cert_A)+Tag(144B): 146px (sum=448+6=454)
+    # Segments: Hdr(4B): 44px, ek_A(1184B): 182px, e_A(32B): 76px, Enc(s_A||Cert_A)+Tag(144B): 146px (sum=448+6=454)
     canvas.rect(546.0, m1_y, 44.0, 34.0, rx=3.0, fill=COLOR_CARD_BG, stroke=COLOR_OBF, stroke_width=1.0)
     canvas.text(568.0, m1_y + 14.0, "Hdr", fill=COLOR_OBF_LIGHT, font_size=8.5, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
     canvas.text(568.0, m1_y + 26.0, "4B", fill=COLOR_TEXT_MUTED, font_size=8.0, text_anchor="middle")
 
     canvas.rect(592.0, m1_y, 182.0, 34.0, rx=3.0, fill=COLOR_PQ_BG, stroke=COLOR_PQ, stroke_width=1.0)
-    canvas.text(683.0, m1_y + 14.0, "ek_A (800B ML-KEM-512 pk)", fill=COLOR_PQ_LIGHT, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
+    canvas.text(683.0, m1_y + 14.0, "ek_A (1184B ML-KEM-768 pk)", fill=COLOR_PQ_LIGHT, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
     canvas.text(683.0, m1_y + 26.0, "Post-Quantum Encapsulation Key", fill=COLOR_TEXT_MUTED, font_size=8.0, text_anchor="middle")
 
     canvas.rect(776.0, m1_y, 76.0, 34.0, rx=3.0, fill=COLOR_NOISE_BG, stroke=COLOR_NOISE_LIGHT, stroke_width=1.0)
@@ -346,16 +346,16 @@ def generate_wire_format_svg() -> str:
     canvas.text(927.0, m1_y + 14.0, "Enc(s_A ‖ Cert_A) + Tag", fill=COLOR_DATA_LIGHT, font_size=8.5, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
     canvas.text(927.0, m1_y + 26.0, "Static Key + CA Cert (144B)", fill=COLOR_TEXT_MUTED, font_size=8.0, text_anchor="middle")
 
-    # Message 2 Breakdown (948 Bytes)
-    canvas.text(546.0, 193.0, "Message 2 (Responder → Initiator) — 948 Bytes:", fill=COLOR_PQ_LIGHT, font_size=9.5, font_family=FONT_MONO, font_weight="700")
+    # Message 2 Breakdown (1,268 Bytes)
+    canvas.text(546.0, 193.0, "Message 2 (Responder → Initiator) — 1,268 Bytes:", fill=COLOR_PQ_LIGHT, font_size=9.5, font_family=FONT_MONO, font_weight="700")
     m2_y = 200.0
-    # Segments: Hdr(4B): 44px, ct(768B): 182px, e_B(32B): 76px, Enc(Cert_B)+Tag(144B): 146px (sum=454)
+    # Segments: Hdr(4B): 44px, ct(1088B): 182px, e_B(32B): 76px, Enc(Cert_B)+Tag(144B): 146px (sum=454)
     canvas.rect(546.0, m2_y, 44.0, 34.0, rx=3.0, fill=COLOR_CARD_BG, stroke=COLOR_OBF, stroke_width=1.0)
     canvas.text(568.0, m2_y + 14.0, "Hdr", fill=COLOR_OBF_LIGHT, font_size=8.5, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
     canvas.text(568.0, m2_y + 26.0, "4B", fill=COLOR_TEXT_MUTED, font_size=8.0, text_anchor="middle")
 
     canvas.rect(592.0, m2_y, 182.0, 34.0, rx=3.0, fill=COLOR_PQ_BG, stroke=COLOR_PQ, stroke_width=1.0)
-    canvas.text(683.0, m2_y + 14.0, "ct (768B ML-KEM-512 ct)", fill=COLOR_PQ_LIGHT, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
+    canvas.text(683.0, m2_y + 14.0, "ct (1088B ML-KEM-768 ct)", fill=COLOR_PQ_LIGHT, font_size=9.0, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
     canvas.text(683.0, m2_y + 26.0, "Post-Quantum Ciphertext Envelope", fill=COLOR_TEXT_MUTED, font_size=8.0, text_anchor="middle")
 
     canvas.rect(776.0, m2_y, 76.0, 34.0, rx=3.0, fill=COLOR_NOISE_BG, stroke=COLOR_NOISE_LIGHT, stroke_width=1.0)
@@ -369,8 +369,8 @@ def generate_wire_format_svg() -> str:
     # Technical Details Sub-card
     info_y = 246.0
     canvas.rect(546.0, info_y, 454.0, 90.0, rx=6.0, fill=COLOR_SUB_CARD_BG, stroke=COLOR_CANVAS_BORDER, stroke_width=1.0)
-    canvas.text(558.0, info_y + 17.0, "✓ Sub-1,200B MTU: Msg 1 (1,028B) & Msg 2 (948B) < 1,200B OBF_MTU_BUDGET", fill=COLOR_PQ_LIGHT, font_size=9.0, font_family=FONT_MONO, font_weight="700")
-    canvas.text(558.0, info_y + 33.0, "• Deadlock-Free: Initiator parses cleartext ct at [4..772], computes", fill=COLOR_TEXT_MUTED, font_size=9.0)
+    canvas.text(558.0, info_y + 17.0, "✓ Sub-1,400B MTU: Msg 1 (1,348B) & Msg 2 (1,268B) < 1,420B OBF_MTU_BUDGET", fill=COLOR_PQ_LIGHT, font_size=9.0, font_family=FONT_MONO, font_weight="700")
+    canvas.text(558.0, info_y + 33.0, "• Deadlock-Free: Initiator parses cleartext ct at [4..1092], computes", fill=COLOR_TEXT_MUTED, font_size=9.0)
     canvas.text(558.0, info_y + 46.0, "  Decaps(dk_A, ct) -> ss, and calls set_psk(2, &ss) before decrypting.", fill=COLOR_TEXT_MUTED, font_size=9.0)
     canvas.text(558.0, info_y + 61.0, "• FIPS 203 §7.2: Modulus (< 3329) validated; IND-CCA2 rejection on tamper.", fill=COLOR_PQ_LIGHT, font_size=9.0, font_weight="700")
     canvas.text(558.0, info_y + 75.0, "• Ephemeral Zeroize: Decapsulation keys and intermediate secrets scrubbed on Drop.", fill=COLOR_TEXT_DIM, font_size=8.5)
@@ -378,7 +378,7 @@ def generate_wire_format_svg() -> str:
     # Outcome banner
     ob2_y = 344.0
     canvas.rect(546.0, ob2_y, 454.0, 24.0, rx=4.0, fill=COLOR_PQ_BG, stroke=COLOR_PQ, stroke_width=1.0)
-    canvas.text(773.0, ob2_y + 16.0, "PQ Security: Quantum-Safe (FIPS 203 Cat 1 ML-KEM-512 + X25519 Hybrid)", fill=COLOR_PQ_LIGHT, font_size=9.5, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
+    canvas.text(773.0, ob2_y + 16.0, "PQ Security: Quantum-Safe (FIPS 203 Cat 3 ML-KEM-768 + X25519 Hybrid)", fill=COLOR_PQ_LIGHT, font_size=9.5, font_family=FONT_MONO, font_weight="700", text_anchor="middle")
 
     # =========================================================================
     # PANEL C: 120-SECOND EPOCH KEY RATCHET OVERLAP (ZERO-LOSS ROTATION)
@@ -513,7 +513,7 @@ def generate_wire_format_svg() -> str:
     canvas.line(24.0, 780.0, w - 24.0, 780.0, stroke=COLOR_CANVAS_BORDER, stroke_width=1.0)
     canvas.text(
         28.0, 800.0,
-        "Protocol: PQNoise_IKpsk2 • NIST FIPS 203 ML-KEM-512 • SipHash-CTR/2-4 • ChaCha20-Poly1305 • BLAKE3",
+        "Protocol: PQNoise_IKpsk2 • NIST FIPS 203 ML-KEM-768 • SipHash-CTR/2-4 • ChaCha20-Poly1305 • BLAKE3",
         fill=COLOR_TEXT_DIM, font_size=9.0, font_family=FONT_MONO
     )
     canvas.text(

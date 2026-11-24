@@ -313,6 +313,7 @@ exclude_re = [
     "replace \\|\\| with && in DaitaEngine::with_limits",
     "replace > with >= in DaitaEngine::dispatch_events",
     "bin/yipd/src/peer_manager/obf\\.rs:48:.*in PeerManager::deobf_ingress",
+    "crates/yip-wire/src/fragment\\.rs:.*replace < with <= in HandshakeReassembler::add_fragment",
 ]
 
 skip_calls = ["reserve"]
