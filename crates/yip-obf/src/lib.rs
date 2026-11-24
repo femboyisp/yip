@@ -14,15 +14,15 @@ pub const NONCE_LEN: usize = 8;
 pub const MIN_ENVELOPE: usize = NONCE_LEN + 3;
 
 /// The obfuscation `ptype` for a rendezvous-protocol message (`yip_rendezvous::Message`
-/// bytes), distinct from `yipd`'s tunnel `PacketType` values (0..=4). Shared by the
+/// bytes), distinct from `yipd`'s tunnel `PacketType` values (0..=6). Shared by the
 /// `yipd` rendezvous client and the `yip-rendezvous` server so both sides mask/unmask
 /// the rendezvous-message layer under the same type tag.
-pub const RDV_TYPE: u8 = 5;
+pub const RDV_TYPE: u8 = 7;
 
 /// Decoy/junk datagram type (3b). A datagram wrapped under this ptype carries
 /// no real data; the receiver drops it silently. Distinct from the tunnel
-/// `PacketType` values (0..=4) and `RDV_TYPE` (5).
-pub const JUNK_TYPE: u8 = 6;
+/// `PacketType` values (0..=6) and `RDV_TYPE` (7).
+pub const JUNK_TYPE: u8 = 8;
 
 /// A fast, non-cryptographic xorshift64* PRNG for junk bodies/lengths/counts.
 /// Seeded once from the OS RNG; thereafter pure userspace (no syscall per
@@ -345,9 +345,32 @@ mod tests {
 
     #[test]
     fn junk_type_is_distinct_from_other_ptypes() {
-        // 0..=4 are yipd PacketType, 5 is RDV_TYPE.
-        assert_eq!(JUNK_TYPE, 6);
+        // 0..=6 are yipd PacketType, 7 is RDV_TYPE.
+        assert_eq!(JUNK_TYPE, 8);
+        assert_eq!(RDV_TYPE, 7);
         assert_ne!(JUNK_TYPE, RDV_TYPE);
+    }
+
+    #[test]
+    fn test_encrypted_control_type_recognized() {
+        let key = derive_key(b"test-obf-key");
+        let payload = b"encrypted control test payload";
+        let wrapped = obfuscate(&key, 6, payload, 0).expect("valid obf");
+        let nonce: [u8; 8] = wrapped[0..8].try_into().unwrap();
+        let ks = keystream(&key, &nonce, 1);
+        assert_eq!(wrapped[8] ^ ks[0], 6);
+        let (ptype, body) = deobfuscate(&key, &wrapped).expect("valid deobf");
+        assert_eq!(ptype, 6);
+        assert_eq!(body, payload);
+        // Verify 6 is within tunnel range and does not collide with RDV_TYPE or JUNK_TYPE
+        assert!(
+            ptype < RDV_TYPE,
+            "tunnel ptype 6 must be strictly below RDV_TYPE {RDV_TYPE}"
+        );
+        assert!(
+            ptype < JUNK_TYPE,
+            "tunnel ptype 6 must be strictly below JUNK_TYPE {JUNK_TYPE}"
+        );
     }
 
     #[test]

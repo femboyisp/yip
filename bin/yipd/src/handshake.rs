@@ -40,6 +40,8 @@ pub enum PacketType {
     Gossip = 4,
     /// Handshake message fragment (for flights exceeding MTU).
     HandshakeFrag = 5,
+    /// In-session encrypted control/anti-entropy gossip packet (#207).
+    EncryptedControl = 6,
 }
 
 // ── established session ───────────────────────────────────────────────────────
