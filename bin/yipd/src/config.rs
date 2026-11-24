@@ -668,6 +668,7 @@ impl Config {
         let mut cur_alias: Option<String> = None;
         let mut cur_kem: Option<yip_crypto::PqKemAlgorithm> = None;
         let mut cur_pq_pk: Option<Vec<u8>> = None;
+        let mut in_peer_block = false;
         let mut global_kem: Option<yip_crypto::PqKemAlgorithm> = None;
         let mut legacy_peer_public: Option<[u8; 32]> = None;
         let mut legacy_peer_endpoint: Option<SocketAddr> = None;
@@ -719,6 +720,7 @@ impl Config {
                 cur_alias = None;
                 cur_kem = None;
                 cur_pq_pk = None;
+                in_peer_block = line.eq_ignore_ascii_case("[peer]");
                 continue;
             }
 
@@ -1028,7 +1030,7 @@ impl Config {
                             format!("invalid kem '{val}': {e}"),
                         )
                     })?;
-                    if cur_pk.is_some() {
+                    if in_peer_block || cur_pk.is_some() {
                         cur_kem = Some(k);
                     } else {
                         global_kem = Some(k);
@@ -1036,7 +1038,7 @@ impl Config {
                 }
                 "pq_public_key" | "pq_key" | "pq_pk" => {
                     let bytes = hex_decode_vec(val)?;
-                    if cur_pk.is_some() {
+                    if in_peer_block || cur_pk.is_some() {
                         cur_pq_pk = Some(bytes);
                     } else {
                         legacy_pq_public = Some(bytes);
@@ -1359,6 +1361,27 @@ mod tests {
             c.peers[0].pq_public_key.as_deref(),
             Some(&[0xde, 0xad, 0xbe, 0xef][..])
         );
+    }
+
+    #[test]
+    fn parse_config_peer_block_order_independent_with_pq_key() {
+        let text = "device=yip0\nlisten=0.0.0.0:443\n\
+                    local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
+                    local_public=00000000000000000000000000000000000000000000000000000000000000aa\n\
+                    [peer]\n\
+                    endpoint=10.0.0.2:443\n\
+                    pq_public_key=cafebabe\n\
+                    kem=mlkem768\n\
+                    public_key=00000000000000000000000000000000000000000000000000000000000000bb\n";
+        let c = Config::parse(text).unwrap();
+        assert_eq!(c.peers.len(), 1);
+        assert_eq!(c.peers[0].public_key[31], 0xbb);
+        assert_eq!(c.peers[0].endpoint, Some("10.0.0.2:443".parse().unwrap()));
+        assert_eq!(
+            c.peers[0].pq_public_key.as_deref(),
+            Some(&[0xca, 0xfe, 0xba, 0xbe][..])
+        );
+        assert_eq!(c.peers[0].kem, Some(yip_crypto::PqKemAlgorithm::MlKem768));
     }
 
     #[test]
