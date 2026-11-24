@@ -489,4 +489,16 @@ mod tests {
         tampered.roots[0].1 = "192.0.2.200:6000".parse::<SocketAddr>().unwrap();
         assert!(!tampered.verify_rootset(&[ca_pub]));
     }
+
+    #[test]
+    fn test_cert_pq_encaps_key_retrieval() {
+        let mut cert = make_cert(&ca(), [1u8; 32], [2u8; 16], 0, 100);
+        assert_eq!(cert.pq_encaps_key(), None);
+        cert.tags.push((99, vec![1, 2, 3]));
+        assert_eq!(cert.pq_encaps_key(), None);
+        cert.tags.push((TAG_PQ_ENCAPS_KEY, vec![0x42; 800]));
+        assert_eq!(cert.pq_encaps_key(), Some(&[0x42; 800][..]));
+        cert.tags.retain(|(tag, _)| *tag != TAG_PQ_ENCAPS_KEY);
+        assert_eq!(cert.pq_encaps_key(), None);
+    }
 }

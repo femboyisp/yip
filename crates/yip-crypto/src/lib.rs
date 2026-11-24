@@ -1821,4 +1821,14 @@ mod tests {
         };
         assert!(attacker_hs.read_message(&flight_1).is_err());
     }
+
+    #[test]
+    fn test_register_and_lookup_test_peer_key() {
+        let pubk = [0x55; 32];
+        let privk = [0x66; 32];
+        assert_eq!(lookup_test_peer_key(&pubk), None);
+        register_test_peer_key(pubk, privk);
+        assert_eq!(lookup_test_peer_key(&pubk), Some(privk));
+        assert_eq!(lookup_test_peer_key(&[0x77; 32]), None);
+    }
 }

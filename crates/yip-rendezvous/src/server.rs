@@ -1613,5 +1613,44 @@ mod tests {
             61,
         );
         assert!(relay_exp.is_empty());
+
+        // Test exact expiry boundary for claimed sender address validation:
+        let sender_node = [7u8; 16];
+        let target_node = [8u8; 16];
+        // Register sender expiring at 61_000 at address A
+        s.handle(
+            addr("192.0.2.10:5000"),
+            Message::Register {
+                node: sender_node,
+                counter: 1,
+            },
+            1_000,
+            1,
+        );
+        // Register target expiring at 70_000 at address B
+        s.handle(
+            addr("192.0.2.20:5000"),
+            Message::Register {
+                node: target_node,
+                counter: 1,
+            },
+            10_000,
+            10,
+        );
+        // At 61_000, sender_reg has expiry_ms == 61_000. It is expired (> 61_000 is false).
+        // A packet claiming sender_node from a different IP (192.0.2.30:5000) must not be dropped by the anti-hijack check,
+        // and should be successfully forwarded to target_node.
+        let fwd = s.handle(
+            addr("192.0.2.30:5000"),
+            Message::RelaySend {
+                src: sender_node,
+                dst: target_node,
+                payload: vec![9, 9],
+            },
+            61_000,
+            61,
+        );
+        assert_eq!(fwd.len(), 1);
+        assert_eq!(fwd[0].0, addr("192.0.2.20:5000"));
     }
 }
