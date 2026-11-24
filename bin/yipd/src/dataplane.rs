@@ -513,6 +513,9 @@ impl DataPlane {
 
     /// Reconfigure shard start object id and stride increment for multi-core scaling.
     pub fn set_shard(&mut self, shard_id: usize, num_shards: usize) {
+        if num_shards > 1 {
+            let _ = self.session.set_stride(shard_id as u64, num_shards as u64);
+        }
         self.transport.set_shard(shard_id, num_shards);
         self.detector.set_stride(num_shards as u64);
     }

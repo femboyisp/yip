@@ -532,7 +532,7 @@ impl PeerManager {
         // `hp_key`) is intentionally left untouched here — see the doc
         // comment on `handle_rekey_resp`.
         let conn_tag = conn_tag_from_keys(&established.auth_key, &established.hp_key);
-        let dp = Box::new(DataPlane::new(
+        let mut dp = Box::new(DataPlane::new(
             established,
             conn_tag,
             self.mode,
@@ -540,6 +540,9 @@ impl PeerManager {
             self.obf_key.is_some(),
             self.data_symbol_size,
         ));
+        if self.num_shards > 1 {
+            dp.set_shard(self.shard_id, self.num_shards);
+        }
         let PeerSessionState::Established(epochs) = &mut self.peers[idx].state else {
             unreachable!("state cannot change between the two borrows above")
         };

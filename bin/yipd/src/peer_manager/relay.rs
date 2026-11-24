@@ -309,6 +309,9 @@ impl PeerManager {
                     self.obf_key.is_some(),
                     self.data_symbol_size,
                 ));
+                if self.num_shards > 1 {
+                    dp.set_shard(self.shard_id, self.num_shards);
+                }
 
                 self.peers[idx].session_obf_key = sess_obf;
                 self.peers[idx].cached_resp = Some(resp_pkt.clone());
@@ -395,6 +398,9 @@ impl PeerManager {
                     self.obf_key.is_some(),
                     self.data_symbol_size,
                 ));
+                if self.num_shards > 1 {
+                    dp.set_shard(self.shard_id, self.num_shards);
+                }
                 self.by_tag.insert(dp.conn_tag(), idx);
                 self.peers[idx].session_obf_key = sess_obf;
                 self.peers[idx].admitted_cert_not_after =
