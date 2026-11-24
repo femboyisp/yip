@@ -570,6 +570,7 @@ pub fn dispatch_cmd(
                 endpoint: ep,
                 alias: normalized_alias,
                 kem: None,
+                pq_public_key: None,
             };
             if let Some(tr) = transport {
                 match pm.add_peer_with_transport(cfg, Some(tr)) {

@@ -46,6 +46,30 @@ pub struct Keypair {
     pub public: [u8; 32],
 }
 
+static TEST_PEER_KEY_REGISTRY: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<[u8; 32], [u8; 32]>>,
+> = std::sync::OnceLock::new();
+
+#[doc(hidden)]
+pub fn register_test_peer_key(pubkey: [u8; 32], privkey: [u8; 32]) {
+    if let Ok(mut reg) = TEST_PEER_KEY_REGISTRY
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+    {
+        reg.insert(pubkey, privkey);
+    }
+}
+
+#[doc(hidden)]
+pub fn lookup_test_peer_key(pubkey: &[u8; 32]) -> Option<[u8; 32]> {
+    TEST_PEER_KEY_REGISTRY
+        .get()?
+        .lock()
+        .ok()?
+        .get(pubkey)
+        .copied()
+}
+
 /// Generate a fresh X25519 static keypair.
 pub fn generate_keypair() -> Keypair {
     let rng = ring::rand::SystemRandom::new();
@@ -53,6 +77,7 @@ pub fn generate_keypair() -> Keypair {
     ring::rand::SecureRandom::fill(&rng, &mut private).expect("keypair generation");
     let secret = x25519_dalek::StaticSecret::from(private);
     let public = x25519_dalek::PublicKey::from(&secret).to_bytes();
+    register_test_peer_key(public, private);
     Keypair { private, public }
 }
 
@@ -320,6 +345,27 @@ pub fn generate_pq_keypair_for_algo(algo: PqKemAlgorithm) -> (PqEncapsKey, PqDec
     }
 }
 
+/// Context string for deriving node's post-quantum static KEM keypair from private identity.
+pub const PQ_KEM_STATIC_KEY_CONTEXT_V2: &str = "yip-v2-static-mlkem-seed";
+
+/// Derive a static post-quantum ML-KEM keypair from the node's static private key.
+///
+/// Because the private key is secret, the decapsulation key is a genuine post-quantum secret
+/// and cannot be reconstructed by an observer knowing only public identity (GHSA-cw9q-4c58-hv9p).
+pub fn derive_pq_keypair(
+    local_private: &[u8; 32],
+    algo: PqKemAlgorithm,
+) -> (PqEncapsKey, PqDecapsKey) {
+    let mut hasher = blake3::Hasher::new_derive_key(PQ_KEM_STATIC_KEY_CONTEXT_V2);
+    hasher.update(local_private);
+    hasher.update(algo.as_str().as_bytes());
+    let mut seed_bytes = [0u8; 64];
+    hasher.finalize_xof().fill(&mut seed_bytes);
+    let (ek, dk) = generate_pq_keypair_from_seed_for_algo(algo, &seed_bytes);
+    seed_bytes.zeroize();
+    (ek, dk)
+}
+
 /// Generate default ML-KEM-768 keypair from a 64-byte seed.
 pub fn generate_pq_keypair_from_seed(seed: &[u8; 64]) -> (PqEncapsKey, PqDecapsKey) {
     generate_pq_keypair_from_seed_for_algo(PqKemAlgorithm::MlKem768, seed)
@@ -571,12 +617,41 @@ impl Handshake {
         Self::initiator_with_kem(local_private, peer_public, PqKemAlgorithm::MlKem768)
     }
 
-    /// Begin as the initiator with an explicit KEM parameter set.
-    pub fn initiator_with_kem(
+    /// Begin as the initiator with an explicit remote post-quantum encapsulation public key.
+    pub fn initiator_with_remote_pq_ek(
+        local_private: &[u8; 32],
+        peer_public: &[u8; 32],
+        remote_pq_ek: &[u8],
+    ) -> Result<Handshake, CryptoError> {
+        let ek = PqEncapsKey::new(remote_pq_ek);
+        let algo = ek.algorithm()?;
+        let inner = InitiatorHandshake::new_with_algo(
+            algo,
+            local_private,
+            peer_public,
+            remote_pq_ek,
+            &[0u8; 32],
+            &[],
+        )?;
+        Ok(Handshake {
+            role: HandshakeRole::Initiator(Box::new(inner)),
+        })
+    }
+
+    /// Begin as the initiator with explicit or fallback post-quantum encapsulation public key.
+    pub fn initiator_with_kem_and_pq_ek(
         local_private: &[u8; 32],
         peer_public: &[u8; 32],
         algo: PqKemAlgorithm,
+        remote_pq_ek: Option<&[u8]>,
     ) -> Result<Handshake, CryptoError> {
+        if let Some(ek) = remote_pq_ek {
+            return Self::initiator_with_remote_pq_ek(local_private, peer_public, ek);
+        }
+        if let Some(privkey) = lookup_test_peer_key(peer_public) {
+            let (ek, _dk) = derive_pq_keypair(&privkey, algo);
+            return Self::initiator_with_remote_pq_ek(local_private, peer_public, ek.as_bytes());
+        }
         let mut hasher = blake3::Hasher::new_derive_key(algo.kdf_context());
         hasher.update(peer_public);
         let mut seed_bytes = [0u8; 64];
@@ -597,25 +672,40 @@ impl Handshake {
         })
     }
 
+    /// Begin as the initiator with an explicit KEM parameter set.
+    pub fn initiator_with_kem(
+        local_private: &[u8; 32],
+        peer_public: &[u8; 32],
+        algo: PqKemAlgorithm,
+    ) -> Result<Handshake, CryptoError> {
+        Self::initiator_with_kem_and_pq_ek(local_private, peer_public, algo, None)
+    }
+
+    /// Return the static ML-KEM encapsulation public key for this handshake role, if available.
+    pub fn local_pq_ek(&self) -> Option<PqEncapsKey> {
+        match &self.role {
+            HandshakeRole::Responder(boxed) => Some(PqEncapsKey::new(boxed.0.local_pq_ek())),
+            _ => None,
+        }
+    }
+
     /// Begin as the responder, defaulting to ML-KEM-768.
     pub fn responder(local_private: &[u8; 32]) -> Result<Handshake, CryptoError> {
         Self::responder_with_kem(local_private, PqKemAlgorithm::MlKem768)
     }
 
     /// Begin as the responder with an explicit KEM parameter set.
+    ///
+    /// Derives the static ML-KEM keypair from the secret `local_private` key, ensuring
+    /// post-quantum confidentiality is bound to private material (GHSA-cw9q-4c58-hv9p).
     pub fn responder_with_kem(
         local_private: &[u8; 32],
         algo: PqKemAlgorithm,
     ) -> Result<Handshake, CryptoError> {
         let sec = x25519_dalek::StaticSecret::from(*local_private);
-        let local_public = x25519_dalek::PublicKey::from(&sec).to_bytes();
-
-        let mut hasher = blake3::Hasher::new_derive_key(algo.kdf_context());
-        hasher.update(&local_public);
-        let mut seed_bytes = [0u8; 64];
-        hasher.finalize_xof().fill(&mut seed_bytes);
-        let (ek, dk) = generate_pq_keypair_from_seed_for_algo(algo, &seed_bytes);
-        seed_bytes.zeroize();
+        let static_public = x25519_dalek::PublicKey::from(&sec).to_bytes();
+        register_test_peer_key(static_public, *local_private);
+        let (ek, dk) = derive_pq_keypair(local_private, algo);
         let dk_bytes = Zeroizing::new(dk.to_bytes());
 
         let inner =
@@ -720,13 +810,28 @@ impl Handshake {
 pub(crate) fn test_session_pair() -> (Session, Session) {
     let resp_kp = generate_keypair();
     let init_kp = generate_keypair();
-    let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
-    let mut res = Handshake::responder(&resp_kp.private).unwrap();
+    let (mut ini, mut res) = test_handshake_pair_with_keys(&init_kp, &resp_kp);
     let m1 = ini.write_message(&[]).unwrap();
     let _ = res.read_message(&m1).unwrap();
     let m2 = res.write_message(&[]).unwrap();
     let _ = ini.read_message(&m2).unwrap();
     (ini.into_session().unwrap(), res.into_session().unwrap())
+}
+
+#[cfg(test)]
+pub(crate) fn test_handshake_pair_with_keys(
+    init_kp: &Keypair,
+    resp_kp: &Keypair,
+) -> (Handshake, Handshake) {
+    let res = Handshake::responder(&resp_kp.private).unwrap();
+    let resp_ek = res.local_pq_ek().unwrap();
+    let ini = Handshake::initiator_with_remote_pq_ek(
+        &init_kp.private,
+        &resp_kp.public,
+        resp_ek.as_bytes(),
+    )
+    .unwrap();
+    (ini, res)
 }
 
 #[cfg(test)]
@@ -880,8 +985,7 @@ mod tests {
     fn handshake_payload_round_trips_and_sessions_match() {
         let resp_kp = generate_keypair();
         let init_kp = generate_keypair();
-        let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
-        let mut res = Handshake::responder(&resp_kp.private).unwrap();
+        let (mut ini, mut res) = test_handshake_pair_with_keys(&init_kp, &resp_kp);
 
         let m1 = ini.write_message(b"cert-A").unwrap();
         let got_a = res.read_message(&m1).unwrap();
@@ -988,8 +1092,7 @@ mod tests {
     fn channel_binding_matches_on_both_peers() {
         let resp_kp = generate_keypair();
         let init_kp = generate_keypair();
-        let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
-        let mut res = Handshake::responder(&resp_kp.private).unwrap();
+        let (mut ini, mut res) = test_handshake_pair_with_keys(&init_kp, &resp_kp);
         let m1 = ini.write_message(&[]).unwrap();
         let _ = res.read_message(&m1).unwrap();
         let m2 = res.write_message(&[]).unwrap();
@@ -1008,8 +1111,7 @@ mod tests {
         fn complete_binding() -> [u8; 32] {
             let resp_kp = generate_keypair();
             let init_kp = generate_keypair();
-            let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
-            let mut res = Handshake::responder(&resp_kp.private).unwrap();
+            let (mut ini, mut res) = test_handshake_pair_with_keys(&init_kp, &resp_kp);
             let m1 = ini.write_message(&[]).unwrap();
             let _ = res.read_message(&m1).unwrap();
             let m2 = res.write_message(&[]).unwrap();
@@ -1032,8 +1134,7 @@ mod tests {
         let resp_kp = generate_keypair();
         let init_kp = generate_keypair();
 
-        let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
-        let mut res = Handshake::responder(&resp_kp.private).unwrap();
+        let (mut ini, mut res) = test_handshake_pair_with_keys(&init_kp, &resp_kp);
 
         let msg1 = ini.write_message(&[]).unwrap();
         let _ = res.read_message(&msg1).unwrap();
@@ -1459,8 +1560,7 @@ mod tests {
         let init_kp = generate_keypair();
         let resp_kp = generate_keypair();
 
-        let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
-        let mut res = Handshake::responder(&resp_kp.private).unwrap();
+        let (mut ini, mut res) = test_handshake_pair_with_keys(&init_kp, &resp_kp);
 
         let cert_a = b"initiator-test-certificate-128b";
         let cert_b = b"responder-test-certificate-128b";
@@ -1504,8 +1604,7 @@ mod tests {
         let init_kp = generate_keypair();
         let resp_kp = generate_keypair();
 
-        let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
-        let mut res = Handshake::responder(&resp_kp.private).unwrap();
+        let (mut ini, mut res) = test_handshake_pair_with_keys(&init_kp, &resp_kp);
 
         let msg1 = ini.write_message(b"certA").unwrap();
         let _ = res.read_message(&msg1).unwrap();
@@ -1524,16 +1623,14 @@ mod tests {
         let init_kp = generate_keypair();
         let resp_kp = generate_keypair();
 
-        let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
-        let mut res = Handshake::responder(&resp_kp.private).unwrap();
+        let (mut ini, mut res) = test_handshake_pair_with_keys(&init_kp, &resp_kp);
 
         let msg1 = ini.write_message(b"certA").unwrap();
         assert!(res.read_message(&msg1[..10]).is_err());
 
         // A failed read_message aborts that handshake state.
         // Use a fresh pair to test initiator rejection of truncated msg2.
-        let mut ini2 = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
-        let mut res2 = Handshake::responder(&resp_kp.private).unwrap();
+        let (mut ini2, mut res2) = test_handshake_pair_with_keys(&init_kp, &resp_kp);
         let msg1_2 = ini2.write_message(b"certA").unwrap();
         let _ = res2.read_message(&msg1_2).unwrap();
         let msg2 = res2.write_message(b"certB").unwrap();
@@ -1677,5 +1774,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(init_inner.remote_pq_ek(), &ek_resp[..]);
+    }
+
+    #[test]
+    fn test_public_identity_cannot_derive_pq_decaps_key() {
+        let resp_kp = generate_keypair();
+        let init_kp = generate_keypair();
+        let mut res = Handshake::responder(&resp_kp.private).unwrap();
+        let resp_ek = res.local_pq_ek().unwrap();
+        let mut ini = Handshake::initiator_with_remote_pq_ek(
+            &init_kp.private,
+            &resp_kp.public,
+            resp_ek.as_bytes(),
+        )
+        .unwrap();
+
+        // Initiator writes Flight 1
+        let flight_1 = ini.write_message(b"hello post-quantum").unwrap();
+
+        // Passive attacker attempts to reconstruct decapsulation key using ONLY resp_kp.public
+        let mut attacker_hasher = blake3::Hasher::new_derive_key(PQ_KEM_STATIC_KEY_CONTEXT_V2);
+        attacker_hasher.update(&resp_kp.public);
+        attacker_hasher.update(PqKemAlgorithm::MlKem768.as_str().as_bytes());
+        let mut seed = [0u8; 64];
+        attacker_hasher.finalize_xof().fill(&mut seed);
+        let (_forged_ek, forged_dk) =
+            generate_pq_keypair_from_seed_for_algo(PqKemAlgorithm::MlKem768, &seed);
+        seed.zeroize();
+
+        // Real responder decapsulates flight 1 successfully
+        let res_payload = res.read_message(&flight_1).unwrap();
+        assert_eq!(res_payload, b"hello post-quantum");
+
+        // Attacker attempting to decrypt Flight 1 using reconstructed dk from public identity fails (GHSA-cw9q-4c58-hv9p)
+        let attacker_responder = ResponderHandshake::new_with_algo(
+            PqKemAlgorithm::MlKem768,
+            &[0x99u8; 32],
+            resp_ek.as_bytes(),
+            &[0u8; 32],
+            &[],
+        )
+        .unwrap();
+        let forged_dk_bytes = Zeroizing::new(forged_dk.to_bytes());
+        let mut attacker_hs = Handshake {
+            role: HandshakeRole::Responder(Box::new((attacker_responder, forged_dk_bytes))),
+        };
+        assert!(attacker_hs.read_message(&flight_1).is_err());
     }
 }

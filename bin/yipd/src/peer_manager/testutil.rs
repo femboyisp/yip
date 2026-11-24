@@ -18,6 +18,7 @@ pub(super) fn peer_cfg(tag_byte: u8, endpoint: &str) -> PeerConfig {
         endpoint: Some(endpoint.parse().unwrap()),
         alias: None,
         kem: None,
+        pq_public_key: None,
     }
 }
 
@@ -48,8 +49,14 @@ pub fn make_test_peer_manager() -> PeerManager {
 pub(super) fn fake_established_dataplane(conn_tag: u64, peer_addr: SocketAddr) -> DataPlane {
     let resp_kp = generate_keypair();
     let init_kp = generate_keypair();
-    let mut ini = Handshake::initiator(&init_kp.private, &resp_kp.public).unwrap();
     let mut res = Handshake::responder(&resp_kp.private).unwrap();
+    let resp_ek = res.local_pq_ek().unwrap();
+    let mut ini = Handshake::initiator_with_remote_pq_ek(
+        &init_kp.private,
+        &resp_kp.public,
+        resp_ek.as_bytes(),
+    )
+    .unwrap();
     let m1 = ini.write_message(&[]).unwrap();
     let _ = res.read_message(&m1).unwrap();
     let m2 = res.write_message(&[]).unwrap();
@@ -190,6 +197,7 @@ pub(super) fn pm_with_established_peer(
         endpoint: Some(ep),
         alias: None,
         kem: None,
+        pq_public_key: None,
     };
     let mut pm = PeerManager::new(
         [7u8; 32],
@@ -255,17 +263,23 @@ pub(crate) fn established_pm_pair(
     let kp_b = generate_keypair();
     let ep_a: SocketAddr = "10.0.0.1:1000".parse().unwrap();
     let ep_b: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+    let (ek_a, _) =
+        yip_crypto::derive_pq_keypair(&kp_a.private, yip_crypto::PqKemAlgorithm::MlKem768);
+    let (ek_b, _) =
+        yip_crypto::derive_pq_keypair(&kp_b.private, yip_crypto::PqKemAlgorithm::MlKem768);
     let cfg_b = PeerConfig {
         public_key: kp_b.public,
         endpoint: Some(ep_b),
         alias: None,
         kem: None,
+        pq_public_key: Some(ek_b.as_bytes().to_vec()),
     };
     let cfg_a = PeerConfig {
         public_key: kp_a.public,
         endpoint: Some(ep_a),
         alias: None,
         kem: None,
+        pq_public_key: Some(ek_a.as_bytes().to_vec()),
     };
     let mut pm_a = PeerManager::new(
         kp_a.private,
@@ -322,17 +336,23 @@ pub(super) fn established_pm_pair_with_obf(
     let kp_b = generate_keypair();
     let ep_a: SocketAddr = "10.0.0.1:1000".parse().unwrap();
     let ep_b: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+    let (ek_a, _) =
+        yip_crypto::derive_pq_keypair(&kp_a.private, yip_crypto::PqKemAlgorithm::MlKem768);
+    let (ek_b, _) =
+        yip_crypto::derive_pq_keypair(&kp_b.private, yip_crypto::PqKemAlgorithm::MlKem768);
     let cfg_b = PeerConfig {
         public_key: kp_b.public,
         endpoint: Some(ep_b),
         alias: None,
         kem: None,
+        pq_public_key: Some(ek_b.as_bytes().to_vec()),
     };
     let cfg_a = PeerConfig {
         public_key: kp_a.public,
         endpoint: Some(ep_a),
         alias: None,
         kem: None,
+        pq_public_key: Some(ek_a.as_bytes().to_vec()),
     };
     let mut pm_a = PeerManager::new(
         kp_a.private,
@@ -636,6 +656,7 @@ pub(super) fn responder_established_for_initiator(
         endpoint: None,
         alias: None,
         kem: None,
+        pq_public_key: None,
     };
     let (mut pm_r, _sent) = pm_with_mock_rdv(&kp_r, &[cfg_a]);
 
@@ -681,6 +702,7 @@ pub(super) fn responder_established_direct_for_initiator(
         endpoint: Some(ep_a),
         alias: None,
         kem: None,
+        pq_public_key: None,
     };
     let (mut pm_r, _sent) = pm_with_mock_rdv(&kp_r, &[cfg_a]);
 
@@ -735,6 +757,7 @@ pub(super) fn established_relay_pm(
         endpoint: None,
         alias: None,
         kem: None,
+        pq_public_key: None,
     };
     let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
     pm.rekey_interval_ms = rekey_interval_ms;
@@ -887,7 +910,17 @@ pub(super) fn pm_mesh_established_peer(
     let ca = test_ca();
     let local = generate_keypair();
     let peer = generate_keypair();
+    peer_test_key_registry()
+        .lock()
+        .unwrap()
+        .insert(local.public, (local.private, local_sign_seed));
+    peer_test_key_registry()
+        .lock()
+        .unwrap()
+        .insert(peer.public, (peer.private, peer_sign_seed));
     let peer_ep: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+    let (ek_peer, _) =
+        yip_crypto::derive_pq_keypair(&peer.private, yip_crypto::PqKemAlgorithm::MlKem768);
 
     let local_sign = SigningKey::from_bytes(&local_sign_seed);
     let local_cert = mk_cert(&ca, local.public, local_sign.verifying_key().to_bytes());
@@ -905,6 +938,7 @@ pub(super) fn pm_mesh_established_peer(
         endpoint: Some(peer_ep),
         alias: None,
         kem: None,
+        pq_public_key: Some(ek_peer.as_bytes().to_vec()),
     };
     let mut pm = PeerManager::new(
         local.private,

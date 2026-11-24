@@ -98,11 +98,36 @@ impl PeerManager {
             // #34: frame the msg1 payload as [ts || cert] (see begin_handshake).
             let payload = crate::handshake::frame_init_payload(&cert);
             let kem = self.peers[idx].kem;
-            let (hs, init_pkt) = match HandshakeState::start_initiator_with_kem(
+            let remote_pq_ek = self.peers[idx].pq_public_key.as_deref().or_else(|| {
+                self.membership
+                    .as_ref()
+                    .and_then(|m| m.record_for(&pubkey))
+                    .and_then(|rec| rec.cert.pq_encaps_key())
+            });
+            #[cfg(test)]
+            let test_ek_holder;
+            #[cfg(test)]
+            let remote_pq_ek = if remote_pq_ek.is_none() {
+                if let Some(&(privkey, _)) = testutil::peer_test_key_registry()
+                    .lock()
+                    .unwrap()
+                    .get(&pubkey)
+                {
+                    let (ek, _) = yip_crypto::derive_pq_keypair(&privkey, kem);
+                    test_ek_holder = Some(ek.as_bytes().to_vec());
+                    test_ek_holder.as_deref()
+                } else {
+                    remote_pq_ek
+                }
+            } else {
+                remote_pq_ek
+            };
+            let (hs, init_pkt) = match HandshakeState::start_initiator_with_kem_and_pq_ek(
                 &self.local_priv,
                 &pubkey,
                 &payload,
                 kem,
+                remote_pq_ek,
             ) {
                 Ok(t) => t,
                 Err(e) => {
@@ -260,9 +285,38 @@ impl PeerManager {
             .unwrap_or_default();
         let payload = crate::handshake::frame_init_payload(&cert);
         let kem = self.peers[idx].kem;
-        let (hs, init_pkt) =
-            HandshakeState::start_initiator_with_kem(&self.local_priv, &pubkey, &payload, kem)
-                .map_err(|e| format!("failed to start rekey handshake: {e}"))?;
+        let remote_pq_ek = self.peers[idx].pq_public_key.as_deref().or_else(|| {
+            self.membership
+                .as_ref()
+                .and_then(|m| m.record_for(&pubkey))
+                .and_then(|rec| rec.cert.pq_encaps_key())
+        });
+        #[cfg(test)]
+        let test_ek_holder;
+        #[cfg(test)]
+        let remote_pq_ek = if remote_pq_ek.is_none() {
+            if let Some(&(privkey, _)) = testutil::peer_test_key_registry()
+                .lock()
+                .unwrap()
+                .get(&pubkey)
+            {
+                let (ek, _) = yip_crypto::derive_pq_keypair(&privkey, kem);
+                test_ek_holder = Some(ek.as_bytes().to_vec());
+                test_ek_holder.as_deref()
+            } else {
+                remote_pq_ek
+            }
+        } else {
+            remote_pq_ek
+        };
+        let (hs, init_pkt) = HandshakeState::start_initiator_with_kem_and_pq_ek(
+            &self.local_priv,
+            &pubkey,
+            &payload,
+            kem,
+            remote_pq_ek,
+        )
+        .map_err(|e| format!("failed to start rekey handshake: {e}"))?;
 
         let retry_ms = if self.obf_key.is_some() {
             jitter_ms(HANDSHAKE_RETRY_MS)
@@ -1320,6 +1374,7 @@ mod tests {
             endpoint: Some(ep_i),
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let mut pm_r = PeerManager::new(
             kp_r.private,

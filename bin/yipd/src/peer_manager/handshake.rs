@@ -40,11 +40,36 @@ impl PeerManager {
         // only establishes the wire format).
         let payload = crate::handshake::frame_init_payload(&cert);
         let kem = self.peers[idx].kem;
-        let (hs, init_pkt) = match HandshakeState::start_initiator_with_kem(
+        let remote_pq_ek = self.peers[idx].pq_public_key.as_deref().or_else(|| {
+            self.membership
+                .as_ref()
+                .and_then(|m| m.record_for(&pubkey))
+                .and_then(|rec| rec.cert.pq_encaps_key())
+        });
+        #[cfg(test)]
+        let test_ek_holder;
+        #[cfg(test)]
+        let remote_pq_ek = if remote_pq_ek.is_none() {
+            if let Some(&(privkey, _)) = testutil::peer_test_key_registry()
+                .lock()
+                .unwrap()
+                .get(&pubkey)
+            {
+                let (ek, _) = yip_crypto::derive_pq_keypair(&privkey, kem);
+                test_ek_holder = Some(ek.as_bytes().to_vec());
+                test_ek_holder.as_deref()
+            } else {
+                remote_pq_ek
+            }
+        } else {
+            remote_pq_ek
+        };
+        let (hs, init_pkt) = match HandshakeState::start_initiator_with_kem_and_pq_ek(
             &self.local_priv,
             &pubkey,
             &payload,
             kem,
+            remote_pq_ek,
         ) {
             Ok(t) => t,
             Err(e) => {
@@ -566,6 +591,7 @@ mod tests {
             endpoint: Some(ep_i),
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let mut pm_r = PeerManager::new(
             kp_r.private,
@@ -660,6 +686,7 @@ mod tests {
             endpoint: Some(ep_i),
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let mut pm_r = PeerManager::new(
             kp_r.private,
@@ -756,12 +783,14 @@ mod tests {
             endpoint: Some(ep_b),
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let cfg_a = PeerConfig {
             public_key: kp_a.public,
             endpoint: Some(ep_a),
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let mut pm_a = PeerManager::new(
             kp_a.private,
@@ -838,6 +867,7 @@ mod tests {
             endpoint: Some(ep),
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
         pm.on_tun(&dummy_tun_pkt(), started_ms);
@@ -1355,6 +1385,7 @@ mod tests {
             endpoint: Some(peer_ep),
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let mut pm = PeerManager::new(
             local.private,
@@ -1420,6 +1451,7 @@ mod tests {
             endpoint: Some(peer_ep),
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
 
         // ── absent cert in msg2 → rejected ──
@@ -1510,6 +1542,7 @@ mod tests {
             endpoint: Some(root_ep),
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let roots = RootSet {
             roots: vec![(root.public, root_ep)],
@@ -1696,6 +1729,7 @@ mod tests {
             endpoint: None,
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
         pm.set_obf_psk(Some([0xBBu8; 32]));

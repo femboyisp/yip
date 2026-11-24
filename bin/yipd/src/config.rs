@@ -101,6 +101,8 @@ pub struct PeerConfig {
     pub alias: Option<String>,
     /// Optional post-quantum KEM algorithm override for this peer.
     pub kem: Option<yip_crypto::PqKemAlgorithm>,
+    /// Optional post-quantum public encapsulation key for this peer (GHSA-cw9q-4c58-hv9p).
+    pub pq_public_key: Option<Vec<u8>>,
 }
 
 impl PeerConfig {
@@ -111,6 +113,7 @@ impl PeerConfig {
             endpoint,
             alias: None,
             kem: None,
+            pq_public_key: None,
         }
     }
 
@@ -120,6 +123,12 @@ impl PeerConfig {
         if !a.is_empty() {
             self.alias = Some(a);
         }
+        self
+    }
+
+    /// Attach an optional post-quantum public encapsulation key to this peer configuration.
+    pub fn with_pq_public_key(mut self, key: impl Into<Vec<u8>>) -> Self {
+        self.pq_public_key = Some(key.into());
         self
     }
 
@@ -621,6 +630,7 @@ fn flush_peer_block(
                 endpoint: cur_ep,
                 alias: cur_alias,
                 kem: cur_kem,
+                pq_public_key: None,
             });
         }
         None if cur_ep.is_some() || cur_alias.is_some() || cur_kem.is_some() => {
@@ -1036,6 +1046,7 @@ impl Config {
                     endpoint: Some(ep),
                     alias: None,
                     kem: None,
+                    pq_public_key: None,
                 });
             }
         }

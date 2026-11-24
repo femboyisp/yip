@@ -190,6 +190,7 @@ mod tests {
             endpoint: Some(src),
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let mut pm = PeerManager::new(
             local.private,
@@ -269,6 +270,7 @@ mod tests {
             endpoint: Some(peer_ep),
             alias: None,
             kem: None,
+            pq_public_key: None,
         };
         let mut pm = PeerManager::new(
             local.private,

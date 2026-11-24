@@ -49,7 +49,18 @@ pub fn cert_signing_body(c: &Cert) -> Vec<u8> {
     out
 }
 
+/// Certificate tag carrying a member's post-quantum encapsulation public key (ML-KEM).
+pub const TAG_PQ_ENCAPS_KEY: u8 = 1;
+
 impl Cert {
+    /// Retrieve the member's post-quantum encapsulation key from `tags` if present.
+    pub fn pq_encaps_key(&self) -> Option<&[u8]> {
+        self.tags
+            .iter()
+            .find(|(tag, _)| *tag == TAG_PQ_ENCAPS_KEY)
+            .map(|(_, val)| val.as_slice())
+    }
+
     /// Serialize `self` onto `out` (appends; caller clears if reusing):
     /// the signing body followed by the 64-byte `ca_sig`.
     pub fn encode(&self, out: &mut Vec<u8>) {

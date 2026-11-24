@@ -7,8 +7,11 @@ use yip_crypto::{generate_keypair, Handshake, Session};
 pub fn established_pair() -> (Session, Session) {
     let rk = generate_keypair();
     let ik = generate_keypair();
-    let mut ini = Handshake::initiator(&ik.private, &rk.public).expect("init");
     let mut res = Handshake::responder(&rk.private).expect("resp");
+    let resp_ek = res.local_pq_ek().expect("ek");
+    let mut ini =
+        Handshake::initiator_with_remote_pq_ek(&ik.private, &rk.public, resp_ek.as_bytes())
+            .expect("init");
     let m1 = ini.write_message(&[]).expect("m1");
     let _ = res.read_message(&m1).expect("read m1");
     let m2 = res.write_message(&[]).expect("m2");
@@ -23,8 +26,11 @@ pub fn established_pair() -> (Session, Session) {
 pub fn established_raw_keys() -> ([u8; 32], [u8; 32]) {
     let rk = generate_keypair();
     let ik = generate_keypair();
-    let mut ini = Handshake::initiator(&ik.private, &rk.public).expect("init");
     let mut res = Handshake::responder(&rk.private).expect("resp");
+    let resp_ek = res.local_pq_ek().expect("ek");
+    let mut ini =
+        Handshake::initiator_with_remote_pq_ek(&ik.private, &rk.public, resp_ek.as_bytes())
+            .expect("init");
     let m1 = ini.write_message(&[]).expect("m1");
     let _ = res.read_message(&m1).expect("read m1");
     let m2 = res.write_message(&[]).expect("m2");
