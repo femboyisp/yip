@@ -1344,12 +1344,19 @@ pub fn run_sharded(config: Config, num_shards: usize) -> io::Result<()> {
                                             shard_id as u64,
                                             num_shards as u64,
                                         ) {
+                                            let (init_ctrl, resp_ctrl) =
+                                                crate::control_codec::derive_control_keys(&epoch.auth_key);
                                             let established = crate::handshake::Established {
                                                 session: shard_session,
                                                 auth_key: epoch.auth_key,
                                                 hp_key: epoch.hp_key,
                                                 raw_send_key: epoch.send_key,
                                                 raw_recv_key: epoch.recv_key,
+                                                ctrl_codec: crate::control_codec::ControlCodec::new(
+                                                    init_ctrl, resp_ctrl,
+                                                ),
+                                                ctrl_send_nonce: 0,
+                                                ctrl_replay: yip_crypto::ReplayWindow::new(),
                                             };
                                             manager.install_established_session(
                                                 &epoch.peer_pk,

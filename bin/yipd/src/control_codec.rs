@@ -62,6 +62,14 @@ pub fn derive_control_keys(auth_key: &[u8; 16]) -> ([u8; 32], [u8; 32]) {
 pub struct ControlCodec {
     send_cipher: ChaCha20Poly1305Cipher,
     recv_cipher: ChaCha20Poly1305Cipher,
+    send_key: [u8; 32],
+    recv_key: [u8; 32],
+}
+
+impl Clone for ControlCodec {
+    fn clone(&self) -> Self {
+        Self::new(self.send_key, self.recv_key)
+    }
 }
 
 impl ControlCodec {
@@ -70,6 +78,8 @@ impl ControlCodec {
         Self {
             send_cipher: ChaCha20Poly1305Cipher::new(send_key),
             recv_cipher: ChaCha20Poly1305Cipher::new(recv_key),
+            send_key,
+            recv_key,
         }
     }
 

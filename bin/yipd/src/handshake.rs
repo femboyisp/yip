@@ -9,8 +9,9 @@ use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
-use yip_crypto::{CryptoError, Handshake, Session};
+use yip_crypto::{CryptoError, Handshake, ReplayWindow, Session};
 
+use crate::control_codec::{derive_control_keys, ControlCodec};
 use crate::wire_glue::derive_wire_keys;
 
 // ── packet type prefix ────────────────────────────────────────────────────────
@@ -58,6 +59,12 @@ pub struct Established {
     pub raw_send_key: [u8; 32],
     /// 32-byte raw Noise receive key.
     pub raw_recv_key: [u8; 32],
+    /// In-session encrypted control codec (#207).
+    pub ctrl_codec: ControlCodec,
+    /// Outbound control frame sequence nonce.
+    pub ctrl_send_nonce: u64,
+    /// Anti-replay sliding window for inbound control frames.
+    pub ctrl_replay: ReplayWindow,
 }
 
 impl Established {
@@ -82,6 +89,9 @@ impl Established {
             hp_key: self.hp_key,
             raw_send_key: self.raw_send_key,
             raw_recv_key: self.raw_recv_key,
+            ctrl_codec: self.ctrl_codec.clone(),
+            ctrl_send_nonce: self.ctrl_send_nonce,
+            ctrl_replay: self.ctrl_replay.clone(),
         })
     }
 }
@@ -217,6 +227,7 @@ pub fn run_initiator_with_kem(
             let (raw_send_key, raw_recv_key) = handshake.raw_split_keys();
             let session = handshake.into_session().map_err(crypto_err)?;
             let (auth_key, hp_key) = derive_wire_keys(&cb);
+            let (init_key, resp_key) = derive_control_keys(&auth_key);
 
             // Restore blocking mode so the socket is left in a sensible state.
             sock.set_read_timeout(None)?;
@@ -227,6 +238,9 @@ pub fn run_initiator_with_kem(
                 hp_key,
                 raw_send_key,
                 raw_recv_key,
+                ctrl_codec: ControlCodec::new(init_key, resp_key),
+                ctrl_send_nonce: 0,
+                ctrl_replay: ReplayWindow::new(),
             });
         }
     }
@@ -547,6 +561,7 @@ impl HandshakeState {
         let (raw_send_key, raw_recv_key) = handshake.raw_split_keys();
         let session = handshake.into_session().map_err(crypto_err)?;
         let (auth_key, hp_key) = derive_wire_keys(&cb);
+        let (init_key, resp_key) = derive_control_keys(&auth_key);
 
         Ok((
             Established {
@@ -555,6 +570,9 @@ impl HandshakeState {
                 hp_key,
                 raw_send_key,
                 raw_recv_key,
+                ctrl_codec: ControlCodec::new(resp_key, init_key),
+                ctrl_send_nonce: 0,
+                ctrl_replay: ReplayWindow::new(),
             },
             resp_pkt,
             remote_static,
@@ -579,6 +597,7 @@ impl HandshakeState {
         let (raw_send_key, raw_recv_key) = self.handshake.raw_split_keys();
         let session = self.handshake.into_session().map_err(crypto_err)?;
         let (auth_key, hp_key) = derive_wire_keys(&cb);
+        let (init_key, resp_key) = derive_control_keys(&auth_key);
 
         Ok((
             Established {
@@ -587,6 +606,9 @@ impl HandshakeState {
                 hp_key,
                 raw_send_key,
                 raw_recv_key,
+                ctrl_codec: ControlCodec::new(init_key, resp_key),
+                ctrl_send_nonce: 0,
+                ctrl_replay: ReplayWindow::new(),
             },
             responder_payload,
         ))
@@ -872,5 +894,58 @@ mod tests {
                 b"encrypted with pq session"
             );
         }
+    }
+
+    fn establish_pair() -> (Established, Established) {
+        let a = generate_keypair();
+        let b = generate_keypair();
+
+        let (ha, init_pkt) = HandshakeState::start_initiator(&a.private, &b.public, &[]).unwrap();
+        let (b_est, resp_pkt, _initiator_static, _initiator_payload) =
+            HandshakeState::start_responder(&b.private, &init_pkt, &[]).unwrap();
+        let (a_est, _responder_payload) = ha.read_response(&resp_pkt).unwrap();
+        (a_est, b_est)
+    }
+
+    #[test]
+    fn test_control_keys_on_established() {
+        let (mut a, mut b) = establish_pair();
+
+        assert_eq!(a.ctrl_send_nonce, 0);
+        assert_eq!(b.ctrl_send_nonce, 0);
+
+        // Initiator seals a control message to Responder
+        let payload_a = b"initiator-control-payload";
+        let frame_a = a.ctrl_codec.seal(
+            a.ctrl_send_nonce,
+            crate::control_codec::INNER_TYPE_GOSSIP,
+            payload_a,
+            128,
+        );
+        a.ctrl_send_nonce += 1;
+
+        let (inner_type_b, opened_b) = b
+            .ctrl_codec
+            .open(&mut b.ctrl_replay, &frame_a)
+            .expect("responder must open initiator control frame");
+        assert_eq!(inner_type_b, crate::control_codec::INNER_TYPE_GOSSIP);
+        assert_eq!(opened_b, payload_a);
+
+        // Responder seals a control message to Initiator
+        let payload_b = b"responder-control-payload";
+        let frame_b = b.ctrl_codec.seal(
+            b.ctrl_send_nonce,
+            crate::control_codec::INNER_TYPE_GOSSIP,
+            payload_b,
+            128,
+        );
+        b.ctrl_send_nonce += 1;
+
+        let (inner_type_a, opened_a) = a
+            .ctrl_codec
+            .open(&mut a.ctrl_replay, &frame_b)
+            .expect("initiator must open responder control frame");
+        assert_eq!(inner_type_a, crate::control_codec::INNER_TYPE_GOSSIP);
+        assert_eq!(opened_a, payload_b);
     }
 }

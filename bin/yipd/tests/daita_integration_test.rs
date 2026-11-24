@@ -240,6 +240,7 @@ fn test_daita_dataplane_integration() {
     let cb = ini.channel_binding();
     let (auth_key, hp_key) = yipd::wire_glue::derive_wire_keys(&cb);
     let (ini_send_k, ini_recv_k) = ini.raw_split_keys();
+    let (init_ctrl, resp_ctrl) = yipd::control_codec::derive_control_keys(&auth_key);
 
     let est = yipd::handshake::Established {
         session: ini.into_session().unwrap(),
@@ -247,6 +248,9 @@ fn test_daita_dataplane_integration() {
         hp_key,
         raw_send_key: ini_send_k,
         raw_recv_key: ini_recv_k,
+        ctrl_codec: yipd::control_codec::ControlCodec::new(init_ctrl, resp_ctrl),
+        ctrl_send_nonce: 0,
+        ctrl_replay: yip_crypto::ReplayWindow::new(),
     };
 
     let conn_tag = yipd::dataplane::conn_tag_from_keys(&auth_key, &hp_key);
