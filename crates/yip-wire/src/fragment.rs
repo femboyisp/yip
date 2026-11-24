@@ -688,7 +688,7 @@ mod tests {
 
     #[test]
     fn test_reassembler_session_cap_reinsertion_for_existing_id() {
-        let mut reassembler = HandshakeReassembler::new();
+        let mut reassembler = HandshakeReassembler::with_ttl(Duration::from_secs(3600));
         // Fill up to MAX_REASSEMBLY_SESSIONS
         for id in 0..MAX_REASSEMBLY_SESSIONS as u32 {
             let frag = HandshakeFragment {
