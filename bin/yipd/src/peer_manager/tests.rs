@@ -345,6 +345,44 @@ fn initiator_retransmits_same_init_within_total_window_then_gives_up() {
 }
 
 #[test]
+fn handshaking_retransmit_chunks_large_init_datagram() {
+    let kp_local = generate_keypair();
+    let peer = PeerConfig {
+        public_key: [7u8; 32],
+        endpoint: Some("10.0.0.9:9000".parse().unwrap()),
+        alias: None,
+        kem: None,
+        pq_public_key: None,
+    };
+    let mut pm = PeerManager::new(
+        kp_local.private,
+        kp_local.public,
+        &[peer],
+        TunnelMode::L3Tun,
+        None,
+        None,
+        false,
+    );
+    let _ = pm.on_tun(&dummy_tun_pkt(), 0);
+    let large_pkt = vec![PacketType::HandshakeInit as u8; 2500];
+    if let PeerSessionState::Handshaking(ref mut h) = pm.peers[0].state {
+        h.init_pkt = large_pkt.clone();
+    } else {
+        panic!("expected Handshaking state");
+    }
+
+    let out = pm
+        .tick(HANDSHAKE_RETRY_MS)
+        .map(<[_]>::to_vec)
+        .unwrap_or_default();
+    assert!(out.len() > 1, "large init must be chunked on retransmit");
+    for dg in &out {
+        assert_eq!(dg.bytes[0], PacketType::HandshakeFrag as u8);
+        assert!(dg.bytes.len() <= 1400);
+    }
+}
+
+#[test]
 fn pending_tun_is_capped_while_handshaking() {
     let kp_local = generate_keypair();
     let peer = PeerConfig {

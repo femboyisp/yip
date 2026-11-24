@@ -3069,16 +3069,27 @@ impl PeerManager {
                         } else {
                             HANDSHAKE_RETRY_MS
                         };
-                        if relay {
-                            if let Some(d) = self.relay_wrap(i, handshaking.init_pkt.clone()) {
-                                self.tick_egress.push(d);
-                            }
+                        let pkts = if handshaking.init_pkt.len() > 1400 {
+                            yip_wire::fragment::chunk_handshake_datagram(
+                                &handshaking.init_pkt,
+                                1400,
+                                self.junk_rng.next_u64() as u32,
+                            )
                         } else {
-                            self.tick_egress.push(EgressDatagram {
-                                fate: 0,
-                                dst: handshaking.target,
-                                bytes: handshaking.init_pkt.clone(),
-                            });
+                            vec![handshaking.init_pkt.clone()]
+                        };
+                        for pkt in pkts {
+                            if relay {
+                                if let Some(d) = self.relay_wrap(i, pkt) {
+                                    self.tick_egress.push(d);
+                                }
+                            } else {
+                                self.tick_egress.push(EgressDatagram {
+                                    fate: 0,
+                                    dst: handshaking.target,
+                                    bytes: pkt,
+                                });
+                            }
                         }
                         PeerSessionState::Handshaking(handshaking)
                     }
