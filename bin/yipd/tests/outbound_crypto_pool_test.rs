@@ -1,6 +1,9 @@
 use std::sync::Arc;
 use yip_crypto::session::ChaCha20Poly1305Cipher;
-use yipd::crypto_pool::outbound::{CompletedDatagram, EncryptTask, OutboundCryptoPool};
+use yip_transport::FlowClass;
+use yipd::crypto_pool::outbound::{
+    CompletedDatagram, EncryptTask, OutboundCryptoPool, MAX_PACKET_LEN,
+};
 
 #[test]
 fn test_outbound_crypto_pool_parallel_encryption_and_in_order_drain() {
@@ -14,15 +17,20 @@ fn test_outbound_crypto_pool_parallel_encryption_and_in_order_drain() {
     // Dispatch 100 packets across 4 workers
     for seq in 0..num_packets {
         let plaintext = format!("hello packet {seq}").into_bytes();
-        let task = EncryptTask {
+        let pt_len = plaintext.len();
+        let mut task = EncryptTask {
             peer_id: 1,
+            seq: 0,
             counter: seq,
             dst,
             fate: (seq % 10) as u16,
             conn_tag: 0x12345678,
             cipher: Arc::clone(&cipher),
-            payload: plaintext,
+            class: FlowClass::Realtime,
+            len: pt_len,
+            payload: [0u8; MAX_PACKET_LEN],
         };
+        task.payload[..pt_len].copy_from_slice(&plaintext);
         pool.dispatch_encrypt(task).expect("dispatch must succeed");
     }
 
@@ -45,11 +53,12 @@ fn test_outbound_crypto_pool_parallel_encryption_and_in_order_drain() {
         );
         assert_eq!(dg.dst, dst);
         assert_eq!(dg.fate, (i % 10) as u16);
+        assert_eq!(dg.class, FlowClass::Realtime);
 
         // Verify decryption roundtrip
-        let mut ct = dg.bytes.clone();
+        let mut ct = dg.bytes;
         let pt_len = cipher
-            .open_in_place(dg.counter, &mut ct, dg.bytes.len())
+            .open_in_place(dg.counter, &mut ct, dg.len)
             .expect("decryption must succeed");
         let pt = String::from_utf8(ct[..pt_len].to_vec()).unwrap();
         assert_eq!(pt, format!("hello packet {i}"));
@@ -73,15 +82,20 @@ fn test_outbound_crypto_pool_burst_stress_1000_packets() {
         let burst_size = (total_packets - seq).min(32);
         for _ in 0..burst_size {
             let plaintext = format!("payload {seq}").into_bytes();
-            let task = EncryptTask {
+            let pt_len = plaintext.len();
+            let mut task = EncryptTask {
                 peer_id: 2,
+                seq: 0,
                 counter: seq,
                 dst,
                 fate: (seq % 8) as u16,
                 conn_tag: 0x87654321,
                 cipher: Arc::clone(&cipher),
-                payload: plaintext,
+                class: FlowClass::Bulk,
+                len: pt_len,
+                payload: [0u8; MAX_PACKET_LEN],
             };
+            task.payload[..pt_len].copy_from_slice(&plaintext);
             pool.dispatch_encrypt(task).expect("dispatch must succeed");
             seq += 1;
         }

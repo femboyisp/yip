@@ -214,6 +214,21 @@ impl Transport {
         (class, syms)
     }
 
+    /// Classify an inner packet using the internal flow classifier.
+    pub fn classify(&mut self, inner: &[u8], l2: bool, now_ms: u64) -> FlowClass {
+        self.classifier.classify(inner, l2, now_ms)
+    }
+
+    /// Zero-allocation encode using an explicit pre-computed `FlowClass`.
+    pub fn encode_scratch_with_class(&mut self, ciphertext: &[u8], class: FlowClass) -> &[Symbol] {
+        let params = self.params_for(class);
+        let source = u32::try_from(ciphertext.len().div_ceil(usize::from(params.symbol_size)))
+            .unwrap_or(u32::MAX)
+            .max(1);
+        let repair = self.controllers[class_index(class)].repair_count(source);
+        self.encoder.encode_scratch(ciphertext, params, repair)
+    }
+
     /// Zero-allocation encode using the transport encoder's internal scratch arena.
     pub fn encode_scratch(
         &mut self,
@@ -222,13 +237,8 @@ impl Transport {
         l2: bool,
         now_ms: u64,
     ) -> (FlowClass, &[Symbol]) {
-        let class = self.classifier.classify(inner, l2, now_ms);
-        let params = self.params_for(class);
-        let source = u32::try_from(ciphertext.len().div_ceil(usize::from(params.symbol_size)))
-            .unwrap_or(u32::MAX)
-            .max(1);
-        let repair = self.controllers[class_index(class)].repair_count(source);
-        let syms = self.encoder.encode_scratch(ciphertext, params, repair);
+        let class = self.classify(inner, l2, now_ms);
+        let syms = self.encode_scratch_with_class(ciphertext, class);
         (class, syms)
     }
 
@@ -698,5 +708,15 @@ mod tests {
         for s in syms {
             assert!(!s.data.is_empty(), "symbol data must not be empty");
         }
+
+        let classified = t.classify(&inner, false, 100);
+        assert_eq!(classified, FlowClass::Default);
+
+        let syms_explicit = t.encode_scratch_with_class(&ciphertext, FlowClass::Realtime);
+        assert!(
+            !syms_explicit.is_empty(),
+            "encode_scratch_with_class must produce symbols"
+        );
+        assert_eq!(syms_explicit.len(), 4);
     }
 }
