@@ -8,9 +8,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::config::PeerConfig;
 use crate::peer_manager::{PeerManager, PeerStats};
@@ -257,11 +258,6 @@ impl ControlHandle {
         }
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
-            }
         }
 
         let listener = UnixListener::bind(&path)?;
@@ -270,26 +266,26 @@ impl ControlHandle {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            // Configure socket permissions: default 0666 so unprivileged desktop users
-            // (e.g. yip-client or CLI) can query status without sudo.
-            // Mode can be overridden via YIP_CONTROL_SOCKET_MODE (e.g. "0660" or "0600").
+            // Configure socket permissions: default 0600 (owner only) for secure operation.
+            // When running with group sharing (e.g. yip-client in 'yip' group), set
+            // YIP_CONTROL_SOCKET_MODE=0660 and YIP_CONTROL_SOCKET_GROUP=yip.
             let mode = if let Ok(val) = std::env::var("YIP_CONTROL_SOCKET_MODE") {
                 let trimmed = val.trim().trim_start_matches("0o").trim_start_matches('0');
                 if trimmed.is_empty() {
-                    0o666
+                    0o600
                 } else {
-                    u32::from_str_radix(trimmed, 8).unwrap_or(0o666)
+                    u32::from_str_radix(trimmed, 8).unwrap_or(0o600)
                 }
             } else {
-                0o666
+                0o600
             };
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
 
-            // Optionally chown group to "yip" (or YIP_CONTROL_SOCKET_GROUP) if present
-            let target_group =
-                std::env::var("YIP_CONTROL_SOCKET_GROUP").unwrap_or_else(|_| "yip".into());
-            if let Some(gid) = lookup_group_gid(&target_group) {
-                let _ = std::os::unix::fs::chown(&path, None, Some(gid));
+            // Optionally chown group if YIP_CONTROL_SOCKET_GROUP is set
+            if let Ok(target_group) = std::env::var("YIP_CONTROL_SOCKET_GROUP") {
+                if let Some(gid) = lookup_group_gid(&target_group) {
+                    let _ = std::os::unix::fs::chown(&path, None, Some(gid));
+                }
             }
         }
 
@@ -347,14 +343,64 @@ pub(crate) fn lookup_group_gid(group_name: &str) -> Option<u32> {
     None
 }
 
+/// Maximum concurrent active control client connections.
+pub const MAX_CONCURRENT_CLIENTS: usize = 64;
+
+/// Maximum allowable size for a single control command request line (64 KiB).
+pub const MAX_REQUEST_LINE_BYTES: usize = 65536;
+
+/// Default socket read/write timeout for control connections.
+pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+static ACTIVE_CLIENTS: AtomicUsize = AtomicUsize::new(0);
+
+fn is_caller_privileged(caller_uid: Option<u32>) -> bool {
+    match caller_uid {
+        Some(0) => true,
+        #[cfg(unix)]
+        Some(uid) => uid == yip_io::get_current_uid(),
+        #[cfg(not(unix))]
+        Some(_) => false,
+        None => {
+            #[cfg(not(target_os = "linux"))]
+            {
+                true
+            }
+            #[cfg(target_os = "linux")]
+            {
+                false
+            }
+        }
+    }
+}
+
 /// Background thread loop accepting connections and servicing client requests.
 fn run_listener(listener: UnixListener, req_tx: Sender<ControlRequest>) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else {
             break;
         };
+        if ACTIVE_CLIENTS.load(Ordering::Relaxed) >= MAX_CONCURRENT_CLIENTS {
+            let mut writer = stream;
+            let err_resp = ControlResponse::Err {
+                ok: false,
+                error: "server busy: max concurrent control clients exceeded".into(),
+            };
+            let _ = send_response(&mut writer, &err_resp);
+            continue;
+        }
+
         let tx = req_tx.clone();
         thread::spawn(move || {
+            struct ActiveGuard;
+            impl Drop for ActiveGuard {
+                fn drop(&mut self) {
+                    ACTIVE_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+            ACTIVE_CLIENTS.fetch_add(1, Ordering::Relaxed);
+            let _guard = ActiveGuard;
+
             handle_client(stream, tx);
         });
     }
@@ -362,65 +408,92 @@ fn run_listener(listener: UnixListener, req_tx: Sender<ControlRequest>) {
 
 /// Read newline-delimited JSON commands from a client connection and write responses.
 fn handle_client(stream: UnixStream, req_tx: Sender<ControlRequest>) {
+    let _ = stream.set_read_timeout(Some(CLIENT_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(CLIENT_TIMEOUT));
+
+    let caller_uid = yip_io::get_unix_peer_uid(&stream).ok();
+    let caller_privileged = is_caller_privileged(caller_uid);
+
     let Ok(mut reader) = stream.try_clone().map(BufReader::new) else {
         return;
     };
     let mut writer = stream;
     let mut line = String::new();
 
-    while let Ok(n) = reader.read_line(&mut line) {
-        if n == 0 {
-            break;
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            line.clear();
-            continue;
-        }
-
-        let parsed: Result<ControlCmd, _> = serde_json::from_str(trimmed);
-        match parsed {
-            Ok(cmd) => {
-                let (resp_tx, resp_rx) = channel();
-                let req = ControlRequest {
-                    cmd,
-                    responder: resp_tx,
-                };
-                if req_tx.send(req).is_err() {
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(n) => {
+                if n > MAX_REQUEST_LINE_BYTES {
                     let err_resp = ControlResponse::Err {
                         ok: false,
-                        error: "server shutting down".into(),
+                        error: "request payload exceeds maximum size limit (64 KiB)".into(),
                     };
                     let _ = send_response(&mut writer, &err_resp);
                     break;
                 }
-                match resp_rx.recv() {
-                    Ok(resp) => {
-                        if send_response(&mut writer, &resp).is_err() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                let parsed: Result<ControlCmd, _> = serde_json::from_str(trimmed);
+                match parsed {
+                    Ok(cmd) => {
+                        if cmd.is_privileged() && !caller_privileged {
+                            let err_resp = ControlResponse::Err {
+                                ok: false,
+                                error: "permission denied: privileged command requires root or daemon owner UID".into(),
+                            };
+                            if send_response(&mut writer, &err_resp).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+
+                        let (resp_tx, resp_rx) = channel();
+                        let req = ControlRequest {
+                            cmd,
+                            responder: resp_tx,
+                        };
+                        if req_tx.send(req).is_err() {
+                            let err_resp = ControlResponse::Err {
+                                ok: false,
+                                error: "server shutting down".into(),
+                            };
+                            let _ = send_response(&mut writer, &err_resp);
+                            break;
+                        }
+                        match resp_rx.recv() {
+                            Ok(resp) => {
+                                if send_response(&mut writer, &resp).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                let err_resp = ControlResponse::Err {
+                                    ok: false,
+                                    error: "request dropped by event loop".into(),
+                                };
+                                let _ = send_response(&mut writer, &err_resp);
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let err_resp = ControlResponse::Err {
+                            ok: false,
+                            error: format!("invalid JSON command: {e}"),
+                        };
+                        if send_response(&mut writer, &err_resp).is_err() {
                             break;
                         }
                     }
-                    Err(_) => {
-                        let err_resp = ControlResponse::Err {
-                            ok: false,
-                            error: "request dropped by event loop".into(),
-                        };
-                        let _ = send_response(&mut writer, &err_resp);
-                        break;
-                    }
                 }
             }
-            Err(e) => {
-                let err_resp = ControlResponse::Err {
-                    ok: false,
-                    error: format!("invalid JSON command: {e}"),
-                };
-                if send_response(&mut writer, &err_resp).is_err() {
-                    break;
-                }
-            }
+            Err(_) => break,
         }
-        line.clear();
     }
 }
 
@@ -2763,7 +2836,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let meta = std::fs::metadata(&socket_path).unwrap();
             let mode = meta.permissions().mode() & 0o777;
-            assert_eq!(mode, 0o666);
+            assert_eq!(mode, 0o600);
         }
 
         let mut pm = crate::peer_manager::testutil::test_peer_manager();
@@ -2805,8 +2878,11 @@ mod tests {
         }
     }
 
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_control_handle_custom_permissions() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let socket_path = format!("/tmp/test_control_perm_{}.sock", std::process::id());
         std::env::set_var("YIP_CONTROL_SOCKET_MODE", "0660");
         let handle = ControlHandle::bind(&socket_path).unwrap();
@@ -4223,5 +4299,40 @@ mod tests {
         // Nonexistent socket fails cleanly
         assert!(run_cli_config(Path::new("/tmp/nonexistent_cfg.sock"), false).is_err());
         assert!(run_cli_reload(Path::new("/tmp/nonexistent_cfg.sock"), None, false).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_control_socket_permissions_and_dos_hardening() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("YIP_CONTROL_SOCKET_MODE");
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir();
+        let sock_path = dir.join(format!(
+            "secure_ctrl_{}_{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let _handle = ControlHandle::bind(&sock_path).unwrap();
+        let metadata = std::fs::metadata(&sock_path).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "socket permissions must default to 0600");
+
+        // 2. Connect client and verify oversized line payload is rejected
+        let mut client = UnixStream::connect(&sock_path).unwrap();
+        let oversized = "a".repeat(MAX_REQUEST_LINE_BYTES + 10) + "\n";
+        client.write_all(oversized.as_bytes()).unwrap();
+
+        let mut reader = BufReader::new(client);
+        let mut resp_line = String::new();
+        reader.read_line(&mut resp_line).unwrap();
+        assert!(
+            resp_line.contains("exceeds maximum size limit"),
+            "oversized line must be rejected: {resp_line}"
+        );
     }
 }

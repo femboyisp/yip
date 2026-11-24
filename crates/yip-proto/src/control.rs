@@ -129,6 +129,27 @@ pub enum ControlCmd {
     GetConfig,
 }
 
+impl ControlCmd {
+    /// Returns true if this command performs daemon state mutations or active network probing
+    /// requiring root or daemon-owner credentials.
+    pub fn is_privileged(&self) -> bool {
+        !matches!(
+            self,
+            Self::Status
+                | Self::ListPeers
+                | Self::CertStatus
+                | Self::GetFecStatus
+                | Self::GetDaitaStatus
+                | Self::GetRoutes
+                | Self::GetTopology
+                | Self::GetSplitTunnelStatus
+                | Self::GetMetrics { .. }
+                | Self::GetXdpStatus
+                | Self::GetConfig
+        )
+    }
+}
+
 const fn default_ping_count() -> u32 {
     4
 }
@@ -876,5 +897,40 @@ mod tests {
             }
             other => panic!("expected ControlResponse::Status, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_control_cmd_privilege_classification() {
+        assert!(!ControlCmd::Status.is_privileged());
+        assert!(!ControlCmd::ListPeers.is_privileged());
+        assert!(!ControlCmd::CertStatus.is_privileged());
+        assert!(!ControlCmd::GetFecStatus.is_privileged());
+        assert!(!ControlCmd::GetDaitaStatus.is_privileged());
+        assert!(!ControlCmd::GetRoutes.is_privileged());
+        assert!(!ControlCmd::GetTopology.is_privileged());
+        assert!(!ControlCmd::GetSplitTunnelStatus.is_privileged());
+        assert!(!ControlCmd::GetMetrics { peer: None }.is_privileged());
+        assert!(!ControlCmd::GetXdpStatus.is_privileged());
+        assert!(!ControlCmd::GetConfig.is_privileged());
+
+        assert!(ControlCmd::AddPeer {
+            public_key: "abc".into(),
+            endpoint: None,
+            transport: None,
+            alias: None,
+        }
+        .is_privileged());
+        assert!(ControlCmd::RemovePeer {
+            public_key: "abc".into(),
+        }
+        .is_privileged());
+        assert!(ControlCmd::Reload { path: None }.is_privileged());
+        assert!(ControlCmd::CertRenew.is_privileged());
+        assert!(ControlCmd::CreateTicket {
+            name: None,
+            route_mode: None,
+            endpoint: None,
+        }
+        .is_privileged());
     }
 }
