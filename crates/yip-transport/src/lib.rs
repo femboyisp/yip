@@ -712,6 +712,14 @@ mod tests {
         let classified = t.classify(&inner, false, 100);
         assert_eq!(classified, FlowClass::Default);
 
+        let mut ef_packet = vec![0x45, 46 << 2];
+        ef_packet.resize(40, 0);
+        let classified_ef = t.classify(&ef_packet, false, 100);
+        assert_eq!(classified_ef, FlowClass::Realtime);
+        assert_ne!(classified_ef, FlowClass::Default);
+        assert_ne!(classified_ef, FlowClass::Bulk);
+        assert_ne!(classified_ef, FlowClass::Ack);
+
         let syms_explicit = t.encode_scratch_with_class(&ciphertext, FlowClass::Realtime);
         assert!(
             !syms_explicit.is_empty(),
