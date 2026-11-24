@@ -63,9 +63,11 @@ NETWORK_ID="dadedadedadedadedadedadedadedad1"
 PID_A=""
 PID_B=""
 PID_R=""
+TCPDUMP_PID=""
 
 cleanup() {
     echo "[cleanup] killing daemons and removing namespaces/bridge"
+    [ -n "$TCPDUMP_PID" ] && kill "$TCPDUMP_PID" 2>/dev/null || true
     [ -n "$PID_A" ] && kill "$PID_A" 2>/dev/null || true
     [ -n "$PID_B" ] && kill "$PID_B" 2>/dev/null || true
     [ -n "$PID_R" ] && kill "$PID_R" 2>/dev/null || true
@@ -80,6 +82,13 @@ cleanup() {
     rm -rf "$TMPDIR_TEST"
 }
 trap cleanup EXIT
+
+for tool in tcpdump tshark python3; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "SKIP $0: missing required tool $tool"
+        exit 0
+    fi
+done
 
 # ── 1. offline CA + per-node keys/certs + signed root set ────────────────────
 echo "[setup] minting CA"
@@ -148,6 +157,11 @@ network_id=${NETWORK_ID}
 cert=${certfile}
 roots=${ROOTS_FILE}
 EOF
+    if [ "$file" != "$CFG_R" ]; then
+        echo "peer_public=${PUB_R}" >> "$file"
+        echo "peer_endpoint=${IP_R}:${PORT}" >> "$file"
+        echo "pq_public_key=${PQ_PUB_R}" >> "$file"
+    fi
     # NOTE: an `[ ] && echo` one-liner here would make this the function's LAST
     # command; when OBF_PSK is unset the test returns 1, and under `set -e` the
     # `write_mesh_cfg` call aborts the whole script. Use an `if` (returns 0 when
@@ -184,6 +198,12 @@ echo "[setup] wiring veths to the bridge"
 setup_leg "$NS_A" "$VETH_A_H" "$VETH_A_N" "$IP_A"
 setup_leg "$NS_B" "$VETH_B_H" "$VETH_B_N" "$IP_B"
 setup_leg "$NS_R" "$VETH_R_H" "$VETH_R_N" "$IP_R"
+
+PCAP="$TMPDIR_TEST/discovery.pcap"
+echo "[capture] starting tcpdump on bridge $BR -> $PCAP"
+tcpdump -i "$BR" -w "$PCAP" -U "udp and port $PORT" >"$TMPDIR_TEST/tcpdump.log" 2>&1 &
+TCPDUMP_PID=$!
+sleep 0.3
 
 # ── 4. start daemons: seed root first, then A and B ───────────────────────────
 LOG_A="$TMPDIR_TEST/yipA.log"
@@ -300,3 +320,77 @@ if [ "$PING_STATUS" -ne 0 ]; then
     exit 1
 fi
 echo "[PASS] ping A->B succeeded: A discovered B via gossip and handshake completed"
+
+# ── 9. stop capture and verify wire secrecy ──────────────────────────────────
+echo "[capture] stopping tcpdump"
+sleep 0.5
+kill "$TCPDUMP_PID" 2>/dev/null || true
+wait "$TCPDUMP_PID" 2>/dev/null || true
+TCPDUMP_PID=""
+
+if [ ! -s "$PCAP" ]; then
+    echo "[FAIL] capture is empty or missing at $PCAP"
+    dump_logs
+    exit 1
+fi
+
+echo "[check] inspecting pcap for zero plaintext gossip and encrypted control frame format"
+NODE_ID_A="$("$YIPD" --node-id "$PUB_A")"
+NODE_ID_B="$("$YIPD" --node-id "$PUB_B")"
+NODE_ID_R="$("$YIPD" --node-id "$PUB_R")"
+
+python3 - "$PCAP" "$PUB_A" "$PUB_B" "$PUB_R" \
+    "$SIGNPUB_A" "$SIGNPUB_B" "$SIGNPUB_R" \
+    "$NODE_ID_A" "$NODE_ID_B" "$NODE_ID_R" \
+    "$NETWORK_ID" << 'EOF'
+import subprocess, sys
+
+pcap_file = sys.argv[1]
+hex_tokens = [tok.strip().lower() for tok in sys.argv[2:] if tok.strip()]
+identities = [bytes.fromhex(tok) for tok in hex_tokens]
+
+cmd = ["tshark", "-r", pcap_file, "-Y", "udp", "-T", "fields", "-e", "udp.payload"]
+res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+
+packets = []
+for line in res.stdout.strip().splitlines():
+    line = line.strip().replace(":", "")
+    if line:
+        packets.append(bytes.fromhex(line))
+
+print(f"[pcap] analyzing {len(packets)} packets captured on discovery bridge")
+
+encrypted_ctrl_count = 0
+plaintext_gossip_count = 0
+established_count = 0
+
+for i, pkt in enumerate(packets):
+    ptype = pkt[0]
+    # 0 = HandshakeInit, 1 = HandshakeResp, 2 = Data, 3 = Control, 4 = Gossip, 5 = HandshakeFrag, 6 = EncryptedControl
+    if ptype == 4:
+        plaintext_gossip_count += 1
+        print(f"[FAIL] packet {i}: observed plaintext PacketType::Gossip (type 4, len {len(pkt)})")
+    elif ptype == 6:
+        encrypted_ctrl_count += 1
+        if len(pkt) != 1420:
+            print(f"[FAIL] packet {i}: EncryptedControl frame length {len(pkt)} != 1420 (uniform OBF_MTU_BUDGET padding required)")
+            sys.exit(1)
+
+    # Established session frames: Data (2), Control (3), EncryptedControl (6)
+    if ptype in (2, 3, 6):
+        established_count += 1
+        for ident in identities:
+            if ident in pkt:
+                print(f"[FAIL] packet {i} (type {ptype}): leaked plaintext identity/record bytes {ident.hex()}")
+                sys.exit(1)
+
+if plaintext_gossip_count > 0:
+    print(f"[FAIL] found {plaintext_gossip_count} plaintext Gossip frames on wire")
+    sys.exit(1)
+
+if encrypted_ctrl_count == 0:
+    print("[FAIL] expected >= 1 EncryptedControl frames during discovery, found 0")
+    sys.exit(1)
+
+print(f"[PASS] wire secrecy verified: {encrypted_ctrl_count} EncryptedControl frames (all 1420 B uniform padding), 0 plaintext Gossip frames, 0 plaintext identity leaks across {established_count} established session frames")
+EOF

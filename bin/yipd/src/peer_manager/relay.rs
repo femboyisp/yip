@@ -162,7 +162,12 @@ impl PeerManager {
             .map(Membership::own_cert_bytes)
             .unwrap_or_default();
         let (established, resp_pkt, remote_static, initiator_payload) =
-            match HandshakeState::start_responder(&self.local_priv, dg, &resp_payload) {
+            match HandshakeState::start_responder_with_kem(
+                &self.local_priv,
+                dg,
+                &resp_payload,
+                self.default_kem,
+            ) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("peer_manager: relayed start_responder failed: {e}");
