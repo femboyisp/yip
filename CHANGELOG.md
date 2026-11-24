@@ -6,6 +6,13 @@ All notable changes to this project are documented here, following
 ## [Unreleased]
 
 ### Added
+- **Post-Quantum ML-KEM-768 Handshake Upgrade, ML-KEM-1024 Support & Wire Fragmentation (`crates/yip-crypto`, `crates/yip-wire`, `crates/yip-proto`, `bin/yipd`, `crates/yip-bench`, #246).**
+  - Upgraded the default post-quantum hybrid handshake protocol from ML-KEM-512 to ML-KEM-768 (`PQNoise_IKpsk2_25519_MLKEM768_ChaChaPoly_BLAKE3`), offering NIST Category 3 post-quantum security by default while maintaining single-RTT sub-1400B datagram sizes fitting within standard 1500B Ethernet frames.
+  - Added full support for NIST Category 5 `ML-KEM-1024` and NIST Category 1 `ML-KEM-512` parameter sets, configured via global or per-peer `kem = "mlkem768" | "mlkem1024" | "mlkem512"` in configuration files and `--kem` CLI option.
+  - Implemented zero-allocation encapsulation (`pq_encapsulate_to_slice`) and decapsulation (`pq_decapsulate_to_slice`) on the handshake hot path, operating strictly on stack buffers with zero heap allocations during flights 1 and 2.
+  - Implemented wire-level handshake datagram chunking (`chunk_handshake_datagram`) and reassembly (`HandshakeReassembler`) with bitmask tracking, TTL pruning, and strict session cap limits (`MAX_REASSEMBLY_SESSIONS = 256`) to handle flights exceeding path MTU (e.g. ML-KEM-1024's 1664B flight 1) without IP fragmentation or memory exhaustion DoS vulnerability.
+  - Added comprehensive FIPS 203 Section 7.2 ByteDecode_12 verification rejecting invalid polynomial modulus bytes (`d >= 3329`) and implicit rejection test coverage ensuring tampered ciphertexts decrypt to deterministic pseudorandom secrets failing Poly1305 MAC tag checks without leaking side-channel timing.
+  - Added criterion benchmark suite in `crates/yip-bench/benches/pq_kem.rs` measuring key generation, encapsulation, decapsulation, PQNoise flight generation, and sub-microsecond wire fragmentation overhead across parameter sets.
 - **Public Rendezvous Deployment Assets & Inline Hex Mesh Config (`deploy/rendezvous`, `bin/yipd`, #264).**
   - Added hardened systemd unit `deploy/rendezvous/yip-rendezvous.service` binding UDP and TCP port 443 with `AmbientCapabilities=CAP_NET_BIND_SERVICE` and strict process isolation.
   - Added setup script `deploy/rendezvous/setup-rendezvous.sh`, verification probe `deploy/rendezvous/verify-rendezvous.sh`, and operational guide `deploy/rendezvous/README.md`.

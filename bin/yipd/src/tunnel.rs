@@ -215,6 +215,7 @@ pub fn run(config: Config) -> io::Result<()> {
     // Opt-in idle cover traffic (3b Task 4): a no-op unless obf is also on
     // (`PeerManager::tick_dispatch` gates cover emission on both).
     manager.set_cover_traffic_ms(config.cover_traffic_ms);
+    manager.set_kem(config.kem);
     manager.set_traffic_defense(config.traffic_defense.clone());
     manager.set_threshold_ca_server(config.threshold_ca_server);
     manager.set_listen_port(config.listen.port());

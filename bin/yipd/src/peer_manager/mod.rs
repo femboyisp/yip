@@ -216,6 +216,11 @@ struct Peer {
     /// future logging/debugging use).
     addr: Ipv6Addr,
 
+    /// Post-quantum KEM algorithm for handshakes with this peer.
+    kem: yip_crypto::PqKemAlgorithm,
+    /// Whether `kem` was explicitly configured for this peer (vs inherited from default).
+    explicit_kem: bool,
+
     /// This peer's UDP endpoint: the configured value until a `HandshakeInit`
     /// admission *learns* the actual observed source address (see
     /// `PeerManager::handle_handshake_init`). `None` until a direct candidate
@@ -378,6 +383,10 @@ pub struct PeerManager {
     /// This node's own rendezvous node id (`node_id(local_pub)`), the `src`
     /// for `register`/`relay`.
     local_node_id: NodeId,
+    /// Default post-quantum KEM algorithm for handshakes.
+    default_kem: yip_crypto::PqKemAlgorithm,
+    /// Handshake fragment reassembler for incoming fragmented flights.
+    handshake_reassembler: yip_wire::fragment::HandshakeReassembler,
     /// When we last emitted `register(local_node_id)` (see [`REG_REFRESH_MS`]).
     last_register_ms: u64,
     /// The registration-refresh spacing to apply the NEXT time
@@ -541,7 +550,7 @@ pub struct DaitaStats {
 /// distinctive otherwise); data/control/gossip get modest padding, room
 /// permitting under this ceiling, since their bodies are already near the path
 /// MTU. Only consulted on the obfuscation-enabled path.
-const OBF_MTU_BUDGET: usize = 1200;
+const OBF_MTU_BUDGET: usize = 1420;
 /// Maximum modest padding (bytes) added to a data/control/gossip envelope.
 const OBF_DATA_PAD_MAX: usize = 64;
 /// Minimum/maximum length (bytes) of a junk datagram's throwaway body, drawn
@@ -595,10 +604,16 @@ impl PeerManager {
             if let Some(ep) = p.endpoint {
                 path.on_direct_addr(ep);
             }
+            let (peer_kem, explicit_kem) = match p.kem {
+                Some(k) => (k, true),
+                None => (yip_crypto::PqKemAlgorithm::MlKem768, false),
+            };
             peers.push(Peer {
                 pubkey: p.public_key,
                 alias: p.alias.clone(),
                 addr,
+                kem: peer_kem,
+                explicit_kem,
                 endpoint: p.endpoint,
                 state: PeerSessionState::Idle,
                 pending_tun: Vec::new(),
@@ -636,6 +651,8 @@ impl PeerManager {
             rendezvous,
             membership,
             local_node_id: node_id(&local_pub),
+            default_kem: yip_crypto::PqKemAlgorithm::MlKem768,
+            handshake_reassembler: yip_wire::fragment::HandshakeReassembler::new(),
             last_register_ms: 0,
             reg_refresh_ms: REG_REFRESH_MS,
             registered_once: false,
@@ -727,6 +744,8 @@ impl PeerManager {
             pubkey,
             alias: None,
             addr,
+            kem: self.default_kem,
+            explicit_kem: false,
             endpoint: endpoints.first().copied(),
             state: PeerSessionState::Idle,
             pending_tun: Vec::new(),
@@ -780,6 +799,16 @@ impl PeerManager {
     /// keeps the existing `PeerManager::new` call sites untouched.
     pub fn set_cover_traffic_ms(&mut self, cover_traffic_ms: Option<u64>) {
         self.cover_traffic_ms = cover_traffic_ms;
+    }
+
+    /// Set default post-quantum KEM algorithm for this manager and update any non-overridden peers.
+    pub fn set_kem(&mut self, kem: yip_crypto::PqKemAlgorithm) {
+        self.default_kem = kem;
+        for p in &mut self.peers {
+            if !p.explicit_kem {
+                p.kem = kem;
+            }
+        }
     }
 
     /// Store traffic defense (DAITA packet length quantization and decoy bursts) configuration.
@@ -1135,7 +1164,7 @@ impl PeerManager {
             node_addr: p.addr.to_string(),
             endpoint: p.endpoint.map(|ep| ep.to_string()),
             session_state,
-            cipher_suite: "PQNoise_IKpsk2_25519_MLKEM512_ChaChaPoly_BLAKE3".to_string(),
+            cipher_suite: String::from_utf8_lossy(p.kem.protocol_name()).to_string(),
             current_epoch,
             current_epoch_age_secs,
             next_epoch,
@@ -1822,10 +1851,16 @@ impl PeerManager {
         }
         self.by_node.insert(node, idx);
         self.by_addr.insert(addr, idx);
+        let (peer_kem, explicit_kem) = match cfg.kem {
+            Some(k) => (k, true),
+            None => (self.default_kem, false),
+        };
         self.peers.push(Peer {
             pubkey: cfg.public_key,
             alias: normalized_alias,
             addr,
+            kem: peer_kem,
+            explicit_kem,
             endpoint: cfg.endpoint,
             state: PeerSessionState::Idle,
             pending_tun: Vec::new(),
@@ -1934,6 +1969,7 @@ impl PeerManager {
         }
 
         self.config_path = Some(path.clone());
+        self.default_kem = new_config.kem;
 
         let mut preserved_peers = 0;
         let mut updated_peers = 0;
@@ -2010,6 +2046,16 @@ impl PeerManager {
                         changed = true;
                     }
                 }
+                if let Some(k) = new_peer.kem {
+                    if self.peers[idx].kem != k {
+                        self.peers[idx].kem = k;
+                        self.peers[idx].explicit_kem = true;
+                        changed = true;
+                    }
+                } else if !self.peers[idx].explicit_kem && self.peers[idx].kem != new_config.kem {
+                    self.peers[idx].kem = new_config.kem;
+                    changed = true;
+                }
                 if changed {
                     updated_peers += 1;
                 }
@@ -2071,6 +2117,7 @@ impl PeerManager {
                 endpoint: p.endpoint.map(|e| e.to_string()),
                 alias: p.alias.clone(),
                 transport: p.transport_name.clone(),
+                kem: Some(p.kem.as_str().to_string()),
             })
             .collect();
 
@@ -2116,6 +2163,7 @@ impl PeerManager {
             fec: Some(self.fec_config),
             daita,
             split_tunnel: Some(self.split_tunnel.config()),
+            kem: Some(self.default_kem.as_str().to_string()),
         }
     }
 
@@ -2476,6 +2524,21 @@ impl PeerManager {
             self.handle_handshake_init(src, dg, now_ms)
         } else if dg[0] == PacketType::HandshakeResp as u8 {
             self.handle_handshake_resp(src, dg, now_ms)
+        } else if dg[0] == PacketType::HandshakeFrag as u8 {
+            match self.handshake_reassembler.process_datagram(dg) {
+                Ok(Some(assembled)) => {
+                    if assembled.is_empty() {
+                        DispatchOut::None
+                    } else if assembled[0] == PacketType::HandshakeInit as u8 {
+                        self.handle_handshake_init(src, &assembled, now_ms)
+                    } else if assembled[0] == PacketType::HandshakeResp as u8 {
+                        self.handle_handshake_resp(src, &assembled, now_ms)
+                    } else {
+                        DispatchOut::None
+                    }
+                }
+                _ => DispatchOut::None,
+            }
         } else if self.membership.is_some() && dg[0] == PacketType::Gossip as u8 {
             // Membership anti-entropy: a self-verifying gossip datagram. Only
             // reached with membership configured — a pure-2a/2b deployment never

@@ -59,6 +59,7 @@ fn print_daemon_usage() {
     println!();
     println!("Options:");
     println!("  -c, --control <SOCKET>  UNIX domain control socket path");
+    println!("      --kem <ALGO>        Post-quantum KEM algorithm: mlkem768, mlkem1024, mlkem512 (default: mlkem768)");
     println!("      --mtu <BYTES>       TUN device MTU (576-65535, default: 1400)");
     println!("      --metrics-listen <ADDR> Prometheus/OTEL HTTP metrics listen address (e.g. 127.0.0.1:9184)");
     println!("      --shards <N|auto>   Worker shards for multi-core scaling (default: 1)");
@@ -973,6 +974,7 @@ fn run_client_subcommand(
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct DaemonOverrides {
     pub control: Option<std::path::PathBuf>,
+    pub kem: Option<yip_crypto::PqKemAlgorithm>,
     pub mtu: Option<u32>,
     pub metrics_listen: Option<std::net::SocketAddr>,
     pub shards: Option<usize>,
@@ -995,6 +997,20 @@ pub(crate) fn parse_daemon_flags(
                 )
             })?;
             overrides.control = Some(std::path::PathBuf::from(cpath));
+        } else if arg == "--kem" {
+            let kstr = args.next().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--kem requires an algorithm argument (mlkem768, mlkem1024, mlkem512)",
+                )
+            })?;
+            let kem: yip_crypto::PqKemAlgorithm = kstr.parse().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid kem '{kstr}': expected mlkem768, mlkem1024, or mlkem512"),
+                )
+            })?;
+            overrides.kem = Some(kem);
         } else if arg == "--mtu" {
             let mstr = args.next().ok_or_else(|| {
                 std::io::Error::new(
@@ -1273,6 +1289,9 @@ fn main() -> std::io::Result<()> {
             if let Some(sock_path) = overrides.control {
                 config.control_socket = Some(sock_path);
             }
+            if let Some(kem) = overrides.kem {
+                config.kem = kem;
+            }
             if let Some(mtu) = overrides.mtu {
                 config.mtu = Some(mtu);
             }
@@ -1394,6 +1413,24 @@ mod tests {
 
         let invalid_addr = vec!["--metrics-listen".to_string(), "not-an-ip-addr".to_string()];
         assert!(parse_daemon_flags(&mut invalid_addr.into_iter()).is_err());
+    }
+
+    #[test]
+    fn test_parse_daemon_flags_kem() {
+        let args_768 = vec!["--kem".to_string(), "mlkem768".to_string()];
+        let o_768 = parse_daemon_flags(&mut args_768.into_iter()).unwrap();
+        assert_eq!(o_768.kem, Some(yip_crypto::PqKemAlgorithm::MlKem768));
+
+        let args_1024 = vec!["--kem".to_string(), "mlkem1024".to_string()];
+        let o_1024 = parse_daemon_flags(&mut args_1024.into_iter()).unwrap();
+        assert_eq!(o_1024.kem, Some(yip_crypto::PqKemAlgorithm::MlKem1024));
+
+        let args_512 = vec!["--kem".to_string(), "mlkem512".to_string()];
+        let o_512 = parse_daemon_flags(&mut args_512.into_iter()).unwrap();
+        assert_eq!(o_512.kem, Some(yip_crypto::PqKemAlgorithm::MlKem512));
+
+        let args_invalid = vec!["--kem".to_string(), "unknown-kem".to_string()];
+        assert!(parse_daemon_flags(&mut args_invalid.into_iter()).is_err());
     }
 
     #[test]

@@ -99,6 +99,8 @@ pub struct PeerConfig {
     pub endpoint: Option<SocketAddr>,
     /// Optional human-readable nickname or alias for this peer.
     pub alias: Option<String>,
+    /// Optional post-quantum KEM algorithm override for this peer.
+    pub kem: Option<yip_crypto::PqKemAlgorithm>,
 }
 
 impl PeerConfig {
@@ -108,6 +110,7 @@ impl PeerConfig {
             public_key,
             endpoint,
             alias: None,
+            kem: None,
         }
     }
 
@@ -117,6 +120,12 @@ impl PeerConfig {
         if !a.is_empty() {
             self.alias = Some(a);
         }
+        self
+    }
+
+    /// Attach an explicit post-quantum KEM algorithm override to this peer configuration.
+    pub fn with_kem(mut self, kem: yip_crypto::PqKemAlgorithm) -> Self {
+        self.kem = Some(kem);
         self
     }
 }
@@ -241,6 +250,8 @@ pub struct Config {
     pub xdp_mode: Option<String>,
     /// Optional dynamic Reed-Solomon FEC runtime configuration (`fec=preset`).
     pub fec: Option<yip_proto::control::FecConfig>,
+    /// Post-quantum KEM algorithm (`kem=mlkem768|mlkem1024|mlkem512`, default `mlkem768`).
+    pub kem: yip_crypto::PqKemAlgorithm,
     /// Optional filesystem path from which this configuration was loaded.
     pub config_path: Option<std::path::PathBuf>,
 }
@@ -582,6 +593,7 @@ fn flush_peer_block(
     cur_pk: Option<[u8; 32]>,
     cur_ep: Option<SocketAddr>,
     cur_alias: Option<String>,
+    cur_kem: Option<yip_crypto::PqKemAlgorithm>,
     peers: &mut Vec<PeerConfig>,
 ) -> io::Result<()> {
     match cur_pk {
@@ -608,12 +620,13 @@ fn flush_peer_block(
                 public_key: pk,
                 endpoint: cur_ep,
                 alias: cur_alias,
+                kem: cur_kem,
             });
         }
-        None if cur_ep.is_some() || cur_alias.is_some() => {
+        None if cur_ep.is_some() || cur_alias.is_some() || cur_kem.is_some() => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "peer block has an endpoint or alias but no public_key".to_string(),
+                "peer block has an endpoint, alias, or kem but no public_key".to_string(),
             ));
         }
         None => {}
@@ -637,6 +650,8 @@ impl Config {
         let mut cur_pk: Option<[u8; 32]> = None;
         let mut cur_ep: Option<SocketAddr> = None;
         let mut cur_alias: Option<String> = None;
+        let mut cur_kem: Option<yip_crypto::PqKemAlgorithm> = None;
+        let mut global_kem: Option<yip_crypto::PqKemAlgorithm> = None;
         let mut legacy_peer_public: Option<[u8; 32]> = None;
         let mut legacy_peer_endpoint: Option<SocketAddr> = None;
         let mut listen: Option<SocketAddr> = None;
@@ -680,10 +695,11 @@ impl Config {
 
             // Check for section headers (e.g. [peer], [mesh], [node], [general])
             if line.starts_with('[') && line.ends_with(']') {
-                flush_peer_block(cur_pk, cur_ep, cur_alias, &mut peers)?;
+                flush_peer_block(cur_pk, cur_ep, cur_alias, cur_kem, &mut peers)?;
                 cur_pk = None;
                 cur_ep = None;
                 cur_alias = None;
+                cur_kem = None;
                 continue;
             }
 
@@ -986,6 +1002,19 @@ impl Config {
                             ));
                     }
                 },
+                "kem" | "pq_kem" => {
+                    let k = val.parse::<yip_crypto::PqKemAlgorithm>().map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid kem '{val}': {e}"),
+                        )
+                    })?;
+                    if cur_pk.is_some() {
+                        cur_kem = Some(k);
+                    } else {
+                        global_kem = Some(k);
+                    }
+                }
                 // Silently ignore unknown keys for forward-compatibility. The
                 // netns config files still contain `initiate=true|false` from
                 // before Task 5 removed the field; this is intentional so
@@ -997,7 +1026,7 @@ impl Config {
         }
 
         // Flush any trailing peer block
-        flush_peer_block(cur_pk, cur_ep, cur_alias, &mut peers)?;
+        flush_peer_block(cur_pk, cur_ep, cur_alias, cur_kem, &mut peers)?;
 
         // If no [peer] blocks, try legacy single-peer format
         if peers.is_empty() {
@@ -1006,6 +1035,7 @@ impl Config {
                     public_key: pk,
                     endpoint: Some(ep),
                     alias: None,
+                    kem: None,
                 });
             }
         }
@@ -1257,6 +1287,7 @@ impl Config {
             xdp_ifname,
             xdp_mode,
             fec,
+            kem: global_kem.unwrap_or(yip_crypto::PqKemAlgorithm::MlKem768),
             config_path: None,
         })
     }
@@ -2957,5 +2988,47 @@ local_public=0000000000000000000000000000000000000000000000000000000000000002
 
         let bad_conf = format!("{base}metrics_listen=invalid_addr\n");
         assert!(Config::parse(&bad_conf).is_err());
+    }
+
+    #[test]
+    fn test_config_kem_parsing_default_global_and_per_peer() {
+        let base =
+            "local_private=00000000000000000000000000000000000000000000000000000000000000ff\n\
+                    local_public=00000000000000000000000000000000000000000000000000000000000000aa\n\
+                    listen=0.0.0.0:443\ndevice=yip0\n";
+
+        // Default global KEM is ML-KEM-768
+        let text_default = format!("{base}peer_public=00000000000000000000000000000000000000000000000000000000000000bb\npeer_endpoint=10.0.0.2:443\n");
+        let cfg_default = Config::parse(&text_default).unwrap();
+        assert_eq!(cfg_default.kem, yip_crypto::PqKemAlgorithm::MlKem768);
+        assert_eq!(cfg_default.peers[0].kem, None);
+
+        // Global KEM configured to ML-KEM-1024
+        let text_global_1024 = format!("{base}kem=mlkem1024\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\npeer_endpoint=10.0.0.2:443\n");
+        let cfg_global_1024 = Config::parse(&text_global_1024).unwrap();
+        assert_eq!(cfg_global_1024.kem, yip_crypto::PqKemAlgorithm::MlKem1024);
+
+        // Per-peer KEM override
+        let text_peer_kem = format!(
+            "{base}kem=mlkem768\n\
+             [peer]\npublic_key=00000000000000000000000000000000000000000000000000000000000000b1\nendpoint=10.0.0.1:443\nkem=mlkem1024\n\
+             [peer]\npublic_key=00000000000000000000000000000000000000000000000000000000000000b2\nendpoint=10.0.0.2:443\nkem=mlkem512\n\
+             [peer]\npublic_key=00000000000000000000000000000000000000000000000000000000000000b3\nendpoint=10.0.0.3:443\n"
+        );
+        let cfg_peer = Config::parse(&text_peer_kem).unwrap();
+        assert_eq!(cfg_peer.kem, yip_crypto::PqKemAlgorithm::MlKem768);
+        assert_eq!(
+            cfg_peer.peers[0].kem,
+            Some(yip_crypto::PqKemAlgorithm::MlKem1024)
+        );
+        assert_eq!(
+            cfg_peer.peers[1].kem,
+            Some(yip_crypto::PqKemAlgorithm::MlKem512)
+        );
+        assert_eq!(cfg_peer.peers[2].kem, None);
+
+        // Invalid KEM
+        let text_invalid = format!("{base}kem=kyber999\npeer_public=00000000000000000000000000000000000000000000000000000000000000bb\npeer_endpoint=10.0.0.2:443\n");
+        assert!(Config::parse(&text_invalid).is_err());
     }
 }

@@ -496,6 +496,7 @@ pub fn dispatch_cmd(
                 public_key: pk,
                 endpoint: ep,
                 alias: normalized_alias,
+                kem: None,
             };
             if let Some(tr) = transport {
                 match pm.add_peer_with_transport(cfg, Some(tr)) {
@@ -4169,10 +4170,12 @@ mod tests {
                                     endpoint: Some("10.0.0.2:51820".into()),
                                     alias: Some("peer-b".into()),
                                     transport: Some("raw".into()),
+                                    kem: None,
                                 }],
                                 fec: Some(yip_proto::control::FecConfig::default()),
                                 daita: Some(yip_proto::control::DaitaConfig::default()),
                                 split_tunnel: Some(yip_proto::control::SplitTunnelConfig::default()),
+                                kem: None,
                             },
                         },
                         ControlCmd::Reload { path } => ControlResponse::Reload {

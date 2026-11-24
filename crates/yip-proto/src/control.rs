@@ -320,6 +320,8 @@ pub struct DaemonConfig {
     pub daita: Option<DaitaConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split_tunnel: Option<SplitTunnelConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kem: Option<String>,
 }
 
 /// A single remote peer configuration entry.
@@ -332,6 +334,8 @@ pub struct PeerConfigEntry {
     pub alias: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kem: Option<String>,
 }
 
 /// Supported Reed-Solomon dynamic FEC presets.

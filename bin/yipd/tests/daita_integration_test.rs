@@ -29,11 +29,13 @@ fn setup_established_daita_pair(
         public_key: kp_b.public,
         endpoint: Some(ep_b),
         alias: None,
+        kem: None,
     };
     let cfg_a = PeerConfig {
         public_key: kp_a.public,
         endpoint: Some(ep_a),
         alias: None,
+        kem: None,
     };
 
     let mut pm_a = PeerManager::new(

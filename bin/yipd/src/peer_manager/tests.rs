@@ -104,6 +104,7 @@ fn stale_replayed_init_is_rejected_and_endpoint_unchanged() {
         public_key: kp_i.public,
         endpoint: Some(ep_i),
         alias: None,
+        kem: None,
     };
     let mut pm_r = PeerManager::new(
         kp_r.private,
@@ -176,6 +177,7 @@ fn retransmit_still_replays_cached_resp_regardless_of_ts() {
         public_key: kp_i.public,
         endpoint: Some(ep_i),
         alias: None,
+        kem: None,
     };
     let mut pm_r = PeerManager::new(
         kp_r.private,
@@ -231,6 +233,7 @@ fn duplicate_init_after_established_does_not_tear_down_session() {
         public_key: kp_i.public,
         endpoint: Some(ep_i),
         alias: None,
+        kem: None,
     };
     let mut pm_r = PeerManager::new(
         kp_r.private,
@@ -279,6 +282,7 @@ fn initiator_retransmits_same_init_within_total_window_then_gives_up() {
         public_key: [7u8; 32],
         endpoint: Some("10.0.0.9:9000".parse().unwrap()),
         alias: None,
+        kem: None,
     };
     let mut pm = PeerManager::new(
         kp_local.private,
@@ -343,6 +347,7 @@ fn pending_tun_is_capped_while_handshaking() {
         public_key: [7u8; 32],
         endpoint: Some("10.0.0.9:9000".parse().unwrap()),
         alias: None,
+        kem: None,
     };
     let mut pm = PeerManager::new(
         kp_local.private,
@@ -378,6 +383,7 @@ fn rendezvous_only_peer_emits_lookup_on_tun_traffic() {
         public_key: peer_kp.public,
         endpoint: None,
         alias: None,
+        kem: None,
     };
     let (mut pm, sent) = pm_with_mock_rdv(&local, &[peer]);
 
@@ -412,6 +418,7 @@ fn peer_candidate_then_tick_probes_candidate_with_init() {
         public_key: peer_kp.public,
         endpoint: None,
         alias: None,
+        kem: None,
     };
     let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
 
@@ -466,6 +473,7 @@ fn peer_candidate_with_valid_signed_record_is_accepted_and_probed() {
         public_key: peer_kp.public,
         endpoint: None,
         alias: None,
+        kem: None,
     };
     let membership = membership_trusting_ca_via_roots(&ca, local.public);
     let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[peer], membership);
@@ -523,6 +531,7 @@ fn peer_candidate_with_invalid_record_is_dropped_no_probe() {
         public_key: peer_kp.public,
         endpoint: None,
         alias: None,
+        kem: None,
     };
     let membership = membership_trusting_ca_via_roots(&ca, local.public);
     let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[peer], membership);
@@ -575,6 +584,7 @@ fn peer_candidate_with_valid_record_for_wrong_node_is_dropped() {
         public_key: peer_kp.public,
         endpoint: None,
         alias: None,
+        kem: None,
     };
     let membership = membership_trusting_ca_via_roots(&ca, local.public);
     let (mut pm, _sent) = pm_with_mock_rdv_and_membership(&local, &[peer], membership);
@@ -619,6 +629,7 @@ fn no_rendezvous_direct_endpoint_is_pure_2a() {
         public_key: [7u8; 32],
         endpoint: Some(endpoint),
         alias: None,
+        kem: None,
     };
     let mut pm = PeerManager::new(
         local.private,
@@ -659,6 +670,7 @@ fn punch_handshake_escalates_to_relay_at_punch_window_not_90s() {
         public_key: peer_kp.public,
         endpoint: None, // rendezvous-only: starts in the Punching stage
         alias: None,
+        kem: None,
     };
     let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
 
@@ -746,6 +758,7 @@ fn punch_relay_retarget_draws_fresh_ephemeral_even_if_relay_flag_preset() {
         public_key: peer_kp.public,
         endpoint: None, // rendezvous-only: starts in the Punching stage
         alias: None,
+        kem: None,
     };
     let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
 
@@ -861,6 +874,7 @@ fn late_punch_reply_after_relay_escalation_does_not_poison_relay() {
         public_key: peer_kp.public,
         endpoint: None, // rendezvous-only: starts in the Punching stage
         alias: None,
+        kem: None,
     };
     let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
 
@@ -1021,6 +1035,7 @@ fn endpoint_peer_emits_lookup_and_punches_after_direct_window() {
         public_key: peer_kp.public,
         endpoint: Some(endpoint), // BOTH a direct endpoint AND (via the mock) a rendezvous
         alias: None,
+        kem: None,
     };
     let (mut pm, sent) = pm_with_mock_rdv(&local, &[peer]);
 
@@ -1312,6 +1327,7 @@ fn anti_hijack_established_peer_unmoved_by_gossip_and_resolve() {
         public_key: peer.public,
         endpoint: Some(committed_ep),
         alias: None,
+        kem: None,
     };
     let mut pm = PeerManager::new(
         local.private,
@@ -1501,6 +1517,7 @@ fn obf_on_unknown_src_handshake_init_via_obf_psk() {
         public_key: kp_i.public,
         endpoint: Some(ep_i),
         alias: None,
+        kem: None,
     };
     let mut pm = PeerManager::new(
         kp_r.private,
@@ -1664,6 +1681,7 @@ fn obf_off_on_udp_is_plaintext_as_today() {
         public_key: kp_i.public,
         endpoint: Some(ep_i),
         alias: None,
+        kem: None,
     };
     let mut pm = PeerManager::new(
         kp_r.private,
@@ -1707,6 +1725,7 @@ fn obf_on_egress_to_server_is_wrapped_under_rdv_type() {
         public_key: peer_kp.public,
         endpoint: None,
         alias: None,
+        kem: None,
     };
     let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
     let psk = [0x55u8; 32];
@@ -1755,6 +1774,7 @@ fn obf_on_ingress_from_server_is_unwrapped_before_on_rdv() {
         public_key: peer_kp.public,
         endpoint: None,
         alias: None,
+        kem: None,
     };
     let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
     let psk = [0x66u8; 32];
@@ -1813,6 +1833,7 @@ fn obf_off_rendezvous_traffic_stays_plaintext() {
         public_key: peer_kp.public,
         endpoint: None,
         alias: None,
+        kem: None,
     };
     let (mut pm, _sent) = pm_with_mock_rdv(&local, &[peer]);
     // No set_obf_psk ⇒ obfuscation disabled.
@@ -2100,11 +2121,13 @@ fn pm_mesh_two_established_one_expired(
         public_key: expired_peer_pub,
         endpoint: Some("10.0.0.2:2000".parse().unwrap()),
         alias: None,
+        kem: None,
     };
     let cfg1 = PeerConfig {
         public_key: valid_peer_pub,
         endpoint: Some("10.0.0.3:3000".parse().unwrap()),
         alias: None,
+        kem: None,
     };
     let mut pm = PeerManager::new(
         local.private,
@@ -2318,6 +2341,7 @@ fn dynamic_add_peer_updates_mappings_and_routes() {
         public_key: new_pk,
         endpoint: Some(new_ep),
         alias: None,
+        kem: None,
     };
 
     // Add peer
@@ -2349,6 +2373,7 @@ fn dynamic_remove_peer_cleans_mappings_and_tears_down() {
             public_key: p2_pk,
             endpoint: Some("10.0.0.2:2000".parse().unwrap()),
             alias: None,
+            kem: None,
         })
         .is_ok());
     assert!(pm
@@ -2356,6 +2381,7 @@ fn dynamic_remove_peer_cleans_mappings_and_tears_down() {
             public_key: p3_pk,
             endpoint: Some("10.0.0.3:3000".parse().unwrap()),
             alias: None,
+            kem: None,
         })
         .is_ok());
     assert_eq!(pm.peers.len(), 3);
@@ -2429,10 +2455,10 @@ fn test_peer_manager_pq_hybrid_handshake_datagrams_fit_mtu_budget() {
         rekey_pkt.len()
     );
     assert_eq!(rekey_pkt[0], PacketType::HandshakeInit as u8);
-    // Msg 1 contains: 1 ptype + 32 Noise ephemeral + 48 encrypted static + 12 TAI64N + 800 ML-KEM ek + cert + 16 Poly1305 MAC tag
+    // Msg 1 contains: 1 ptype + 32 Noise ephemeral + 48 encrypted static + 12 TAI64N + 1184 ML-KEM-768 ek + cert + 16 Poly1305 MAC tag
     assert!(
-        rekey_pkt.len() >= 1025 && rekey_pkt.len() <= 1080,
-        "rekey Init with cert should be around 1,025-1,080 bytes, got {}",
+        rekey_pkt.len() >= 1345 && rekey_pkt.len() <= 1400,
+        "rekey Init with cert should be around 1,345-1,400 bytes, got {}",
         rekey_pkt.len()
     );
 
@@ -3143,11 +3169,13 @@ fn test_peer_manager_metrics_relayed_traffic() {
         public_key: kp_b.public,
         endpoint: Some(ep_b),
         alias: None,
+        kem: None,
     };
     let cfg_a = PeerConfig {
         public_key: kp_a.public,
         endpoint: Some(ep_a),
         alias: None,
+        kem: None,
     };
 
     let (mut pm_a, _sent_a) = pm_with_mock_rdv(&kp_a, &[cfg_b]);

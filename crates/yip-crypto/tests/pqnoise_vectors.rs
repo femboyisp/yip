@@ -9,11 +9,12 @@
 
 use std::fmt::Write;
 use x25519_dalek::{PublicKey, StaticSecret};
-use yip_crypto::generate_pq_keypair_from_seed;
 use yip_crypto::handshake::{
-    InitiatorHandshake, ResponderHandshake, FLIGHT_1_BASE_LEN, FLIGHT_2_BASE_LEN,
+    InitiatorHandshake, ResponderHandshake, FLIGHT_2_BASE_LEN, MLKEM1024_FLIGHT_1_BASE_LEN,
+    MLKEM512_FLIGHT_1_BASE_LEN, MLKEM768_FLIGHT_1_BASE_LEN,
 };
 use yip_crypto::session::{rekey_transport_key, ReplayWindow, Session};
+use yip_crypto::{generate_pq_keypair_from_seed_for_algo, PqKemAlgorithm};
 
 fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -38,7 +39,8 @@ fn test_pqnoise_deterministic_golden_vectors() {
     let rs_secret = StaticSecret::from(rs_priv);
     let rs_pub = PublicKey::from(&rs_secret).to_bytes();
 
-    let (rs_pq_ek, rs_pq_dk) = generate_pq_keypair_from_seed(&rs_pq_seed);
+    let (rs_pq_ek, rs_pq_dk) =
+        generate_pq_keypair_from_seed_for_algo(PqKemAlgorithm::MlKem512, &rs_pq_seed);
     let rs_pq_dk_bytes = rs_pq_dk.to_bytes();
 
     // ── 2. Initialize Handshake Machines ─────────────────────────────────────
@@ -67,12 +69,12 @@ fn test_pqnoise_deterministic_golden_vectors() {
 
     // ── 3. Flight 1: Initiator -> Responder ──────────────────────────────────
     let payload_1 = b"initiator flight 1 payload message";
-    let mut msg1 = vec![0u8; FLIGHT_1_BASE_LEN + payload_1.len()];
+    let mut msg1 = vec![0u8; MLKEM512_FLIGHT_1_BASE_LEN + payload_1.len()];
 
     let n1 = initiator
         .write_message_1_with_ephemeral(payload_1, &mut msg1, e_i_priv, Some(kem_seed))
         .expect("write flight 1");
-    assert_eq!(n1, FLIGHT_1_BASE_LEN + payload_1.len());
+    assert_eq!(n1, MLKEM512_FLIGHT_1_BASE_LEN + payload_1.len());
 
     let (k1, k2, k3) = initiator
         .flight_1_keys()
@@ -301,4 +303,156 @@ fn test_pqnoise_deterministic_golden_vectors() {
         .open(frame2.counter, &frame2.ciphertext)
         .expect("open");
     assert_eq!(decrypted2, b"post session rekey");
+}
+
+#[test]
+fn test_pqnoise_deterministic_vectors_mlkem768() {
+    let s_i_priv = [0x11u8; 32];
+    let rs_priv = [0x22u8; 32];
+    let rs_pq_seed = [0x33u8; 64];
+    let e_i_priv = [0x44u8; 32];
+    let kem_seed = [0x55u8; 32];
+    let e_r_priv = [0x66u8; 32];
+    let psk = [0x77u8; 32];
+    let prologue = b"yip-pqnoise-blake3-golden-test-vector-v1";
+
+    let rs_secret = StaticSecret::from(rs_priv);
+    let rs_pub = PublicKey::from(&rs_secret).to_bytes();
+
+    let (rs_pq_ek, rs_pq_dk) =
+        generate_pq_keypair_from_seed_for_algo(PqKemAlgorithm::MlKem768, &rs_pq_seed);
+    let rs_pq_dk_bytes = rs_pq_dk.to_bytes();
+
+    let mut initiator = InitiatorHandshake::new(&s_i_priv, &rs_pub, &rs_pq_ek.0, &psk, prologue)
+        .expect("initiator initialization");
+    assert_eq!(initiator.algorithm(), PqKemAlgorithm::MlKem768);
+
+    let mut responder = ResponderHandshake::new(&rs_priv, &rs_pq_ek.0, &psk, prologue)
+        .expect("responder initialization");
+    assert_eq!(responder.algorithm(), PqKemAlgorithm::MlKem768);
+
+    assert_eq!(
+        initiator.symmetric_state().ck,
+        responder.symmetric_state().ck
+    );
+    assert_eq!(initiator.symmetric_state().h, responder.symmetric_state().h);
+
+    let payload_1 = b"flight 1 mlkem768 payload";
+    let mut msg1 = vec![0u8; MLKEM768_FLIGHT_1_BASE_LEN + payload_1.len()];
+    let n1 = initiator
+        .write_message_1_with_ephemeral(payload_1, &mut msg1, e_i_priv, Some(kem_seed))
+        .expect("write flight 1");
+    assert_eq!(n1, MLKEM768_FLIGHT_1_BASE_LEN + payload_1.len());
+
+    let mut payload_1_recv = vec![0u8; payload_1.len()];
+    let n1_recv = responder
+        .read_message_1(&msg1[..n1], &rs_pq_dk_bytes, &mut payload_1_recv)
+        .expect("read flight 1");
+    assert_eq!(n1_recv, payload_1.len());
+    assert_eq!(payload_1_recv, payload_1);
+
+    assert_eq!(
+        initiator.symmetric_state().ck,
+        responder.symmetric_state().ck
+    );
+    assert_eq!(initiator.symmetric_state().h, responder.symmetric_state().h);
+
+    let payload_2 = b"flight 2 mlkem768 payload";
+    let mut msg2 = vec![0u8; FLIGHT_2_BASE_LEN + payload_2.len()];
+    let n2 = responder
+        .write_message_2_with_ephemeral(payload_2, &mut msg2, e_r_priv)
+        .expect("write flight 2");
+    assert_eq!(n2, FLIGHT_2_BASE_LEN + payload_2.len());
+
+    let mut payload_2_recv = vec![0u8; payload_2.len()];
+    let n2_recv = initiator
+        .read_message_2(&msg2[..n2], &mut payload_2_recv)
+        .expect("read flight 2");
+    assert_eq!(n2_recv, payload_2.len());
+    assert_eq!(payload_2_recv, payload_2);
+
+    assert!(initiator.is_finished());
+    assert!(responder.is_finished());
+    assert_eq!(initiator.channel_binding(), responder.channel_binding());
+
+    let (ini_send, ini_recv) = initiator.transport_keys().unwrap();
+    let (res_send, res_recv) = responder.transport_keys().unwrap();
+    assert_eq!(ini_send, res_recv);
+    assert_eq!(ini_recv, res_send);
+}
+
+#[test]
+fn test_pqnoise_deterministic_vectors_mlkem1024() {
+    let s_i_priv = [0x11u8; 32];
+    let rs_priv = [0x22u8; 32];
+    let rs_pq_seed = [0x33u8; 64];
+    let e_i_priv = [0x44u8; 32];
+    let kem_seed = [0x55u8; 32];
+    let e_r_priv = [0x66u8; 32];
+    let psk = [0x77u8; 32];
+    let prologue = b"yip-pqnoise-blake3-golden-test-vector-v1";
+
+    let rs_secret = StaticSecret::from(rs_priv);
+    let rs_pub = PublicKey::from(&rs_secret).to_bytes();
+
+    let (rs_pq_ek, rs_pq_dk) =
+        generate_pq_keypair_from_seed_for_algo(PqKemAlgorithm::MlKem1024, &rs_pq_seed);
+    let rs_pq_dk_bytes = rs_pq_dk.to_bytes();
+
+    let mut initiator = InitiatorHandshake::new(&s_i_priv, &rs_pub, &rs_pq_ek.0, &psk, prologue)
+        .expect("initiator initialization");
+    assert_eq!(initiator.algorithm(), PqKemAlgorithm::MlKem1024);
+
+    let mut responder = ResponderHandshake::new(&rs_priv, &rs_pq_ek.0, &psk, prologue)
+        .expect("responder initialization");
+    assert_eq!(responder.algorithm(), PqKemAlgorithm::MlKem1024);
+
+    assert_eq!(
+        initiator.symmetric_state().ck,
+        responder.symmetric_state().ck
+    );
+    assert_eq!(initiator.symmetric_state().h, responder.symmetric_state().h);
+
+    let payload_1 = b"flight 1 mlkem1024 payload";
+    let mut msg1 = vec![0u8; MLKEM1024_FLIGHT_1_BASE_LEN + payload_1.len()];
+    let n1 = initiator
+        .write_message_1_with_ephemeral(payload_1, &mut msg1, e_i_priv, Some(kem_seed))
+        .expect("write flight 1");
+    assert_eq!(n1, MLKEM1024_FLIGHT_1_BASE_LEN + payload_1.len());
+
+    let mut payload_1_recv = vec![0u8; payload_1.len()];
+    let n1_recv = responder
+        .read_message_1(&msg1[..n1], &rs_pq_dk_bytes, &mut payload_1_recv)
+        .expect("read flight 1");
+    assert_eq!(n1_recv, payload_1.len());
+    assert_eq!(payload_1_recv, payload_1);
+
+    assert_eq!(
+        initiator.symmetric_state().ck,
+        responder.symmetric_state().ck
+    );
+    assert_eq!(initiator.symmetric_state().h, responder.symmetric_state().h);
+
+    let payload_2 = b"flight 2 mlkem1024 payload";
+    let mut msg2 = vec![0u8; FLIGHT_2_BASE_LEN + payload_2.len()];
+    let n2 = responder
+        .write_message_2_with_ephemeral(payload_2, &mut msg2, e_r_priv)
+        .expect("write flight 2");
+    assert_eq!(n2, FLIGHT_2_BASE_LEN + payload_2.len());
+
+    let mut payload_2_recv = vec![0u8; payload_2.len()];
+    let n2_recv = initiator
+        .read_message_2(&msg2[..n2], &mut payload_2_recv)
+        .expect("read flight 2");
+    assert_eq!(n2_recv, payload_2.len());
+    assert_eq!(payload_2_recv, payload_2);
+
+    assert!(initiator.is_finished());
+    assert!(responder.is_finished());
+    assert_eq!(initiator.channel_binding(), responder.channel_binding());
+
+    let (ini_send, ini_recv) = initiator.transport_keys().unwrap();
+    let (res_send, res_recv) = responder.transport_keys().unwrap();
+    assert_eq!(ini_send, res_recv);
+    assert_eq!(ini_recv, res_send);
 }

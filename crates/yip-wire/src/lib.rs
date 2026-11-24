@@ -3,6 +3,12 @@
 //! milestone establishes the public surface later crates depend on.
 #![forbid(unsafe_code)]
 
+pub mod fragment;
+pub use fragment::{
+    chunk_handshake_datagram, HandshakeFragment, HandshakeReassembler, FRAGMENT_HEADER_LEN,
+    PACKET_TYPE_HANDSHAKE_FRAG,
+};
+
 use siphasher::sip::SipHasher13;
 use std::hash::Hasher;
 use subtle::ConstantTimeEq;

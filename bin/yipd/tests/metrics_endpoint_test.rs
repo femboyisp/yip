@@ -20,6 +20,7 @@ fn make_test_peer_manager() -> PeerManager {
         public_key: [1u8; 32],
         endpoint: Some("10.0.0.1:1000".parse().unwrap()),
         alias: None,
+        kem: None,
     };
     PeerManager::new(
         kp.private,

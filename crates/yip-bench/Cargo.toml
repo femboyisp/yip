@@ -50,5 +50,9 @@ harness = false
 name = "fec_reassemble"
 harness = false
 
+[[bench]]
+name = "pq_kem"
+harness = false
+
 [lints]
 workspace = true
