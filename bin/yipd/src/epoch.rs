@@ -353,6 +353,20 @@ impl EpochSet {
     }
 }
 
+impl std::ops::Deref for EpochSet {
+    type Target = DataPlane;
+
+    fn deref(&self) -> &Self::Target {
+        &self.current
+    }
+}
+
+impl std::ops::DerefMut for EpochSet {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.current
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -207,6 +207,58 @@ enum PeerSessionState {
     Established(Box<crate::epoch::EpochSet>),
 }
 
+impl PeerSessionState {
+    pub(crate) fn as_established_mut(&mut self) -> Option<&mut crate::dataplane::DataPlane> {
+        match self {
+            PeerSessionState::Established(epochs) => Some(&mut epochs.current),
+            _ => None,
+        }
+    }
+}
+
+/// In-session control channel accessor for sealing encrypted control frames.
+pub(crate) trait ControlSession {
+    fn ctrl_codec(&self) -> &crate::control_codec::ControlCodec;
+    fn ctrl_send_nonce(&self) -> u64;
+    fn set_ctrl_send_nonce(&mut self, nonce: u64);
+}
+
+impl ControlSession for crate::handshake::Established {
+    fn ctrl_codec(&self) -> &crate::control_codec::ControlCodec {
+        &self.ctrl_codec
+    }
+    fn ctrl_send_nonce(&self) -> u64 {
+        self.ctrl_send_nonce
+    }
+    fn set_ctrl_send_nonce(&mut self, nonce: u64) {
+        self.ctrl_send_nonce = nonce;
+    }
+}
+
+impl ControlSession for crate::dataplane::DataPlane {
+    fn ctrl_codec(&self) -> &crate::control_codec::ControlCodec {
+        &self.ctrl_codec
+    }
+    fn ctrl_send_nonce(&self) -> u64 {
+        self.ctrl_send_nonce
+    }
+    fn set_ctrl_send_nonce(&mut self, nonce: u64) {
+        self.ctrl_send_nonce = nonce;
+    }
+}
+
+impl ControlSession for crate::epoch::EpochSet {
+    fn ctrl_codec(&self) -> &crate::control_codec::ControlCodec {
+        &self.current.ctrl_codec
+    }
+    fn ctrl_send_nonce(&self) -> u64 {
+        self.current.ctrl_send_nonce
+    }
+    fn set_ctrl_send_nonce(&mut self, nonce: u64) {
+        self.current.ctrl_send_nonce = nonce;
+    }
+}
+
 /// One configured remote peer plus its live handshake/session state.
 struct Peer {
     pubkey: [u8; 32],
@@ -1768,6 +1820,11 @@ impl PeerManager {
     /// Returns the active FEC runtime configuration.
     pub fn fec_config(&self) -> crate::control::FecConfig {
         self.fec_config
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drain_tick_egress(&mut self) -> Vec<EgressDatagram> {
+        std::mem::take(&mut self.tick_egress)
     }
 
     /// Dynamically update the FEC configuration across all established sessions.

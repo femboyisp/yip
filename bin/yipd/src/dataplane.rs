@@ -228,6 +228,12 @@ pub struct DataPlane {
     raw_recv_key: [u8; 32],
     auth_key: [u8; 16],
     hp_key: [u8; 16],
+    /// In-session encrypted control codec (#207).
+    pub ctrl_codec: crate::control_codec::ControlCodec,
+    /// Outbound control frame sequence nonce (#207).
+    pub ctrl_send_nonce: u64,
+    /// Anti-replay sliding window for inbound control frames (#207).
+    pub ctrl_replay: yip_crypto::ReplayWindow,
     transport: Transport,
     codec: Codec,
     conn_tag: u64,
@@ -412,6 +418,9 @@ impl DataPlane {
             raw_recv_key,
             auth_key,
             hp_key,
+            ctrl_codec: established.ctrl_codec,
+            ctrl_send_nonce: established.ctrl_send_nonce,
+            ctrl_replay: established.ctrl_replay,
             transport: Transport::new(vec![], symbol_size),
             codec,
             conn_tag,

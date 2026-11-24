@@ -58,12 +58,22 @@ pub fn derive_control_keys(auth_key: &[u8; 16]) -> ([u8; 32], [u8; 32]) {
 }
 
 /// In-session encrypted control codec with uniform padding and anti-replay protection.
-#[derive(Debug)]
 pub struct ControlCodec {
     send_cipher: ChaCha20Poly1305Cipher,
     recv_cipher: ChaCha20Poly1305Cipher,
     send_key: [u8; 32],
     recv_key: [u8; 32],
+}
+
+impl std::fmt::Debug for ControlCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlCodec")
+            .field("send_cipher", &"[redacted]")
+            .field("recv_cipher", &"[redacted]")
+            .field("send_key", &"[redacted]")
+            .field("recv_key", &"[redacted]")
+            .finish()
+    }
 }
 
 impl Clone for ControlCodec {
@@ -391,5 +401,16 @@ mod tests {
         );
         // Nonce was not committed due to validation failure
         assert!(replay.check(1), "uncommitted nonce should still be valid");
+    }
+
+    #[test]
+    fn test_control_codec_debug_redacted() {
+        let auth_key = [0x42u8; 16];
+        let (init_key, resp_key) = derive_control_keys(&auth_key);
+        let codec = ControlCodec::new(init_key, resp_key);
+        let debug_str = format!("{codec:?}");
+        assert!(debug_str.contains("[redacted]"));
+        assert!(!debug_str.contains(&format!("{:02x?}", init_key)));
+        assert!(!debug_str.contains(&format!("{:02x?}", resp_key)));
     }
 }
