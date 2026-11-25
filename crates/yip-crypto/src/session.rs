@@ -542,6 +542,27 @@ impl Session {
     }
 
     /// Reserve a contiguous block of `count` send counters, returning the starting counter.
+    ///
+    /// Advances the internal `send_counter` by `count * stride` to allocate sequence
+    /// space for multi-packet batch sealing or multi-threaded worker dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::Decrypt`] if advancing the counter would overflow `u64`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use yip_crypto::Session;
+    ///
+    /// let k_send = [0x42u8; 32];
+    /// let k_recv = [0x24u8; 32];
+    /// let mut session = Session::from_raw_keys(&k_send, &k_recv, 100, 1).unwrap();
+    ///
+    /// let start = session.reserve_counters(4).unwrap();
+    /// assert_eq!(start, 100);
+    /// assert_eq!(session.send_counter(), 104);
+    /// ```
     pub fn reserve_counters(&mut self, count: u64) -> Result<u64, CryptoError> {
         self.sealed_any = true;
         let start = self.send_counter;
@@ -602,6 +623,25 @@ impl Session {
     }
 
     /// Commit `counter` into the anti-replay window.
+    ///
+    /// Marks `counter` as seen in the session's sliding replay window bitmap,
+    /// preventing replay attacks. Callers typically test `counter` with
+    /// [`check_replay`](Self::check_replay) prior to decrypting, and call `commit_replay`
+    /// only after payload authentication succeeds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use yip_crypto::Session;
+    ///
+    /// let k_send = [0x42u8; 32];
+    /// let k_recv = [0x24u8; 32];
+    /// let mut session = Session::from_raw_keys(&k_send, &k_recv, 0, 1).unwrap();
+    ///
+    /// assert!(session.check_replay(42));
+    /// session.commit_replay(42);
+    /// assert!(!session.check_replay(42));
+    /// ```
     #[inline]
     pub fn commit_replay(&mut self, counter: u64) {
         let idx = self.replay_idx(counter);
