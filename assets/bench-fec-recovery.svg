@@ -1,82 +1,151 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 480" width="100%" height="100%">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 520" width="100%" height="100%">
   <defs>
     <style>
       text { text-rendering: geometricPrecision; }
     </style>
   </defs>
-  <rect width="100%" height="100%" rx="12" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
-  <text x="32.00" y="34.00" fill="#f0f6fc" font-size="18" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="start">FEC Recovery: Effective Loss Suppression</text>
-  <text x="32.00" y="56.00" fill="#8b949e" font-size="12" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="start">AWS Multi-Region WAN: us-east-1 ↔ us-west-2 (~60.6ms RTT, Systematic Cauchy RS GF(256))</text>
-  <line x1="80.00" y1="82.00" x2="100.00" y2="82.00" stroke="#f97316" stroke-width="2.50"/>
-  <circle cx="90.00" cy="82.00" r="3.50" fill="#f97316"/>
-  <text x="106.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">yip (RS-FEC)</text>
-  <line x1="208.40" y1="82.00" x2="228.40" y2="82.00" stroke="#38bdf8" stroke-width="2.50"/>
-  <circle cx="218.40" cy="82.00" r="3.50" fill="#38bdf8"/>
-  <text x="234.40" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">WireGuard</text>
-  <line x1="315.20" y1="82.00" x2="335.20" y2="82.00" stroke="#64748b" stroke-width="2.50" stroke-dasharray="4,3"/>
-  <circle cx="325.20" cy="82.00" r="3.50" fill="#64748b"/>
-  <text x="341.20" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">Baseline</text>
-  <line x1="414.80" y1="82.00" x2="434.80" y2="82.00" stroke="#a855f7" stroke-width="2.50"/>
-  <circle cx="424.80" cy="82.00" r="3.50" fill="#a855f7"/>
-  <text x="440.80" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">OpenVPN</text>
-  <rect x="545.80" y="72.00" width="259.20" height="24.00" fill="#141c2b" rx="6.00" stroke="#38bdf8" stroke-width="1.00"/>
-  <text x="675.40" y="88.80" fill="#38bdf8" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">Zero TCP Backoff via Systematic RS-FEC</text>
-  <line x1="80.00" y1="410.00" x2="805.00" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
-  <text x="72.00" y="414.00" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">0%</text>
-  <line x1="80.00" y1="351.00" x2="805.00" y2="351.00" stroke="#21262d" stroke-width="1.00"/>
-  <text x="72.00" y="355.00" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">3%</text>
-  <line x1="80.00" y1="292.00" x2="805.00" y2="292.00" stroke="#21262d" stroke-width="1.00"/>
-  <text x="72.00" y="296.00" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">6%</text>
-  <line x1="80.00" y1="233.00" x2="805.00" y2="233.00" stroke="#21262d" stroke-width="1.00"/>
-  <text x="72.00" y="237.00" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">9%</text>
-  <line x1="80.00" y1="174.00" x2="805.00" y2="174.00" stroke="#21262d" stroke-width="1.00"/>
-  <text x="72.00" y="178.00" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">12%</text>
-  <line x1="80.00" y1="115.00" x2="805.00" y2="115.00" stroke="#21262d" stroke-width="1.00"/>
-  <text x="72.00" y="119.00" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">15%</text>
-  <line x1="80.00" y1="115.00" x2="80.00" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
-  <text x="80.00" y="428.00" fill="#8b949e" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">0%</text>
-  <line x1="261.25" y1="115.00" x2="261.25" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
-  <text x="261.25" y="428.00" fill="#8b949e" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">1%</text>
-  <line x1="442.50" y1="115.00" x2="442.50" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
-  <text x="442.50" y="428.00" fill="#8b949e" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">3%</text>
-  <line x1="623.75" y1="115.00" x2="623.75" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
-  <text x="623.75" y="428.00" fill="#8b949e" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">5%</text>
-  <line x1="805.00" y1="115.00" x2="805.00" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
-  <text x="805.00" y="428.00" fill="#8b949e" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">10%</text>
-  <text x="442.50" y="446.00" fill="#f0f6fc" font-size="12" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="middle">Injected Network Loss (netem)</text>
-  <text x="34.00" y="262.50" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="middle" transform="rotate(-90 34.00 262.50)">Effective Ping Packet Loss %</text>
-  <polygon points="80.00,410.00 80.00,410.00 261.25,410.00 442.50,410.00 623.75,410.00 805.00,390.33 805.00,410.00" fill="#f97316" stroke="none" opacity="0.15"/>
-  <polyline points="80.00,410.00 261.25,370.67 442.50,331.33 623.75,351.00 805.00,193.67" fill="none" stroke="#64748b" stroke-width="1.50" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="4,4"/>
-  <circle cx="80.00" cy="410.00" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="261.25" cy="370.67" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="442.50" cy="331.33" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="623.75" cy="351.00" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="805.00" cy="193.67" r="3.50" fill="#64748b" stroke="#0d1117" stroke-width="1.50"/>
-  <polyline points="80.00,410.00 261.25,410.00 442.50,390.33 623.75,311.67 805.00,95.33" fill="none" stroke="#a855f7" stroke-width="2.00" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="80.00" cy="410.00" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="261.25" cy="410.00" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="442.50" cy="390.33" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="623.75" cy="311.67" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="805.00" cy="95.33" r="3.50" fill="#a855f7" stroke="#0d1117" stroke-width="1.50"/>
-  <polyline points="80.00,410.00 261.25,331.33 442.50,331.33 623.75,292.00 805.00,193.67" fill="none" stroke="#38bdf8" stroke-width="2.50" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="80.00" cy="410.00" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="261.25" cy="331.33" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="442.50" cy="331.33" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="623.75" cy="292.00" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="805.00" cy="193.67" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
-  <polyline points="80.00,410.00 261.25,410.00 442.50,410.00 623.75,410.00 805.00,390.33" fill="none" stroke="#f97316" stroke-width="3.50" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="80.00" cy="410.00" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="261.25" cy="410.00" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="442.50" cy="410.00" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="623.75" cy="410.00" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="805.00" cy="390.33" r="4.50" fill="#f97316" stroke="#0d1117" stroke-width="1.50"/>
-  <rect x="659.80" y="167.67" width="131.20" height="20.00" fill="#0d1117" rx="6.00" stroke="#30363d" stroke-width="1.00"/>
-  <text x="725.40" y="181.67" fill="#38bdf8" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">11% effective loss</text>
-  <rect x="627.80" y="352.33" width="163.20" height="20.00" fill="#1f1610" rx="6.00" stroke="#f97316" stroke-width="1.00"/>
-  <text x="709.40" y="366.33" fill="#fb923c" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">1% loss (90% recovered)</text>
-  <rect x="104.00" y="139.00" width="387.20" height="22.00" fill="#161b22" rx="6.00" stroke="#30363d" stroke-width="1.00"/>
-  <text x="297.60" y="154.40" fill="#c9d1d9" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">Cauchy RS GF(256): 100% recovery before kernel TCP timeout</text>
-  <rect x="80.00" y="450.00" width="37.60" height="16.00" fill="#161b22" rx="6.00" stroke="#30363d" stroke-width="1.00"/>
-  <text x="98.80" y="461.20" fill="#8b949e" font-size="9" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">NOTE</text>
-  <text x="125.60" y="462.00" fill="#6e7681" font-size="10.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">Systematic Cauchy RS-FEC decodes lost packets in userspace, maintaining near-zero drop rate.</text>
+  <rect width="100%" height="100%" rx="10" fill="#000000" stroke="#1f1f1f" stroke-width="1.5"/>
+  <text x="32.00" y="32.00" fill="#ededed" font-size="18" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="start">FEC Recovery: Effective Loss Suppression (All Contenders)</text>
+  <text x="32.00" y="52.00" fill="#a3a3a3" font-size="11" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="start">AWS Multi-Region WAN: us-east-1 ↔ us-west-2 (~54.6ms RTT, Systematic Cauchy RS GF(256))</text>
+  <line x1="75.00" y1="74.00" x2="91.00" y2="74.00" stroke="#ff6600" stroke-width="3.50"/>
+  <circle cx="83.00" cy="74.00" r="3.20" fill="#ff6600"/>
+  <text x="97.00" y="78.00" fill="#ededed" font-size="10" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">yip (RS-FEC)</text>
+  <line x1="187.00" y1="74.00" x2="203.00" y2="74.00" stroke="#38bdf8" stroke-width="2.20"/>
+  <circle cx="195.00" cy="74.00" r="3.20" fill="#38bdf8"/>
+  <text x="209.00" y="78.00" fill="#ededed" font-size="10" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">WireGuard (In-Tree)</text>
+  <line x1="344.50" y1="74.00" x2="360.50" y2="74.00" stroke="#6366f1" stroke-width="1.60" stroke-dasharray="4,2"/>
+  <circle cx="352.50" cy="74.00" r="3.20" fill="#6366f1"/>
+  <text x="366.50" y="78.00" fill="#ededed" font-size="10" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">Tailscale</text>
+  <line x1="437.00" y1="74.00" x2="453.00" y2="74.00" stroke="#ec4899" stroke-width="1.60" stroke-dasharray="4,2"/>
+  <circle cx="445.00" cy="74.00" r="3.20" fill="#ec4899"/>
+  <text x="459.00" y="78.00" fill="#ededed" font-size="10" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">NetBird</text>
+  <line x1="516.50" y1="74.00" x2="532.50" y2="74.00" stroke="#14b8a6" stroke-width="1.60" stroke-dasharray="4,2"/>
+  <circle cx="524.50" cy="74.00" r="3.20" fill="#14b8a6"/>
+  <text x="538.50" y="78.00" fill="#ededed" font-size="10" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">AmneziaWG</text>
+  <line x1="609.00" y1="74.00" x2="625.00" y2="74.00" stroke="#06b6d4" stroke-width="1.60" stroke-dasharray="4,2"/>
+  <circle cx="617.00" cy="74.00" r="3.20" fill="#06b6d4"/>
+  <text x="631.00" y="78.00" fill="#ededed" font-size="10" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">WireGuard-Go</text>
+  <line x1="75.00" y1="96.00" x2="91.00" y2="96.00" stroke="#a855f7" stroke-width="1.60" stroke-dasharray="4,2"/>
+  <circle cx="83.00" cy="96.00" r="3.20" fill="#a855f7"/>
+  <text x="97.00" y="100.00" fill="#ededed" font-size="10" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">Nebula</text>
+  <line x1="148.00" y1="96.00" x2="164.00" y2="96.00" stroke="#eab308" stroke-width="1.60" stroke-dasharray="4,2"/>
+  <circle cx="156.00" cy="96.00" r="3.20" fill="#eab308"/>
+  <text x="170.00" y="100.00" fill="#ededed" font-size="10" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">ZeroTier</text>
+  <line x1="234.00" y1="96.00" x2="250.00" y2="96.00" stroke="#84cc16" stroke-width="1.60" stroke-dasharray="4,2"/>
+  <circle cx="242.00" cy="96.00" r="3.20" fill="#84cc16"/>
+  <text x="256.00" y="100.00" fill="#ededed" font-size="10" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">n2n (v3)</text>
+  <line x1="320.00" y1="96.00" x2="336.00" y2="96.00" stroke="#ef4444" stroke-width="1.80" stroke-dasharray="4,2"/>
+  <circle cx="328.00" cy="96.00" r="3.20" fill="#ef4444"/>
+  <text x="342.00" y="100.00" fill="#ededed" font-size="10" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">OpenVPN</text>
+  <line x1="399.50" y1="96.00" x2="415.50" y2="96.00" stroke="#737373" stroke-width="1.50" stroke-dasharray="4,2"/>
+  <circle cx="407.50" cy="96.00" r="3.20" fill="#737373"/>
+  <text x="421.50" y="100.00" fill="#ededed" font-size="10" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">Baseline (No Tunnel)</text>
+  <rect x="585.80" y="26.00" width="259.20" height="24.00" fill="#0a0a0a" rx="5.00" stroke="#00ff88" stroke-width="1.00"/>
+  <text x="715.40" y="42.80" fill="#00ff88" font-size="11" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">Zero TCP Backoff via Systematic RS-FEC</text>
+  <line x1="75.00" y1="430.00" x2="845.00" y2="430.00" stroke="#141414" stroke-width="1.00"/>
+  <text x="67.00" y="434.00" fill="#a3a3a3" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="end">0%</text>
+  <line x1="75.00" y1="392.00" x2="845.00" y2="392.00" stroke="#141414" stroke-width="1.00"/>
+  <text x="67.00" y="396.00" fill="#a3a3a3" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="end">2%</text>
+  <line x1="75.00" y1="354.00" x2="845.00" y2="354.00" stroke="#141414" stroke-width="1.00"/>
+  <text x="67.00" y="358.00" fill="#a3a3a3" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="end">4%</text>
+  <line x1="75.00" y1="316.00" x2="845.00" y2="316.00" stroke="#141414" stroke-width="1.00"/>
+  <text x="67.00" y="320.00" fill="#a3a3a3" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="end">6%</text>
+  <line x1="75.00" y1="278.00" x2="845.00" y2="278.00" stroke="#141414" stroke-width="1.00"/>
+  <text x="67.00" y="282.00" fill="#a3a3a3" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="end">8%</text>
+  <line x1="75.00" y1="240.00" x2="845.00" y2="240.00" stroke="#141414" stroke-width="1.00"/>
+  <text x="67.00" y="244.00" fill="#a3a3a3" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="end">10%</text>
+  <line x1="75.00" y1="202.00" x2="845.00" y2="202.00" stroke="#141414" stroke-width="1.00"/>
+  <text x="67.00" y="206.00" fill="#a3a3a3" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="end">12%</text>
+  <line x1="75.00" y1="164.00" x2="845.00" y2="164.00" stroke="#141414" stroke-width="1.00"/>
+  <text x="67.00" y="168.00" fill="#a3a3a3" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="end">14%</text>
+  <line x1="75.00" y1="126.00" x2="845.00" y2="126.00" stroke="#141414" stroke-width="1.00"/>
+  <text x="67.00" y="130.00" fill="#a3a3a3" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="end">16%</text>
+  <line x1="75.00" y1="126.00" x2="75.00" y2="430.00" stroke="#141414" stroke-width="1.00"/>
+  <text x="75.00" y="448.00" fill="#a3a3a3" font-size="11" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="middle">0%</text>
+  <line x1="267.50" y1="126.00" x2="267.50" y2="430.00" stroke="#141414" stroke-width="1.00"/>
+  <text x="267.50" y="448.00" fill="#a3a3a3" font-size="11" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="middle">1%</text>
+  <line x1="460.00" y1="126.00" x2="460.00" y2="430.00" stroke="#141414" stroke-width="1.00"/>
+  <text x="460.00" y="448.00" fill="#a3a3a3" font-size="11" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="middle">3%</text>
+  <line x1="652.50" y1="126.00" x2="652.50" y2="430.00" stroke="#141414" stroke-width="1.00"/>
+  <text x="652.50" y="448.00" fill="#a3a3a3" font-size="11" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="middle">5%</text>
+  <line x1="845.00" y1="126.00" x2="845.00" y2="430.00" stroke="#141414" stroke-width="1.00"/>
+  <text x="845.00" y="448.00" fill="#a3a3a3" font-size="11" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="middle">10%</text>
+  <text x="460.00" y="466.00" fill="#ededed" font-size="11" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="middle">Injected Network Loss (netem on outer egress)</text>
+  <text x="24.00" y="278.00" fill="#ededed" font-size="11" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="middle" transform="rotate(-90 24.00 278.00)">Effective Ping Packet Loss %</text>
+  <polygon points="75.00,430.00 75.00,430.00 267.50,430.00 460.00,430.00 652.50,430.00 845.00,411.00 845.00,430.00" fill="#ff6600" stroke="none" opacity="0.15"/>
+  <polyline points="75.00,430.00 267.50,392.00 460.00,354.00 652.50,373.00 845.00,221.00" fill="none" stroke="#737373" stroke-width="1.50" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="4,4"/>
+  <circle cx="75.00" cy="430.00" r="3.00" fill="#737373" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="267.50" cy="392.00" r="3.00" fill="#737373" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="460.00" cy="354.00" r="3.00" fill="#737373" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="652.50" cy="373.00" r="3.00" fill="#737373" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="845.00" cy="221.00" r="3.00" fill="#737373" stroke="#000000" stroke-width="1.50"/>
+  <polyline points="75.00,430.00 267.50,430.00 460.00,411.00 652.50,335.00 845.00,126.00" fill="none" stroke="#ef4444" stroke-width="1.80" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="2,2"/>
+  <circle cx="75.00" cy="430.00" r="3.00" fill="#ef4444" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="267.50" cy="430.00" r="3.00" fill="#ef4444" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="460.00" cy="411.00" r="3.00" fill="#ef4444" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="652.50" cy="335.00" r="3.00" fill="#ef4444" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="845.00" cy="126.00" r="3.00" fill="#ef4444" stroke="#000000" stroke-width="1.50"/>
+  <polyline points="75.00,430.00 267.50,392.00 460.00,354.00 652.50,278.00 845.00,145.00" fill="none" stroke="#84cc16" stroke-width="1.60" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="3,3"/>
+  <circle cx="75.00" cy="430.00" r="3.00" fill="#84cc16" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="267.50" cy="392.00" r="3.00" fill="#84cc16" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="460.00" cy="354.00" r="3.00" fill="#84cc16" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="652.50" cy="278.00" r="3.00" fill="#84cc16" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="845.00" cy="145.00" r="3.00" fill="#84cc16" stroke="#000000" stroke-width="1.50"/>
+  <polyline points="75.00,430.00 267.50,392.00 460.00,354.00 652.50,297.00 845.00,164.00" fill="none" stroke="#eab308" stroke-width="1.60" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="4,3"/>
+  <circle cx="75.00" cy="430.00" r="3.00" fill="#eab308" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="267.50" cy="392.00" r="3.00" fill="#eab308" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="460.00" cy="354.00" r="3.00" fill="#eab308" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="652.50" cy="297.00" r="3.00" fill="#eab308" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="845.00" cy="164.00" r="3.00" fill="#eab308" stroke="#000000" stroke-width="1.50"/>
+  <polyline points="75.00,430.00 267.50,392.00 460.00,354.00 652.50,297.00 845.00,164.00" fill="none" stroke="#a855f7" stroke-width="1.60" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="5,3"/>
+  <circle cx="75.00" cy="430.00" r="3.00" fill="#a855f7" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="267.50" cy="392.00" r="3.00" fill="#a855f7" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="460.00" cy="354.00" r="3.00" fill="#a855f7" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="652.50" cy="297.00" r="3.00" fill="#a855f7" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="845.00" cy="164.00" r="3.00" fill="#a855f7" stroke="#000000" stroke-width="1.50"/>
+  <polyline points="75.00,430.00 267.50,392.00 460.00,354.00 652.50,316.00 845.00,202.00" fill="none" stroke="#06b6d4" stroke-width="1.60" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="3,2"/>
+  <circle cx="75.00" cy="430.00" r="3.00" fill="#06b6d4" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="267.50" cy="392.00" r="3.00" fill="#06b6d4" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="460.00" cy="354.00" r="3.00" fill="#06b6d4" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="652.50" cy="316.00" r="3.00" fill="#06b6d4" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="845.00" cy="202.00" r="3.00" fill="#06b6d4" stroke="#000000" stroke-width="1.50"/>
+  <polyline points="75.00,430.00 267.50,392.00 460.00,354.00 652.50,316.00 845.00,202.00" fill="none" stroke="#14b8a6" stroke-width="1.60" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="4,2"/>
+  <circle cx="75.00" cy="430.00" r="3.00" fill="#14b8a6" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="267.50" cy="392.00" r="3.00" fill="#14b8a6" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="460.00" cy="354.00" r="3.00" fill="#14b8a6" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="652.50" cy="316.00" r="3.00" fill="#14b8a6" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="845.00" cy="202.00" r="3.00" fill="#14b8a6" stroke="#000000" stroke-width="1.50"/>
+  <polyline points="75.00,430.00 267.50,392.00 460.00,354.00 652.50,316.00 845.00,183.00" fill="none" stroke="#ec4899" stroke-width="1.60" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="5,2"/>
+  <circle cx="75.00" cy="430.00" r="3.00" fill="#ec4899" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="267.50" cy="392.00" r="3.00" fill="#ec4899" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="460.00" cy="354.00" r="3.00" fill="#ec4899" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="652.50" cy="316.00" r="3.00" fill="#ec4899" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="845.00" cy="183.00" r="3.00" fill="#ec4899" stroke="#000000" stroke-width="1.50"/>
+  <polyline points="75.00,430.00 267.50,392.00 460.00,354.00 652.50,316.00 845.00,183.00" fill="none" stroke="#6366f1" stroke-width="1.60" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="6,3"/>
+  <circle cx="75.00" cy="430.00" r="3.00" fill="#6366f1" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="267.50" cy="392.00" r="3.00" fill="#6366f1" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="460.00" cy="354.00" r="3.00" fill="#6366f1" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="652.50" cy="316.00" r="3.00" fill="#6366f1" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="845.00" cy="183.00" r="3.00" fill="#6366f1" stroke="#000000" stroke-width="1.50"/>
+  <polyline points="75.00,430.00 267.50,354.00 460.00,354.00 652.50,316.00 845.00,221.00" fill="none" stroke="#38bdf8" stroke-width="2.20" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="75.00" cy="430.00" r="3.00" fill="#38bdf8" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="267.50" cy="354.00" r="3.00" fill="#38bdf8" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="460.00" cy="354.00" r="3.00" fill="#38bdf8" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="652.50" cy="316.00" r="3.00" fill="#38bdf8" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="845.00" cy="221.00" r="3.00" fill="#38bdf8" stroke="#000000" stroke-width="1.50"/>
+  <polyline points="75.00,430.00 267.50,430.00 460.00,430.00 652.50,430.00 845.00,411.00" fill="none" stroke="#ff6600" stroke-width="3.50" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="75.00" cy="430.00" r="4.50" fill="#ff6600" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="267.50" cy="430.00" r="4.50" fill="#ff6600" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="460.00" cy="430.00" r="4.50" fill="#ff6600" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="652.50" cy="430.00" r="4.50" fill="#ff6600" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="845.00" cy="411.00" r="4.50" fill="#ff6600" stroke="#000000" stroke-width="1.50"/>
+  <rect x="655.00" y="195.00" width="176.00" height="20.00" fill="#0a0a0a" rx="5.00" stroke="#38bdf8" stroke-width="1.00"/>
+  <text x="743.00" y="209.00" fill="#38bdf8" font-size="10" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">11% unmitigated loss (WG)</text>
+  <rect x="591.00" y="373.00" width="240.00" height="20.00" fill="#0a0a0a" rx="5.00" stroke="#ff6600" stroke-width="1.00"/>
+  <text x="711.00" y="387.00" fill="#ff6600" font-size="10" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">1.0% effective loss (91% recovered)</text>
+  <rect x="99.00" y="146.00" width="476.80" height="22.00" fill="#0a0a0a" rx="5.00" stroke="#1f1f1f" stroke-width="1.00"/>
+  <text x="337.40" y="161.40" fill="#ededed" font-size="10" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">Cauchy RS GF(256): 100% recovery up to 5% loss before kernel TCP timeout</text>
+  <rect x="75.00" y="470.00" width="82.40" height="16.00" fill="#0a0a0a" rx="5.00" stroke="#1f1f1f" stroke-width="1.00"/>
+  <text x="116.20" y="481.20" fill="#a3a3a3" font-size="9" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">METHODOLOGY</text>
+  <text x="165.40" y="482.00" fill="#737373" font-size="10.5" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">Systematic Cauchy RS-FEC decodes lost packets in userspace, maintaining near-zero drop rate.</text>
 </svg>
