@@ -1,68 +1,99 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 480" width="100%" height="100%">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 520" width="100%" height="100%">
   <defs>
     <style>
       text { text-rendering: geometricPrecision; }
     </style>
   </defs>
-  <rect width="100%" height="100%" rx="12" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
-  <text x="32.00" y="34.00" fill="#f0f6fc" font-size="18" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="start">Multi-Core Throughput Scaling (AF_XDP vs epoll vs io_uring)</text>
-  <text x="32.00" y="56.00" fill="#8b949e" font-size="12" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="start">Dedicated Multi-Core Testbed: 64 Parallel TCP Streams, Lock-Free SPSC Sharding (AMD Ryzen / EPYC)</text>
-  <line x1="92.00" y1="82.00" x2="112.00" y2="82.00" stroke="#fb923c" stroke-width="2.50"/>
-  <circle cx="102.00" cy="82.00" r="3.50" fill="#fb923c"/>
-  <text x="118.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">AF_XDP (Optional)</text>
-  <line x1="252.40" y1="82.00" x2="272.40" y2="82.00" stroke="#34d399" stroke-width="2.50"/>
-  <circle cx="262.40" cy="82.00" r="3.50" fill="#34d399"/>
-  <text x="278.40" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">io_uring Multishot</text>
-  <line x1="420.00" y1="82.00" x2="440.00" y2="82.00" stroke="#38bdf8" stroke-width="2.50"/>
-  <circle cx="430.00" cy="82.00" r="3.50" fill="#38bdf8"/>
-  <text x="446.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">Standard Socket (epoll+GSO)</text>
-  <rect x="552.20" y="72.00" width="252.80" height="24.00" fill="#1f1610" rx="6.00" stroke="#fb923c" stroke-width="1.00"/>
-  <text x="678.60" y="88.80" fill="#fb923c" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">40+ Gbps Line-Rate Multi-Core Scaling</text>
-  <line x1="92.00" y1="410.00" x2="805.00" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
-  <text x="84.00" y="414.00" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">0 Gbps</text>
-  <line x1="92.00" y1="344.44" x2="805.00" y2="344.44" stroke="#21262d" stroke-width="1.00"/>
-  <text x="84.00" y="348.44" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">10 Gbps</text>
-  <line x1="92.00" y1="278.89" x2="805.00" y2="278.89" stroke="#21262d" stroke-width="1.00"/>
-  <text x="84.00" y="282.89" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">20 Gbps</text>
-  <line x1="92.00" y1="213.33" x2="805.00" y2="213.33" stroke="#21262d" stroke-width="1.00"/>
-  <text x="84.00" y="217.33" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">30 Gbps</text>
-  <line x1="92.00" y1="147.78" x2="805.00" y2="147.78" stroke="#21262d" stroke-width="1.00"/>
-  <text x="84.00" y="151.78" fill="#8b949e" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="end">40 Gbps</text>
-  <line x1="92.00" y1="115.00" x2="92.00" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
-  <text x="92.00" y="428.00" fill="#8b949e" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">1 Core</text>
-  <line x1="329.67" y1="115.00" x2="329.67" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
-  <text x="329.67" y="428.00" fill="#8b949e" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">2 Cores</text>
-  <line x1="567.33" y1="115.00" x2="567.33" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
-  <text x="567.33" y="428.00" fill="#8b949e" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">4 Cores</text>
-  <line x1="805.00" y1="115.00" x2="805.00" y2="410.00" stroke="#21262d" stroke-width="1.00"/>
-  <text x="805.00" y="428.00" fill="#8b949e" font-size="11" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="middle">8 Cores</text>
-  <text x="448.50" y="446.00" fill="#f0f6fc" font-size="12" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="middle">Dedicated Worker Cores (Lock-Free Sharded Threads)</text>
-  <text x="26.00" y="262.50" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="middle" transform="rotate(-90 26.00 262.50)">Multi-Stream TCP Throughput (Gbps)</text>
-  <polygon points="92.00,410.00 92.00,353.10 329.67,336.18 567.33,270.89 805.00,146.01 805.00,410.00" fill="#fb923c" stroke="none" opacity="0.12"/>
-  <polyline points="92.00,379.98 329.67,370.40 567.33,335.07 805.00,268.66" fill="none" stroke="#38bdf8" stroke-width="2.00" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="92.00" cy="379.98" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="329.67" cy="370.40" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="567.33" cy="335.07" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="805.00" cy="268.66" r="3.50" fill="#38bdf8" stroke="#0d1117" stroke-width="1.50"/>
-  <text x="805.00" y="284.66" fill="#38bdf8" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="bold" text-anchor="middle">21.6</text>
-  <polyline points="92.00,376.44 329.67,365.42 567.33,328.06 805.00,265.12" fill="none" stroke="#34d399" stroke-width="2.20" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="92.00" cy="376.44" r="3.50" fill="#34d399" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="329.67" cy="365.42" r="3.50" fill="#34d399" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="567.33" cy="328.06" r="3.50" fill="#34d399" stroke="#0d1117" stroke-width="1.50"/>
-  <circle cx="805.00" cy="265.12" r="3.50" fill="#34d399" stroke="#0d1117" stroke-width="1.50"/>
-  <text x="805.00" y="253.12" fill="#34d399" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="bold" text-anchor="middle">22.1</text>
-  <polyline points="92.00,353.10 329.67,336.18 567.33,270.89 805.00,146.01" fill="none" stroke="#fb923c" stroke-width="3.20" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="92.00" cy="353.10" r="4.50" fill="#fb923c" stroke="#0d1117" stroke-width="1.50"/>
-  <text x="100.00" y="343.10" fill="#fb923c" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="bold" text-anchor="start">8.7</text>
-  <circle cx="329.67" cy="336.18" r="4.50" fill="#fb923c" stroke="#0d1117" stroke-width="1.50"/>
-  <text x="329.67" y="326.18" fill="#fb923c" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="bold" text-anchor="middle">11.3</text>
-  <circle cx="567.33" cy="270.89" r="4.50" fill="#fb923c" stroke="#0d1117" stroke-width="1.50"/>
-  <text x="567.33" y="260.89" fill="#fb923c" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="bold" text-anchor="middle">21.2</text>
-  <circle cx="805.00" cy="146.01" r="4.50" fill="#fb923c" stroke="#0d1117" stroke-width="1.50"/>
-  <text x="805.00" y="136.01" fill="#fb923c" font-size="10" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="bold" text-anchor="middle">40.3</text>
-  <rect x="538.20" y="120.00" width="252.80" height="22.00" fill="#161b22" rx="6.00" stroke="#30363d" stroke-width="1.00"/>
-  <text x="664.60" y="135.40" fill="#fb923c" font-size="10" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">40.27 Gbps @ 3.93 Mpps (4.6× speedup)</text>
-  <rect x="92.00" y="450.00" width="37.60" height="16.00" fill="#161b22" rx="6.00" stroke="#30363d" stroke-width="1.00"/>
-  <text x="110.80" y="461.20" fill="#8b949e" font-size="9" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">NOTE</text>
-  <text x="137.60" y="462.00" fill="#6e7681" font-size="10.5" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">Lock-free SPSC sharding eliminates cross-core contention, scaling near-linearly to 40+ Gbps line-rate.</text>
+  <rect width="100%" height="100%" rx="10" fill="#000000" stroke="#1f1f1f" stroke-width="1.5"/>
+  <text x="32.00" y="32.00" fill="#ededed" font-size="16" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="start">Multi-Core Throughput Scaling (1 to 8 Cores)</text>
+  <text x="32.00" y="50.00" fill="#a3a3a3" font-size="10.5" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="start">Dedicated Multi-Core Testbed: 64 Parallel TCP Streams, Lock-Free SPSC Sharding</text>
+  <rect x="595.20" y="24.00" width="284.80" height="24.00" fill="#0a0a0a" rx="5.00" stroke="#ff6600" stroke-width="1.00"/>
+  <text x="737.60" y="40.80" fill="#ff6600" font-size="11" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">40+ Gbps Kernel-Bypass / 21.6 Gbps Sockets</text>
+  <line x1="85.00" y1="74.00" x2="101.00" y2="74.00" stroke="#ff6600" stroke-width="3.50"/>
+  <circle cx="93.00" cy="74.00" r="3.20" fill="#ff6600"/>
+  <text x="107.00" y="78.00" fill="#ededed" font-size="10" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">yip: AF_XDP Zero-Copy</text>
+  <line x1="261.50" y1="74.00" x2="277.50" y2="74.00" stroke="#00ff88" stroke-width="2.20"/>
+  <circle cx="269.50" cy="74.00" r="3.20" fill="#00ff88"/>
+  <text x="283.50" y="78.00" fill="#ededed" font-size="10" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">yip: io_uring Multishot</text>
+  <line x1="451.00" y1="74.00" x2="467.00" y2="74.00" stroke="#38bdf8" stroke-width="2.20"/>
+  <circle cx="459.00" cy="74.00" r="3.20" fill="#38bdf8"/>
+  <text x="473.00" y="78.00" fill="#ededed" font-size="10" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">yip: Standard epoll Sockets</text>
+  <line x1="85.00" y1="96.00" x2="101.00" y2="96.00" stroke="#737373" stroke-width="1.80" stroke-dasharray="4,2"/>
+  <circle cx="93.00" cy="96.00" r="3.20" fill="#737373"/>
+  <text x="107.00" y="100.00" fill="#ededed" font-size="10" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">WireGuard (Kernel wg0)</text>
+  <line x1="268.00" y1="96.00" x2="284.00" y2="96.00" stroke="#6366f1" stroke-width="1.60" stroke-dasharray="4,2"/>
+  <circle cx="276.00" cy="96.00" r="3.20" fill="#6366f1"/>
+  <text x="290.00" y="100.00" fill="#ededed" font-size="10" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">Tailscale / WireGuard-Go</text>
+  <line x1="464.00" y1="96.00" x2="480.00" y2="96.00" stroke="#ef4444" stroke-width="1.60" stroke-dasharray="4,2"/>
+  <circle cx="472.00" cy="96.00" r="3.20" fill="#ef4444"/>
+  <text x="486.00" y="100.00" fill="#ededed" font-size="10" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">OpenVPN (Userspace tun0)</text>
+  <line x1="85.00" y1="430.00" x2="880.00" y2="430.00" stroke="#141414" stroke-width="1.00"/>
+  <text x="77.00" y="434.00" fill="#a3a3a3" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="end">0 Gbps</text>
+  <line x1="85.00" y1="362.44" x2="880.00" y2="362.44" stroke="#141414" stroke-width="1.00"/>
+  <text x="77.00" y="366.44" fill="#a3a3a3" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="end">10 Gbps</text>
+  <line x1="85.00" y1="294.89" x2="880.00" y2="294.89" stroke="#141414" stroke-width="1.00"/>
+  <text x="77.00" y="298.89" fill="#a3a3a3" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="end">20 Gbps</text>
+  <line x1="85.00" y1="227.33" x2="880.00" y2="227.33" stroke="#141414" stroke-width="1.00"/>
+  <text x="77.00" y="231.33" fill="#a3a3a3" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="end">30 Gbps</text>
+  <line x1="85.00" y1="159.78" x2="880.00" y2="159.78" stroke="#141414" stroke-width="1.00"/>
+  <text x="77.00" y="163.78" fill="#a3a3a3" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="end">40 Gbps</text>
+  <line x1="85.00" y1="126.00" x2="85.00" y2="430.00" stroke="#141414" stroke-width="1.00"/>
+  <text x="85.00" y="448.00" fill="#a3a3a3" font-size="11" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="middle">1 Core</text>
+  <line x1="350.00" y1="126.00" x2="350.00" y2="430.00" stroke="#141414" stroke-width="1.00"/>
+  <text x="350.00" y="448.00" fill="#a3a3a3" font-size="11" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="middle">2 Cores</text>
+  <line x1="615.00" y1="126.00" x2="615.00" y2="430.00" stroke="#141414" stroke-width="1.00"/>
+  <text x="615.00" y="448.00" fill="#a3a3a3" font-size="11" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="middle">4 Cores</text>
+  <line x1="880.00" y1="126.00" x2="880.00" y2="430.00" stroke="#141414" stroke-width="1.00"/>
+  <text x="880.00" y="448.00" fill="#a3a3a3" font-size="11" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="normal" text-anchor="middle">8 Cores</text>
+  <text x="482.50" y="466.00" fill="#ededed" font-size="11" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="middle">Dedicated Worker Cores (Lock-Free Sharded Threads)</text>
+  <text x="24.00" y="278.00" fill="#ededed" font-size="11" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="middle" transform="rotate(-90 24.00 278.00)">Multi-Stream TCP Throughput (Gbps)</text>
+  <polygon points="85.00,430.00 85.00,371.36 350.00,353.93 615.00,286.65 880.00,157.95 880.00,430.00" fill="#ff6600" stroke="none" opacity="0.10"/>
+  <polyline points="85.00,425.00 350.00,425.00 615.00,425.00 880.00,425.00" fill="none" stroke="#ef4444" stroke-width="1.60" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="2,2"/>
+  <circle cx="85.00" cy="425.00" r="3.00" fill="#ef4444" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="350.00" cy="425.00" r="3.00" fill="#ef4444" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="615.00" cy="425.00" r="3.00" fill="#ef4444" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="880.00" cy="425.00" r="3.00" fill="#ef4444" stroke="#000000" stroke-width="1.50"/>
+  <polyline points="85.00,417.57 350.00,417.57 615.00,417.50 880.00,417.50" fill="none" stroke="#6366f1" stroke-width="1.80" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="4,2"/>
+  <circle cx="85.00" cy="417.57" r="3.00" fill="#6366f1" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="350.00" cy="417.57" r="3.00" fill="#6366f1" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="615.00" cy="417.50" r="3.00" fill="#6366f1" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="880.00" cy="417.50" r="3.00" fill="#6366f1" stroke="#000000" stroke-width="1.50"/>
+  <polyline points="85.00,411.69 350.00,411.62 615.00,411.49 880.00,411.42" fill="none" stroke="#737373" stroke-width="2.00" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="5,3"/>
+  <circle cx="85.00" cy="411.69" r="3.00" fill="#737373" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="350.00" cy="411.62" r="3.00" fill="#737373" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="615.00" cy="411.49" r="3.00" fill="#737373" stroke="#000000" stroke-width="1.50"/>
+  <circle cx="880.00" cy="411.42" r="3.00" fill="#737373" stroke="#000000" stroke-width="1.50"/>
+  <rect x="444.00" y="394.00" width="422.00" height="20.00" fill="#0a0a0a" rx="5.00" stroke="#1f1f1f" stroke-width="1.00"/>
+  <text x="655.00" y="408.00" fill="#a3a3a3" font-size="9.5" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="middle">Competitor Ceilings: WireGuard 2.75G • Tailscale 1.85G • OpenVPN 0.74G</text>
+  <polyline points="85.00,399.06 350.00,389.20 615.00,352.78 880.00,284.35" fill="none" stroke="#38bdf8" stroke-width="2.20" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="85.00" cy="399.06" r="3.50" fill="#38bdf8" stroke="#000000" stroke-width="1.50"/>
+  <text x="93.00" y="415.06" fill="#38bdf8" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="bold" text-anchor="start">4.6G</text>
+  <circle cx="350.00" cy="389.20" r="3.50" fill="#38bdf8" stroke="#000000" stroke-width="1.50"/>
+  <text x="350.00" y="405.20" fill="#38bdf8" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="bold" text-anchor="middle">6.0G</text>
+  <circle cx="615.00" cy="352.78" r="3.50" fill="#38bdf8" stroke="#000000" stroke-width="1.50"/>
+  <text x="615.00" y="368.78" fill="#38bdf8" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="bold" text-anchor="middle">11.4G</text>
+  <circle cx="880.00" cy="284.35" r="3.50" fill="#38bdf8" stroke="#000000" stroke-width="1.50"/>
+  <text x="872.00" y="300.35" fill="#38bdf8" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="bold" text-anchor="end">21.6G</text>
+  <polyline points="85.00,395.41 350.00,384.06 615.00,345.56 880.00,280.70" fill="none" stroke="#00ff88" stroke-width="2.40" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="85.00" cy="395.41" r="3.50" fill="#00ff88" stroke="#000000" stroke-width="1.50"/>
+  <text x="93.00" y="383.41" fill="#00ff88" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="bold" text-anchor="start">5.1G</text>
+  <circle cx="350.00" cy="384.06" r="3.50" fill="#00ff88" stroke="#000000" stroke-width="1.50"/>
+  <text x="350.00" y="372.06" fill="#00ff88" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="bold" text-anchor="middle">6.8G</text>
+  <circle cx="615.00" cy="345.56" r="3.50" fill="#00ff88" stroke="#000000" stroke-width="1.50"/>
+  <text x="615.00" y="333.56" fill="#00ff88" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="bold" text-anchor="middle">12.5G</text>
+  <circle cx="880.00" cy="280.70" r="3.50" fill="#00ff88" stroke="#000000" stroke-width="1.50"/>
+  <text x="872.00" y="268.70" fill="#00ff88" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="bold" text-anchor="end">22.1G</text>
+  <polyline points="85.00,371.36 350.00,353.93 615.00,286.65 880.00,157.95" fill="none" stroke="#ff6600" stroke-width="3.50" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="85.00" cy="371.36" r="4.50" fill="#ff6600" stroke="#000000" stroke-width="1.50"/>
+  <text x="93.00" y="359.36" fill="#ff6600" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="bold" text-anchor="start">8.7G</text>
+  <circle cx="350.00" cy="353.93" r="4.50" fill="#ff6600" stroke="#000000" stroke-width="1.50"/>
+  <text x="350.00" y="341.93" fill="#ff6600" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="bold" text-anchor="middle">11.3G</text>
+  <circle cx="615.00" cy="286.65" r="4.50" fill="#ff6600" stroke="#000000" stroke-width="1.50"/>
+  <text x="615.00" y="274.65" fill="#ff6600" font-size="10" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="bold" text-anchor="middle">21.2G</text>
+  <circle cx="880.00" cy="157.95" r="4.50" fill="#ff6600" stroke="#000000" stroke-width="1.50"/>
+  <rect x="613.20" y="140.00" width="252.80" height="22.00" fill="#0a0a0a" rx="5.00" stroke="#1f1f1f" stroke-width="1.00"/>
+  <text x="739.60" y="155.40" fill="#ff6600" font-size="10" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">40.27 Gbps @ 3.93 Mpps (4.6× speedup)</text>
+  <rect x="85.00" y="470.00" width="82.40" height="16.00" fill="#0a0a0a" rx="5.00" stroke="#1f1f1f" stroke-width="1.00"/>
+  <text x="126.20" y="481.20" fill="#a3a3a3" font-size="9" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">METHODOLOGY</text>
+  <text x="175.40" y="482.00" fill="#737373" font-size="10.5" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="normal" text-anchor="start">Lock-free SPSC sharding eliminates cross-core contention, scaling near-linearly to 40+ Gbps line-rate.</text>
 </svg>

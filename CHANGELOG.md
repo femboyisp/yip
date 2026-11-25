@@ -5,6 +5,13 @@ All notable changes to this project are documented here, following
 
 ## [Unreleased]
 
+### Changed
+- **Benchmark Methodology Transparency Audit and Visual Theme Unification (`crates/yip-bench`, `docs`, `README.md`).**
+  - Documented explicit testbed conditions across all benchmark documentation: CPU models (AWS `t3.small` Intel Xeon Platinum 8259CL for WAN; AMD Ryzen 5 7640U / AMD EPYC for local netns and 2 Gbps dedicated link), NIC/veth topologies (AWS ENA multi-region transit vs Linux `veth` pair with `txqueuelen 10000`), `tc netem` loss injection parameters (outer UDP egress drop targeting peer IP via 4-band `prio` qdisc with 0 ms added delay on WAN; symmetric netem drop + 5 ms delay on local netns), TCP congestion control settings (default Linux `cubic` with `fq_codel` qdisc), and MTUs (1500 byte underlay MTU, uniform 1380 byte inner overlay MTU across contenders).
+  - Derived the theoretical TCP throughput bounds under the Mathis formula ($BW \le \frac{\text{MSS}}{\text{RTT}} \times \frac{C}{\sqrt{p}}$), demonstrating that WireGuard's collapse to 1.1 Mbit/s under 3% loss over a 55 ms RTT link precisely reflects fundamental loss-based congestion control limits, whereas `yip`'s in-flight Cauchy RS-FEC reconstructs lost symbols before host stack observation to prevent congestion window halving.
+  - Clarified the empirical variance between clean single-stream 312.9 Mbit/s and netem loss sweep values (412.0 Mbit/s @ 0%, 349.3 Mbit/s @ 1%, 372.3 Mbit/s @ 3%) stemming from separate execution phases on burstable cloud instances, cross-country WAN transit jitter, and in-flight FEC micro-pacing smoothing TCP ACK spacing to settle CUBIC at a marginally wider congestion window.
+  - Refactored `crates/yip-bench/generate-graphs.py` to match the `yipmesh.tech` OLED dark theme (`#000000` background, `#1f1f1f` borders, `#ff6600` neon orange accent, `#00ff88` green) and incorporated all 10 contenders (`yip`, `wireguard`, `tailscale`, `netbird`, `amneziawg`, `wireguard-go`, `nebula`, `zerotier`, `n2n`, `openvpn`, and `baseline`) across all generated charts.
+
 ## [0.2.0] - 2026-11-25
 
 ### Security
