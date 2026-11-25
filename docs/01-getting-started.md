@@ -3,6 +3,7 @@
 This guide walks through system requirements, installation workflows, production init service integration, and a complete end-to-end tutorial to establish your first encrypted, forward-error-corrected `yip` tunnel between two Linux hosts.
 
 For comprehensive configuration directives and wire protocol internals, refer to:
+- [migrating-from-wireguard.md](migrating-from-wireguard.md): Direct mapping guide for migrating existing Linux WireGuard tunnels to yip.
 - [configuration.md](configuration.md): Exhaustive configuration syntax and option reference.
 - [architecture.md](architecture.md): System architecture, packet pipeline, and crypto engine.
 - [user-guide.md](user-guide.md): Advanced topologies, NAT traversal, and mesh operation.

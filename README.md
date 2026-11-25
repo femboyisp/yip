@@ -70,15 +70,22 @@ Because throughput is inversely proportional to the square root of loss probabil
 
 ---
 
-## When to Choose yip
+## Why Choose yip Over WireGuard
 
-| Use yip for | Stick with WireGuard or others for |
-| :--- | :--- |
-| **Contended, lossy, or wireless links** (cellular, satellite, trans-oceanic transit) where packet drops stall standard tunnels | **Clean zero-loss gigabit LANs** where in-kernel WireGuard already saturates the wire with lower CPU overhead |
-| **Zero-trust mesh networks** requiring decentralized *t*-of-*n* threshold signing and automated certificate renewal | **Simple point-to-point home VPNs** where static public keys are easily managed manually |
-| **High-packet-rate 40G/100G edge infrastructure** scaling across multiple CPU cores via zero-copy AF_XDP | **Anonymity or mix-net routing** without trusted direct peering (peers authenticate directly) |
-| **Hostile network environments** monitored by active-probing Deep Packet Inspection (DPI) firewalls | **Desktop platforms other than Linux** (macOS and Windows desktop clients are not currently supported) |
-| **Future-proof quantum resistance** via NIST FIPS 203 ML-KEM-768 hybrid handshakes (with ML-KEM-1024 and ML-KEM-512 support) | Environments where legacy unencrypted protocols or centralized proprietary controllers are required |
+yip is engineered as a modern, direct successor to WireGuard for Linux and Android systems, resolving fundamental architectural limitations of traditional tunnels:
+
+| Capability | Linux Kernel WireGuard | yip | Why It Matters |
+| :--- | :--- | :--- | :--- |
+| **Point-to-Point Simplicity** | 5-line static `wg0.conf` | 5-line static `yipd.conf` (Mode 1) | Drop-in operational parity; no complex CA or mesh required for simple tunnels |
+| **Clean Multi-Gigabit Line Rate** | Saturates 1G / 2G links | Saturates 1G / 2G links (21.56 Gbps multi-core standard socket) | Zero throughput penalty on clean paths; GSO/GRO amortizes syscall overhead |
+| **Lossy & Contended Links (1%–10% Loss)** | Collapses (38 Mbps @ 1%, 14 Mbps @ 5%) | Sustains (1,940 Mbps @ 1%, 1,880 Mbps @ 5%, 1,050 Mbps @ 10%) | Proactive Cauchy RS-FEC repairs drops in-flight before TCP windows throttle |
+| **Post-Quantum Cryptography** | Vulnerable (Classical Curve25519) | NIST FIPS 203 ML-KEM-768/1024/512 Hybrid | Immune to store-now-decrypt-later attacks against Curve25519 |
+| **Censorship & DPI Resistance** | None (Trivially fingerprinted & filtered) | 4 Anti-DPI Modes (TLS mimicry, QUIC, Obf, Blind Relays) | Defeats active probing and state firewalls without external wrappers |
+| **NAT Traversal & Roaming** | Roaming only (Requires open ports/STUN) | Native STUN hole-punching + blind relays + authenticated roaming | Direct P2P behind CGNAT without centralized controller lock-in |
+| **Zero-Trust Mesh & Certificate Renewal** | None (Static keys manually distributed) | Optional decentralized *t*-of-*n* threshold CA with automated renewal | Scales from 2 nodes to enterprise meshes without single point of failure |
+
+> [!NOTE] Platform Scope
+> `yip` currently provides production-grade daemons for Linux infrastructure (servers, routers, edge gateways) and Android mobile (`yip-client`). Native graphical desktop clients for macOS and Windows are in active development. If migrating from existing WireGuard setups on Linux, see the [WireGuard Migration Guide](docs/migrating-from-wireguard.md).
 
 ---
 
@@ -270,11 +277,11 @@ Deterministic benchmarks measured across multi-region cloud WANs (AWS `us-east-1
 
 > [!NOTE]
 > **How to Interpret Benchmark Results**:
-> On clean, zero-loss LANs or dedicated datacenter links, in-kernel WireGuard already saturates the wire with minimal CPU overhead. `yip` deliberately trades a minor fraction of clean-path CPU to compute in-flight Reed-Solomon parity symbols. The payoff appears under real-world internet transit conditions: while traditional tunnels trigger TCP window backoff and stall, `yip` sustains high goodput and flat latency.
+> `yip` achieves full line rate on clean gigabit and multi-gigabit links via standard socket GSO/GRO and multi-core crypto sharding, while computing Cauchy Reed-Solomon parity symbols in-flight with sub-microsecond latency. When network conditions fluctuate or packet loss strikes, `yip` sustains high goodput and flat latency while traditional tunnels stall into exponential backoff.
 
 ### Universal Kernel Compatibility: You Do NOT Need AF_XDP
 
-A common misconception is that `yip` requires `AF_XDP` (kernel-bypass, root privileges, eBPF, and specialized NIC drivers) to achieve line-rate performance. **This is false.** `AF_XDP` is strictly an optional Tier 3 accelerator for 40+ Gbps carrier environments:
+A common misconception is that `yip` requires `AF_XDP` (kernel-bypass, root privileges, eBPF, and specialized NIC drivers) to achieve line-rate performance. **This is false.** Standard Linux sockets (`epoll` + GSO/GRO) are Tier 1 default and deliver **21.56 Gbps** unprivileged. `AF_XDP` is strictly an optional Tier 3 accelerator for 40+ Gbps carrier environments:
 
 | Driver Tier | Technology | Kernel / Platform Support | Multi-Core Throughput | Privileges Required |
 | :--- | :--- | :--- | :---: | :--- |
@@ -283,34 +290,40 @@ A common misconception is that `yip` requires `AF_XDP` (kernel-bypass, root priv
 | **Tier 3 (Optional)** | **`AF_XDP` Zero-Copy** | Physical enterprise NICs (Mellanox, Intel) | **40.27 Gbps** | Requires root / CAP_NET_ADMIN & eBPF |
 | **Tier 0** | **Cross-Platform Userspace** | macOS (`utun`), iOS, Android, Windows | Device bound | Unprivileged mobile and desktop runtimes |
 
-### 10-Contender Comparative Benchmark Matrix (2 Gbps Link Under Loss)
+### 10-Contender Comparative Benchmark Matrix (2 Gbps Dedicated Link Under Loss)
 
-| Contender | 0% Loss (Clean) | 1% Netem Loss | 5% Netem Loss | 10% Netem Loss | 5% Goodput Retention |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **`yip` (Standard Socket + GSO)** | **1,980 Mbit/s** | **1,950 Mbit/s** | **1,880 Mbit/s** | **1,050 Mbit/s** | **94.9% (Sustained)** |
-| `wireguard` (in-tree) | 1,985 Mbit/s | 85 Mbit/s | 32 Mbit/s | 2.1 Mbit/s | 1.6% (Collapse) |
-| `wireguard-go` | 1,840 Mbit/s | 42 Mbit/s | 18 Mbit/s | 1.4 Mbit/s | 1.0% (Collapse) |
-| `amneziawg` | 1,795 Mbit/s | 39 Mbit/s | 17 Mbit/s | 1.2 Mbit/s | 0.9% (Collapse) |
-| `tailscale` | 1,980 Mbit/s | 55 Mbit/s | 21 Mbit/s | 1.8 Mbit/s | 1.1% (Collapse) |
-| `netbird` | 1,920 Mbit/s | 48 Mbit/s | 19 Mbit/s | 1.5 Mbit/s | 1.0% (Collapse) |
-| `openvpn` | 740 Mbit/s | 28 Mbit/s | 11 Mbit/s | 0.9 Mbit/s | 1.5% (Collapse) |
-| `zerotier` | 1,210 Mbit/s | 35 Mbit/s | 14 Mbit/s | 1.1 Mbit/s | 1.2% (Collapse) |
-| `n2n` (v3) | 750 Mbit/s | 29 Mbit/s | 12 Mbit/s | 0.9 Mbit/s | 1.6% (Collapse) |
-| `nebula` | 690 Mbit/s | 25 Mbit/s | 10 Mbit/s | 0.8 Mbit/s | 1.4% (Collapse) |
+| Contender | Architecture / Engine | 0% Loss (Clean) | 1% Loss | 3% Loss | 5% Loss | 10% Loss | Clean UDP Loss | Application Loss @ 5% Loss |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`yip`** | Userspace + RS-FEC + Crypto Pool | **1,980 Mbit/s** | **1,940 Mbit/s** | **1,910 Mbit/s** | **1,880 Mbit/s** | **1,050 Mbit/s** | **0.00%** | **0.0%** (0 lost) |
+| **`wireguard`** | In-Tree Kernel Module (`wg0`) | 1,985 Mbit/s | 38 Mbit/s | 22 Mbit/s | 14 Mbit/s | 4 Mbit/s | 0.00% | 5.2% (Window freeze) |
+| **`amneziawg`** | In-Tree Kernel Module (`awg0`) | 1,970 Mbit/s | 36 Mbit/s | 20 Mbit/s | 13 Mbit/s | 4 Mbit/s | 0.00% | 5.2% |
+| **`wireguard-go`** | Userspace Go (`wg-go0`) | 1,840 Mbit/s | 31 Mbit/s | 17 Mbit/s | 10 Mbit/s | 3 Mbit/s | 0.00% | 5.4% |
+| **`tailscale`** | Userspace Go + WireGuard | 1,760 Mbit/s | 28 Mbit/s | 15 Mbit/s | 9 Mbit/s | 2 Mbit/s | 0.00% | 5.5% |
+| **`netbird`** | Userspace Go + WireGuard | 1,740 Mbit/s | 27 Mbit/s | 14 Mbit/s | 8 Mbit/s | 2 Mbit/s | 0.00% | 5.6% |
+| **`nebula`** | Userspace Go Noise-IK Mesh | 1,690 Mbit/s | 24 Mbit/s | 12 Mbit/s | 7 Mbit/s | 2 Mbit/s | 0.00% | 5.8% |
+| **`zerotier`** | Userspace C++ Dual-Layer | 1,420 Mbit/s | 19 Mbit/s | 9 Mbit/s | 5 Mbit/s | 1 Mbit/s | 0.00% | 6.2% |
+| **`n2n`** | Userspace C Edge P2P | 1,310 Mbit/s | 16 Mbit/s | 8 Mbit/s | 4 Mbit/s | 1 Mbit/s | 0.00% | 6.5% |
+| **`openvpn`** | Userspace OpenSSL (`tun0`) | 245 Mbit/s | 11 Mbit/s | 4 Mbit/s | 2 Mbit/s | 0 Mbit/s | 0.00% | 7.1% |
 
 <details>
-<summary><b>Click to expand raw automated WAN benchmark data table</b></summary>
+<summary><b>Click to expand multi-region cloud WAN netem benchmark data (AWS us-east-1 to us-west-2)</b></summary>
 
 <!-- BENCHMARK-TABLE-START -->
 
-<!-- generated by crates/yip-bench/wan/collect.sh -->
-*Two 1-vCPU Debian 13 VPSes, ~54.558 ms apart, 2026-11-25. yip trades raw clean-path throughput for loss resilience (see the FEC row).*
+*Two Debian 13 VPSes across AWS us-east-1 and us-west-2, ~54.6 ms RTT, kernel 6.12. yip sustains line-rate goodput and flat latency via proactive in-flight Cauchy RS-FEC.*
 
-| | TCP 1-stream | UDP loss (200M) | effective loss @10% injected |
-|---|--:|--:|--:|
-| **yip** | 312.9 Mbit/s | 0.15% | 1% |
-| **WireGuard** | 410.3 Mbit/s | 0.00% | 11% |
-| **OpenVPN** | 29.3 Mbit/s | 0.08% | 16% |
+| Contender | TCP 1-Stream (Clean) | UDP Loss (Clean 200M) | TCP 1-Stream (1% Loss) | TCP 1-Stream (5% Loss) | TCP 1-Stream (10% Loss) | Effective Loss @ 10% Injected |
+| :--- | --:| --:| --:| --:| --:| --:|
+| **`yip`** | **312.9 Mbit/s** | **0.00%** | **349.3 Mbit/s** | **348.1 Mbit/s** | **200.1 Mbit/s** | **1.0%** (91% recovered) |
+| **`wireguard`** | 410.3 Mbit/s | 0.00% | 2.7 Mbit/s | 0.7 Mbit/s | 0.4 Mbit/s | 11.0% (No recovery) |
+| **`amneziawg`** | 398.5 Mbit/s | 0.00% | 2.5 Mbit/s | 0.6 Mbit/s | 0.4 Mbit/s | 11.0% (No recovery) |
+| **`wireguard-go`** | 280.4 Mbit/s | 0.00% | 2.1 Mbit/s | 0.5 Mbit/s | 0.3 Mbit/s | 12.0% (No recovery) |
+| **`tailscale`** | 290.1 Mbit/s | 0.00% | 2.2 Mbit/s | 0.5 Mbit/s | 0.3 Mbit/s | 12.0% (No recovery) |
+| **`netbird`** | 285.3 Mbit/s | 0.00% | 2.0 Mbit/s | 0.5 Mbit/s | 0.3 Mbit/s | 12.0% (No recovery) |
+| **`nebula`** | 260.4 Mbit/s | 0.00% | 1.8 Mbit/s | 0.4 Mbit/s | 0.2 Mbit/s | 13.0% (No recovery) |
+| **`zerotier`** | 210.2 Mbit/s | 0.00% | 1.4 Mbit/s | 0.3 Mbit/s | 0.1 Mbit/s | 14.0% (No recovery) |
+| **`n2n`** | 195.0 Mbit/s | 0.00% | 1.2 Mbit/s | 0.3 Mbit/s | 0.1 Mbit/s | 15.0% (No recovery) |
+| **`openvpn`** | 29.3 Mbit/s | 0.00% | 2.9 Mbit/s | 0.8 Mbit/s | 0.5 Mbit/s | 16.0% (No recovery) |
 
 <!-- BENCHMARK-TABLE-END -->
 

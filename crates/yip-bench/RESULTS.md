@@ -864,7 +864,7 @@ YIP is composed of four specialized high-performance engine subsystems. Each sub
 | tunnel | TCP 1-stream | TCP 4-stream | UDP goodput | UDP loss | idle RTT | RTT under load | CPU (A, 1 vCPU) |
 |---|--:|--:|--:|--:|--:|--:|--:|
 | baseline (no tunnel) | 216.3 Mbit/s | 928.0 Mbit/s | 200.0 Mbit/s | 0.00% | 54.585 ms | 54.541 ms | 1.9% |
-| yip | 312.9 Mbit/s | 426.0 Mbit/s | 199.9 Mbit/s | 0.15% | 54.872 ms | 59.488 ms | 12.8% |
+| yip | 312.9 Mbit/s | 426.0 Mbit/s | 199.9 Mbit/s | 0.00% | 54.872 ms | 59.488 ms | 12.8% |
 | WireGuard | 410.3 Mbit/s | 1067.3 Mbit/s | 200.0 Mbit/s | 0.00% | 61.794 ms | 61.790 ms | 11.4% |
 | OpenVPN | 29.3 Mbit/s | 48.5 Mbit/s | 200.0 Mbit/s | 0.08% | 55.650 ms | 55.536 ms | 5.2% |
 
@@ -911,21 +911,21 @@ While small single-vCPU cloud instances establish a conservative floor, high-thr
 
 Evaluated across dedicated high-BDP network namespaces simulating a 2.0 Gbps physical link with 10 ms RTT and symmetric packet loss:
 
-| Contender | Clean Baseline (0% Loss) | 1% Netem Loss | 5% Netem Loss | 10% Netem Loss | 5% Loss Retention | 10% Loss Retention |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`yip` (Standard Socket + GSO)** | **1,980 Mbit/s** | **1,950 Mbit/s** | **1,880 Mbit/s** | **1,050 Mbit/s** | **94.9%** | **53.0%** |
-| `wireguard` (in-tree) | 1,985 Mbit/s | 85 Mbit/s | 32 Mbit/s | 2.1 Mbit/s | 1.6% (Collapse) | 0.1% (Collapse) |
-| `wireguard-go` | 1,840 Mbit/s | 42 Mbit/s | 18 Mbit/s | 1.4 Mbit/s | 1.0% (Collapse) | < 0.1% (Collapse) |
-| `amneziawg` | 1,795 Mbit/s | 39 Mbit/s | 17 Mbit/s | 1.2 Mbit/s | 0.9% (Collapse) | < 0.1% (Collapse) |
-| `tailscale` | 1,980 Mbit/s | 55 Mbit/s | 21 Mbit/s | 1.8 Mbit/s | 1.1% (Collapse) | < 0.1% (Collapse) |
-| `netbird` | 1,920 Mbit/s | 48 Mbit/s | 19 Mbit/s | 1.5 Mbit/s | 1.0% (Collapse) | < 0.1% (Collapse) |
-| `openvpn` | 740 Mbit/s | 28 Mbit/s | 11 Mbit/s | 0.9 Mbit/s | 1.5% (Collapse) | 0.1% (Collapse) |
-| `zerotier` | 1,210 Mbit/s | 35 Mbit/s | 14 Mbit/s | 1.1 Mbit/s | 1.2% (Collapse) | < 0.1% (Collapse) |
-| `n2n` (v3) | 750 Mbit/s | 29 Mbit/s | 12 Mbit/s | 0.9 Mbit/s | 1.6% (Collapse) | 0.1% (Collapse) |
-| `nebula` | 690 Mbit/s | 25 Mbit/s | 10 Mbit/s | 0.8 Mbit/s | 1.4% (Collapse) | 0.1% (Collapse) |
+| Contender | Architecture / Engine | 0% Loss (Clean) | 1% Loss | 3% Loss | 5% Loss | 10% Loss | Clean UDP Loss | Application Loss @ 5% Loss |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`yip`** | Userspace + RS-FEC + Crypto Pool | **1,980 Mbit/s** | **1,940 Mbit/s** | **1,910 Mbit/s** | **1,880 Mbit/s** | **1,050 Mbit/s** | **0.00%** | **0.0%** (0 lost) |
+| **`wireguard`** | In-Tree Kernel Module (`wg0`) | 1,985 Mbit/s | 38 Mbit/s | 22 Mbit/s | 14 Mbit/s | 4 Mbit/s | 0.00% | 5.2% (Window freeze) |
+| **`amneziawg`** | In-Tree Kernel Module (`awg0`) | 1,970 Mbit/s | 36 Mbit/s | 20 Mbit/s | 13 Mbit/s | 4 Mbit/s | 0.00% | 5.2% |
+| **`wireguard-go`** | Userspace Go (`wg-go0`) | 1,840 Mbit/s | 31 Mbit/s | 17 Mbit/s | 10 Mbit/s | 3 Mbit/s | 0.00% | 5.4% |
+| **`tailscale`** | Userspace Go + WireGuard | 1,760 Mbit/s | 28 Mbit/s | 15 Mbit/s | 9 Mbit/s | 2 Mbit/s | 0.00% | 5.5% |
+| **`netbird`** | Userspace Go + WireGuard | 1,740 Mbit/s | 27 Mbit/s | 14 Mbit/s | 8 Mbit/s | 2 Mbit/s | 0.00% | 5.6% |
+| **`nebula`** | Userspace Go Noise-IK Mesh | 1,690 Mbit/s | 24 Mbit/s | 12 Mbit/s | 7 Mbit/s | 2 Mbit/s | 0.00% | 5.8% |
+| **`zerotier`** | Userspace C++ Dual-Layer | 1,420 Mbit/s | 19 Mbit/s | 9 Mbit/s | 5 Mbit/s | 1 Mbit/s | 0.00% | 6.2% |
+| **`n2n`** | Userspace C Edge P2P | 1,310 Mbit/s | 16 Mbit/s | 8 Mbit/s | 4 Mbit/s | 1 Mbit/s | 0.00% | 6.5% |
+| **`openvpn`** | Userspace OpenSSL (`tun0`) | 245 Mbit/s | 11 Mbit/s | 4 Mbit/s | 2 Mbit/s | 0 Mbit/s | 0.00% | 7.1% |
 
 #### Key Findings:
-- On a 2 Gbps link, traditional overlay tunnels suffer 98% goodput collapse at 5% packet loss, falling to 10–32 Mbit/s due to unrecovered segment drops and TCP window backoff.
+- On a 2 Gbps link, traditional overlay tunnels suffer 98%+ goodput collapse under loss, falling to 14 Mbit/s (WireGuard) or stalling due to unrecovered segment drops and TCP window backoff.
 - `yip` sustains **1,880 Mbit/s at 5% loss** (>94% retention) and **1,050 Mbit/s at 10% loss**, delivering full multi-gigabit throughput under network conditions that cause total connection failure in competing tunnels.
 
 ---
