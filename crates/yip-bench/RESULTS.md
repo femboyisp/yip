@@ -851,9 +851,9 @@ YIP is composed of four specialized high-performance engine subsystems. Each sub
 
 ### Conditions
 
-- **Hosts:** `EC2 us-east-1 (t3.small)` ↔ `EC2 us-west-2 (t3.small)` (two 1-vCPU / ~1 GB Debian 13 VPSes, kernel 6.12.63+deb13-cloud-amd64)
-- **Baseline path:** ~54.365 ms RTT, single Gbit links
-- **Date / commit:** 2026-10-27T14:51:10Z / `4491d57`
+- **Hosts:** `EC2 us-east-1 (t3.small)` ↔ `EC2 us-west-2 (t3.small)` (two 1-vCPU / ~1 GB Debian 13 VPSes, kernel 6.12.118+deb13-cloud-amd64)
+- **Baseline path:** ~54.558 ms RTT, single Gbit links
+- **Date / commit:** 2026-11-25T18:05:06Z / `882b61a`
 - **Host tuning (applied equally, all tunnels):** `net.core.rmem_max=net.core.wmem_max=16 MiB` (so yipd's userspace 4 MiB socket buffers take effect; in-kernel WireGuard is unaffected)
 - **All tunnels:** UDP outer transport, MTU 1380; yip `transport=raw` (epoll driver — kernel 6.12 has no io_uring multishot recv, #25); WireGuard kernel module; OpenVPN static-key AES-256-GCM
 
@@ -863,10 +863,10 @@ YIP is composed of four specialized high-performance engine subsystems. Each sub
 
 | tunnel | TCP 1-stream | TCP 4-stream | UDP goodput | UDP loss | idle RTT | RTT under load | CPU (A, 1 vCPU) |
 |---|--:|--:|--:|--:|--:|--:|--:|
-| baseline (no tunnel) | 390.7 Mbit/s | 906.1 Mbit/s | 200.0 Mbit/s | 0.00% | 54.365 ms | 54.360 ms | 1.7% |
-| yip | 253.7 Mbit/s | 350.7 Mbit/s | 200.0 Mbit/s | 0.00% | 55.288 ms | 56.051 ms | 12.5% |
-| WireGuard | 453.1 Mbit/s | 1077.7 Mbit/s | 200.0 Mbit/s | 0.00% | 54.981 ms | 55.067 ms | 11.2% |
-| OpenVPN | 32.6 Mbit/s | 35.6 Mbit/s | 200.0 Mbit/s | 0.04% | 54.745 ms | 54.661 ms | 3.7% |
+| baseline (no tunnel) | 216.3 Mbit/s | 928.0 Mbit/s | 200.0 Mbit/s | 0.00% | 54.585 ms | 54.541 ms | 1.9% |
+| yip | 312.9 Mbit/s | 426.0 Mbit/s | 199.9 Mbit/s | 0.15% | 54.872 ms | 59.488 ms | 12.8% |
+| WireGuard | 410.3 Mbit/s | 1067.3 Mbit/s | 200.0 Mbit/s | 0.00% | 61.794 ms | 61.790 ms | 11.4% |
+| OpenVPN | 29.3 Mbit/s | 48.5 Mbit/s | 200.0 Mbit/s | 0.08% | 55.650 ms | 55.536 ms | 5.2% |
 
 ### Loss resilience (netem injected on the A→B outer path)
 
@@ -875,20 +875,20 @@ Effective end-to-end loss (ping) — lower is better; yip's FEC recovers what th
 | injected loss | baseline (no tunnel) | yip | WireGuard | OpenVPN |
 |---|--:|--:|--:|--:|
 | 0% | 0% | 0% | 0% | 0% |
-| 1% | 0% | 0% | 0% | 0% |
-| 3% | 0% | 0% | 2% | 1% |
-| 5% | 1% | 0% | 2% | 4% |
-| 10% | 9% | 0% | 7% | 8% |
+| 1% | 2% | 0% | 4% | 0% |
+| 3% | 4% | 0% | 4% | 1% |
+| 5% | 3% | 0% | 6% | 5% |
+| 10% | 11% | 1% | 11% | 16% |
 
 TCP goodput under the same injected loss (Mbit/s):
 
 | injected loss | baseline (no tunnel) | yip | WireGuard | OpenVPN |
 |---|--:|--:|--:|--:|
-| 0% | 497.9 | 307.2 | 455.6 | 27.7 |
-| 1% | 32.8 | 310.5 | 2.1 | 3.7 |
-| 3% | 2.2 | 179.3 | 1.3 | 1.2 |
-| 5% | 1.6 | 232.6 | 1.2 | 1.0 |
-| 10% | 0.7 | 44.2 | 0.6 | 0.6 |
+| 0% | 153.1 | 412.0 | 410.5 | 30.4 |
+| 1% | 3.8 | 349.3 | 2.7 | 2.9 |
+| 3% | 1.8 | 372.3 | 1.1 | 1.0 |
+| 5% | 1.0 | 348.1 | 0.7 | 0.8 |
+| 10% | 0.8 | 200.1 | 0.4 | 0.5 |
 
 ### Reproduce
 ```sh

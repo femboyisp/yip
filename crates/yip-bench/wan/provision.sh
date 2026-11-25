@@ -66,14 +66,16 @@ tune_sysctls() {
 # ── yip tunnel ──────────────────────────────────────────────────────────────
 setup_yip() {
     log "bringing up yip tunnel ($YIP_A <-> $YIP_B, udp/$YIP_PORT, transport=raw)"
-    local ka kb pa pb sa sb
+    local ka kb pa pb sa sb pqa pqb
     ka="$("$REPO_ROOT/target/release/yipd" --genkey)"
     kb="$("$REPO_ROOT/target/release/yipd" --genkey)"
-    pa="$(sed -n 's/public=//p'  <<<"$ka")"; sa="$(sed -n 's/private=//p' <<<"$ka")"
-    pb="$(sed -n 's/public=//p'  <<<"$kb")"; sb="$(sed -n 's/private=//p' <<<"$kb")"
+    pa="$(sed -n 's/^public=//p'  <<<"$ka")"; sa="$(sed -n 's/^private=//p' <<<"$ka")"
+    pb="$(sed -n 's/^public=//p'  <<<"$kb")"; sb="$(sed -n 's/^private=//p' <<<"$kb")"
+    pqa="$(sed -n 's/^pq_public=//p' <<<"$ka")"
+    pqb="$(sed -n 's/^pq_public=//p' <<<"$kb")"
 
     local tmp="$SUITE_DIR/results/.yipconf"; mkdir -p "$tmp"
-    _yip_conf() { # <priv> <pub> <peerpub> <peer_ip> > file
+    _yip_conf() { # <priv> <pub> <peerpub> <peer_ip> <peer_pq_pub> > file
         cat <<EOF
 local_private=$1
 local_public=$2
@@ -83,10 +85,11 @@ device_kind=tun
 [peer]
 public_key=$3
 endpoint=$4:$YIP_PORT
+pq_public_key=$5
 EOF
     }
-    _yip_conf "$sa" "$pa" "$pb" "$HOST_B" > "$tmp/a.conf"
-    _yip_conf "$sb" "$pb" "$pa" "$HOST_A" > "$tmp/b.conf"
+    _yip_conf "$sa" "$pa" "$pb" "$HOST_B" "$pqb" > "$tmp/a.conf"
+    _yip_conf "$sb" "$pb" "$pa" "$HOST_A" "$pqa" > "$tmp/b.conf"
     put_A "$tmp/a.conf" "$REMOTE_ETC/yip.conf"
     put_B "$tmp/b.conf" "$REMOTE_ETC/yip.conf"
 
@@ -179,7 +182,7 @@ verify() {
     for t in "yip:$YIP_B" "wireguard:$WG_B" "openvpn:$OVPN_B"; do
         local name="${t%%:*}" dst="${t##*:}" out
         out="$(Aq "ping -c 5 -i 0.3 -W 2 $dst | tail -2 | tr '\n' ' '")"
-        if grep -q "0% packet loss" <<<"$out"; then
+        if grep -q -E '\b0% packet loss' <<<"$out"; then
             log "  $name: UP  ($(grep -oE 'rtt[^ ]* = [0-9./]+ ms' <<<"$out" | head -1))"
         else
             warn "  $name: DOWN — $out"; ok=0
