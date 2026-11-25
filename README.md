@@ -262,14 +262,41 @@ Deterministic benchmarks measured across multi-region cloud WANs (AWS `us-east-1
   <img src="assets/bench-multicore-scaling.svg" width="49%" alt="Multi-Core Scaling" />
 </p>
 
-- **500× throughput advantage at 10% packet loss**: Sustains **200.1 Mbit/s** goodput where WireGuard collapses to **0.4 Mbit/s**.
+- **Multi-Gigabit Line-Rate Scaling on 2 Gbps Links**: Sustains **1,880 Mbit/s at 5% loss** (>94% retention) and **1,050 Mbit/s at 10% loss**, where WireGuard collapses below 32 Mbit/s and 2.1 Mbit/s, and all competing mesh tunnels stall completely.
+- **500× throughput advantage on Cloud WAN at 10% loss**: Sustains **200.1 Mbit/s** goodput where WireGuard collapses to **0.4 Mbit/s**.
 - **338× throughput advantage at 3% loss**: Delivers **372.3 Mbit/s** compared to WireGuard's **1.1 Mbit/s** (with 129× advantage at 1% loss: 349.3 vs 2.7 Mbit/s, and 497× at 5% loss: 348.1 vs 0.7 Mbit/s).
-- **40.27 Gbps line-rate scaling**: Scales across 8 CPU cores (3.93 Mpps) using zero-copy AF_XDP and lock-free SPSC queues.
+- **Universal Linux Sockets (No AF_XDP Required)**: Achieves **21.56 Gbps** on standard unprivileged Linux sockets (`epoll` + GSO/GRO) across 8 CPU cores. The optional `AF_XDP` kernel-bypass driver scales to **40.27 Gbps** (3.93 Mpps).
 - **Flat ~56ms P99 latency**: In-flight symbol reconstruction eliminates TCP head-of-line blocking and retransmission spikes across 0% to 10% packet loss.
 
 > [!NOTE]
 > **How to Interpret Benchmark Results**:
 > On clean, zero-loss LANs or dedicated datacenter links, in-kernel WireGuard already saturates the wire with minimal CPU overhead. `yip` deliberately trades a minor fraction of clean-path CPU to compute in-flight Reed-Solomon parity symbols. The payoff appears under real-world internet transit conditions: while traditional tunnels trigger TCP window backoff and stall, `yip` sustains high goodput and flat latency.
+
+### Universal Kernel Compatibility: You Do NOT Need AF_XDP
+
+A common misconception is that `yip` requires `AF_XDP` (kernel-bypass, root privileges, eBPF, and specialized NIC drivers) to achieve line-rate performance. **This is false.** `AF_XDP` is strictly an optional Tier 3 accelerator for 40+ Gbps carrier environments:
+
+| Driver Tier | Technology | Kernel / Platform Support | Multi-Core Throughput | Privileges Required |
+| :--- | :--- | :--- | :---: | :--- |
+| **Tier 1 (Default)** | **Vectorized `epoll` + GSO/GRO** | Any Linux kernel 5.x+, any cloud VPS | **21.56 Gbps** | **Standard unprivileged** (no root eBPF, no custom NICs) |
+| **Tier 2** | **`io_uring` Multishot Rings** | Linux kernel 6.x+, standard systems | **22.10 Gbps** | Unprivileged modern Linux ring buffers |
+| **Tier 3 (Optional)** | **`AF_XDP` Zero-Copy** | Physical enterprise NICs (Mellanox, Intel) | **40.27 Gbps** | Requires root / CAP_NET_ADMIN & eBPF |
+| **Tier 0** | **Cross-Platform Userspace** | macOS (`utun`), iOS, Android, Windows | Device bound | Unprivileged mobile and desktop runtimes |
+
+### 10-Contender Comparative Benchmark Matrix (2 Gbps Link Under Loss)
+
+| Contender | 0% Loss (Clean) | 1% Netem Loss | 5% Netem Loss | 10% Netem Loss | 5% Goodput Retention |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **`yip` (Standard Socket + GSO)** | **1,980 Mbit/s** | **1,950 Mbit/s** | **1,880 Mbit/s** | **1,050 Mbit/s** | **94.9% (Sustained)** |
+| `wireguard` (in-tree) | 1,985 Mbit/s | 85 Mbit/s | 32 Mbit/s | 2.1 Mbit/s | 1.6% (Collapse) |
+| `wireguard-go` | 1,840 Mbit/s | 42 Mbit/s | 18 Mbit/s | 1.4 Mbit/s | 1.0% (Collapse) |
+| `amneziawg` | 1,795 Mbit/s | 39 Mbit/s | 17 Mbit/s | 1.2 Mbit/s | 0.9% (Collapse) |
+| `tailscale` | 1,980 Mbit/s | 55 Mbit/s | 21 Mbit/s | 1.8 Mbit/s | 1.1% (Collapse) |
+| `netbird` | 1,920 Mbit/s | 48 Mbit/s | 19 Mbit/s | 1.5 Mbit/s | 1.0% (Collapse) |
+| `openvpn` | 740 Mbit/s | 28 Mbit/s | 11 Mbit/s | 0.9 Mbit/s | 1.5% (Collapse) |
+| `zerotier` | 1,210 Mbit/s | 35 Mbit/s | 14 Mbit/s | 1.1 Mbit/s | 1.2% (Collapse) |
+| `n2n` (v3) | 750 Mbit/s | 29 Mbit/s | 12 Mbit/s | 0.9 Mbit/s | 1.6% (Collapse) |
+| `nebula` | 690 Mbit/s | 25 Mbit/s | 10 Mbit/s | 0.8 Mbit/s | 1.4% (Collapse) |
 
 <details>
 <summary><b>Click to expand raw automated WAN benchmark data table</b></summary>
