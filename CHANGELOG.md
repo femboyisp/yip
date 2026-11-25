@@ -22,6 +22,12 @@ All notable changes to this project are documented here, following
   - Added strict SHA-256 verification before extracting `musl.cc` cross-compilation toolchains in the release workflow.
 
 ### Added
+- **AWS Inter-Region WAN Benchmark Suite, Empirical Dataset Refresh & Documentation Modernization (`crates/yip-bench`, `docs`, `README.md`, #263).**
+  - Executed automated ephemeral EC2 benchmark sweep across AWS `us-east-1` (North Virginia) and `us-west-2` (Oregon) under Linux kernel 6.12 (`882b61a`), updating the authoritative multi-region WAN loss matrix (0%, 1%, 3%, 5%, 10% packet loss) in `crates/yip-bench/wan/results/history.csv` and `RESULTS.md`.
+  - Documented empirical throughput multipliers demonstrating `yip`'s 129x advantage at 1% loss (349.3 Mbit/s vs 2.7 Mbit/s), 338x advantage at 3% loss (372.3 Mbit/s vs 1.1 Mbit/s), 497x advantage at 5% loss (348.1 Mbit/s vs 0.7 Mbit/s), and 500x advantage at 10% loss (200.1 Mbit/s vs 0.4 Mbit/s) compared to Linux kernel WireGuard, with 0% effective application packet loss up to 5% channel degradation.
+  - Regenerated all deterministic SVG benchmark graphs (`bench-throughput-loss.svg`, `bench-fec-recovery.svg`, `bench-multicore-scaling.svg`, `bench-latency-jitter.svg`) and verified XML determinism via `python3 crates/yip-bench/generate-graphs.py --check`.
+  - Synchronized `docs/05-benchmarking-and-performance.md` and `README.md` with fresh AWS WAN measurements, updated collapsible summary tables, and full 10-contender comparative matrix under clean and 5% loss conditions.
+  - Documented the parallel cryptographic worker pool subsystem (`OutboundCryptoPool` and `InboundCryptoPool`) in `docs/03-architecture.md`, detailing lock-free SPSC task rings, zero-contention batch nonce reservations, monotonic sequence retirement via `ReorderBuffer`, and the `crypto_workers` configuration setting and CLI flag.
 - **Parallel Crypto Worker Pool for Single-Stream Line-Rate Scaling (`bin/yipd`, `crates/yip-crypto`, #252).**
   - Implemented dedicated SPSC ring-buffer crypto worker pool (`OutboundCryptoPool` and `InboundCryptoPool`) distributing ChaCha20-Poly1305 AEAD sealing and opening across multiple dedicated worker threads while maintaining strict in-order sequence reassembly via `ReorderBuffer`.
   - Added monotonic batch nonce reservation (`reserve_counters`) in `Session` to safely pipeline concurrent multi-threaded sealing without lock contention.
