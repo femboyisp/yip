@@ -665,9 +665,9 @@ def generate_multicore_scaling_chart(data: dict | None = None) -> str:
 
     # Legend at Row 3 (y = 84)
     legend_items = [
-        ("AF_XDP Zero-Copy", COLOR_AF_XDP, False),
-        ("io_uring batch", COLOR_IO_URING, False),
-        ("Vectorized epoll", COLOR_EPOLL, False),
+        ("AF_XDP (Optional)", COLOR_AF_XDP, False),
+        ("io_uring Multishot", COLOR_IO_URING, False),
+        ("Standard Socket (epoll+GSO)", COLOR_EPOLL, False),
     ]
     cur_lx = plot_left
     for label, color, dashed in legend_items:

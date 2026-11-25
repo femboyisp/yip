@@ -29,8 +29,20 @@ CSV_FILE="$RESULTS_DIR/wan.csv"; echo "$CSV_HEADER" > "$CSV_FILE"
 log "results -> $CSV_FILE (egress=$EGRESS, dur=${DUR}s)"
 
 # tunnel -> B-side overlay IP the client on A dials ("" = baseline public IP)
-declare -A DST=( [baseline]="$HOST_B" [yip]="$YIP_B" [wireguard]="$WG_B" [openvpn]="$OVPN_B" )
-TUNNELS=(baseline yip wireguard openvpn)
+declare -A DST=(
+    [baseline]="$HOST_B"
+    [yip]="$YIP_B"
+    [wireguard]="$WG_B"
+    [wireguard-go]="$WGGO_B"
+    [amneziawg]="$AWG_B"
+    [openvpn]="$OVPN_B"
+    [n2n]="$N2N_B"
+    [zerotier]="$ZT_B"
+    [tailscale]="$TS_B"
+    [netbird]="$NB_B"
+    [nebula]="$NEB_B"
+)
+TUNNELS=(baseline yip wireguard wireguard-go amneziawg openvpn n2n zerotier tailscale netbird nebula)
 
 # ── iperf3 server on B (whole-suite) ────────────────────────────────────────
 iperf_up()   { B "systemctl reset-failed yipbench-iperf 2>/dev/null; systemctl stop yipbench-iperf 2>/dev/null; \
@@ -150,13 +162,19 @@ mgen_media() { # <tunnel> <dst> — periodic ~8Mbit/s media flow at 3% injected 
 set +e
 iperf_up
 for t in "${TUNNELS[@]}"; do
-    log "── tunnel: $t (dst ${DST[$t]}) ──────────────────────────────"
-    tcp_tput "$t" "${DST[$t]}" 1
-    tcp_tput "$t" "${DST[$t]}" 4
-    udp_tput "$t" "${DST[$t]}"
-    latency_load "$t" "${DST[$t]}"
-    cpu_headroom "$t" "${DST[$t]}"
-    loss_sweep "$t" "${DST[$t]}"
-    [[ "${RUN_MGEN:-0}" == "1" ]] && mgen_media "$t" "${DST[$t]}"
+    dst="${DST[$t]}"
+    [[ -z "$dst" ]] && continue
+    if ! Aq "ping -c 2 -W 1 $dst >/dev/null 2>&1"; then
+        warn "── tunnel: $t ($dst) not reachable; skipping"
+        continue
+    fi
+    log "── tunnel: $t (dst $dst) ──────────────────────────────"
+    tcp_tput "$t" "$dst" 1
+    tcp_tput "$t" "$dst" 4
+    udp_tput "$t" "$dst"
+    latency_load "$t" "$dst"
+    cpu_headroom "$t" "$dst"
+    loss_sweep "$t" "$dst"
+    [[ "${RUN_MGEN:-0}" == "1" ]] && mgen_media "$t" "$dst"
 done
 log "matrix complete -> $CSV_FILE"

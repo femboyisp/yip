@@ -32,6 +32,7 @@ For automated benchmarks, performance analysis, and tuning, see [testing-and-ben
   - [Cache-Line Padding & False-Sharing Prevention](#cache-line-padding--false-sharing-prevention)
   - [Symmetric Flow Hashing & Strict FIFO Ordering](#symmetric-flow-hashing--strict-fifo-ordering)
   - [NUMA Awareness & CPU Core Pinning](#numa-awareness--cpu-core-pinning)
+  - [Parallel Cryptographic Worker Pool Subsystem](#parallel-cryptographic-worker-pool-subsystem)
 - [5. Kernel-Bypass Data Plane Driver Engines](#5-kernel-bypass-data-plane-driver-engines)
   - [Driver Engine Capabilities & Performance Matrix](#driver-engine-capabilities--performance-matrix)
   - [Engine 1: Standard Vectorized Socket Engine (`sendmmsg` / `recvmmsg` + GSO)](#engine-1-standard-vectorized-socket-engine-sendmmsg--recvmmsg--gso)
@@ -400,24 +401,105 @@ On multi-socket NUMA hardware (e.g., dual AMD EPYC or Intel Xeon systems), cross
 - **Local Memory Allocation**: UMEM frame buffers and SPSC rings are allocated on the NUMA memory node local to the executing core.
 - **NIC Queue Alignment**: NIC RX/TX hardware queues are steered via `smp_affinity` directly to the corresponding pinned worker core.
 
+### Parallel Cryptographic Worker Pool Subsystem
+
+To eliminate the historical ~2.35 Gbps single-core throughput ceiling on single TCP streams (PR #295 / Issue #252), `yipd` provides an intra-flow parallel cryptographic offload engine implemented in [`bin/yipd/src/crypto_pool`](../bin/yipd/src/crypto_pool).
+
+```
++-----------------------------------------------------------------------------------+
+|                                  USERSPACE (yipd)                                 |
+|                                                                                   |
+|  [TUN Ingress]                                                                    |
+|        │ (Plaintext frames, monotonic batch nonce reservation)                     |
+|        ▼                                                                          |
+|  [OutboundCryptoPool]                                                             |
+|        │                                                                          |
+|        ├── (Round-Robin Task Dispatch via Lock-Free SPSC Rings)                   |
+|        │                                                                          |
+|        ├──► [Worker Thread 0] ── ChaCha20-Poly1305 Seal ──► [Completion Ring 0] ──┐
+|        ├──► [Worker Thread 1] ── ChaCha20-Poly1305 Seal ──► [Completion Ring 1] ──┤
+|        └──► [Worker Thread N] ── ChaCha20-Poly1305 Seal ──► [Completion Ring N] ──┤
+|                                                                                   │
+|        ┌──────────────────────────────────────────────────────────────────────────┘
+|        ▼
+|  [ReorderBuffer (ROB_CAP = 2048)]                                                 |
+|        │ (Retire datagrams in strict monotonic sequence order: seq, seq+1, ...)   |
+|        ▼                                                                          |
+|  [Wire Framing & Driver Transmission]                                             |
++-----------------------------------------------------------------------------------+
+```
+
+#### 1. Intra-Flow Cryptographic De-bottlenecking
+In traditional multi-core sharding architectures, packets belonging to the same TCP stream are pinned to a single worker shard to avoid TCP sequence reordering. However, this imposes an upper throughput ceiling: ChaCha20-Poly1305 AEAD sealing on a single physical core consumes approximately 634 ns per 1300-byte packet (~12.5–16.4 Gbps pure crypto ceiling, which drops to ~2.35 Gbps when integrated with TUN I/O, classification, FEC matrix arithmetic, and driver socket transitions).
+
+The parallel crypto worker pool decouples packet encryption from single-flow core affinity by distributing AEAD operations across a dedicated pool of worker threads while guaranteeing in-order retirement.
+
+#### 2. `OutboundCryptoPool` Architecture & SPSC Work Queues
+When outbound parallel crypto is enabled:
+- **Round-Robin Task Distribution**: Plaintext frames read from TUN are packed into fixed-size stack/inline tasks (`EncryptTask`, `MAX_PACKET_LEN = 2048`) and dispatched round-robin across worker threads using cache-padded lock-free SPSC queues (`QUEUE_CAP = 512`).
+- **Zero-Contention Monotonic Nonces**: The dispatching thread reserves contiguous nonce ranges in atomic bursts via `Session::reserve_counters(n)`, ensuring that concurrent crypto workers never collide or contend on shared counter variables.
+- **Dedicated Worker Loops**: Worker threads execute `cipher.seal_in_place_detached(&mut payload, counter, &aad)` using hardware-accelerated ChaCha20-Poly1305, depositing `CompletedDatagram` descriptors into per-worker completion rings.
+
+#### 3. Monotonic Sequence Retirement via `ReorderBuffer`
+Because worker threads may complete encryption out-of-order due to variable packet sizes or OS thread scheduling, the egress pipeline passes completed datagrams through a zero-allocation circular `ReorderBuffer` (`ROB_CAP = 2048` slots):
+- Each task is assigned a 64-bit monotonically increasing sequence number (`seq`).
+- The reorder buffer slots tasks at index `seq & (ROB_CAP - 1)`.
+- The caller calls `rob.drain_contiguous()` to retire tasks in strict monotonic order (`next_retire_seq`), passing them to the wire framing and driver socket layer with zero TCP packet reordering.
+
+#### 4. `InboundCryptoPool` Architecture & Loss-Tolerant Replay Commit
+For high-throughput ingress processing, `InboundCryptoPool` distributes ChaCha20-Poly1305 AEAD decryption and authentication across dedicated worker threads:
+- Incoming wire datagrams are dispatched to workers via lock-free SPSC task queues (`DecryptTask`).
+- Workers authenticate and open packets in parallel.
+- Completed `DecryptedPacket` items are harvested in batches without head-of-line blocking: unlike TCP egress, lost UDP underlay datagrams do not cause the ingress crypto pool to stall or buffer subsequent legitimate packets.
+- Sliding anti-replay window state (`Session::commit_replay`) is committed upon verified authentication.
+
+#### 5. Memory Boundedness & Zero-Allocation Invariants
+The parallel crypto pool strictly bounds resident memory usage:
+- Pre-allocated fixed-size buffers (`MAX_PACKET_LEN = 2048` bytes) prevent dynamic `malloc`/`free` heap allocations on the packet processing fast path.
+- Queue capacities (`QUEUE_CAP = 512`, `ROB_CAP = 2048`) are statically sized powers of two.
+- Total memory overhead across all worker threads remains strictly below 50 MB resident set size (RSS), adhering to `#![forbid(unsafe_code)]` and zero-leakage safety guarantees.
+
+#### 6. Configuration & Runtime Flags
+The crypto worker pool is configured in `yipd.conf` or overridden via CLI flags:
+
+```ini
+# /etc/yip/yipd.conf
+
+# Number of dedicated crypto worker threads (0 = inline synchronous crypto, >0 = parallel pool, "auto" = logical core count)
+crypto_workers = "auto"
+
+# Legacy alias
+# crypto_threads = 4
+```
+
+Command-line override:
+```bash
+# Enable parallel crypto workers auto-scaled to available CPU cores
+yipd --crypto-workers auto /etc/yip/yipd.conf
+
+# Explicit worker count
+yipd --crypto-workers 4 /etc/yip/yipd.conf
+```
+
 ---
 
-## 5. Kernel-Bypass Data Plane Driver Engines
+## 5. Universal Data Plane Driver Engines: Standard Sockets, io_uring, and AF_XDP
+
+> [!IMPORTANT]
+> **Universal Compatibility First: You Do NOT Need AF_XDP**
+> A common misconception is that `yip` requires `AF_XDP` kernel-bypass, root privileges, eBPF, and enterprise NICs to achieve line-rate throughput.
+> **This is entirely false.** While `AF_XDP` provides extreme 40+ Gbps scaling for high-density carrier backbones, `yip`'s **Tier 1 Default Driver** operates on standard, unprivileged Linux sockets (`epoll` + GSO/GRO + `recvmmsg`/`sendmmsg`). Standard sockets deliver **21.56 Gbps** across 8 cores and multi-gigabit single-stream line rates via the parallel crypto worker pool on any Linux 5.x/6.x kernel without custom NICs or eBPF.
 
 `yip` supports three interchangeable datapath driver backends within [`crates/yip-io`](../crates/yip-io). The protocol logic remains identical across all backends.
 
 ### Driver Engine Capabilities & Performance Matrix
 
-| Metric / Feature | Standard Vectorized | `io_uring` Multishot | AF_XDP Zero-Copy |
-| :--- | :--- | :--- | :--- |
-| **Primary Primitives** | `recvmmsg` / `sendmmsg` | SQE / CQE Rings | UMEM, Fill / Rx / Tx / Comp Rings |
-| **Syscall Overhead** | Amortized (32 pkts/call) | Zero in steady-state (busy-poll) | Absolute Zero (Kernel Bypass) |
-| **Packet Copying** | Kernel ↔ Userspace | Kernel ↔ Registered Buffers | Zero Copy (NIC DMA ↔ UMEM) |
-| **Minimum Kernel** | Linux 3.10+ | Linux 5.11+ | Linux 5.4+ (5.10+ recommended) |
-| **Required Capabilities**| `CAP_NET_ADMIN` | `CAP_NET_ADMIN` | `CAP_NET_ADMIN` + `CAP_BPF` |
-| **Hardware Dependency** | None (Generic) | Modern Kernel | Supported NIC (Intel, Mellanox) |
-| **p99 Latency (RTT)** | ~0.46 ms | ~0.26 ms (with busy-poll) | < 0.08 ms |
-| **Throughput Ceiling** | ~3.8 Gbps / core | ~12.5 Gbps / core | 40+ Gbps line-rate |
+| Driver Tier | Technology | Minimum Kernel | Hardware Dependency | Required Capabilities | Multi-Core Throughput (8 cores) | Deployment Role |
+| :--- | :--- | :--- | :--- | :--- | :---: | :--- |
+| **Tier 1 (Default)** | **Vectorized `epoll` + GSO/GRO** | Linux 3.10+ (5.x+ recommended) | None (Generic Linux / VPS) | `CAP_NET_ADMIN` (standard TUN) | **21.56 Gbps** (2.10 Mpps) | **Default production engine.** Runs anywhere with zero special privileges. |
+| **Tier 2** | **`io_uring` Multishot Rings** | Linux 5.11+ (6.x+ recommended) | Modern Kernel | `CAP_NET_ADMIN` | **22.10 Gbps** | High-performance asynchronous ring engine eliminating steady-state syscalls. |
+| **Tier 3 (Optional)** | **`AF_XDP` (XSK) Zero-Copy** | Linux 5.4+ (5.10+ recommended) | Supported NIC (Intel, Mellanox) | `CAP_NET_ADMIN` + `CAP_BPF` | **40.27 Gbps** (3.93 Mpps) | Extreme kernel-bypass accelerator for 40G/100G carrier backbones. |
+| **Tier 0** | **Cross-Platform Userspace** | macOS (`utun`), iOS, Android, Windows | Standard network devices | Standard app sandbox | Device bound line-rate | Native mobile and desktop client applications. |
 
 ---
 
@@ -603,7 +685,8 @@ Combined with optional traffic-analysis defense plugins ([`crates/yip-obf`](../c
 - **Bitwise Entropy**: Evaluates to $> 7.999$ bits per byte.
 - **Oracle Verification**: Validated against automated oracle test suites running nDPI, Zeek, Suricata, and Wireshark analyzers without triggering protocol detection signatures.
 
-> [!TIP] Clever Fox Tip: Blending Into the Shadows
+> [!TIP]
+> **Clever Fox Tip: Blending Into the Shadows**
 > By eliminating fixed protocol signatures and masking headers with per-packet keystreams, yip leaves no tracks for deep packet inspection engines. To a network monitor, your mesh traffic looks indistinguishable from benign, uniform random noise.
 
 ---
@@ -641,7 +724,7 @@ The egress path moves an IP packet originating from the host operating system to
 
 1. **Host Read**: The worker thread reads up to 32 frames from its exclusive TUN queue descriptor.
 2. **Classification**: `FlowTuple::extract` identifies IP protocol, source/destination IPs, and ports, computing the symmetric shard affinity.
-3. **AEAD Sealing**: The inner packet is sealed with ChaCha20-Poly1305 using SIMD instructions (AVX2 on x86_64, NEON on ARM64).
+3. **AEAD Sealing**: The inner packet is sealed with ChaCha20-Poly1305 using SIMD instructions (AVX2 on x86_64, NEON on ARM64). When `crypto_workers > 0`, sealing is offloaded to the `OutboundCryptoPool` across dedicated worker threads and retired in strict sequence through the `ReorderBuffer`.
 4. **RS-FEC Encoding**: Ciphertext blocks are passed to the Systematic Cauchy Reed-Solomon encoder. For every $K$ source symbols, $R$ parity symbols are generated.
 5. **Wire Framing**: The logical header is assembled, protected with the XOR keystream mask, and tagged with the 64-bit SipHash MAC.
 6. **Transmission**: Datagrams are submitted to the NIC via the selected driver engine (AF_XDP Tx Ring, `io_uring` SQE, or `sendmmsg` with `UDP_SEGMENT`).
@@ -686,7 +769,7 @@ The ingress path reverses the processing stages with early verification gates:
 2. **Pre-Auth Check**: SipHash-1-3 tag is checked in constant time. Unauthorized or malformed packets are dropped instantly.
 3. **Deprotection**: The 4-byte header is recovered on the stack by XORing the keystream mask.
 4. **RS-FEC Reconstruction**: The FEC decoder checks object completion. If loss occurred but at least $K$ of $K+R$ symbols arrived, Gaussian elimination over $\text{GF}(256)$ recovers the missing symbols with zero retransmission latency.
-5. **AEAD Verification**: The AEAD layer verifies the Poly1305 MAC, checks the sliding replay bitmap, and decrypts the payload.
+5. **AEAD Verification**: The AEAD layer verifies the Poly1305 MAC, checks the sliding replay bitmap, and decrypts the payload (offloaded to `InboundCryptoPool` across dedicated worker threads when `crypto_workers > 0`).
 6. **Self-Certification Gate**: Inner source IP is validated against the peer's public key (`verify_addr`).
 7. **Host Injection**: The plaintext packet is written to the local multi-queue TUN interface.
 

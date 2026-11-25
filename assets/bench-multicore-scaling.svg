@@ -9,13 +9,13 @@
   <text x="32.00" y="56.00" fill="#8b949e" font-size="12" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="normal" text-anchor="start">Dedicated Multi-Core Testbed: 64 Parallel TCP Streams, Lock-Free SPSC Sharding (AMD Ryzen / EPYC)</text>
   <line x1="92.00" y1="82.00" x2="112.00" y2="82.00" stroke="#fb923c" stroke-width="2.50"/>
   <circle cx="102.00" cy="82.00" r="3.50" fill="#fb923c"/>
-  <text x="118.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">AF_XDP Zero-Copy</text>
-  <line x1="245.20" y1="82.00" x2="265.20" y2="82.00" stroke="#34d399" stroke-width="2.50"/>
-  <circle cx="255.20" cy="82.00" r="3.50" fill="#34d399"/>
-  <text x="271.20" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">io_uring batch</text>
-  <line x1="384.00" y1="82.00" x2="404.00" y2="82.00" stroke="#38bdf8" stroke-width="2.50"/>
-  <circle cx="394.00" cy="82.00" r="3.50" fill="#38bdf8"/>
-  <text x="410.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">Vectorized epoll</text>
+  <text x="118.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">AF_XDP (Optional)</text>
+  <line x1="252.40" y1="82.00" x2="272.40" y2="82.00" stroke="#34d399" stroke-width="2.50"/>
+  <circle cx="262.40" cy="82.00" r="3.50" fill="#34d399"/>
+  <text x="278.40" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">io_uring Multishot</text>
+  <line x1="420.00" y1="82.00" x2="440.00" y2="82.00" stroke="#38bdf8" stroke-width="2.50"/>
+  <circle cx="430.00" cy="82.00" r="3.50" fill="#38bdf8"/>
+  <text x="446.00" y="86.00" fill="#f0f6fc" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="600" text-anchor="start">Standard Socket (epoll+GSO)</text>
   <rect x="552.20" y="72.00" width="252.80" height="24.00" fill="#1f1610" rx="6.00" stroke="#fb923c" stroke-width="1.00"/>
   <text x="678.60" y="88.80" fill="#fb923c" font-size="11" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="bold" text-anchor="middle">40+ Gbps Line-Rate Multi-Core Scaling</text>
   <line x1="92.00" y1="410.00" x2="805.00" y2="410.00" stroke="#21262d" stroke-width="1.00"/>

@@ -215,11 +215,48 @@ impl Transport {
     }
 
     /// Classify an inner packet using the internal flow classifier.
+    ///
+    /// Inspects protocol headers (IPv4, IPv6, TCP, UDP, ICMP) to assign a [`FlowClass`]
+    /// governing FEC redundancy parameters and latency trade-offs.
+    ///
+    /// - `inner`: Raw packet payload (L3 IP packet, or L2 Ethernet frame if `l2` is true).
+    /// - `l2`: Whether the payload begins with an Ethernet header.
+    /// - `now_ms`: Monotonic millisecond timestamp used for flow state and TCP ACK heuristics.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use yip_transport::{FlowClass, Transport};
+    ///
+    /// let mut transport = Transport::new(vec![], 1200);
+    /// let dummy_packet = [
+    ///     0x45, 0x00, 0x00, 0x28, 0, 0, 0, 0, 64, 6, 0, 0,
+    ///     127, 0, 0, 1, 127, 0, 0, 1,
+    /// ];
+    /// let class = transport.classify(&dummy_packet, false, 1000);
+    /// assert_eq!(class, FlowClass::Default);
+    /// ```
     pub fn classify(&mut self, inner: &[u8], l2: bool, now_ms: u64) -> FlowClass {
         self.classifier.classify(inner, l2, now_ms)
     }
 
     /// Zero-allocation encode using an explicit pre-computed `FlowClass`.
+    ///
+    /// Encodes `ciphertext` into Reed-Solomon source and repair symbols using the
+    /// redundancy parameters of `class`, writing symbols into the encoder's reused scratch arena.
+    ///
+    /// Returns a borrowed slice of [`Symbol`]s valid until the next encoding call.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use yip_transport::{FlowClass, Transport};
+    ///
+    /// let mut transport = Transport::new(vec![], 1200);
+    /// let ciphertext = vec![0xAB; 1000];
+    /// let symbols = transport.encode_scratch_with_class(&ciphertext, FlowClass::Default);
+    /// assert!(!symbols.is_empty());
+    /// ```
     pub fn encode_scratch_with_class(&mut self, ciphertext: &[u8], class: FlowClass) -> &[Symbol] {
         let params = self.params_for(class);
         let source = u32::try_from(ciphertext.len().div_ceil(usize::from(params.symbol_size)))

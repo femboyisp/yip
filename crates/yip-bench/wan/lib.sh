@@ -21,9 +21,16 @@ fi
 : "${YIP_PORT:=51833}" "${WG_PORT:=51834}" "${OVPN_PORT:=51835}" "${OVERLAY_MTU:=1380}"
 
 # Overlay addressing (each tunnel on its own /30; A always .1, B always .2).
-YIP_A=10.77.0.1  YIP_B=10.77.0.2
-WG_A=10.77.1.1   WG_B=10.77.1.2
-OVPN_A=10.77.2.1 OVPN_B=10.77.2.2
+YIP_A=10.77.0.1    YIP_B=10.77.0.2
+WG_A=10.77.1.1     WG_B=10.77.1.2
+OVPN_A=10.77.2.1   OVPN_B=10.77.2.2
+WGGO_A=10.77.3.1   WGGO_B=10.77.3.2
+AWG_A=10.77.4.1    AWG_B=10.77.4.2
+N2N_A=10.77.5.1    N2N_B=10.77.5.2
+ZT_A=10.77.6.1     ZT_B=10.77.6.2
+TS_A=10.77.7.1     TS_B=10.77.7.2
+NB_A=10.77.8.1     NB_B=10.77.8.2
+NEB_A=10.77.9.1    NEB_B=10.77.9.2
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new
           -o ServerAliveInterval=5 -i "$SSH_KEY")

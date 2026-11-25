@@ -221,7 +221,7 @@ pub enum Outcome<'a> {
 /// Mutex-free, I/O-free data-plane state machine.
 ///
 /// Owns the AEAD [`yip_crypto::Session`], the FEC [`Transport`], the
-/// [`WireCodec`], and the two auxiliary logs ([`SentLog`], [`RetxBuffer`]).
+/// [`yip_wire::WireCodec`], and the two auxiliary logs ([`SentLog`], [`RetxBuffer`]).
 /// All methods take `&mut self`; no locks are acquired.
 ///
 /// Framed egress datagrams are returned as a borrow of an internal reused

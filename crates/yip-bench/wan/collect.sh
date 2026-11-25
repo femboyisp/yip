@@ -55,8 +55,20 @@ V = {(r['tunnel'], r['profile'], r['param']): r['value'] for r in rows}
 if not base_rtt or base_rtt == '?':
     base_rtt = V.get(('baseline', 'latency', 'idle'), '23.258')
 
-order = ['baseline', 'yip', 'wireguard', 'openvpn']
-label = {'baseline': 'baseline (no tunnel)', 'yip': 'yip', 'wireguard': 'WireGuard', 'openvpn': 'OpenVPN'}
+order = ['baseline', 'yip', 'wireguard', 'wireguard-go', 'amneziawg', 'openvpn', 'n2n', 'zerotier', 'tailscale', 'netbird', 'nebula']
+label = {
+    'baseline': 'baseline (no tunnel)',
+    'yip': 'yip',
+    'wireguard': 'WireGuard',
+    'wireguard-go': 'WireGuard-Go',
+    'amneziawg': 'AmneziaWG',
+    'openvpn': 'OpenVPN',
+    'n2n': 'n2n (v3)',
+    'zerotier': 'ZeroTier',
+    'tailscale': 'Tailscale',
+    'netbird': 'NetBird',
+    'nebula': 'Nebula',
+}
 tuns = [t for t in order if any(k[0] == t for k in V)]
 
 def g(t, prof, param):

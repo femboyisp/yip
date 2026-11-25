@@ -370,7 +370,8 @@ persistent_keepalive = 25  # Sends periodic keepalive every 25 seconds
 ##### Step 3.4: Enable Blind Relay Fallback
 When direct UDP hole-punching fails due to symmetric NAT on both sides, configure blind relay transport fallback. `yip` automatically proxies encrypted ciphertext through the rendezvous node without revealing keys or payload:
 
-> [!TIP] Clever Fox Tip: Nimble Tunneling Around Symmetric NATs
+> [!TIP]
+> **Clever Fox Tip: Nimble Tunneling Around Symmetric NATs**
 > Symmetric NATs try to trap you by randomizing outbound ports for every new destination. When direct hole-punching cannot find an open path, yip doesn't give up: it burrows through via blind relaying. The relay forwards your packets without ever possessing your session keys, keeping the data completely private while punching through otherwise impassable carrier networks.
 
 ```toml

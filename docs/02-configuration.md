@@ -562,7 +562,8 @@ Parameters governing the external wire encapsulation and mimicry costume.
 
 Parameters governing userspace Galois Field $GF(2^8)$ Cauchy Reed-Solomon erasure coding and loss recovery.
 
-> [!TIP] Clever Fox Tip: Dynamic Loss Adaptation
+> [!TIP]
+> **Clever Fox Tip: Dynamic Loss Adaptation**
 > yip doesn't just blast redundant packets blindly. Its Cauchy Reed-Solomon engine continuously gauges link turbulence: on clean links, repair overhead stays at a feather-light 10%, but when packets start disappearing into the void, yip automatically boosts parity output up to 50% to reconstruct your packets without breaking stride.
 
 > [!NOTE]
