@@ -17,7 +17,7 @@ For automated benchmarks, performance analysis, and tuning, see [testing-and-ben
   - [Repository Crate Topology](#repository-crate-topology)
 - [2. Out-of-Band Cryptographic Control Plane](#2-out-of-band-cryptographic-control-plane)
   - [Node Identity Foundation](#node-identity-foundation)
-  - [PQNoise-IKpsk2 Handshake with Hybrid ML-KEM-512](#pqnoise-ikpsk2-handshake-with-hybrid-ml-kem-512)
+  - [PQNoise-IKpsk2 Handshake with Hybrid ML-KEM-768 / 1024 / 512](#pqnoise-ikpsk2-handshake-with-hybrid-ml-kem-768--1024--512)
   - [Handshake Wire Message Breakdown](#handshake-wire-message-breakdown)
   - [120-Second Epoch Ratchet & Rekey Overlap Window](#120-second-epoch-ratchet--rekey-overlap-window)
   - [Topology Orchestration & Blind Relay Signaling](#topology-orchestration--blind-relay-signaling)
@@ -88,7 +88,7 @@ For automated benchmarks, performance analysis, and tuning, see [testing-and-ben
 |                           CONTROL PLANE (Out-of-Band)                            |
 |                                                                                   |
 |  - Ed25519 Node Identity & Root CA Tokens        - Out-of-Band STUN / Relay Coord |
-|  - PQNoise-IKpsk2 + ML-KEM-512 Handshakes        - Dynamic Peer Lifecycle Events  |
+|  - PQNoise-IKpsk2 + ML-KEM-768 Handshakes        - Dynamic Peer Lifecycle Events  |
 |  - 120s Ephemeral Rekey Ratchet Scheduling       - Asynchronous State Replication |
 +-----------------------------------------------------------------------------------+
                                   |
@@ -119,7 +119,7 @@ The `yip` codebase is organized into modular Rust crates with strict interface b
 | Crate | Responsibility | Unsafe Code |
 | :--- | :--- | :--- |
 | [`crates/yip-mesh`](../crates/yip-mesh) | Primary unified SDK facade crate exposing modular feature flags (`crypto`, `wire`, `transport`, `membership`, `device`, `io`, etc.). | `#![forbid(unsafe_code)]` |
-| [`crates/yip-crypto`](../crates/yip-crypto) | Native zero-alloc PQNoise-IKpsk2 state machine, ML-KEM-512 post-quantum KDF, BLAKE3 ratchets, ChaCha20-Poly1305 AEAD, sliding replay window. | `#![forbid(unsafe_code)]` |
+| [`crates/yip-crypto`](../crates/yip-crypto) | Native zero-alloc PQNoise-IKpsk2 state machine, ML-KEM-768/1024/512 post-quantum KDF, BLAKE3 ratchets, ChaCha20-Poly1305 AEAD, sliding replay window. | `#![forbid(unsafe_code)]` |
 | [`crates/yip-wire`](../crates/yip-wire) | Frame serialization, SipHash-1-3 coverage authentication, keyed header obfuscation. | `#![forbid(unsafe_code)]` |
 | [`crates/yip-transport`](../crates/yip-transport) | Flow classification, GF(256) Cauchy Reed-Solomon FEC, RLNC codec, thin ARQ, PLPMTU discovery. | `#![forbid(unsafe_code)]` |
 | [`crates/yip-membership`](../crates/yip-membership) | Cryptographic identity certificates, RootSets, epidemic anti-entropy gossip, and TAI64N replay freshness. | `#![forbid(unsafe_code)]` |
@@ -145,47 +145,48 @@ Every node participating in a `yip` mesh network possesses an immutable identity
 
 Nodes prove authorization via signed certificates issued by a private root CA (`yip-ca`). Certificates bind node identity keys, mesh roles, and validity epochs without requiring centralized phone-home databases.
 
-### PQNoise-IKpsk2 Handshake with Hybrid ML-KEM-512
+### PQNoise-IKpsk2 Handshake with Hybrid ML-KEM-768 / 1024 / 512
 
-`yip` implements a post-quantum hybrid cryptographic handshake (`PQNoise_IKpsk2_25519_MLKEM512_ChaChaPoly_BLAKE3`). It builds on the Noise Protocol Framework pattern **Noise-IKpsk2** (Initiator knows Responder static key beforehand, one round-trip mutual authentication, with pre-shared key slot 2) augmented with NIST FIPS 203 **ML-KEM-512** (Kyber-512) and native BLAKE3 keyed XOF ratchets:
+`yip` implements a post-quantum hybrid cryptographic handshake (`PQNoise_IKpsk2_25519_MLKEM768_ChaChaPoly_BLAKE3`, also supporting `MLKEM1024` and `MLKEM512`). It builds on the Noise Protocol Framework pattern **Noise-IKpsk2** (Initiator knows Responder static key beforehand, one round-trip mutual authentication, with pre-shared key slot 2) augmented with NIST FIPS 203 **ML-KEM** and native BLAKE3 keyed XOF ratchets:
 
-```
+```text
 Initiator (Host A)                                      Responder (Host B)
 --------------------------------------------------------------------------
 Generate ephemeral e_A (X25519)
-Generate PQ keypair (ek_A, dk_A)
-Noise Step: e, es, s, ss
-                       Message 1: Init (1,028 Bytes)
-                       ---------------------------->
-                                                        Parse ek_A, e_A
-                                                        Noise Step: e, es, s, ss
-                                                        Encapsulate: (ct, ss_pq) = pq_encaps(ek_A)
-                                                        Inject PSK: set_psk(2, ss_pq)
-                                                        Noise Step: se, ee
-                       Message 2: Response (948 Bytes)
-                       <----------------------------
-Parse ct, e_B
-Decapsulate: ss_pq = pq_decaps(dk_A, ct)
-Inject PSK: set_psk(2, ss_pq)
-Noise Step: se, ee
+Encapsulate against Responder static ML-KEM ek_B:
+  (ct, ss_pq) = pq_encaps(ek_B)
+Noise Step: e, es, s, ss, skem
+Ratchet: MixKey(ss_pq) -> k_3
+                      Message 1: Init (Flight 1: 1,185+ B)
+                      ---------------------------->
+                                                       Parse e_A, decrypt s_A
+                                                       Decapsulate: ss_pq = pq_decaps(dk_B, ct)
+                                                       Ratchet: MixKey(ss_pq) -> k_3
+                                                       Verify payload MAC under k_3
+                                                       Generate ephemeral e_B (X25519)
+                                                       Noise Step: e, ee, se
+                                                       Encrypt response payload
+                      Message 2: Response (Flight 2: 49+ B)
+                      <----------------------------
+Parse e_B, decrypt payload
+Noise Step: e, ee, se
 Split: (CipherState_Tx, CipherState_Rx)
 ```
 
-#### Post-Quantum Deadlock-Free Design
+#### Post-Quantum Zero-Round-Trip Design
 
-To achieve post-quantum confidentiality without requiring a multi-round pre-handshake exchange, the Responder encapsulates a shared secret `ss_pq` against the Initiator's public encapsulation key `ek_A` in Message 1. The Responder sends the resulting 768-byte ciphertext `ct` in the clear (at bytes `4..772` of Message 2).
-
-The Initiator extracts `ct` prior to decrypting Message 2's AEAD envelope, executes `pq_decapsulate(dk_A, ct)` to recover `ss_pq`, mixes it into Noise PSK slot 2 via `NoiseState::set_psk(2, &ss_pq)`, and then decrypts the remainder of Message 2. This structure guarantees:
-- **Zero Round-Trip Penalty**: Full classical and quantum forward secrecy established in a single RTT ($1.0 \times \text{RTT}$).
-- **FIPS 203 §7.2 Compliance**: Every received ML-KEM ciphertext undergoes strict modulus range verification ($c_i < 3329$) and IND-CCA2 implicit rejection on tampering.
+To achieve post-quantum confidentiality without requiring multi-round key exchange or out-of-band pre-handshakes, the Initiator encapsulates against the Responder's known static ML-KEM encapsulation key (`ek_B`) directly in Message 1 (`skem` token). The resulting ML-KEM ciphertext `ct` is transmitted inside Message 1 immediately following the encrypted static key:
+- **Zero Round-Trip Penalty**: Full classical and post-quantum forward secrecy established in a single RTT ($1.0 \times \text{RTT}$).
+- **FIPS 203 §7.2 Compliance**: Every received ML-KEM encapsulation key and ciphertext undergoes strict modulus range verification ($c_i < 3329$) and IND-CCA2 implicit rejection on tampering.
+- **Configurable Parameter Sets**: Defaults to `mlkem768` (NIST Category 3, 128-bit quantum security margin), with full support for `mlkem1024` (NIST Category 5) and `mlkem512` (NIST Category 1).
 
 ### Handshake Wire Message Breakdown
 
-Handshake packets are designed to fit strictly within the MTU budget (`OBF_MTU_BUDGET = 1,200` bytes) to prevent IP fragmentation on paths with restricted MTUs:
+Handshake packets are designed to fit strictly within the MTU budget (`OBF_MTU_BUDGET = 1,200` bytes) for `mlkem768` and `mlkem512` to prevent IP fragmentation on paths with restricted MTUs:
 
-#### Message 1 (Initiator $\to$ Responder): 864 Bytes Base (~1,028 Bytes with Certificate)
+#### Message 1 (Initiator $\to$ Responder): 1,185 Bytes Base for ML-KEM-768 (~1,349 Bytes with Certificate)
 
-```
+```text
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -196,17 +197,23 @@ Handshake packets are designed to fit strictly within the MTU budget (`OBF_MTU_B
 |       Encrypted Static Public Key s_A + Poly1305 Tag (48 B)   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                                                               |
-+                   ML-KEM-512 Ciphertext                       +
-|                          ct (768 B)                           |
++                   ML-KEM Ciphertext                           +
+|        ct (1,088 B for ML-KEM-768 / 1,568 B for ML-KEM-1024)   |
+|                   (768 B for ML-KEM-512)                      |
 |                                                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |       Encrypted Payload (Admission Cert) + Poly1305 (16+ B)   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-#### Message 2 (Responder $\to$ Initiator): 48 Bytes Base (~212 Bytes with Certificate)
+*Base Framing*:
+- `mlkem768` (Default): 1 + 32 + 48 + 1,088 + 16 = 1,185 Bytes
+- `mlkem1024`: 1 + 32 + 48 + 1,568 + 16 = 1,665 Bytes
+- `mlkem512`: 1 + 32 + 48 + 768 + 16 = 865 Bytes
 
-```
+#### Message 2 (Responder $\to$ Initiator): 49 Bytes Base (~213 Bytes with Certificate)
+
+```text
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -217,6 +224,8 @@ Handshake packets are designed to fit strictly within the MTU budget (`OBF_MTU_B
 |       Encrypted Payload (Responder Cert) + Poly1305 (16+ B)   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
+
+*Base Framing*: 1 + 32 + 16 = 49 Bytes (all KEM parameter sets)
 
 ### 120-Second Epoch Ratchet & Rekey Overlap Window
 
@@ -807,7 +816,7 @@ For traffic flows where forward error correction is temporarily exhausted (e.g.,
 
 `yip` is built to withstand the emergence of Cryptanalytically Relevant Quantum Computers (CRQC) and "Harvest Now, Decrypt Later" adversaries:
 - **Classical Floor**: 128-bit classical security via Curve25519 and ChaCha20-Poly1305.
-- **Quantum Ceiling**: Category 1 post-quantum security via NIST FIPS 203 ML-KEM-512 (lattice-based Learning With Errors over Module Lattices).
+- **Quantum Ceiling**: Category 3 post-quantum security via NIST FIPS 203 ML-KEM-768 default (with support for ML-KEM-1024 Category 5 and ML-KEM-512 Category 1; lattice-based Module Learning With Errors).
 - **Hybrid Construction**: Breaking the session key requires simultaneously compromising *both* the classical discrete-log hardness (X25519) and the module lattice hardness (ML-KEM).
 
 ### Sliding Bitmap Replay Protection

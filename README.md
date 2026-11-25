@@ -47,11 +47,11 @@ Find the fastest path to what you need:
 
 | Persona | Immediate Next Steps | Recommended Guide |
 | :--- | :--- | :--- |
-| 🟢 **New User** | Install binary → Generate keypair → Connect two nodes → Ping overlay | [5-Minute Quickstart](#5-minute-quickstart) • [`01. Getting Started`](docs/01-getting-started.md) |
-| 🌐 **Mesh Operator** | Choose deployment topology → Set up root CA / Threshold Quorum → Configure seeds | [Deployment Modes](#primary-deployment-modes) • [`Threshold CA Guide`](examples/threshold-ca/README.md) • [`02. Configuration`](docs/02-configuration.md) |
-| 🛠️ **Developer** | Inspect lock-free ring buffers → Zero-alloc FEC pipeline → Run test suites | [`03. Architecture`](docs/03-architecture.md) • [`crates/yip-bench`](crates/yip-bench/RESULTS.md) |
-| 🦀 **Rust Developer** | Import `yip-mesh` facade crate → Embed Cauchy RS-FEC or Noise-IK into custom apps | [Rust Library & SDK](#rust-library--sdk) • [`crates/yip-mesh`](crates/yip-mesh/README.md) • [docs.rs](https://docs.rs/yip-mesh) |
-| 🛡️ **Security Reviewer** | Verify post-quantum hybrid KEM → ROAST threshold quorum → Anti-DPI test oracle | [Trust Model](#crisp-trust-model--security-invariants) • [`04. Security & Threat Model`](docs/04-security-and-threat-model.md) |
+| **New User** | Install binary → Generate keypair → Connect two nodes → Ping overlay | [5-Minute Quickstart](#5-minute-quickstart) • [`01. Getting Started`](docs/01-getting-started.md) |
+| **Mesh Operator** | Choose deployment topology → Set up root CA / Threshold Quorum → Configure seeds | [Deployment Modes](#primary-deployment-modes) • [`Threshold CA Guide`](examples/threshold-ca/README.md) • [`02. Configuration`](docs/02-configuration.md) |
+| **Developer** | Inspect lock-free ring buffers → Zero-alloc FEC pipeline → Run test suites | [`03. Architecture`](docs/03-architecture.md) • [`crates/yip-bench`](crates/yip-bench/RESULTS.md) |
+| **Rust Developer** | Import `yip-mesh` facade crate → Embed Cauchy RS-FEC or Noise-IK into custom apps | [Rust Library & SDK](#rust-library--sdk) • [`crates/yip-mesh`](crates/yip-mesh/README.md) • [docs.rs](https://docs.rs/yip-mesh) |
+| **Security Reviewer** | Verify post-quantum hybrid KEM → ROAST threshold quorum → Anti-DPI test oracle | [Trust Model](#crisp-trust-model--security-invariants) • [`04. Security & Threat Model`](docs/04-security-and-threat-model.md) |
 
 ---
 
@@ -91,7 +91,7 @@ yip is engineered as a modern, direct successor to WireGuard for Linux and Andro
 
 ## 5-Minute Quickstart
 
-Set up an encrypted, forward-error-corrected tunnel between two Linux nodes in four steps:
+Set up an encrypted, forward-error-corrected tunnel with post-quantum hybrid key exchange between two Linux nodes:
 
 ```bash
 # 1. Install binaries
@@ -100,13 +100,22 @@ cargo install yipd yip-ca
 # Or pre-compiled binary: cargo binstall yipd yip-ca
 
 # 2. Generate identity keypair and print self-certifying overlay IPv6 address
-yipd --genkey > /etc/yip/node.key && yipd --addr $(grep '^public=' /etc/yip/node.key | cut -d= -f2)
+sudo mkdir -p /etc/yip
+yipd --genkey | sudo tee /etc/yip/node.key > /dev/null
+sudo chmod 0600 /etc/yip/node.key
+yipd --addr $(grep '^public=' /etc/yip/node.key | cut -d= -f2)
 
-# 3. Start the daemon (systemd service or direct configuration file invocation)
+# 3. Install configuration (/etc/yip/yipd.conf)
+# yip defaults to NIST FIPS 203 ML-KEM-768 hybrid key exchange (kem=mlkem768).
+# Turnkey configs are provided in examples/point-to-point/ (yipd-host-a.conf and yipd-host-b.conf).
+sudo cp examples/point-to-point/yipd-host-a.conf /etc/yip/yipd.conf
+sudo chmod 0600 /etc/yip/yipd.conf
+
+# 4. Start the daemon (systemd service or direct configuration file invocation)
 sudo systemctl start yipd
-# Or run manually: sudo yipd /etc/yip/yipd.conf
+# Or run manually in foreground: sudo yipd /etc/yip/yipd.conf
 
-# 4. Verify telemetry and ping remote overlay peer
+# 5. Verify telemetry, post-quantum session status, and ping overlay peer
 yipctl status
 ping6 <peer-overlay-ip>
 ```
@@ -116,12 +125,13 @@ ping6 <peer-overlay-ip>
 ## Primary Deployment Modes
 
 ### Mode 1: Direct Point-to-Point (VPS-to-VPS)
-Direct UDP tunnel between two publicly addressable nodes with Cauchy RS-FEC:
+Direct UDP tunnel between two publicly addressable nodes with Cauchy RS-FEC and post-quantum hybrid KEM:
 
 ```ini
 # /etc/yip/yipd.conf (Host A: 198.51.100.1)
 local_private = dd152fc311a115549005da852d101a7d3a14594c728f71ff87aa0872da6c0fa9
 local_public  = bf923deeaddb66dde39e99987abdfd789c54eb882a570c340cd338071727ceeb
+kem           = mlkem768
 listen        = 0.0.0.0:443
 device        = yip0
 
@@ -138,6 +148,7 @@ Node behind NAT discovering and coordinating through an intermediate rendezvous 
 # /etc/yip/yipd.conf (Node A behind CGNAT)
 local_private = 2f2b5880cc15f29f826e876f5396c6f418e2366b73b415c5441f152b23c0334d
 local_public  = 4cbc48cf095389d829abf3c7d78747ca35c96483375bd73860b2ebba94c99d50
+kem           = mlkem768
 listen        = 0.0.0.0:443
 device        = yip0
 rendezvous    = 198.51.100.5:443
@@ -154,6 +165,7 @@ Nodes discover and peer with authorized members automatically via signed gossip 
 # /etc/yip/yipd.conf (Mesh Member Node)
 local_private       = 2f2b5880cc15f29f826e876f5396c6f418e2366b73b415c5441f152b23c0334d
 local_public        = 4cbc48cf095389d829abf3c7d78747ca35c96483375bd73860b2ebba94c99d50
+kem                 = mlkem768
 listen              = 0.0.0.0:443
 device              = yip0
 rendezvous          = 198.51.100.5:443
@@ -171,6 +183,13 @@ Eliminates single-point-of-compromise root keys. Online signers jointly issue an
 
 ```ini
 # /etc/yip/yipd.conf (Enrolled Node with Automated Renewal)
+local_private       = 2f2b5880cc15f29f826e876f5396c6f418e2366b73b415c5441f152b23c0334d
+local_public        = 4cbc48cf095389d829abf3c7d78747ca35c96483375bd73860b2ebba94c99d50
+kem                 = mlkem768
+listen              = 0.0.0.0:443
+device              = yip0
+rendezvous          = 198.51.100.5:443
+
 ca_public           = 8a03a4cf43c2907041efb394c0effabad5bdb4cbbc35d17c924c0b6cbfa8ba75
 cert                = /etc/yip/node.cert
 roots               = /etc/yip/network.roots
@@ -187,7 +206,7 @@ sudo yipd cert status
 sudo yipd cert renew
 ```
 
-👉 **Complete deployment walk-through**: See the [Turnkey Threshold CA Tutorial & Systemd Units](examples/threshold-ca/README.md).
+**Complete deployment walk-through**: See the [Turnkey Threshold CA Tutorial & Systemd Units](examples/threshold-ca/README.md).
 
 ---
 
@@ -341,19 +360,19 @@ Full methodology and reproducible test harnesses are documented in [`crates/yip-
 ┌───────────────────────────────────────┬───────────────────────────────────────┐
 │           WHAT IS PROTECTED           │         WHAT IS NOT PROTECTED         │
 ├───────────────────────────────────────┼───────────────────────────────────────┤
-│ ✔ Payload Confidentiality & Integrity │ ✘ Physical Peer IP Concealment        │
+│ [+] Payload Confidentiality & Integrity│ [-] Physical Peer IP Concealment       │
 │   ChaCha20-Poly1305 with post-quantum │   Peers authenticate directly and     │
 │   hybrid ML-KEM-768 forward secrecy   │   exchange traffic peer-to-peer       │
 ├───────────────────────────────────────┼───────────────────────────────────────┤
-│ ✔ Single-Point-of-Failure CA Defense  │ ✘ Mix-Net Anonymity                   │
+│ [+] Single-Point-of-Failure CA Defense │ [-] Mix-Net Anonymity                  │
 │   t-of-n FROST quorum ensures master  │   yip is not Tor; it does not route   │
 │   private key never exists on 1 host  │   through multi-hop onion circuits    │
 ├───────────────────────────────────────┼───────────────────────────────────────┤
-│ ✔ Probe Resistance & DPI Bypass       │ ✘ Covert Timing on Raw UDP            │
+│ [+] Probe Resistance & DPI Bypass      │ [-] Covert Timing on Raw UDP           │
 │   REALITY splices active probers into │   Without DAITA padding enabled,      │
 │   authentic CDNs (Apple/Microsoft)    │   packet timing mirrors traffic flows │
 ├───────────────────────────────────────┼───────────────────────────────────────┤
-│ ✔ Replay & Identity Spoofing          │ ✘ Subverted Host Kernels              │
+│ [+] Replay & Identity Spoofing         │ [-] Subverted Host Kernels             │
 │   TAI64N monotonic freshness and      │   The daemon relies on Linux memory   │
 │   BLAKE3 cryptographic addressing     │   isolation and privileged namespaces │
 └───────────────────────────────────────┴───────────────────────────────────────┘

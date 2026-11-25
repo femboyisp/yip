@@ -395,6 +395,9 @@ Create the configuration file at `/etc/yip/yipd.conf` on **Host A**:
 local_private=e81d76326087b220d3f237ef39aa4d91361ff55b7661005a7657d23d8c117d4a
 local_public=7df4d68205f03a2cae7e1713444fcda80ff43a29de7e9b0b4b2c159286d9a11a
 
+# Post-quantum KEM parameter set: "mlkem768" (default), "mlkem1024", or "mlkem512"
+kem=mlkem768
+
 # Socket binding & network device
 listen=0.0.0.0:443
 device=yip0
@@ -426,6 +429,9 @@ Create the matching configuration file at `/etc/yip/yipd.conf` on **Host B**:
 # Local identity
 local_private=50b522bb0b57e7eb133e9b11b5275ea011cf8c3f4e24eb37452d192131b0e01c
 local_public=9b49ffeb4566b53a0f78cae08920bc9e30a6e0c60f252cfdf4740e74f8c92b21
+
+# Post-quantum KEM parameter set: "mlkem768" (default), "mlkem1024", or "mlkem512"
+kem=mlkem768
 
 # Socket binding & network device
 listen=0.0.0.0:443
@@ -715,6 +721,9 @@ local_public=9b49ffeb4566b53a0f78cae08920bc9e30a6e0c60f252cfdf4740e74f8c92b21
 listen=0.0.0.0:443
 device=yip0
 device_kind=tun
+
+# Post-quantum KEM parameter set: "mlkem768" (default), "mlkem1024", or "mlkem512"
+kem=mlkem768
 
 # Zero-Trust Mesh Directives (All 5 Required)
 ca_public=8a03a4cf43c2907041efb394c0effabad5bdb4cbbc35d17c924c0b6cbfa8ba75

@@ -35,6 +35,7 @@ The following table maps standard WireGuard configuration directives directly to
 | `AllowedIPs = 10.0.0.2/32` | `route_mode = "MeshOnly"` | Default point-to-point overlay routing |
 | `AllowedIPs = 192.168.1.0/24` | `route_mode = "SplitTunnel"` | Subnet routing with explicit CIDRs |
 | `PersistentKeepalive = 25` | Handled automatically | `yip` sends adaptive heartbeats dynamically |
+| *(None / Classical only)* | `kem = mlkem768` | NIST FIPS 203 hybrid post-quantum KEM (`mlkem768`, `mlkem1024`, `mlkem512`) |
 
 ---
 
@@ -86,6 +87,7 @@ PersistentKeepalive = 25
 ```ini
 local_private = 2f2b5880cc15f29f826e876f5396c6f418e2366b73b415c5441f152b23c0334d
 local_public  = 4cbc48cf095389d829abf3c7d78747ca35c96483375bd73860b2ebba94c99d50
+kem           = mlkem768
 listen        = 0.0.0.0:443
 device        = yip0
 
@@ -115,6 +117,7 @@ AllowedIPs = 0.0.0.0/0, ::/0
 ```ini
 local_private = dd152fc311a115549005da852d101a7d3a14594c728f71ff87aa0872da6c0fa9
 local_public  = bf923deeaddb66dde39e99987abdfd789c54eb882a570c340cd338071727ceeb
+kem           = mlkem768
 listen        = 0.0.0.0:443
 device        = yip0
 route_mode    = "ExitNode"

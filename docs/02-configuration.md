@@ -57,7 +57,7 @@ A baseline commented configuration file is maintained at [`example.config`](../e
 `yip` is migrating toward a fully structured TOML schema. Today, `bin/yipd/src/config.rs` parses the unified key-value format while logically segmenting parameters into functional domains:
 
 ```
-[node]          -> local_private, local_public, listen, control_socket
+[node]          -> local_private, local_public, kem, listen, control_socket
 [interface]     -> device, device_kind, mtu, shards
 [transport]     -> transport, tls_sni
 [fec]           -> systematic Cauchy RS-FEC / P+Q engine parameters
@@ -114,6 +114,7 @@ flowchart LR
 # Core node parameters
 local_private=e81d76326087b220d3f237ef39aa4d91361ff55b7661005a7657d23d8c117d4a
 local_public=7df4d68205f03a2cae7e1713444fcda80ff43a29de7e9b0b4b2c159286d9a11a
+kem=mlkem768
 listen=0.0.0.0:443
 device=yip0
 device_kind=tun
@@ -136,6 +137,7 @@ endpoint=203.0.113.2:443
 # Core node parameters
 local_private=50b522bb0b57e7eb133e9b11b5275ea011cf8c3f4e24eb37452d192131b0e01c
 local_public=9b49ffeb4566b53a0f78cae08920bc9e30a6e0c60f252cfdf4740e74f8c92b21
+kem=mlkem768
 listen=0.0.0.0:443
 device=yip0
 device_kind=tun
@@ -226,6 +228,7 @@ yip-rendezvous 0.0.0.0:51821 \
 ```ini
 local_private=dd152fc311a115549005da852d101a7d3a14594c728f71ff87aa0872da6c0fa9
 local_public=bf923deeaddb66dde39e99987abdfd789c54eb882a570c340cd338071727ceeb
+kem=mlkem768
 listen=0.0.0.0
 device=yip0
 device_kind=tun
@@ -244,6 +247,7 @@ public_key=1f5b6b76d9723a79221777a7450522c32faa7300efd59b0a5efa42665cac0a0a
 ```ini
 local_private=b7f496a24be70c3a856e53a21456963c784aaf0d4f21dce9eca620120974eada
 local_public=1f5b6b76d9723a79221777a7450522c32faa7300efd59b0a5efa42665cac0a0a
+kem=mlkem768
 listen=0.0.0.0
 device=yip0
 device_kind=tun
@@ -303,6 +307,7 @@ yip-rendezvous 0.0.0.0:51821 \
 ```ini
 local_private=d8e1d3269e750a802a3a64c9f07c2691ebbbc830a00d7a2f98aac554708822ab
 local_public=5bc3510da3fb0d32c493aab3a1eac641f81a7f87cc7d3977af594174e4d3c946
+kem=mlkem768
 listen=0.0.0.0
 device=yip0
 device_kind=tun
@@ -368,6 +373,7 @@ flowchart TD
 # Core Node
 local_private=38e55e4bf5b7d903f5ad6f406ab2d3e0984a95610ecae251783515436c7a8fe8
 local_public=47d25e016147610fa65d93e157291a13481e18d6e326b48fbba2637651a5d2eb
+kem=mlkem768
 listen=198.51.100.10:443
 device=yip0
 device_kind=tun
@@ -471,6 +477,7 @@ yip-ca sign-roots \
 ```ini
 local_private=dd152fc311a115549005da852d101a7d3a14594c728f71ff87aa0872da6c0fa9
 local_public=bf923deeaddb66dde39e99987abdfd789c54eb882a570c340cd338071727ceeb
+kem=mlkem768
 listen=0.0.0.0:443
 device=yip0
 device_kind=tun
@@ -488,6 +495,7 @@ network_id=f11a8e0df8fa6352eeb62192de7ece47
 ```ini
 local_private=2f2b5880cc15f29f826e876f5396c6f418e2366b73b415c5441f152b23c0334d
 local_public=4cbc48cf095389d829abf3c7d78747ca35c96483375bd73860b2ebba94c99d50
+kem=mlkem768
 listen=0.0.0.0:443
 device=yip0
 device_kind=tun
@@ -518,6 +526,7 @@ Parameters governing node identity, cryptographic keys, network listening, and a
 | :--- | :--- | :--- | :--- | :--- |
 | `local_private`<br/>*(TOML: `node_key`)* | String (Hex) | *None* (Required) | 64 hex characters (32 bytes) | Defines this node's long-term X25519 private key. Kept strictly secret. Used to authenticate handshakes via Noise-IK. |
 | `local_public` | String (Hex) | *None* (Required) | 64 hex characters (32 bytes) | Public half of the node's X25519 keypair. Determines the node's self-certifying IPv6 address (`yipd --addr`). |
+| `kem` | String | `mlkem768` | `mlkem768`, `mlkem1024`, `mlkem512` | Post-quantum KEM algorithm selection (NIST FIPS 203). Combined with X25519 and ChaCha20-Poly1305 in hybrid PQNoise-IKpsk2. |
 | `listen`<br/>*(TOML: `listen_port`)* | String | `0.0.0.0:443` | `IP:port` or `IP` | Local socket bind address. If port is omitted or absent, defaults to port 443 with fallback to 8443 if unprivileged. |
 | `control_socket` | String (Path) | `/run/yipd/yip.sock` | Absolute filesystem path | Path to UNIX domain control socket for `yipctl` command-and-control and live telemetry. |
 | `log_level` | String | `info` | `trace`, `debug`, `info`, `warn`, `error` | Output verbosity emitted to stderr and systemd journal. |
@@ -634,6 +643,8 @@ Parameters defined within repeatable `[peer]` blocks to establish connections to
 | :--- | :--- | :--- | :--- | :--- |
 | `public_key` | String (Hex) | *None* (Required) | 64 hex characters (32 bytes) | Remote peer's public X25519 key. Authenticates the peer during Noise-IK key exchange. |
 | `endpoint` | String | *None* (Optional) | `IP:port` (IPv4 or `[IPv6]:port`) | Direct UDP endpoint. If omitted, the peer is reached via rendezvous STUN hole punching or blind relaying. |
+| `kem` | String | *Inherits node `kem`* | `mlkem768`, `mlkem1024`, `mlkem512` | Optional per-peer post-quantum KEM override. |
+| `pq_public_key` | String (Hex) | *None* (Optional) | Hex string (1,184 B for 768, 1,568 B for 1024, 800 B for 512) | Static post-quantum public encapsulation key for this peer (GHSA-cw9q-4c58-hv9p). |
 
 > [!IMPORTANT]
 > **Cryptographic Addressing vs. WireGuard `allowed_ips`**:

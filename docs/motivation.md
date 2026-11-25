@@ -396,7 +396,7 @@ To help different engineering disciplines navigate our technical documentation, 
 |                             | 4. SECURITY REVIEWERS                                     |
 |                             |                                                           |
 |                             | Formal STRIDE Threat Model                                |
-|                             | Post-Quantum Hybrid KEM (ML-KEM-512 + X25519)             |
+|                             | Post-Quantum Hybrid KEM (ML-KEM-768/1024/512 + X25519)     |
 |                             | Zero Fixed Wire Signatures (No Magic Bytes)               |
 |                             | 4-Engine DPI Test Oracle (Zeek, Snort3, Suricata, nDPI)   |
 |                             |                                                           |
@@ -429,7 +429,7 @@ If your goal is contributing to the codebase, extending driver backends, or audi
 1. **Modular Rust Workspace Architecture:**
    - Inspect [03-architecture.md#repository-crate-topology](03-architecture.md#repository-crate-topology) for the modular crate breakdown:
      - `yip-core`: Core primitives, state machines, and configuration schema.
-     - `yip-crypto`: Cryptographic primitives, Noise-IKpsk2, ML-KEM-512, and ChaCha20-Poly1305.
+     - `yip-crypto`: Cryptographic primitives, Noise-IKpsk2, ML-KEM-768/1024/512, and ChaCha20-Poly1305.
      - `yip-fec`: Systematic Cauchy Reed-Solomon encoder and Galois field arithmetic.
      - `yip-net`: Wire framing, packet parsing, and network socket abstractions.
      - `yip-driver`: Kernel-bypass driver backends (vectorized epoll, io_uring, and AF_XDP).
@@ -471,10 +471,10 @@ If your goal is auditing the cryptographic foundations, session ratchets, threat
 
 1. **Executive Security Architecture and Primitives:**
    - Read [04-security-and-threat-model.md#1-executive-security-summary--cryptographic-primitives](04-security-and-threat-model.md#1-executive-security-summary--cryptographic-primitives).
-   - Verify primitive selections: X25519, ML-KEM-512 (Kyber-512, FIPS 203), BLAKE3, ChaCha20-Poly1305, and SipHash-1-3.
+   - Verify primitive selections: X25519, ML-KEM-768 (Kyber-768, FIPS 203, with 1024/512 support), BLAKE3, ChaCha20-Poly1305, and SipHash-1-3.
 2. **Post-Quantum Hybrid Key Exchange:**
    - Study [04-security-and-threat-model.md#2-post-quantum-hybrid-handshake-architecture](04-security-and-threat-model.md#2-post-quantum-hybrid-handshake-architecture) and [03-architecture.md#2-out-of-band-cryptographic-control-plane](03-architecture.md#2-out-of-band-cryptographic-control-plane).
-   - Review the Noise-IKpsk2 handshake extension incorporating ML-KEM-512 to defend against Harvest-Now-Decrypt-Later (HNDL) quantum attacks.
+   - Review the Noise-IKpsk2 handshake extension incorporating ML-KEM to defend against Harvest-Now-Decrypt-Later (HNDL) quantum attacks.
    - Note the strict wire budget constraint: keeping total handshake datagrams under 1,200 bytes (`OBF_MTU_BUDGET`) to guarantee zero IP fragmentation over restrictive networks.
 3. **Continuous Forward Secrecy and Rekeying:**
    - Review [04-security-and-threat-model.md#4-120-second-epoch-ratchet--memory-hygiene](04-security-and-threat-model.md#4-120-second-epoch-ratchet--memory-hygiene).
