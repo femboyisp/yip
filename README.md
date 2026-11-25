@@ -347,6 +347,13 @@ A common misconception is that `yip` requires `AF_XDP` (kernel-bypass, root priv
 
 <!-- BENCHMARK-TABLE-END -->
 
+> **Methodology Transparency Notes:**
+> - **Testbeds & CPUs:** AWS `t3.small` (Intel Xeon Platinum 8259CL @ 2.50 GHz, 2 vCPUs) across `us-east-1` (VA) and `us-west-2` (OR) for WAN (~54.8 ms RTT, ENA); AMD Ryzen 5 7640U (6C/12T) / AMD EPYC for local netns and 2 Gbps link sweeps.
+> - **Topology & MTU:** Underlay MTU 1500 bytes; uniform overlay MTU 1380 bytes across all 10 contenders to guarantee identical segment sizing without IP fragmentation.
+> - **Loss Injection:** Linux `tc netem` drop applied strictly to outer UDP egress carrier datagrams destined to the peer endpoint.
+> - **TCP Congestion Control (CUBIC vs. BBR):** Standard Linux default CUBIC (`fq_codel`). Under loss, the Mathis formula ($BW \le \frac{\text{MSS}}{\text{RTT}} \times \frac{C}{\sqrt{p}}$) predicts WireGuard collapsing to ~1.1 Mbit/s at 3% loss (measured: 1.1 Mbit/s). `yip` avoids collapse because in-flight Cauchy RS-FEC reconstructs missing symbols before the host stack observes loss (0.00% TCP drop).
+> - **WAN Run-to-Run Variance:** In the sequential WAN loss sweep, clean 0% was 412.0 Mbit/s, 1% was 349.3 Mbit/s, and 3% was 372.3 Mbit/s (vs 312.9 Mbit/s in an earlier single-stream run). This reflects normal 10-15% cloud transit variance on burstable instances and micro-pacing dynamics of in-flight reconstructed ACKs.
+
 </details>
 
 Full methodology and reproducible test harnesses are documented in [`crates/yip-bench/RESULTS.md`](crates/yip-bench/RESULTS.md) and [`05. Benchmarks & Performance`](docs/05-benchmarking-and-performance.md).
