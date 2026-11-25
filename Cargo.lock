@@ -3103,7 +3103,7 @@ dependencies = [
 
 [[package]]
 name = "yip-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "criterion",
@@ -3119,7 +3119,7 @@ dependencies = [
 
 [[package]]
 name = "yip-ca"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ed25519-dalek",
  "frost-core",
@@ -3137,7 +3137,7 @@ dependencies = [
 
 [[package]]
 name = "yip-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -3151,7 +3151,7 @@ dependencies = [
 
 [[package]]
 name = "yip-device"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "thiserror",
@@ -3159,7 +3159,7 @@ dependencies = [
 
 [[package]]
 name = "yip-io"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-utils",
  "io-uring",
@@ -3169,7 +3169,7 @@ dependencies = [
 
 [[package]]
 name = "yip-membership"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -3179,7 +3179,7 @@ dependencies = [
 
 [[package]]
 name = "yip-mesh"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "yip-ca",
  "yip-crypto",
@@ -3195,7 +3195,7 @@ dependencies = [
 
 [[package]]
 name = "yip-obf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "enum-map",
@@ -3208,7 +3208,7 @@ dependencies = [
 
 [[package]]
 name = "yip-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -3219,7 +3219,7 @@ dependencies = [
 
 [[package]]
 name = "yip-rendezvous"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -3231,7 +3231,7 @@ dependencies = [
 
 [[package]]
 name = "yip-rendezvous-bin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "boring",
  "getrandom 0.4.3",
@@ -3250,14 +3250,14 @@ dependencies = [
 
 [[package]]
 name = "yip-transport"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "yip-verify",
 ]
 
 [[package]]
 name = "yip-utls"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chacha20poly1305",
  "der",
@@ -3275,7 +3275,7 @@ dependencies = [
 
 [[package]]
 name = "yip-verify"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "tokio",
@@ -3290,7 +3290,7 @@ dependencies = [
 
 [[package]]
 name = "yip-wire"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bolero",
  "siphasher",
@@ -3300,7 +3300,7 @@ dependencies = [
 
 [[package]]
 name = "yipd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "boring",

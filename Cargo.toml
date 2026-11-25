@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*", "bin/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.89.0"
 license = "AGPL-3.0-or-later"
@@ -14,18 +14,18 @@ keywords = ["vpn", "mesh", "fec", "cryptography", "peer-to-peer"]
 categories = ["network-programming", "cryptography"]
 
 [workspace.dependencies]
-yip-wire = { version = "0.1.0", path = "crates/yip-wire" }
-yip-crypto = { version = "0.1.0", path = "crates/yip-crypto" }
-yip-device = { version = "0.1.0", path = "crates/yip-device" }
-yip-io = { version = "0.1.0", path = "crates/yip-io" }
-yip-transport = { version = "0.1.0", path = "crates/yip-transport" }
-yip-membership = { version = "0.1.0", path = "crates/yip-membership" }
-yip-rendezvous = { version = "0.1.0", path = "crates/yip-rendezvous" }
-yip-obf = { version = "0.1.0", path = "crates/yip-obf" }
-yip-utls = { version = "0.1.0", path = "crates/yip-utls" }
-yip-verify = { version = "0.1.0", path = "crates/yip-verify" }
-yip-proto = { version = "0.1.0", path = "crates/yip-proto" }
-yip-ca = { version = "0.1.0", path = "bin/yip-ca" }
+yip-wire = { version = "0.2.0", path = "crates/yip-wire" }
+yip-crypto = { version = "0.2.0", path = "crates/yip-crypto" }
+yip-device = { version = "0.2.0", path = "crates/yip-device" }
+yip-io = { version = "0.2.0", path = "crates/yip-io" }
+yip-transport = { version = "0.2.0", path = "crates/yip-transport" }
+yip-membership = { version = "0.2.0", path = "crates/yip-membership" }
+yip-rendezvous = { version = "0.2.0", path = "crates/yip-rendezvous" }
+yip-obf = { version = "0.2.0", path = "crates/yip-obf" }
+yip-utls = { version = "0.2.0", path = "crates/yip-utls" }
+yip-verify = { version = "0.2.0", path = "crates/yip-verify" }
+yip-proto = { version = "0.2.0", path = "crates/yip-proto" }
+yip-ca = { version = "0.2.0", path = "bin/yip-ca" }
 
 blake3 = { version = "1.8", default-features = false, features = ["zeroize"] }
 subtle = "2.6"

@@ -5,6 +5,8 @@ All notable changes to this project are documented here, following
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-25
+
 ### Security
 - **Mitigate Post-Quantum ML-KEM Private Key Derivation from Public Identity (GHSA-cw9q-4c58-hv9p, `crates/yip-crypto`, `crates/yip-membership`, `bin/yipd`).**
   - Derived the static post-quantum ML-KEM decapsulation key strictly from secret local private key material (`local_private`) via `PQ_KEM_STATIC_KEY_CONTEXT_V2`, closing a critical vulnerability where passive observers could compute the responder's decapsulation key from public identity.
@@ -789,5 +791,6 @@ All notable changes to this project are documented here, following
   via Criterion, and a `tc netem` latency/loss harness comparing the yip tunnel
   against kernel WireGuard (results in `crates/yip-bench/README.md`).
 
-[Unreleased]: https://github.com/femboyisp/yip/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/femboyisp/yip/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/femboyisp/yip/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/femboyisp/yip/releases/tag/v0.1.0
