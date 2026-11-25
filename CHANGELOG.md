@@ -22,6 +22,11 @@ All notable changes to this project are documented here, following
   - Added strict SHA-256 verification before extracting `musl.cc` cross-compilation toolchains in the release workflow.
 
 ### Added
+- **Parallel Crypto Worker Pool for Single-Stream Line-Rate Scaling (`bin/yipd`, `crates/yip-crypto`, #252).**
+  - Implemented dedicated SPSC ring-buffer crypto worker pool (`OutboundCryptoPool` and `InboundCryptoPool`) distributing ChaCha20-Poly1305 AEAD sealing and opening across multiple dedicated worker threads while maintaining strict in-order sequence reassembly via `ReorderBuffer`.
+  - Added monotonic batch nonce reservation (`reserve_counters`) in `Session` to safely pipeline concurrent multi-threaded sealing without lock contention.
+  - Added configuration support for `crypto_workers = <N|auto>` (and alias `crypto_threads`) in `yipd.conf` and `--crypto-workers <N|auto>` CLI flag, defaulting to inline crypto (0) or auto-scaling worker threads.
+  - Preserved `#![forbid(unsafe_code)]`, zero steady-state heap allocations on the packet processing hot path, and sub-50 MB RSS footprint under line rate.
 - **In-Session Authenticated Encryption for Anti-Entropy Gossip (`bin/yipd`, #207).**
   - Implemented authenticated encryption for membership anti-entropy gossip control frames using `PacketType::EncryptedControl` (type 6), eliminating plaintext gossip and directory metadata leakage across established sessions.
   - Added `ControlCodec` with ChaCha20-Poly1305 authenticated encryption, independent directional keys derived from session authentication secrets, monotonic 64-bit anti-replay window tracking, and uniform padding to `OBF_MTU_BUDGET` (1420 bytes).

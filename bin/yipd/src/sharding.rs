@@ -685,6 +685,7 @@ fn create_peer_manager(
     if let Some(fec) = config.fec {
         manager.set_fec_config(fec);
     }
+    manager.set_crypto_workers(config.crypto_workers);
     Ok(manager)
 }
 
