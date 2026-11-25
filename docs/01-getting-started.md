@@ -143,7 +143,8 @@ sudo mkdir -p /etc/yip
 sudo cp example.config /etc/yip/yipd.conf.example
 ```
 
-> [!TIP] Clever Fox Tip: Always Build in Release Mode
+> [!TIP]
+> **Clever Fox Tip: Always Build in Release Mode**
 > Always compile with `--release`. Unoptimized debug builds run the Galois field GF(256) Reed-Solomon matrix routines in software without SIMD autovectorization, resulting in substantially higher CPU latency.
 
 ### Option D: Container / Docker Deployment
@@ -377,7 +378,8 @@ yipd --addr 9b49ffeb4566b53a0f78cae08920bc9e30a6e0c60f252cfdf4740e74f8c92b21
 
 You can choose either standard custom ULA prefixes (such as `fd00:1::1/64`) or these self-certifying key addresses for your overlay. For this tutorial, we will assign `fd00:1::1/64` to Host A and `fd00:1::2/64` to Host B.
 
-> [!TIP] Clever Fox Tip: Self-Certifying Addressing
+> [!TIP]
+> **Clever Fox Tip: Self-Certifying Addressing**
 > Because your overlay IPv6 is cryptographically bound to your public key, peers can verify your identity without consulting a centralized directory or authority. If an incoming packet doesn't match its cryptographic origin, yip quietly drops it in its tracks.
 
 ---

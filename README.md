@@ -84,8 +84,8 @@ yip is engineered as a modern, direct successor to WireGuard for Linux and Andro
 | **NAT Traversal & Roaming** | Roaming only (Requires open ports/STUN) | Native STUN hole-punching + blind relays + authenticated roaming | Direct P2P behind CGNAT without centralized controller lock-in |
 | **Zero-Trust Mesh & Certificate Renewal** | None (Static keys manually distributed) | Optional decentralized *t*-of-*n* threshold CA with automated renewal | Scales from 2 nodes to enterprise meshes without single point of failure |
 
-> [!NOTE] Platform Scope
-> `yip` currently provides production-grade daemons for Linux infrastructure (servers, routers, edge gateways) and Android mobile (`yip-client`). Native graphical desktop clients for macOS and Windows are in active development. If migrating from existing WireGuard setups on Linux, see the [WireGuard Migration Guide](docs/migrating-from-wireguard.md).
+> [!NOTE]
+> **Platform Scope**: `yip` currently provides production-grade daemons for Linux infrastructure (servers, routers, edge gateways) and Android mobile (`yip-client`). Native graphical desktop clients for macOS and Windows are in active development. If migrating from existing WireGuard setups on Linux, see the [WireGuard Migration Guide](docs/migrating-from-wireguard.md).
 
 ---
 

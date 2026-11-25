@@ -425,7 +425,8 @@ flowchart TD
    - The relay replays the exact buffered `ClientHello` bytes to the destination server and pipes bidirectional traffic between the prober and the authentic web server.
    - The active prober observes a genuine, valid X.509 certificate signed by a public CA, complete with authentic HTTP/2 responses. The prober cannot distinguish the `yip` node from the real web service.
 
-> [!TIP] Clever Fox Tip: Burrowing Past Active Probers
+> [!TIP]
+> **Clever Fox Tip: Burrowing Past Active Probers**
 > When a suspicious firewall probes your endpoint, yip doesn't drop the connection or serve a fishy self-signed certificate. Instead, like a clever fox diving into a familiar burrow, yip transparently splices the prober into an authentic web server (such as Apple or Microsoft CDN). The prober sees genuine CA certs and valid HTTP/2 responses, completely unaware that an encrypted mesh was ever there.
 
 ---

@@ -685,7 +685,8 @@ Combined with optional traffic-analysis defense plugins ([`crates/yip-obf`](../c
 - **Bitwise Entropy**: Evaluates to $> 7.999$ bits per byte.
 - **Oracle Verification**: Validated against automated oracle test suites running nDPI, Zeek, Suricata, and Wireshark analyzers without triggering protocol detection signatures.
 
-> [!TIP] Clever Fox Tip: Blending Into the Shadows
+> [!TIP]
+> **Clever Fox Tip: Blending Into the Shadows**
 > By eliminating fixed protocol signatures and masking headers with per-packet keystreams, yip leaves no tracks for deep packet inspection engines. To a network monitor, your mesh traffic looks indistinguishable from benign, uniform random noise.
 
 ---

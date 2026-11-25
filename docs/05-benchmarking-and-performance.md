@@ -127,7 +127,8 @@ This difference is the intentional, mathematically necessary trade-off for users
 
 On clean fiber, both tunnels provide more than enough bandwidth for typical interactive usage. But on real-world mobile networks, congested satellite links (Starlink), inter-continental transit, and adversarial middleboxes injecting drops, `yip` keeps connections alive and fast when standard tunnels fail completely.
 
-> [!TIP] Clever Fox Tip: Line-Rate Parity and the In-Flight Loss Shield
+> [!TIP]
+> **Clever Fox Tip: Line-Rate Parity and the In-Flight Loss Shield**
 > `yip` achieves full line-rate saturation on clean gigabit and multi-gigabit links via standard Linux sockets (`epoll` + GSO/GRO) and the parallel crypto worker pool. But unlike traditional tunnels that assume pristine lab cables, `yip` was engineered for real-world hostility. Like a clever fox navigating thorny terrain, `yip`'s in-flight Cauchy Reed-Solomon parity symbols act as an automatic insurance policy: missing packets are reconstructed in 117 ns before the host TCP stack detects a gap, keeping throughput near line rate when traditional tunnels collapse into exponential backoff.
 
 ### Metrics That Matter: Goodput, P99 Tail Latency, and Recovery Ratios
