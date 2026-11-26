@@ -271,6 +271,7 @@ setup_leg "$NS_R" "$VETH_R_H" "$VETH_R_N" "$IP_R"
 # ── 4. start daemons: seed root first, then A and B, at a fast rekey cadence ──
 export YIP_REKEY_INTERVAL_MS
 export YIP_CERT_SKEW_SECS
+export RUST_LOG="${RUST_LOG:-info}"
 
 LOG_A="$TMPDIR_TEST/yipA.log"
 LOG_B="$TMPDIR_TEST/yipB.log"
@@ -294,7 +295,7 @@ ip netns exec "$NS_A" "$YIPD" "$CFG_A" >"$LOG_A" 2>&1 &
 PID_A=$!
 
 echo "[start] starting yipRevB"
-ip netns exec "$NS_B" "$YIPD" "$CFG_B" >"$LOG_B" 2>&1 &
+ip netns exec "$NS_B" env -u YIP_REKEY_INTERVAL_MS "$YIPD" "$CFG_B" >"$LOG_B" 2>&1 &
 PID_B=$!
 
 # ── 5. wait for TUN devices to appear in all three namespaces ─────────────────
@@ -383,7 +384,7 @@ while :; do
     if [ "$NOW" -ge "$((EXPIRY_TIME - 5))" ]; then
         break
     fi
-    if ip netns exec "$NS_A" ping -6 -c 3 -W 2 "$ADDR_B" >/dev/null 2>&1; then
+    if ip netns exec "$NS_A" ping -6 -c 1 -W 1 "$ADDR_B" >/dev/null 2>&1; then
         ESTABLISHED=1
         break
     fi

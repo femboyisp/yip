@@ -293,6 +293,51 @@ impl EpochSet {
         EpochInbound::None
     }
 
+    /// Open an inbound encrypted control datagram against the epochs in order
+    /// (current, then responder's `next`, then grace `previous`).
+    pub fn inbound_open_control(
+        &mut self,
+        dg: &[u8],
+        now_ms: u64,
+    ) -> Result<(u8, Vec<u8>), crate::control_codec::ControlError> {
+        // current
+        let res = self
+            .current
+            .ctrl_codec
+            .open(&mut self.current.ctrl_replay, dg);
+        if res.is_ok() {
+            return res;
+        }
+
+        // next (responder unconfirmed new epoch)
+        if self.next.is_some() {
+            let next_res = {
+                let next_dp = &mut self.next.as_mut().expect("checked is_some").dp;
+                next_dp.ctrl_codec.open(&mut next_dp.ctrl_replay, dg)
+            };
+            if next_res.is_ok() {
+                // Confirmed: promote next -> current, old current -> previous
+                let new = self.next.take().expect("checked is_some");
+                let old = std::mem::replace(&mut self.current, new.dp);
+                self.current_created_ms = now_ms;
+                self.previous = Some(old);
+                self.previous_retire_ms = now_ms.saturating_add(PREVIOUS_EPOCH_GRACE_MS);
+                self.epoch = self.epoch.saturating_add(1);
+                return next_res;
+            }
+        }
+
+        // previous (grace)
+        if let Some(prev) = self.previous.as_mut() {
+            let prev_res = prev.ctrl_codec.open(&mut prev.ctrl_replay, dg);
+            if prev_res.is_ok() {
+                return prev_res;
+            }
+        }
+
+        res
+    }
+
     /// Initiator switch on rekey completion: it now holds `new` AND knows the
     /// responder installed it (the responder sent the Resp), so switch outbound
     /// immediately; the old epoch becomes receive-only `previous`.

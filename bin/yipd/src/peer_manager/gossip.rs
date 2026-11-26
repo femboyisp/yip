@@ -47,13 +47,28 @@ impl PeerManager {
         &mut self,
         peer_idx: usize,
         dg: &[u8],
+        now_ms: u64,
     ) -> DispatchOut<'_> {
         let (inner_type, payload) = {
-            let Some(est) = self.peers[peer_idx].state.as_established_mut() else {
-                return DispatchOut::None;
+            let (opened, promoted) = {
+                let Some(est) = self.peers[peer_idx].state.as_established_mut() else {
+                    return DispatchOut::None;
+                };
+                let prev_epoch = est.epoch();
+                let opened = est.inbound_open_control(dg, now_ms);
+                let promoted = if est.epoch() != prev_epoch {
+                    Some((est.epoch(), est.current_obf_key()))
+                } else {
+                    None
+                };
+                (opened, promoted)
             };
-            let dp = &mut est.current;
-            match dp.ctrl_codec.open(&mut dp.ctrl_replay, dg) {
+            if let Some((new_epoch, obf)) = promoted {
+                self.peers[peer_idx].session_obf_key = obf;
+                self.metrics.record_rekey();
+                self.metrics.set_current_epoch(new_epoch);
+            }
+            match opened {
                 Ok(res) => res,
                 Err(_) => return DispatchOut::None,
             }
@@ -123,7 +138,7 @@ impl PeerManager {
             return DispatchOut::None;
         };
 
-        self.process_encrypted_control(peer_idx, dg)
+        self.process_encrypted_control(peer_idx, dg, _now_ms)
     }
 
     /// Handle an inbound `[Gossip]` datagram from `src`: decode the
@@ -697,6 +712,114 @@ mod tests {
         assert!(
             matches!(invalid_out, DispatchOut::None),
             "control datagram with invalid inner type must be dropped"
+        );
+    }
+
+    #[test]
+    fn test_encrypted_control_ingress_previous_epoch() {
+        let ca = test_ca();
+        let local = generate_keypair();
+        let peer = generate_keypair();
+        let peer_ep: SocketAddr = "10.0.0.6:51820".parse().unwrap();
+        let cfg = PeerConfig {
+            public_key: peer.public,
+            endpoint: Some(peer_ep),
+            alias: None,
+            kem: None,
+            pq_public_key: None,
+        };
+        let mut pm = PeerManager::new(
+            local.private,
+            local.public,
+            &[cfg],
+            TunnelMode::L3Tun,
+            None,
+            Some(membership_for(&ca, local.public)),
+            false,
+        );
+
+        // Epoch 1 keys
+        let mut ini1 = Handshake::initiator(&local.private, &peer.public).unwrap();
+        let mut res1 = Handshake::responder(&peer.private).unwrap();
+        let m1 = ini1.write_message(&[]).unwrap();
+        res1.read_message(&m1).unwrap();
+        let m2 = res1.write_message(&[]).unwrap();
+        ini1.read_message(&m2).unwrap();
+        let (auth_key1, hp_key1) = derive_wire_keys(&ini1.channel_binding());
+        let (ini_send1, ini_recv1) = ini1.raw_split_keys();
+        let (init_ctrl1, resp_ctrl1) = derive_control_keys(&auth_key1);
+
+        let local_est1 = Established {
+            session: ini1.into_session().unwrap(),
+            auth_key: auth_key1,
+            hp_key: hp_key1,
+            raw_send_key: ini_send1,
+            raw_recv_key: ini_recv1,
+            ctrl_codec: ControlCodec::new(init_ctrl1, resp_ctrl1),
+            ctrl_send_nonce: 0,
+            ctrl_replay: ReplayWindow::new(),
+        };
+        let peer_codec1 = ControlCodec::new(resp_ctrl1, init_ctrl1);
+
+        const TAG1: u64 = 0x1111_2222_3333_4444;
+        let dp1 = DataPlane::new(local_est1, TAG1, TunnelMode::L3Tun, peer_ep, false, 1200);
+        let mut epochs = Box::new(crate::epoch::EpochSet::new(Box::new(dp1), 0));
+
+        // Epoch 2 keys
+        let mut ini2 = Handshake::initiator(&local.private, &peer.public).unwrap();
+        let mut res2 = Handshake::responder(&peer.private).unwrap();
+        let m3 = ini2.write_message(&[]).unwrap();
+        res2.read_message(&m3).unwrap();
+        let m4 = res2.write_message(&[]).unwrap();
+        ini2.read_message(&m4).unwrap();
+        let (auth_key2, hp_key2) = derive_wire_keys(&ini2.channel_binding());
+        let (ini_send2, ini_recv2) = ini2.raw_split_keys();
+        let (init_ctrl2, resp_ctrl2) = derive_control_keys(&auth_key2);
+
+        let local_est2 = Established {
+            session: ini2.into_session().unwrap(),
+            auth_key: auth_key2,
+            hp_key: hp_key2,
+            raw_send_key: ini_send2,
+            raw_recv_key: ini_recv2,
+            ctrl_codec: ControlCodec::new(init_ctrl2, resp_ctrl2),
+            ctrl_send_nonce: 0,
+            ctrl_replay: ReplayWindow::new(),
+        };
+        const TAG2: u64 = 0x5555_6666_7777_8888;
+        let dp2 = DataPlane::new(local_est2, TAG2, TunnelMode::L3Tun, peer_ep, false, 1200);
+
+        // Promote epoch: dp1 moves to previous, dp2 becomes current
+        epochs.promote_from_rekey(Box::new(dp2), 100);
+        assert!(epochs.previous.is_some(), "previous epoch must be retained");
+        pm.peers[0].state = PeerSessionState::Established(epochs);
+        pm.by_tag.insert(TAG2, 0);
+
+        // Member record so reply is generated
+        let other = generate_keypair();
+        let other_ep: SocketAddr = "192.0.2.89:6000".parse().unwrap();
+        let other_rec = mk_record(&ca, 202, other.public, vec![other_ep], 1);
+        assert!(pm
+            .membership
+            .as_mut()
+            .unwrap()
+            .ingest_record(other_rec.clone(), now_secs()));
+
+        // Peer seals PullRequest using OLD epoch 1 keys (simulating in-flight packet during rekey)
+        let pull = GossipMsg::PullRequest(vec![yip_membership::node_id(&other.public)]);
+        let mut pull_raw = Vec::new();
+        pull.encode(&mut pull_raw);
+        let sealed_old = peer_codec1.seal(0, INNER_TYPE_GOSSIP, &pull_raw, OBF_MTU_BUDGET);
+
+        // Deliver old-epoch encrypted control packet to pm: must succeed via `previous`
+        let out = pm.on_udp(peer_ep, &sealed_old, 200);
+        let reply_dgs = match out {
+            DispatchOut::Udp(e) => e,
+            _ => panic!("expected DispatchOut::Udp for control packet opened via previous epoch"),
+        };
+        assert!(
+            !reply_dgs.is_empty(),
+            "must emit replies for gossip opened via previous epoch"
         );
     }
 

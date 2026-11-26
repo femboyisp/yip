@@ -583,12 +583,12 @@ impl PeerManager {
         &mut self,
         idx: usize,
         payload: &[u8],
-        _now_ms: u64,
+        now_ms: u64,
     ) -> DispatchOut<'_> {
         if !matches!(self.peers[idx].state, PeerSessionState::Established(_)) {
             return DispatchOut::None;
         }
-        self.process_encrypted_control(idx, payload)
+        self.process_encrypted_control(idx, payload, now_ms)
     }
 
     /// Relay-path counterpart of `on_gossip`: handle an inbound relayed `[Gossip]`
