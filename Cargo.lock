@@ -3158,6 +3158,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "yip-exit"
+version = "0.2.0"
+dependencies = [
+ "blake3",
+ "subtle",
+ "tokio",
+ "yip-device",
+]
+
+[[package]]
 name = "yip-io"
 version = "0.2.0"
 dependencies = [
