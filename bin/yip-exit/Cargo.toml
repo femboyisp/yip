@@ -1,0 +1,26 @@
+[package]
+name = "yip-exit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "L3 IPv4/IPv6 exit NAT gateway for yip mobile Full Tunnel (ExitNode) clients"
+
+[[bin]]
+name = "yip-exit"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+yip-device = { workspace = true }
+blake3 = { workspace = true }
+subtle = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
+
+[lints]
+workspace = true
